@@ -4,6 +4,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../peripherals/aplic.dart';
 import '../peripherals/imsic.dart';
 import '../peripherals/plic.dart';
+import 'harbor_soc.dart';
 
 /// Describes the interrupt controller topology for a SoC.
 ///
@@ -155,4 +156,73 @@ class HarborInterruptRouting {
 
   /// Total number of interrupt sources connected.
   int get sourceCount => _nextSourceIndex;
+
+  /// Builds the routing for the interrupt controller [soc] contains.
+  ///
+  /// Returns null when the SoC has no PLIC and no APLIC.
+  static HarborInterruptRouting? forSoC(HarborSoC soc) {
+    for (final p in soc.peripherals) {
+      if (p is HarborPlic) return HarborInterruptRouting.plic(plic: p);
+    }
+    for (final p in soc.peripherals) {
+      if (p is HarborAplic) return HarborInterruptRouting.aplicWired(aplic: p);
+    }
+    return null;
+  }
+
+  /// Drives the interrupt controller source inputs from [soc]'s own numbering.
+  ///
+  /// [HarborSoC.interruptAssignments] is the ONE place a source number is
+  /// chosen. The device tree, the ACPI tables and the SVD read that same map,
+  /// so the wires and the tables cannot disagree.
+  ///
+  /// Each peripheral with an `interrupt` output drives `src_irq_<n>` of the
+  /// controller, where `n` is its assigned number. Every other source input is
+  /// tied low. Source 0 is always tied low because RISC-V reserves it: the
+  /// allocator starts at [HarborSoC.interruptBase], which is 1.
+  ///
+  /// Returns the assignment map that was wired.
+  Map<BridgeModule, int> connectSoCSources(HarborSoC soc) {
+    final assignments = soc.interruptAssignments();
+    final controller = _controller;
+    final maxSources = plic?.sources ?? aplic?.sources ?? 0;
+
+    final driven = <int, BridgeModule>{};
+    for (final entry in assignments.entries) {
+      final index = entry.value;
+      if (index < 1) {
+        throw StateError(
+          'Interrupt source $index for ${entry.key.name} is not legal: '
+          'RISC-V reserves source 0',
+        );
+      }
+      if (index >= maxSources) {
+        throw StateError(
+          'Interrupt source overflow: ${entry.key.name} needs source $index '
+          'but the controller has only $maxSources sources',
+        );
+      }
+      driven[index] = entry.key;
+      _sourceMap[entry.key.name] = index;
+    }
+    if (assignments.isNotEmpty) {
+      _nextSourceIndex = assignments.values.reduce((a, b) => a > b ? a : b) + 1;
+    }
+
+    for (var i = 0; i < maxSources; i++) {
+      final source = driven[i];
+      controller.input('src_irq_$i').srcConnection! <=
+          (source == null ? Const(0) : source.output('interrupt'));
+    }
+    return assignments;
+  }
+
+  /// The interrupt controller that takes the wired source inputs.
+  BridgeModule get _controller {
+    final c = plic ?? aplic;
+    if (c == null) {
+      throw StateError('No wired interrupt controller configured');
+    }
+    return c;
+  }
 }

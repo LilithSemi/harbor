@@ -354,5 +354,9 @@ export 'src/peripherals/temperature_sensor.dart';
 export 'src/peripherals/uart.dart';
 export 'src/peripherals/usb.dart';
 export 'src/peripherals/usb_dfu.dart';
+export 'src/peripherals/usb_fs_phy.dart';
+export 'src/peripherals/usb_fs_pe.dart';
+export 'src/peripherals/usb_fs_device.dart';
+
 export 'src/peripherals/usb_phy.dart';
 export 'src/peripherals/watchdog.dart';

@@ -167,6 +167,117 @@ void main() {
     });
   });
 
+  group('HarborFpgaTarget extraConstraints', () {
+    // One raw line for every family, in that family's own language. Harbor
+    // writes each one without a change, it does not translate between them.
+    const lpfLine = 'IOBUF PORT "usb_dp" SLEWRATE=SLOW;';
+    const pcfLine = 'set_frequency usb_dp 12.0';
+    const xdcLine = 'set_property LOC BUFHCE_X0Y12 [get_cells bufh]';
+
+    test('ECP5 puts the lines in the LPF', () {
+      const target = HarborFpgaTarget.ecp5(
+        device: 'lfe5u-25f',
+        package: 'CSFBGA285',
+        frequency: 48000000,
+        pinMap: {'clk': 'A9 LVCMOS33', 'usb_dp': 'N1 LVCMOS33'},
+        extraConstraints: {'usb_dp_slew': lpfLine},
+      );
+      final lpf = target.generateConstraints();
+      expect(lpf, contains(lpfLine));
+      expect(lpf, contains('# BEGIN extraConstraints (raw LPF lines)'));
+      expect(lpf, contains('# END extraConstraints'));
+      // The pin constraints stay, the block only adds to them, and it comes
+      // after the clock constraint at the end of the file.
+      expect(lpf, contains('LOCATE COMP "usb_dp" SITE "N1";'));
+      expect(
+        lpf.indexOf(lpfLine),
+        greaterThan(lpf.indexOf('FREQUENCY PORT "clk"')),
+      );
+    });
+
+    test('iCE40 puts the lines in the PCF', () {
+      const target = HarborFpgaTarget.ice40(
+        device: 'up5k',
+        package: 'sg48',
+        frequency: 48000000,
+        pinMap: {'clk': '35', 'usb_dp': '37'},
+        extraConstraints: {'usb_dp_freq': pcfLine},
+      );
+      final pcf = target.generateConstraints();
+      expect(pcf, contains(pcfLine));
+      expect(pcf, contains('# BEGIN extraConstraints (raw PCF lines)'));
+      expect(pcf, contains('# END extraConstraints'));
+      expect(pcf, contains('set_io usb_dp 37'));
+      expect(
+        pcf.indexOf(pcfLine),
+        greaterThan(pcf.indexOf('set_frequency clk')),
+      );
+    });
+
+    test('Xilinx still puts the lines in the XDC', () {
+      const target = HarborFpgaTarget.spartan7(
+        device: 'xc7s50',
+        package: 'csga324',
+        useOpenXc7: true,
+        frequency: 100000000,
+        pinMap: {'clk': 'R2'},
+        extraConstraints: {'bufh_loc': xdcLine},
+      );
+      final xdc = target.generateConstraints();
+      expect(xdc, contains(xdcLine));
+      expect(xdc, contains('# BEGIN extraConstraints (raw XDC lines)'));
+      expect(xdc, contains('# END extraConstraints'));
+      expect(xdc.indexOf(xdcLine), greaterThan(xdc.indexOf('create_clock')));
+    });
+
+    test('the lines keep their order', () {
+      const target = HarborFpgaTarget.ecp5(
+        device: 'lfe5u-25f',
+        package: 'CSFBGA285',
+        pinMap: {'clk': 'A9 LVCMOS33'},
+        extraConstraints: {
+          'first': 'BLOCK RESETPATHS;',
+          'second': 'BLOCK ASYNCPATHS;',
+        },
+      );
+      final lpf = target.generateConstraints();
+      expect(
+        lpf.indexOf('BLOCK RESETPATHS;'),
+        lessThan(lpf.indexOf('BLOCK ASYNCPATHS;')),
+      );
+    });
+
+    test('no block at all when there are no extra constraints', () {
+      for (final target in const [
+        HarborFpgaTarget.ecp5(
+          device: 'lfe5u-25f',
+          package: 'CSFBGA285',
+          frequency: 48000000,
+          pinMap: {'clk': 'A9 LVCMOS33'},
+        ),
+        HarborFpgaTarget.ice40(
+          device: 'up5k',
+          package: 'sg48',
+          frequency: 48000000,
+          pinMap: {'clk': '35'},
+        ),
+        HarborFpgaTarget.spartan7(
+          device: 'xc7s50',
+          package: 'csga324',
+          useOpenXc7: true,
+          frequency: 100000000,
+          pinMap: {'clk': 'R2'},
+        ),
+      ]) {
+        expect(
+          target.generateConstraints(),
+          isNot(contains('extraConstraints')),
+          reason: '${target.vendor} emitted a stray block',
+        );
+      }
+    });
+  });
+
   group('HarborAsicTarget', () {
     late Sky130Provider pdk;
 

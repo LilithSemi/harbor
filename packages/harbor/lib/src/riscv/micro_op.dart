@@ -149,20 +149,46 @@ sealed class RiscVMicroOp {
 }
 
 /// Read a value from a register into a micro-op field.
+///
+/// Set [fp] when the operand names a floating-point register. The micro-op
+/// alone does not say which register file an operand belongs to, so a
+/// microcoded execution unit reads the integer file unless [fp] tells it
+/// otherwise. A static execution unit takes the file from the operation's
+/// [RfResource] list instead and ignores this flag.
 class RiscVReadRegister extends RiscVMicroOp {
   final RiscVMicroOpField source;
   final int offset;
+  final bool fp;
 
-  const RiscVReadRegister(this.source, {this.offset = 0});
+  const RiscVReadRegister(this.source, {this.offset = 0, this.fp = false});
 }
 
 /// Write a value to a register.
+///
+/// Set [fp] when the destination names a floating-point register. See
+/// [RiscVReadRegister] for why the flag is necessary. An FP destination also
+/// skips the x0 and x2 special cases: f0 is normal storage, and there is no
+/// floating-point stack pointer.
+///
+/// Set [nanBox] when the value is a 32-bit single-precision datum that goes to
+/// a 64-bit floating-point register. The register file keeps FLEN bits, and the
+/// specification says a narrower value must have all upper bits set (NaN
+/// boxing). The micro-op that produced the value does not say how wide it is,
+/// so the write carries the flag.
 class RiscVWriteRegister extends RiscVMicroOp {
   final RiscVMicroOpField dest;
   final RiscVMicroOpSource source;
   final int valueOffset;
+  final bool fp;
+  final bool nanBox;
 
-  const RiscVWriteRegister(this.dest, this.source, {this.valueOffset = 0});
+  const RiscVWriteRegister(
+    this.dest,
+    this.source, {
+    this.valueOffset = 0,
+    this.fp = false,
+    this.nanBox = false,
+  });
 }
 
 /// Read a CSR value.

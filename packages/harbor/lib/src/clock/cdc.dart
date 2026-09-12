@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../peripherals/bram.dart';
 import '../soc/target.dart';
 
 /// Clock domain crossing synchronizer.
@@ -82,6 +83,13 @@ class HarborCdcHandshake extends BridgeModule {
     final srcReq = Logic(name: 'src_req');
     final dataReg = Logic(name: 'data_reg', width: dataWidth);
 
+    // The acknowledge register of the destination domain. It is made here,
+    // above the source block, because the source block synchronizes it back.
+    // A signal with no driver in its place holds X, and the X reaches
+    // dataReg through the load condition below, so every bit of the
+    // crossing becomes X on the first clock after reset.
+    final dstAck = Logic(name: 'dst_ack');
+
     // Synchronize ack back to src domain
     final ackSync0 = Logic(name: 'ack_sync0');
     final ackSync1 = Logic(name: 'ack_sync1');
@@ -96,7 +104,7 @@ class HarborCdcHandshake extends BridgeModule {
           ackSync1 < Const(0),
         ],
         orElse: [
-          ackSync0 < Logic(name: 'dst_ack_raw'),
+          ackSync0 < dstAck,
           ackSync1 < ackSync0,
           If(
             input('src_valid') & ~srcReq & ~ackSync1,
@@ -112,7 +120,6 @@ class HarborCdcHandshake extends BridgeModule {
     // Destination side: synchronize req, latch data, assert ack
     final reqSync0 = Logic(name: 'req_sync0');
     final reqSync1 = Logic(name: 'req_sync1');
-    final dstAck = Logic(name: 'dst_ack');
 
     Sequential(dstClk, [
       If(
@@ -156,11 +163,30 @@ class HarborCdcFifo extends BridgeModule {
 
   /// Back the `depth x dataWidth` storage with block RAM where [target] supports
   /// it, instead of a flop array: keeps a deep/wide FIFO off the flop budget.
-  /// The gray pointers stay in flops (small). NOTE: not yet implemented. The
-  /// flop array is used regardless, so this is currently accepted-but-ignored
-  /// and safe to set. The BRAM storage path lands with the dual-clock RAMB/DP16KD
-  /// wiring.
+  /// The gray pointers stay in flops (small).
+  ///
+  /// The storage becomes a [HarborDualClockBram], which the synthesis tool maps
+  /// onto the cell that `target.blockRam` names (`DP16KD` on ECP5). When
+  /// [target] is null, or the target has no block RAM, the flop array is used
+  /// instead and this flag does nothing, so the flag is always safe to set.
+  /// [usesBlockRam] reports which storage the built FIFO has.
+  ///
+  /// A block RAM read port is SYNCHRONOUS, so the block RAM path adds a
+  /// pre-fetch stage that holds the head word in the read port register. The
+  /// external contract does not change: `rd_data` is still valid in the SAME
+  /// cycle that `rd_empty` is low, and one word for each cycle can still be
+  /// read. Only the LATENCY changes. `rd_empty` falls one `rd_clk` cycle later
+  /// than with the flop array, because the head word must come out of the RAM
+  /// first.
   final bool blockRam;
+
+  /// Whether the storage of this FIFO is block RAM. False when [blockRam] is
+  /// not set, and false when the [target] has no block RAM (or is null), where
+  /// the FIFO falls back to the flop array.
+  bool get usesBlockRam => _bram != null;
+
+  /// The block RAM storage, or null when the FIFO uses the flop array.
+  final HarborBlockRam? _bram;
 
   HarborCdcFifo({
     this.dataWidth = 32,
@@ -172,7 +198,14 @@ class HarborCdcFifo extends BridgeModule {
     // Derive the module definition name from the parameters so that two
     // differently-sized FIFOs (e.g. a Wishbone-CDC bridge's request and
     // response paths) do not collide on one reserved definitionName in ROHD.
-  }) : super('HarborCdcFifo_${dataWidth}w${depth}d') {
+  }) : _bram = blockRam ? target?.blockRam : null,
+       // Two FIFOs of one size but a different storage have a different
+       // structure, so the block RAM one takes its own definition name and the
+       // two cannot dedupe onto one definition.
+       super(
+         'HarborCdcFifo_${dataWidth}w${depth}d'
+         '${blockRam && target?.blockRam != null ? '_bram' : ''}',
+       ) {
     assert(
       depth >= 2 && (depth & (depth - 1)) == 0,
       'HarborCdcFifo depth must be a power of 2 and >= 2',
@@ -250,21 +283,31 @@ class HarborCdcFifo extends BridgeModule {
     output('wr_almost_full') <=
         occupancy.gt(Const(depth - almostFullMargin, width: ptrWidth));
 
-    // Empty: read gray == write gray
-    output('rd_empty') <= rdPtrGray.eq(wrPtrGraySync);
+    // Empty (flop storage): read gray == write gray. The block RAM path drives
+    // `rd_empty` from its pre-fetch stage instead, further down.
+    if (_bram == null) {
+      output('rd_empty') <= rdPtrGray.eq(wrPtrGraySync);
+    }
 
     // Write domain logic
     final wrClk = input('wr_clk');
     final wrReset = input('wr_reset');
 
     // Storage memory: `depth` entries of `dataWidth` bits. Written in the write
-    // domain at the low (non-wrap) bits of the write pointer, read combinational
-    // in the read domain at the low bits of the read pointer. The extra wrap bit
-    // of the pointers (used only for full/empty detection) is dropped here.
+    // domain at the low (non-wrap) bits of the write pointer, read in the read
+    // domain at the low bits of a read-side pointer. The extra wrap bit of the
+    // pointers (used only for full/empty detection) is dropped here.
+    //
+    // Flop storage keeps the array here and reads it combinational. Block RAM
+    // storage puts the array in a [HarborDualClockBram] instead, and its read
+    // port is SYNCHRONOUS (see the pre-fetch stage in the read domain below).
     final addrWidth = ptrWidth - 1;
-    final mem = <Logic>[
-      for (var i = 0; i < depth; i++) Logic(name: 'mem_$i', width: dataWidth),
-    ];
+    final mem = _bram != null
+        ? const <Logic>[]
+        : <Logic>[
+            for (var i = 0; i < depth; i++)
+              Logic(name: 'mem_$i', width: dataWidth),
+          ];
     final wrAddr = wrPtr.getRange(0, addrWidth);
     final wrPush = input('wr_en') & ~output('wr_full');
 
@@ -285,9 +328,12 @@ class HarborCdcFifo extends BridgeModule {
             wrPush,
             then: [
               wrPtr < wrPtr + 1,
-              // Write data into the addressed memory entry.
-              for (var i = 0; i < depth; i++)
-                If(wrAddr.eq(i), then: [mem[i] < input('wr_data')]),
+              // Write data into the addressed memory entry. The block RAM has
+              // its own write port, clocked by the same `wr_clk` and enabled by
+              // the same `wrPush`, so it takes no statement here.
+              if (_bram == null)
+                for (var i = 0; i < depth; i++)
+                  If(wrAddr.eq(i), then: [mem[i] < input('wr_data')]),
             ],
           ),
         ],
@@ -299,6 +345,90 @@ class HarborCdcFifo extends BridgeModule {
     final rdReset = input('rd_reset');
 
     final wrGraySync0 = Logic(name: 'wr_gray_sync0', width: ptrWidth);
+
+    if (_bram == null) {
+      Sequential(rdClk, [
+        If(
+          rdReset,
+          then: [
+            rdPtr < Const(0, width: ptrWidth),
+            wrGraySync0 < Const(0, width: ptrWidth),
+            wrPtrGraySync < Const(0, width: ptrWidth),
+          ],
+          orElse: [
+            wrGraySync0 < wrPtrGray,
+            wrPtrGraySync < wrGraySync0,
+            If(input('rd_en') & ~output('rd_empty'), then: [rdPtr < rdPtr + 1]),
+          ],
+        ),
+      ]);
+
+      // Combinational read: mux the addressed memory entry onto rd_data using
+      // the low (non-wrap) bits of the read pointer.
+      final rdAddr = rdPtr.getRange(0, addrWidth);
+      Combinational([
+        Case(
+          rdAddr,
+          [
+            for (var i = 0; i < depth; i++)
+              CaseItem(Const(i, width: addrWidth), [
+                output('rd_data') < mem[i],
+              ]),
+          ],
+          defaultItem: [output('rd_data') < Const(0, width: dataWidth)],
+        ),
+      ]);
+      return;
+    }
+
+    // Block RAM storage. The read port of a block RAM is SYNCHRONOUS: the data
+    // of an address comes out one `rd_clk` cycle later. To keep the same
+    // external contract as the flop array (`rd_data` valid in the SAME cycle
+    // that `rd_empty` is low), the read side PRE-FETCHES the head word into the
+    // read port register, where it waits for the consumer.
+    //
+    // Two pointers do this:
+    //   * `fetchPtr` says which entry to read OUT OF the RAM next. It runs one
+    //     entry ahead while the head word waits in the register.
+    //   * `rdPtr` says which entries the consumer has TAKEN. It is the pointer
+    //     that crosses to the write domain, so an entry stays reserved until
+    //     the consumer has the word. The write side therefore cannot overwrite
+    //     the pre-fetched entry, and the depth of the FIFO does not change.
+    //
+    // `dataValid` follows the read port register: a fetch of cycle N puts both
+    // its data and `dataValid` in place in cycle N+1, so the two never
+    // disagree and no half-fetched word is observable. The register HOLDS while
+    // no fetch goes out (the read enable of the port is low), so `rd_data` also
+    // cannot change under a consumer that does not read.
+    final fetchPtr = Logic(name: 'fetch_ptr', width: ptrWidth);
+    final fetchPtrGray = (fetchPtr ^ (fetchPtr >>> 1)).named('fetch_ptr_gray');
+    // No entry left to pre-fetch: the same gray comparison as `rd_empty` of the
+    // flop path, but against the pointer of the pre-fetch instead.
+    final memEmpty = fetchPtrGray.eq(wrPtrGraySync).named('mem_empty');
+    final dataValid = Logic(name: 'rd_data_valid');
+    // A word leaves the FIFO. This is `rd_en & ~rd_empty`, written from
+    // `dataValid` because `rd_empty` is driven from it below.
+    final pop = (input('rd_en') & dataValid).named('rd_pop');
+    // Send a fetch only when the read port register is free in the next cycle:
+    // it either holds nothing, or the consumer takes what it holds now. So one
+    // fetch at most is ever in flight and no pre-fetched word is lost.
+    final fetch = (~memEmpty & (~dataValid | pop)).named('rd_fetch');
+
+    final ram = HarborDualClockBram(
+      wrClk: wrClk,
+      wrEn: wrPush,
+      wrAddr: wrAddr,
+      wrData: input('wr_data'),
+      rdClk: rdClk,
+      rdReset: rdReset,
+      rdEn: fetch,
+      rdAddr: fetchPtr.getRange(0, addrWidth),
+      width: dataWidth,
+      depth: depth,
+      primitive: _bram,
+      name: 'storage',
+    );
+
     Sequential(rdClk, [
       If(
         rdReset,
@@ -306,28 +436,29 @@ class HarborCdcFifo extends BridgeModule {
           rdPtr < Const(0, width: ptrWidth),
           wrGraySync0 < Const(0, width: ptrWidth),
           wrPtrGraySync < Const(0, width: ptrWidth),
+          fetchPtr < Const(0, width: ptrWidth),
+          dataValid < Const(0),
         ],
         orElse: [
           wrGraySync0 < wrPtrGray,
           wrPtrGraySync < wrGraySync0,
-          If(input('rd_en') & ~output('rd_empty'), then: [rdPtr < rdPtr + 1]),
+          If(pop, then: [rdPtr < rdPtr + 1]),
+          If(fetch, then: [fetchPtr < fetchPtr + 1]),
+          // A fetch of this cycle lands in the read port register at the next
+          // edge, which is the same edge that sets `dataValid`.
+          If(
+            fetch,
+            then: [dataValid < Const(1)],
+            orElse: [
+              If(pop, then: [dataValid < Const(0)]),
+            ],
+          ),
         ],
       ),
     ]);
 
-    // Combinational read: mux the addressed memory entry onto rd_data using the
-    // low (non-wrap) bits of the read pointer.
-    final rdAddr = rdPtr.getRange(0, addrWidth);
-    Combinational([
-      Case(
-        rdAddr,
-        [
-          for (var i = 0; i < depth; i++)
-            CaseItem(Const(i, width: addrWidth), [output('rd_data') < mem[i]]),
-        ],
-        defaultItem: [output('rd_data') < Const(0, width: dataWidth)],
-      ),
-    ]);
+    output('rd_data') <= ram.rdData;
+    output('rd_empty') <= ~dataValid;
   }
 
   static int _log2(int val) {

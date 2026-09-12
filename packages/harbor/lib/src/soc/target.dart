@@ -12,7 +12,35 @@ sealed class HarborDeviceTarget {
   /// Human-readable name for this target.
   String get name;
 
+  /// The dual-clock block RAM primitive of this target, or null when the
+  /// target has none.
+  ///
+  /// A block that can keep a `depth x width` storage array off the flop budget
+  /// (for example `HarborCdcFifo` with `blockRam: true`) asks the target here.
+  /// A null answer means the block must build the array from flops instead.
+  /// Every target answers, so a new family only has to add its own case.
+  HarborBlockRam? get blockRam => null;
+
   const HarborDeviceTarget();
+}
+
+/// The dual-clock block RAM primitive of a device family.
+///
+/// Each value names the vendor cell that the family maps a dual-clock
+/// `depth x width` memory onto. Harbor does not instantiate the cell by hand:
+/// it emits the inference template that the family's synthesis tool maps onto
+/// this cell. The name here says which cell to expect in the netlist, and which
+/// cell to count when you check the fit.
+enum HarborBlockRam {
+  /// Lattice ECP5 EBR: `DP16KD`, 18 kbit, one clock for each of the two ports.
+  dp16kd,
+
+  /// Lattice iCE40 EBR: `SB_RAM40_4K`, 4 kbit, separate `RCLK` and `WCLK`.
+  sbRam40_4k,
+
+  /// Xilinx 7-series block RAM: `RAMB18E1`/`RAMB36E1`, one clock for each of
+  /// the two ports.
+  ramb,
 }
 
 /// Implemented by a bus master that exposes a debug module over the FPGA
@@ -56,7 +84,29 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// Pin constraints: signal name → pin identifier.
   final Map<String, String> pinMap;
 
-  /// Additional constraints passed to the toolchain.
+  /// Extra constraint lines, written into the generated file without a change.
+  ///
+  /// The key is a label only. The value is one full line of the constraint
+  /// language of this target's family, with its own terminator (an LPF
+  /// statement ends with `;`, a PCF or XDC line does not). The lines go at the
+  /// end of the file, between `# BEGIN extraConstraints` and
+  /// `# END extraConstraints`.
+  ///
+  /// Every family has its own language: iCE40 writes PCF, ECP5 writes LPF, and
+  /// Xilinx writes XDC. Harbor does not translate between them and does not
+  /// check the syntax, so a line that is correct for one family goes to the
+  /// place-and-route tool of another family as written, and that tool rejects
+  /// it. Keep one map for each family.
+  ///
+  /// These lines are added to the [pinMap] constraints, they do not replace
+  /// them. In LPF, a second `IOBUF PORT` statement for a pin that [pinMap] also
+  /// constrains adds its attributes to the first one. In PCF, a second `set_io`
+  /// for the same pin is an error ("duplicate pin constraint").
+  ///
+  /// nextpnr uses only the IO attributes that it knows. `syn_useioff` in an LPF
+  /// `IOBUF PORT` line gives "attribute 'syn_useioff' is not recognised" and
+  /// does nothing. To pack a flop into an ECP5 IO cell, put the `syn_useioff`
+  /// attribute on the flop in the RTL, which nextpnr-ecp5 does obey.
   final Map<String, String> extraConstraints;
 
   /// Name of the top-level clock input port, used for the timing constraint in
@@ -77,6 +127,17 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     HarborFpgaVendor.ecp5 => true,
     HarborFpgaVendor.vivado => true,
     HarborFpgaVendor.openXc7 => true,
+  };
+
+  /// The dual-clock block RAM primitive of this FPGA family.
+  ///
+  /// Every supported family has one, so this is never null for an FPGA.
+  @override
+  HarborBlockRam get blockRam => switch (vendor) {
+    HarborFpgaVendor.ice40 => HarborBlockRam.sbRam40_4k,
+    HarborFpgaVendor.ecp5 => HarborBlockRam.dp16kd,
+    HarborFpgaVendor.vivado => HarborBlockRam.ramb,
+    HarborFpgaVendor.openXc7 => HarborBlockRam.ramb,
   };
 
   /// Whether this FPGA has a built-in temperature sensor primitive.
@@ -538,9 +599,27 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       final intermediate = vendor == HarborFpgaVendor.ice40
           ? '\$(TOP).asc'
           : '\$(TOP).config';
+      buf.writeln(
+        '# --pre-place/--pre-route hooks activate only when Harbor emitted the',
+      );
+      buf.writeln(
+        '# scripts, which happens when a peripheral contributed a fragment.',
+      );
+      buf.writeln(
+        '# Both are empty otherwise, so a plain design is unaffected.',
+      );
+      buf.writeln(
+        'PREPLACE := \$(if \$(wildcard support/nextpnr/constraints.py),'
+        '--pre-place support/nextpnr/constraints.py,)',
+      );
+      buf.writeln(
+        'PREROUTE := \$(if \$(wildcard support/nextpnr/show_bels.py),'
+        '--pre-route support/nextpnr/show_bels.py,)',
+      );
+      buf.writeln();
       buf.writeln('pnr: $intermediate');
       buf.writeln('$intermediate: \$(TOP).json \$(TOP).$constraintExtension');
-      buf.writeln('\t$pnrCmd');
+      buf.writeln('\t$pnrCmd \$(PREPLACE) \$(PREROUTE)');
       buf.writeln();
       buf.writeln('pack: \$(TOP).$bitstreamExtension');
       buf.writeln('\$(TOP).$bitstreamExtension: $intermediate');
@@ -589,11 +668,20 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         '# --pre-place/--pre-route hooks activate only when Harbor emitted the',
       );
       buf.writeln(
-        '# DDR train-serdes scripts (openXC7 + DDR peripheral); empty otherwise.',
+        '# matching script (openXC7 + DDR peripheral, or any peripheral that',
+      );
+      buf.writeln(
+        '# contributes a fragment); empty otherwise. The two are tested apart,',
+      );
+      buf.writeln(
+        '# so a design with a pre-place script but no BEL dump still routes.',
       );
       buf.writeln(
         'PREPLACE := \$(if \$(wildcard support/nextpnr/constraints.py),'
-        '--pre-place support/nextpnr/constraints.py '
+        '--pre-place support/nextpnr/constraints.py,)',
+      );
+      buf.writeln(
+        'PREROUTE := \$(if \$(wildcard support/nextpnr/show_bels.py),'
         '--pre-route support/nextpnr/show_bels.py,)',
       );
       buf.writeln(
@@ -614,7 +702,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         '\tOMP_NUM_THREADS=\$(THREADS) nextpnr-xilinx --chipdb \$(CHIPDB) '
         '--xdc \$(TOP).$constraintExtension '
         '--json \$(TOP).json --write \$(TOP)_routed.json --fasm \$(TOP).fasm '
-        '\$(PREPACK) \$(PREPLACE) --placer \$(PLACER) --seed \$(SEED)',
+        '\$(PREPACK) \$(PREPLACE) \$(PREROUTE) --placer \$(PLACER) '
+        '--seed \$(SEED)',
       );
       buf.writeln();
       buf.writeln('pack: \$(TOP).$bitstreamExtension');
@@ -692,6 +781,20 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   static List<String> _ioAttrs(String value) =>
       value.trim().split(RegExp(r'\s+')).skip(1).toList();
 
+  /// Writes [extraConstraints] at the end of a constraint file, as a delimited
+  /// block of lines that do not change.
+  ///
+  /// [family] names the constraint language for a person who reads the
+  /// generated file. PCF, LPF and XDC all start a comment with `#`.
+  void _writeExtraConstraints(StringBuffer buf, String family) {
+    if (extraConstraints.isEmpty) return;
+    buf.writeln('# BEGIN extraConstraints (raw $family lines)');
+    for (final line in extraConstraints.values) {
+      buf.writeln(line);
+    }
+    buf.writeln('# END extraConstraints');
+  }
+
   String _generatePcf(Set<String>? knownPorts) {
     final buf = StringBuffer();
     buf.writeln('# Auto-generated PCF for $name');
@@ -705,6 +808,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         buf.writeln('set_frequency $clockPortName ${frequency / 1e6}');
       }
     }
+    _writeExtraConstraints(buf, 'PCF');
     return buf.toString();
   }
 
@@ -774,6 +878,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         '${(frequency / 1e6).toStringAsFixed(1)} MHz;',
       );
     }
+    _writeExtraConstraints(buf, 'LPF');
     return buf.toString();
   }
 
@@ -800,15 +905,13 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         '[get_ports $clockPortName]',
       );
     }
-    // Extra raw XDC lines (values emitted verbatim). Used for openXC7 clock-BEL
+    // Extra raw XDC lines (values written verbatim). Used for openXC7 clock-BEL
     // placement constraints the auto placer gets wrong, e.g. pinning the DDR3
     // PHY's regional clock buffers (BUFHCE) into the DDR bank's clock region so
     // the BUFG->BUFH dedicated arc routes (nextpnr-xilinx otherwise places them
     // in the wrong clock region and the dedicated clock router rejects the arc).
     // The key is a label only, the value is the full XDC line.
-    for (final line in extraConstraints.values) {
-      buf.writeln(line);
-    }
+    _writeExtraConstraints(buf, 'XDC');
     return buf.toString();
   }
 }
@@ -2028,4 +2131,60 @@ class HarborSimModelContext {
 mixin HarborSimModelProvider {
   /// Models for this peripheral, or empty when its pins are not exposed.
   List<HarborSimModel> simModels(HarborSimModelContext ctx);
+}
+
+/// State a [HarborNextpnrPreplaceProvider] gets when the SoC asks it for a
+/// nextpnr pre-place fragment.
+///
+/// The peripheral knows the names of its own cells. The target knows the part.
+/// This context carries the part down so a provider can pin a cell to a BEL
+/// that is correct for the device, or return null for a part it has no
+/// verified placement for.
+class HarborNextpnrPreplaceContext {
+  /// FPGA family the build targets. A BEL name is family-specific, so a
+  /// provider must check this before it emits a pin.
+  final HarborFpgaVendor vendor;
+
+  /// FPGA part, as [HarborFpgaTarget.device] gives it (e.g. `xc7s50`,
+  /// `lfe5u-45f`, `up5k`).
+  final String device;
+
+  /// FPGA package, as [HarborFpgaTarget.package] gives it (e.g. `csga324`).
+  final String package;
+
+  const HarborNextpnrPreplaceContext({
+    required this.vendor,
+    required this.device,
+    required this.package,
+  });
+}
+
+/// Implemented by a peripheral that must pin one of its cells to a BEL before
+/// nextpnr places the design.
+///
+/// The SoC collects a fragment from every peripheral that has this mixin, joins
+/// them, and writes the result as `support/nextpnr/constraints.py`. The
+/// generated Makefile passes that file to nextpnr with `--pre-place`, but only
+/// when the file exists, so a design with no provider runs the normal flow.
+///
+/// A fragment is Python that nextpnr runs with `ctx` bound to the design. Give
+/// each helper function a name that cannot collide with another fragment: all
+/// fragments share ONE namespace.
+///
+/// ```dart
+/// class MyPhy extends Module with HarborNextpnrPreplaceProvider {
+///   @override
+///   String? nextpnrPreplacePy(HarborNextpnrPreplaceContext ctx) {
+///     if (ctx.vendor != HarborFpgaVendor.ecp5) return null;
+///     return "for c in ctx.cells:\n"
+///         "    if 'my_phy_ff' in c.first:\n"
+///         "        c.second.setAttr('BEL', 'X0/Y0/SLICEA')\n";
+///   }
+/// }
+/// ```
+mixin HarborNextpnrPreplaceProvider {
+  /// The pre-place Python for this peripheral, or null when it has nothing to
+  /// pin on [ctx]. Return null (not an empty string) for a part or a family
+  /// this peripheral has no verified placement for.
+  String? nextpnrPreplacePy(HarborNextpnrPreplaceContext ctx);
 }

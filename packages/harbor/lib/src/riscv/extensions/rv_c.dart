@@ -7,6 +7,7 @@ import '../operation.dart';
 import '../resource.dart';
 
 const _int = RiscVIntRegFile(32);
+const _fp64 = RiscVFloatRegFile(64);
 
 /// C extension: Compressed instructions.
 ///
@@ -757,6 +758,161 @@ const rvC = RiscVExtension(
       matchValue: 0x1000,
       zeroMask: 0xFFC, // rd == 0 and rs2 == 0
       microcode: [RiscVTrapOp(3)],
+    ),
+  ],
+);
+
+/// Zcd: the compressed double-precision floating-point load and store
+/// instructions (c.fld, c.fsd, c.fldsp, c.fsdsp).
+///
+/// These are part of the C extension only when D is also present, so they are
+/// a separate extension here. A core that has C but no D must trap them as
+/// illegal, and it must not grow a floating-point register file because the
+/// C extension is enabled. Add this extension next to [rvC] and `rvD`.
+///
+/// RV64 gives the funct3=011/111 encodings of quadrants 0 and 2 to c.ld / c.sd
+/// / c.ldsp / c.sdsp, so RV64 has no c.flw / c.fsw. Only the double-precision
+/// forms exist. The encodings below are RV64-only for that reason: on RV32 the
+/// same funct3 values are still c.fld / c.fsd, but this core family does not
+/// use RV32 with D.
+///
+/// The address operand stays an integer register (rs1' or sp). Only the data
+/// operand comes from the floating-point file, so only that micro-op sets
+/// `fp: true`.
+const rvZcd = RiscVExtension(
+  name: 'Zcd',
+  key: null,
+  misaBit: null,
+  operations: [
+    // Quadrant 0. Same CL/CS layout and scaled-by-8 offset as c.ld / c.sd.
+    RiscVOperation(
+      mnemonic: 'c.fld',
+      opcode: CompressedOp.c0,
+      funct3: C0Funct3.cFld,
+      format: clType,
+      immKind: RvcImm.cldsd,
+      xlenConstraint: {RiscVMxlen.rv64},
+      resources: [
+        RfResource(_int, rs1),
+        RfResource(_fp64, rd),
+        MemoryResource.load(),
+        FpuResource(),
+      ],
+      microcode: [
+        RiscVReadRegister(RiscVMicroOpField.rs1),
+        RiscVAlu(
+          RiscVAluFunct.add,
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.imm,
+        ),
+        RiscVMemLoad(
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.rd,
+          RiscVMemSize.dword,
+        ),
+        RiscVWriteRegister(
+          RiscVMicroOpField.rd,
+          RiscVMicroOpSource.rd,
+          fp: true,
+        ),
+        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+      ],
+    ),
+    RiscVOperation(
+      mnemonic: 'c.fsd',
+      opcode: CompressedOp.c0,
+      funct3: C0Funct3.cFsd,
+      format: csType,
+      immKind: RvcImm.cldsd,
+      xlenConstraint: {RiscVMxlen.rv64},
+      resources: [
+        RfResource(_int, rs1),
+        RfResource(_fp64, rs2),
+        MemoryResource.store(),
+        FpuResource(),
+      ],
+      microcode: [
+        RiscVReadRegister(RiscVMicroOpField.rs1),
+        RiscVReadRegister(RiscVMicroOpField.rs2, fp: true),
+        RiscVAlu(
+          RiscVAluFunct.add,
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.imm,
+        ),
+        RiscVMemStore(
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.rs2,
+          RiscVMemSize.dword,
+        ),
+        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+      ],
+    ),
+
+    // Quadrant 2. Same CI/CSS layout and scaled-by-8 offset as c.ldsp /
+    // c.sdsp. The base is sp (x2), an integer register.
+    RiscVOperation(
+      mnemonic: 'c.fldsp',
+      opcode: CompressedOp.c2,
+      funct3: C2Funct3.cFldsp,
+      format: ciType,
+      immKind: RvcImm.ciLdsp,
+      fixedRs1: 2, // base is sp (x2)
+      xlenConstraint: {RiscVMxlen.rv64},
+      resources: [
+        RfResource(_int, rs1),
+        RfResource(_fp64, rd),
+        MemoryResource.load(),
+        FpuResource(),
+      ],
+      microcode: [
+        RiscVReadRegister(RiscVMicroOpField.rs1),
+        RiscVAlu(
+          RiscVAluFunct.add,
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.imm,
+        ),
+        RiscVMemLoad(
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.rd,
+          RiscVMemSize.dword,
+        ),
+        RiscVWriteRegister(
+          RiscVMicroOpField.rd,
+          RiscVMicroOpSource.rd,
+          fp: true,
+        ),
+        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+      ],
+    ),
+    RiscVOperation(
+      mnemonic: 'c.fsdsp',
+      opcode: CompressedOp.c2,
+      funct3: C2Funct3.cFsdsp,
+      format: cssType,
+      immKind: RvcImm.cssSdsp,
+      fixedRs1: 2, // base is sp (x2)
+      xlenConstraint: {RiscVMxlen.rv64},
+      resources: [
+        RfResource(_int, rs1),
+        RfResource(_fp64, rs2),
+        MemoryResource.store(),
+        FpuResource(),
+      ],
+      microcode: [
+        RiscVReadRegister(RiscVMicroOpField.rs1),
+        RiscVReadRegister(RiscVMicroOpField.rs2, fp: true),
+        RiscVAlu(
+          RiscVAluFunct.add,
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.imm,
+        ),
+        RiscVMemStore(
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.rs2,
+          RiscVMemSize.dword,
+        ),
+        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+      ],
     ),
   ],
 );

@@ -159,6 +159,46 @@ void main() {
       expect(acpi, contains('Interrupt (ResourceConsumer'));
     });
 
+    test('the ACPI GSI base reaches _GSB and the device GSIs', () {
+      final soc = HarborSoC(
+        name: 'TestSoC',
+        compatible: 'test,soc-v1',
+        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
+      );
+
+      soc.addPeripheral(HarborPlic(baseAddress: 0x0C000000));
+      final uart = soc.addPeripheral(HarborUart(baseAddress: 0x10000000));
+
+      final acpi = soc.generateAcpi();
+      // The PLIC device answers the base Linux matches against the MADT.
+      expect(acpi, contains('Name (_HID, "RSCV0001")'));
+      expect(acpi, contains('Method (_GSB, 0, NotSerialized)'));
+      expect(acpi, contains('Return (0x0)'));
+      // The consumer's GSI is its allocator source plus that same base, so a
+      // reader gets the source back with gsi - gsiBase.
+      expect(soc.interruptAssignments()[uart], equals(1));
+      expect(soc.interruptGsiBase, equals(0));
+      expect(acpi, contains('0x1'));
+    });
+
+    test('a custom GSI base moves _GSB and the device GSIs together', () {
+      final soc = HarborSoC(
+        name: 'TestSoC',
+        compatible: 'test,soc-v1',
+        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
+        interruptGsiBase: 0x40,
+      );
+
+      soc.addPeripheral(HarborPlic(baseAddress: 0x0C000000));
+      soc.addPeripheral(HarborUart(baseAddress: 0x10000000));
+
+      final acpi = soc.generateAcpi();
+      expect(acpi, contains('Return (0x40)'));
+      expect(acpi, contains('0x41'));
+      // The device tree keeps the raw source number. It has no GSI space.
+      expect(soc.generateDts(), contains('interrupts = <0x1>;'));
+    });
+
     test('respects a custom interrupt base', () {
       final soc = HarborSoC(
         name: 'TestSoC',

@@ -63,12 +63,34 @@ class HarborClint extends BridgeModule
     final clk = input('clk');
     final reset = input('reset');
     final addr = bus.addr.getRange(0, 16);
-    final datIn32 = bus.dataIn.getRange(0, 32);
-    final datOut32 = Logic(name: 'clint_dat_out', width: 32);
-    bus.dataOut <= datOut32.zeroExtend(bus.dataOut.width);
     final ack = bus.ack;
     final stb = bus.stb;
     final we = bus.we;
+
+    // Byte-lane decode. The bus carries whole 32-bit words side by side, and a
+    // master puts a word-aligned address on ADR with the data and SEL shifted
+    // into the byte lane of the access (River MMU wbAdr/wbDatMosi/wbSel, and
+    // the debug SBA). So a register at byte offset X answers at bus address
+    // X & ~(busBytes - 1) in word lane (X % busBytes) / 4. On a 32-bit bus
+    // every register is in lane 0 and this is the identity. On a 64-bit bus the
+    // mtimecmp high half is in lane 1: a decode that always took lane 0 wrote
+    // the low half with the wrong data and could never set the high half.
+    final dataWidth = bus.dataIn.width;
+    final busBytes = dataWidth ~/ 8;
+    final laneCount = dataWidth ~/ 32;
+    final datOut = List.generate(
+      laneCount,
+      (l) => Logic(name: 'clint_dat_out_$l', width: 32),
+    );
+    bus.dataOut <= datOut.rswizzle();
+
+    int laneOf(int off) => (off % busBytes) ~/ 4;
+    Logic addrHit(int off) => addr.eq(Const(off - (off % busBytes), width: 16));
+    // A lane takes a write only when the master selects one of its bytes.
+    Logic laneSel(int off) =>
+        bus.sel.getRange(laneOf(off) * 4, laneOf(off) * 4 + 4).or();
+    Logic wrData(int off) =>
+        bus.dataIn.getRange(laneOf(off) * 32, laneOf(off) * 32 + 32);
 
     timerInterrupt = List.generate(hartCount, (i) => addOutput('timer_irq_$i'));
     softwareInterrupt = List.generate(hartCount, (i) => addOutput('sw_irq_$i'));
@@ -92,6 +114,23 @@ class HarborClint extends BridgeModule
     final mtimeOut = addOutput('mtime_val', width: 64);
     mtimeOut <= mtime;
 
+    // Per-half write enables for mtimecmp, so one assignment can merge a
+    // doubleword store that carries both halves.
+    final cmpWriteLo = [
+      for (var i = 0; i < hartCount; i++)
+        (stb & ~ack & we & addrHit(0x4000 + i * 8) & laneSel(0x4000 + i * 8))
+            .named('mtimecmp_wr_lo_$i'),
+    ];
+    final cmpWriteHi = [
+      for (var i = 0; i < hartCount; i++)
+        (stb &
+                ~ack &
+                we &
+                addrHit(0x4000 + i * 8 + 4) &
+                laneSel(0x4000 + i * 8 + 4))
+            .named('mtimecmp_wr_hi_$i'),
+    ];
+
     Sequential(clk, [
       If(
         reset,
@@ -108,12 +147,12 @@ class HarborClint extends BridgeModule
             msip[i] < Const(0),
           ],
           ack < Const(0),
-          datOut32 < Const(0, width: 32),
+          for (var l = 0; l < laneCount; l++) datOut[l] < Const(0, width: 32),
         ],
         orElse: [
           mtime < mtime + Const(1, width: 64),
           ack < Const(0),
-          datOut32 < Const(0, width: 32),
+          for (var l = 0; l < laneCount; l++) datOut[l] < Const(0, width: 32),
 
           If(
             stb & ~ack,
@@ -122,58 +161,68 @@ class HarborClint extends BridgeModule
 
               for (var i = 0; i < hartCount; i++) ...[
                 If(
-                  addr.eq(Const(i * 4, width: 16)),
+                  addrHit(i * 4),
                   then: [
+                    If(we & laneSel(i * 4), then: [msip[i] < wrData(i * 4)[0]]),
                     If(
-                      we,
-                      then: [msip[i] < datIn32[0]],
-                      orElse: [datOut32 < msip[i].zeroExtend(32)],
+                      ~we,
+                      then: [datOut[laneOf(i * 4)] < msip[i].zeroExtend(32)],
                     ),
                   ],
                 ),
               ],
 
+              // Both mtimecmp halves can arrive in one bus word, so the two
+              // halves merge into ONE assignment. Two separate assignments to
+              // the same register in a Sequential keep only the last, which
+              // would drop the half written by the other lane.
               for (var i = 0; i < hartCount; i++) ...[
                 If(
-                  addr.eq(Const(0x4000 + i * 8, width: 16)),
+                  cmpWriteLo[i] | cmpWriteHi[i],
                   then: [
-                    If(
-                      we,
-                      then: [
-                        mtimecmp[i] <
-                            mtimecmp[i] &
-                                    (Const(0xFFFFFFFF00000000, width: 64)) |
-                                (datIn32.zeroExtend(64)),
-                      ],
-                      orElse: [datOut32 < mtimecmp[i].getRange(0, 32)],
-                    ),
+                    mtimecmp[i] <
+                        [
+                          mux(
+                            cmpWriteHi[i],
+                            wrData(0x4000 + i * 8 + 4),
+                            mtimecmp[i].getRange(32, 64),
+                          ),
+                          mux(
+                            cmpWriteLo[i],
+                            wrData(0x4000 + i * 8),
+                            mtimecmp[i].getRange(0, 32),
+                          ),
+                        ].swizzle(),
                   ],
                 ),
                 If(
-                  addr.eq(Const(0x4000 + i * 8 + 4, width: 16)),
+                  ~we,
                   then: [
                     If(
-                      we,
+                      addrHit(0x4000 + i * 8),
                       then: [
-                        mtimecmp[i] <
-                            mtimecmp[i] &
-                                    (Const(0x00000000FFFFFFFF, width: 64)) |
-                                (datIn32.zeroExtend(64) <<
-                                    Const(32, width: 64)),
+                        datOut[laneOf(0x4000 + i * 8)] <
+                            mtimecmp[i].getRange(0, 32),
                       ],
-                      orElse: [datOut32 < mtimecmp[i].getRange(32, 64)],
+                    ),
+                    If(
+                      addrHit(0x4000 + i * 8 + 4),
+                      then: [
+                        datOut[laneOf(0x4000 + i * 8 + 4)] <
+                            mtimecmp[i].getRange(32, 64),
+                      ],
                     ),
                   ],
                 ),
               ],
 
               If(
-                addr.eq(Const(0xBFF8, width: 16)),
-                then: [datOut32 < mtime.getRange(0, 32)],
+                addrHit(0xBFF8),
+                then: [datOut[laneOf(0xBFF8)] < mtime.getRange(0, 32)],
               ),
               If(
-                addr.eq(Const(0xBFFC, width: 16)),
-                then: [datOut32 < mtime.getRange(32, 64)],
+                addrHit(0xBFFC),
+                then: [datOut[laneOf(0xBFFC)] < mtime.getRange(32, 64)],
               ),
             ],
           ),
@@ -190,15 +239,23 @@ class HarborClint extends BridgeModule
   );
 
   @override
-  HarborAcpiDevice get acpiDevice => HarborAcpiDevice(
-    hid: 'PRP0001',
-    uid: 0,
-    memory: [BusAddressRange(baseAddress, 0x10000)],
-    properties: {
-      'compatible': ['riscv,clint0'],
-      'reg-names': 'control',
-    },
-  );
+  // The CLINT has NO ACPI representation, deliberately. Under ACPI the RISC-V
+  // timer is initialised from the RHCT table
+  // (`TIMER_ACPI_DECLARE(aclint_mtimer, ACPI_SIG_RHCT, riscv_timer_acpi_init)`,
+  // drivers/clocksource/timer-riscv.c) using `sbi_set_timer()` and the `time`
+  // CSR, and IPIs come from the SBI IPI extension. Linux never touches CLINT
+  // MMIO in that path, which is why there is no RSCV* _HID for it, unlike the
+  // PLIC (RSCV0001) and APLIC (RSCV0002).
+  //
+  // A PRP0001 device-tree shim would not work either: drivers/clocksource/
+  // timer-clint.c registers via `TIMER_OF_DECLARE(clint_timer, "riscv,clint0",
+  // ...)`, and TIMER_OF_DECLARE is matched only by timer_probe() walking a real
+  // device tree at early boot, never through the platform bus that PRP0001
+  // feeds. So the old PRP0001 entry could never bind to anything and was just a
+  // bogus namespace object.
+  //
+  // The device-tree description in [dtNode] is unaffected and still complete.
+  HarborAcpiDevice? get acpiDevice => null;
 
   @override
   HarborSvdPeripheral get svdPeripheral => HarborSvdPeripheral(

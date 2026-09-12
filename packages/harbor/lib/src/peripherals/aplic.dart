@@ -327,15 +327,15 @@ class HarborAplic extends BridgeModule
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(
-    hid: 'PRP0001',
+    // Same reasoning as the PLIC: ACPI matches a real _HID, not the PRP0001
+    // device-tree shim. Linux matches `RSCV0002`
+    // (drivers/irqchip/irq-riscv-aplic-main.c) and enumerates it with
+    // `acpi_get_devices("RSCV0002", ...)` in drivers/acpi/riscv/irq.c, taking
+    // gsi_base/id/nr_irqs from the MADT rather than from _DSD. The device-tree
+    // form is unaffected, see [dtNode] above.
+    hid: 'RSCV0002',
     uid: 0,
     memory: [BusAddressRange(baseAddress, 0x8000)],
-    properties: {
-      'compatible': ['riscv,aplic'],
-      'riscv,num-sources': sources,
-      'interrupt-controller': true,
-      '#interrupt-cells': 2,
-    },
   );
 
   @override

@@ -1723,6 +1723,278 @@ void main() {
     });
   });
 
+  // EP1 bulk OUT transfer framing.
+  //
+  // cmd_start must mark the start of a bulk TRANSFER, not the start of a
+  // packet. A command frame that is longer than wMaxPacketSize (64) arrives as
+  // more than one packet, and the transfer only ends on a packet that is
+  // shorter than 64 bytes (a zero-length packet when the length divides by 64).
+  // A consumer resets its command parse state on cmd_start, so a pulse on every
+  // packet chops the frame at each packet boundary: the bytes still arrive on
+  // cmd_data, but the consumer throws away everything before the last packet.
+  // This is the hardware failure that was seen on the sibling endpoint (writes
+  // broke the moment they were longer than one packet, with no error).
+  group('UsbEp0Engine EP1 bulk OUT framing (host model)', () {
+    test('a 3-packet command frame gives ONE cmd_start and every byte in '
+        'order, and a new command after a short packet pulses again', () async {
+      // The engine's EP1 wMaxPacketSize (UsbEp0Engine._maxPacket).
+      const maxPacket = 64;
+
+      final eng = UsbEp0Engine(name: 'ep1_eng', bulkEndpoints: true);
+      final htx = UsbPacketTx(name: 'bulk_host_ptx');
+      final hphyTx = HarborUsbFsPhyTx(name: 'bulk_host_phytx');
+      final hphyRx = HarborUsbFsPhyRx(name: 'bulk_host_phyrx');
+      final hrx = UsbPacketRx(name: 'bulk_host_prx', bufBytes: 80);
+
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset');
+      final hSend = Logic(name: 'h_send');
+      final hIsData = Logic(name: 'h_is_data');
+      final hPid = Logic(name: 'h_pid', width: 8);
+      final hPayLen = Logic(name: 'h_payload_len', width: 8);
+      final hPayByte = Logic(name: 'h_payload_byte', width: 8);
+      final hRdIndex = Logic(name: 'h_rd_index', width: 8);
+
+      htx.input('clk').srcConnection! <= clk;
+      htx.input('reset').srcConnection! <= reset;
+      htx.input('send').srcConnection! <= hSend;
+      htx.input('is_data').srcConnection! <= hIsData;
+      htx.input('pid').srcConnection! <= hPid;
+      htx.input('payload_len').srcConnection! <= hPayLen;
+      htx.input('payload_byte').srcConnection! <= hPayByte;
+
+      hphyTx.input('clk').srcConnection! <= clk;
+      hphyTx.input('reset').srcConnection! <= reset;
+      hphyTx.input('data').srcConnection! <= htx.output('tx_data');
+      hphyTx.input('data_valid').srcConnection! <= htx.output('tx_data_valid');
+      hphyTx.input('eop_req').srcConnection! <= htx.output('tx_eop_req');
+      htx.input('tx_ready').srcConnection! <= hphyTx.output('ready');
+      htx.input('tx_oe').srcConnection! <= hphyTx.output('oe');
+
+      eng.input('clk').srcConnection! <= clk;
+      eng.input('reset').srcConnection! <= reset;
+      eng.input('dp').srcConnection! <= hphyTx.output('dp_out');
+      eng.input('dm').srcConnection! <= hphyTx.output('dm_out');
+
+      // Command sink: always ready, so the OUT drain runs at one byte per
+      // cycle. No response is ever offered, so the engine NAKs any IN token
+      // and the OUT recovery cooldown never arms.
+      eng.input('cmd_ready').srcConnection! <= Const(1);
+      eng.input('resp_data').srcConnection! <= Const(0, width: 8);
+      eng.input('resp_valid').srcConnection! <= Const(0);
+      eng.input('resp_last').srcConnection! <= Const(0);
+
+      hphyRx.input('clk').srcConnection! <= clk;
+      hphyRx.input('reset').srcConnection! <= reset;
+      hphyRx.input('dp').srcConnection! <= eng.output('dp_out');
+      hphyRx.input('dm').srcConnection! <= eng.output('dm_out');
+
+      hrx.input('clk').srcConnection! <= clk;
+      hrx.input('reset').srcConnection! <= reset;
+      hrx.input('rx_data').srcConnection! <= hphyRx.output('data');
+      hrx.input('rx_valid').srcConnection! <= hphyRx.output('valid');
+      hrx.input('rx_sop').srcConnection! <= hphyRx.output('sop');
+      hrx.input('rx_eop').srcConnection! <= hphyRx.output('eop');
+      hrx.input('rd_index').srcConnection! <= hRdIndex;
+
+      await eng.build();
+      await htx.build();
+      await hphyTx.build();
+      await hphyRx.build();
+      await hrx.build();
+
+      reset.inject(1);
+      hSend.inject(0);
+      hIsData.inject(0);
+      hPid.inject(0);
+      hPayLen.inject(0);
+      hPayByte.inject(0);
+      hRdIndex.inject(0);
+      Simulator.setMaxSimTime(160000000);
+      unawaited(Simulator.run());
+
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      for (var i = 0; i < 20; i++) {
+        await clk.nextPosedge;
+      }
+
+      int engOut(String port) {
+        final v = eng.output(port).value;
+        return v.isValid ? v.toInt() : 0;
+      }
+
+      // Downstream consumer model. It appends every accepted cmd byte to the
+      // frame it is parsing and DROPS that frame on cmd_start, which is what a
+      // command engine does when it is told a new command has started. So the
+      // frame that is left at the end is what the consumer really sees.
+      final frame = <int>[];
+      var startPulses = 0;
+      var monitorOn = true;
+      unawaited(() async {
+        while (monitorOn) {
+          // Sample at the negedge: registered and combinational outputs are
+          // both settled in the middle of the cycle.
+          await clk.nextNegedge;
+          if (engOut('cmd_start') == 1) {
+            startPulses++;
+            frame.clear();
+          }
+          if (engOut('cmd_valid') == 1) {
+            frame.add(engOut('cmd_data'));
+          }
+        }
+      }());
+
+      // Current host send payload (served combinationally by payload_index).
+      List<int> curPayload = const [];
+      void serve() {
+        if (curPayload.isEmpty) return;
+        final i = htx.output('payload_index').value;
+        final idx = i.isValid ? i.toInt() : 0;
+        hPayByte.inject(idx < curPayload.length ? curPayload[idx] : 0);
+      }
+
+      Future<void> hostSend({
+        required int pid,
+        required bool isData,
+        List<int> payload = const [],
+      }) async {
+        curPayload = payload;
+        hIsData.inject(isData ? 1 : 0);
+        hPid.inject(pid);
+        hPayLen.inject(payload.length);
+        serve();
+        hSend.inject(1);
+        await clk.nextPosedge;
+        hSend.inject(0);
+        serve();
+        var guard = 0;
+        while (htx.output('busy').value.toInt() == 0 && guard < 50) {
+          guard++;
+          serve();
+          await clk.nextPosedge;
+        }
+        guard = 0;
+        while (htx.output('done').value.toInt() == 0 && guard < 8000) {
+          guard++;
+          serve();
+          await clk.nextPosedge;
+        }
+        for (var i = 0; i < 30; i++) {
+          await clk.nextPosedge;
+        }
+      }
+
+      // Wait for one device packet on the host RX and return its PID.
+      Future<int> hostExpectPid({int timeout = 8000}) async {
+        var guard = 0;
+        while (guard < timeout) {
+          guard++;
+          await clk.nextPosedge;
+          if (hrx.output('pkt_done').value.toInt() == 1) {
+            return hrx.output('pid').value.toInt();
+          }
+        }
+        return -1;
+      }
+
+      // Send one EP1 bulk OUT packet: the OUT token, then the DATA packet, then
+      // wait for the device ACK and let the drain finish.
+      //
+      // The token carries its 2 address/endpoint bytes, so it goes out through
+      // the DATA path of the host TX (the handshake path sends the PID only).
+      // Byte 0 is addr[6:0] | endp[0]<<7 = 0x80, which selects EP1. The engine
+      // does not check a token CRC, so the trailing CRC16 is harmless.
+      Future<int> ep1OutPacket(List<int> payload, {required bool data1}) async {
+        await hostSend(pid: pidOut, isData: true, payload: const [0x80, 0x00]);
+        await hostSend(
+          pid: data1 ? pidData1 : pidData0,
+          isData: true,
+          payload: payload,
+        );
+        final ack = await hostExpectPid();
+        // The drain runs at one byte per cycle once the ACK is sent.
+        for (var i = 0; i < payload.length + 40; i++) {
+          await clk.nextPosedge;
+        }
+        return ack;
+      }
+
+      try {
+        // ----------------------------------------------------------------
+        // Phase 1: one command frame of 144 bytes = 64 + 64 + 16. Three
+        // packets covers the first, a middle and the last packet of a
+        // transfer.
+        // ----------------------------------------------------------------
+        final cmd1 = [for (var i = 0; i < 144; i++) (i + 1) & 0xFF];
+        expect(
+          await ep1OutPacket(cmd1.sublist(0, maxPacket), data1: false),
+          equals(pidAck),
+          reason: 'packet 1 of 3 (full size) is ACKed',
+        );
+        expect(
+          await ep1OutPacket(
+            cmd1.sublist(maxPacket, 2 * maxPacket),
+            data1: true,
+          ),
+          equals(pidAck),
+          reason: 'packet 2 of 3 (full size) is ACKed',
+        );
+        expect(
+          await ep1OutPacket(cmd1.sublist(2 * maxPacket), data1: false),
+          equals(pidAck),
+          reason: 'packet 3 of 3 (short, ends the transfer) is ACKed',
+        );
+
+        expect(
+          frame,
+          equals(cmd1),
+          reason:
+              'the consumer sees the whole 144-byte command frame in order. '
+              'A pulse on each packet makes it drop everything before the '
+              'last packet, which is the silent data loss seen on hardware',
+        );
+        expect(
+          startPulses,
+          equals(1),
+          reason:
+              'cmd_start marks the start of a TRANSFER: the two packets that '
+              'follow a full-size packet continue the same command and must '
+              'not pulse',
+        );
+
+        // ----------------------------------------------------------------
+        // Phase 2: the transfer above ended on a short packet, so the next
+        // packet is a genuinely NEW command and must pulse cmd_start. This is
+        // the preempt path: a new command always wins over a stale response.
+        // ----------------------------------------------------------------
+        final cmd2 = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7];
+        expect(
+          await ep1OutPacket(cmd2, data1: true),
+          equals(pidAck),
+          reason: 'the new command packet is ACKed',
+        );
+        expect(
+          startPulses,
+          equals(2),
+          reason:
+              'a packet after a short packet starts a new command, so it '
+              'pulses cmd_start',
+        );
+        expect(
+          frame,
+          equals(cmd2),
+          reason: 'the new command replaces the frame before it',
+        );
+      } finally {
+        monitorOn = false;
+        await Simulator.endSimulation();
+      }
+    });
+  });
+
   // B4: UsbDfuRamSink: DMA the DFU firmware-byte sink stream into RAM over a
   // Wishbone MASTER bus, crossing 48 MHz USB -> 12 MHz bus via a CDC FIFO.
   group('UsbDfuRamSink (Wishbone master + CDC)', () {

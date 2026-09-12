@@ -43,6 +43,27 @@ class HarborBoard {
   /// `'clk'`).
   final String clockPortName;
 
+  /// Package balls that reach a global clock net with no clock buffer.
+  ///
+  /// A design that clocks logic from a pin must know if the ball is on a
+  /// dedicated clock route. A ball that is not on one needs a vendor clock
+  /// buffer between the pad and the logic (an ECP5 `DCCA`, a Xilinx `BUFG`,
+  /// an iCE40 `SB_GB`). Without the buffer the tool routes the clock through
+  /// general fabric, where the skew across the loads is large and the design
+  /// fails on hardware even though it passes in simulation.
+  ///
+  /// The entries are SITE names (package balls), NOT catalog signal names,
+  /// because clock capability belongs to the part and the package and not to
+  /// the role a board gives a ball. A design that moves a signal to another
+  /// ball is then still judged correctly. Use [siteIsClockCapable] to ask.
+  ///
+  /// The default is empty, which reads as "no ball is known to reach a clock
+  /// net". A design then puts a clock buffer on every pin it clocks from,
+  /// which is always correct and costs one global buffer. A board lists the
+  /// balls it has confirmed. A list can be incomplete: an absent ball only
+  /// gives a buffer that was not necessary.
+  final Set<String> clockCapableSites;
+
   const HarborBoard({
     required this.name,
     required this.vendor,
@@ -53,7 +74,18 @@ class HarborBoard {
     this.interfaces = const {},
     this.progCommand,
     this.clockPortName = 'clk',
+    this.clockCapableSites = const {},
   });
+
+  /// Whether [pin] is on a ball that reaches a global clock net with no clock
+  /// buffer, per [clockCapableSites].
+  ///
+  /// [pin] is a pin map VALUE, so both a bare ball (`"K1"`) and a full catalog
+  /// entry (`"K1 LVCMOS33 PULLMODE=UP"`) are accepted. Only the site token is
+  /// read. Give the value from the target the design really builds, so a pin
+  /// the build moved is judged on the ball it moved to.
+  bool siteIsClockCapable(String pin) =>
+      clockCapableSites.contains(pin.trim().split(RegExp(r'\s+')).first);
 
   /// Built-in board presets, keyed by [name].
   static const byName = <String, HarborBoard>{
@@ -149,10 +181,13 @@ const _ulx3s85f = HarborBoard(
 /// OrangeCrab r0.2 with the Lattice ECP5 LFE5U-25F (CSFBGA285), 48 MHz oscillator.
 ///
 /// Fully open toolchain (yosys + nextpnr-ecp5 + trellis). The catalog covers the
-/// oscillator, the DirtyJTAG CDC UART, and the config SPI flash (quad, clock via
-/// the ECP5 USRMCLK macro so there is no spi_clk pad). DDR3L sdram_* sites are
-/// added with their SSTL135 attributes when the DDR weight backend lands (the
-/// OrangeCrab DDR path is not yet hardware-proven). Loaded over DirtyJTAG.
+/// oscillator, the DirtyJTAG CDC UART, the config SPI flash (quad, clock via
+/// the ECP5 USRMCLK macro so there is no spi_clk pad), the USB device pads, the
+/// button, and the green LED. Sites come from the litex-boards
+/// `gsd_orangecrab` `_io_r0_2` table and are proven on hardware: a bitstream
+/// with these pins enumerates over USB. DDR3L sdram_* sites are added with
+/// their SSTL135 attributes when the DDR weight backend lands (the OrangeCrab
+/// DDR path is not yet hardware-proven). Loaded over DirtyJTAG.
 const _orangeCrab25f = HarborBoard(
   name: 'orangecrab-25f',
   vendor: HarborFpgaVendor.ecp5,
@@ -170,7 +205,61 @@ const _orangeCrab25f = HarborBoard(
     'spi_io[1]': 'T18 LVCMOS33',
     'spi_io[2]': 'R18 LVCMOS33',
     'spi_io[3]': 'N18 LVCMOS33',
+    // USB device port (the same USB-C socket that carries power). The FPGA
+    // drives the full-speed pads itself, there is no PHY chip. D+ and D- are
+    // bidirectional, so a design binds one top-level pad port to each and
+    // drives it with an output enable. usb_pullup enables the 1k5 pull-up on
+    // D+, which is how a full-speed device tells the host it is present: hold
+    // it low to stay disconnected, drive it high to enumerate.
+    'usb_dp': 'N1 LVCMOS33',
+    'usb_dm': 'M2 LVCMOS33',
+    'usb_pullup': 'N2 LVCMOS33',
+    // The user button. It is ACTIVE LOW (pressed reads 0), while the SoC top
+    // port `reset` is active high, so a design must invert this pin.
+    'rst_n': 'V17 LVCMOS33',
+    // Green channel of the RGB LED. It is ACTIVE LOW (drive 0 to light it).
+    // The red and blue channels are added when a bring-up needs them.
+    'led_g': 'M3 LVCMOS33',
+    // The microSD socket, 1-bit mode. Sites from the litex-boards
+    // `gsd_orangecrab` `_io_r0_2` table. CMD and DAT carry a pull-up, which
+    // is what an SD host and an SD card both expect on an idle line: the line
+    // reads high while nothing drives it, so a released line is not a start
+    // bit. The clock needs no pull-up, because the host always drives it.
+    //
+    // DAT1 to DAT3 are here although the 1-bit datapath reads none of them.
+    // An SD HOST holds its command inhibit while DAT[3:0] read busy, and a
+    // real card holds all four lines high through pull-ups. A ball with no
+    // constraint has no pull-up and floats, so a host can read a card that
+    // is permanently busy and send no command at all. A design that takes
+    // these three lines therefore needs only a top-level port for each one:
+    // the pad pull-up then holds the line high the way a card does. The
+    // 4-bit datapath reads the same three lines later.
+    //
+    // A constraint for a port the design has no pin for makes nextpnr reject
+    // the build, so a design that does not carry these ports must not ask
+    // for these pins.
+    //
+    // sd_clk takes a pull-down. The host drives the clock, so nothing holds
+    // the line when no host is connected. A floating input picks up noise,
+    // and every noise edge counts as a clock in DBG_SD_CLK, which makes that
+    // counter lie during bring-up. A pull-down gives a clean 0 instead.
+    //
+    // sd_clk is on K1, which is NOT a clock-capable ball (see
+    // [clockCapableSites]), so a design that clocks logic from it must put a
+    // DCCA between the pad and the logic.
+    'sd_clk': 'K1 LVCMOS33 PULLMODE=DOWN',
+    'sd_cmd': 'K2 LVCMOS33 PULLMODE=UP',
+    'sd_dat0': 'J1 LVCMOS33 PULLMODE=UP',
+    'sd_dat1': 'K3 LVCMOS33 PULLMODE=UP',
+    'sd_dat2': 'L3 LVCMOS33 PULLMODE=UP',
+    'sd_dat3': 'M1 LVCMOS33 PULLMODE=UP',
   },
+  // The 48 MHz oscillator ball is the one confirmed clock input of this
+  // board. Every other ball the catalog carries is a general I/O, so a clock
+  // taken from one of them needs a DCCA. The list is deliberately short: it
+  // states what is proven, and an absent ball only costs a clock buffer that
+  // was not necessary.
+  clockCapableSites: {'A9'},
   // DirtyJTAG speaks the OrangeCrab JTAG. openFPGALoader loads to SRAM.
   progCommand: 'openFPGALoader -c dirtyJtag \$(TOP).bit',
 );

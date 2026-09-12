@@ -7,6 +7,32 @@ class _MockAcpiDevice with HarborAcpiDeviceProvider {
   _MockAcpiDevice(this.acpiDevice);
 }
 
+/// A peripheral that is both an ACPI device and an interrupt controller, the
+/// shape the PLIC and the APLIC have.
+class _MockIntc with HarborAcpiDeviceProvider, HarborDeviceTreeNodeProvider {
+  @override
+  final HarborAcpiDevice acpiDevice;
+
+  @override
+  final HarborDeviceTreeNode dtNode;
+
+  _MockIntc(this.acpiDevice, this.dtNode);
+
+  factory _MockIntc.plic({int base = 0xC000000, int size = 0x4000000}) =>
+      _MockIntc(
+        HarborAcpiDevice(
+          hid: 'RSCV0001',
+          memory: [BusAddressRange(base, size)],
+        ),
+        HarborDeviceTreeNode(
+          compatible: const ['sifive,plic-1.0.0'],
+          reg: BusAddressRange(base, size),
+          interruptController: true,
+          interruptCells: 1,
+        ),
+      );
+}
+
 void main() {
   group('HarborAcpiGenerator', () {
     test('generates a DSDT with CPUs and peripherals', () {
@@ -174,6 +200,88 @@ void main() {
       expect(asl, contains('Name (_HID, "PRP0001")'));
       expect(asl, contains('"compatible"'));
       expect(asl, contains('"harbor,sram"'));
+    });
+  });
+
+  group('_GSB on the interrupt controller', () {
+    test('the RSCV0001 PLIC gets a _GSB that returns the GSI base', () {
+      final asl = HarborAcpiGenerator(
+        oemId: 'MDSTLL',
+        oemTableId: 'CREEKV1',
+        peripherals: [_MockIntc.plic()],
+      ).generate();
+
+      expect(asl, contains('Name (_HID, "RSCV0001")'));
+      expect(asl, contains('Method (_GSB, 0, NotSerialized)'));
+      expect(asl, contains('Return (0x0)'));
+    });
+
+    test('_GSB follows the GSI base and so do the device GSIs', () {
+      final uart = _MockAcpiDevice(
+        const HarborAcpiDevice(
+          hid: 'RSCV0003',
+          memory: [BusAddressRange(0x10000000, 0x1000)],
+        ),
+      );
+
+      final asl = HarborAcpiGenerator(
+        oemId: 'MDSTLL',
+        oemTableId: 'CREEKV1',
+        peripherals: [_MockIntc.plic(), uart],
+        interrupts: {
+          uart: const [1],
+        },
+        gsiBase: 0x20,
+      ).generate();
+
+      // One base moves both the controller's _GSB and the consumer's GSI, so
+      // the OS still reads source 1 back out of GSI 0x21.
+      expect(asl, contains('Return (0x20)'));
+      expect(asl, contains('0x21'));
+    });
+
+    test('a device that is not an interrupt controller gets no _GSB', () {
+      final uart = _MockAcpiDevice(
+        const HarborAcpiDevice(
+          hid: 'RSCV0003',
+          memory: [BusAddressRange(0x10000000, 0x1000)],
+          interrupts: [1],
+        ),
+      );
+
+      final asl = HarborAcpiGenerator(
+        oemId: 'MDSTLL',
+        oemTableId: 'CREEKV1',
+        peripherals: [uart],
+      ).generate();
+
+      expect(asl, isNot(contains('_GSB')));
+    });
+
+    test('the real PLIC peripheral emits a _GSB', () {
+      final plic = HarborPlic(baseAddress: 0xC000000, sources: 32, contexts: 2);
+      final asl = HarborAcpiGenerator(
+        oemId: 'MDSTLL',
+        oemTableId: 'CREEKV1',
+        peripherals: [plic],
+      ).generate();
+
+      expect(asl, contains('Name (_HID, "RSCV0001")'));
+      expect(asl, contains('Method (_GSB, 0, NotSerialized)'));
+      expect(asl, contains('Return (0x0)'));
+    });
+
+    test('the real APLIC peripheral emits a _GSB', () {
+      final aplic = HarborAplic(baseAddress: 0xC000000, sources: 32, harts: 1);
+      final asl = HarborAcpiGenerator(
+        oemId: 'MDSTLL',
+        oemTableId: 'CREEKV1',
+        peripherals: [aplic],
+      ).generate();
+
+      expect(asl, contains('Name (_HID, "RSCV0002")'));
+      expect(asl, contains('Method (_GSB, 0, NotSerialized)'));
+      expect(asl, contains('Return (0x0)'));
     });
   });
 }

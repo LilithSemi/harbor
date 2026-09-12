@@ -26,7 +26,7 @@ void main() {
     final cache = HarborL1ICache(
       config: const HarborL1iCacheConfig(size: 256, ways: 1, lineSize: 8),
       xlen: 64,
-      physAddrBits: 32,
+      reqAddrBits: 32,
     );
     cache.port('clk').getsLogic(clk);
     cache.port('reset').getsLogic(reset);
@@ -118,7 +118,7 @@ void main() {
     final cache = HarborL1DCache(
       config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
       xlen: 64,
-      physAddrBits: 32,
+      reqAddrBits: 32,
     );
     for (final (n, l) in [
       ('clk', clk),
@@ -268,7 +268,7 @@ void main() {
       final cache = HarborL1DCache(
         config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
         xlen: 64,
-        physAddrBits: 32,
+        reqAddrBits: 32,
         // DRAM base, anything below is MMIO/SRAM/flash and must bypass.
         cacheableBase: 0x80000000,
       );

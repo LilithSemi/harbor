@@ -20,6 +20,123 @@ void main() {
       expect(HarborBoard.get('ulx3s-85f').progCommand, isNotNull);
     });
 
+    test('the orangecrab-25f preset exposes the USB, button and LED pins', () {
+      final pins = HarborBoard.get('orangecrab-25f').pins;
+      expect(pins['usb_dp'], equals('N1 LVCMOS33'));
+      expect(pins['usb_dm'], equals('M2 LVCMOS33'));
+      expect(pins['usb_pullup'], equals('N2 LVCMOS33'));
+      expect(pins['rst_n'], equals('V17 LVCMOS33'));
+      expect(pins['led_g'], equals('M3 LVCMOS33'));
+    });
+
+    test('the orangecrab-25f clock is the 48 MHz oscillator on A9', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      expect(board.pins[board.clockPortName], startsWith('A9'));
+      expect(board.oscillatorHz, equals(48000000));
+      // A9 belongs to the clock entry only, no second pin repeats it.
+      final onA9 = board.pins.entries.where(
+        (e) => e.value.split(' ').first == 'A9',
+      );
+      expect(onA9.length, equals(1));
+    });
+
+    test('the orangecrab-25f preset carries the 1-bit microSD socket', () {
+      final pins = HarborBoard.get('orangecrab-25f').pins;
+      expect(pins['sd_clk'], equals('K1 LVCMOS33'));
+      expect(pins['sd_cmd'], equals('K2 LVCMOS33 PULLMODE=UP'));
+      expect(pins['sd_dat0'], equals('J1 LVCMOS33 PULLMODE=UP'));
+      // A 1-bit bus reads DAT0 alone, but all four data balls are here. An
+      // SD host holds its command inhibit while DAT[3:0] read busy, and a
+      // ball with no constraint has no pull-up and floats, so a design that
+      // leaves DAT1 to DAT3 out can look permanently busy to the host. A
+      // design that asks for these pins must carry a top-level port for
+      // each one, because a site for a port that does not exist makes the
+      // place-and-route tool reject the build.
+      expect(pins['sd_dat1'], equals('K3 LVCMOS33 PULLMODE=UP'));
+      expect(pins['sd_dat2'], equals('L3 LVCMOS33 PULLMODE=UP'));
+      expect(pins['sd_dat3'], equals('M1 LVCMOS33 PULLMODE=UP'));
+    });
+
+    test('the orangecrab SD clock ball is NOT clock capable', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      // K1 is a general I/O, so a design that clocks logic from sd_clk must
+      // put a clock buffer between the pad and the logic. The oscillator
+      // ball is the one this board states reaches a clock net.
+      expect(board.siteIsClockCapable(board.pins['sd_clk']!), isFalse);
+      expect(board.siteIsClockCapable(board.pins['clk']!), isTrue);
+      // A bare ball reads the same as a full catalog entry.
+      expect(board.siteIsClockCapable('A9'), isTrue);
+      expect(board.siteIsClockCapable('K1'), isFalse);
+    });
+
+    test('a board that states nothing has no clock-capable ball', () {
+      // The default is empty, so a design puts a clock buffer on every pin
+      // it clocks from. That is the safe direction: a buffer that was not
+      // necessary costs one global buffer, a missing one gives skew.
+      final board = HarborBoard.get('ulx3s-85f');
+      expect(board.clockCapableSites, isEmpty);
+      expect(board.siteIsClockCapable(board.pins['clk']!), isFalse);
+    });
+
+    test('the orangecrab SD pins reach the generated LPF', () {
+      final target = HarborBoard.get(
+        'orangecrab-25f',
+      ).fpgaTarget(pins: ['clk', 'sd_clk', 'sd_cmd', 'sd_dat0']);
+      final lpf = target.generateConstraints();
+      expect(lpf, contains('LOCATE COMP "sd_clk" SITE "K1";'));
+      expect(lpf, contains('LOCATE COMP "sd_cmd" SITE "K2";'));
+      expect(lpf, contains('LOCATE COMP "sd_dat0" SITE "J1";'));
+      // The pull-up attribute passes through to the LPF verbatim.
+      expect(
+        lpf,
+        contains('IOBUF PORT "sd_cmd" IO_TYPE=LVCMOS33 PULLMODE=UP;'),
+      );
+      expect(
+        lpf,
+        contains('IOBUF PORT "sd_dat0" IO_TYPE=LVCMOS33 PULLMODE=UP;'),
+      );
+    });
+
+    test('the orangecrab DAT1 to DAT3 balls carry a pull-up', () {
+      // An SD host holds its command inhibit while DAT[3:0] read busy. A
+      // real card holds all four lines high through pull-ups, so a ball
+      // with no constraint floats and the host can read a card that never
+      // becomes free. The three balls a 1-bit datapath does not read
+      // therefore still need the pull-up attribute.
+      final target = HarborBoard.get(
+        'orangecrab-25f',
+      ).fpgaTarget(pins: ['clk', 'sd_dat1', 'sd_dat2', 'sd_dat3']);
+      final lpf = target.generateConstraints();
+      expect(lpf, contains('LOCATE COMP "sd_dat1" SITE "K3";'));
+      expect(lpf, contains('LOCATE COMP "sd_dat2" SITE "L3";'));
+      expect(lpf, contains('LOCATE COMP "sd_dat3" SITE "M1";'));
+      expect(
+        lpf,
+        contains('IOBUF PORT "sd_dat1" IO_TYPE=LVCMOS33 PULLMODE=UP;'),
+      );
+      expect(
+        lpf,
+        contains('IOBUF PORT "sd_dat2" IO_TYPE=LVCMOS33 PULLMODE=UP;'),
+      );
+      expect(
+        lpf,
+        contains('IOBUF PORT "sd_dat3" IO_TYPE=LVCMOS33 PULLMODE=UP;'),
+      );
+      // The four data balls are four different sites.
+      final sites = ['J1', 'K3', 'L3', 'M1'];
+      expect(sites.toSet(), hasLength(4));
+    });
+
+    test('the orangecrab USB pins reach the generated LPF', () {
+      final target = HarborBoard.get(
+        'orangecrab-25f',
+      ).fpgaTarget(pins: ['clk', 'usb_dp', 'usb_dm', 'usb_pullup']);
+      final lpf = target.generateConstraints();
+      expect(lpf, contains('LOCATE COMP "usb_dp" SITE "N1";'));
+      expect(lpf, contains('LOCATE COMP "usb_dm" SITE "M2";'));
+      expect(lpf, contains('IOBUF PORT "usb_pullup" IO_TYPE=LVCMOS33;'));
+    });
+
     test('the ulx3s preset exposes the GPDI pins (LVCMOS33D)', () {
       final pins = HarborBoard.get('ulx3s-85f').pins;
       expect(pins['gpdi_dp[0]'], startsWith('A16'));

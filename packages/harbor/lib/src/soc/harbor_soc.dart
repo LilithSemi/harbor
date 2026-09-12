@@ -165,6 +165,31 @@ class HarborSoC extends BridgeModule {
   /// default first real source is 1.
   final int interruptBase;
 
+  /// The global system interrupt (GSI) that the interrupt controller's source
+  /// 0 answers to.
+  ///
+  /// [interruptAssignments] names a controller source. ACPI names a GSI. The
+  /// two spaces share an origin here: the GSI of a device is its source number
+  /// plus this base, and an OS gets the source back with
+  /// `source = gsi - gsiBase`. One SoC has one interrupt controller today and
+  /// it owns the numbers from the start of the space, so the default is 0.
+  ///
+  /// This is the only place the origin is stated. The ACPI generator adds it
+  /// to every `_CRS` interrupt and returns it from the controller's `_GSB`, so
+  /// a change moves the whole space at once. Firmware must put the same value
+  /// in the `GsiBase` field of the controller's MADT record: Linux matches the
+  /// MADT record to the namespace device by that pair, and a mismatch (or a
+  /// missing `_GSB`) stops the interrupt controller from probing at all.
+  final int interruptGsiBase;
+
+  /// The interrupt controller's contexts, in hardware context order.
+  ///
+  /// Entry N describes context N of the SoC's PLIC/APLIC: which hart claims
+  /// from it and which hart-local cause it drives. [generateDts] emits it as
+  /// `interrupts-extended`, and the SoC integrator wires `ext_irq_<N>` from the
+  /// same list, so the tables and the wires stay in step.
+  final List<HarborInterruptContext> interruptContexts;
+
   /// Add an active-low external reset input (`reset_n`) that ORs into the
   /// power-on reset. A board reset button can then restart the whole SoC (core
   /// to its reset vector, peripherals + DDR controller re-init) without a full
@@ -185,6 +210,8 @@ class HarborSoC extends BridgeModule {
     this.svdVendor = 'Lilith Semiconductor',
     this.svdVersion = '1.0',
     this.interruptBase = 1,
+    this.interruptGsiBase = 0,
+    this.interruptContexts = const [],
     this.externalReset = false,
     this.cpus = const [],
     this.target,
@@ -962,6 +989,7 @@ class HarborSoC extends BridgeModule {
         for (final p in providers)
           if (assign[p] != null) p: [assign[p]!],
       },
+      gsiBase: interruptGsiBase,
     ).generate();
   }
 
@@ -989,6 +1017,7 @@ class HarborSoC extends BridgeModule {
         for (final p in providers)
           if (assign[p] != null) p: [assign[p]!],
       },
+      interruptContexts: interruptContexts,
     ).generate();
   }
 
@@ -1262,6 +1291,15 @@ class HarborSoC extends BridgeModule {
             );
           }
 
+          // nextpnr --pre-place fragments. Two sources feed the ONE
+          // support/nextpnr/constraints.py file: the openXC7 DDR train-SERDES
+          // pins, and every peripheral that mixes in
+          // HarborNextpnrPreplaceProvider. The fragments are collected and
+          // joined, so a second contributor does not overwrite the first.
+          // Nothing is written when no source contributes, which leaves the
+          // Makefile --pre-place hook empty.
+          final preplacePy = <String>[];
+
           // openXC7 DDR3 nextpnr helper scripts. The DDR PHY's bitslip-
           // reference train SERDES must be pinned off the dead _SING tile;
           // these ride nextpnr-xilinx --pre-place (constraints.py) and
@@ -1270,10 +1308,8 @@ class HarborSoC extends BridgeModule {
           if (t.vendor == HarborFpgaVendor.openXc7) {
             final ddr = peripherals.whereType<HarborDdr3>().firstOrNull;
             if (ddr != null) {
+              preplacePy.add(t.generateDdrPreplacePy(lanes: ddr.lanes));
               Directory('$path/support/nextpnr').createSync(recursive: true);
-              File(
-                '$path/support/nextpnr/constraints.py',
-              ).writeAsStringSync(t.generateDdrPreplacePy(lanes: ddr.lanes));
               File(
                 '$path/support/nextpnr/show_bels.py',
               ).writeAsStringSync(t.generateDdrShowBelsPy());
@@ -1302,6 +1338,29 @@ class HarborSoC extends BridgeModule {
                 );
               }
             }
+          }
+
+          // Peripheral-contributed pins. The peripheral names its own cells;
+          // the part those cells must land on comes down in the context, so a
+          // provider can decline a family or a device it has no verified
+          // placement for.
+          final preplaceCtx = HarborNextpnrPreplaceContext(
+            vendor: t.vendor,
+            device: t.device,
+            package: t.package,
+          );
+          for (final p
+              in peripherals.whereType<HarborNextpnrPreplaceProvider>()) {
+            final fragment = p.nextpnrPreplacePy(preplaceCtx);
+            if (fragment == null || fragment.trim().isEmpty) continue;
+            preplacePy.add(fragment);
+          }
+
+          if (preplacePy.isNotEmpty) {
+            Directory('$path/support/nextpnr').createSync(recursive: true);
+            File(
+              '$path/support/nextpnr/constraints.py',
+            ).writeAsStringSync(preplacePy.join('\n'));
           }
         case HarborAsicTarget():
           File('$path/$name.sdc').writeAsStringSync(t.generateSdc());

@@ -32,7 +32,7 @@ void main() {
     final cache = HarborL1ICache(
       config: const HarborL1iCacheConfig(size: 256, ways: 1, lineSize: 8),
       xlen: 64,
-      physAddrBits: 32,
+      reqAddrBits: 32,
     );
     cache.port('clk').getsLogic(clk);
     cache.port('reset').getsLogic(reset);

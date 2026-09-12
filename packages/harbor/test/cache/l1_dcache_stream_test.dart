@@ -37,7 +37,7 @@ void main() {
     final cache = HarborL1DCache(
       config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
       xlen: 64,
-      physAddrBits: 32,
+      reqAddrBits: 32,
     );
     for (final (n, l) in [
       ('clk', clk),

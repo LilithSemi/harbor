@@ -940,8 +940,11 @@ class UsbEp0Engine extends BridgeModule {
       // resp_valid-low boundary, preserving single-word behaviour).
       createPort('resp_last', PortDirection.input);
       addOutput('resp_ready');
-      // cmd_start: a one-cycle pulse the instant a NEW bulk OUT DATA packet
-      // (a fresh command) is accepted. A downstream command engine that may be
+      // cmd_start: a one-cycle pulse the instant a NEW bulk OUT TRANSFER
+      // (a fresh command) is accepted. A transfer is one or more packets: it
+      // ends on a packet that is shorter than wMaxPacketSize, so a packet that
+      // follows a full-size packet continues the same command and gives NO
+      // pulse. A downstream command engine that may be
       // mid-RESPONSE (e.g. a multi-byte READ whose bytes the host only partially
       // drained before issuing a new command) MUST preempt that stale response
       // so it can accept the new command: otherwise the engine holds cmd_ready
@@ -999,24 +1002,6 @@ class UsbEp0Engine extends BridgeModule {
     // transmit, fire a spurious sop/pkt_done mid-TX and advance the control FSM
     // into the wrong state, after which the GET_DESCRIPTOR IN-DATA stage never
     // starts and the host reports "device descriptor read/64, error -32".
-    // Squelch source: tx_data_active, NOT oe. tx_data_active is high only while
-    // we drive encoded DATA (sending/stuffing) and DROPS at the start of our
-    // EOP (SE0/SE0/J), whereas oe stays high through the whole EOP. Both isolate
-    // the receiver from self-decoding our outgoing DATA (the part that could be
-    // mistaken for an incoming packet), so enumeration, which only needs the
-    // DATA-phase isolation, works with either. The difference matters for the
-    // OUT->IN turnaround the real host drives: after we transmit an EP1 IN DATA
-    // packet the host turns the bus around and ACKs within the minimum
-    // inter-packet gap. If the squelch were still asserted through our EOP (the
-    // oe choice) it would blank the LEADING edge of that tightly-following host
-    // ACK and our RX would never decode it, leaving the bulk-IN endpoint waiting
-    // for an ACK that (to us) never came. Every following IN then times out
-    // (the errno 32/110 first-read wedge on hardware). Releasing the squelch at
-    // EOP start (tx_data_active) lets the RX re-lock during our own EOP/J idle so
-    // it is ready for the host's ACK SYNC. The EOP is SE0/J and can never be
-    // mistaken for a SYNC, so un-squelching across it is safe. (The squelch-
-    // recovery seeds in HarborUsbFsPhyRx still hold the bit-recovery DLL / NRZI /
-    // framing at their idle values WHILE squelched, so the RX re-locks fresh.)
     phyRx.input('squelch').srcConnection! <= phyTx.output('tx_data_active');
 
     final pktRx = UsbPacketRx(name: 'ep0_pktrx', bufBytes: dfuTransferSize + 2);
@@ -1166,7 +1151,10 @@ class UsbEp0Engine extends BridgeModule {
     Logic? cmdValidReg;
     Logic? respReadyReg;
     Logic? cmdStartReg;
+    Logic? ep1XfrOpen;
+    Logic? ep1PktFull;
     Logic? ep1InAckWait;
+    Logic? ep1OutRecovery;
     Logic? cmdReady;
     Logic? respData;
     Logic? respValid;
@@ -1190,6 +1178,20 @@ class UsbEp0Engine extends BridgeModule {
       cmdValidReg = Logic(name: 'cmd_valid_reg');
       respReadyReg = Logic(name: 'resp_ready_reg');
       cmdStartReg = Logic(name: 'cmd_start_reg');
+      // Bulk OUT transfer boundary. A USB bulk TRANSFER that is longer than
+      // wMaxPacketSize arrives as more than one packet: full-size packets,
+      // then a packet that is shorter (a zero-length packet when the
+      // transfer length divides by the packet size). ep1XfrOpen holds the
+      // size class of the last accepted EP1 OUT packet, so it is high while
+      // a transfer stays open across a packet boundary. ep1PktFull is the
+      // size class of the packet that is in the pktRx buffer now: byte_count
+      // holds the payload bytes plus the 2 CRC16 bytes, so a full packet
+      // shows _maxPacket + 2. Together they make cmd_start mark the start of
+      // a transfer instead of the start of a packet.
+      ep1XfrOpen = Logic(name: 'ep1_xfr_open');
+      ep1PktFull = rxByteCount
+          .eq(Const(_maxPacket + 2, width: 8))
+          .named('ep1_pkt_full');
       // Bulk IN ACK-wait watchdog. After we transmit an EP1 IN DATA packet we
       // wait for the host ACK in _stEp1InWaitAck. If that ACK never arrives:
       // the host gave up on this IN, the ACK was lost, or (the silicon failure
@@ -1201,6 +1203,17 @@ class UsbEp0Engine extends BridgeModule {
       // WITHOUT flipping the IN toggle, so the host's re-IN resends the same
       // byte on the toggle it still expects.
       ep1InAckWait = Logic(name: 'ep1_in_ack_wait', width: 16);
+      // Recovery cooldown after an IN response: NAK EP1 OUT tokens for
+      // this many cycles after leaving _stEp1InWaitAck. The ACK-wait
+      // exit (ACK confirmed or non-ACK fallback) happens one cycle after
+      // the packet lands. If the host's next OUT token arrives within
+      // that window, the token decode can read a stale buffer or the
+      // FSM can miss the transition. A short cooldown forces the host
+      // to retry (the retry lands after the cooldown), which the bulk
+      // protocol handles transparently. 32 cycles = ~667 ns, well under
+      // the host's retry interval (the host retries after seeing the
+      // NAK handshake, which takes ~10 bit times).
+      ep1OutRecovery = Logic(name: 'ep1_out_recovery', width: 6);
       cmdReady = input('cmd_ready');
       respData = input('resp_data');
       respValid = input('resp_valid');
@@ -1509,7 +1522,11 @@ class UsbEp0Engine extends BridgeModule {
             cmdValidReg! < Const(0),
             respReadyReg! < Const(0),
             cmdStartReg! < Const(0),
+            // No transfer is open after a reset or a bus reset, so the first
+            // packet that follows starts a new command.
+            ep1XfrOpen! < Const(0),
             ep1InAckWait! < Const(0, width: 16),
+            ep1OutRecovery! < Const(0, width: 6),
             // EP1-IN packet assembler.
             ep1InCount! < Const(0, width: 8),
             for (final b in ep1InBuf) b < Const(0, width: 8),
@@ -1578,6 +1595,15 @@ class UsbEp0Engine extends BridgeModule {
                   // suspenders hold guarantees a correct token decode even if some
                   // path forgot to (the intermittent -71 routing bug).
                   if (bulkEndpoints) capIdx < Const(0, width: 8),
+                  // Decrement the OUT recovery cooldown (if armed).
+                  if (bulkEndpoints) ...[
+                    If(
+                      ~ep1OutRecovery!.eq(Const(0, width: 6)),
+                      then: [
+                        ep1OutRecovery < ep1OutRecovery! - Const(1, width: 6),
+                      ],
+                    ),
+                  ],
                   If(
                     rxDone,
                     then: [
@@ -1632,8 +1658,24 @@ class UsbEp0Engine extends BridgeModule {
                                   tokEndp0.eq(Const(1)) &
                                   tokAddrMatch,
                               then: [
-                                // Bulk OUT: await the DATA packet carrying the command.
-                                state < Const(_stEp1OutData, width: 5),
+                                If(
+                                  ~ep1OutRecovery!.eq(Const(0, width: 6)),
+                                  then: [
+                                    // Bulk OUT during the recovery cooldown
+                                    // after an IN response: NAK so the host
+                                    // retries after the cooldown expires. The
+                                    // retry lands with the FSM fully settled.
+                                    txSend < Const(1),
+                                    txIsData < Const(0),
+                                    txPid < Const(_pidNak, width: 8),
+                                    txLen < Const(0, width: 8),
+                                    state < Const(_stEp1Nak, width: 5),
+                                  ],
+                                  orElse: [
+                                    // Bulk OUT: await the DATA packet carrying the command.
+                                    state < Const(_stEp1OutData, width: 5),
+                                  ],
+                                ),
                               ],
                             ),
                           ],
@@ -2231,7 +2273,29 @@ class UsbEp0Engine extends BridgeModule {
                             // _stEp1OutDrain. Without this, a busy engine holds cmd_ready
                             // low forever and the drain deadlocks (the OUT-after-partial-
                             // read wedge).
-                            cmdStartReg! < Const(1),
+                            //
+                            // cmd_start marks the start of a bulk TRANSFER, not the
+                            // start of a packet. A command frame that is longer than
+                            // wMaxPacketSize arrives as more than one packet, and a
+                            // packet that comes after a full-size packet CONTINUES the
+                            // command that is open. A pulse on such a packet tells the
+                            // command engine to drop the parse state of the command it
+                            // is reading, which silently loses every byte after the
+                            // first packet.
+                            //
+                            // The preempt above stays intact: the FIRST packet of every
+                            // new command still pulses, because the last packet of the
+                            // command before it was short or zero-length, which clears
+                            // ep1XfrOpen. Only continuation packets are quiet, and there
+                            // the command in flight IS the one the engine is parsing, so
+                            // there is no stale response to drop and no deadlock.
+                            //
+                            // A host that ends a transfer whose length is an exact
+                            // multiple of wMaxPacketSize must send the terminating
+                            // zero-length packet, as USB requires. Without it the next
+                            // command looks like a continuation.
+                            cmdStartReg! < ~ep1XfrOpen!,
+                            ep1XfrOpen < ep1PktFull!,
                             state < Const(_stEp1OutAck, width: 5),
                           ],
                         ),
@@ -2255,16 +2319,33 @@ class UsbEp0Engine extends BridgeModule {
                   // buffer) into cmd_*, one byte per cmd_ready handshake. The ACK has
                   // already been sent, so any backpressure here only paces the cmd
                   // engine. It can never delay a handshake or wedge the endpoint.
+                  //
+                  // The byte and its valid are driven COMBINATIONALLY from the
+                  // current capIdx (see the output wiring below), mirroring the
+                  // resp_data pattern on the response side: the byte at capIdx is
+                  // presented for as long as the command engine has not consumed
+                  // it, and the indexes advance only on an actual consumption
+                  // (cmd_ready, with valid implied by the drain state itself).
+                  // The command engine dips cmd_ready for one cycle between its
+                  // header collect and its data stage (the DISPATCH state). The
+                  // previous design pulsed a REGISTERED valid one cycle after
+                  // each cmd_ready sample and advanced the index on the same
+                  // sample: a byte offered during a not-ready cycle was dropped
+                  // and the index skipped past it, so every WRITE command lost
+                  // a data byte and the command engine then waited forever for
+                  // a byte that never came (the write never reached the bus,
+                  // and the next OUT packet found the endpoint still draining:
+                  // no handshake, host halt, EPIPE). A held combinational offer
+                  // makes the handshake a real valid/ready contract: no byte is
+                  // lost, none is duplicated.
                   CaseItem(Const(_stEp1OutDrain, width: 5), [
-                    cmdDataReg! < rxByte,
                     If(
                       cmdReady!,
                       then: [
-                        cmdValidReg! < Const(1),
                         If(
                           (ep1OutIdx + Const(1, width: 8)).eq(ep1OutLen),
                           then: [
-                            // Last payload byte accepted -> back to idle.
+                            // Last payload byte consumed -> back to idle.
                             state < Const(_stIdle, width: 5),
                           ],
                           orElse: [
@@ -2353,13 +2434,28 @@ class UsbEp0Engine extends BridgeModule {
                           then: [
                             // ACK confirmed: flip the IN toggle for the next IN DATA.
                             ep1InToggle < ~ep1InToggle,
+                            ep1OutRecovery! < Const(32, width: 6),
                             state < Const(_stIdle, width: 5),
                           ],
                           orElse: [
-                            // Lost/garbled ACK, or a NEW token (the host's re-IN): return
-                            // to idle WITHOUT flipping the toggle, so a host re-IN resends
-                            // the same byte on the same toggle the host still expects
-                            // (Important #3). IDLE will re-decode that token next.
+                            // Not an ACK. This is almost always the host's ACK
+                            // itself arriving garbled (a bit-recovery slip at
+                            // the TX->RX turnaround: the ACK PID 0xD2 shifted
+                            // by one bit reads as the IN PID 0x69), or the
+                            // OUT token of the host's next command after a
+                            // turnaround miss. In both stories the host
+                            // received our data and its ACK is simply
+                            // invisible to us: assume the ACK happened, flip
+                            // the toggle so the data toggles stay in sync,
+                            // and drop to IDLE. Do NOT re-send the packet:
+                            // an unsolicited transmit right after the host
+                            // acknowledged is a babble the host will halt
+                            // the endpoint for. The token consumed here is
+                            // re-issued by the host (an OUT with no
+                            // handshake is retried), so the command flow
+                            // survives at the cost of one retry.
+                            ep1InToggle < ~ep1InToggle,
+                            ep1OutRecovery! < Const(32, width: 6),
                             state < Const(_stIdle, width: 5),
                           ],
                         ),
@@ -2414,8 +2510,18 @@ class UsbEp0Engine extends BridgeModule {
     output('dfu_state') <= dfuState;
 
     if (bulkEndpoints) {
-      output('cmd_data') <= cmdDataReg!;
-      output('cmd_valid') <= cmdValidReg!;
+      // cmd_data / cmd_valid: COMBINATIONAL during the EP1 OUT drain (the
+      // byte at the current capIdx, held until consumed), the idle registers
+      // (constant 0) otherwise. See the drain state comment for why the offer
+      // must be combinational and held.
+      output('cmd_data') <=
+          mux(state.eq(Const(_stEp1OutDrain, width: 5)), rxByte, cmdDataReg!);
+      output('cmd_valid') <=
+          mux(
+            state.eq(Const(_stEp1OutDrain, width: 5)),
+            Const(1),
+            cmdValidReg!,
+          );
       // resp_ready: the registered handshake strobe (used by the OUT-drain path)
       // OR a COMBINATIONAL accept while gathering an IN packet. The gather term
       // must be combinational so the cmd engine (which holds each resp_data byte

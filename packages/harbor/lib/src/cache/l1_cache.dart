@@ -61,11 +61,28 @@ class HarborL1ICache extends BridgeModule {
   /// bandwidth a single shared bus could not provide.
   final bool dualPort;
 
+  /// Width of the permission-context tag kept with each line. Zero disables it.
+  ///
+  /// The cache is in FRONT of the MMU: the pipeline presents a VIRTUAL address,
+  /// and only a MISS goes on to the MMU, which translates it and checks the PTE.
+  /// A HIT is decided by the tag and the valid bit alone, so no permission check
+  /// runs on it. A line that one privilege mode was allowed to fill therefore
+  /// stays usable by a mode the page table forbids.
+  ///
+  /// Each line records the context that filled it, and a hit must match the
+  /// context of the access. An access from a different context misses and goes
+  /// to the MMU, which checks the PTE and faults if the access is not allowed.
+  /// The core supplies the privilege mode here (see [reqCtx]).
+  final int ctxBits;
+
   /// Request port (from CPU fetch unit). The fetcher holds [reqAddr]/[reqValid]
   /// until [respValid]. A hit answers one cycle after the address is presented.
   Logic get reqAddr => input('req_addr');
   Logic get reqValid => input('req_valid');
   Logic get respData => output('resp_data');
+
+  /// Permission context of the current request. Present only when [ctxBits] > 0.
+  Logic get reqCtx => input('req_ctx');
 
   /// High for one cycle when the held request is served (hit). Doubles as the
   /// done handshake, the fetch unit re-reads until it sees this.
@@ -106,10 +123,11 @@ class HarborL1ICache extends BridgeModule {
     required this.config,
     this.xlen = 64,
     this.dualPort = false,
-    // Physical address bits the fetch stream can actually present. The tag store
-    // and compares are sized to this instead of [xlen], so a tiny cache over a
-    // <=32-bit memory map does not pay for a wide tag. Null = xlen.
-    int? physAddrBits,
+    this.ctxBits = 0,
+    // Significant low bits of [reqAddr]: the tag store and compares are sized to
+    // this instead of [xlen], so a cache over a narrow map does not pay for a
+    // full 64-bit tag. Null = xlen. See the note on tag width below.
+    int? reqAddrBits,
     // FPGA/ASIC target for the data block RAM. Null (simulation / std-cell) uses
     // the flop backend at the same forced read latency.
     HarborDeviceTarget? target,
@@ -120,11 +138,17 @@ class HarborL1ICache extends BridgeModule {
         'HarborL1ICache is direct-mapped (ways must be 1, got ${config.ways}).',
       );
     }
+    if (ctxBits < 0) {
+      throw ArgumentError('ctxBits must not be negative (got $ctxBits).');
+    }
 
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('req_addr', PortDirection.input, width: xlen);
     createPort('req_valid', PortDirection.input);
+    if (ctxBits > 0) {
+      createPort('req_ctx', PortDirection.input, width: ctxBits);
+    }
     createPort('flush', PortDirection.input);
     addOutput('resp_data', width: xlen);
     addOutput('resp_valid');
@@ -160,14 +184,46 @@ class HarborL1ICache extends BridgeModule {
     final idxBits = (numLines - 1).bitLength; // line index
     final byteBits = (wordBytes - 1).bitLength; // byte within a word
     final tagLo = byteBits + offBits + idxBits;
-    final reqPa = physAddrBits ?? xlen;
-    final paBits = reqPa > xlen ? xlen : reqPa;
-    final tagBits = paBits - tagLo;
+    // Tag width.
+    //
+    // This cache is in FRONT of the MMU, so it is virtually indexed AND
+    // virtually tagged: [reqAddr] is a VIRTUAL address whenever paging is on.
+    // The tag must therefore span every significant bit of the VIRTUAL address,
+    // not of the physical map. Sizing it from a physical width (32 bits on a
+    // 4 GB map) dropped VA[63:32] from the compare, and under Sv39 the
+    // supervisor half puts the linear map, vmalloc and kernel text at different
+    // VA[38:32] with overlapping low bits, so two different pages became ONE
+    // line and a load returned the other page's data.
+    //
+    // For a canonical Sv39 address VA[63:39] is a sign extension of VA[38], so
+    // comparing VA[38:tagLo] is EXACTLY equivalent to comparing all 64 bits, not
+    // an approximation: 39 is the minimum correct width, and the caller passes
+    // it. A non-canonical address is architecturally a fault and never reaches a
+    // resident line, because nothing can fill one for it.
+    //
+    // The bits cannot be folded or hashed down. The tag is the only evidence the
+    // cache has about which address a line holds, so any encoding that maps two
+    // addresses onto one tag produces a false HIT and serves the wrong data.
+    // Only a lossless width is correct.
+    final reqBits = reqAddrBits ?? xlen;
+    final addrBits = reqBits > xlen ? xlen : reqBits;
+    if (addrBits <= tagLo) {
+      throw ArgumentError(
+        'reqAddrBits ($reqBits) must exceed the index and offset bits '
+        '($tagLo), or a line has no tag at all.',
+      );
+    }
+    final tagBits = addrBits - tagLo;
+    // The stored tag is {context, address tag}, so a line is only hit from the
+    // context that filled it. See [ctxBits].
+    final lineTagBits = tagBits + ctxBits;
 
     Logic idxOf(Logic addr) => idxBits == 0
         ? Const(0, width: 1)
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits + offBits);
-    Logic tagOf(Logic addr) => addr.slice(paBits - 1, tagLo);
+    Logic tagOf(Logic addr) => addr.slice(addrBits - 1, tagLo);
+    Logic fullTagOf(Logic addr) =>
+        ctxBits == 0 ? tagOf(addr) : [reqCtx, tagOf(addr)].swizzle();
     // Combined {line, word} index into the flat data RAM.
     Logic dataEntryOf(Logic addr) => (offBits + idxBits) == 0
         ? Const(0, width: 1)
@@ -178,7 +234,7 @@ class HarborL1ICache extends BridgeModule {
     final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
     final lineTag = List.generate(
       numLines,
-      (i) => Logic(name: 'tag_$i', width: tagBits),
+      (i) => Logic(name: 'tag_$i', width: lineTagBits),
     );
 
     // Balanced mux tree (log2(numLines) deep) when the line count is a power of
@@ -239,7 +295,7 @@ class HarborL1ICache extends BridgeModule {
     // cycle after. Gates the hit off for that settling cycle.
     final fillSettle = Logic(name: 'fillSettle');
     final fillIdx = Logic(name: 'fillIdx', width: idxBits == 0 ? 1 : idxBits);
-    final fillTag = Logic(name: 'fillTag', width: tagBits);
+    final fillTag = Logic(name: 'fillTag', width: lineTagBits);
     final fillBase = Logic(name: 'fillBase', width: xlen);
     final fillWord = Logic(
       name: 'fillWord',
@@ -261,7 +317,8 @@ class HarborL1ICache extends BridgeModule {
     final blockHit = (filling | fillSettle).named('blockHit');
 
     Logic committedHit(Logic a) =>
-        muxLine(lineValid, idxOf(a)) & muxLine(lineTag, idxOf(a)).eq(tagOf(a));
+        muxLine(lineValid, idxOf(a)) &
+        muxLine(lineTag, idxOf(a)).eq(fullTagOf(a));
 
     final ans = (reqValid & reqAddr.eq(addrQ)).named('ans');
     final hit = (ans & committedHit(addrQ) & ~blockHit).named('hit');
@@ -348,7 +405,18 @@ class HarborL1ICache extends BridgeModule {
               // If a refill read is still outstanding to the MMU (filling, or
               // already draining a prior flush), keep draining until its stale
               // completion arrives, unless it completes this very cycle.
-              drain < (filling | drain) & ~(memDone & memValid),
+              //
+              // "Completes" is `memDone` ALONE, exactly like the release arm
+              // below and like HarborL1DCache. A page-faulting refill answers
+              // with mem_done high and mem_valid LOW, so the old
+              // `~(memDone & memValid)` treated a fault as "no completion yet".
+              // A fetch page fault that landed on the same cycle as a flush
+              // therefore armed a drain that was ALREADY satisfied, no second
+              // response ever came to release it, and the cache blocked every
+              // future fill: the core stopped fetching. Linux reaches this
+              // every time a demand-paging fetch fault meets the satp write of
+              // a context switch, an sfence.vma or a fence.i.
+              drain < (filling | drain) & ~memDone,
             ],
             orElse: [
               fillSettle < 0,
@@ -414,7 +482,7 @@ class HarborL1ICache extends BridgeModule {
                         then: [
                           filling < 1,
                           fillIdx < idxOf(fillAddr),
-                          fillTag < tagOf(fillAddr),
+                          fillTag < fullTagOf(fillAddr),
                           fillBase < fillLineBase,
                           fillWord < 0,
                           memEnR < 1,
@@ -466,7 +534,42 @@ class HarborL1DCache extends BridgeModule {
   /// whose reads need pacing.
   final int cacheableBase;
 
+  /// Bits of the address that translation does not change (log2 of the page
+  /// size). Sv32, Sv39 and Sv48 all use 4 KB base pages, so 12. The store
+  /// invalidate relies on the cache index being cut from these bits, because
+  /// they are identical in every virtual mapping of one physical frame.
+  static const int pageOffsetBits = 12;
+
+  /// Width of the permission-context tag kept with each line. Zero disables it.
+  ///
+  /// The cache is in FRONT of the MMU: the pipeline presents a VIRTUAL address,
+  /// and only a MISS goes on to the MMU, which translates it and checks the PTE.
+  /// A LOAD HIT is decided by the tag and the valid bit alone, so no permission
+  /// check runs on it. A line that one privilege mode was allowed to fill
+  /// therefore stays readable by a mode the page table forbids: user code read
+  /// a supervisor-only page out of the cache, and a supervisor load with
+  /// sstatus.SUM clear read a user page out of it.
+  ///
+  /// Each line records the context that filled it, and a load hit must match the
+  /// context of the access. An access from a different context misses and goes
+  /// to the MMU, which checks the PTE and faults if the access is not allowed.
+  /// The core supplies the privilege mode and the SUM bit here (see [reqCtx]).
+  ///
+  /// Stores are unaffected: they are write-through, so every store already
+  /// reaches the MMU and is checked. Store invalidation stays context-blind, so
+  /// a store never leaves another context holding stale data.
+  final int ctxBits;
+
   /// Request port (from the load/store unit). [reqWrite] selects store.
+  ///
+  /// There is no accept handshake. The cache answers with [respValid] or
+  /// [respFault] and gives no earlier signal, so the requester MUST hold
+  /// [reqValid], [reqAddr], [reqData] and [reqSize] steady until one of the two
+  /// arrives. A request that is withdrawn while the cache is busy with an
+  /// earlier op is simply not seen. The core's exec unit keeps its registered
+  /// request asserted until it samples done, which satisfies this, and it cannot
+  /// do otherwise because a store completes only through `storeDone`, which the
+  /// cache raises only after the write-through has gone to memory.
   Logic get reqAddr => input('req_addr');
   Logic get reqValid => input('req_valid');
   Logic get reqWrite => input('req_write');
@@ -474,9 +577,24 @@ class HarborL1DCache extends BridgeModule {
   Logic get reqSize => input('req_size');
   Logic get respData => output('resp_data');
 
+  /// Permission context of the current request. Present only when [ctxBits] > 0.
+  Logic get reqCtx => input('req_ctx');
+
   /// High for one cycle when the op completes: a load hit/fill-done, or a store
   /// once memory acknowledges the write.
   Logic get respValid => output('resp_valid');
+
+  /// High for one cycle when the memory response for this op was a FAULT
+  /// (`mem_done` with `mem_valid` low, which is how the MMU reports a page
+  /// fault). The core raises done AND not valid from it so the exec unit takes a
+  /// load/store page fault.
+  ///
+  /// Without this the fill and bypass FSMs only ever complete on
+  /// `mem_done & mem_valid`, so a faulting access left them asserted FOREVER and
+  /// the core hung on that instruction instead of trapping: a NULL pointer
+  /// dereference froze the machine rather than producing a kernel oops. The
+  /// I-cache has had the equivalent path; the D-cache never did.
+  Logic get respFault => output('resp_fault');
   Logic get miss => output('miss');
   Logic get busy => output('busy');
 
@@ -497,7 +615,9 @@ class HarborL1DCache extends BridgeModule {
     required this.config,
     this.xlen = 64,
     this.cacheableBase = 0x80000000,
-    int? physAddrBits,
+    this.ctxBits = 0,
+    // Significant low bits of [reqAddr]. See the note on tag width below.
+    int? reqAddrBits,
     HarborDeviceTarget? target,
     super.name = 'l1d',
   }) : super('HarborL1DCache') {
@@ -506,17 +626,24 @@ class HarborL1DCache extends BridgeModule {
         'HarborL1DCache is direct-mapped (ways must be 1, got ${config.ways}).',
       );
     }
+    if (ctxBits < 0) {
+      throw ArgumentError('ctxBits must not be negative (got $ctxBits).');
+    }
 
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('req_addr', PortDirection.input, width: xlen);
     createPort('req_valid', PortDirection.input);
+    if (ctxBits > 0) {
+      createPort('req_ctx', PortDirection.input, width: ctxBits);
+    }
     createPort('req_write', PortDirection.input);
     createPort('req_data', PortDirection.input, width: xlen);
     createPort('req_size', PortDirection.input, width: 3);
     createPort('flush', PortDirection.input);
     addOutput('resp_data', width: xlen);
     addOutput('resp_valid');
+    addOutput('resp_fault');
     addOutput('miss');
     addOutput('busy');
     // Word-granular memory port.
@@ -545,14 +672,67 @@ class HarborL1DCache extends BridgeModule {
     final idxBits = (numLines - 1).bitLength;
     final byteBits = (wordBytes - 1).bitLength;
     final tagLo = byteBits + offBits + idxBits;
-    final reqPa = physAddrBits ?? xlen;
-    final paBits = reqPa > xlen ? xlen : reqPa;
-    final tagBits = paBits - tagLo;
+    // Tag width.
+    //
+    // This cache is in FRONT of the MMU, so it is virtually indexed AND
+    // virtually tagged: [reqAddr] is a VIRTUAL address whenever paging is on.
+    // The tag must therefore span every significant bit of the VIRTUAL address,
+    // not of the physical map. Sizing it from a physical width (32 bits on a
+    // 4 GB map) dropped VA[63:32] from the compare, and under Sv39 the
+    // supervisor half puts the linear map, vmalloc and kernel text at different
+    // VA[38:32] with overlapping low bits, so two different pages became ONE
+    // line and a load returned the other page's data.
+    //
+    // For a canonical Sv39 address VA[63:39] is a sign extension of VA[38], so
+    // comparing VA[38:tagLo] is EXACTLY equivalent to comparing all 64 bits, not
+    // an approximation: 39 is the minimum correct width, and the caller passes
+    // it. A non-canonical address is architecturally a fault and never reaches a
+    // resident line, because nothing can fill one for it.
+    //
+    // The bits cannot be folded or hashed down. The tag is the only evidence the
+    // cache has about which address a line holds, so any encoding that maps two
+    // addresses onto one tag produces a false HIT and serves the wrong data.
+    // Only a lossless width is correct.
+    final reqBits = reqAddrBits ?? xlen;
+    final addrBits = reqBits > xlen ? xlen : reqBits;
+    if (addrBits <= tagLo) {
+      throw ArgumentError(
+        'reqAddrBits ($reqBits) must exceed the index and offset bits '
+        '($tagLo), or a line has no tag at all.',
+      );
+    }
+    // The index must come from bits BELOW the 4 KB page offset, so the cache
+    // size per way must not exceed one page.
+    //
+    // Two virtual addresses can name one physical word. The cache is virtually
+    // tagged, so it cannot see that, and a store through one of them must still
+    // drop the line the other one holds. It does that by index (see `storeInv`
+    // in the store arm), which only reaches every alias while the index bits
+    // are inside the page offset: those bits are the same in every mapping of
+    // one frame. Above a page per way the index moves into the translated part
+    // of the address, two aliases land on DIFFERENT lines, and a store can no
+    // longer find the other one. This is the classic alias-free condition for a
+    // virtually indexed cache.
+    if (tagLo > pageOffsetBits) {
+      throw ArgumentError(
+        'the cache is virtually indexed, so one way (${config.size ~/ config.ways} '
+        'bytes) must not exceed the ${1 << pageOffsetBits}-byte page: the index '
+        'takes bits [${tagLo - 1}:0] and anything above bit '
+        '${pageOffsetBits - 1} differs between two mappings of one frame, so a '
+        'store cannot invalidate its aliases.',
+      );
+    }
+    final tagBits = addrBits - tagLo;
+    // The stored tag is {context, address tag}, so a load is only hit from the
+    // context that filled the line. See [ctxBits].
+    final lineTagBits = tagBits + ctxBits;
 
     Logic idxOf(Logic addr) => idxBits == 0
         ? Const(0, width: 1)
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits + offBits);
-    Logic tagOf(Logic addr) => addr.slice(paBits - 1, tagLo);
+    Logic tagOf(Logic addr) => addr.slice(addrBits - 1, tagLo);
+    Logic fullTagOf(Logic addr) =>
+        ctxBits == 0 ? tagOf(addr) : [reqCtx, tagOf(addr)].swizzle();
     Logic dataEntryOf(Logic addr) => (offBits + idxBits) == 0
         ? Const(0, width: 1)
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits);
@@ -560,7 +740,7 @@ class HarborL1DCache extends BridgeModule {
     final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
     final lineTag = List.generate(
       numLines,
-      (i) => Logic(name: 'tag_$i', width: tagBits),
+      (i) => Logic(name: 'tag_$i', width: lineTagBits),
     );
 
     // Select arr[idx]. A balanced mux tree (log2(numLines) deep) when the line
@@ -589,8 +769,21 @@ class HarborL1DCache extends BridgeModule {
       return r;
     }
 
-    Logic committedHitOf(Logic a) =>
-        muxLine(lineValid, idxOf(a)) & muxLine(lineTag, idxOf(a)).eq(tagOf(a));
+    // Address-only residency: the line holds this address, whatever context
+    // filled it. Store invalidation uses this, so a write-through store always
+    // drops the resident copy even when another context owns it.
+    Logic addrHitOf(Logic a) =>
+        muxLine(lineValid, idxOf(a)) &
+        muxLine(lineTag, idxOf(a)).getRange(0, tagBits).eq(tagOf(a));
+    // Load residency: the address AND the permission context must match, so a
+    // load from another context misses and the MMU checks the page.
+    Logic committedHitOf(Logic a) => ctxBits == 0
+        ? addrHitOf(a)
+        : addrHitOf(a) &
+              muxLine(
+                lineTag,
+                idxOf(a),
+              ).getRange(tagBits, lineTagBits).eq(reqCtx);
 
     final dataRam = HarborRegisterFile(
       numEntries: numLines * lineWords,
@@ -617,6 +810,9 @@ class HarborL1DCache extends BridgeModule {
     // line (the creek Weir->Ferrite handoff corruption). Mirrors [HarborL1ICache].
     final drain = Logic(name: 'drain');
     final storing = Logic(name: 'storing');
+    // Single-cycle pulse, same shape as storeDone/bypassDone: the memory
+    // response for the in-flight op was a fault.
+    final faultDone = Logic(name: 'faultDone');
     final storeDone = Logic(name: 'storeDone');
     // Uncached-read pass-through (MMIO / SRAM / flash): a single memory read
     // whose data is returned directly, never written into the cache.
@@ -624,7 +820,7 @@ class HarborL1DCache extends BridgeModule {
     final bypassDone = Logic(name: 'bypassDone');
     final bypassData = Logic(name: 'bypassData', width: xlen);
     final fillIdx = Logic(name: 'fillIdx', width: idxBits == 0 ? 1 : idxBits);
-    final fillTag = Logic(name: 'fillTag', width: tagBits);
+    final fillTag = Logic(name: 'fillTag', width: lineTagBits);
     final fillBase = Logic(name: 'fillBase', width: xlen);
     final fillWord = Logic(
       name: 'fillWord',
@@ -641,7 +837,13 @@ class HarborL1DCache extends BridgeModule {
     // between transactions), the on-hardware hang the instant-memory unit test
     // could not surface.
     final blockHit =
-        (filling | fillSettle | storing | bypassing | storeDone | bypassDone)
+        (filling |
+                fillSettle |
+                storing |
+                bypassing |
+                storeDone |
+                bypassDone |
+                faultDone)
             .named('blockHit');
 
     // Only DRAM (>= cacheableBase) is cacheable, everything else bypasses.
@@ -657,6 +859,15 @@ class HarborL1DCache extends BridgeModule {
         .named('loadMiss');
     // Uncacheable load: pass straight through to memory, do not allocate.
     final loadBypass = (ansLoad & ~cacheableQ & ~blockHit).named('loadBypass');
+    // A store is taken from the COMBINATIONAL request, with no counterpart to
+    // the load's `reqAddr.eq(addrQ)` stability guard. That asymmetry is
+    // deliberate. A load needs the extra cycle because the data RAM read has one
+    // cycle of latency and the fill path works off `addrQ`, so the address has to
+    // be one cycle old for the RAM output to belong to it. A store reads nothing
+    // and only samples the request into `memAddrR`/`memWdataR`/`memSizeR` on the
+    // cycle it starts. The requester drives all of those from registers that
+    // change on the same edge as `req_write`, so the sampled cycle never carries
+    // a half-updated address or a stale data word.
     final storeReq = (reqValid & reqWrite).named('storeReq');
 
     final fillLineBase =
@@ -685,6 +896,7 @@ class HarborL1DCache extends BridgeModule {
         : [addrQ.slice(byteBits - 1, 0), Const(0, width: 3)].swizzle();
     respData <= mux(bypassDone, bypassData, dataRam.readData(0) >> rdShift);
     respValid <= (loadHit | storeDone | bypassDone);
+    respFault <= faultDone;
     miss <= loadMiss;
     busy <= (filling | storing | bypassing | drain);
 
@@ -715,11 +927,21 @@ class HarborL1DCache extends BridgeModule {
           storeDone < 0,
           bypassing < 0,
           bypassDone < 0,
+          faultDone < 0,
           memEnR < 0,
           memWeR < 0,
           drain < 0,
         ],
         orElse: [
+          // Whole-cache flush (fence.i, sfence.vma, a satp write): drop every
+          // line and abandon any op in flight.
+          //
+          // The abandoned refill matters most: its words belong to a line this
+          // flush has just dropped, and word 0 of the abandoned read would
+          // otherwise be captured as word 0 of the NEXT line (the creek Weir to
+          // Ferrite handoff corruption). The MMU still completes the read it
+          // launched, so drain that stale completion before a new op starts,
+          // unless it lands this very cycle.
           If(
             flush,
             then: [
@@ -730,22 +952,24 @@ class HarborL1DCache extends BridgeModule {
               storeDone < 0,
               bypassing < 0,
               bypassDone < 0,
+              faultDone < 0,
               memEnR < 0,
               memWeR < 0,
               // Any in-flight memory op (fill/store/bypass) was launched at the
-              // MMU and will still complete; drain that stale completion before a
-              // new op, unless it completes this very cycle.
+              // MMU and will still complete; drain that stale completion before
+              // a new op, unless it completes this very cycle.
               drain < (filling | storing | bypassing | drain) & ~memDone,
             ],
             orElse: [
               fillSettle < 0,
               storeDone < 0,
               bypassDone < 0,
+              faultDone < 0,
               If(
                 drain,
                 then: [
-                  // Waiting out the abandoned op; discard its completion (filling
-                  // is 0 so nothing is written) and release.
+                  // Waiting out the abandoned op; discard its completion
+                  // (filling is 0 so nothing is written) and release.
                   If(memDone, then: [drain < 0]),
                 ],
                 orElse: [
@@ -782,6 +1006,15 @@ class HarborL1DCache extends BridgeModule {
                           ),
                         ],
                       ),
+                      // done AND not valid: the MMU faulted this refill. End the
+                      // fill (never mark the line valid, the data is garbage) and
+                      // pulse faultDone so the core takes a load page fault.
+                      // Without this arm `filling` stays asserted forever and the
+                      // core hangs on the load instead of trapping.
+                      If(
+                        memDone & ~memValid,
+                        then: [memEnR < 0, filling < 0, faultDone < 1],
+                      ),
                     ],
                     orElse: [
                       If(
@@ -789,8 +1022,13 @@ class HarborL1DCache extends BridgeModule {
                         then: [
                           // Write-through in flight: wait for the memory ack, then drop
                           // the resident line if the store landed on it.
+                          //
+                          // Gated on memValid too. This used to complete on
+                          // memDone ALONE, so a FAULTING store reported success
+                          // and the store page fault was silently swallowed: the
+                          // core carried on as if the write had landed.
                           If(
-                            memDone,
+                            memDone & memValid,
                             then: [
                               memEnR < 0,
                               memWeR < 0,
@@ -803,6 +1041,17 @@ class HarborL1DCache extends BridgeModule {
                                   then: [lineValid[l] < 0],
                                 ),
                               ),
+                            ],
+                          ),
+                          // Faulting store: end it, leave the resident line
+                          // alone (nothing was written), and report the fault.
+                          If(
+                            memDone & ~memValid,
+                            then: [
+                              memEnR < 0,
+                              memWeR < 0,
+                              storing < 0,
+                              faultDone < 1,
                             ],
                           ),
                         ],
@@ -818,6 +1067,16 @@ class HarborL1DCache extends BridgeModule {
                                   bypassing < 0,
                                   bypassDone < 1,
                                   bypassData < memRdata,
+                                ],
+                              ),
+                              // Faulting uncached load: end it and report, else
+                              // `bypassing` stalls forever exactly like a fill.
+                              If(
+                                memDone & ~memValid,
+                                then: [
+                                  memEnR < 0,
+                                  bypassing < 0,
+                                  faultDone < 1,
                                 ],
                               ),
                             ],
@@ -837,9 +1096,42 @@ class HarborL1DCache extends BridgeModule {
                                   memWdataR < reqData,
                                   memSizeR < reqSize,
                                   storeIdx < idxOf(reqAddr),
-                                  storeInv <
-                                      (committedHitOf(reqAddr) &
-                                          cacheableOf(reqAddr)),
+                                  // ALWAYS drop the line at the stored index.
+                                  //
+                                  // This used to be
+                                  // `addrHitOf(reqAddr) & cacheableOf(reqAddr)`,
+                                  // which only dropped the line when the STORED
+                                  // virtual address matched the tag. The cache
+                                  // is virtually tagged, so a second virtual
+                                  // address for the same physical page has a
+                                  // DIFFERENT tag: the store left that line
+                                  // resident and a later load through it
+                                  // returned the value from before the store.
+                                  // RVWMO makes a hart see its own store to the
+                                  // same PHYSICAL address, so that was a memory
+                                  // model violation with no fence software is
+                                  // obliged to insert. Linux hits it through
+                                  // the linear map, vmemmap, vmalloc/vmap,
+                                  // kmap and DMA buffers, all of which name one
+                                  // frame by two virtual addresses.
+                                  //
+                                  // The index is safe to use for this because
+                                  // it is cut from bits BELOW the page offset
+                                  // (see the tagLo check in the constructor):
+                                  // every synonym of a physical word shares
+                                  // those bits, so every alias of the stored
+                                  // word is on this one line. The tag compare
+                                  // added nothing but the hole, so dropping it
+                                  // also removes a comparator from the store
+                                  // path.
+                                  //
+                                  // Uncacheable stores drop the line too. The
+                                  // cacheable test reads the VIRTUAL address,
+                                  // so one physical word can be cacheable
+                                  // through a high virtual address and
+                                  // uncacheable through a low one, and gating
+                                  // on it reopened the same hole.
+                                  storeInv < Const(1),
                                 ],
                                 orElse: [
                                   If(
@@ -859,7 +1151,7 @@ class HarborL1DCache extends BridgeModule {
                                             width: 3,
                                           ),
                                       fillIdx < idxOf(addrQ),
-                                      fillTag < tagOf(addrQ),
+                                      fillTag < fullTagOf(addrQ),
                                       fillBase < fillLineBase,
                                       fillWord < 0,
                                       memAddrR < fillLineBase,
@@ -871,7 +1163,15 @@ class HarborL1DCache extends BridgeModule {
                                           bypassing < 1,
                                           memEnR < 1,
                                           memWeR < 0,
-                                          memSizeR < Const(2, width: 3),
+                                          // Carry the REQUESTED size, as the
+                                          // store and fill paths do. A
+                                          // hardcoded 2 (4 bytes) told the bus
+                                          // that an 8-byte `ld` from an MMIO
+                                          // register, from boot SRAM or from
+                                          // flash wanted only 4 bytes, because
+                                          // the MMU makes the Wishbone SEL mask
+                                          // from this size.
+                                          memSizeR < reqSize,
                                           memAddrR < addrQ,
                                         ],
                                       ),

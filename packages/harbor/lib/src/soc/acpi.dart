@@ -1,5 +1,6 @@
 import '../bus/bus.dart';
 import 'cpu.dart';
+import 'device_tree.dart';
 
 class HarborAcpiDevice {
   /// ACPI Hardware ID
@@ -42,7 +43,21 @@ class HarborAcpiDevice {
 }
 
 mixin HarborAcpiDeviceProvider {
-  HarborAcpiDevice get acpiDevice;
+  /// The ACPI device node for this peripheral, or null when the peripheral has
+  /// NO valid ACPI representation and must be left out of the DSDT entirely.
+  ///
+  /// Null is the right answer when the firmware already describes the hardware
+  /// through a static ACPI table. The RISC-V CLINT is the example: the timer
+  /// comes from RHCT (`TIMER_ACPI_DECLARE(aclint_mtimer, ACPI_SIG_RHCT, ...)`
+  /// in drivers/clocksource/timer-riscv.c) and IPIs come from the SBI IPI
+  /// extension, so Linux never needs a CLINT namespace object. Emitting one as
+  /// a PRP0001 device-tree shim cannot help either, because the CLINT driver is
+  /// registered with `TIMER_OF_DECLARE`, which is matched only against a real
+  /// device tree and never through the platform bus.
+  ///
+  /// Returning null does not affect the device-tree output, which still
+  /// describes the peripheral in full.
+  HarborAcpiDevice? get acpiDevice;
 }
 
 class HarborAcpiGenerator {
@@ -66,17 +81,37 @@ class HarborAcpiGenerator {
   /// rather than being hardcoded per peripheral.
   final Map<HarborAcpiDeviceProvider, List<int>> interrupts;
 
+  /// The global system interrupt (GSI) that interrupt source 0 answers to.
+  ///
+  /// ACPI calls a system-wide interrupt number a GSI. An OS turns a GSI back
+  /// into a controller source with `source = gsi - gsiBase`, so this offset is
+  /// the origin of the whole ACPI interrupt number space. It is added to every
+  /// number in [interrupts] to make the GSI in a device's `_CRS`, and it is the
+  /// value the interrupt controller returns from `_GSB`. One field feeds both,
+  /// so the two cannot disagree.
+  ///
+  /// It must also equal the `GsiBase` field of the MADT record for the same
+  /// controller. Linux ties the MADT record to the namespace device by that
+  /// pair (`riscv_acpi_create_gsi_map` in drivers/acpi/riscv/irq.c). If they
+  /// differ, or if `_GSB` is absent, `riscv_acpi_get_gsi_info` fails and the
+  /// interrupt controller never probes.
+  ///
+  /// `HarborSoC.interruptGsiBase` supplies this value.
+  final int gsiBase;
+
   const HarborAcpiGenerator({
     required this.oemId,
     required this.oemTableId,
     this.cpus = const [],
     this.peripherals = const [],
     this.interrupts = const {},
+    this.gsiBase = 0,
   });
 
-  /// ACPI device nodes from the peripherals.
+  /// ACPI device nodes from the peripherals. Peripherals with no valid ACPI
+  /// representation return null and are omitted.
   List<HarborAcpiDevice> get devices =>
-      peripherals.map((p) => p.acpiDevice).toList();
+      peripherals.map((p) => p.acpiDevice).nonNulls.toList();
 
   /// Generates the DSDT ASL source as a string.
   ///
@@ -98,11 +133,21 @@ class HarborAcpiGenerator {
 
     if (cpus.isNotEmpty && peripherals.isNotEmpty) buf.writeln();
 
-    for (var i = 0; i < peripherals.length; i++) {
+    // Skip peripherals with no ACPI representation (see acpiDevice above).
+    final acpiProviders = peripherals
+        .where((p) => p.acpiDevice != null)
+        .toList();
+    for (var i = 0; i < acpiProviders.length; i++) {
       if (i > 0) buf.writeln();
-      final provider = peripherals[i];
-      final dev = provider.acpiDevice;
-      _writeDevice(buf, dev, i, interrupts[provider] ?? dev.interrupts);
+      final provider = acpiProviders[i];
+      final dev = provider.acpiDevice!;
+      _writeDevice(
+        buf,
+        dev,
+        i,
+        interrupts[provider] ?? dev.interrupts,
+        _isInterruptController(provider),
+      );
     }
 
     buf.writeln('    }');
@@ -129,11 +174,24 @@ class HarborAcpiGenerator {
     buf.writeln('        }');
   }
 
+  /// Whether [provider] is the interrupt controller and not a device that
+  /// sources interrupts.
+  ///
+  /// The answer comes from the device tree node's `interrupt-controller`, the
+  /// same flag `HarborSoC.interruptAssignments` uses to decide which
+  /// peripherals get no source number. A device therefore gets a `_GSB` if and
+  /// only if the allocator hands it no interrupt, so the two views of the same
+  /// topology cannot drift apart.
+  static bool _isInterruptController(HarborAcpiDeviceProvider provider) =>
+      provider is HarborDeviceTreeNodeProvider &&
+      (provider as HarborDeviceTreeNodeProvider).dtNode.interruptController;
+
   void _writeDevice(
     StringBuffer buf,
     HarborAcpiDevice dev,
     int index,
     List<int> irqs,
+    bool isController,
   ) {
     final name = _nameSeg('D', index);
     buf.writeln('        Device ($name)');
@@ -150,6 +208,16 @@ class HarborAcpiGenerator {
     buf.writeln('            Name (_UID, ${_hex(dev.uid)})');
     buf.writeln('            Name (_STA, 0x0F)');
 
+    // _GSB: the first global system interrupt this controller owns. Linux
+    // reads it to attach the controller's MADT record to this namespace
+    // device, and refuses to probe the controller without it.
+    if (isController) {
+      buf.writeln('            Method (_GSB, 0, NotSerialized)');
+      buf.writeln('            {');
+      buf.writeln('                Return (${_hex(gsiBase)})');
+      buf.writeln('            }');
+    }
+
     if (dev.memory.isNotEmpty || irqs.isNotEmpty) {
       buf.writeln('            Name (_CRS, ResourceTemplate ()');
       buf.writeln('            {');
@@ -157,7 +225,9 @@ class HarborAcpiGenerator {
         _writeMemory(buf, region);
       }
       if (irqs.isNotEmpty) {
-        final irqList = irqs.map(_hex).join(', ');
+        // The allocator gives a source number. The GSI is that number offset
+        // by the controller's base, the same base _GSB reports.
+        final irqList = irqs.map((n) => _hex(gsiBase + n)).join(', ');
         buf.writeln(
           '                Interrupt (ResourceConsumer, Level, ActiveHigh, '
           'Exclusive)',
