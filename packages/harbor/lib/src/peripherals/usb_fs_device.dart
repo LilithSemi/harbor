@@ -25,17 +25,11 @@ import 'usb_fs_pe.dart';
 
 /// Vendor full-speed USB device on the ported tinyfpga engine.
 class HarborUsbFsDevice extends BridgeModule {
-  /// Cycles a command may wait in the EP1 OUT buffer before `cmd_start`
-  /// goes out anyway and preempts the answer in front of it.
-  ///
-  /// The wait is normal: a command that arrives while an answer is still
-  /// going out waits for that answer. The bound is for the host that
-  /// walked away from an answer it asked for, because the engine then
-  /// takes no more bytes and the command would wait for ever. It is far
-  /// above any true answer, which takes microseconds, and low enough that
-  /// a dead host does not keep the device quiet. At 48 MHz it is about
-  /// 87 ms.
-  static const int _ep1StartStallMax = 4194303;
+  /// Width of the counter behind [ep1StartStallCycles].
+  static const int _ep1StallBits = 22;
+
+  /// The largest bound the counter can hold.
+  static const int ep1StartStallMax = (1 << _ep1StallBits) - 1;
 
   /// The vendor descriptor set served on endpoint 0.
   final List<UsbDescriptorEntry> descriptors;
@@ -46,12 +40,40 @@ class HarborUsbFsDevice extends BridgeModule {
   /// Maximum packet payload per endpoint, in bytes.
   final int maxPacketSize;
 
+  /// Cycles a command may wait in the EP1 OUT buffer before `cmd_start`
+  /// goes out anyway and preempts the answer in front of it.
+  ///
+  /// The wait itself is normal: a command that arrives while an answer is
+  /// still going out waits for that answer, which is what lets a host put
+  /// a command and the answer to the command before it on the queue
+  /// together. The bound is for the host that walks away from an answer it
+  /// asked for. Such an engine takes no more bytes, so the command would
+  /// wait for ever.
+  ///
+  /// The default is far above any true answer and low enough that a dead
+  /// host does not keep the device quiet: at 48 MHz it is about 87 ms,
+  /// against an answer that drains in milliseconds.
+  ///
+  /// A SIMULATION cannot run millions of cycles, so a bench that wants to
+  /// reach the bound sets a small value here. Do NOT make it small in
+  /// hardware: a bound below the time an answer takes to drain fires
+  /// during a healthy read and kills the answer it was meant to protect.
+  final int ep1StartStallCycles;
+
   HarborUsbFsDevice({
     required this.descriptors,
     this.bulkEndpoints = true,
     this.maxPacketSize = 32,
+    this.ep1StartStallCycles = ep1StartStallMax,
     String? name,
   }) : super('HarborUsbFsDevice', name: name ?? 'usb_fs_device') {
+    if (ep1StartStallCycles < 1 || ep1StartStallCycles > ep1StartStallMax) {
+      throw ArgumentError.value(
+        ep1StartStallCycles,
+        'ep1StartStallCycles',
+        'must be between 1 and $ep1StartStallMax',
+      );
+    }
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('dp', PortDirection.input);
@@ -625,9 +647,12 @@ class HarborUsbFsDevice extends BridgeModule {
       // has waited that long the pulse goes out anyway and the stale
       // answer is preempted, which is what this endpoint did before.
       final ep1PendingStart = Logic(name: 'ep1_pending_start_q');
-      final ep1StartStall = Logic(name: 'ep1_start_stall_q', width: 22);
+      final ep1StartStall = Logic(
+        name: 'ep1_start_stall_q',
+        width: _ep1StallBits,
+      );
       final ep1StallFull = ep1StartStall
-          .eq(Const(_ep1StartStallMax, width: 22))
+          .eq(Const(ep1StartStallCycles, width: _ep1StallBits))
           .named('ep1_stall_full');
       final cmdStart =
           (((ep1Offer & cmdReady) | ep1StallFull) & ep1PendingStart).named(
@@ -653,7 +678,7 @@ class HarborUsbFsDevice extends BridgeModule {
           then: [
             ep1XfrOpen < Const(0),
             ep1PendingStart < Const(0),
-            ep1StartStall < Const(0, width: 22),
+            ep1StartStall < Const(0, width: _ep1StallBits),
           ],
           orElse: [
             If(ep1Acked, then: [ep1XfrOpen < ep1PktFull]),
@@ -669,10 +694,13 @@ class HarborUsbFsDevice extends BridgeModule {
               then: [
                 If(
                   ~ep1StallFull,
-                  then: [ep1StartStall < ep1StartStall + Const(1, width: 22)],
+                  then: [
+                    ep1StartStall <
+                        ep1StartStall + Const(1, width: _ep1StallBits),
+                  ],
                 ),
               ],
-              orElse: [ep1StartStall < Const(0, width: 22)],
+              orElse: [ep1StartStall < Const(0, width: _ep1StallBits)],
             ),
           ],
         ),
