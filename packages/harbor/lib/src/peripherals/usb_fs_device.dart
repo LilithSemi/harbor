@@ -25,6 +25,18 @@ import 'usb_fs_pe.dart';
 
 /// Vendor full-speed USB device on the ported tinyfpga engine.
 class HarborUsbFsDevice extends BridgeModule {
+  /// Cycles a command may wait in the EP1 OUT buffer before `cmd_start`
+  /// goes out anyway and preempts the answer in front of it.
+  ///
+  /// The wait is normal: a command that arrives while an answer is still
+  /// going out waits for that answer. The bound is for the host that
+  /// walked away from an answer it asked for, because the engine then
+  /// takes no more bytes and the command would wait for ever. It is far
+  /// above any true answer, which takes microseconds, and low enough that
+  /// a dead host does not keep the device quiet. At 48 MHz it is about
+  /// 87 ms.
+  static const int _ep1StartStallMax = 4194303;
+
   /// The vendor descriptor set served on endpoint 0.
   final List<UsbDescriptorEntry> descriptors;
 
@@ -556,8 +568,14 @@ class HarborUsbFsDevice extends BridgeModule {
           orElse: [ep1DataValid < (ep1Avail & ep1Granted)],
         ),
       ]);
-      cmdValid <= ep1DataValid & ep1Gap.eq(Const(0, width: 2));
-      output('cmd_valid') <= cmdValid;
+      // The raw offer: a byte is sitting in the endpoint and the read
+      // delay has passed. cmd_valid is this, minus the cycle the
+      // cmd_start pulse takes for itself. The pulse is built from the
+      // RAW offer and not from cmd_valid, because cmd_valid is built
+      // from the pulse and the two would otherwise chase each other.
+      final ep1Offer = (ep1DataValid & ep1Gap.eq(Const(0, width: 2))).named(
+        'ep1_offer',
+      );
       output('cmd_data') <= ep1Data;
 
       // cmd_start marks the start of a bulk TRANSFER, not the start of a
@@ -584,18 +602,82 @@ class HarborUsbFsDevice extends BridgeModule {
           .slice(1, 1)
           .named('ep1_pkt_full');
       final ep1XfrOpen = Logic(name: 'ep1_xfr_open_q');
+
+      // The pulse comes when the engine TAKES the first byte of the new
+      // transfer, not when the packet that carries it was acknowledged.
+      //
+      // It used to come at the acknowledge. A command that arrived while
+      // the engine was still emitting an answer then preempted that
+      // answer, which died half sent, and the host waited for bytes that
+      // never came. That is what stopped a host from putting a command and
+      // the answer to the command in front of it on the queue together.
+      //
+      // Held to the first accepted byte, the command WAITS in the endpoint
+      // buffer, because the drain runs at cmd_ready and the engine holds
+      // cmd_ready low while it emits. A full buffer makes the endpoint
+      // busy, so the protocol engine NAKs any further OUT by itself and
+      // the host retries. The answer finishes, the engine takes the first
+      // byte, and the command that waited is parsed then.
+      //
+      // The escape below keeps the old behaviour for a host that walks
+      // away from an answer it asked for. Such an engine never takes
+      // another byte, so the command would wait for ever. When a command
+      // has waited that long the pulse goes out anyway and the stale
+      // answer is preempted, which is what this endpoint did before.
+      final ep1PendingStart = Logic(name: 'ep1_pending_start_q');
+      final ep1StartStall = Logic(name: 'ep1_start_stall_q', width: 22);
+      final ep1StallFull = ep1StartStall
+          .eq(Const(_ep1StartStallMax, width: 22))
+          .named('ep1_stall_full');
+      final cmdStart =
+          (((ep1Offer & cmdReady) | ep1StallFull) & ep1PendingStart).named(
+            'cmd_start_pulse',
+          );
+      output('cmd_start') <= cmdStart;
+
+      // The pulse takes the cycle to itself and the byte is NOT offered on
+      // it. The engine treats cmd_start as a preempt and drops what it
+      // holds, so a byte offered on that cycle would be taken and thrown
+      // away. Held back one cycle, cmd_start reaches the engine alone, the
+      // engine goes back to the start of a command, and the byte is
+      // offered to it on the cycle after. This is the order the engine has
+      // always seen: the pulse comes BEFORE the first byte of a command.
+      cmdValid <= ep1Offer & ~cmdStart;
+      output('cmd_valid') <= cmdValid;
+
+      final accept = (cmdValid & cmdReady).named('cmd_accept');
+
       Sequential(clk, [
         If(
           combinedReset,
-          then: [ep1XfrOpen < Const(0)],
+          then: [
+            ep1XfrOpen < Const(0),
+            ep1PendingStart < Const(0),
+            ep1StartStall < Const(0, width: 22),
+          ],
           orElse: [
             If(ep1Acked, then: [ep1XfrOpen < ep1PktFull]),
+            // A packet that starts a new transfer arms the pulse. The arm
+            // survives until the engine takes a byte, however long the
+            // answer in front of it runs.
+            If(ep1Acked & ~ep1XfrOpen, then: [ep1PendingStart < Const(1)]),
+            If(cmdStart, then: [ep1PendingStart < Const(0)]),
+            // The stall counts only while a command is armed and waiting.
+            // It starts again the moment the pulse goes out.
+            If(
+              ep1PendingStart & ~cmdStart,
+              then: [
+                If(
+                  ~ep1StallFull,
+                  then: [ep1StartStall < ep1StartStall + Const(1, width: 22)],
+                ),
+              ],
+              orElse: [ep1StartStall < Const(0, width: 22)],
+            ),
           ],
         ),
       ]);
-      output('cmd_start') <= ep1Acked & ~ep1XfrOpen;
 
-      final accept = (cmdValid & cmdReady).named('cmd_accept');
       Sequential(clk, [
         If(
           combinedReset,
