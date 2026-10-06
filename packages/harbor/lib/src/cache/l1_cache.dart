@@ -119,6 +119,10 @@ class HarborL1ICache extends BridgeModule {
   /// of the cache hanging on a fill that can never complete.
   Logic get respFault => output('resp_fault');
 
+  /// Physical instruction access fault from the refill memory path. Held for
+  /// the faulting request until fetch redirects, like [respFault].
+  Logic get respAccessFault => output('resp_access_fault');
+
   HarborL1ICache({
     required this.config,
     this.xlen = 64,
@@ -153,6 +157,7 @@ class HarborL1ICache extends BridgeModule {
     addOutput('resp_data', width: xlen);
     addOutput('resp_valid');
     addOutput('resp_fault');
+    addOutput('resp_access_fault');
     addOutput('miss');
     if (dualPort) {
       createPort('req_addr1', PortDirection.input, width: xlen);
@@ -302,11 +307,13 @@ class HarborL1ICache extends BridgeModule {
       width: (offBits == 0 ? 1 : offBits) + 1,
     );
 
-    // Fetch-fault latch: set when a refill returns a page fault (mem_fault), held
-    // until the requesting fetch retargets (the pipeline trapped and redirected).
+    // Fetch-fault latch: set when a refill fails, with mem_fault preserving
+    // whether it was a page fault or a physical access fault. Held until the
+    // requesting fetch retargets (the pipeline trapped and redirected).
     // While set for [faultAddr] it suppresses a fresh fill of that same line, so
     // the miss does not loop fill -> fault -> fill.
     final faultResp = Logic(name: 'faultResp');
+    final faultIsPage = Logic(name: 'faultIsPage');
     final faultAddr = Logic(name: 'faultAddr', width: xlen);
 
     // One-cycle-delayed copy of the request address: the block-RAM read launched
@@ -357,7 +364,8 @@ class HarborL1ICache extends BridgeModule {
     // respFault) with valid low, so the FetchUnit raises the instruction page
     // fault instead of retrying. Gated to the held request so a stale latch never
     // faults an unrelated fetch.
-    respFault <= faultHeld;
+    respFault <= faultHeld & faultIsPage;
+    respAccessFault <= faultHeld & ~faultIsPage;
     miss <= miss0;
     if (dualPort) {
       respData1 <= dataRam.readData(1);
@@ -392,6 +400,7 @@ class HarborL1ICache extends BridgeModule {
           memEnR < 0,
           drain < 0,
           faultResp < 0,
+          faultIsPage < 0,
         ],
         orElse: [
           If(
@@ -471,7 +480,12 @@ class HarborL1ICache extends BridgeModule {
                         orElse: [
                           If(
                             memDone,
-                            then: [memEnR < 0, filling < 0, faultResp < 1],
+                            then: [
+                              memEnR < 0,
+                              filling < 0,
+                              faultResp < 1,
+                              faultIsPage < memFault,
+                            ],
                           ),
                         ],
                       ),
@@ -605,6 +619,10 @@ class HarborL1DCache extends BridgeModule {
   /// dereference froze the machine rather than producing a kernel oops. The
   /// I-cache has had the equivalent path; the D-cache never did.
   Logic get respFault => output('resp_fault');
+
+  /// High for one cycle when the failed memory response was a physical access
+  /// fault rather than a translation/page fault.
+  Logic get respAccessFault => output('resp_access_fault');
   Logic get miss => output('miss');
   Logic get busy => output('busy');
 
@@ -620,6 +638,10 @@ class HarborL1DCache extends BridgeModule {
   Logic get memDone => input('mem_done');
   Logic get memValid => input('mem_valid');
   Logic get memRdata => input('mem_rdata');
+
+  /// Distinguishes a page fault from a physical access fault when [memDone] is
+  /// high and [memValid] is low.
+  Logic get memFault => input('mem_fault');
 
   HarborL1DCache({
     required this.config,
@@ -654,6 +676,7 @@ class HarborL1DCache extends BridgeModule {
     addOutput('resp_data', width: xlen);
     addOutput('resp_valid');
     addOutput('resp_fault');
+    addOutput('resp_access_fault');
     addOutput('miss');
     addOutput('busy');
     // Word-granular memory port.
@@ -665,6 +688,7 @@ class HarborL1DCache extends BridgeModule {
     createPort('mem_done', PortDirection.input);
     createPort('mem_valid', PortDirection.input);
     createPort('mem_rdata', PortDirection.input, width: xlen);
+    createPort('mem_fault', PortDirection.input);
 
     final clk = input('clk');
     final reset = input('reset');
@@ -823,6 +847,7 @@ class HarborL1DCache extends BridgeModule {
     // Single-cycle pulse, same shape as storeDone/bypassDone: the memory
     // response for the in-flight op was a fault.
     final faultDone = Logic(name: 'faultDone');
+    final faultIsPage = Logic(name: 'faultIsPage');
     final storeDone = Logic(name: 'storeDone');
     // Uncached-read pass-through (MMIO / SRAM / flash): a single memory read
     // whose data is returned directly, never written into the cache.
@@ -906,7 +931,8 @@ class HarborL1DCache extends BridgeModule {
         : [addrQ.slice(byteBits - 1, 0), Const(0, width: 3)].swizzle();
     respData <= mux(bypassDone, bypassData, dataRam.readData(0) >> rdShift);
     respValid <= (loadHit | storeDone | bypassDone);
-    respFault <= faultDone;
+    respFault <= faultDone & faultIsPage;
+    respAccessFault <= faultDone & ~faultIsPage;
     miss <= loadMiss;
     busy <= (filling | storing | bypassing | drain);
 
@@ -938,6 +964,7 @@ class HarborL1DCache extends BridgeModule {
           bypassing < 0,
           bypassDone < 0,
           faultDone < 0,
+          faultIsPage < 0,
           memEnR < 0,
           memWeR < 0,
           drain < 0,
@@ -1023,7 +1050,12 @@ class HarborL1DCache extends BridgeModule {
                       // core hangs on the load instead of trapping.
                       If(
                         memDone & ~memValid,
-                        then: [memEnR < 0, filling < 0, faultDone < 1],
+                        then: [
+                          memEnR < 0,
+                          filling < 0,
+                          faultDone < 1,
+                          faultIsPage < memFault,
+                        ],
                       ),
                     ],
                     orElse: [
@@ -1062,6 +1094,7 @@ class HarborL1DCache extends BridgeModule {
                               memWeR < 0,
                               storing < 0,
                               faultDone < 1,
+                              faultIsPage < memFault,
                             ],
                           ),
                         ],
@@ -1087,6 +1120,7 @@ class HarborL1DCache extends BridgeModule {
                                   memEnR < 0,
                                   bypassing < 0,
                                   faultDone < 1,
+                                  faultIsPage < memFault,
                                 ],
                               ),
                             ],

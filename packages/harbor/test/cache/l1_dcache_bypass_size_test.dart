@@ -32,6 +32,7 @@ void main() {
     final memDone = Logic(name: 'mem_done');
     final memValid = Logic(name: 'mem_valid');
     final memRdata = Logic(name: 'mem_rdata', width: 64);
+    final memFault = Logic(name: 'mem_fault');
 
     final cache = HarborL1DCache(
       config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
@@ -50,6 +51,7 @@ void main() {
       ('mem_done', memDone),
       ('mem_valid', memValid),
       ('mem_rdata', memRdata),
+      ('mem_fault', memFault),
     ]) {
       cache.port(n).getsLogic(l);
     }

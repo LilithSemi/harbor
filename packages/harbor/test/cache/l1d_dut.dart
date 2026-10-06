@@ -11,6 +11,7 @@ class Backing {
     required this.memDone,
     required this.memValid,
     required this.memRdata,
+    required this.memFault,
     required this.latency,
   });
 
@@ -18,11 +19,16 @@ class Backing {
   final Logic memDone;
   final Logic memValid;
   final Logic memRdata;
+  final Logic memFault;
   final int latency;
 
   /// When set, every memory response is a FAULT (`mem_done` with `mem_valid`
   /// low), which is how the MMU reports a page fault.
   var faultResponse = false;
+
+  /// Classification for [faultResponse]: true is page fault, false is physical
+  /// access fault.
+  var faultIsPage = true;
 
   final mem = <int, BigInt>{};
   final readLog = <int>[];
@@ -67,6 +73,7 @@ class Backing {
       if (faultResponse) {
         memDone.inject(1);
         memValid.inject(0);
+        memFault.inject(faultIsPage ? 1 : 0);
         return;
       }
       if (_pendWe) {
@@ -80,9 +87,11 @@ class Backing {
       }
       memDone.inject(1);
       memValid.inject(1);
+      memFault.inject(0);
     } else {
       memDone.inject(0);
       memValid.inject(0);
+      memFault.inject(0);
     }
   }
 }
@@ -96,6 +105,7 @@ class Dut {
   Logic operator [](String n) => ports[n]!;
   bool get respValid => cache.output('resp_valid').value.toBool();
   bool get respFault => cache.output('resp_fault').value.toBool();
+  bool get respAccessFault => cache.output('resp_access_fault').value.toBool();
   bool get busy => cache.output('busy').value.toBool();
 }
 
@@ -118,6 +128,7 @@ Future<Dut> makeDut({
     'mem_done': Logic(name: 'mem_done'),
     'mem_valid': Logic(name: 'mem_valid'),
     'mem_rdata': Logic(name: 'mem_rdata', width: 64),
+    'mem_fault': Logic(name: 'mem_fault'),
     if (ctxBits > 0) 'req_ctx': Logic(name: 'req_ctx', width: ctxBits),
   };
 
@@ -141,6 +152,7 @@ Future<Dut> makeDut({
   ports['mem_done']!.inject(0);
   ports['mem_valid']!.inject(0);
   ports['mem_rdata']!.inject(0);
+  ports['mem_fault']!.inject(0);
   if (ctxBits > 0) ports['req_ctx']!.inject(0);
 
   unawaited(Simulator.run());
@@ -150,6 +162,7 @@ Future<Dut> makeDut({
     memDone: ports['mem_done']!,
     memValid: ports['mem_valid']!,
     memRdata: ports['mem_rdata']!,
+    memFault: ports['mem_fault']!,
     latency: latency,
   );
   await backing.step();

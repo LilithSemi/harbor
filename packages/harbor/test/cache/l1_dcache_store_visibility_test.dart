@@ -125,6 +125,7 @@ Future<_Dut> makeDut({
     'mem_done': Logic(name: 'mem_done'),
     'mem_valid': Logic(name: 'mem_valid'),
     'mem_rdata': Logic(name: 'mem_rdata', width: 64),
+    'mem_fault': Logic(name: 'mem_fault'),
     if (ctxBits > 0) 'req_ctx': Logic(name: 'req_ctx', width: ctxBits),
   };
 
@@ -148,6 +149,8 @@ Future<_Dut> makeDut({
   ports['mem_done']!.inject(0);
   ports['mem_valid']!.inject(0);
   ports['mem_rdata']!.inject(0);
+  // This suite's denied responses model MMU page faults.
+  ports['mem_fault']!.inject(1);
   if (ctxBits > 0) ports['req_ctx']!.inject(0);
 
   unawaited(Simulator.run());

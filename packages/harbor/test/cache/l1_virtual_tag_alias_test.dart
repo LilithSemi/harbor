@@ -109,6 +109,7 @@ void main() {
         'mem_done': Logic(name: 'mem_done'),
         'mem_valid': Logic(name: 'mem_valid'),
         'mem_rdata': Logic(name: 'mem_rdata', width: 64),
+        'mem_fault': Logic(name: 'mem_fault'),
         if (ctxBits > 0) 'req_ctx': Logic(name: 'req_ctx', width: ctxBits),
       };
       final cache = HarborL1DCache(
