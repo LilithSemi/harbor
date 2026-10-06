@@ -128,7 +128,6 @@ class HarborL1ICache extends BridgeModule {
     this.xlen = 64,
     this.dualPort = false,
     this.ctxBits = 0,
-    Logic? memFaultIn,
     // Significant low bits of [reqAddr]: the tag store and compares are sized to
     // this instead of [xlen], so a cache over a narrow map does not pay for a
     // full 64-bit tag. Null = xlen. See the note on tag width below.
@@ -172,9 +171,7 @@ class HarborL1ICache extends BridgeModule {
     createPort('mem_done', PortDirection.input);
     createPort('mem_valid', PortDirection.input);
     createPort('mem_rdata', PortDirection.input, width: xlen);
-    // Default to page fault for backwards compatibility: an old consumer that
-    // does not wire classification must still complete and trap, never float.
-    addInput('mem_fault', memFaultIn ?? (Logic()..put(0)));
+    createPort('mem_fault', PortDirection.input);
 
     final clk = input('clk');
     final reset = input('reset');
@@ -693,7 +690,7 @@ class HarborL1DCache extends BridgeModule {
     createPort('mem_rdata', PortDirection.input, width: xlen);
     // Default to page fault for backwards compatibility: an old consumer that
     // does not wire classification must still complete and trap, never float.
-    addInput('mem_fault', memFaultIn ?? (Logic()..put(0)));
+    addInput('mem_fault', memFaultIn ?? Const(0));
 
     final clk = input('clk');
     final reset = input('reset');

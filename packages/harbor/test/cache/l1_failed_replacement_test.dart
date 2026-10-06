@@ -33,6 +33,7 @@ void main() {
                     lineSize: lineSize,
                   ),
                   xlen: xlen,
+                  memFaultIn: Logic(),
                 );
           final clk = SimpleClockGenerator(10).clk;
           for (final input in cache.inputs.values) {

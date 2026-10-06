@@ -120,6 +120,7 @@ void main() {
       config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
       xlen: 64,
       reqAddrBits: 32,
+      memFaultIn: memFault,
     );
     for (final (n, l) in [
       ('clk', clk),
@@ -133,7 +134,6 @@ void main() {
       ('mem_done', memDone),
       ('mem_valid', memValid),
       ('mem_rdata', memRdata),
-      ('mem_fault', memFault),
     ]) {
       cache.port(n).getsLogic(l);
     }
@@ -272,6 +272,7 @@ void main() {
         config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
         xlen: 64,
         reqAddrBits: 32,
+        memFaultIn: memFault,
         // DRAM base, anything below is MMIO/SRAM/flash and must bypass.
         cacheableBase: 0x80000000,
       );
@@ -287,7 +288,6 @@ void main() {
         ('mem_done', memDone),
         ('mem_valid', memValid),
         ('mem_rdata', memRdata),
-        ('mem_fault', memFault),
       ]) {
         cache.port(n).getsLogic(l);
       }
