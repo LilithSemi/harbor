@@ -803,11 +803,11 @@ class HarborL1DCache extends BridgeModule {
     // FSM state.
     final filling = Logic(name: 'filling');
     final fillSettle = Logic(name: 'fillSettle');
-    // Drain an abandoned in-flight memory op after a flush (fence.i) mid-fill/
-    // store/bypass: the MMU completes the read/write it already launched, so
-    // block a new op until that stale completion lands and is discarded. Without
-    // this, a post-flush fill captures the abandoned read as word 0 of the new
-    // line (the creek Weir->Ferrite handoff corruption). Mirrors [HarborL1ICache].
+    // Drain an abandoned refill beat after a flush. Stores and bypass reads
+    // must instead finish normally: they may already have caused MMIO side
+    // effects, so discarding their response would make the requester retry.
+    // A discarded refill completion must not become word 0 of a new line.
+    // Mirrors [HarborL1ICache].
     final drain = Logic(name: 'drain');
     final storing = Logic(name: 'storing');
     // Single-cycle pulse, same shape as storeDone/bypassDone: the memory
@@ -843,7 +843,9 @@ class HarborL1DCache extends BridgeModule {
                 bypassing |
                 storeDone |
                 bypassDone |
-                faultDone)
+                faultDone |
+                drain |
+                flush)
             .named('blockHit');
 
     // Only DRAM (>= cacheableBase) is cacheable, everything else bypasses.
@@ -933,19 +935,19 @@ class HarborL1DCache extends BridgeModule {
           drain < 0,
         ],
         orElse: [
-          // Whole-cache flush (fence.i, sfence.vma, a satp write): drop every
-          // line and abandon any op in flight.
-          //
-          // The abandoned refill matters most: its words belong to a line this
-          // flush has just dropped, and word 0 of the abandoned read would
-          // otherwise be captured as word 0 of the NEXT line (the creek Weir to
-          // Ferrite handoff corruption). The MMU still completes the read it
-          // launched, so drain that stale completion before a new op starts,
-          // unless it lands this very cycle.
+          // Invalidate every line even while an uncached read or write-through
+          // store is finishing. Those operations cannot be cancelled safely:
+          // their side effects may already have happened. Keep their state and
+          // deliver their success/fault response, including during a held flush.
+          If(flush, then: [
+            ...List.generate(numLines, (i) => lineValid[i] < 0),
+          ]),
+          // Refills can be abandoned, but drain their outstanding beat before
+          // starting another operation. blockHit prevents new requests and
+          // cached hits while flush is asserted or a stale beat is draining.
           If(
-            flush,
+            flush & ~storing & ~bypassing,
             then: [
-              ...List.generate(numLines, (i) => lineValid[i] < 0),
               filling < 0,
               fillSettle < 0,
               storing < 0,
@@ -955,10 +957,9 @@ class HarborL1DCache extends BridgeModule {
               faultDone < 0,
               memEnR < 0,
               memWeR < 0,
-              // Any in-flight memory op (fill/store/bypass) was launched at the
-              // MMU and will still complete; drain that stale completion before
-              // a new op, unless it completes this very cycle.
-              drain < (filling | storing | bypassing | drain) & ~memDone,
+              // Only an abandoned refill can enter drain; an in-flight store
+              // or bypass read follows its normal completion path below.
+              drain < (filling | drain) & ~memDone,
             ],
             orElse: [
               fillSettle < 0,
