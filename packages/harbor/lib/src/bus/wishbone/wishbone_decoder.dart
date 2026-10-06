@@ -115,6 +115,13 @@ class WishboneDecoder extends BridgeModule {
 
     m.ack <= muxedAck;
     m.datMiso <= muxedData;
-    if (m.err != null) m.err! <= noMatch;
+    if (m.err != null) {
+      m.err! <=
+          noMatch |
+              [
+                for (var i = 0; i < mappings.length; i++)
+                  hitBits[i] & m.stb & slaveIntfs[i].err!,
+              ].reduce((a, b) => a | b);
+    }
   }
 }

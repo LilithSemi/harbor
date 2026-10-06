@@ -129,6 +129,10 @@ class WishboneArbiter extends BridgeModule {
     // DAT_MISO broadcast: only the granted master consumes it).
     for (var i = 0; i < numMasters; i++) {
       masters[i].ack <= slave.ack & effGrant[i];
+      if (masters[i].err != null) {
+        masters[i].err! <=
+            slave.err! & effGrant[i] & masters[i].cyc & masters[i].stb;
+      }
       masters[i].datMiso <= slave.datMiso;
     }
   }

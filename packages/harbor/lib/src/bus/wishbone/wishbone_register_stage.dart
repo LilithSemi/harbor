@@ -75,10 +75,11 @@ class WishboneRegisterStage extends BridgeModule {
     Sequential(clk, [
       If(
         reset,
-        then: [busy < Const(0), ackR < Const(0)],
+        then: [busy < Const(0), ackR < Const(0), if (errR != null) errR < 0],
         orElse: [
           // ACK upstream is a one-cycle pulse.
           ackR < Const(0),
+          if (errR != null) errR < 0,
           If(
             ~busy,
             then: [
@@ -88,7 +89,7 @@ class WishboneRegisterStage extends BridgeModule {
               // its deassert is registered. Without this gate we would re-capture
               // that stale request and run the transfer twice.
               If(
-                up.cyc & up.stb & ~ackR,
+                up.cyc & up.stb & ~ackR & ~(errR ?? Const(0)),
                 then: [
                   busy < Const(1),
                   weR < up.we,
@@ -102,10 +103,10 @@ class WishboneRegisterStage extends BridgeModule {
               // Outstanding: complete on the downstream ACK, latch the response
               // and pulse ACK upstream next cycle.
               If(
-                down.ack,
+                down.ack | (down.err ?? Const(0)),
                 then: [
                   busy < Const(0),
-                  ackR < Const(1),
+                  ackR < down.ack,
                   misoR < down.datMiso,
                   if (errR != null) errR < (down.err ?? Const(0)),
                 ],
