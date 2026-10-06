@@ -51,8 +51,8 @@ void main() {
       ports['mem_fault']!.inject(0);
       await clk.nextPosedge;
 
-      expect(cache.output('resp_fault').value.toBool(), pageFault);
-      expect(cache.output('resp_access_fault').value.toBool(), !pageFault);
+      expect(cache.output('resp_fault').value.toBool(), isTrue);
+      expect(cache.output('resp_fault_is_access').value.toBool(), !pageFault);
       expect(cache.output('resp_valid').value.toBool(), isFalse);
       await Simulator.endSimulation();
     });
@@ -70,12 +70,12 @@ void main() {
         var sawCompletion = false;
         for (var cycle = 0; cycle < 40 && !sawCompletion; cycle++) {
           await dut.backing.step();
-          sawCompletion = dut.respFault || dut.respAccessFault;
+          sawCompletion = dut.respFault;
         }
 
         expect(sawCompletion, isTrue);
-        expect(dut.respFault, pageFault);
-        expect(dut.respAccessFault, !pageFault);
+        expect(dut.respFault, isTrue);
+        expect(dut.respFaultIsAccess, !pageFault);
         expect(dut.respValid, isFalse);
         await Simulator.endSimulation();
       });

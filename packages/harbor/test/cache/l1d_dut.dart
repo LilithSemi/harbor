@@ -105,7 +105,8 @@ class Dut {
   Logic operator [](String n) => ports[n]!;
   bool get respValid => cache.output('resp_valid').value.toBool();
   bool get respFault => cache.output('resp_fault').value.toBool();
-  bool get respAccessFault => cache.output('resp_access_fault').value.toBool();
+  bool get respFaultIsAccess =>
+      cache.output('resp_fault_is_access').value.toBool();
   bool get busy => cache.output('busy').value.toBool();
 }
 
