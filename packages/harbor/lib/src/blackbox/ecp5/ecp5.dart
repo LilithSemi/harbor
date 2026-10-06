@@ -16,6 +16,7 @@ class Ecp5Ehxplll extends BridgeModule {
     // is clkosDiv/4 (the DDR PHY uses this for centered write data).
     int? clkosDiv,
     int clkosCphase = 0,
+    int clkosFphase = 0,
     // Optional SECOND secondary output (CLKOS2): an independently phase-shifted
     // clock off the same VCO, same rules as CLKOS. The DLL-off DDR PHY uses it as
     // a per-beat read-capture clock (beat0 captured on CLKOS2, beat1 on CLKOS) so
@@ -77,6 +78,7 @@ class Ecp5Ehxplll extends BridgeModule {
       createParameter('CLKOS_ENABLE', '"ENABLED"');
       createParameter('CLKOS_DIV', '$clkosDiv');
       createParameter('CLKOS_CPHASE', '$clkosCphase');
+      createParameter('CLKOS_FPHASE', '$clkosFphase');
     }
     if (clkos2Div != null) {
       createParameter('CLKOS2_ENABLE', '"ENABLED"');

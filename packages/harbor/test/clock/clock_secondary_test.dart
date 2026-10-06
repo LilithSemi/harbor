@@ -44,11 +44,16 @@ class _ClkHarness extends BridgeModule {
 
 void main() {
   group('ecp5ClkosDiv', () {
-    test('25MHz -> 125MHz primary + 25MHz secondary needs CLKOS_DIV 20', () {
-      // VCO = 125 MHz * CLKOP_DIV(4) = 500 MHz. CLKOS_DIV = 500/25 = 20.
+    test('25MHz -> 125MHz primary + 25MHz secondary needs CLKOS_DIV 25', () {
+      // ecp5PllDividers now runs ecppll.cpp's real search/tie-break: for
+      // 25 -> 125, CLKOP_DIV 5 (VCO 625 MHz) beats CLKOP_DIV 4 (VCO 500 MHz)
+      // because 625 MHz is closer to ecppll.cpp's 600 MHz tie-break target
+      // (both give an exact 125 MHz CLKOP; the achieved frequency doesn't
+      // depend on CLKOP_DIV at all in this mode, so the VCO tie-break is the
+      // only thing that ever decides it). CLKOS_DIV = 625/25 = 25.
       expect(
         HarborClockGenerator.ecp5ClkosDiv(25000000, 125000000, 25000000),
-        equals(20),
+        equals(25),
       );
     });
   });

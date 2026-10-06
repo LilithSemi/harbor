@@ -463,13 +463,7 @@ class HarborClockGenerator {
   HarborClockDomain _createIce40Pll(HarborClockConfig config, int sourceFreq) {
     // Calculate PLL dividers
     // fout = (fin * (DIVF + 1)) / ((DIVR + 1) * (1 << DIVQ))
-    final (divr, divf, divq) = calculateDividers(
-      sourceFreq,
-      config.frequency,
-      maxDivr: 15,
-      maxDivf: 127,
-      maxDivq: 7,
-    );
+    final (divr, divf, divq) = calculateDividers(sourceFreq, config.frequency);
 
     final pll = parent.addSubModule(
       Ice40SbPll40Core(
@@ -499,51 +493,329 @@ class HarborClockGenerator {
     return domain;
   }
 
-  /// ECP5 EHXPLLL divider selection for self-feedback (CLKFB driven by CLKOP).
+  // ECP5 EHXPLLL operating limits, from prjtrellis's ecppll.cpp #define block
+  // (https://github.com/YosysHQ/prjtrellis/blob/master/libtrellis/tools/ecppll.cpp#L26-L33):
+  // INPUT 8-400 MHz, OUTPUT 10-400 MHz, PFD 3.125-400 MHz, VCO 400-800 MHz.
+  static const double _ecp5InputMinHz = 8e6;
+  static const double _ecp5InputMaxHz = 400e6;
+  static const double _ecp5OutputMinHz = 10e6;
+  static const double _ecp5OutputMaxHz = 400e6;
+  static const double _ecp5PfdMinHz = 3.125e6;
+  static const double _ecp5PfdMaxHz = 400e6;
+  static const double _ecp5VcoMinHz = 400e6;
+  static const double _ecp5VcoMaxHz = 800e6;
+  // Divider ranges from the same file's search loops: CLKI_DIV/CLKOP_DIV/
+  // CLKOS_DIV 1-128, CLKFB_DIV 1-80.
+  static const int _ecp5ClkiDivMax = 128;
+  static const int _ecp5ClkfbDivMax = 80;
+  static const int _ecp5OutDivMax = 128;
+
+  // ecppll.cpp's pll_params() constructor always sets CLKOP_CPHASE to 9 and
+  // never recomputes it on the highres path (and write_pll_config always
+  // emits CLKOP_FPHASE(0), which [Ecp5Ehxplll] already hardcodes).
+  static const int _ecp5HighresClkopCphase = 9;
+
+  // ecppll.cpp's highres mode never computes CLKOS_CPHASE/CLKOS_FPHASE at all
+  // (calc_pll_params_highres only ever sets params.secondary[0].div/.enabled/
+  // .freq, never .cphase/.fphase), so a real ecppll --highres run emits
+  // whatever was already on the stack there (uninitialized memory, not a
+  // function of the requested frequencies: not safe to bake in as a
+  // constant). The one real phase rule the tool does have is
+  // generate_secondary_output's zero-phase case (ecppll.cpp lines 357-368):
+  // with phase 0, cphase = primary_cphase and fphase = 0. Applying that rule
+  // to CLKOS here (CLKOS_CPHASE = the CLKOP_CPHASE above, CLKOS_FPHASE = 0)
+  // is the one sourced, zero-phase default for a CLKOS output with no
+  // specific phase request.
+  static const int _ecp5HighresClkosFphase = 0;
+
+  static void _ecp5CheckInOut(int sourceFreq, int targetFreq) {
+    if (sourceFreq < _ecp5InputMinHz || sourceFreq > _ecp5InputMaxHz) {
+      throw ArgumentError(
+        'ECP5 EHXPLLL input $sourceFreq Hz is outside the 8-400 MHz input '
+        'band.',
+      );
+    }
+    if (targetFreq < _ecp5OutputMinHz || targetFreq > _ecp5OutputMaxHz) {
+      throw ArgumentError(
+        'ECP5 EHXPLLL output $targetFreq Hz is outside the 10-400 MHz '
+        'output band.',
+      );
+    }
+  }
+
+  /// Direct port of prjtrellis ecppll.cpp's `calc_pll_params`: CLKOP is the
+  /// real output. Searches CLKI_DIV x CLKFB_DIV x CLKOP_DIV keeping the PFD
+  /// and VCO in band, picks the smallest |fout - targetFreq|, and breaks ties
+  /// toward the VCO closest to 600 MHz (ecppll.cpp's own tie-break; fout does
+  /// not depend on CLKOP_DIV at all in this mode, so this is the only thing
+  /// that ever decides a tie). Returns null when nothing is in band.
+  static ({
+    int clkiDiv,
+    int clkfbDiv,
+    int clkopDiv,
+    double pfd,
+    double vco,
+    double fout,
+  })?
+  _ecp5SimpleSearch(int sourceFreq, int targetFreq) {
+    var bestErr = double.infinity;
+    var bestVco = 0.0;
+    int? bClkiDiv, bClkfbDiv, bClkopDiv;
+    var bestPfd = 0.0, bestFout = 0.0;
+    for (var clkiDiv = 1; clkiDiv <= _ecp5ClkiDivMax; clkiDiv++) {
+      final pfd = sourceFreq / clkiDiv;
+      if (pfd < _ecp5PfdMinHz || pfd > _ecp5PfdMaxHz) continue;
+      for (var clkfbDiv = 1; clkfbDiv <= _ecp5ClkfbDivMax; clkfbDiv++) {
+        for (var clkopDiv = 1; clkopDiv <= _ecp5OutDivMax; clkopDiv++) {
+          final vco = pfd * clkfbDiv * clkopDiv;
+          if (vco < _ecp5VcoMinHz || vco > _ecp5VcoMaxHz) continue;
+          final fout = pfd * clkfbDiv; // == vco / clkopDiv
+          final err = (fout - targetFreq).abs();
+          if (err < bestErr ||
+              (err == bestErr &&
+                  (vco - 600e6).abs() < (bestVco - 600e6).abs())) {
+            bestErr = err;
+            bestVco = vco;
+            bestPfd = pfd;
+            bestFout = fout;
+            bClkiDiv = clkiDiv;
+            bClkfbDiv = clkfbDiv;
+            bClkopDiv = clkopDiv;
+          }
+        }
+      }
+    }
+    if (bClkiDiv == null) return null;
+    return (
+      clkiDiv: bClkiDiv,
+      clkfbDiv: bClkfbDiv!,
+      clkopDiv: bClkopDiv!,
+      pfd: bestPfd,
+      vco: bestVco,
+      fout: bestFout,
+    );
+  }
+
+  /// Direct port of prjtrellis ecppll.cpp's `calc_pll_params_highres`
+  /// (`ecppll --highres`): CLKOP is feedback-only (FEEDBK_PATH "CLKOP") and
+  /// CLKOS is the real output. Same PFD/VCO band checks as [_ecp5SimpleSearch]
+  /// plus one more: the CLKOP feedback frequency must also land in the
+  /// output band (ecppll.cpp around line 326). A solver that checked only the
+  /// VCO would accept the broken 1 MHz PFD instance this fixes.
+  ///
+  /// CLKOS_DIV is a literal brute-force loop over 1..128, matching
+  /// ecppll.cpp exactly, rather than a `round(vco / targetFreq)` shortcut: a
+  /// review found `round` does not always land on the integer divisor with
+  /// the least error (fout = vco / div is a reciprocal, not linear, function
+  /// of div, so nearest-integer rounding of the real-valued ratio is not
+  /// always the brute-force optimum). This runs once per clock domain at
+  /// elaboration, not in a hot path, so the extra loop cost is cheap to pay
+  /// for exactness.
+  static ({
+    int clkiDiv,
+    int clkfbDiv,
+    int clkopDiv,
+    int clkosDiv,
+    double pfd,
+    double vco,
+    double feedback,
+    double fout,
+  })?
+  _ecp5HighresSearch(int sourceFreq, int targetFreq) {
+    var bestErr = double.infinity;
+    var bestVco = 0.0;
+    int? bClkiDiv, bClkfbDiv, bClkopDiv, bClkosDiv;
+    var bestPfd = 0.0, bestFeedback = 0.0, bestFout = 0.0;
+    for (var clkiDiv = 1; clkiDiv <= _ecp5ClkiDivMax; clkiDiv++) {
+      final pfd = sourceFreq / clkiDiv;
+      if (pfd < _ecp5PfdMinHz || pfd > _ecp5PfdMaxHz) continue;
+      for (var clkfbDiv = 1; clkfbDiv <= _ecp5ClkfbDivMax; clkfbDiv++) {
+        for (var clkopDiv = 1; clkopDiv <= _ecp5OutDivMax; clkopDiv++) {
+          final vco = pfd * clkfbDiv * clkopDiv;
+          if (vco < _ecp5VcoMinHz || vco > _ecp5VcoMaxHz) continue;
+          final feedback = vco / clkopDiv;
+          if (feedback < _ecp5OutputMinHz || feedback > _ecp5OutputMaxHz) {
+            continue;
+          }
+          for (var clkosDiv = 1; clkosDiv <= _ecp5OutDivMax; clkosDiv++) {
+            final fout = vco / clkosDiv;
+            final err = (fout - targetFreq).abs();
+            if (err < bestErr ||
+                (err == bestErr &&
+                    (vco - 600e6).abs() < (bestVco - 600e6).abs())) {
+              bestErr = err;
+              bestVco = vco;
+              bestPfd = pfd;
+              bestFeedback = feedback;
+              bestFout = fout;
+              bClkiDiv = clkiDiv;
+              bClkfbDiv = clkfbDiv;
+              bClkopDiv = clkopDiv;
+              bClkosDiv = clkosDiv;
+            }
+          }
+        }
+      }
+    }
+    if (bClkiDiv == null) return null;
+    return (
+      clkiDiv: bClkiDiv,
+      clkfbDiv: bClkfbDiv!,
+      clkopDiv: bClkopDiv!,
+      clkosDiv: bClkosDiv!,
+      pfd: bestPfd,
+      vco: bestVco,
+      feedback: bestFeedback,
+      fout: bestFout,
+    );
+  }
+
+  /// ECP5 EHXPLLL divider selection for self-feedback (CLKFB driven by CLKOP),
+  /// CLKOP-direct mode only (ecppll.cpp's `calc_pll_params`, no `--highres`).
   ///
   /// At lock fCLKOP = sourceFreq * CLKFB_DIV / CLKI_DIV, and the VCO
-  /// fVCO = fCLKOP * CLKOP_DIV must land in the ECP5 400-800 MHz band. The
-  /// output:input ratio is realized as a reduced integer fraction (CLKFB_DIV :
-  /// CLKI_DIV) so the PLL can divide DOWN as well as up: targetFreq below
-  /// sourceFreq needs CLKI_DIV > 1, which the old code (CLKI_DIV hardcoded to 1)
-  /// could not express, so a 48->24 request produced a 1:1 PLL whose VCO landed
-  /// at 1584 MHz (out of range, never locks).
+  /// fVCO = fCLKOP * CLKOP_DIV must land in the ECP5 400-800 MHz band, and the
+  /// PFD (sourceFreq / CLKI_DIV) in the 3.125-400 MHz band. The old code
+  /// reduced target:source by GCD with no band checks at all, so 25 -> 48
+  /// picked CLKI_DIV 25, a 1 MHz PFD: a setting that looks right (it IS an
+  /// exact 25:48 reduction) but is far below the PFD minimum, so the PLL
+  /// never asserts LOCK on real hardware. This now does a real search and
+  /// throws instead of silently clamping into a dead configuration.
+  ///
+  /// This is the CLKOP-only search: callers that need CLKOS too (an exact
+  /// frequency the CLKOP-direct path cannot reach in band, or a second
+  /// independent output) use [ecp5PllSolve] / [ecp5ClkosDiv] instead.
   static ({int clkiDiv, int clkfbDiv, int clkopDiv}) ecp5PllDividers(
     int sourceFreq,
     int targetFreq,
   ) {
-    final g = targetFreq.gcd(sourceFreq);
-    final clkfbDiv = (targetFreq ~/ g).clamp(1, 128);
-    final clkiDiv = (sourceFreq ~/ g).clamp(1, 128);
-    final clkopDiv = (600000000 ~/ targetFreq).clamp(1, 128);
-    return (clkiDiv: clkiDiv, clkfbDiv: clkfbDiv, clkopDiv: clkopDiv);
+    _ecp5CheckInOut(sourceFreq, targetFreq);
+    final best = _ecp5SimpleSearch(sourceFreq, targetFreq);
+    if (best == null) {
+      throw ArgumentError(
+        'No ECP5 EHXPLLL solution for $sourceFreq Hz -> $targetFreq Hz: no '
+        'CLKI_DIV/CLKFB_DIV/CLKOP_DIV keeps the PFD (3.125-400 MHz) and VCO '
+        '(400-800 MHz) in band.',
+      );
+    }
+    return (
+      clkiDiv: best.clkiDiv,
+      clkfbDiv: best.clkfbDiv,
+      clkopDiv: best.clkopDiv,
+    );
+  }
+
+  /// Full ECP5 EHXPLLL divider search for a single [targetFreq] out of
+  /// [sourceFreq]: tries both of ecppll.cpp's modes and keeps whichever lands
+  /// closer to [targetFreq].
+  ///
+  ///  - simple (`calc_pll_params`): CLKOP is the real output, divider fields
+  ///    are CLKI_DIV/CLKFB_DIV/CLKOP_DIV only ([clkosDiv] null).
+  ///  - highres (`ecppll --highres`, `calc_pll_params_highres`): CLKOP is
+  ///    feedback-only (FEEDBK_PATH "CLKOP"), CLKOS is the real output
+  ///    ([clkosDiv] set). This reaches exact frequencies the simple search
+  ///    cannot: 25 MHz -> 48 MHz has no in-band simple solution (its nearest
+  ///    is 46.875 MHz at a 3.125 MHz PFD), but highres hits 48 MHz exactly at
+  ///    a 5 MHz PFD (CLKI_DIV 5, CLKFB_DIV 2, CLKOP_DIV 48, CLKOS_DIV 10).
+  ///
+  /// The exact frequency always wins over a merely lower-PFD/VCO-friendly
+  /// one: highres is used only when it is strictly closer to [targetFreq]
+  /// than the simple result (ties keep the simpler CLKOP-direct mode, which
+  /// needs no CLKOS wiring). Throws [ArgumentError] when neither mode has an
+  /// in-band solution: a setting outside these bands can look plausible but
+  /// never locks on hardware.
+  static ({
+    int clkiDiv,
+    int clkfbDiv,
+    int clkopDiv,
+    int? clkosDiv,
+    int clkopCphase,
+    int? clkosCphase,
+    int? clkosFphase,
+    double pfd,
+    double vco,
+    double fout,
+  })
+  ecp5PllSolve(int sourceFreq, int targetFreq) {
+    _ecp5CheckInOut(sourceFreq, targetFreq);
+    final simple = _ecp5SimpleSearch(sourceFreq, targetFreq);
+    final highres = _ecp5HighresSearch(sourceFreq, targetFreq);
+    if (simple == null && highres == null) {
+      throw ArgumentError(
+        'No ECP5 EHXPLLL solution for $sourceFreq Hz -> $targetFreq Hz: no '
+        'CLKI_DIV/CLKFB_DIV/CLKOP_DIV[/CLKOS_DIV] keeps the PFD (3.125-400 '
+        'MHz), VCO (400-800 MHz) and feedback output (10-400 MHz) in band.',
+      );
+    }
+    final simpleErr = simple == null
+        ? double.infinity
+        : (simple.fout - targetFreq).abs();
+    final highresErr = highres == null
+        ? double.infinity
+        : (highres.fout - targetFreq).abs();
+    if (highres != null && highresErr < simpleErr) {
+      return (
+        clkiDiv: highres.clkiDiv,
+        clkfbDiv: highres.clkfbDiv,
+        clkopDiv: highres.clkopDiv,
+        clkosDiv: highres.clkosDiv,
+        clkopCphase: _ecp5HighresClkopCphase,
+        // Zero-phase secondary rule (see the comment above): CLKOS_CPHASE
+        // takes the same value as CLKOP_CPHASE.
+        clkosCphase: _ecp5HighresClkopCphase,
+        clkosFphase: _ecp5HighresClkosFphase,
+        pfd: highres.pfd,
+        vco: highres.vco,
+        fout: highres.fout,
+      );
+    }
+    final s = simple!;
+    return (
+      clkiDiv: s.clkiDiv,
+      clkfbDiv: s.clkfbDiv,
+      clkopDiv: s.clkopDiv,
+      clkosDiv: null,
+      clkopCphase: s.clkopDiv ~/ 2,
+      clkosCphase: null,
+      clkosFphase: null,
+      pfd: s.pfd,
+      vco: s.vco,
+      fout: s.fout,
+    );
   }
 
   HarborClockDomain _createEcp5Pll(HarborClockConfig config, int sourceFreq) {
-    final dividers = ecp5PllDividers(sourceFreq, config.frequency);
-    final clkiDiv = dividers.clkiDiv;
-    final clkfbDiv = dividers.clkfbDiv;
-    final clkopDiv = dividers.clkopDiv;
+    final sol = ecp5PllSolve(sourceFreq, config.frequency);
 
-    // Self-feedback: CLKFB driven by CLKOP
+    // Self-feedback: CLKFB driven by CLKOP.
     final feedback = Logic(name: '${config.name}_pll_fb');
 
     final pll = Ecp5Ehxplll(
-      clkiDiv: clkiDiv,
-      clkfbDiv: clkfbDiv,
-      clkopDiv: clkopDiv,
+      clkiDiv: sol.clkiDiv,
+      clkfbDiv: sol.clkfbDiv,
+      clkopDiv: sol.clkopDiv,
       clk: inputClk,
       clkfb: feedback,
+      clkopCphase: sol.clkopCphase,
+      clkosDiv: sol.clkosDiv,
+      clkosCphase: sol.clkosCphase ?? 0,
+      clkosFphase: sol.clkosFphase ?? 0,
       name: '${config.name}_pll',
     );
 
     feedback <= pll.output('CLKOP');
+    // When the solver picked the highres/CLKOS path, CLKOP is feedback-only
+    // (its frequency just keeps the VCO in band) and the real output is
+    // CLKOS.
+    final outClk = sol.clkosDiv != null
+        ? pll.output('CLKOS')
+        : pll.output('CLKOP');
 
     final domain = HarborClockDomain(
       config: config,
-      clk: pll.output('CLKOP'),
+      clk: outClk,
       reset: _domainReset(
-        pll.output('CLKOP'),
+        outClk,
         inputReset | ~pll.output('LOCK'),
         config.name,
       ),
@@ -803,36 +1075,86 @@ class HarborClockGenerator {
     return domain;
   }
 
-  /// Calculates PLL dividers for a target frequency.
+  // iCE40 PLL (SB_PLL40_CORE/PAD, SIMPLE feedback) operating limits, from
+  // icestorm's icepll.cc (https://github.com/YosysHQ/icestorm/blob/master/icepll/icepll.cc):
+  // INPUT 10-133 MHz, OUTPUT 16-275 MHz, PFD 10-133 MHz, VCO 533-1066 MHz.
+  // DIVQ is only valid 1-6 (icepll.cc's analyze(): `for (divq = 1; divq <= 6;
+  // divq++)`); the old code looped DIVQ 0-7, which includes DIVQ 0 (bypass,
+  // not a valid divide stage here) and 7 (unsupported).
+  static const double _ice40InputMinHz = 10e6;
+  static const double _ice40InputMaxHz = 133e6;
+  static const double _ice40OutputMinHz = 16e6;
+  static const double _ice40OutputMaxHz = 275e6;
+  static const double _ice40PfdMinHz = 10e6;
+  static const double _ice40PfdMaxHz = 133e6;
+  static const double _ice40VcoMinHz = 533e6;
+  static const double _ice40VcoMaxHz = 1066e6;
+
+  /// Calculates PLL dividers for a target frequency on the iCE40 SIMPLE
+  /// feedback path. A direct port of icepll.cc's `analyze()`: same loop
+  /// order (DIVR outer, DIVF middle, DIVQ inner) and the same strict `<`
+  /// comparison (the first candidate found at the best error wins any tie,
+  /// no secondary tie-break - icepll.cc has none here).
   ///
   /// Returns (DIVR, DIVF, DIVQ) such that:
   /// fout = (fin * (DIVF + 1)) / ((DIVR + 1) * (1 << DIVQ))
+  ///
+  /// The old code picked the DIVF that puts `actual` closest to [fout] with
+  /// no regard for the PFD or VCO bands, so an in-range-looking divider triple
+  /// could still carry a PFD or VCO outside icepll.cc's bands, and the PLL
+  /// would never lock. A later, closed-form fix (solving DIVF analytically
+  /// per (DIVR, DIVQ) instead of scanning it) checked only that ONE DIVF's
+  /// VCO and could falsely reject an input a neighboring DIVF would have
+  /// solved (icepll.cc tries every DIVF, not just the one closest to
+  /// [fout]'s own ratio). This now scans DIVF exhaustively like icepll.cc
+  /// does, and throws instead of returning an unreachable configuration.
   static (int, int, int) calculateDividers(
     int fin,
     int fout, {
     int maxDivr = 15,
     int maxDivf = 127,
-    int maxDivq = 7,
+    int maxDivq = 6,
   }) {
-    var bestDivr = 0;
+    if (fin < _ice40InputMinHz || fin > _ice40InputMaxHz) {
+      throw ArgumentError(
+        'iCE40 PLL input $fin Hz is outside the 10-133 MHz input band.',
+      );
+    }
+    if (fout < _ice40OutputMinHz || fout > _ice40OutputMaxHz) {
+      throw ArgumentError(
+        'iCE40 PLL output $fout Hz is outside the 16-275 MHz output band.',
+      );
+    }
+
+    var bestDivr = -1;
     var bestDivf = 0;
     var bestDivq = 0;
     var bestError = double.infinity;
 
     for (var divr = 0; divr <= maxDivr; divr++) {
-      for (var divq = 0; divq <= maxDivq; divq++) {
-        final divf = ((fout * (divr + 1) * (1 << divq)) / fin - 1).round();
-        if (divf < 0 || divf > maxDivf) continue;
-
-        final actual = (fin * (divf + 1)) ~/ ((divr + 1) * (1 << divq));
-        final error = (actual - fout).abs().toDouble();
-        if (error < bestError) {
-          bestError = error;
-          bestDivr = divr;
-          bestDivf = divf;
-          bestDivq = divq;
+      final fpfd = fin / (divr + 1);
+      if (fpfd < _ice40PfdMinHz || fpfd > _ice40PfdMaxHz) continue;
+      for (var divf = 0; divf <= maxDivf; divf++) {
+        final fvco = fpfd * (divf + 1);
+        if (fvco < _ice40VcoMinHz || fvco > _ice40VcoMaxHz) continue;
+        for (var divq = 1; divq <= maxDivq; divq++) {
+          final actual = fvco / (1 << divq);
+          final error = (actual - fout).abs();
+          if (error < bestError) {
+            bestError = error;
+            bestDivr = divr;
+            bestDivf = divf;
+            bestDivq = divq;
+          }
         }
       }
+    }
+
+    if (bestDivr < 0) {
+      throw ArgumentError(
+        'No iCE40 PLL solution for $fin Hz -> $fout Hz: no DIVR/DIVF/DIVQ '
+        'keeps the PFD (10-133 MHz) and VCO (533-1066 MHz) in band.',
+      );
     }
 
     return (bestDivr, bestDivf, bestDivq);
