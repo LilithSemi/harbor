@@ -481,6 +481,16 @@ class HarborL1ICache extends BridgeModule {
                         wantFill,
                         then: [
                           filling < 1,
+                          // Refill overwrites data before committing its tag.
+                          // Drop the victim now so a later fault cannot expose
+                          // partial replacement data under the old valid tag.
+                          ...List.generate(
+                            numLines,
+                            (l) => If(
+                              idxOf(fillAddr).eq(l),
+                              then: [lineValid[l] < 0],
+                            ),
+                          ),
                           fillIdx < idxOf(fillAddr),
                           fillTag < fullTagOf(fillAddr),
                           fillBase < fillLineBase,
@@ -1138,6 +1148,16 @@ class HarborL1DCache extends BridgeModule {
                                     loadMiss,
                                     then: [
                                       filling < 1,
+                                      // A fault after an earlier refill beat
+                                      // must not leave the victim's old tag
+                                      // pointing at partially overwritten data.
+                                      ...List.generate(
+                                        numLines,
+                                        (l) => If(
+                                          idxOf(addrQ).eq(l),
+                                          then: [lineValid[l] < 0],
+                                        ),
+                                      ),
                                       memEnR < 1,
                                       memWeR < 0,
                                       // Read a FULL word per fill beat. wordBytes
