@@ -79,7 +79,7 @@ void main() {
                 address == replacement + faultWord * wordBytes;
             drive('mem_done', done ? 1 : 0);
             drive('mem_valid', done && !fault ? 1 : 0);
-            if (instruction) drive('mem_fault', fault ? 1 : 0);
+            drive('mem_fault', fault ? 1 : 0);
             if (done && !fault) drive('mem_rdata', dataAt(address));
           }
 
@@ -122,10 +122,14 @@ void main() {
             ]);
             final beforeRecovery = reads.length;
             await request(victim);
-            expect(reads.sublist(beforeRecovery), [
-              for (var w = 0; w < lineSize ~/ wordBytes; w++)
-                victim + w * wordBytes,
-            ], reason: 'failed replacement must force the victim to refill');
+            expect(
+              reads.sublist(beforeRecovery),
+              [
+                for (var w = 0; w < lineSize ~/ wordBytes; w++)
+                  victim + w * wordBytes,
+              ],
+              reason: 'failed replacement must force the victim to refill',
+            );
             for (var w = 1; w < lineSize ~/ wordBytes; w++) {
               await request(victim + w * wordBytes);
             }
