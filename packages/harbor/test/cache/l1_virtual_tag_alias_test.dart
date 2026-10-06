@@ -116,11 +116,14 @@ void main() {
         config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
         xlen: 64,
         ctxBits: ctxBits,
+        memFaultIn: ports['mem_fault'],
         // Sv39: the request is a 39-bit canonical virtual address.
         reqAddrBits: 39,
       );
       cache.port('clk').getsLogic(clk);
-      ports.forEach((n, l) => cache.port(n).getsLogic(l));
+      ports.forEach((n, l) {
+        if (n != 'mem_fault') cache.port(n).getsLogic(l);
+      });
       await cache.build();
       ports.forEach((n, l) => l.inject(0));
       ports['reset']!.inject(1);

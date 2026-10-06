@@ -134,9 +134,12 @@ Future<_Dut> makeDut({
     xlen: 64,
     ctxBits: ctxBits,
     reqAddrBits: reqAddrBits,
+    memFaultIn: ports['mem_fault'],
   );
   cache.port('clk').getsLogic(clk);
-  ports.forEach((n, l) => cache.port(n).getsLogic(l));
+  ports.forEach((n, l) {
+    if (n != 'mem_fault') cache.port(n).getsLogic(l);
+  });
   await cache.build();
 
   ports['reset']!.inject(1);
