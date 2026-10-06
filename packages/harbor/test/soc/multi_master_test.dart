@@ -38,7 +38,10 @@ class _IdleMaster extends BridgeModule {
 /// two masters contending on a shared peripheral through the arbiter.
 class _RwMaster extends BridgeModule {
   _RwMaster(WishboneConfig cfg, int addr, int value, {String? name})
-    : super('RwMaster', name: name ?? 'rw_master') {
+    : super(
+        cfg.useErr ? 'RwMaster_${name ?? "default"}' : 'RwMaster',
+        name: name ?? 'rw_master',
+      ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('start', PortDirection.input);
@@ -133,6 +136,7 @@ class _RwMaster extends BridgeModule {
         Const((1 << cfg.effectiveSelWidth) - 1, width: cfg.effectiveSelWidth);
     done <= doneReg;
     rdata <= rdReg;
+    if (cfg.useErr) addOutput('error') <= bus.err!;
   }
 }
 
@@ -140,6 +144,127 @@ void main() {
   tearDown(() async {
     await Simulator.reset();
   });
+
+  for (final topology in ['single', 'private', 'shared']) {
+    for (final pipeline in [false, true]) {
+      test(
+        'ACK-only slaves have defined ERR: $topology pipeline=$pipeline',
+        () async {
+          const cfg = WishboneConfig(
+            addressWidth: 32,
+            dataWidth: 32,
+            useErr: true,
+          );
+          final soc = HarborSoC(
+            name: 'ErrorSoC',
+            compatible: 'test,error',
+            busConfig: cfg,
+          );
+          final a = _RwMaster(cfg, 0x20, 0x12345678, name: 'cpu');
+          final b = _RwMaster(
+            cfg,
+            topology == 'private' ? 0x1040 : 0x40,
+            0x76543210,
+            name: 'dma',
+          );
+          soc.addMaster(a, busInterfaceName: 'bus');
+          if (topology != 'single') {
+            soc.addMaster(b, busInterfaceName: 'bus', channel: 'dma');
+          }
+          soc.addPeripheral(
+            HarborSram(
+              baseAddress: 0,
+              size: 4096,
+              busAddressWidth: 32,
+              name: 'ram_a',
+            ),
+          );
+          if (topology == 'private') {
+            // Give the private decoders different slave counts so this fixture
+            // does not collide on ROHD's reserved WishboneDecoder_S1 name.
+            soc.addPeripheral(
+              HarborSram(
+                baseAddress: 8192,
+                size: 4096,
+                busAddressWidth: 32,
+                name: 'spare',
+              ),
+            );
+            soc.addPeripheral(
+              HarborSram(
+                baseAddress: 4096,
+                size: 4096,
+                busAddressWidth: 32,
+                name: 'ram_b',
+              ),
+            );
+          }
+          soc.buildFabric(
+            pipeline: pipeline,
+            channelSlaves: topology == 'single'
+                ? null
+                : {
+                    'primary': {'ram_a', if (topology == 'private') 'spare'},
+                    'dma': {topology == 'private' ? 'ram_b' : 'ram_a'},
+                  },
+          );
+          final clk = SimpleClockGenerator(10).clk;
+          final reset = Logic()..inject(1);
+          final start = Logic()..inject(0);
+          soc.input('clk').srcConnection! <= clk;
+          soc.input('reset').srcConnection! <= reset;
+          final masters = [a, if (topology != 'single') b];
+          for (final master in masters) {
+            master.input('start').srcConnection! <= start;
+          }
+          await soc.build();
+          // Also exercise RTL generation, not only ROHD evaluation.
+          final rtl = soc.generateSynth();
+          Simulator.setMaxSimTime(10000);
+          unawaited(Simulator.run());
+          try {
+            await clk.nextNegedge;
+            await clk.nextNegedge;
+            reset.inject(0);
+            start.inject(1);
+            await clk.nextNegedge;
+            start.inject(0);
+            var completed = false;
+            for (var i = 0; i < 200; i++) {
+              await clk.nextNegedge;
+              for (final master in masters) {
+                expect(
+                  master.output('error').value,
+                  LogicValue.zero,
+                  reason: 'ACK-only peripheral must not leave ERR floating',
+                );
+              }
+              if (masters.every((m) => m.output('done').value.toBool())) {
+                completed = true;
+                break;
+              }
+            }
+            expect(completed, isTrue);
+            expect(
+              rtl,
+              contains(
+                topology == 'shared'
+                    ? ".slave_ERR(1'h0)"
+                    : ".slave_0_ERR(1'h0)",
+              ),
+            );
+            expect(a.output('rdata').value.toInt(), 0x12345678);
+            if (topology != 'single') {
+              expect(b.output('rdata').value.toInt(), 0x76543210);
+            }
+          } finally {
+            await Simulator.endSimulation();
+            await Simulator.simulationEnded;
+          }
+        },
+      );
+    }
+  }
 
   test('buildFabric inserts a WishboneArbiter for >1 master', () async {
     const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
