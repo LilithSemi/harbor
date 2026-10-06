@@ -114,20 +114,21 @@ class HarborL1ICache extends BridgeModule {
   /// done AND valid.
   Logic get memFault => input('mem_fault');
 
-  /// Fetch page fault to the pipeline. Held with resp done AND not valid for the
-  /// faulting request, so the FetchUnit raises an instruction page fault instead
-  /// of the cache hanging on a fill that can never complete.
+  /// Fetch fault to the pipeline. Held with resp done AND not valid for the
+  /// faulting request. Consumers that do not inspect [respFaultIsAccess] still
+  /// complete and trap the request safely.
   Logic get respFault => output('resp_fault');
 
-  /// Physical instruction access fault from the refill memory path. Held for
-  /// the faulting request until fetch redirects, like [respFault].
-  Logic get respAccessFault => output('resp_access_fault');
+  /// Qualifies [respFault]: high for a physical access fault, low for a page
+  /// fault. Meaningful only while [respFault] is high.
+  Logic get respFaultIsAccess => output('resp_fault_is_access');
 
   HarborL1ICache({
     required this.config,
     this.xlen = 64,
     this.dualPort = false,
     this.ctxBits = 0,
+    Logic? memFaultIn,
     // Significant low bits of [reqAddr]: the tag store and compares are sized to
     // this instead of [xlen], so a cache over a narrow map does not pay for a
     // full 64-bit tag. Null = xlen. See the note on tag width below.
@@ -157,7 +158,7 @@ class HarborL1ICache extends BridgeModule {
     addOutput('resp_data', width: xlen);
     addOutput('resp_valid');
     addOutput('resp_fault');
-    addOutput('resp_access_fault');
+    addOutput('resp_fault_is_access');
     addOutput('miss');
     if (dualPort) {
       createPort('req_addr1', PortDirection.input, width: xlen);
@@ -171,7 +172,9 @@ class HarborL1ICache extends BridgeModule {
     createPort('mem_done', PortDirection.input);
     createPort('mem_valid', PortDirection.input);
     createPort('mem_rdata', PortDirection.input, width: xlen);
-    createPort('mem_fault', PortDirection.input);
+    // Default to page fault for backwards compatibility: an old consumer that
+    // does not wire classification must still complete and trap, never float.
+    addInput('mem_fault', memFaultIn ?? (Logic()..put(0)));
 
     final clk = input('clk');
     final reset = input('reset');
@@ -364,8 +367,8 @@ class HarborL1ICache extends BridgeModule {
     // respFault) with valid low, so the FetchUnit raises the instruction page
     // fault instead of retrying. Gated to the held request so a stale latch never
     // faults an unrelated fetch.
-    respFault <= faultHeld & faultIsPage;
-    respAccessFault <= faultHeld & ~faultIsPage;
+    respFault <= faultHeld;
+    respFaultIsAccess <= faultHeld & ~faultIsPage;
     miss <= miss0;
     if (dualPort) {
       respData1 <= dataRam.readData(1);
@@ -608,10 +611,9 @@ class HarborL1DCache extends BridgeModule {
   /// once memory acknowledges the write.
   Logic get respValid => output('resp_valid');
 
-  /// High for one cycle when the memory response for this op was a FAULT
-  /// (`mem_done` with `mem_valid` low, which is how the MMU reports a page
-  /// fault). The core raises done AND not valid from it so the exec unit takes a
-  /// load/store page fault.
+  /// High for one cycle when the memory response for this op was a fault. A
+  /// consumer that does not inspect [respFaultIsAccess] still completes and
+  /// traps the request safely.
   ///
   /// Without this the fill and bypass FSMs only ever complete on
   /// `mem_done & mem_valid`, so a faulting access left them asserted FOREVER and
@@ -620,9 +622,9 @@ class HarborL1DCache extends BridgeModule {
   /// I-cache has had the equivalent path; the D-cache never did.
   Logic get respFault => output('resp_fault');
 
-  /// High for one cycle when the failed memory response was a physical access
-  /// fault rather than a translation/page fault.
-  Logic get respAccessFault => output('resp_access_fault');
+  /// Qualifies [respFault]: high for a physical access fault, low for a page
+  /// fault. Meaningful only while [respFault] is high.
+  Logic get respFaultIsAccess => output('resp_fault_is_access');
   Logic get miss => output('miss');
   Logic get busy => output('busy');
 
@@ -648,6 +650,7 @@ class HarborL1DCache extends BridgeModule {
     this.xlen = 64,
     this.cacheableBase = 0x80000000,
     this.ctxBits = 0,
+    Logic? memFaultIn,
     // Significant low bits of [reqAddr]. See the note on tag width below.
     int? reqAddrBits,
     HarborDeviceTarget? target,
@@ -676,7 +679,7 @@ class HarborL1DCache extends BridgeModule {
     addOutput('resp_data', width: xlen);
     addOutput('resp_valid');
     addOutput('resp_fault');
-    addOutput('resp_access_fault');
+    addOutput('resp_fault_is_access');
     addOutput('miss');
     addOutput('busy');
     // Word-granular memory port.
@@ -688,7 +691,9 @@ class HarborL1DCache extends BridgeModule {
     createPort('mem_done', PortDirection.input);
     createPort('mem_valid', PortDirection.input);
     createPort('mem_rdata', PortDirection.input, width: xlen);
-    createPort('mem_fault', PortDirection.input);
+    // Default to page fault for backwards compatibility: an old consumer that
+    // does not wire classification must still complete and trap, never float.
+    addInput('mem_fault', memFaultIn ?? (Logic()..put(0)));
 
     final clk = input('clk');
     final reset = input('reset');
@@ -931,8 +936,8 @@ class HarborL1DCache extends BridgeModule {
         : [addrQ.slice(byteBits - 1, 0), Const(0, width: 3)].swizzle();
     respData <= mux(bypassDone, bypassData, dataRam.readData(0) >> rdShift);
     respValid <= (loadHit | storeDone | bypassDone);
-    respFault <= faultDone & faultIsPage;
-    respAccessFault <= faultDone & ~faultIsPage;
+    respFault <= faultDone;
+    respFaultIsAccess <= faultDone & ~faultIsPage;
     miss <= loadMiss;
     busy <= (filling | storing | bypassing | drain);
 
