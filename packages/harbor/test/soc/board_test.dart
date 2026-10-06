@@ -42,7 +42,7 @@ void main() {
 
     test('the orangecrab-25f preset carries the 1-bit microSD socket', () {
       final pins = HarborBoard.get('orangecrab-25f').pins;
-      expect(pins['sd_clk'], equals('K1 LVCMOS33'));
+      expect(pins['sd_clk'], equals('K1 LVCMOS33 PULLMODE=DOWN'));
       expect(pins['sd_cmd'], equals('K2 LVCMOS33 PULLMODE=UP'));
       expect(pins['sd_dat0'], equals('J1 LVCMOS33 PULLMODE=UP'));
       // A 1-bit bus reads DAT0 alone, but all four data balls are here. An
@@ -144,6 +144,48 @@ void main() {
       expect(pins['gpdi_dp[2]'], startsWith('A12'));
       expect(pins['gpdi_dp[3]'], startsWith('A17')); // clock pair
       expect(pins['gpdi_dp[0]'], contains('LVCMOS33D'));
+    });
+
+    test('the ulx3s preset exposes the GPDI sideband pins', () {
+      final pins = HarborBoard.get('ulx3s-85f').pins;
+      expect(pins['gpdi_sda'], equals('B19 LVCMOS33 DRIVE=4 PULLMODE=UP'));
+      expect(pins['gpdi_scl'], equals('E12 LVCMOS33 DRIVE=4 PULLMODE=UP'));
+      expect(pins['gpdi_hpd'], equals('B20 LVCMOS33 DRIVE=4'));
+      expect(pins['gpdi_cec'], equals('A18 LVCMOS33 DRIVE=4 PULLMODE=UP'));
+    });
+
+    test('the ulx3s preset exposes the USB device port pins', () {
+      final pins = HarborBoard.get('ulx3s-85f').pins;
+      expect(pins['usb_dp'], equals('D15 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['usb_dm'], equals('E15 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['usb_pullup'], equals('B12 LVCMOS33 DRIVE=16 PULLMODE=NONE'));
+      // The differential-input-only pads and the unused pull-down control
+      // are not in the hardware-proven mapping.
+      expect(pins.containsKey('usb_fpga_dp'), isFalse);
+      expect(pins.containsKey('usb_fpga_pu_dn'), isFalse);
+    });
+
+    test('the ulx3s preset exposes the LED pins', () {
+      final pins = HarborBoard.get('ulx3s-85f').pins;
+      expect(pins['led[0]'], equals('B2 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['led[1]'], equals('C2 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['led[2]'], equals('C1 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['led[3]'], equals('D2 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['led[4]'], equals('D1 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['led[5]'], equals('E2 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['led[6]'], equals('E1 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+      expect(pins['led[7]'], equals('H3 LVCMOS33 DRIVE=4 PULLMODE=NONE'));
+    });
+
+    test('the ulx3s preset exposes the button pins', () {
+      final pins = HarborBoard.get('ulx3s-85f').pins;
+      expect(pins['rst_n'], equals('D6 LVCMOS33 DRIVE=4 PULLMODE=UP'));
+      expect(pins['btn_fire1'], equals('R1 LVCMOS33 DRIVE=4 PULLMODE=DOWN'));
+      expect(pins['btn_fire2'], equals('T1 LVCMOS33 DRIVE=4 PULLMODE=DOWN'));
+      expect(pins['btn_up'], equals('R18 LVCMOS33 DRIVE=4 PULLMODE=DOWN'));
+      expect(pins['btn_down'], equals('V1 LVCMOS33 DRIVE=4 PULLMODE=DOWN'));
+      expect(pins['btn_left'], equals('U1 LVCMOS33 DRIVE=4 PULLMODE=DOWN'));
+      expect(pins['btn_right'], equals('H16 LVCMOS33 DRIVE=4 PULLMODE=DOWN'));
     });
   });
 

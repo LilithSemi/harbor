@@ -153,9 +153,9 @@ class HarborBoard {
 /// ULX3S with the Lattice ECP5 LFE5U-85F (CABGA381), 25 MHz oscillator.
 ///
 /// Fully open toolchain (yosys + nextpnr + trellis) with GPDI/HDMI display
-/// output. The catalog currently covers the oscillator and the FTDI console
-/// UART. LEDs, the button, and the GPDI pairs are added with verified sites as
-/// the bring-up needs them.
+/// output. The catalog covers the oscillator, the FTDI console UART, the GPDI
+/// TMDS lanes and sideband, the LEDs, and the buttons. Sites come from the
+/// upstream `ulx3s_v20.lpf` constraint file (emard/ulx3s).
 const _ulx3s85f = HarborBoard(
   name: 'ulx3s-85f',
   vendor: HarborFpgaVendor.ecp5,
@@ -173,6 +173,43 @@ const _ulx3s85f = HarborBoard(
     'gpdi_dp[1]': 'A14 LVCMOS33D DRIVE=4',
     'gpdi_dp[2]': 'A12 LVCMOS33D DRIVE=4',
     'gpdi_dp[3]': 'A17 LVCMOS33D DRIVE=4',
+    // GPDI sideband. sda and scl are an I2C bus shared with the on-board
+    // RTC, so a driver must not assume it owns the bus.
+    'gpdi_sda': 'B19 LVCMOS33 DRIVE=4 PULLMODE=UP',
+    'gpdi_scl': 'E12 LVCMOS33 DRIVE=4 PULLMODE=UP',
+    'gpdi_hpd': 'B20 LVCMOS33 DRIVE=4',
+    'gpdi_cec': 'A18 LVCMOS33 DRIVE=4 PULLMODE=UP',
+    // USB device port ("US2" on the schematic), wired straight to the FPGA
+    // and not through the FTDI chip. Confirmed on real hardware: a bitstream
+    // with this mapping enumerates over USB.
+    //
+    // usb_fpga_dp/dn (E16/F16) are differential input only and cannot
+    // transmit, so they are not usable for a device port and are left out.
+    // usb_fpga_pu_dn (C12) is left out too: the hardware-proven build does
+    // not constrain it.
+    'usb_dp': 'D15 LVCMOS33 DRIVE=4 PULLMODE=NONE', // usb_fpga_bd_dp
+    'usb_dm': 'E15 LVCMOS33 DRIVE=4 PULLMODE=NONE', // usb_fpga_bd_dn
+    'usb_pullup': 'B12 LVCMOS33 DRIVE=16 PULLMODE=NONE', // usb_fpga_pu_dp
+    // LEDs. Active high, no inversion noted upstream.
+    'led[0]': 'B2 LVCMOS33 DRIVE=4 PULLMODE=NONE',
+    'led[1]': 'C2 LVCMOS33 DRIVE=4 PULLMODE=NONE',
+    'led[2]': 'C1 LVCMOS33 DRIVE=4 PULLMODE=NONE',
+    'led[3]': 'D2 LVCMOS33 DRIVE=4 PULLMODE=NONE',
+    'led[4]': 'D1 LVCMOS33 DRIVE=4 PULLMODE=NONE',
+    'led[5]': 'E2 LVCMOS33 DRIVE=4 PULLMODE=NONE',
+    'led[6]': 'E1 LVCMOS33 DRIVE=4 PULLMODE=NONE',
+    'led[7]': 'H3 LVCMOS33 DRIVE=4 PULLMODE=NONE',
+    // BTN_PWRn. It is ACTIVE LOW (pressed reads 0), while the SoC top port
+    // `reset` is active high, so a design must invert this pin, same as
+    // OrangeCrab's rst_n.
+    'rst_n': 'D6 LVCMOS33 DRIVE=4 PULLMODE=UP',
+    // Fire and direction buttons. Active high, pulled down when idle.
+    'btn_fire1': 'R1 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
+    'btn_fire2': 'T1 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
+    'btn_up': 'R18 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
+    'btn_down': 'V1 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
+    'btn_left': 'U1 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
+    'btn_right': 'H16 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
   },
   // openFPGALoader knows the ULX3S. Loads the bitstream over USB.
   progCommand: 'openFPGALoader -b ulx3s \$(TOP).bit',
