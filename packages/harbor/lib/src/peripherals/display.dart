@@ -106,6 +106,20 @@ class HarborDisplayTiming with HarborPrettyString {
       hSyncPositive = false,
       vSyncPositive = false;
 
+  /// SVGA (800x600 @ 60 Hz).
+  const HarborDisplayTiming.svga800x600()
+    : hActive = 800,
+      hFrontPorch = 40,
+      hSyncWidth = 128,
+      hBackPorch = 88,
+      vActive = 600,
+      vFrontPorch = 1,
+      vSyncWidth = 4,
+      vBackPorch = 23,
+      pixelClock = 40000000,
+      hSyncPositive = true,
+      vSyncPositive = true;
+
   /// 720p (1280x720 @ 60 Hz).
   const HarborDisplayTiming.hd720()
     : hActive = 1280,

@@ -45,6 +45,9 @@ class HarborDualClockDisplay extends Module {
   final HarborDisplayTiming timing;
   final HarborDisplayInterface outputType;
 
+  /// Pixel format read from the framebuffer.
+  final HarborPixelFormat pixelFormat;
+
   HarborDualClockDisplay({
     required this.timing,
     required Logic pixelClk,
@@ -58,10 +61,22 @@ class HarborDualClockDisplay extends Module {
     required Logic mDataIn,
     required Logic mAck,
     this.outputType = HarborDisplayInterface.hdmi,
+    this.pixelFormat = HarborPixelFormat.xrgb8888,
     required HarborDeviceTarget target,
     super.name = 'dual_clock_display',
   }) : super(definitionName: 'HarborDualClockDisplay') {
     requireDisplayOutputSupported(outputType);
+    if (pixelFormat == HarborPixelFormat.rgb888) {
+      throw ArgumentError(
+        'rgb888 does not fit the 32-bit scanout word layout.',
+      );
+    }
+    if (pixelFormat == HarborPixelFormat.rgb565 && timing.hActive.isOdd) {
+      throw ArgumentError(
+        'rgb565 needs an even hActive (got ${timing.hActive}).',
+      );
+    }
+    final rgb565 = pixelFormat == HarborPixelFormat.rgb565;
 
     pixelClk = addInput('pixel_clk', pixelClk);
     pixelReset = addInput('pixel_reset', pixelReset);
@@ -120,6 +135,11 @@ class HarborDualClockDisplay extends Module {
     final lineStart =
         enable & tx.eq(timing.hActive) & ty.lt(timing.vActive - 1);
 
+    // rgb565 packs two pixels in each word. The word is tx >> 1 and the half
+    // is tx bit 0. The buffer read is combinational, so no extra register.
+    final wordsPerLine = rgb565 ? timing.hActive ~/ 2 : timing.hActive;
+    final scanoutCol = rgb565 ? tx.getRange(1, tx.width) : tx;
+
     final scanout = HarborDualClockScanout(
       pixelClk: pixelClk,
       pixelReset: pixelReset,
@@ -127,13 +147,13 @@ class HarborDualClockDisplay extends Module {
       sysReset: sysReset,
       frameStart: frameStart,
       lineStart: lineStart,
-      col: tx,
+      col: scanoutCol,
       fbBase: fbBase,
-      stride: Const(timing.hActive * 4, width: 32),
-      wordsPerLine: Const(timing.hActive, width: 16),
+      stride: Const(timing.hActive * (rgb565 ? 2 : 4), width: 32),
+      wordsPerLine: Const(wordsPerLine, width: 16),
       mDataIn: mDataIn,
       mAck: mAck,
-      maxWords: timing.hActive,
+      maxWords: wordsPerLine,
     );
 
     mStb <= scanout.mStb;
@@ -147,9 +167,29 @@ class HarborDualClockDisplay extends Module {
     final word = scanout.pixel;
     pixelWord <= word;
 
-    final r = mux(deActive, word.getRange(16, 24), Const(0, width: 8));
-    final g = mux(deActive, word.getRange(8, 16), Const(0, width: 8));
-    final b = mux(deActive, word.getRange(0, 8), Const(0, width: 8));
+    Logic r;
+    Logic g;
+    Logic b;
+    if (rgb565) {
+      // Column 0 is the low half (bits 15..0), column 1 the high half
+      // (bits 31..16): little-endian memory order.
+      final halfSel = tx.getRange(0, 1);
+      final half = mux(halfSel, word.getRange(16, 32), word.getRange(0, 16));
+      final r5 = half.getRange(11, 16);
+      final g6 = half.getRange(5, 11);
+      final b5 = half.getRange(0, 5);
+      final r8 = [r5, r5.getRange(2, 5)].swizzle();
+      final g8 = [g6, g6.getRange(4, 6)].swizzle();
+      final b8 = [b5, b5.getRange(2, 5)].swizzle();
+      r = mux(deActive, r8, Const(0, width: 8));
+      g = mux(deActive, g8, Const(0, width: 8));
+      b = mux(deActive, b8, Const(0, width: 8));
+    } else {
+      // argb8888 behaves like xrgb8888: alpha is ignored.
+      r = mux(deActive, word.getRange(16, 24), Const(0, width: 8));
+      g = mux(deActive, word.getRange(8, 16), Const(0, width: 8));
+      b = mux(deActive, word.getRange(0, 8), Const(0, width: 8));
+    }
     red <= r;
     green <= g;
     blue <= b;

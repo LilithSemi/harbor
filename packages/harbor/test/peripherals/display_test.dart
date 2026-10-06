@@ -38,6 +38,18 @@ void main() {
       expect(t.refreshRate, closeTo(60.0, 0.1));
     });
 
+    test('SVGA 800x600 timing', () {
+      const t = HarborDisplayTiming.svga800x600();
+      expect(t.hActive, equals(800));
+      expect(t.vActive, equals(600));
+      expect(t.pixelClock, equals(40000000));
+      expect(t.hSyncPositive, isTrue);
+      expect(t.vSyncPositive, isTrue);
+      expect(t.hTotal, equals(1056));
+      expect(t.vTotal, equals(628));
+      expect(t.refreshRate, closeTo(60.0, 0.5));
+    });
+
     test('hTotal and vTotal', () {
       const t = HarborDisplayTiming.vga640x480();
       expect(t.hTotal, equals(640 + 16 + 96 + 48)); // 800
