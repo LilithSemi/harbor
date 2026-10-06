@@ -721,6 +721,18 @@ class HarborSoC extends BridgeModule {
     );
   }
 
+  // ACK-only peripherals have no ERR response. Tie the missing signal low
+  // rather than leaving an error-enabled fabric input floating.
+  void _connectWishboneSlave(
+    InterfaceReference upstream,
+    InterfaceReference downstream,
+  ) {
+    final up = upstream.interface as WishboneInterface;
+    final down = downstream.interface as WishboneInterface;
+    if (up.err != null && down.err == null) up.err! <= Const(0);
+    connectInterfaces(upstream, downstream);
+  }
+
   /// The historic one-fabric path: all masters -> one arbiter -> one decoder ->
   /// all slaves. Kept verbatim so its emitted netlist stays byte identical.
   void _buildSingleChannelWishboneFabric(
@@ -777,7 +789,7 @@ class HarborSoC extends BridgeModule {
 
     // Connect decoder's slave interfaces to the primary + secondary slaves.
     for (var i = 0; i < slaves.length; i++) {
-      connectInterfaces(
+      _connectWishboneSlave(
         decoder.interface('slave_$i'),
         slaves[i].module.interface(slaves[i].iface),
       );
@@ -896,7 +908,7 @@ class HarborSoC extends BridgeModule {
       final ds = drivers[gi]!;
       final slaveIface = slaves[gi].module.interface(slaves[gi].iface);
       if (ds.length == 1) {
-        connectInterfaces(ds[0], slaveIface);
+        _connectWishboneSlave(ds[0], slaveIface);
         continue;
       }
       if (converge != HarborMemConverge.arbiter) {
@@ -915,7 +927,7 @@ class HarborSoC extends BridgeModule {
       for (var i = 0; i < ds.length; i++) {
         connectInterfaces(ds[i], conv.interface('master_$i'));
       }
-      connectInterfaces(conv.interface('slave'), slaveIface);
+      _connectWishboneSlave(conv.interface('slave'), slaveIface);
     }
   }
 
