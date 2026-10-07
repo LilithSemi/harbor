@@ -55,6 +55,22 @@ abstract interface class HarborJtagDebug {
   int? get jtagDmIdcode;
 }
 
+/// Xilinx 7-series family for the Vivado/openXC7 vendors.
+///
+/// Set once by each Xilinx constructor. [HarborFpgaTarget._prjxrayFamily]
+/// reads this instead of parsing [HarborFpgaTarget.name], so the prjxray-db
+/// directory name a target maps to never depends on the `name` string.
+enum _XilinxFamily {
+  /// prjxray-db directory `spartan7`.
+  spartan7,
+
+  /// prjxray-db directory `artix7`.
+  artix7,
+
+  /// prjxray-db directory `kintex7`.
+  kintex7,
+}
+
 /// FPGA target with vendor-specific toolchain configuration.
 ///
 /// ```dart
@@ -118,9 +134,15 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// target is emitted.
   final String? progCommand;
 
+  /// The Xilinx 7-series family, or null for a non-Xilinx vendor.
+  ///
+  /// Set by the constructor, not derived from [vendor] or [name], so a new
+  /// Xilinx family only has to set this field.
+  final _XilinxFamily? _xilinxFamily;
+
   /// Whether this FPGA supports eFuse OTP storage.
   ///
-  /// ECP5 and Spartan 7 have eFuse support for user data and
+  /// ECP5 and Xilinx 7-series have eFuse support for user data and
   /// security keys. iCE40 does not.
   bool get hasEfuse => switch (vendor) {
     HarborFpgaVendor.ice40 => false,
@@ -168,7 +190,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
     this.progCommand,
-  });
+  }) : _xilinxFamily = null;
 
   /// iCE40 UP5K target using Yosys + nextpnr-ice40.
   const HarborFpgaTarget.ice40({
@@ -180,7 +202,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.clockPortName = 'clk',
     this.progCommand,
   }) : name = 'ice40-$device',
-       vendor = HarborFpgaVendor.ice40;
+       vendor = HarborFpgaVendor.ice40,
+       _xilinxFamily = null;
 
   /// Lattice ECP5 target using Yosys + nextpnr-ecp5.
   const HarborFpgaTarget.ecp5({
@@ -192,9 +215,13 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.clockPortName = 'clk',
     this.progCommand,
   }) : name = 'ecp5-$device',
-       vendor = HarborFpgaVendor.ecp5;
+       vendor = HarborFpgaVendor.ecp5,
+       _xilinxFamily = null;
 
-  /// Xilinx Spartan 7 target using Vivado or openXC7.
+  /// Xilinx Spartan-7 target using Vivado or openXC7.
+  ///
+  /// The default flow is Vivado. Spartan-7 also runs on openXC7 with
+  /// useOpenXc7: true.
   const HarborFpgaTarget.spartan7({
     required this.device,
     required this.package,
@@ -205,7 +232,42 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
   }) : name = 'spartan7-$device',
-       vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado;
+       vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
+       _xilinxFamily = _XilinxFamily.spartan7;
+
+  /// Xilinx Artix-7 target using Vivado or openXC7.
+  ///
+  /// The default flow is Vivado. Artix-7 also runs on openXC7 with
+  /// useOpenXc7: true.
+  const HarborFpgaTarget.artix7({
+    required this.device,
+    required this.package,
+    this.frequency = 0,
+    this.pinMap = const {},
+    this.extraConstraints = const {},
+    this.clockPortName = 'clk',
+    this.progCommand,
+    bool useOpenXc7 = false,
+  }) : name = 'artix7-$device',
+       vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
+       _xilinxFamily = _XilinxFamily.artix7;
+
+  /// Xilinx Kintex-7 target using Vivado or openXC7.
+  ///
+  /// The default flow is Vivado. Kintex-7 also runs on openXC7 with
+  /// useOpenXc7: true.
+  const HarborFpgaTarget.kintex7({
+    required this.device,
+    required this.package,
+    this.frequency = 0,
+    this.pinMap = const {},
+    this.extraConstraints = const {},
+    this.clockPortName = 'clk',
+    this.progCommand,
+    bool useOpenXc7 = false,
+  }) : name = 'kintex7-$device',
+       vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
+       _xilinxFamily = _XilinxFamily.kintex7;
 
   /// Yosys synthesis target string for this FPGA family.
   String get _yosysSynthTarget => switch (vendor) {
@@ -226,12 +288,43 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// prjxray architecture family string for the openXC7 flow.
   ///
   /// Used as the `fasm2frames --db-root $(XRAY_DB)/<family>` segment and the
-  /// `xc7frames2bit --part_file $(XRAY_DB)/<family>/<part>/part.yaml` path. Only
-  /// meaningful for the Xilinx vendors (empty otherwise).
-  String get _prjxrayFamily => switch (vendor) {
-    HarborFpgaVendor.vivado || HarborFpgaVendor.openXc7 => 'spartan7',
-    HarborFpgaVendor.ice40 || HarborFpgaVendor.ecp5 => '',
-  };
+  /// `xc7frames2bit --part_file $(XRAY_DB)/<family>/<part>/part.yaml` path.
+  /// Matches a prjxray-db top-level directory name (`spartan7`, `artix7`,
+  /// `kintex7`). Empty for a non-Xilinx vendor.
+  ///
+  /// [_xilinxFamily] is null for a target built through the plain
+  /// [HarborFpgaTarget] constructor (for example [HarborBoard.fpgaTarget]),
+  /// which has no family-specific constructor to set it. For a Xilinx vendor
+  /// this falls back to the [device] part prefix rather than returning an
+  /// empty string, so a target built this way still gets a real prjxray
+  /// path instead of a silently broken one; an unrecognised prefix throws,
+  /// since a wrong guess here is worse than a loud failure.
+  String get _prjxrayFamily {
+    final family = _xilinxFamily;
+    if (family != null) {
+      return switch (family) {
+        _XilinxFamily.spartan7 => 'spartan7',
+        _XilinxFamily.artix7 => 'artix7',
+        _XilinxFamily.kintex7 => 'kintex7',
+      };
+    }
+    switch (vendor) {
+      case HarborFpgaVendor.ice40:
+      case HarborFpgaVendor.ecp5:
+        return '';
+      case HarborFpgaVendor.vivado:
+      case HarborFpgaVendor.openXc7:
+        final lower = device.toLowerCase();
+        if (lower.startsWith('xc7s')) return 'spartan7';
+        if (lower.startsWith('xc7a')) return 'artix7';
+        if (lower.startsWith('xc7k')) return 'kintex7';
+        throw StateError(
+          'Cannot infer the prjxray family for Xilinx device "$device". '
+          'Build this target with HarborFpgaTarget.spartan7, .artix7 or '
+          '.kintex7 instead of the plain constructor.',
+        );
+    }
+  }
 
   /// Generates a Yosys synthesis TCL script for this FPGA target.
   ///
@@ -326,6 +419,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   }
 
   /// Boundary-scan TAP IR length for this FPGA family.
+  ///
+  /// Every 7-series part (Spartan-7, Artix-7, Kintex-7) shares the same
+  /// 6-bit instruction register, per UG470 (7 Series FPGAs Configuration
+  /// User Guide) chapter 6, JTAG Boundary-Scan.
   int get jtagIrLength => switch (vendor) {
     HarborFpgaVendor.vivado || HarborFpgaVendor.openXc7 => 6, // Xilinx 7-series
     HarborFpgaVendor.ecp5 => 8,

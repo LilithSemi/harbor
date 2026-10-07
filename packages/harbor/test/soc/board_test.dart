@@ -245,6 +245,29 @@ void main() {
     });
   });
 
+  group('HarborBoard.fpgaTarget on the Arty S7 (openXC7, Xilinx)', () {
+    // Regression: HarborBoard.fpgaTarget builds its target through the
+    // plain HarborFpgaTarget constructor, which has no family-specific
+    // constructor to set the family from. The prjxray family must still
+    // resolve to spartan7 for this board, same as before family tracking
+    // was added to HarborFpgaTarget.
+    test('generated Makefile uses the spartan7 prjxray family', () {
+      final target = HarborBoard.get('arty-s7-50').fpgaTarget();
+      final makefile = target.generateMakefile('my_soc');
+      expect(makefile, contains('FAMILY = spartan7'));
+      expect(
+        makefile,
+        contains('fasm2frames --db-root \$(XRAY_DB)/\$(FAMILY)'),
+      );
+      expect(
+        makefile,
+        contains(
+          'xc7frames2bit --part_file \$(XRAY_DB)/\$(FAMILY)/\$(PART)/part.yaml',
+        ),
+      );
+    });
+  });
+
   group('HarborFpgaTarget programming and clock', () {
     test('no prog target without a progCommand', () {
       const target = HarborFpgaTarget.ecp5(

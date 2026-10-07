@@ -89,6 +89,168 @@ void main() {
     });
   });
 
+  group('HarborFpgaTarget.artix7', () {
+    test('name', () {
+      const target = HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+      );
+      expect(target.name, equals('artix7-xc7a200t'));
+    });
+
+    test('vivado vendor by default', () {
+      const target = HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+      );
+      expect(target.vendor, equals(HarborFpgaVendor.vivado));
+      expect(target.constraintExtension, equals('xdc'));
+    });
+
+    test('openXc7 vendor when flag set', () {
+      const target = HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+        useOpenXc7: true,
+      );
+      expect(target.vendor, equals(HarborFpgaVendor.openXc7));
+      expect(target.constraintExtension, equals('xdc'));
+    });
+
+    test('jtagIrLength is 6, same as every 7-series part', () {
+      const target = HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+      );
+      expect(target.jtagIrLength, equals(6));
+    });
+
+    test('generateYosysTcl targets xilinx synth, not spartan7-specific', () {
+      const target = HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+      );
+      final result = target.generateYosysTcl('TopCell');
+      expect(result, contains('synth_xilinx'));
+    });
+
+    test('openXc7 Makefile uses the artix7 prjxray family', () {
+      const target = HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+        useOpenXc7: true,
+      );
+      final mk = target.generateMakefile('TopCell');
+      expect(mk, contains('FAMILY = artix7'));
+      expect(mk, isNot(contains('FAMILY = spartan7')));
+      expect(mk, contains('nextpnr-xilinx'));
+    });
+  });
+
+  group('HarborFpgaTarget.kintex7', () {
+    test('name', () {
+      const target = HarborFpgaTarget.kintex7(
+        device: 'xc7k325t',
+        package: 'ffg676',
+      );
+      expect(target.name, equals('kintex7-xc7k325t'));
+    });
+
+    test('vivado vendor by default', () {
+      const target = HarborFpgaTarget.kintex7(
+        device: 'xc7k325t',
+        package: 'ffg676',
+      );
+      expect(target.vendor, equals(HarborFpgaVendor.vivado));
+      expect(target.constraintExtension, equals('xdc'));
+    });
+
+    test('openXc7 vendor when flag set', () {
+      const target = HarborFpgaTarget.kintex7(
+        device: 'xc7k325t',
+        package: 'ffg676',
+        useOpenXc7: true,
+      );
+      expect(target.vendor, equals(HarborFpgaVendor.openXc7));
+      expect(target.constraintExtension, equals('xdc'));
+    });
+
+    test('jtagIrLength is 6, same as every 7-series part', () {
+      const target = HarborFpgaTarget.kintex7(
+        device: 'xc7k325t',
+        package: 'ffg676',
+      );
+      expect(target.jtagIrLength, equals(6));
+    });
+
+    test('generateYosysTcl targets xilinx synth, not spartan7-specific', () {
+      const target = HarborFpgaTarget.kintex7(
+        device: 'xc7k325t',
+        package: 'ffg676',
+      );
+      final result = target.generateYosysTcl('TopCell');
+      expect(result, contains('synth_xilinx'));
+    });
+
+    test('openXc7 Makefile uses the kintex7 prjxray family', () {
+      const target = HarborFpgaTarget.kintex7(
+        device: 'xc7k325t',
+        package: 'ffg676',
+        useOpenXc7: true,
+      );
+      final mk = target.generateMakefile('TopCell');
+      expect(mk, contains('FAMILY = kintex7'));
+      expect(mk, isNot(contains('FAMILY = spartan7')));
+      expect(mk, contains('nextpnr-xilinx'));
+    });
+  });
+
+  group('HarborFpgaTarget prjxray family fallback (plain constructor)', () {
+    // The plain constructor (used by HarborBoard.fpgaTarget, among others)
+    // has no family-specific constructor to set the family from, so the
+    // family must come from the device part prefix instead of silently
+    // going empty.
+    test('infers spartan7 from an xc7s device', () {
+      const target = HarborFpgaTarget(
+        name: 'custom',
+        vendor: HarborFpgaVendor.openXc7,
+        device: 'xc7s50',
+        package: 'csga324',
+      );
+      expect(target.generateMakefile('TopCell'), contains('FAMILY = spartan7'));
+    });
+
+    test('infers artix7 from an xc7a device', () {
+      const target = HarborFpgaTarget(
+        name: 'custom',
+        vendor: HarborFpgaVendor.openXc7,
+        device: 'xc7a200t',
+        package: 'fbg484',
+      );
+      expect(target.generateMakefile('TopCell'), contains('FAMILY = artix7'));
+    });
+
+    test('infers kintex7 from an xc7k device', () {
+      const target = HarborFpgaTarget(
+        name: 'custom',
+        vendor: HarborFpgaVendor.openXc7,
+        device: 'xc7k325t',
+        package: 'ffg676',
+      );
+      expect(target.generateMakefile('TopCell'), contains('FAMILY = kintex7'));
+    });
+
+    test('throws for an unrecognised Xilinx device prefix', () {
+      const target = HarborFpgaTarget(
+        name: 'custom',
+        vendor: HarborFpgaVendor.openXc7,
+        device: 'xc7v2000t',
+        package: 'flg1925',
+      );
+      expect(() => target.generateMakefile('TopCell'), throwsStateError);
+    });
+  });
+
   group('HarborFpgaTarget generation', () {
     test('generateConstraints returns non-empty string', () {
       const target = HarborFpgaTarget.ice40(
