@@ -39,9 +39,10 @@ void main() {
     test('usedDomains tracks assignments', () {
       final pdi = HarborPowerDomainIntegration(pmu: pmu);
       final uart = HarborUart(baseAddress: 0x10000000);
-      final ddr = HarborDdrController(
+      final ddr = HarborDdr3(
         baseAddress: 0x10006000,
         config: const HarborDdrConfig.orangeCrab(),
+        clockHz: 48000000,
       );
 
       pdi.assign(uart, domain: 1);

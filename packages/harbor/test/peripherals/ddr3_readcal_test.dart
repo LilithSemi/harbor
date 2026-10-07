@@ -79,9 +79,11 @@ void main() {
       var reachedWrite = false;
       for (var i = 0; i < 30000 && !reachedWrite; i++) {
         await clk.nextPosedge;
-        final st = ctrl.debug1.value;
+        // Only the state field: other debug1 bits (cap_valid) stay X until
+        // the first ANALYZE_DATA.
+        final st = ctrl.debug1.value.getRange(0, 6);
         if (st.isValid) {
-          final s = st.toInt() & 0x3F;
+          final s = st.toInt();
           statesSeen.add(s);
           if (s == 9) reachedWrite = true; // ISSUE_WRITE_1 (write phase)
         }

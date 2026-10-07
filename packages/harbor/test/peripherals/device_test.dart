@@ -148,15 +148,17 @@ void main() {
     });
   });
 
-  group('HarborDdrController', () {
+  group('HarborDdr3', () {
     test('creates with correct config', () {
-      final ddr = HarborDdrController(
+      final ddr = HarborDdr3(
         config: const HarborDdrConfig.orangeCrab(),
         baseAddress: 0x40000000,
+        clockHz: 48000000,
       );
       expect(ddr.bus, isNotNull);
       final dt = ddr.dtNode;
       expect(dt.compatible.first, equals('harbor,sdram-controller'));
+      expect(dt.compatible, contains('harbor,ddr3-sdram'));
       expect(dt.reg.size, equals(128 * 1024 * 1024));
       expect(dt.properties['sdram-type'], equals('ddr3'));
     });

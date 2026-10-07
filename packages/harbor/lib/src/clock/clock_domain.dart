@@ -97,10 +97,10 @@ class HarborClockConfig with HarborPrettyString {
   /// structure. Ignored when [isPrimary].
   final bool forcePll;
 
-  /// Optional CLKOS secondary clock derived from the SAME PLL as this domain.
+  /// Optional CLKOS secondary clock derived from the same PLL as this domain.
   ///
   /// When set, this domain is the PLL primary (CLKOP) and the named secondary
-  /// is a CLKOS output off the SAME VCO, sharing one EHXPLLL and one LOCK. This
+  /// is a CLKOS output off the same VCO, sharing one EHXPLLL and one LOCK. This
   /// exists because a SECOND EHXPLLL on the ECP5 may not lock on silicon (the
   /// 2nd PLL site's clock-input routing): collapsing two related clocks (e.g. a
   /// 144 MHz DDR CK and a 24 MHz core) into one PLL avoids that failure. The
@@ -885,7 +885,7 @@ class HarborClockGenerator {
   }
 
   /// Creates a [config] clock domain plus a [secondaryFrequency] clock derived
-  /// from the SAME PLL. On ECP5 this is one EHXPLLL driving CLKOP (primary) and
+  /// from the same PLL. On ECP5 this is one EHXPLLL driving CLKOP (primary) and
   /// CLKOS (secondary) off a shared VCO, with a single lock signal, so a design
   /// needing two related clocks (e.g. a 125 MHz pixel-serializer clock and its
   /// 25 MHz pixel clock) spends one PLL block instead of two.
@@ -1168,4 +1168,167 @@ class HarborClockGenerator {
     if (pfdFreq < 101000000) return 5;
     return 6;
   }
+}
+
+/// The clocks [Ddr3PhyEcp5] and [HarborDdr3] need off one ECP5 EHXPLLL: the
+/// full-rate DDR3 CK and the CK/4 controller clock, aligned to the same VCO
+/// edge. [ddrCk90], [ddrCkDqs], and [idelayRef] mirror [XilinxDdr3Clocks]'s
+/// shape so a genip call site can wire either tree the same way, but
+/// [Ddr3PhyEcp5] does not use any of the three: DQSBUFM makes its own write
+/// strobes once DDRDLLA locks, referenced off [ddrCk] alone. All three are
+/// tied to [ddrCk].
+class Ecp5Ddr3Clocks {
+  const Ecp5Ddr3Clocks({
+    required this.ddrCk,
+    required this.controllerClk,
+    required this.ddrCk90,
+    required this.ddrCkDqs,
+    required this.idelayRef,
+    required this.locked,
+    required this.ddrCkMhz,
+    required this.controllerClkMhz,
+    required this.vcoMhz,
+  });
+
+  /// Full-rate DDR3 CK (EHXPLLL CLKOP), [Ddr3PhyEcp5]'s `ddr3Clk`.
+  final Logic ddrCk;
+
+  /// CK/4 controller clock (EHXPLLL CLKOS), [Ddr3PhyEcp5]'s `controllerClk`.
+  final Logic controllerClk;
+
+  /// Tied to [ddrCk]. [Ddr3PhyEcp5] accepts a `ddr3Clk90` port for the shared
+  /// [Ddr3PhyBase] contract but does not wire it to anything.
+  final Logic ddrCk90;
+
+  /// Tied to [ddrCk]. No ECP5 use (see [ddrCk90]).
+  final Logic ddrCkDqs;
+
+  /// Tied to [ddrCk]. No ECP5 use (see [ddrCk90]).
+  final Logic idelayRef;
+
+  /// EHXPLLL LOCK.
+  final Logic locked;
+
+  /// Realised DDR CK rate.
+  final double ddrCkMhz;
+
+  /// Realised controller clock rate (= [ddrCkMhz] / 4).
+  final double controllerClkMhz;
+
+  /// Realised VCO rate.
+  final double vcoMhz;
+}
+
+/// Builds the ECP5 DDR3 clock tree in [parent]: one EHXPLLL (CLKOP = DDR CK,
+/// CLKOS = CK/4 controller clock) driven by [source] at [sourceHz]. Both
+/// outputs share one VCO so their rising edges stay aligned, the contract
+/// [Ddr3PhyEcp5] and [HarborDdr3] need for the write-launch regear.
+///
+/// Uses [HarborClockGenerator.ecp5PllSolve] as the single validated divider
+/// authority. CLKOP must stay a real, directly-driven output here (it feeds
+/// [Ddr3PhyEcp5]'s `ddr3Clk`), so a solve that needs the highres path
+/// (`clkosDiv` set: CLKOP feedback-only, CLKOS the exact single output) is
+/// rejected rather than silently taken. That path cannot also hand back
+/// CLKOP as a used clock. When the solve picks its CLKOP-direct ("simple")
+/// result instead, that result's `clkiDiv`/`clkfbDiv`/`clkopDiv` are the
+/// same [HarborClockGenerator.ecp5PllDividers] would return for the same
+/// inputs (both call the identical internal search), so this always uses
+/// the one validated, in-band pair either entry point would hand back.
+/// [HarborClockGenerator.ecp5ClkosDiv] then solves the CK/4 secondary off
+/// that same VCO.
+///
+/// Throws [ArgumentError] when [ddrCkHz] does not divide evenly by 4 (no
+/// exact CK/4 target), when the solver has no in-band EHXPLLL solution for
+/// [sourceHz] -> [ddrCkHz], or when the only in-band solution needs the
+/// highres path. A [StateError] double-checks `clkosDiv == 4 * clkopDiv`
+/// after the solve: structurally this is always exact (the CLKOS divide
+/// formula cancels the nominal target, so no rounding can break a clean 1:4
+/// secondary), but the check makes that invariant loud if a future solver
+/// change ever violates it.
+///
+/// [ddrCkHz] defaults to 96 MHz: the litex-boards `gsd_orangecrab.py` proven
+/// setting (`sys_clk_freq=48e6` by default, both as the `BaseSoC` default
+/// and the `--sys-clk-freq` CLI default; `_CRGSDRAM.pll.create_clkout(
+/// cd_sys2x_i, 2*sys_clk_freq)` makes the DDR3 CK, and `ECP5DDRPHY`'s ECLK
+/// runs off that same `sys2x` net). [sourceHz] is the OrangeCrab's 48 MHz
+/// board oscillator (`oscillatorHz: 48000000` in Harbor's board catalog,
+/// `clk48` in `gsd_orangecrab.py`).
+Ecp5Ddr3Clocks buildEcp5Ddr3ClockTree(
+  BridgeModule parent, {
+  required Logic source,
+  required int sourceHz,
+  int ddrCkHz = 96000000,
+  String name = 'ddr3clk',
+}) {
+  if (ddrCkHz % 4 != 0) {
+    throw ArgumentError.value(
+      ddrCkHz,
+      'ddrCkHz',
+      'must divide evenly by 4 for the CK/4 controller clock',
+    );
+  }
+  final controllerHz = ddrCkHz ~/ 4;
+
+  final sol = HarborClockGenerator.ecp5PllSolve(sourceHz, ddrCkHz);
+  if (sol.clkosDiv != null) {
+    throw ArgumentError(
+      'ECP5 DDR3 clock tree: $sourceHz Hz -> $ddrCkHz Hz has no CLKOP-direct '
+      'EHXPLLL solution (the solver only reaches it through the highres '
+      'CLKOS path, which makes CLKOP feedback-only). This tree needs CLKOP '
+      'as the real `ddr3Clk` output, so only a CK the CLKOP-direct search '
+      'reaches is accepted.',
+    );
+  }
+
+  final clkosDiv = HarborClockGenerator.ecp5ClkosDiv(
+    sourceHz,
+    ddrCkHz,
+    controllerHz,
+  );
+  // CLKOS comes off the same VCO as CLKOP, and the secondary is exactly
+  // CLKOP/4, so clkosDiv is always exactly 4x clkopDiv (no rounding can slip
+  // this). Checked anyway so a future solver change fails elaboration loudly
+  // instead of silently misaligning the controllerClk/ddrCk regear.
+  if (clkosDiv != 4 * sol.clkopDiv) {
+    throw StateError(
+      'ECP5 DDR3 clock tree: CLKOS divide $clkosDiv is not exactly 4x the '
+      'CLKOP divide ${sol.clkopDiv} (source=$sourceHz ck=$ddrCkHz). '
+      'controllerClk and ddrCk would not share one VCO at an exact 1:4 '
+      'ratio.',
+    );
+  }
+
+  // LiteX's ECP5PLL gives every 0-degree clkout CPHASE = DIV - 1, FPHASE = 0
+  // (lattice_ecp5.py do_finalize: CPHASE = (phase >> 3) + (div - 1), phase 0
+  // for 0 degrees). The same formula on CLKOP and CLKOS lines up both rising
+  // edges, so CK/4's edge lands on a CK edge instead of half a CK off it.
+  final feedback = Logic(name: '${name}_pll_fb');
+  final pll = parent.addSubModule(
+    Ecp5Ehxplll(
+      clkiDiv: sol.clkiDiv,
+      clkfbDiv: sol.clkfbDiv,
+      clkopDiv: sol.clkopDiv,
+      clk: source,
+      clkfb: feedback,
+      clkopCphase: sol.clkopDiv - 1,
+      clkosDiv: clkosDiv,
+      clkosCphase: clkosDiv - 1,
+      name: '${name}_pll',
+    ),
+  );
+  feedback <= pll.output('CLKOP');
+
+  final ddrCk = pll.output('CLKOP');
+
+  return Ecp5Ddr3Clocks(
+    ddrCk: ddrCk,
+    controllerClk: pll.output('CLKOS'),
+    ddrCk90: ddrCk,
+    ddrCkDqs: ddrCk,
+    idelayRef: ddrCk,
+    locked: pll.output('LOCK'),
+    ddrCkMhz: sol.fout / 1.0e6,
+    controllerClkMhz: sol.fout / 1.0e6 / 4,
+    vcoMhz: sol.vco / 1.0e6,
+  );
 }

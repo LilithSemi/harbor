@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:harbor/src/peripherals/ddr.dart'
+import 'package:harbor/src/peripherals/ddr3_config.dart'
     show HarborDdrConfig, HarborDdrType;
 import 'package:harbor/src/peripherals/ddr3_controller.dart';
 import 'package:harbor/src/peripherals/ddr3_gearbox.dart';
@@ -19,17 +19,17 @@ typedef _RunResult = ({
   int readSlot,
 });
 
-/// T3 + T6 correctness proof for the CK/8 controller gearbox.
+/// Correctness proof for the CK/8 controller gearbox.
 ///
 /// The gearbox itself is proven elsewhere (ddr3_gearbox_test.dart). This file
-/// proves the entangled CONTROLLER changes that make CK/8 operation correct:
+/// proves the entangled controller changes that make CK/8 operation correct:
 ///
-///  * T6 (data-loss bug): the refresh / AC-timing counters count CK/8 cycles, so
-///    a refresh still fires at ~7.8 us of WALL TIME at gearRatio 2, not 15.6 us.
-///  * T3 (the crux): the write command -> data and read command -> data-return CK
-///    separations stay CWL (5) and CL (6) at gearRatio 2, identical to gearRatio
-///    1. That equality is the proof the gearbox + gearRatio-aware launch pipeline
-///    preserve the DRAM's fixed latencies.
+///  * Refresh timing: the refresh / AC-timing counters count CK/8 cycles, so
+///    a refresh still fires at ~7.8 us of wall time at gearRatio 2, not 15.6 us.
+///  * Fixed latencies: the write command -> data and read command -> data-return
+///    CK separations stay CWL (5) and CL (6) at gearRatio 2, identical to
+///    gearRatio 1. That equality is the proof the gearbox + gearRatio-aware
+///    launch pipeline preserve the DRAM's fixed latencies.
 ///  * Wiring: gearRatio 1 is byte-identical (no gearbox module, no extra clock);
 ///    gearRatio 2 inserts the gearbox and a CK/4 serdes clock.
 ///  * A live CK/8 controller drives real reset-ROM commands through the gearbox;
@@ -69,7 +69,7 @@ void main() {
     );
   }
 
-  group('T6: refresh + AC timing hold the same WALL-CLOCK interval at CK/8', () {
+  group('refresh + AC timing hold the same wall-clock interval at CK/8', () {
     test('refresh fires every ~7.8 us at gearRatio 1 AND 2 (not doubled)', () {
       // Same construction the controller uses (fromPs, gearRatio-derived ratio).
       final t1 = DdrTiming.fromPs(
@@ -94,7 +94,7 @@ void main() {
         reason: 'CK/8 refresh payload must shrink in cycles',
       );
 
-      // The WALL-CLOCK interval is what the DRAM sees: cycles * cycle period.
+      // The wall-clock interval is what the DRAM sees: cycles * cycle period.
       final wall1 = cyc1 * t1.controllerClkPeriodNs;
       final wall2 = cyc2 * t2.controllerClkPeriodNs;
 
@@ -143,7 +143,7 @@ void main() {
     });
   });
 
-  group('T3 crux: CWL/CL CK separations are identical across gearRatio', () {
+  group('CWL/CL CK separations are identical across gearRatio', () {
     test('write command -> data burst is CWL CK at both ratios', () {
       final c1 = makeCtrl(controllerGearRatio: 1);
       final c2 = makeCtrl(controllerGearRatio: 2);

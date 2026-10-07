@@ -12,6 +12,8 @@
 /// is nothing to hand-tune.
 library;
 
+import 'ddr3_timing.dart';
+
 class DdrParams {
   /// Controller-LOGIC clock period in picoseconds. Must be an integer multiple
   /// of [ddr3ClkPeriodPs] that is itself a multiple of [serdesRatio]. When it
@@ -80,6 +82,9 @@ class DdrParams {
   /// [controllerClkPeriodPs] + the gearbox, not a larger serdesRatio.
   final int serdesRatio;
 
+  /// Device density. It sets tRFC in the controller timing.
+  final DdrDensity density;
+
   const DdrParams({
     required this.controllerClkPeriodPs,
     required this.ddr3ClkPeriodPs,
@@ -97,6 +102,7 @@ class DdrParams {
     this.speedBin = 1,
     this.eccEnable = false,
     this.dualRankDimm = false,
+    this.density = DdrDensity.gb2,
   }) : assert(dqBits == 8, 'DDR3 DQ is 8 bits per lane'),
        assert(lanes == 1 || lanes == 2, 'x8 (1) or x16 (2)'),
        assert(serdesRatio >= 1, 'serdesRatio must be >= 1'),
@@ -127,6 +133,31 @@ class DdrParams {
     lanes: 2,
     odelaySupported: false,
     speedBin: 1,
+  );
+
+  /// OrangeCrab r0.2: Micron MT41K64M16 (1 Gb, 128 MB, x16), the litex-boards
+  /// gsd_orangecrab default part. The ECP5 PHY presents the same CK/4 SERDES
+  /// interface as the Xilinx PHY, so [serdesRatio] stays 4. The default CK is
+  /// 96 MHz, the litex-boards `gsd_orangecrab.py` proven setting
+  /// (`sys_clk_freq=48e6` default on both `BaseSoC` and the `--sys-clk-freq`
+  /// CLI flag). `_CRGSDRAM.pll.create_clkout(cd_sys2x_i, 2*sys_clk_freq)`
+  /// makes the DDR3 CK, and litedram's `ecp5ddrphy.py` ECLK runs off that
+  /// same `sys2x` net. 10417 ps rounds 1e6/96.0 to the nearest ps
+  /// ([buildEcp5Ddr3ClockTree]'s own realised-CK rounding).
+  factory DdrParams.orangeCrab({
+    int ckPeriodPs = 10417,
+    int controllerGearRatio = 1,
+  }) => DdrParams(
+    ddr3ClkPeriodPs: ckPeriodPs,
+    controllerClkPeriodPs: ckPeriodPs * 4 * controllerGearRatio,
+    rowBits: 13,
+    colBits: 10,
+    baBits: 3,
+    dqBits: 8,
+    lanes: 2,
+    odelaySupported: false,
+    speedBin: 1,
+    density: DdrDensity.gb1,
   );
 
   // --- derived geometry (mirrors the UberDDR3 localparams) ---

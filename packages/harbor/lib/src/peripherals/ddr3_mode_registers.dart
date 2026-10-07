@@ -59,7 +59,7 @@ class Ddr3ModeRegisters {
 
   // --- Mode Register values (ddr3_controller.v:300-340) ---
 
-  /// MR2: CWL=8, ASR on, RTT_WR off. = 0x20040.
+  /// MR2: CWL=5 (A5:A3=000), ASR on, RTT_WR off. = 0x20040.
   int get mr2 {
     const mr2Sel = 0x2; // 3'b010
     const asr = 1;
@@ -105,7 +105,7 @@ class Ddr3ModeRegisters {
   /// MR1 with write leveling disabled. = 0x10044.
   int get mr1WlDis => _mr1(0);
 
-  /// MR0: BL8 fixed, CL=10 (4'b0100), DLL reset, WR from tWR/CK. = 0x520.
+  /// MR0: BL8 fixed, CL=6 (A6:A4=010, A2=0), DLL reset, WR from tWR/CK. = 0x520.
   int get mr0 {
     const cl = 0x4; // 4'b0100
     const dllRst = 1;

@@ -1,6 +1,82 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+// sim-only x2 DDR gearbox models (DQ/DQS/command IOLOGIC). Grounded in
+// Lattice FPGA-TN-02035 ("ECP5 and ECP5-5G High-Speed I/O Interface") section
+// 6.2: the ODDRX2/IDDRX2 family gears 1 fabric ([sclk]) cycle to 4 beats on
+// the edge clock ([eclk], 2x sclk), 2 beats per eclk half. yosys
+// techlibs/lattice/cells_bb_ecp5.v confirms the port names and order (it
+// carries no behavior, so it is a port-fidelity reference only). None of
+// this appears in the generated SV: each leaf below is `isSystemVerilogLeaf`,
+// so `instantiationVerilog` emits only the declared ports, never this body.
+//
+// Beat framing: CLKDIVF makes SCLK rise just after the ECLK rising edge that
+// starts a 4-beat group, so the SCLK levels seen at two ECLK edges in a row
+// are (0,0) at beat 0, (0,1) at beat 1, (1,1) at beat 2 and (1,0) at beat 3.
+// The word boundary is fixed to SCLK, as in the silicon gearbox, with no reset
+// needed (IOLOGIC RST is pulsed while ECLK is stopped). The models need SCLK
+// to change after the ECLK rising edge and before the falling one.
+//
+// Latency: TN-02035 gives no cell latencies, so these come from litedram's
+// hardware-validated ECP5DDRPHY, which drives the command ODDRX2F, the write
+// data ODDRX2DQA, and the DQSBUFM READ pulse at fixed SCLK offsets:
+//  - Write: litedram puts the data on ODDRX2DQA 4 SCLK after the command on
+//    ODDRX2F, and the DRAM wants it CWL (5 CK) after the command. That holds
+//    only if ODDRX2F is 1 SCLK slower than ODDRX2DQA.
+//  - Read: litedram raises READ 4 SCLK after the command. TN-02035 Table 6.3
+//    wants READ about 5.5T before the preamble (no round trip), which puts
+//    ODDRX2F at 4 SCLK of latency, so ODDRX2DQA (and DQSB/TSH) at 3.
+//  - IDDRX2DQA at 3 SCLK puts litedram's read data at its read_latency
+//    (cl_sys_latency + 10) with bitslip 0..3.
+// Output cells: D is taken on the SCLK rising edge, delayed through SCLK
+// registers, and sent out on ECLK edges, so Q only changes on an ECLK edge.
+// [latency] counts SCLK groups from the fabric cycle that holds D to the
+// group it goes out in (minimum 2).
+Logic _x2Out(Logic eclk, Logic sclk, List<Logic> d, int latency, String name) {
+  Logic word = d.rswizzle();
+  for (var i = 0; i < latency - 1; i++) {
+    final r = Logic(name: '${name}_sim_hold$i', width: 4);
+    Sequential(sclk, [r < word]);
+    word = r;
+  }
+  final prev = Logic(name: '${name}_sim_sclk_prev');
+  final q = Logic(name: '${name}_sim_q');
+  // The word for the whole group is taken at beat 0, since SCLK (and so the
+  // last SCLK register) moves just after that ECLK edge.
+  final cur = Logic(name: '${name}_sim_cur', width: 4);
+  final phase = [prev, sclk ^ prev].swizzle();
+  Sequential.multi(
+    [eclk],
+    [
+      If(
+        phase.eq(0),
+        then: [cur < word, q < word[0]],
+        orElse: [
+          q <
+              cases(
+                phase,
+                {for (var j = 1; j < 4; j++) Const(j, width: 2): cur[j]},
+                defaultValue: cur[0],
+                conditionalType: ConditionalType.unique,
+              ),
+        ],
+      ),
+      prev < sclk,
+    ],
+    negedgeTriggers: [eclk],
+  );
+  return q;
+}
+
+/// SCLK groups of latency for ODDRX2F (command and CK pads).
+const int _oddrx2fLatency = 4;
+
+/// SCLK groups of latency for ODDRX2DQA, ODDRX2DQSB, TSHX2DQA, TSHX2DQSA.
+const int _oddrx2dqaLatency = 3;
+
+/// SCLK groups from a DQ sample to its IDDRX2DQA Q output.
+const int _iddrx2dqaLatency = 3;
+
 /// ECP5 EHXPLLL: Primary PLL.
 class Ecp5Ehxplll extends BridgeModule {
   Ecp5Ehxplll({
@@ -121,14 +197,27 @@ class Ecp5Bb extends BridgeModule {
     required Logic b,
     super.name = 'bb',
   }) : super('BB', isSystemVerilogLeaf: true) {
-    addInput('I', i);
-    addInput('T', t);
+    i = addInput('I', i);
+    t = addInput('T', t);
     addOutput('O');
     // Bind the pad net AS the inOut source so the BB `.B` actually connects to
     // the parent pad (a post-construction `<=` from inOut('B') does NOT bind it.
     // The rohd_bridge inout-hierarchy idiom is source-at-construction, else
     // `.B()` emits empty and the pad is severed from the buffer).
-    addInOut('B', b);
+    final pad = addInOut('B', b);
+    // sim-only tristate model: T=0 drives I onto the pad, T=1 releases it to
+    // Z so another driver (or a DRAM model) on the same net can be seen. O
+    // always reflects the net. No effect on synth: this leaf emits only the
+    // declared ports (yosys cells_bb_ecp5.v BB has no body either). It must
+    // be a TriStateBuffer: a ROHD mux turns a selected Z into X.
+    pad <= TriStateBuffer(i, enable: ~t, name: 'sim_tristate').out;
+    // A floating pad reads 0: the ECP5 input default is PULLMODE DOWN. Two
+    // drivers that disagree still read X.
+    final o = output('O');
+    void readPad() =>
+        o.put(pad.value == LogicValue.z ? LogicValue.zero : pad.value);
+    pad.glitch.listen((_) => readPad());
+    Simulator.injectAction(readPad);
   }
 }
 
@@ -381,6 +470,34 @@ class Ecp5Oddrx1f extends BridgeModule {
   }
 }
 
+/// ECP5 ODDRX2F: 4:1 DDR output register on the edge clock. [d0] to [d3] are
+/// the four half-CK beats of one [sclk] cycle, [d0] first. Used for the CK and
+/// command pads of an x2 DDR3 PHY.
+class Ecp5Oddrx2f extends BridgeModule {
+  Logic get q => output('Q');
+
+  Ecp5Oddrx2f({
+    required Logic d0,
+    required Logic d1,
+    required Logic d2,
+    required Logic d3,
+    required Logic sclk,
+    required Logic eclk,
+    required Logic rst,
+    super.name = 'oddrx2f',
+  }) : super('ODDRX2F', isSystemVerilogLeaf: true) {
+    d0 = addInput('D0', d0);
+    d1 = addInput('D1', d1);
+    d2 = addInput('D2', d2);
+    d3 = addInput('D3', d3);
+    sclk = addInput('SCLK', sclk);
+    eclk = addInput('ECLK', eclk);
+    rst = addInput('RST', rst);
+    addOutput('Q');
+    output('Q') <= _x2Out(eclk, sclk, [d0, d1, d2, d3], _oddrx2fLatency, name);
+  }
+}
+
 /// ECP5 IDDRX1F: 1:2 gearing DDR input register. [q0] is the bit captured
 /// on the rising edge of [sclk], [q1] the falling-edge bit.
 class Ecp5Iddrx1f extends BridgeModule {
@@ -420,8 +537,11 @@ class Ecp5Delayg extends BridgeModule {
   }) : super('DELAYG', isSystemVerilogLeaf: true) {
     createParameter('DEL_MODE', '"$delMode"');
     createParameter('DEL_VALUE', '$delValue');
-    addInput('A', a);
+    a = addInput('A', a);
     addOutput('Z');
+    // sim-only: the leveler sweeps READCLKSEL and bitslip, not this tap, so a
+    // digital identity model is enough (no analog eye to miss in sim).
+    output('Z') <= a;
   }
 }
 
@@ -451,12 +571,16 @@ class Ecp5Delayf extends BridgeModule {
   }) : super('DELAYF', isSystemVerilogLeaf: true) {
     createParameter('DEL_MODE', '"$delMode"');
     createParameter('DEL_VALUE', '$delValue');
-    addInput('A', a);
+    a = addInput('A', a);
     addInput('LOADN', loadn);
     addInput('MOVE', move);
     addInput('DIRECTION', direction);
     addOutput('Z');
     addOutput('CFLAG');
+    // sim-only: see Ecp5Delayg. CFLAG (sweep-limit flag) is not consumed by
+    // the leveler, so it ties to a defined 0 rather than floating.
+    output('Z') <= a;
+    output('CFLAG') <= Const(0);
   }
 }
 
@@ -624,23 +748,23 @@ class Ecp5Dqsbufm extends BridgeModule {
     createParameter('DQS_LI_DEL_VAL', '1');
     createParameter('DQS_LO_DEL_ADJ', '"MINUS"');
     createParameter('DQS_LO_DEL_VAL', '4');
-    addInput('DQSI', dqsi);
-    addInput('READ0', read0);
-    addInput('READ1', read1);
-    addInput('READCLKSEL0', readclksel.getRange(0, 1));
-    addInput('READCLKSEL1', readclksel.getRange(1, 2));
-    addInput('READCLKSEL2', readclksel.getRange(2, 3));
+    dqsi = addInput('DQSI', dqsi);
+    read0 = addInput('READ0', read0);
+    read1 = addInput('READ1', read1);
+    final rcs0 = addInput('READCLKSEL0', readclksel.getRange(0, 1));
+    final rcs1 = addInput('READCLKSEL1', readclksel.getRange(1, 2));
+    final rcs2 = addInput('READCLKSEL2', readclksel.getRange(2, 3));
     addInput('DDRDEL', ddrdel);
-    addInput('ECLK', eclk);
+    eclk = addInput('ECLK', eclk);
     addInput('SCLK', sclk);
-    addInput('RST', rst);
+    rst = addInput('RST', rst);
     addInput('RDLOADN', rdloadn);
     addInput('RDMOVE', rdmove);
     addInput('RDDIRECTION', rddirection);
     addInput('WRLOADN', wrloadn);
     addInput('WRMOVE', wrmove);
     addInput('WRDIRECTION', wrdirection);
-    addInput('PAUSE', pause);
+    pause = addInput('PAUSE', pause);
     // The 8 single-bit DYNDELAY ports = bits [7:0] of the dynamic DQS-delay
     // value. Tied low per bit when [dyndelay] is null (the prior behavior), else
     // driven from the supplied 8-bit value bit-by-bit.
@@ -663,6 +787,78 @@ class Ecp5Dqsbufm extends BridgeModule {
     addOutput('BURSTDET');
     addOutput('RDCFLAG');
     addOutput('WRCFLAG');
+
+    // sim-only READ pulse model, from FPGA-TN-02035 6.2.4 and Table 6.3:
+    //  - The internal READ pulse opens 5.5T after READ0/READ1 rise, plus
+    //    READCLKSEL x T/4 (8 steps over 2T).
+    //  - It is placed right when it opens inside the 1T DQS preamble. The
+    //    model takes only the middle of the preamble: 1 to 3 quarter-T steps
+    //    before the first DQS rising edge (narrower than silicon, so a
+    //    marginal setting fails here rather than passing).
+    //  - Then RDPNTR reads 0 for the 8 beats of that burst (the IDDRX2DQA
+    //    model passes data only then) and BURSTDET rises after the last DQS
+    //    edge, until the next READ. Otherwise RDPNTR reads 7 and BURSTDET
+    //    stays low. PAUSE at the opening fails the burst.
+    // Behavioral (event-driven) because it needs quarter-T timing. One burst
+    // per READ rise. The write strobes have no role in the write models.
+    final valid = Logic(name: '${name}_sim_window');
+    final burst = Logic(name: '${name}_sim_burstdet');
+    Simulator.injectAction(() {
+      valid.put(0);
+      burst.put(0);
+    });
+    final readIn = read0 | read1;
+    final selIn = [rcs2, rcs1, rcs0].swizzle();
+    int? lastEclkRise;
+    int? tck;
+    eclk.posedge.listen((_) {
+      final t = Simulator.time;
+      if (lastEclkRise != null) tck = t - lastEclkRise!;
+      lastEclkRise = t;
+    });
+    int? gateAt;
+    readIn.posedge.listen((_) {
+      final period = tck;
+      final sel = selIn.value;
+      if (period == null || !sel.isValid) return;
+      final quarter = period ~/ 4;
+      final g = Simulator.time + (period * 11) ~/ 2 + sel.toInt() * quarter;
+      Simulator.registerAction(g, () {
+        gateAt = pause.value == LogicValue.one ? null : g;
+        burst.put(0);
+        Simulator.registerAction(g + 4 * period, () {
+          if (gateAt == g) gateAt = null;
+        });
+      });
+    });
+    dqsi.posedge.listen((_) {
+      final g = gateAt;
+      final period = tck;
+      if (g == null || period == null) return;
+      gateAt = null;
+      final t = Simulator.time;
+      final quarter = period ~/ 4;
+      final early = t - g;
+      if (early < quarter || early > 3 * quarter) return;
+      valid.put(1);
+      Simulator.registerAction(t + 4 * period, () {
+        valid.put(0);
+        burst.put(1);
+      });
+    });
+    output('RDPNTR0') <= ~valid;
+    output('RDPNTR1') <= ~valid;
+    output('RDPNTR2') <= ~valid;
+    output('WRPNTR0') <= Const(0);
+    output('WRPNTR1') <= Const(0);
+    output('WRPNTR2') <= Const(0);
+    output('DQSR90') <= eclk;
+    output('DQSW') <= eclk;
+    output('DQSW270') <= eclk;
+    output('RDCFLAG') <= Const(0);
+    output('WRCFLAG') <= Const(0);
+    output('DATAVALID') <= valid;
+    output('BURSTDET') <= burst;
   }
 }
 
@@ -689,15 +885,17 @@ class Ecp5Oddrx2dqa extends BridgeModule {
     required Logic rst,
     super.name = 'oddrx2dqa',
   }) : super('ODDRX2DQA', isSystemVerilogLeaf: true) {
-    addInput('D0', d0);
-    addInput('D1', d1);
-    addInput('D2', d2);
-    addInput('D3', d3);
+    d0 = addInput('D0', d0);
+    d1 = addInput('D1', d1);
+    d2 = addInput('D2', d2);
+    d3 = addInput('D3', d3);
     addInput('DQSW270', dqsw270);
-    addInput('SCLK', sclk);
-    addInput('ECLK', eclk);
-    addInput('RST', rst);
+    sclk = addInput('SCLK', sclk);
+    eclk = addInput('ECLK', eclk);
+    rst = addInput('RST', rst);
     addOutput('Q');
+    output('Q') <=
+        _x2Out(eclk, sclk, [d0, d1, d2, d3], _oddrx2dqaLatency, name);
   }
 }
 
@@ -720,15 +918,17 @@ class Ecp5Oddrx2dqsb extends BridgeModule {
     required Logic rst,
     super.name = 'oddrx2dqsb',
   }) : super('ODDRX2DQSB', isSystemVerilogLeaf: true) {
-    addInput('D0', d0);
-    addInput('D1', d1);
-    addInput('D2', d2);
-    addInput('D3', d3);
+    d0 = addInput('D0', d0);
+    d1 = addInput('D1', d1);
+    d2 = addInput('D2', d2);
+    d3 = addInput('D3', d3);
     addInput('DQSW', dqsw);
-    addInput('SCLK', sclk);
-    addInput('ECLK', eclk);
-    addInput('RST', rst);
+    sclk = addInput('SCLK', sclk);
+    eclk = addInput('ECLK', eclk);
+    rst = addInput('RST', rst);
     addOutput('Q');
+    output('Q') <=
+        _x2Out(eclk, sclk, [d0, d1, d2, d3], _oddrx2dqaLatency, name);
   }
 }
 
@@ -749,13 +949,15 @@ class Ecp5Tshx2dqa extends BridgeModule {
     required Logic rst,
     super.name = 'tshx2dqa',
   }) : super('TSHX2DQA', isSystemVerilogLeaf: true) {
-    addInput('T0', t0);
-    addInput('T1', t1);
+    t0 = addInput('T0', t0);
+    t1 = addInput('T1', t1);
     addInput('DQSW270', dqsw270);
-    addInput('SCLK', sclk);
-    addInput('ECLK', eclk);
-    addInput('RST', rst);
+    sclk = addInput('SCLK', sclk);
+    eclk = addInput('ECLK', eclk);
+    rst = addInput('RST', rst);
     addOutput('Q');
+    output('Q') <=
+        _x2Out(eclk, sclk, [t0, t0, t1, t1], _oddrx2dqaLatency, name);
   }
 }
 
@@ -775,13 +977,15 @@ class Ecp5Tshx2dqsa extends BridgeModule {
     required Logic rst,
     super.name = 'tshx2dqsa',
   }) : super('TSHX2DQSA', isSystemVerilogLeaf: true) {
-    addInput('T0', t0);
-    addInput('T1', t1);
+    t0 = addInput('T0', t0);
+    t1 = addInput('T1', t1);
     addInput('DQSW', dqsw);
-    addInput('SCLK', sclk);
-    addInput('ECLK', eclk);
-    addInput('RST', rst);
+    sclk = addInput('SCLK', sclk);
+    eclk = addInput('ECLK', eclk);
+    rst = addInput('RST', rst);
     addOutput('Q');
+    output('Q') <=
+        _x2Out(eclk, sclk, [t0, t0, t1, t1], _oddrx2dqaLatency, name);
   }
 }
 
@@ -806,11 +1010,11 @@ class Ecp5Iddrx2dqa extends BridgeModule {
     required Logic rst,
     super.name = 'iddrx2dqa',
   }) : super('IDDRX2DQA', isSystemVerilogLeaf: true) {
-    addInput('D', d);
+    d = addInput('D', d);
     addInput('DQSR90', dqsr90);
-    addInput('RDPNTR0', rdpntr.getRange(0, 1));
-    addInput('RDPNTR1', rdpntr.getRange(1, 2));
-    addInput('RDPNTR2', rdpntr.getRange(2, 3));
+    final rdpntr0 = addInput('RDPNTR0', rdpntr.getRange(0, 1));
+    final rdpntr1 = addInput('RDPNTR1', rdpntr.getRange(1, 2));
+    final rdpntr2 = addInput('RDPNTR2', rdpntr.getRange(2, 3));
     // When the IDDRX2DQA packs with the DQ pad's ODDRX2DQA/TSHX2DQA into a single
     // merged MIDDRX_MODDRX DQ-IOLOGIC bel, nextpnr requires the bel's write
     // pointer (WRPNTR0..2) to be driven from the byte lane's DQSBUFM, exactly as
@@ -818,13 +1022,43 @@ class Ecp5Iddrx2dqa extends BridgeModule {
     addInput('WRPNTR0', wrpntr.getRange(0, 1));
     addInput('WRPNTR1', wrpntr.getRange(1, 2));
     addInput('WRPNTR2', wrpntr.getRange(2, 3));
-    addInput('ECLK', eclk);
-    addInput('SCLK', sclk);
-    addInput('RST', rst);
+    eclk = addInput('ECLK', eclk);
+    sclk = addInput('SCLK', sclk);
+    rst = addInput('RST', rst);
     addOutput('Q0');
     addOutput('Q1');
     addOutput('Q2');
     addOutput('Q3');
+
+    // sim-only. D is sampled on both ECLK edges: the DRAM model trails CK by
+    // T/4, so an ECLK edge is the middle of a beat, which stands in for the
+    // 90 degree DQSR90 shift. RDPNTR carries the DQSBUFM read-window flag
+    // (0 = inside a properly gated burst, see Ecp5Dqsbufm). A sample taken
+    // outside it is inverted, so a misplaced READ pulse returns wrong data.
+    // Each 4-beat group is handed to SCLK on the SCLK edge, oldest in Q0,
+    // then delayed to _iddrx2dqaLatency groups.
+    final valid = [rdpntr2, rdpntr1, rdpntr0].swizzle().eq(0);
+    final sample = mux(valid, d, ~d);
+    final sr = [for (var k = 0; k < 4; k++) Logic(name: '${name}_sim_sr$k')];
+    Sequential.multi(
+      [eclk],
+      [sr[0] < sample, for (var k = 1; k < 4; k++) sr[k] < sr[k - 1]],
+      negedgeTriggers: [eclk],
+    );
+    Logic group = [sr[0], sr[1], sr[2], sr[3]].swizzle();
+    for (var i = 0; i < _iddrx2dqaLatency; i++) {
+      final r = Logic(name: '${name}_sim_grp$i', width: 4);
+      Sequential(sclk, [r < group]);
+      group = r;
+    }
+    final q0r = group[0];
+    final q1r = group[1];
+    final q2r = group[2];
+    final q3r = group[3];
+    output('Q0') <= q0r;
+    output('Q1') <= q1r;
+    output('Q2') <= q2r;
+    output('Q3') <= q3r;
   }
 }
 
@@ -1076,10 +1310,22 @@ DDRDLLA ${instanceName}_dlla (
         : '''
 assign $ddrdelO = 8'b0; // DLL-OFF: DDRDLLA omitted (single-bank eclk); read is static-tap
 assign $lockO = 1'b0;''';
+    // The source goes through an ECLKBRIDGECS before the ECLKSYNCB, as in the
+    // LiteX OrangeCrab CRG (gsd_orangecrab.py _CRGSDRAM). Without the bridge
+    // one ECLKSYNCB reaches the edge clocks of one chip side only, and a DDR
+    // pin map that uses both sides (OrangeCrab: DQ in banks 6/7, address in
+    // bank 2) cannot route.
     return '''
 // ddr_clk_tree ($instanceName): Lattice 2-phase edge clock + DDRDEL-load init
+wire ${instanceName}_ecsout;
+ECLKBRIDGECS ${instanceName}_eclkbridge (
+  .CLK0($src),
+  .CLK1(1'b0),
+  .SEL(1'b0),
+  .ECSOUT(${instanceName}_ecsout)
+);
 ECLKSYNCB ${instanceName}_eclksync (
-  .ECLKI($src),
+  .ECLKI(${instanceName}_ecsout),
   .STOP($eclkStop),
   .ECLKO($eclkO)
 );

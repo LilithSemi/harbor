@@ -32,6 +32,20 @@ class Ddr3Controller extends Module {
   /// and the RTL byte-identical to the silicon-proven train=hw boot path.
   final bool runtimeTrainable;
 
+  /// The PHY levels its own read path ([Ddr3PhyBase.selfTrainsRead]). The
+  /// calibration FSM then skips the sampled-DQS states, writes its test
+  /// pattern, and reads it back once per PHY leveling point until the PHY
+  /// reports done. Defaults false, which leaves the RTL unchanged.
+  final bool phySelfTrainsRead;
+
+  /// Controller ticks the PHY adds to the read return. They are added to the
+  /// read capture pipe. Used only with [phySelfTrainsRead].
+  final int phyReadPipeTicks;
+
+  /// Calibration runs before a self-trained calibration gives up and reports
+  /// [calFailed]. 1 to 8. Used only with [phySelfTrainsRead].
+  final int maxCalAttempts;
+
   // --- runtime-trainable knob registers (built only when runtimeTrainable) ---
   List<Logic>? _rtOdelay; // per-lane 5-bit write odelay tap
   List<Logic>? _rtIdelay; // per-lane 5-bit read idelay tap
@@ -41,12 +55,19 @@ class Ddr3Controller extends Module {
   List<Logic>? _rtIdelayLd; // per-lane read-idelay load pulse (on APPLY)
   Logic? _rtLaneSel; // active lane selector (from CTL[11:8])
   Logic? _rtActive; // override armed: set on the first CTL APPLY
+  List<Logic>? _rtClkSel; // per-lane 3-bit read clock select (self-train PHY)
+  List<Logic>? _rtBitslipStep; // per-lane bitslip step pulse, one per APPLY
 
   /// Runtime knob registers, exposed for simulation tests (null in train=hw).
   List<Logic>? get rtOdelayRegs => _rtOdelay;
   List<Logic>? get rtIdelayRegs => _rtIdelay;
   List<Logic>? get rtBitslipRegs => _rtBitslip;
   List<Logic>? get rtWlevelRegs => _rtWlevel;
+
+  /// Calibration read-pipe depth, exposed for simulation tests: the lane
+  /// max and each lane's own value.
+  Logic get addedReadPipeMaxReg => _addedReadPipeMax;
+  List<Logic> get addedReadPipeLaneRegs => _addedReadPipeLane;
 
   static const int auxWidth = 4;
   static const int wb2AddrBits = 7;
@@ -92,18 +113,24 @@ class Ddr3Controller extends Module {
     required Logic phyIserdesDqs,
     required Logic phyIserdesBitslipReference,
     required Logic phyIdelayctrlRdy,
+    Logic? phyReadLevelDone,
     this.runtimeTrainable = false,
+    this.phySelfTrainsRead = false,
+    this.phyReadPipeTicks = 0,
+    this.maxCalAttempts = defaultMaxCalAttempts,
     super.name = 'ddr3_controller',
   }) : timing = DdrTiming.fromPs(
          ddr3ClkPeriodPs: params.ddr3ClkPeriodPs,
          serdesRatio: params.serdesRatio,
          controllerClkRatio: params.controllerClkRatio,
+         density: params.density,
        ),
        modeRegs = Ddr3ModeRegisters(
          DdrTiming.fromPs(
            ddr3ClkPeriodPs: params.ddr3ClkPeriodPs,
            serdesRatio: params.serdesRatio,
            controllerClkRatio: params.controllerClkRatio,
+           density: params.density,
          ),
        ) {
     // --- clocks/reset ---
@@ -168,6 +195,24 @@ class Ddr3Controller extends Module {
     addOutput('o_phy_bitslip', width: lanes);
     addOutput('o_phy_write_leveling_calib');
     addOutput('o_phy_reset');
+    Logic? readLevelDone;
+    if (phySelfTrainsRead) {
+      if (phyReadLevelDone == null) {
+        throw ArgumentError.notNull('phyReadLevelDone');
+      }
+      if (maxCalAttempts < 1 || maxCalAttempts > 8) {
+        throw ArgumentError.value(maxCalAttempts, 'maxCalAttempts');
+      }
+      if (phyReadPipeTicks < 0 || phyReadPipeTicks > 15) {
+        throw ArgumentError.value(phyReadPipeTicks, 'phyReadPipeTicks');
+      }
+      readLevelDone = addInput('i_phy_read_level_done', phyReadLevelDone);
+      addOutput('o_phy_read_level_start');
+      addOutput('o_phy_read_level_check');
+      addOutput('o_phy_read_level_pass', width: lanes);
+      if (runtimeTrainable) addOutput('o_phy_read_clk_sel', width: 3 * lanes);
+      addOutput('o_cal_failed');
+    }
 
     // --- debug ---
     addOutput('o_debug1', width: 32);
@@ -203,6 +248,7 @@ class Ddr3Controller extends Module {
       phyIdelayctrlRdy,
       phyIserdesDqs,
       phyIserdesBitslipReference,
+      readLevelDone,
     );
     _buildWriteStrobeDatapath(controllerClk);
     _buildWishbonePipeline(
@@ -335,7 +381,12 @@ class Ddr3Controller extends Module {
     final depth = _stage2DataDepth; // 2
     final readAckPipeWidth = _readDelay + 1 + 2 + 1 + 1; // 6
     const maxAckDelay = 16;
-    final done = _stateCalibrate.eq(_stDoneCalibrate);
+    // A failed self-trained calibration also opens the bus, so a CPU access
+    // does not stall forever and firmware can read the failure flag.
+    final done = phySelfTrainsRead
+        ? (_stateCalibrate.eq(_stDoneCalibrate) |
+              _stateCalibrate.eq(_stCalFailed))
+        : _stateCalibrate.eq(_stDoneCalibrate);
 
     // --- registers ---
     Logic reg(String n, [int w = 1]) => Logic(name: n, width: w);
@@ -1218,6 +1269,23 @@ class Ddr3Controller extends Module {
   static const int _stReadData = 12;
   static const int _stAnalyzeData = 13;
   static const int _stDoneCalibrate = 23;
+  // Self-training PHY only: report one test read, then wait for the PHY.
+  static const int _stReadLevel = 24;
+  static const int _stReadLevelWait = 25;
+
+  // Self-training PHY only: calibration gave up (see [maxCalAttempts]).
+  static const int _stCalFailed = 26;
+
+  /// Ticks to wait after a leveling report before the next test read. Longer
+  /// than the PHY needs to settle a point or to finish its scoring.
+  static const int readLevelWaitTicks = 40;
+
+  /// Default for [maxCalAttempts].
+  static const int defaultMaxCalAttempts = 4;
+
+  /// High when a self-trained calibration failed [maxCalAttempts] times. Null
+  /// unless [phySelfTrainsRead].
+  Logic? get calFailed => phySelfTrainsRead ? output('o_cal_failed') : null;
 
   /// Calibration write patterns: each 16-bit beat is a byte replicated across
   /// the two lanes (ddr3_controller.v:1554/1563). x16 (LANES=2) only.
@@ -1244,7 +1312,9 @@ class Ddr3Controller extends Module {
     Logic idelayctrlRdy,
     Logic iserdesDqs,
     Logic bitslipReference,
+    Logic? readLevelDone,
   ) {
+    final selfTrain = phySelfTrainsRead;
     final laneW = _lanesClog2;
     const idxW = 6; // clog2(STORED_DQS_SIZE*8=40)
 
@@ -1278,6 +1348,25 @@ class Ddr3Controller extends Module {
     final addedReadPipeMax = Logic(name: 'added_read_pipe_max', width: 4);
     final pauseCounterReg = Logic(name: 'pause_counter_reg');
     final resetFromCalibrateReg = Logic(name: 'reset_from_calibrate_reg');
+    // Self-training PHY handshake (built only when the PHY self-trains).
+    final levelStart = selfTrain ? Logic(name: 'read_level_start') : null;
+    final levelCheck = selfTrain ? Logic(name: 'read_level_check') : null;
+    final levelPass = selfTrain
+        ? Logic(name: 'read_level_pass', width: lanes)
+        : null;
+    final levelWait = selfTrain
+        ? Logic(name: 'read_level_wait', width: 6)
+        : null;
+    // Calibration restarts, counted from power-on (the restart reset does not
+    // clear it).
+    final calAttempts = selfTrain
+        ? Logic(name: 'cal_attempts', width: 3)
+        : null;
+    if (selfTrain) {
+      Sequential(clk, reset: ~input('i_rst_n'), [
+        If(resetFromCalibrateReg, then: [calAttempts! < calAttempts + 1]),
+      ]);
+    }
 
     // Per-lane registers.
     List<Logic> perLane(String base, int w) => [
@@ -1405,7 +1494,7 @@ class Ddr3Controller extends Module {
           dqsBitslipArrangement < Const(0, width: 16),
           delayBeforeReadData < Const(0, width: 4),
           idelayDataCntPrev < Const(0, width: 5),
-          addedReadPipeMax < Const(0, width: 4),
+          addedReadPipeMax < Const(selfTrain ? phyReadPipeTicks : 0, width: 4),
           pauseCounterReg < Const(0),
           resetFromCalibrateReg < Const(0),
           oWlCalib < Const(0),
@@ -1419,6 +1508,12 @@ class Ddr3Controller extends Module {
           calibData < Const(0, width: params.wbDataBits),
           readDataStore < Const(0, width: params.wbDataBits),
           writePattern < Const(0, width: 128),
+          if (selfTrain) ...[
+            levelStart! < Const(0),
+            levelCheck! < Const(0),
+            levelPass! < Const(0, width: lanes),
+            levelWait! < Const(0, width: 6),
+          ],
           for (var l = 0; l < lanes; l++)
             dataStartIndex[l] < Const(0, width: 7),
           for (var l = 0; l < lanes; l++) ...[
@@ -1427,7 +1522,8 @@ class Ddr3Controller extends Module {
             idelayDataCnt[l] < initIdelayData,
             idelayDqsCnt[l] < initIdelayDqs,
             dqTargetIndex[l] < Const(0, width: idxW + 1),
-            addedReadPipe[l] < Const(0, width: 4),
+            addedReadPipe[l] <
+                Const(selfTrain ? phyReadPipeTicks : 0, width: 4),
             oBitslip[l] < Const(0),
             oIdelayDataLd[l] < Const(0),
             oIdelayDqsLd[l] < Const(0),
@@ -1446,6 +1542,11 @@ class Ddr3Controller extends Module {
                 delayBeforeReadData - 1,
               ),
           laneTimes8 < laneReg.zeroExtend(4) << 3,
+          if (selfTrain) ...[
+            levelCheck! < Const(0),
+            levelWait! <
+                mux(levelWait.eq(0), Const(0, width: 6), levelWait - 1),
+          ],
           idelayDataCntPrev < laneSlice5(idelayDataCnt, laneReg, laneW),
           resetFromCalibrateReg < Const(0),
           // ld pulses default low each cycle; states re-assert.
@@ -1519,7 +1620,13 @@ class Ddr3Controller extends Module {
               If(
                 idelayctrlRdy & _instructionAddress.eq(13),
                 then: [
-                  state < Const(_stBitslipTrain1, width: 6),
+                  // A self-training PHY needs no sampled-DQS calibration: go
+                  // to the write phase, which writes its test pattern.
+                  state <
+                      Const(
+                        selfTrain ? _stStartWriteLevel : _stBitslipTrain1,
+                        width: 6,
+                      ),
                   laneReg < Const(0, width: laneW),
                   for (var l = 0; l < lanes; l++) ...[
                     oOdelayDataLd[l] < Const(1),
@@ -1645,12 +1752,20 @@ class Ddr3Controller extends Module {
                     If(
                       laneReg.eq(l),
                       then: [
+                        // added_read_pipe can only be 0 or 1 (UberDDR3
+                        // ddr3_controller.v:2682-2683): a lane needs at most
+                        // one extra controller-clock cycle of read pipe.
                         addedReadPipe[l] <
-                            (dqTargetIndex[l].getRange(4, 6).zeroExtend(4) +
-                                dqTargetIndex[l]
-                                    .getRange(0, 4)
-                                    .gte(Const(13, width: 4))
-                                    .zeroExtend(4)),
+                            mux(
+                              (dqTargetIndex[l].getRange(4, 6).zeroExtend(4) +
+                                      dqTargetIndex[l]
+                                          .getRange(0, 4)
+                                          .gte(Const(13, width: 4))
+                                          .zeroExtend(4))
+                                  .or(),
+                              Const(1, width: 4),
+                              Const(0, width: 4),
+                            ),
                         dqsBitslipArrangement <
                             (Const(0x3C3C, width: 16) >>
                                 dqTargetIndex[l].getRange(0, 3)),
@@ -1701,6 +1816,18 @@ class Ddr3Controller extends Module {
                         oWlCalib < Const(1),
                         state < Const(_stStartWriteLevel, width: 6),
                       ],
+                      // Track the highest added_read_pipe across lanes: every
+                      // lane is captured on the slowest lane's cycle, so the
+                      // read-ack pipe needs that lane's own delay (UberDDR3
+                      // ddr3_controller.v:2757).
+                      addedReadPipeMax <
+                          mux(
+                            addedReadPipeMax.gt(
+                              laneSlice5(addedReadPipe, laneReg, laneW),
+                            ),
+                            addedReadPipeMax,
+                            laneSlice5(addedReadPipe, laneReg, laneW),
+                          ),
                     ],
                     orElse: [
                       for (var l = 0; l < lanes; l++)
@@ -1752,6 +1879,7 @@ class Ddr3Controller extends Module {
               calibAddr < Const(1, width: params.wbAddrBits),
               calibData < Const(_calibDataW2, width: params.wbDataBits),
               state < Const(_stIssueRead, width: 6),
+              if (selfTrain) levelStart! < Const(1),
             ]),
             // ISSUE_READ: read back address 0 (aux=1 marks the read ack).
             CaseItem(Const(_stIssueRead, width: 6), [
@@ -1768,7 +1896,11 @@ class Ddr3Controller extends Module {
                 then: [
                   readDataStore < _oWbData,
                   calibStb < Const(0),
-                  state < Const(_stAnalyzeData, width: 6),
+                  state <
+                      Const(
+                        selfTrain ? _stReadLevel : _stAnalyzeData,
+                        width: 6,
+                      ),
                   for (var l = 0; l < lanes; l++)
                     If(
                       laneReg.eq(l),
@@ -1807,7 +1939,14 @@ class Ddr3Controller extends Module {
                           dataStartIndex[l].eq(56),
                           then: [
                             dataStartIndex[l] < Const(0, width: 7),
-                            resetFromCalibrateReg < Const(1),
+                            if (selfTrain)
+                              If(
+                                calAttempts!.eq(maxCalAttempts - 1),
+                                then: [state < Const(_stCalFailed, width: 6)],
+                                orElse: [resetFromCalibrateReg < Const(1)],
+                              )
+                            else
+                              resetFromCalibrateReg < Const(1),
                           ],
                         ),
                       ],
@@ -1815,6 +1954,49 @@ class Ddr3Controller extends Module {
                 ],
               ),
             ]),
+            // DONE_CALIBRATE: stay here, on both PHY paths. Without this item
+            // the unique case leaves every register it drives at X in
+            // simulation the cycle after DONE, and a different synthesis tool
+            // or a later netlist change could resolve the undriven case
+            // differently.
+            CaseItem(Const(_stDoneCalibrate, width: 6), []),
+            if (selfTrain) ...[
+              // READ_LEVEL: once the PHY is done, check this read (it used the
+              // final setting). Else report it per lane and wait for the PHY
+              // to move to its next point. In train=runtime firmware owns the
+              // read path, so the check is skipped.
+              CaseItem(Const(_stReadLevel, width: 6), [
+                If(
+                  readLevelDone!,
+                  then: [
+                    state <
+                        Const(
+                          runtimeTrainable ? _stDoneCalibrate : _stAnalyzeData,
+                          width: 6,
+                        ),
+                  ],
+                  orElse: [
+                    levelCheck! < Const(1),
+                    levelPass! <
+                        [
+                          for (var l = lanes - 1; l >= 0; l--)
+                            gatherLane(l).eq(writePattern.getRange(0, 64)),
+                        ].swizzle(),
+                    levelWait! < Const(readLevelWaitTicks, width: 6),
+                    state < Const(_stReadLevelWait, width: 6),
+                  ],
+                ),
+              ]),
+              // CAL_FAILED: stay here. The bus is open and o_cal_failed is
+              // high.
+              CaseItem(Const(_stCalFailed, width: 6), []),
+              CaseItem(Const(_stReadLevelWait, width: 6), [
+                If(
+                  levelWait.eq(0),
+                  then: [state < Const(_stIssueRead, width: 6)],
+                ),
+              ]),
+            ],
             // ISSUE_WRITE_1..DONE: remaining BIST sweep states stubbed (hold).
           ], conditionalType: ConditionalType.unique),
         ],
@@ -1843,10 +2025,21 @@ class Ddr3Controller extends Module {
     // FSBL arms the override (the first CTL APPLY sets rtActive), the four knob
     // groups follow the wb2 knob registers instead of the cal FSM. In train=hw
     // (runtimeTrainable=false) these are the unchanged FSM drives.
+    if (selfTrain) {
+      output('o_cal_failed') <= state.eq(_stCalFailed);
+      output('o_phy_read_level_start') <= levelStart!;
+      output('o_phy_read_level_check') <= levelCheck!;
+      output('o_phy_read_level_pass') <= levelPass!;
+      if (runtimeTrainable) {
+        output('o_phy_read_clk_sel') <= _rtClkSel!.rswizzle();
+      }
+    }
     if (runtimeTrainable) {
       final active = _rtActive!;
+      // Each APPLY that commits the bitslip knob drives one strobe cycle,
+      // one slip per APPLY, on both PHY paths.
       output('o_phy_bitslip') <=
-          mux(active, _rtBitslip!.rswizzle(), oBitslip.rswizzle());
+          mux(active, _rtBitslipStep!.rswizzle(), oBitslip.rswizzle());
       output('o_phy_idelay_data_ld') <=
           mux(active, _rtIdelayLd!.rswizzle(), oIdelayDataLd.rswizzle());
       output('o_phy_idelay_dqs_ld') <= oIdelayDqsLd.rswizzle();
@@ -1954,9 +2147,9 @@ class Ddr3Controller extends Module {
     }
   }
 
-  /// Build the wb2 knob-ABI register file (train=runtime, plan Task 1).
+  /// Build the wb2 knob-ABI register file (train=runtime).
   ///
-  /// This port decodes wb2Addr as a bus-width-independent REGISTER INDEX (one
+  /// This port decodes wb2Addr as a bus-width-independent register index (one
   /// per knob-ABI register, contiguous 0..6). The SoC-facing byte layout (the
   /// contract genip/FSBL use) is 8-byte-strided; the wrapper ([HarborDdr3])
   /// converts the fabric word address to this register index for whatever SoC
@@ -1970,6 +2163,11 @@ class Ddr3Controller extends Module {
   ///   index 5 (byte 0x28) STATUS  ro  bit0 BUSY, bit8 WL-done, [23:16] WL map
   ///   index 6 (byte 0x30) CAP     ro  bit0 active, [7:4] lanes, [15:8] tapMax,
   ///                                   [19:16] slipMax
+  ///   index 7 (byte 0x38) RDCLKSEL rw per-lane read clock select (3-bit),
+  ///                                   only with a self-training PHY
+  ///
+  /// With a self-training PHY, each LOAD/APPLY of a written BITSLIP of 1
+  /// sends one bitslip step pulse, and slipMax is 15.
   ///
   /// The knob value/read data are 32-bit; on a wider SoC bus the wrapper takes
   /// the low 32 bits of the write word and zero-extends the read word.
@@ -1991,6 +2189,8 @@ class Ddr3Controller extends Module {
     const wCtl = 4;
     const wStatus = 5;
     const wCap = 6;
+    const wRdClkSel = 7;
+    final selfTrain = phySelfTrainsRead;
 
     final wb2Cyc = input('i_wb2_cyc');
     final wb2Stb = input('i_wb2_stb');
@@ -2010,6 +2210,22 @@ class Ddr3Controller extends Module {
     final dIdelay = Logic(name: 'rt_dirty_idelay');
     final dBitslip = Logic(name: 'rt_dirty_bitslip');
     final dWlevel = Logic(name: 'rt_dirty_wlevel');
+    final shClkSel = selfTrain ? Logic(name: 'rt_sh_clk_sel', width: 3) : null;
+    final dClkSel = selfTrain ? Logic(name: 'rt_dirty_clk_sel') : null;
+    final rtClkSel = selfTrain
+        ? [
+            for (var l = 0; l < lanes; l++)
+              Logic(name: 'rt_clk_sel_$l', width: 3),
+          ]
+        : null;
+    // One-cycle strobe per lane, one pulse per APPLY that commits the
+    // bitslip knob. Used on both PHY paths so a held knob value cannot
+    // drive a held BITSLIP level into ISERDESE2.
+    final rtBitslipStep = [
+      for (var l = 0; l < lanes; l++) Logic(name: 'rt_bitslip_step_$l'),
+    ];
+    _rtClkSel = rtClkSel;
+    _rtBitslipStep = rtBitslipStep;
 
     final laneSel = Logic(name: 'rt_lane_sel', width: laneW);
     final active = Logic(name: 'rt_active');
@@ -2061,10 +2277,16 @@ class Ddr3Controller extends Module {
           laneSel < Const(0, width: laneW),
           active < Const(0),
           busy < Const(0),
+          if (selfTrain) ...[
+            shClkSel! < Const(0, width: 3),
+            dClkSel! < Const(0),
+            for (var l = 0; l < lanes; l++) rtClkSel![l] < Const(0, width: 3),
+          ],
           for (var l = 0; l < lanes; l++) ...[
             rtOdelay[l] < Const(0, width: 5),
             rtIdelay[l] < Const(0, width: 5),
             rtBitslip[l] < Const(0),
+            rtBitslipStep[l] < Const(0),
             rtWlevel[l] < Const(0),
             rtOdelayLd[l] < Const(0),
             rtIdelayLd[l] < Const(0),
@@ -2076,6 +2298,26 @@ class Ddr3Controller extends Module {
           for (var l = 0; l < lanes; l++) ...[
             rtOdelayLd[l] < Const(0),
             rtIdelayLd[l] < Const(0),
+            rtBitslipStep[l] < Const(0),
+          ],
+          if (selfTrain) ...[
+            If(
+              write & wb2Addr.eq(wRdClkSel),
+              then: [shClkSel! < wb2Data.getRange(0, 3), dClkSel! < Const(1)],
+            ),
+            If(
+              apply,
+              then: [
+                dClkSel < Const(0),
+                for (var l = 0; l < lanes; l++)
+                  If(
+                    laneSel.eq(l),
+                    then: [
+                      If(dClkSel, then: [rtClkSel![l] < shClkSel]),
+                    ],
+                  ),
+              ],
+            ),
           ],
           // Knob-register writes stage a value + raise the dirty flag.
           If(
@@ -2119,6 +2361,13 @@ class Ddr3Controller extends Module {
                       then: [rtIdelay[l] < shIdelay, rtIdelayLd[l] < Const(1)],
                     ),
                     If(dBitslip, then: [rtBitslip[l] < shBitslip]),
+                    // One strobe cycle per APPLY that commits a bitslip
+                    // value of 1. ISERDESE2 BITSLIP needs a pulse, not a
+                    // held level, to slip exactly once (UG471).
+                    If(
+                      dBitslip & shBitslip,
+                      then: [rtBitslipStep[l] < Const(1)],
+                    ),
                     If(dWlevel, then: [rtWlevel[l] < shWlevel]),
                   ],
                 ),
@@ -2158,12 +2407,23 @@ class Ddr3Controller extends Module {
           Const(0, width: 8), // [23:16] WL feedback map (placeholder)
           Const(0, width: 7), // [15:9]
           Const(0), // [8] WL-done (placeholder)
-          Const(0, width: 7), // [7:1]
+          // [1] calibration failed (self-training PHY only)
+          if (selfTrain) ...[
+            Const(0, width: 6), // [7:2]
+            output('o_cal_failed'),
+          ] else
+            Const(0, width: 7), // [7:1]
           busy, // [0] BUSY
         ].swizzle(),
+        if (selfTrain)
+          Const(wRdClkSel, width: wb2AddrBits): laneSlice5(
+            rtClkSel!,
+            laneSel,
+            laneW,
+          ).zeroExtend(wb2DataBits),
         Const(wCap, width: wb2AddrBits): [
           Const(0, width: 12), // [31:20]
-          Const(7, width: 4), // [19:16] slipMax
+          Const(selfTrain ? 15 : 7, width: 4), // [19:16] slipMax
           Const(31, width: 8), // [15:8] tapMax
           Const(lanes, width: 4), // [7:4] lanes
           Const(0, width: 3), // [3:1]

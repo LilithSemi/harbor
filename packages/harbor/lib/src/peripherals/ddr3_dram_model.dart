@@ -48,6 +48,27 @@ class Ddr3DramModel extends Module {
   /// Live MPR-mode flag (observable for the testbench).
   Logic get mprEnabled => output('dbg_mpr_enabled');
 
+  /// Per-lane extra shift on the modeled DQS edge, in bit positions. Zero
+  /// for every lane models a board with no lane-to-lane DQS skew. A test can
+  /// set one lane's offset to model a lane whose edge lands further out.
+  final List<int> laneDqsBoundaryOffset;
+
+  /// When true, a non-MPR read presents the stored data only during its own
+  /// burst window ([readWindowStart] to [readWindowStart] + [readWindowCycles]
+  /// controller cycles after the read command) and an inverted pattern
+  /// outside it. Default false: a read presents its data from the command
+  /// onward and holds it, same as before this option existed, so no test
+  /// that does not pass this changes behavior.
+  final bool gateReadWindow;
+
+  /// First controller cycle after the read command, inclusive, at which the
+  /// real burst window opens. Only used when [gateReadWindow] is true.
+  final int readWindowStart;
+
+  /// Width of the burst window in controller cycles. Only used when
+  /// [gateReadWindow] is true.
+  final int readWindowCycles;
+
   Ddr3DramModel(
     this.params, {
     required Logic controllerClk,
@@ -56,8 +77,13 @@ class Ddr3DramModel extends Module {
     required Logic writeData, // o_phy_data [wbData]
     required Logic bitslip, // o_phy_bitslip [lanes]
     required Logic idelayDqsLd, // o_phy_idelay_dqs_ld [lanes]
+    List<int>? laneDqsBoundaryOffset,
+    this.gateReadWindow = false,
+    this.readWindowStart = 0,
+    this.readWindowCycles = 1,
     super.name = 'ddr3_dram_model',
-  }) {
+  }) : laneDqsBoundaryOffset =
+           laneDqsBoundaryOffset ?? List.filled(params.lanes, 0) {
     controllerClk = addInput('i_controller_clk', controllerClk);
     phyReset = addInput('i_phy_reset', phyReset);
     cmd = addInput('o_phy_cmd', cmd, width: cmdLen * serdes);
@@ -226,10 +252,11 @@ class Ddr3DramModel extends Module {
     final dataValid = pipe[readLatency];
 
     // A tiny two-entry memory (calibration BIST writes address 0 and 1). The
-    // write data (o_phy_data) arrives a couple of cycles after the write
-    // command, so capture it a few cycles later. mem index = column bit 3.
-    final wrPending = Logic(name: 'wr_pending', width: 4);
-    final wrIndex = Logic(name: 'wr_index');
+    // write data (o_phy_data) arrives three cycles after the write command,
+    // so each write is tracked in a short pipe (back-to-back writes each
+    // land). mem index = column bit 3.
+    final wrPending = Logic(name: 'wr_pending', width: 3);
+    final wrIndex = Logic(name: 'wr_index', width: 3);
     final mem0 = Logic(name: 'mem0', width: params.wbDataBits);
     final mem1 = Logic(name: 'mem1', width: params.wbDataBits);
     // Read-data hold: latched on a (non-MPR) read command and held so the
@@ -239,26 +266,24 @@ class Ddr3DramModel extends Module {
       If(
         reset,
         then: [
-          wrPending < Const(0, width: 4),
-          wrIndex < Const(0),
+          wrPending < Const(0, width: 3),
+          wrIndex < Const(0, width: 3),
           mem0 < Const(0, width: params.wbDataBits),
           mem1 < Const(0, width: params.wbDataBits),
           readHold < Const(0, width: params.wbDataBits),
         ],
         orElse: [
-          // schedule a write-data capture a few cycles after the command.
+          // capture the write data three cycles after the command.
+          wrPending < [wrPending.getRange(0, 2), writeStrobe].swizzle(),
+          wrIndex < [wrIndex.getRange(0, 2), wrAddrBit].swizzle(),
           If(
-            writeStrobe,
+            wrPending[2],
             then: [
-              wrPending < Const(1 << 2, width: 4), // capture ~2 cycles later
-              wrIndex < wrAddrBit,
-            ],
-            orElse: [wrPending < (wrPending >> 1)],
-          ),
-          If(
-            wrPending[0],
-            then: [
-              If(wrIndex, then: [mem1 < writeData], orElse: [mem0 < writeData]),
+              If(
+                wrIndex[2],
+                then: [mem1 < writeData],
+                orElse: [mem0 < writeData],
+              ),
             ],
           ),
           If(readStrobe & ~mpr, then: [readHold < mux(rdAddrBit, mem1, mem0)]),
@@ -272,9 +297,19 @@ class Ddr3DramModel extends Module {
       _repeatByte(mprByte, params.wbDataBits ~/ 8),
       width: params.wbDataBits,
     );
-    // MPR reads present the windowed pattern; BIST reads hold their memory word.
+    // Non-MPR (BIST) read data: held indefinitely by default (unchanged), or
+    // gated to its own burst window with an inverted pattern outside it, so a
+    // capture at the wrong cycle reads wrong data instead of the same held
+    // value. A dedicated shift register tracks cycles since the read command
+    // (readStrobe), independent of [pipe] so the window can sit further out
+    // than the DQS collect stages without resizing that pipe.
+    final bistData = gateReadWindow
+        ? _gatedBistData(clk, reset, readStrobe, readHold)
+        : readHold;
+    // MPR reads present the windowed pattern. BIST reads hold (or gate) their
+    // memory word.
     output('o_controller_iserdes_data') <=
-        mux(mpr, mux(dataValid, mprWord, Const(0, width: dq * 8)), readHold);
+        mux(mpr, mux(dataValid, mprWord, Const(0, width: dq * 8)), bistData);
 
     // DQS: model the read strobe the controller deserializes into dqs_store over
     // the 5 collect cycles. Per lane, present the byte slices of the 40-bit word
@@ -300,16 +335,44 @@ class Ddr3DramModel extends Module {
     // The 5 collect cycles line up with pipe stages [readLatency+2 .. +6]
     // (cycle 0 = the lowest dqs_store byte).
     final dqsWord = [
-      for (var l = 0; l < lanes; l++) _laneDqsByte(taps[l], pipe),
+      for (var l = 0; l < lanes; l++)
+        _laneDqsByte(taps[l], pipe, laneDqsBoundaryOffset[l]),
     ].rswizzle();
     output('o_controller_iserdes_dqs') <= dqsWord;
+  }
+
+  /// Gate [readHold] to [readWindowStart]..+[readWindowCycles] controller
+  /// cycles after [readStrobe]. Present an inverted pattern elsewhere. The inverted
+  /// pattern is never equal to a written pattern, so a capture outside the
+  /// real window reads back wrong, not coincidentally right.
+  Logic _gatedBistData(
+    Logic clk,
+    Logic reset,
+    Logic readStrobe,
+    Logic readHold,
+  ) {
+    final depth = readWindowStart + readWindowCycles + 1;
+    final track = Logic(name: 'bist_window_track', width: depth);
+    Sequential(clk, [
+      If(
+        reset,
+        then: [track < Const(0, width: depth)],
+        orElse: [
+          track < [track.getRange(0, depth - 1), readStrobe].swizzle(),
+        ],
+      ),
+    ]);
+    final inWindow = [
+      for (var k = 0; k < readWindowCycles; k++) track[readWindowStart + k],
+    ].swizzle().or();
+    return mux(inWindow, readHold, ~readHold);
   }
 
   /// Per-lane DQS byte for the current collect cycle: the byte slices of the
   /// 40-bit word 0x55 << (2 + tap) across the 5 collect pipe stages (only one
   /// stage is hot at a time). dqs_store then reconstructs that word.
-  Logic _laneDqsByte(Logic tap, Logic pipe) {
-    final shiftAmt = tap.zeroExtend(7) + 2;
+  Logic _laneDqsByte(Logic tap, Logic pipe, int boundaryOffset) {
+    final shiftAmt = tap.zeroExtend(7) + 2 + boundaryOffset;
     final target = Const(0x55, width: 48) << shiftAmt;
     Logic acc = Const(0, width: 8);
     for (var c = 0; c < _storedDqsSize; c++) {

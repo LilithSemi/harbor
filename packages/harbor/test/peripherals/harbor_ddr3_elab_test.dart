@@ -1,4 +1,4 @@
-import 'package:harbor/src/peripherals/ddr.dart'
+import 'package:harbor/src/peripherals/ddr3_config.dart'
     show HarborDdrConfig, HarborDdrType;
 import 'package:harbor/src/peripherals/harbor_ddr3.dart';
 import 'package:rohd/rohd.dart';

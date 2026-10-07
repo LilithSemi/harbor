@@ -8,19 +8,21 @@ import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../soc/target.dart';
-import 'ddr.dart' show HarborDdrConfig, HarborDdrType;
+import 'ddr3_config.dart' show HarborDdrConfig, HarborDdrType;
 import 'ddr3_burst_adapter.dart';
 import 'ddr3_controller.dart';
 import 'ddr3_gearbox.dart';
 import 'ddr3_params.dart';
 import 'ddr3_phy.dart';
+import 'ddr3_phy_base.dart';
+import 'ddr3_phy_ecp5.dart';
 
 /// Clean SoC wrapper for the production [Ddr3Controller] + [Ddr3Phy] (the
 /// UberDDR3-derived, silicon-proven stack: read/write calibration + multi-row
 /// bank management verified on the Arty S7).
 ///
-/// It presents the same external contract as the legacy `HarborDdrController`
-/// so genip wires it identically: a Wishbone-B4 slave `'bus'`, the DDR3 clock
+/// It presents one fixed external contract so genip wires it the same way on
+/// every target: a Wishbone-B4 slave `'bus'`, the DDR3 clock
 /// inputs (`clk`, `reset`, `ddr_clk`, `ddr_reset`, `ddr_ck_fast`,
 /// `ddr_ck90_fast`, `ddr_ck_dqs_fast`, `ddr_idelay_ref`), and the `sdram_*`
 /// pads. Internally:
@@ -32,6 +34,12 @@ import 'ddr3_phy.dart';
 /// No writeVerify / readLevel / trainableRead workarounds: the controller
 /// self-calibrates and keeps the bus stalled (o_wb_stall high) until
 /// calibration completes, so a CPU access naturally waits for a ready array.
+///
+/// On an ECP5 target the PHY is [Ddr3PhyEcp5]. Clock contract there:
+/// `ddr_clk` (CK/4) and `ddr_ck_fast` (CK) come from one PLL with aligned
+/// rising edges. If its read leveling fails [Ddr3Controller.defaultMaxCalAttempts]
+/// times, the controller stops in a failed state, opens the bus, and raises
+/// [Ddr3Controller.calFailed] (STATUS bit 1 in the knob window).
 class HarborDdr3 extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -95,6 +103,12 @@ class HarborDdr3 extends BridgeModule
   /// The wrapped controller, exposed for simulation tests.
   Ddr3Controller? controller;
 
+  /// True when [target] is a Lattice ECP5, which builds [Ddr3PhyEcp5].
+  bool get isEcp5 => switch (target) {
+    HarborFpgaTarget(vendor: HarborFpgaVendor.ecp5) => true,
+    _ => false,
+  };
+
   late final DdrParams _p;
 
   HarborDdr3({
@@ -140,10 +154,20 @@ class HarborDdr3 extends BridgeModule
       dataWidth: busDW,
     );
 
-    final p = DdrParams.artyS7(
-      ckPeriodPs: ckPeriodPs,
-      controllerGearRatio: controllerGearRatio,
-    );
+    if (isEcp5 && controllerGearRatio != 1) {
+      throw ArgumentError.value(
+        controllerGearRatio,
+        'controllerGearRatio',
+        'the ECP5 DDR3 PHY needs a CK/4 controller',
+      );
+    }
+    // The ECP5 board is the OrangeCrab r0.2 (MT41K64M16).
+    final p = isEcp5
+        ? DdrParams.orangeCrab(ckPeriodPs: ckPeriodPs)
+        : DdrParams.artyS7(
+            ckPeriodPs: ckPeriodPs,
+            controllerGearRatio: controllerGearRatio,
+          );
     _p = p;
 
     // Knob-ABI wishbone slave (train=runtime only). SoC (sys clk) facing; a
@@ -192,6 +216,8 @@ class HarborDdr3 extends BridgeModule
     createPort('sdram_dqs_n', PortDirection.inOut, width: p.lanes);
     createPort('sdram_odt', PortDirection.output);
     createPort('sdram_reset_n', PortDirection.output);
+    // Self-trained (ECP5) calibration gave up. See [Ddr3Controller.calFailed].
+    if (isEcp5) addOutput('cal_failed');
 
     _build(
       clk,
@@ -550,10 +576,14 @@ struct DramStore {
       trainCdc.input('m_dat_r').srcConnection! <= wb2DataOut.zeroExtend(busDW);
     }
 
+    // A self-training PHY (ECP5) reports its read leveling back.
+    final phyLevelDone = isEcp5 ? Logic(name: 'phy_read_level_done') : null;
     final ctrl = Ddr3Controller(
       p,
       controllerClk: ddrClk,
-      rstN: rstN,
+      // ECP5: the controller starts once the PHY can drive the pins (DLL lock
+      // and init done), so a late lock cannot use up a calibration try.
+      rstN: isEcp5 ? rstN & phyRdy : rstN,
       wbCyc: adapter.output('m_cyc'),
       wbStb: adapter.output('m_stb'),
       wbWe: adapter.output('m_we'),
@@ -572,8 +602,12 @@ struct DramStore {
       phyIserdesBitslipReference: phyBsRef,
       phyIdelayctrlRdy: phyRdy,
       runtimeTrainable: runtimeTrainable,
+      phyReadLevelDone: phyLevelDone,
+      phySelfTrainsRead: isEcp5,
+      phyReadPipeTicks: isEcp5 ? Ddr3PhyEcp5.readPipeTicks : 0,
     );
     controller = ctrl;
+    if (isEcp5) output('cal_failed') <= ctrl.calFailed!;
     ctrlStall <= ctrl.output('o_wb_stall');
     ctrlAck <= ctrl.output('o_wb_ack');
     ctrlData <= ctrl.output('o_wb_data');
@@ -647,7 +681,10 @@ struct DramStore {
     Logic phyIn(String gbOut, String ctrlOut) =>
         geared ? gb!.output(gbOut) : ctrl.output(ctrlOut);
 
-    final phy = Ddr3Phy(
+    // Xilinx 7-series PHY build, shared by every target this stack can
+    // serve today. Captured as a closure so the vendor switch below picks
+    // a PHY without repeating this argument list per case.
+    Ddr3Phy buildXilinxPhy() => Ddr3Phy(
       p,
       controllerClk: serdesClk,
       ddr3Clk: ddrCk,
@@ -690,6 +727,55 @@ struct DramStore {
       dqsPad: dqsPad,
       dqsNPad: dqsNPad,
     );
+
+    // Lattice ECP5 PHY (gearRatio 1 only, so straight from the controller).
+    Ddr3PhyEcp5 buildEcp5Phy() => Ddr3PhyEcp5(
+      p,
+      controllerClk: serdesClk,
+      ddr3Clk: ddrCk,
+      refClk: idelayRef,
+      ddr3Clk90: ddrCk90,
+      rstN: rstN,
+      controllerReset: ctrl.output('o_phy_reset'),
+      cmd: ctrl.output('o_phy_cmd'),
+      dqsTriControl: ctrl.output('o_phy_dqs_tri_control'),
+      dqTriControl: ctrl.output('o_phy_dq_tri_control'),
+      toggleDqs: ctrl.output('o_phy_toggle_dqs'),
+      data: ctrl.output('o_phy_data'),
+      dm: ctrl.output('o_phy_dm'),
+      odelayDataCntValueIn: ctrl.output('o_phy_odelay_data_cntvaluein'),
+      odelayDqsCntValueIn: ctrl.output('o_phy_odelay_dqs_cntvaluein'),
+      idelayDataCntValueIn: ctrl.output('o_phy_idelay_data_cntvaluein'),
+      idelayDqsCntValueIn: ctrl.output('o_phy_idelay_dqs_cntvaluein'),
+      odelayDataLd: ctrl.output('o_phy_odelay_data_ld'),
+      odelayDqsLd: ctrl.output('o_phy_odelay_dqs_ld'),
+      idelayDataLd: ctrl.output('o_phy_idelay_data_ld'),
+      idelayDqsLd: ctrl.output('o_phy_idelay_dqs_ld'),
+      bitslip: ctrl.output('o_phy_bitslip'),
+      writeLevelingCalib: ctrl.output('o_phy_write_leveling_calib'),
+      readLevelStart: ctrl.output('o_phy_read_level_start'),
+      readLevelCheck: ctrl.output('o_phy_read_level_check'),
+      readLevelPass: ctrl.output('o_phy_read_level_pass'),
+      readClkSel: runtimeTrainable ? ctrl.output('o_phy_read_clk_sel') : null,
+      dqPad: dqPad,
+      dqsPad: dqsPad,
+      dqsNPad: dqsNPad,
+      runtimeTrainable: runtimeTrainable,
+      dmRemapping: config.dmRemapping,
+    );
+
+    // Pick the PHY by target vendor. iCE40 has no DDR3 PHY in this stack.
+    final Ddr3PhyBase phy = switch (target) {
+      HarborFpgaTarget(vendor: HarborFpgaVendor.ice40) =>
+        throw ArgumentError.value(
+          target,
+          'target',
+          'HarborDdr3 has no DDR3 PHY for iCE40',
+        ),
+      HarborFpgaTarget(vendor: HarborFpgaVendor.ecp5) => buildEcp5Phy(),
+      _ => buildXilinxPhy(),
+    };
+    if (phyLevelDone != null) phyLevelDone <= phy.readLevelDone!;
     if (geared) {
       // Raw CK/4 ISERDES returns feed the gearbox, which re-times them to CK/8.
       phyIserRawData! <= phy.iserdesData;
@@ -707,18 +793,18 @@ struct DramStore {
     phyRdy <= phy.idelayctrlRdy;
 
     // --- drive the SDRAM control/address pads ---
-    output('sdram_ck') <= phy.output('o_ddr3_clk_p');
-    output('sdram_ck_n') <= phy.output('o_ddr3_clk_n');
-    output('sdram_cke') <= phy.output('o_ddr3_cke');
-    output('sdram_cs_n') <= phy.output('o_ddr3_cs_n');
-    output('sdram_ras_n') <= phy.output('o_ddr3_ras_n');
-    output('sdram_cas_n') <= phy.output('o_ddr3_cas_n');
-    output('sdram_we_n') <= phy.output('o_ddr3_we_n');
-    output('sdram_ba') <= phy.output('o_ddr3_ba_addr');
-    output('sdram_addr') <= phy.output('o_ddr3_addr');
-    output('sdram_dm') <= phy.output('o_ddr3_dm');
-    output('sdram_odt') <= phy.output('o_ddr3_odt');
-    output('sdram_reset_n') <= phy.output('o_ddr3_reset_n');
+    output('sdram_ck') <= phy.oDdr3ClkP;
+    output('sdram_ck_n') <= phy.oDdr3ClkN;
+    output('sdram_cke') <= phy.oDdr3Cke;
+    output('sdram_cs_n') <= phy.oDdr3CsN;
+    output('sdram_ras_n') <= phy.oDdr3RasN;
+    output('sdram_cas_n') <= phy.oDdr3CasN;
+    output('sdram_we_n') <= phy.oDdr3WeN;
+    output('sdram_ba') <= phy.oDdr3BaAddr;
+    output('sdram_addr') <= phy.oDdr3Addr;
+    output('sdram_dm') <= phy.oDdr3Dm;
+    output('sdram_odt') <= phy.oDdr3Odt;
+    output('sdram_reset_n') <= phy.oDdr3ResetN;
   }
 
   /// Number of DQ byte lanes (dataWidth / 8). Used by the openXC7 DDR
@@ -744,51 +830,93 @@ struct DramStore {
       'harbor,train-reg': [trainBase, trainWindowSize],
       'harbor,train-stride': 8,
     },
-    children: const [
-      HarborDeviceTreeChild(
-        name: 'knob@0',
-        properties: {
-          'harbor,knob': 'write-level',
-          'harbor,reg': [0x00],
-          'harbor,scope': 'per-lane',
-          'harbor,feedback': 'map',
-        },
-      ),
-      HarborDeviceTreeChild(
-        name: 'knob@1',
-        properties: {
-          'harbor,knob': 'write-odelay',
-          'harbor,reg': [0x08],
-          'harbor,scope': 'per-lane',
-          'harbor,feedback': 'pattern',
-          'harbor,min': [0],
-          'harbor,max': [31],
-        },
-      ),
-      HarborDeviceTreeChild(
-        name: 'knob@2',
-        properties: {
-          'harbor,knob': 'read-idelay',
-          'harbor,reg': [0x10],
-          'harbor,scope': 'per-lane',
-          'harbor,feedback': 'pattern',
-          'harbor,min': [0],
-          'harbor,max': [31],
-        },
-      ),
-      HarborDeviceTreeChild(
-        name: 'knob@3',
-        properties: {
-          'harbor,knob': 'bitslip',
-          'harbor,reg': [0x18],
-          'harbor,scope': 'per-lane',
-          'harbor,feedback': 'pattern',
-          'harbor,min': [0],
-          'harbor,max': [7],
-        },
-      ),
-    ],
+    children: isEcp5 ? _ecp5Knobs : _xilinxKnobs,
   );
+
+  /// Xilinx knob table (write leveling, write and read taps, bitslip).
+  static const _xilinxKnobs = [
+    HarborDeviceTreeChild(
+      name: 'knob@0',
+      properties: {
+        'harbor,knob': 'write-level',
+        'harbor,reg': [0x00],
+        'harbor,scope': 'per-lane',
+        'harbor,feedback': 'map',
+      },
+    ),
+    HarborDeviceTreeChild(
+      name: 'knob@1',
+      properties: {
+        'harbor,knob': 'write-odelay',
+        'harbor,reg': [0x08],
+        'harbor,scope': 'per-lane',
+        'harbor,feedback': 'pattern',
+        'harbor,min': [0],
+        'harbor,max': [31],
+      },
+    ),
+    HarborDeviceTreeChild(
+      name: 'knob@2',
+      properties: {
+        'harbor,knob': 'read-idelay',
+        'harbor,reg': [0x10],
+        'harbor,scope': 'per-lane',
+        'harbor,feedback': 'pattern',
+        'harbor,min': [0],
+        'harbor,max': [31],
+      },
+    ),
+    HarborDeviceTreeChild(
+      name: 'knob@3',
+      properties: {
+        'harbor,knob': 'bitslip',
+        'harbor,reg': [0x18],
+        'harbor,scope': 'per-lane',
+        'harbor,feedback': 'pattern',
+        'harbor,min': [0],
+        'harbor,max': [7],
+      },
+    ),
+  ];
+
+  /// ECP5 knob table. ECP5 has no write taps and is not write leveled. Read
+  /// leveling is a 2D search (bitslip outer, read clock select inner, as the
+  /// LiteX BIOS does), then the DELAYF read tap.
+  static const _ecp5Knobs = [
+    HarborDeviceTreeChild(
+      name: 'knob@3',
+      properties: {
+        'harbor,knob': 'bitslip',
+        'harbor,reg': [0x18],
+        'harbor,scope': 'per-lane',
+        'harbor,feedback': 'pattern',
+        'harbor,min': [0],
+        'harbor,max': [15],
+      },
+    ),
+    HarborDeviceTreeChild(
+      name: 'knob@7',
+      properties: {
+        'harbor,knob': 'read-clk-sel',
+        'harbor,reg': [0x38],
+        'harbor,scope': 'per-lane',
+        'harbor,feedback': 'pattern',
+        'harbor,min': [0],
+        'harbor,max': [7],
+      },
+    ),
+    HarborDeviceTreeChild(
+      name: 'knob@2',
+      properties: {
+        'harbor,knob': 'read-idelay',
+        'harbor,reg': [0x10],
+        'harbor,scope': 'per-lane',
+        'harbor,feedback': 'pattern',
+        'harbor,min': [0],
+        'harbor,max': [31],
+      },
+    ),
+  ];
 
   @override
   HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(

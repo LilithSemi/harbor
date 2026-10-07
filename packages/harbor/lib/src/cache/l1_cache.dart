@@ -978,9 +978,10 @@ class HarborL1DCache extends BridgeModule {
           // store is finishing. Those operations cannot be cancelled safely:
           // their side effects may already have happened. Keep their state and
           // deliver their success/fault response, including during a held flush.
-          If(flush, then: [
-            ...List.generate(numLines, (i) => lineValid[i] < 0),
-          ]),
+          If(
+            flush,
+            then: [...List.generate(numLines, (i) => lineValid[i] < 0)],
+          ),
           // Refills can be abandoned, but drain their outstanding beat before
           // starting another operation. blockHit prevents new requests and
           // cached hits while flush is asserted or a stale beat is draining.

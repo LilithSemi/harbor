@@ -79,44 +79,6 @@ void main() {
     });
   });
 
-  group('HarborDdrController', () {
-    test('creates with OrangeCrab config', () {
-      final ddr = HarborDdrController(
-        config: HarborDdrConfig.orangeCrab(),
-        baseAddress: 0x80000000,
-      );
-      expect(ddr, isNotNull);
-      expect(ddr.config.type, equals(HarborDdrType.ddr3));
-    });
-
-    test('creates with SDR config (isSdr=true, isDdr=false)', () {
-      final ddr = HarborDdrController(
-        config: HarborDdrConfig.sdr(),
-        baseAddress: 0x80000000,
-      );
-      expect(ddr.config.isSdr, isTrue);
-      expect(ddr.config.isDdr, isFalse);
-    });
-
-    test('DT node', () {
-      final ddr = HarborDdrController(
-        config: HarborDdrConfig.orangeCrab(),
-        baseAddress: 0x80000000,
-      );
-      expect(ddr.dtNode.compatible, contains('harbor,sdram-controller'));
-    });
-
-    test('SDR has no DDR-specific ports', () {
-      final ddr = HarborDdrController(
-        config: HarborDdrConfig.sdr(),
-        baseAddress: 0x80000000,
-      );
-      expect(ddr.config.isSdr, isTrue);
-      // SDR config does not create DDR-specific ports (sdram_dqs, sdram_odt, sdram_reset_n)
-      expect(() => ddr.input('sdram_dqs'), throwsA(isA<Exception>()));
-    });
-  });
-
   group('HarborDdrConfig', () {
     test('dataRate SDR is 1x frequency', () {
       const config = HarborDdrConfig.sdr(frequency: 133000000);

@@ -4,6 +4,7 @@ import 'package:rohd/rohd.dart';
 
 import '../blackbox/xilinx/xilinx.dart';
 import 'ddr3_params.dart';
+import 'ddr3_phy_base.dart';
 
 /// Xilinx 7-series DDR3 PHY, a faithful ROHD translation of UberDDR3's
 /// `ddr3_phy.v`. Family-generic (Artix/Kintex/Spartan/Zynq-7); the only
@@ -20,7 +21,7 @@ import 'ddr3_params.dart';
 /// This is a translation-in-progress: the module contract, reset sequencing,
 /// IDELAYCTRL and CK are in place; the DQ/DQS/command datapaths are being ported
 /// datapath-by-datapath and verified against `ddr3_phy.v`.
-class Ddr3Phy extends Module {
+class Ddr3Phy extends Ddr3PhyBase {
   final DdrParams params;
 
   int get lanes => params.lanes;
@@ -30,18 +31,53 @@ class Ddr3Phy extends Module {
 
   /// IDELAYCTRL RDY (gated with DCI lock). The calibration engine waits on this
   /// before touching the delay taps.
+  @override
   Logic get idelayctrlRdy => output('o_controller_idelayctrl_rdy');
 
   /// Deserialized read data (DQ_BITS*LANES*8 = one BL8 gather).
+  @override
   Logic get iserdesData => output('o_controller_iserdes_data');
 
   /// Deserialized DQS strobe (LANES*8) - the phase reference the DQS-analyze
   /// calibration step reads to find where the read burst begins.
+  @override
   Logic get iserdesDqs => output('o_controller_iserdes_dqs');
 
   /// Fabric model of the ISERDES bitslip barrel-shift (LANES*8).
+  @override
   Logic get iserdesBitslipReference =>
       output('o_controller_iserdes_bitslip_reference');
+
+  @override
+  Logic get oDdr3ClkP => output('o_ddr3_clk_p');
+  @override
+  Logic get oDdr3ClkN => output('o_ddr3_clk_n');
+  @override
+  Logic get oDdr3Cke => output('o_ddr3_cke');
+  @override
+  Logic get oDdr3CsN => output('o_ddr3_cs_n');
+  @override
+  Logic get oDdr3RasN => output('o_ddr3_ras_n');
+  @override
+  Logic get oDdr3CasN => output('o_ddr3_cas_n');
+  @override
+  Logic get oDdr3WeN => output('o_ddr3_we_n');
+  @override
+  Logic get oDdr3Odt => output('o_ddr3_odt');
+  @override
+  Logic get oDdr3ResetN => output('o_ddr3_reset_n');
+  @override
+  Logic get oDdr3BaAddr => output('o_ddr3_ba_addr');
+  @override
+  Logic get oDdr3Addr => output('o_ddr3_addr');
+  @override
+  Logic get oDdr3Dm => output('o_ddr3_dm');
+  @override
+  Logic get ioDdr3Dq => inOut('io_ddr3_dq');
+  @override
+  Logic get ioDdr3Dqs => inOut('io_ddr3_dqs');
+  @override
+  Logic get ioDdr3DqsN => inOut('io_ddr3_dqs_n');
 
   Ddr3Phy(
     this.params, {

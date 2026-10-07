@@ -488,7 +488,7 @@ XilinxDdr3Clocks buildXilinxDdr3ClockTree(
   );
 }
 
-/// A standalone core/sys clock PLL for the single-oscillator ddr3Fast boards: a
+/// A standalone core/sys clock PLL for the single-oscillator DDR3 boards: a
 /// SECOND PLLE2_ADV off the SAME oscillator as the DDR MMCM (both fed from one
 /// shared input BUFG so openXC7 accepts two PLLs on the one clock-capable pin).
 ///
@@ -697,7 +697,7 @@ class XilinxObufds extends BridgeModule {
 ///     construction (the rohd_bridge idiom: a post-construction `<=` from
 ///     inOut('IO') does NOT bind it and the `.IO()` emits empty, severing the
 ///     pad from the buffer, exactly like [Ecp5Bb]). This is the form the
-///     ddr3Fast write path uses so the write OSERDESE2 `.OQ` -> `.I` and its
+///     DDR3 write path uses so the write OSERDESE2 `.OQ` -> `.I` and its
 ///     in-site `.TQ` -> `.T` reach the pad with the tristate STILL in the
 ///     OLOGIC. [t] is active-HIGH = high-Z (drive when [t]=0), matching the
 ///     OSERDESE2 TQ polarity.
@@ -973,8 +973,8 @@ class XilinxIddr extends BridgeModule {
 ///
 /// This is the HW-verified UberDDR3 write-datapath primitive (the openXC7 Arty
 /// S7 oracle, /tmp/uberddr3_ref/rtl/ddr3_phy.v `OSERDESE2_data`). It replaces
-/// the plain [XilinxOddr] + a SHARED FABRIC tristate on the ddr3Fast write DQ
-/// pins, which is what stalled the ddr3Fast route at overused=32 on the OLOGIC
+/// the plain [XilinxOddr] + a SHARED FABRIC tristate on the DDR3 write DQ
+/// pins, which is what stalled the DDR3 route at overused=32 on the OLOGIC
 /// D1 pins: with a plain ODDR + a fabric-LUT tristate, nextpnr's ODDR packer
 /// branch (pack_io_xc7.cc) fails to strip `$PACKER_GND_NET` off the OLOGIC spare
 /// inputs and double-binds `wr_word[N]` + a GND tie onto `IOI_OLOGIC*_D1`. The
@@ -1239,7 +1239,7 @@ class XilinxIserdese2 extends BridgeModule {
     // 8-beat parallel word (Q1..Q8) is loaded and BITSLIP advances on CLKDIV.
     // Left unconnected, that parallel register never clocks and Q1..Q8 FREEZE at
     // their reset value. Every read returns a fixed constant regardless of the
-    // captured DQ (HW-confirmed on the Arty ddr3Fast read: A==B==C == 0x73145241
+    // captured DQ (HW-confirmed on the Arty DDR3 read: A==B==C == 0x73145241
     // for any write/address/IDELAY/window). EARLIER BELIEF (wrong): a BUFG-net
     // CLKDIV forced all 16 lanes onto the single contended IOI_CLK0 leaf
     // (overused=32) so it was left null to route. But the write OSERDESE2 in the

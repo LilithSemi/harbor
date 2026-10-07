@@ -8,7 +8,7 @@ import 'package:harbor/src/clock/wishbone_cdc.dart';
 /// Reproduces the real DDR bus path minus the analog PHY: a 64-bit master drives
 /// a [HarborWishboneDownsizer] (64->32) whose narrow master feeds a
 /// [HarborWishboneCdcBridge] (32-bit) crossing to a faster clock, where a simple
-/// 32-bit Wishbone memory lives. This is exactly the chain in HarborDdrController
+/// 32-bit Wishbone memory lives. This is exactly the chain a DDR bus path uses
 /// (bus -> downsizer -> CDC -> 32-bit datapath), so a structural corruption in
 /// the downsizer+CDC interaction under back-to-back 64-bit traffic shows here.
 void main() {

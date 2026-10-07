@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:harbor/src/clock/wishbone_cdc_fifo.dart';
-import 'package:harbor/src/peripherals/ddr.dart'
+import 'package:harbor/src/peripherals/ddr3_config.dart'
     show HarborDdrConfig, HarborDdrType;
 import 'package:harbor/src/peripherals/ddr3_controller.dart';
 import 'package:harbor/src/peripherals/ddr3_params.dart';

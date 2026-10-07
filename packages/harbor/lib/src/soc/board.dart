@@ -254,9 +254,13 @@ const _orangeCrab25f = HarborBoard(
     // The user button. It is ACTIVE LOW (pressed reads 0), while the SoC top
     // port `reset` is active high, so a design must invert this pin.
     'rst_n': 'V17 LVCMOS33',
-    // Green channel of the RGB LED. It is ACTIVE LOW (drive 0 to light it).
-    // The red and blue channels are added when a bring-up needs them.
+    // Green channel of the RGB LED. It is active low (drive 0 to light it).
+    // The blue channel is added when a bring-up needs it.
     'led_g': 'M3 LVCMOS33',
+    // Red channel of the RGB LED (gsd_orangecrab.py _io_r0_2, user_led 0,
+    // "K4"). Wired to the DDR3 cal-failed signal. Active low, so a lit LED
+    // means calibration failed.
+    'ddr_cal_failed': 'K4 LVCMOS33',
     // The microSD socket, 1-bit mode. Sites from the litex-boards
     // `gsd_orangecrab` `_io_r0_2` table. CMD and DAT carry a pull-up, which
     // is what an SD host and an SD card both expect on an idle line: the line
