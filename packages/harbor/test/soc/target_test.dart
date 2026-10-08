@@ -305,6 +305,28 @@ void main() {
       expect(result, contains('synth_ecp5'));
     });
 
+    test('generateYosysTcl ecp5 skips autoname by default', () {
+      const target = HarborFpgaTarget.ecp5(
+        device: 'lfe5u-45f',
+        package: 'CABGA381',
+      );
+      final result = target.generateYosysTcl('TopCell');
+      expect(result, contains('synth_ecp5 -top TopCell -run begin:check'));
+      expect(result, isNot(contains('autoname')));
+      expect(result, contains('write_json TopCell.json'));
+    });
+
+    test('generateYosysTcl ecp5 runs full synth_ecp5 when ecp5Autoname is '
+        'true', () {
+      const target = HarborFpgaTarget.ecp5(
+        device: 'lfe5u-45f',
+        package: 'CABGA381',
+        ecp5Autoname: true,
+      );
+      final result = target.generateYosysTcl('TopCell');
+      expect(result, contains('synth_ecp5 -top TopCell -json TopCell.json'));
+    });
+
     test('generateNextpnrCommand returns non-null for ice40', () {
       const target = HarborFpgaTarget.ice40(device: 'up5k', package: 'sg48');
       final result = target.generateNextpnrCommand('TopCell');

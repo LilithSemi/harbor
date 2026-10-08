@@ -140,6 +140,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// Xilinx family only has to set this field.
   final _XilinxFamily? _xilinxFamily;
 
+  /// Runs the full `synth_ecp5`, including its `autoname` pass. Other
+  /// vendors ignore it.
+  final bool ecp5Autoname;
+
   /// Whether this FPGA supports eFuse OTP storage.
   ///
   /// ECP5 and Xilinx 7-series have eFuse support for user data and
@@ -190,6 +194,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
     this.progCommand,
+    this.ecp5Autoname = false,
   }) : _xilinxFamily = null;
 
   /// iCE40 UP5K target using Yosys + nextpnr-ice40.
@@ -203,7 +208,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
   }) : name = 'ice40-$device',
        vendor = HarborFpgaVendor.ice40,
-       _xilinxFamily = null;
+       _xilinxFamily = null,
+       ecp5Autoname = false;
 
   /// Lattice ECP5 target using Yosys + nextpnr-ecp5.
   const HarborFpgaTarget.ecp5({
@@ -214,6 +220,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
     this.progCommand,
+    this.ecp5Autoname = false,
   }) : name = 'ecp5-$device',
        vendor = HarborFpgaVendor.ecp5,
        _xilinxFamily = null;
@@ -233,7 +240,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     bool useOpenXc7 = false,
   }) : name = 'spartan7-$device',
        vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
-       _xilinxFamily = _XilinxFamily.spartan7;
+       _xilinxFamily = _XilinxFamily.spartan7,
+       ecp5Autoname = false;
 
   /// Xilinx Artix-7 target using Vivado or openXC7.
   ///
@@ -250,7 +258,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     bool useOpenXc7 = false,
   }) : name = 'artix7-$device',
        vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
-       _xilinxFamily = _XilinxFamily.artix7;
+       _xilinxFamily = _XilinxFamily.artix7,
+       ecp5Autoname = false;
 
   /// Xilinx Kintex-7 target using Vivado or openXC7.
   ///
@@ -267,7 +276,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     bool useOpenXc7 = false,
   }) : name = 'kintex7-$device',
        vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
-       _xilinxFamily = _XilinxFamily.kintex7;
+       _xilinxFamily = _XilinxFamily.kintex7,
+       ecp5Autoname = false;
 
   /// Yosys synthesis target string for this FPGA family.
   String get _yosysSynthTarget => switch (vendor) {
@@ -352,7 +362,18 @@ class HarborFpgaTarget extends HarborDeviceTarget {
           'synth_ice40 -abc2 -relut -top $topCell -json $topCell.json',
         );
       case HarborFpgaVendor.ecp5:
-        buf.writeln('synth_ecp5 -top $topCell -json $topCell.json');
+        if (ecp5Autoname) {
+          buf.writeln('synth_ecp5 -top $topCell -json $topCell.json');
+        } else {
+          // autoname can cost more than all of synthesis on a large design.
+          // Stop before the check step and run its other steps here.
+          buf.writeln('synth_ecp5 -top $topCell -run begin:check');
+          buf.writeln('hierarchy -check');
+          buf.writeln('stat');
+          buf.writeln('check -noinit');
+          buf.writeln('blackbox =A:whitebox');
+          buf.writeln('write_json $topCell.json');
+        }
       case HarborFpgaVendor.vivado:
       case HarborFpgaVendor.openXc7:
         // NOTE: -nowidelut (wide muxes as LUT trees, not MUXF7/8 carry chains)
