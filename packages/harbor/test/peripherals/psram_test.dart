@@ -228,4 +228,99 @@ void main() {
       await Simulator.endSimulation();
     },
   );
+
+  test('an aborted write runs as issued, is not acked, and the next request '
+      'waits for it', () async {
+    final clk = SimpleClockGenerator(10).clk;
+    final reset = Logic(name: 'reset');
+    final stb = Logic(name: 'stb');
+    final we = Logic(name: 'we');
+    final addr = Logic(name: 'addr', width: 32);
+    final dat = Logic(name: 'dat', width: 32);
+
+    final p = HarborPsramController(
+      config: const HarborPsramConfig(
+        size: 8 * 1024 * 1024,
+        mode: HarborPsramMode.standard,
+      ),
+      baseAddress: 0x80000000,
+    );
+    p.input('clk').srcConnection! <= clk;
+    p.input('reset').srcConnection! <= reset;
+    p.input('bus_CYC').srcConnection! <= stb;
+    p.input('bus_STB').srcConnection! <= stb;
+    p.input('bus_WE').srcConnection! <= we;
+    p.input('bus_ADR').srcConnection! <= addr;
+    p.input('bus_DAT_MOSI').srcConnection! <= dat;
+    p.input('bus_SEL').srcConnection! <=
+        Const(0xF, width: p.input('bus_SEL').width);
+    p.input('spi_miso').srcConnection! <= Const(0);
+    await p.build();
+
+    final spiClk = p.output('spi_clk');
+    final csN = p.output('spi_cs_n');
+    final mosi = p.output('spi_mosi');
+    final ack = p.output('bus_ACK');
+
+    reset.inject(1);
+    stb.inject(0);
+    we.inject(0);
+    addr.inject(0);
+    dat.inject(0);
+    Simulator.setMaxSimTime(4000000);
+    unawaited(Simulator.run());
+    await clk.nextPosedge;
+    await clk.nextPosedge;
+    reset.inject(0);
+    await clk.nextPosedge;
+
+    // Bits on each SCK rise, one list per CS-low frame. ACK cycles count by
+    // frame index.
+    final frames = <List<int>>[];
+    final acksInFrame = <int>[];
+    var prevClk = 0;
+    var prevCs = 1;
+    Future<void> tick() async {
+      await clk.nextPosedge;
+      final cs = csN.value.toInt();
+      final sc = spiClk.value.toInt();
+      if (cs == 0 && prevCs == 1) frames.add([]);
+      if (cs == 0 && sc == 1 && prevClk == 0) {
+        frames.last.add(mosi.value.toInt());
+      }
+      if (ack.value.toBool()) acksInFrame.add(frames.length - 1);
+      prevClk = sc;
+      prevCs = cs;
+    }
+
+    we.inject(1);
+    addr.inject(0x40);
+    dat.inject(0xAABBCCDD);
+    stb.inject(1);
+    for (var i = 0; i < 10; i++) {
+      await tick();
+    }
+    // Abort, then ask for a read right away.
+    stb.inject(0);
+    await tick();
+    we.inject(0);
+    addr.inject(0x80);
+    dat.inject(0x11111111);
+    stb.inject(1);
+    for (var i = 0; i < 400 && acksInFrame.isEmpty; i++) {
+      await tick();
+    }
+    stb.inject(0);
+    await Simulator.endSimulation();
+
+    int field(List<int> bits, int from, int n) =>
+        bits.sublist(from, from + n).fold(0, (a, b) => (a << 1) | b);
+    expect(frames.length, 2);
+    expect(field(frames[0], 0, 8), 0x02);
+    expect(field(frames[0], 8, 24), 0x40);
+    expect(field(frames[0], 32, 32), 0xAABBCCDD);
+    expect(field(frames[1], 0, 8), 0x03);
+    expect(field(frames[1], 8, 24), 0x80);
+    expect(acksInFrame, [1], reason: 'only the read is acked');
+  });
 }

@@ -88,10 +88,12 @@ class HarborWishboneDownsizer extends Module {
     );
     final sSel = addInput('s_sel', Logic(width: wideSel), width: wideSel);
     final sAck = addOutput('s_ack');
+    final sErr = addOutput('s_err');
     final sDatR = addOutput('s_dat_r', width: wideWidth);
 
     // Narrow master face.
     final mAck = addInput('m_ack', Logic());
+    final mErr = addInput('m_err', Logic());
     final mDatR = addInput(
       'm_dat_r',
       Logic(width: narrowWidth),
@@ -115,6 +117,7 @@ class HarborWishboneDownsizer extends Module {
     final latSel = Logic(name: 'lat_sel', width: wideSel);
     final rdLo = Logic(name: 'rd_lo', width: narrowWidth);
     final ackReg = Logic(name: 's_ack_reg');
+    final errReg = Logic(name: 's_err_reg');
     final datRReg = Logic(name: 's_dat_r_reg', width: wideWidth);
     final mCycReg = Logic(name: 'm_cyc_reg');
     final hiSel = Logic(name: 'hi_sel'); // 0 -> drive low half, 1 -> high half
@@ -166,6 +169,7 @@ class HarborWishboneDownsizer extends Module {
         state.eq(Const(3, width: 3));
     Sequential(clk, reset: reset, [
       ackReg < Const(0),
+      errReg < Const(0),
       If(
         ~sCyc & midWait,
         then: [
@@ -209,12 +213,26 @@ class HarborWishboneDownsizer extends Module {
                 ],
                 orElse: [
                   If(
-                    mCycReg & mAck,
+                    mCycReg & (mAck | mErr),
                     then: [
-                      rdLo < mDatR,
-                      mCycReg < Const(0),
-                      cnt < Const(0, width: 16),
-                      state < Const(2, width: 3),
+                      // An errored low half ends the whole wide transaction
+                      // with ERR: the high half is never issued.
+                      If(
+                        mErr,
+                        then: [
+                          errReg < Const(1),
+                          mCycReg < Const(0),
+                          hiSel < Const(0),
+                          cnt < Const(0, width: 16),
+                          state < Const(4, width: 3),
+                        ],
+                        orElse: [
+                          rdLo < mDatR,
+                          mCycReg < Const(0),
+                          cnt < Const(0, width: 16),
+                          state < Const(2, width: 3),
+                        ],
+                      ),
                     ],
                     orElse: [
                       // Still waiting on the narrow ack: run the completion watchdog.
@@ -239,11 +257,13 @@ class HarborWishboneDownsizer extends Module {
                                   reissues < reissues + 1,
                                 ],
                                 orElse: [
-                                  // budget spent: force-complete (poison) to guarantee liveness
-                                  rdLo < mDatR,
+                                  // budget spent: report ERR instead of
+                                  // acking with unverified (poison) data.
+                                  errReg < Const(1),
                                   mCycReg < Const(0),
+                                  hiSel < Const(0),
                                   cnt < Const(0, width: 16),
-                                  state < Const(2, width: 3),
+                                  state < Const(4, width: 3),
                                 ],
                               ),
                             ],
@@ -285,14 +305,26 @@ class HarborWishboneDownsizer extends Module {
                 ],
                 orElse: [
                   If(
-                    mCycReg & mAck,
+                    mCycReg & (mAck | mErr),
                     then: [
-                      datRReg < [mDatR, rdLo].swizzle(),
-                      ackReg < Const(1),
-                      mCycReg < Const(0),
-                      hiSel < Const(0),
-                      cnt < Const(0, width: 16),
-                      state < Const(4, width: 3),
+                      If(
+                        mErr,
+                        then: [
+                          errReg < Const(1),
+                          mCycReg < Const(0),
+                          hiSel < Const(0),
+                          cnt < Const(0, width: 16),
+                          state < Const(4, width: 3),
+                        ],
+                        orElse: [
+                          datRReg < [mDatR, rdLo].swizzle(),
+                          ackReg < Const(1),
+                          mCycReg < Const(0),
+                          hiSel < Const(0),
+                          cnt < Const(0, width: 16),
+                          state < Const(4, width: 3),
+                        ],
+                      ),
                     ],
                     orElse: [
                       // Still waiting on the narrow ack: run the completion watchdog.
@@ -317,9 +349,9 @@ class HarborWishboneDownsizer extends Module {
                                   reissues < reissues + 1,
                                 ],
                                 orElse: [
-                                  // budget spent: force-complete (poison) to guarantee liveness
-                                  datRReg < [mDatR, rdLo].swizzle(),
-                                  ackReg < Const(1),
+                                  // budget spent: report ERR instead of
+                                  // acking with unverified (poison) data.
+                                  errReg < Const(1),
                                   mCycReg < Const(0),
                                   hiSel < Const(0),
                                   cnt < Const(0, width: 16),
@@ -349,7 +381,11 @@ class HarborWishboneDownsizer extends Module {
       ),
     ]);
 
-    sAck <= ackReg;
+    // ACK and ERR are mutually exclusive (only one of ackReg/errReg is ever
+    // set per cycle) and gated by CYC & STB so a stray pulse can never land
+    // on an unrelated later cycle.
+    sAck <= ackReg & sCyc & sStb;
+    sErr <= errReg & sCyc & sStb;
     sDatR <= datRReg;
 
     mCyc <= mCycReg;

@@ -178,6 +178,8 @@ class HarborMediaEngine extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
     );
@@ -924,7 +926,7 @@ class HarborMediaEngine extends BridgeModule
                     CaseItem(Const(0x00, width: 8), [
                       If(
                         bus.we,
-                        then: [engineCtrl < bus.dataIn],
+                        then: [engineCtrl < bus.selMerge(engineCtrl, 0x00)],
                         orElse: [bus.dataOut < engineCtrl],
                       ),
                     ]),
@@ -940,8 +942,7 @@ class HarborMediaEngine extends BridgeModule
                         bus.we,
                         then: [
                           intStatus <
-                              (intStatus &
-                                  ~bus.dataIn.getRange(0, maxSessions)),
+                              (intStatus & ~bus.selMasked(0x20, maxSessions)),
                         ],
                         orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                       ),
@@ -950,7 +951,7 @@ class HarborMediaEngine extends BridgeModule
                     CaseItem(Const(0x28, width: 8), [
                       If(
                         bus.we,
-                        then: [intEnable < bus.dataIn.getRange(0, maxSessions)],
+                        then: [intEnable < bus.selMerge(intEnable, 0x28)],
                         orElse: [bus.dataOut < intEnable.zeroExtend(32)],
                       ),
                     ]),
@@ -988,7 +989,7 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x00, width: 8), [
                         If(
                           bus.we,
-                          then: [sessCtrl[i] < bus.dataIn],
+                          then: [sessCtrl[i] < bus.selMerge(sessCtrl[i], 0x00)],
                           orElse: [bus.dataOut < sessCtrl[i]],
                         ),
                       ]),
@@ -1000,7 +1001,12 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x10, width: 8), [
                         If(
                           bus.we,
-                          then: [sessSrcAddr[i] < busToAddr(bus.dataIn)],
+                          then: [
+                            sessSrcAddr[i] <
+                                busToAddr(
+                                  bus.selMerge(addrToBus(sessSrcAddr[i]), 0x10),
+                                ),
+                          ],
                           orElse: [bus.dataOut < addrToBus(sessSrcAddr[i])],
                         ),
                       ]),
@@ -1008,7 +1014,9 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x18, width: 8), [
                         If(
                           bus.we,
-                          then: [sessSrcSize[i] < bus.dataIn],
+                          then: [
+                            sessSrcSize[i] < bus.selMerge(sessSrcSize[i], 0x18),
+                          ],
                           orElse: [bus.dataOut < sessSrcSize[i]],
                         ),
                       ]),
@@ -1016,7 +1024,12 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x20, width: 8), [
                         If(
                           bus.we,
-                          then: [sessDstAddr[i] < busToAddr(bus.dataIn)],
+                          then: [
+                            sessDstAddr[i] <
+                                busToAddr(
+                                  bus.selMerge(addrToBus(sessDstAddr[i]), 0x20),
+                                ),
+                          ],
                           orElse: [bus.dataOut < addrToBus(sessDstAddr[i])],
                         ),
                       ]),
@@ -1024,7 +1037,9 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x28, width: 8), [
                         If(
                           bus.we,
-                          then: [sessDstSize[i] < bus.dataIn],
+                          then: [
+                            sessDstSize[i] < bus.selMerge(sessDstSize[i], 0x28),
+                          ],
                           orElse: [bus.dataOut < sessDstSize[i]],
                         ),
                       ]),
@@ -1032,7 +1047,9 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x30, width: 8), [
                         If(
                           bus.we,
-                          then: [sessWidth[i] < bus.dataIn.getRange(0, 16)],
+                          then: [
+                            sessWidth[i] < bus.selMerge(sessWidth[i], 0x30),
+                          ],
                           orElse: [bus.dataOut < sessWidth[i].zeroExtend(32)],
                         ),
                       ]),
@@ -1040,7 +1057,9 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x38, width: 8), [
                         If(
                           bus.we,
-                          then: [sessHeight[i] < bus.dataIn.getRange(0, 16)],
+                          then: [
+                            sessHeight[i] < bus.selMerge(sessHeight[i], 0x38),
+                          ],
                           orElse: [bus.dataOut < sessHeight[i].zeroExtend(32)],
                         ),
                       ]),
@@ -1048,7 +1067,10 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x40, width: 8), [
                         If(
                           bus.we,
-                          then: [sessRefStride[i] < bus.dataIn.getRange(0, 16)],
+                          then: [
+                            sessRefStride[i] <
+                                bus.selMerge(sessRefStride[i], 0x40),
+                          ],
                           orElse: [
                             bus.dataOut < sessRefStride[i].zeroExtend(32),
                           ],
@@ -1058,7 +1080,7 @@ class HarborMediaEngine extends BridgeModule
                       CaseItem(Const(0x50, width: 8), [
                         If(
                           bus.we,
-                          then: [sessQp[i] < bus.dataIn.getRange(0, 8)],
+                          then: [sessQp[i] < bus.selMerge(sessQp[i], 0x50)],
                           orElse: [bus.dataOut < sessQp[i].zeroExtend(32)],
                         ),
                       ]),

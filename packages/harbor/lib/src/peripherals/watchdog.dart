@@ -62,6 +62,8 @@ class HarborWatchdog extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 8,
       dataWidth: 32,
     );
@@ -119,11 +121,14 @@ class HarborWatchdog extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              Case(bus.addr.getRange(0, 6), [
+              // Match the full address, not just enough low bits for the
+              // registers defined today, so an address outside the map
+              // reads 0 and ignores writes instead of aliasing a register.
+              Case(bus.addr, [
                 // 0x00: CTRL
-                CaseItem(Const(0x00, width: 6), [
+                CaseItem(Const(0x00, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x00, 1),
                     then: [
                       enable < bus.dataIn[0],
                       resetEn < bus.dataIn[1],
@@ -140,31 +145,31 @@ class HarborWatchdog extends BridgeModule
                   ),
                 ]),
                 // 0x08: STATUS
-                CaseItem(Const(0x08, width: 6), [
+                CaseItem(Const(0x08, width: 8), [
                   bus.dataOut <
                       enable.zeroExtend(32) |
                           (expired.zeroExtend(32) << Const(1, width: 32)),
                 ]),
                 // 0x10: TIMEOUT
-                CaseItem(Const(0x10, width: 6), [
+                CaseItem(Const(0x10, width: 8), [
                   If(
                     bus.we,
-                    then: [timeout < bus.dataIn.getRange(0, counterWidth)],
+                    then: [timeout < bus.selMerge(timeout, 0x10)],
                     orElse: [bus.dataOut < timeout.zeroExtend(32)],
                   ),
                 ]),
                 // 0x18: WINDOW
-                CaseItem(Const(0x18, width: 6), [
+                CaseItem(Const(0x18, width: 8), [
                   If(
                     bus.we,
-                    then: [window < bus.dataIn.getRange(0, counterWidth)],
+                    then: [window < bus.selMerge(window, 0x18)],
                     orElse: [bus.dataOut < window.zeroExtend(32)],
                   ),
                 ]),
                 // 0x20: KICK (write magic to reset counter)
-                CaseItem(Const(0x20, width: 6), [
+                CaseItem(Const(0x20, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x20, 3),
                     then: [
                       If(
                         bus.dataIn
@@ -189,7 +194,7 @@ class HarborWatchdog extends BridgeModule
                   ),
                 ]),
                 // 0x28: COUNT (read-only)
-                CaseItem(Const(0x28, width: 6), [
+                CaseItem(Const(0x28, width: 8), [
                   bus.dataOut < count.zeroExtend(32),
                 ]),
               ]),

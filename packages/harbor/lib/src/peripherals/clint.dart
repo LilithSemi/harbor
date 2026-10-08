@@ -56,6 +56,8 @@ class HarborClint extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: busAddressWidth ?? 16,
       dataWidth: busDataWidth ?? 32,
     );

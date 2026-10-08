@@ -50,6 +50,41 @@ class HarborCdcSync extends BridgeModule {
   }
 }
 
+/// Reset for one side of a two-clock bridge.
+///
+/// It asserts as soon as [own] or [other] asserts, and releases [stages]
+/// cycles of [clk] after both are low. Both sides of a bridge thus enter
+/// reset together, and each side releases only after it saw both resets low.
+///
+/// The flops of the chain reset asynchronously and release synchronously, so
+/// the result is a flop output in the [clk] domain. A peer pulse of any width
+/// that the reset pins of the chain accept resets the full domain for at least
+/// [stages] edges of [clk].
+Logic harborCdcJoinReset(
+  Logic clk,
+  Logic own,
+  Logic other, {
+  int stages = 2,
+  String name = 'join_reset',
+}) {
+  assert(stages >= 2, 'reset synchronizer needs >= 2 stages');
+  final raw = (own | other).named('${name}_raw');
+  final chain = [
+    for (var i = 0; i < stages; i++) Logic(name: '${name}_sync_$i'),
+  ];
+  Sequential(
+    clk,
+    [
+      chain[0] < Const(0),
+      for (var i = 1; i < stages; i++) chain[i] < chain[i - 1],
+    ],
+    reset: raw,
+    asyncReset: true,
+    resetValues: {for (final c in chain) c: Const(1)},
+  );
+  return chain.last.named(name);
+}
+
 /// Clock domain crossing with handshake protocol.
 ///
 /// Safely transfers multi-bit data between two clock domains

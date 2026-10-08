@@ -61,6 +61,7 @@ void main() {
     cdc.input('s_sel').srcConnection! <= ds.output('m_sel');
     ds.input('m_ack').srcConnection! <= cdc.output('s_ack');
     ds.input('m_dat_r').srcConnection! <= cdc.output('s_dat_r');
+    ds.input('m_err').srcConnection! <= Const(0);
 
     cdc.input('m_clk').srcConnection! <= mClk;
     cdc.input('m_reset').srcConnection! <= mReset;

@@ -289,6 +289,8 @@ class HarborDisplayController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 8,
       dataWidth: 32,
     );
@@ -423,45 +425,61 @@ class HarborDisplayController extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              Case(bus.addr.getRange(0, 7), [
-                CaseItem(Const(0x00, width: 7), [
+              // Byte-address decode: registers sit 8 bytes apart (see the
+              // map above). Match the full address, not just enough low bits
+              // for the registers defined today, so an address outside the
+              // map reads 0 and ignores writes instead of aliasing a
+              // register.
+              Case(bus.addr, [
+                CaseItem(Const(0x00, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x00, 1),
                     then: [enable < bus.dataIn[0]],
                     orElse: [bus.dataOut < enable.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x08, width: 7), [
+                CaseItem(Const(0x08, width: 8), [
                   bus.dataOut < Const(0, width: 32), // STATUS
                 ]),
-                CaseItem(Const(0x10, width: 7), [
+                CaseItem(Const(0x10, width: 8), [
                   If(
                     bus.we,
-                    then: [fbBase < bus.dataIn],
+                    then: [fbBase < bus.selMerge(fbBase, 0x10)],
                     orElse: [bus.dataOut < fbBase],
                   ),
                 ]),
-                CaseItem(Const(0x18, width: 7), [
+                CaseItem(Const(0x18, width: 8), [
                   If(
                     bus.we,
-                    then: [fbStride < bus.dataIn.getRange(0, 16)],
+                    then: [fbStride < bus.selMerge(fbStride, 0x18)],
                     orElse: [bus.dataOut < fbStride.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x20, width: 7), [
+                CaseItem(Const(0x20, width: 8), [
                   If(
                     bus.we,
-                    then: [hActive < bus.dataIn.getRange(0, 12)],
+                    then: [hActive < bus.selMerge(hActive, 0x20)],
                     orElse: [bus.dataOut < hActive.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x28, width: 7), [
+                CaseItem(Const(0x28, width: 8), [
                   If(
                     bus.we,
                     then: [
-                      hFp < bus.dataIn.getRange(0, 8),
-                      hSync < bus.dataIn.getRange(8, 16),
-                      hBp < bus.dataIn.getRange(16, 24),
+                      // hFp, hSync, and hBp each take one byte of this word,
+                      // so each updates only when its own byte is selected.
+                      If(
+                        bus.selAny(0x28, 1),
+                        then: [hFp < bus.dataIn.getRange(0, 8)],
+                      ),
+                      If(
+                        bus.selAny(0x29, 1),
+                        then: [hSync < bus.dataIn.getRange(8, 16)],
+                      ),
+                      If(
+                        bus.selAny(0x2A, 1),
+                        then: [hBp < bus.dataIn.getRange(16, 24)],
+                      ),
                     ],
                     orElse: [
                       bus.dataOut <
@@ -471,20 +489,31 @@ class HarborDisplayController extends BridgeModule
                     ],
                   ),
                 ]),
-                CaseItem(Const(0x30, width: 7), [
+                CaseItem(Const(0x30, width: 8), [
                   If(
                     bus.we,
-                    then: [vActive < bus.dataIn.getRange(0, 12)],
+                    then: [vActive < bus.selMerge(vActive, 0x30)],
                     orElse: [bus.dataOut < vActive.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x38, width: 7), [
+                CaseItem(Const(0x38, width: 8), [
                   If(
                     bus.we,
                     then: [
-                      vFp < bus.dataIn.getRange(0, 8),
-                      vSync < bus.dataIn.getRange(8, 16),
-                      vBp < bus.dataIn.getRange(16, 24),
+                      // vFp, vSync, and vBp each take one byte of this word,
+                      // so each updates only when its own byte is selected.
+                      If(
+                        bus.selAny(0x38, 1),
+                        then: [vFp < bus.dataIn.getRange(0, 8)],
+                      ),
+                      If(
+                        bus.selAny(0x39, 1),
+                        then: [vSync < bus.dataIn.getRange(8, 16)],
+                      ),
+                      If(
+                        bus.selAny(0x3A, 1),
+                        then: [vBp < bus.dataIn.getRange(16, 24)],
+                      ),
                     ],
                     orElse: [
                       bus.dataOut <
@@ -494,19 +523,17 @@ class HarborDisplayController extends BridgeModule
                     ],
                   ),
                 ]),
-                CaseItem(Const(0x40, width: 7), [
+                CaseItem(Const(0x40, width: 8), [
                   If(
                     bus.we,
-                    then: [
-                      intStatus < (intStatus & ~bus.dataIn.getRange(0, 4)),
-                    ],
+                    then: [intStatus < (intStatus & ~bus.selMasked(0x40, 4))],
                     orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x48, width: 7), [
+                CaseItem(Const(0x48, width: 8), [
                   If(
                     bus.we,
-                    then: [intEnable < bus.dataIn.getRange(0, 4)],
+                    then: [intEnable < bus.selMerge(intEnable, 0x48)],
                     orElse: [bus.dataOut < intEnable.zeroExtend(32)],
                   ),
                 ]),

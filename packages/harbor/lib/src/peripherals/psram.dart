@@ -119,6 +119,8 @@ class HarborPsramController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: addrWidth,
       dataWidth: busDataWidth ?? 32,
     );
@@ -144,7 +146,6 @@ class HarborPsramController extends BridgeModule
 
     final valid = bus.stb.named('psram_valid');
     final write = bus.we.named('psram_write');
-    final read = (~write).named('psram_read');
     // Word index into the bank (byte address >> 2), 21 bits for an 8 MB span.
     final wordAddr = bus.addr.getRange(2, 23).named('psram_word_addr');
 
@@ -222,6 +223,15 @@ class HarborPsramController extends BridgeModule
     final sioOe = Logic(name: 'sio_oe', width: 4);
     final busAckReg = Logic(name: 'bus_ack_r');
     final busMisoReg = Logic(name: 'bus_miso_r', width: 32);
+    // The request is latched at accept, so an aborted one still runs to its
+    // end with what was issued. Its result is then not acked.
+    final orphan = Logic(name: 'orphan');
+    final weR = Logic(name: 'we_r');
+    final wordAddrR = Logic(name: 'word_addr_r', width: 21);
+    final byteOffsetR = Logic(name: 'byte_offset_r', width: 2);
+    final wrBufferR = Logic(name: 'wr_buffer_r', width: 32);
+    final wrCyclesR = Logic(name: 'wr_cycles_r', width: 6);
+    final read = (~weR).named('psram_read');
 
     // Input lines: quad reads all four IO pins, standard reads MISO on IO1.
     final sioIn = quad
@@ -235,18 +245,14 @@ class HarborPsramController extends BridgeModule
     // Command byte selected by mode + direction, placed in the top byte.
     final cmdByte = mux(
       Const(quad),
-      mux(
-        write,
-        Const(cmdQuadWrite, width: 8),
-        Const(cmdFastReadQuad, width: 8),
-      ),
-      mux(write, Const(cmdWrite, width: 8), Const(cmdRead, width: 8)),
+      mux(weR, Const(cmdQuadWrite, width: 8), Const(cmdFastReadQuad, width: 8)),
+      mux(weR, Const(cmdWrite, width: 8), Const(cmdRead, width: 8)),
     );
     // Address word placed in bits [31:8]: {1'b0, wordAddr[20:0], offset[1:0]}.
     final addrField = [
       Const(0),
-      wordAddr,
-      mux(write, byteOffset, Const(0, width: 2)),
+      wordAddrR,
+      mux(weR, byteOffsetR, Const(0, width: 2)),
     ].swizzle().getRange(0, 24);
 
     final quadC = Const(quad);
@@ -266,8 +272,12 @@ class HarborPsramController extends BridgeModule
           xferCycles < Const(0, width: 6),
           busAckReg < Const(0),
           busMisoReg < Const(0, width: 32),
+          orphan < Const(0),
         ],
         orElse: [
+          // ACK is a one-cycle pulse.
+          busAckReg < Const(0),
+          If(state.neq(Const(sIdle, width: 3)) & ~valid, then: [orphan < 1]),
           If(
             xferCycles.neq(Const(0, width: 6)),
             then: [
@@ -311,18 +321,20 @@ class HarborPsramController extends BridgeModule
                   CaseItem(Const(sIdle, width: 3), [
                     sioOe < Const(0x1, width: 4),
                     isQuad < Const(0),
+                    ce < Const(1),
+                    // A classic master still holds its request on the ACK
+                    // cycle. Do not take it again.
                     If(
                       valid & ~busAckReg,
                       then: [
                         state < Const(sSelect, width: 3),
                         xferCycles < Const(0, width: 6),
-                      ],
-                      orElse: [
-                        If(
-                          ~valid & busAckReg,
-                          then: [busAckReg < Const(0), ce < Const(1)],
-                          orElse: [ce < Const(1)],
-                        ),
+                        orphan < Const(0),
+                        weR < write,
+                        wordAddrR < wordAddr,
+                        byteOffsetR < byteOffset,
+                        wrBufferR < wrBuffer,
+                        wrCyclesR < wrCycles,
                       ],
                     ),
                   ]),
@@ -364,19 +376,19 @@ class HarborPsramController extends BridgeModule
                   CaseItem(Const(sXfer, width: 3), [
                     isQuad < quadC,
                     If(
-                      write,
-                      then: [sioOe < oeQuadAddr, spiBuf < wrBuffer],
+                      weR,
+                      then: [sioOe < oeQuadAddr, spiBuf < wrBufferR],
                       orElse: [
                         sioOe <
                             (quad ? Const(0, width: 4) : Const(0x1, width: 4)),
                       ],
                     ),
-                    xferCycles < mux(write, wrCycles, Const(32, width: 6)),
+                    xferCycles < mux(weR, wrCyclesR, Const(32, width: 6)),
                     state < Const(sDone, width: 3),
                   ]),
                   CaseItem(Const(sDone, width: 3), [
                     busMisoReg < spiBuf,
-                    busAckReg < Const(1),
+                    busAckReg < ~orphan & valid,
                     state < Const(sIdle, width: 3),
                   ]),
                 ],
@@ -397,7 +409,7 @@ class HarborPsramController extends BridgeModule
     } else {
       output('spi_mosi') <= sioOut[0];
     }
-    bus.ack <= busAckReg;
+    bus.ack <= busAckReg & valid;
     bus.dataOut <= busMisoReg;
   }
 

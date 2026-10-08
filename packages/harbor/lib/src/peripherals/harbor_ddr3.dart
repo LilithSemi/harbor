@@ -2,6 +2,7 @@ import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../bus/bus.dart';
+import '../bus/bus_error_source.dart';
 import '../bus/bus_slave_port.dart';
 import '../clock/wishbone_cdc_fifo.dart';
 import '../soc/acpi.dart';
@@ -46,8 +47,12 @@ class HarborDdr3 extends BridgeModule
         HarborSystemMemoryProvider,
         HarborAcpiDeviceProvider,
         HarborSvdPeripheralProvider,
-        HarborSimModelProvider {
+        HarborSimModelProvider,
+        HarborBusErrorSource {
   final HarborDdrConfig config;
+
+  @override
+  Logic get busError => output('bus_error');
   final int baseAddress;
   final int clockHz;
   final HarborDeviceTarget? target;
@@ -152,6 +157,8 @@ class HarborDdr3 extends BridgeModule
       protocol: BusProtocol.wishbone,
       addressWidth: busAW,
       dataWidth: busDW,
+      clk: clk,
+      reset: reset,
     );
 
     if (isEcp5 && controllerGearRatio != 1) {
@@ -183,6 +190,8 @@ class HarborDdr3 extends BridgeModule
         // controller's fixed 32-bit / register-index port.
         addressWidth: busAW,
         dataWidth: busDW,
+        clk: clk,
+        reset: reset,
       );
     }
 
@@ -472,6 +481,10 @@ struct DramStore {
     // Placeholder nets break the controller<->adapter<->phy construction cycles.
     final ctrlStall = Logic(name: 'ctrl_stall');
     final ctrlAck = Logic(name: 'ctrl_ack');
+    final ctrlAckAux = Logic(
+      name: 'ctrl_ack_aux',
+      width: Ddr3Controller.auxWidth,
+    );
     final ctrlData = Logic(name: 'ctrl_data', width: p.wbDataBits);
     final phyData = Logic(
       name: 'phy_iserdes_data',
@@ -489,7 +502,10 @@ struct DramStore {
       auxWidth: Ddr3Controller.auxWidth,
       writeCombine: writeCombine,
       clk: ddrClk,
-      reset: ddrReset,
+      // The CDC master side and the adapter reset together, so a stale
+      // response cannot complete the first request after a reset.
+      reset: cdc.output('m_reset_joined'),
+      ctrlReset: ddrReset,
       sCyc: cdc.output('m_cyc') & cdc.output('m_stb'),
       sStb: Const(1),
       sWe: cdc.output('m_we'),
@@ -498,6 +514,7 @@ struct DramStore {
       sSel: cdc.output('m_sel'),
       mStall: ctrlStall,
       mAck: ctrlAck,
+      mAckAux: ctrlAckAux,
       mData: ctrlData,
     );
     cdc.input('m_ack').srcConnection! <= adapter.output('s_ack');
@@ -576,6 +593,12 @@ struct DramStore {
       trainCdc.input('m_dat_r').srcConnection! <= wb2DataOut.zeroExtend(busDW);
     }
 
+    // Sticky: a bus cycle ended with poison data during a DDR clock reset.
+    addOutput('bus_error') <=
+        (trainCdc == null
+            ? cdc.output('s_bus_error')
+            : cdc.output('s_bus_error') | trainCdc.output('s_bus_error'));
+
     // A self-training PHY (ECP5) reports its read leveling back.
     final phyLevelDone = isEcp5 ? Logic(name: 'phy_read_level_done') : null;
     final ctrl = Ddr3Controller(
@@ -610,6 +633,7 @@ struct DramStore {
     if (isEcp5) output('cal_failed') <= ctrl.calFailed!;
     ctrlStall <= ctrl.output('o_wb_stall');
     ctrlAck <= ctrl.output('o_wb_ack');
+    ctrlAckAux <= ctrl.output('o_aux');
     ctrlData <= ctrl.output('o_wb_data');
     if (runtimeTrainable) {
       wb2Ack! <= ctrl.output('o_wb2_ack');

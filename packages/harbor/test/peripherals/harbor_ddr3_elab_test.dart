@@ -1,3 +1,5 @@
+import 'package:harbor/src/clock/wishbone_cdc_fifo.dart';
+import 'package:harbor/src/peripherals/ddr3_burst_adapter.dart';
 import 'package:harbor/src/peripherals/ddr3_config.dart'
     show HarborDdrConfig, HarborDdrType;
 import 'package:harbor/src/peripherals/harbor_ddr3.dart';
@@ -35,5 +37,16 @@ void main() {
     expect(sv, contains('sdram_dq'));
     // internal stack present
     expect(sv, contains('ddr_cdc'));
+
+    // The burst adapter resets with the CDC master side, so a bus-side reset
+    // reaches both.
+    final cdc = ddr.subModules
+        .whereType<HarborWishboneCdcFifoBridge>()
+        .firstWhere((m) => m.name == 'ddr_cdc');
+    final adapter = ddr.subModules.whereType<Ddr3BurstAdapter>().single;
+    expect(
+      adapter.input('reset').srcConnection,
+      same(cdc.output('m_reset_joined')),
+    );
   });
 }

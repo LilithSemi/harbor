@@ -2,6 +2,7 @@
 
 // Common types
 export 'bus.dart';
+export 'bus_error_source.dart';
 export 'bus_slave_port.dart';
 export 'firewall.dart';
 
@@ -9,6 +10,8 @@ export 'firewall.dart';
 export 'wishbone/wishbone_interface.dart';
 export 'wishbone/wishbone_arbiter.dart';
 export 'wishbone/wishbone_decoder.dart';
+export 'wishbone/wishbone_connect.dart';
+export 'wishbone/wishbone_register_stage.dart';
 
 // TileLink
 export 'tilelink/tilelink_interface.dart';

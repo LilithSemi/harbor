@@ -125,6 +125,8 @@ class HarborBusFabric extends BridgeModule {
           protocol: m.protocol,
           addressWidth: m.addressWidth,
           dataWidth: m.dataWidth,
+          clk: input('clk'),
+          reset: input('reset'),
         ),
       );
     }
@@ -138,6 +140,8 @@ class HarborBusFabric extends BridgeModule {
           protocol: s.protocol,
           addressWidth: 32,
           dataWidth: s.dataWidth,
+          clk: input('clk'),
+          reset: input('reset'),
         ),
       );
     }

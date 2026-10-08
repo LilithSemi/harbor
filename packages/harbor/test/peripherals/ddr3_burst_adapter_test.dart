@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:harbor/src/clock/wishbone_cdc_fifo.dart';
 import 'package:harbor/src/peripherals/ddr3_burst_adapter.dart';
@@ -24,7 +25,9 @@ void main() {
     final sSel = Logic(width: 4)..inject(0);
     final mStall = Logic()..inject(0); // always accept
     final mAck = Logic()..inject(0);
+    final mAckAux = Logic(width: 4)..inject(0);
     final mData = Logic(width: 128)..inject(0);
+    final acks = _AckPipe(mAck, mAckAux, mData);
 
     final dut = Ddr3BurstAdapter(
       busAddrWidth: busAddrW,
@@ -39,13 +42,13 @@ void main() {
       sSel: sSel,
       mStall: mStall,
       mAck: mAck,
+      mAckAux: mAckAux,
       mData: mData,
     );
     await dut.build();
 
     // Procedural mock of the wide controller side.
     final mem = <int, BigInt>{}; // burst addr -> 128-bit word
-    final pendingReads = <List<int>>[]; // [addr, cyclesLeft]
     // Models the controller's write pipeline: a write only reaches DRAM if cyc
     // stays asserted long enough for it to flush; if cyc drops early the
     // controller ABORTS it (o_wb_cyc gates s1/s2 pending). This is exactly the
@@ -59,12 +62,11 @@ void main() {
 
     // Mock: every posedge, service the adapter's wide master port.
     clk.posedge.listen((_) {
-      // default: no ack this cycle unless a pending read matures.
-      mAck.inject(0);
       final cyc = dut.output('m_cyc').value.toInt();
       // accept a command (mStall held 0).
       if (cyc == 1 && dut.output('m_stb').value.toInt() == 1) {
         final addr = dut.output('m_addr').value.toInt();
+        acks.accept(dut, () => mem[addr] ?? BigInt.zero);
         if (dut.output('m_we').value.toInt() == 1) {
           // capture the write, but DON'T commit yet: it must survive the drain.
           pendingWrite ??= {
@@ -73,8 +75,6 @@ void main() {
             'sel': dut.output('m_sel').value.toInt(),
             'left': wrDrainNeeded,
           };
-        } else {
-          pendingReads.add([addr, 3]); // 3-cycle read latency
         }
       }
       // in-flight write: commit iff cyc stays high through the drain; else abort.
@@ -97,17 +97,7 @@ void main() {
           }
         }
       }
-      // mature pending reads.
-      for (final r in pendingReads) {
-        r[1]--;
-      }
-      final ready = pendingReads.where((r) => r[1] <= 0).toList();
-      if (ready.isNotEmpty) {
-        final r = ready.first;
-        pendingReads.remove(r);
-        mData.inject(mem[r[0]] ?? BigInt.zero);
-        mAck.inject(1);
-      }
+      acks.tick();
     });
 
     await clk.nextPosedge;
@@ -291,7 +281,9 @@ void main() {
         final sDatW = Logic(name: 's_dat_w', width: dw)..inject(0);
         final mStall = Logic(name: 'm_stall')..inject(0);
         final mAck = Logic(name: 'm_ack')..inject(0);
+        final mAckAux = Logic(name: 'm_ack_aux', width: 4)..inject(0);
         final mData = Logic(name: 'm_data', width: 128)..inject(0);
+        final acks = _AckPipe(mAck, mAckAux, mData);
 
         final cdc = HarborWishboneCdcFifoBridge(
           addressWidth: aw,
@@ -323,6 +315,7 @@ void main() {
           sSel: cdc.output('m_sel'),
           mStall: mStall,
           mAck: mAck,
+          mAckAux: mAckAux,
           mData: mData,
         );
         cdc.input('m_ack').srcConnection! <= dut.output('s_ack');
@@ -332,18 +325,17 @@ void main() {
 
         // Wide controller mock: commits a write only if cyc survives the drain.
         final mem = <int, BigInt>{};
-        final pendingReads = <List<int>>[];
         final inflight = <Map<String, dynamic>>[];
         Simulator.setMaxSimTime(20000000);
         unawaited(Simulator.run());
 
         mClk.posedge.listen((_) {
-          mAck.inject(0);
           final cycVal = dut.output('m_cyc').value;
           if (!cycVal.isValid) return;
           final cyc = cycVal == LogicValue.one;
           if (cyc && dut.output('m_stb').value == LogicValue.one) {
             final addr = dut.output('m_addr').value.toInt();
+            acks.accept(dut, () => mem[addr] ?? BigInt.zero);
             if (dut.output('m_we').value == LogicValue.one) {
               inflight.add({
                 'addr': addr,
@@ -351,8 +343,6 @@ void main() {
                 'sel': dut.output('m_sel').value.toInt(),
                 'left': 4,
               });
-            } else {
-              pendingReads.add([addr, 3]);
             }
           }
           if (!cyc) {
@@ -373,16 +363,7 @@ void main() {
               inflight.remove(w);
             }
           }
-          for (final r in pendingReads) {
-            r[1]--;
-          }
-          final ready = pendingReads.where((r) => r[1] <= 0).toList();
-          if (ready.isNotEmpty) {
-            final r = ready.first;
-            pendingReads.remove(r);
-            mData.inject(mem[r[0]] ?? BigInt.zero);
-            mAck.inject(1);
-          }
+          acks.tick();
         });
 
         for (var i = 0; i < 6; i++) {
@@ -465,6 +446,113 @@ void main() {
       await h.stop();
     });
   });
+
+  group('write acks', () {
+    // Each burst holds its burst address in every lane, so a read that takes
+    // the wrong ack shows junk or another burst.
+    void prefill(_Harness h, Iterable<int> bursts) {
+      for (final b in bursts) {
+        var v = BigInt.zero;
+        for (var w = 0; w < 4; w++) {
+          v |= BigInt.from(0x5A000000 | b) << (32 * w);
+        }
+        h.mem[b] = v;
+      }
+    }
+
+    for (final combine in const [false, true]) {
+      final mode = combine ? 'combining' : 'pass-through';
+      for (final lat in const [3, 8]) {
+        test(
+          '$mode, latency $lat: a read right after a posted write',
+          () async {
+            final h = _Harness(writeCombine: combine, ackLatency: lat);
+            prefill(h, [0x10, 0x20]);
+            await h.start();
+            await h.busWrite(0x000, 0x1234);
+            expect(await h.busRead(0x100), 0x5A000010);
+            expect(await h.busRead(0x200), 0x5A000020);
+            await h.idle(120);
+            expect(await h.busRead(0x000), 0x1234);
+            expect(h.acks.writeAcks, greaterThan(0));
+            await h.stop();
+          },
+        );
+      }
+    }
+
+    test('a read while several writes are not acked yet', () async {
+      final h = _Harness(writeCombine: false, ackLatency: 16);
+      prefill(h, [0x40]);
+      await h.start();
+      for (var i = 0; i < 4; i++) {
+        await h.busWrite(i * 0x10, 0xA0 + i);
+      }
+      expect(await h.busRead(0x404), 0x5A000040);
+      for (var i = 0; i < 4; i++) {
+        expect(await h.busRead(i * 0x10), 0xA0 + i);
+      }
+      expect(h.acks.writeAcks, 4);
+      await h.stop();
+    });
+
+    for (final combine in const [false, true]) {
+      final mode = combine ? 'combining' : 'pass-through';
+      test('$mode: a read lost to a bus-side reset cannot complete '
+          'the next read', () async {
+        final h = _Harness(
+          writeCombine: combine,
+          ackLatency: 12,
+          splitReset: true,
+        );
+        prefill(h, [0x10, 0x20]);
+        await h.start();
+        // The controller accepts the read, then only the bus side resets.
+        h.sCyc.inject(1);
+        h.sStb.inject(1);
+        h.sWe.inject(0);
+        h.sAddr.inject(0x100);
+        await h.idle(4);
+        expect(h.wideReads, 1);
+        h.sCyc.inject(0);
+        h.sStb.inject(0);
+        h.reset.inject(1);
+        await h.idle(2);
+        h.reset.inject(0);
+        await h.idle(1);
+        // The old read's ACK arrives while this read waits.
+        expect(await h.busRead(0x200), 0x5A000020);
+        expect(await h.busRead(0x100), 0x5A000010);
+        await h.stop();
+      });
+    }
+
+    for (final combine in const [false, true]) {
+      final mode = combine ? 'combining' : 'pass-through';
+      test('$mode: random reads and writes in any order', () async {
+        final h = _Harness(writeCombine: combine, ackLatency: 6);
+        await h.start();
+        final rng = Random(7);
+        final model = <int, int>{};
+        for (var i = 0; i < 300; i++) {
+          final addr = rng.nextInt(16) * 4;
+          if (rng.nextBool()) {
+            final v = rng.nextInt(1 << 32);
+            await h.busWrite(addr, v);
+            model[addr] = v;
+          } else {
+            expect(
+              await h.busRead(addr),
+              model[addr] ?? 0,
+              reason: 'op $i read 0x${addr.toRadixString(16)}',
+            );
+          }
+        }
+        expect(h.acks.writeAcks, greaterThan(0));
+        await h.stop();
+      });
+    }
+  });
 }
 
 /// Drives the adapter against a procedural mock of the wide controller side.
@@ -484,6 +572,7 @@ class _Harness {
 
   final Logic clk;
   final Logic reset = Logic(name: 'reset')..inject(1);
+  final Logic ctrlReset = Logic(name: 'ctrl_reset')..inject(1);
   final Logic sCyc = Logic()..inject(0);
   final Logic sStb = Logic()..inject(0);
   final Logic sWe = Logic()..inject(0);
@@ -492,7 +581,9 @@ class _Harness {
   final Logic sSel = Logic(width: 4)..inject(0);
   final Logic mStall = Logic()..inject(0);
   final Logic mAck = Logic()..inject(0);
+  final Logic mAckAux = Logic(width: 4)..inject(0);
   final Logic mData = Logic(width: 128)..inject(0);
+  late final _AckPipe acks;
   late final Ddr3BurstAdapter dut;
 
   /// Burst address -> 128-bit contents.
@@ -507,14 +598,20 @@ class _Harness {
 
   StreamSubscription<void>? _mock;
 
-  _Harness({required this.writeCombine, int period = 10})
-    : clk = SimpleClockGenerator(period).clk {
+  _Harness({
+    required this.writeCombine,
+    int period = 10,
+    int ackLatency = 3,
+    bool splitReset = false,
+  }) : clk = SimpleClockGenerator(period).clk {
+    acks = _AckPipe(mAck, mAckAux, mData, latency: ackLatency);
     dut = Ddr3BurstAdapter(
       busAddrWidth: busAddrW,
       ddrAddrWidth: ddrAddrW,
       writeCombine: writeCombine,
       clk: clk,
       reset: reset,
+      ctrlReset: splitReset ? ctrlReset : null,
       sCyc: sCyc,
       sStb: sStb,
       sWe: sWe,
@@ -523,6 +620,7 @@ class _Harness {
       sSel: sSel,
       mStall: mStall,
       mAck: mAck,
+      mAckAux: mAckAux,
       mData: mData,
     );
   }
@@ -530,7 +628,6 @@ class _Harness {
   Future<void> start() async {
     await dut.build();
 
-    final pendingReads = <List<int>>[];
     final inflight = <Map<String, dynamic>>[];
 
     Simulator.setMaxSimTime(20000000);
@@ -538,7 +635,6 @@ class _Harness {
 
     _mock = clk.posedge.listen((_) {
       cycles++;
-      mAck.inject(0);
       final cycVal = dut.output('m_cyc').value;
       if (!cycVal.isValid) return;
       final cyc = cycVal == LogicValue.one;
@@ -547,6 +643,7 @@ class _Harness {
           dut.output('m_stb').value == LogicValue.one &&
           mStall.value == LogicValue.zero) {
         final addr = dut.output('m_addr').value.toInt();
+        acks.accept(dut, () => mem[addr] ?? BigInt.zero);
         if (dut.output('m_we').value == LogicValue.one) {
           wideWrites++;
           inflight.add({
@@ -557,7 +654,6 @@ class _Harness {
           });
         } else {
           wideReads++;
-          pendingReads.add([addr, 3]); // 3-cycle read latency
         }
       }
 
@@ -579,21 +675,13 @@ class _Harness {
         }
       }
 
-      for (final r in pendingReads) {
-        r[1]--;
-      }
-      final ready = pendingReads.where((r) => r[1] <= 0).toList();
-      if (ready.isNotEmpty) {
-        final r = ready.first;
-        pendingReads.remove(r);
-        mData.inject(mem[r[0]] ?? BigInt.zero);
-        mAck.inject(1);
-      }
+      acks.tick();
     });
 
     await clk.nextPosedge;
     await clk.nextPosedge;
     reset.inject(0);
+    ctrlReset.inject(0);
     await clk.nextPosedge;
   }
 
@@ -671,5 +759,49 @@ class _Harness {
   Future<void> stop() async {
     await _mock?.cancel();
     await Simulator.endSimulation();
+  }
+}
+
+/// The controller's ack pipe. Every accepted command, read or write, is acked
+/// [latency] cycles later in command order, and the ack echoes the command's
+/// `aux`. A write ack carries junk on the data bus.
+class _AckPipe {
+  static final junk = BigInt.parse(
+    'BADBADBADBADBADBADBADBADBADBADBA',
+    radix: 16,
+  );
+
+  final Logic ack;
+  final Logic aux;
+  final Logic data;
+  final int latency;
+  final _queue = <(List<int>, int, BigInt Function())>[];
+
+  /// Write commands that got an ack.
+  int writeAcks = 0;
+
+  _AckPipe(this.ack, this.aux, this.data, {this.latency = 3});
+
+  /// Queue the ack for the command [dut] drives now. [readValue] gives the
+  /// burst contents when a read ack fires.
+  void accept(Ddr3BurstAdapter dut, BigInt Function() readValue) {
+    final we = dut.output('m_we').value == LogicValue.one;
+    final tag = dut.output('m_aux').value.toInt();
+    _queue.add(([latency], tag, we ? () => junk : readValue));
+    if (we) writeAcks++;
+  }
+
+  /// Advance one cycle. Call once per posedge, after [accept].
+  void tick() {
+    ack.inject(0);
+    for (final e in _queue) {
+      e.$1[0]--;
+    }
+    if (_queue.isNotEmpty && _queue.first.$1[0] <= 0) {
+      final e = _queue.removeAt(0);
+      data.inject(e.$3());
+      aux.inject(e.$2);
+      ack.inject(1);
+    }
   }
 }

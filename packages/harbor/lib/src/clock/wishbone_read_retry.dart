@@ -59,10 +59,12 @@ class HarborWishboneReadRetry extends Module {
     );
     final sSel = addInput('s_sel', Logic(width: selWidth), width: selWidth);
     final sAck = addOutput('s_ack');
+    final sErr = addOutput('s_err');
     final sDatR = addOutput('s_dat_r', width: dataWidth);
 
     // Master face.
     final mAck = addInput('m_ack', Logic());
+    final mErr = addInput('m_err', Logic());
     final mDatR = addInput(
       'm_dat_r',
       Logic(width: dataWidth),
@@ -88,6 +90,7 @@ class HarborWishboneReadRetry extends Module {
     final prevValid = Logic(name: 'prev_valid');
     final tries = Logic(name: 'tries', width: triesW);
     final ackReg = Logic(name: 's_ack_reg');
+    final errReg = Logic(name: 's_err_reg');
     final datRReg = Logic(name: 's_dat_r_reg', width: dataWidth);
     final mCycReg = Logic(name: 'm_cyc_reg');
 
@@ -97,70 +100,103 @@ class HarborWishboneReadRetry extends Module {
     // Reaching the last allowed try forces a return (liveness).
     final lastTry = tries.gte(Const(maxTries - 1, width: triesW));
 
+    // Master-abort: if the master drops s_cyc while a write or a read (or
+    // its gap) is outstanding, tear down and return to idle instead of
+    // chasing a request nobody wants anymore.
+    final midWait =
+        state.eq(Const(1, width: 2)) |
+        state.eq(Const(2, width: 2)) |
+        state.eq(Const(3, width: 2));
+
     Sequential(clk, reset: reset, [
       ackReg < Const(0),
-      Case(state, [
-        // Idle: accept a new transaction.
-        CaseItem(Const(0, width: 2), [
-          If(
-            sCyc & sStb & ~ackReg,
-            then: [
-              latAdr < sAdr,
-              latWe < sWe,
-              latDatW < sDatW,
-              latSel < sSel,
-              prevValid < Const(0),
-              tries < Const(0, width: triesW),
-              mCycReg < Const(1),
-              state < mux(sWe, Const(1, width: 2), Const(2, width: 2)),
-            ],
-          ),
-        ]),
-        // Write in flight: single pass-through, ack on the master ack.
-        CaseItem(Const(1, width: 2), [
-          If(
-            mCycReg & mAck,
-            then: [
-              datRReg < mDatR,
-              ackReg < Const(1),
-              mCycReg < Const(0),
-              state < Const(0, width: 2),
-            ],
-          ),
-        ]),
-        // Read in flight: capture the word, ack if it agrees with the previous
-        // read (or the try cap is hit), else record it and issue another read.
-        CaseItem(Const(2, width: 2), [
-          If(
-            mCycReg & mAck,
-            then: [
-              mCycReg < Const(0),
+      errReg < Const(0),
+      If(
+        ~sCyc & midWait,
+        then: [state < Const(0, width: 2), mCycReg < Const(0)],
+        orElse: [
+          Case(state, [
+            // Idle: accept a new transaction.
+            CaseItem(Const(0, width: 2), [
               If(
-                settled | lastTry,
+                sCyc & sStb & ~ackReg & ~errReg,
                 then: [
-                  datRReg < curD,
-                  ackReg < Const(1),
-                  state < Const(0, width: 2),
-                ],
-                orElse: [
-                  prev < curD,
-                  prevValid < Const(1),
-                  tries < tries + 1,
-                  state < Const(3, width: 2), // gap, then re-read
+                  latAdr < sAdr,
+                  latWe < sWe,
+                  latDatW < sDatW,
+                  latSel < sSel,
+                  prevValid < Const(0),
+                  tries < Const(0, width: triesW),
+                  mCycReg < Const(1),
+                  state < mux(sWe, Const(1, width: 2), Const(2, width: 2)),
                 ],
               ),
-            ],
-          ),
-        ]),
-        // Read gap: one cyc-low cycle, then re-issue the read.
-        CaseItem(Const(3, width: 2), [
-          mCycReg < Const(1),
-          state < Const(2, width: 2),
-        ]),
-      ]),
+            ]),
+            // Write in flight: single pass-through, terminate on the
+            // master's ack or err (never both; RTY or no response yet
+            // simply holds and re-presents the same write).
+            CaseItem(Const(1, width: 2), [
+              If(
+                mCycReg & (mAck | mErr),
+                then: [
+                  mCycReg < Const(0),
+                  state < Const(0, width: 2),
+                  If(
+                    mErr,
+                    then: [errReg < Const(1)],
+                    orElse: [datRReg < mDatR, ackReg < Const(1)],
+                  ),
+                ],
+              ),
+            ]),
+            // Read in flight: an error is authoritative and ends the
+            // transaction immediately (not subject to read-voting).
+            // Otherwise capture the word, ack if it agrees with the
+            // previous read (or the try cap is hit), else record it and
+            // issue another read.
+            CaseItem(Const(2, width: 2), [
+              If(
+                mCycReg & (mAck | mErr),
+                then: [
+                  mCycReg < Const(0),
+                  If(
+                    mErr,
+                    then: [errReg < Const(1), state < Const(0, width: 2)],
+                    orElse: [
+                      If(
+                        settled | lastTry,
+                        then: [
+                          datRReg < curD,
+                          ackReg < Const(1),
+                          state < Const(0, width: 2),
+                        ],
+                        orElse: [
+                          prev < curD,
+                          prevValid < Const(1),
+                          tries < tries + 1,
+                          state < Const(3, width: 2), // gap, then re-read
+                        ],
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ]),
+            // Read gap: one cyc-low cycle, then re-issue the read.
+            CaseItem(Const(3, width: 2), [
+              mCycReg < Const(1),
+              state < Const(2, width: 2),
+            ]),
+          ]),
+        ],
+      ),
     ]);
 
-    sAck <= ackReg;
+    // ACK and ERR are mutually exclusive (only one of ackReg/errReg is ever
+    // set per cycle) and gated by CYC & STB so a stray pulse can never land
+    // on an unrelated later cycle.
+    sAck <= ackReg & sCyc & sStb;
+    sErr <= errReg & sCyc & sStb;
     sDatR <= datRReg;
 
     mCyc <= mCycReg;

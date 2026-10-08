@@ -35,6 +35,14 @@ import 'package:rohd/rohd.dart';
 /// ACK, then muxes out the addressed narrow word. Reads are strictly ordered
 /// against the held burst by the flush above. One read is outstanding at a
 /// time.
+///
+/// The controller also ACKs writes, in command order, and echoes `aux` with
+/// each ACK. Writes carry aux 1. A read carries a tag with bit 0 clear and a
+/// sequence number above it, and only the ACK with that tag completes the
+/// read.
+///
+/// `ctrl_reset` is the reset of the controller. When only `reset` asserts, a
+/// read can still be in the controller, so the adapter skips that read tag.
 class Ddr3BurstAdapter extends Module {
   final int busDataWidth;
   final int ddrDataWidth;
@@ -70,6 +78,7 @@ class Ddr3BurstAdapter extends Module {
     // --- narrow B4 slave side ---
     required Logic clk,
     required Logic reset,
+    Logic? ctrlReset,
     required Logic sCyc,
     required Logic sStb,
     required Logic sWe,
@@ -78,15 +87,21 @@ class Ddr3BurstAdapter extends Module {
     required Logic sSel,
     // --- wide controller read-return / status side ---
     required Logic mStall,
-    required Logic mAck, // controller o_wb_ack (reads only)
+    required Logic mAck, // controller o_wb_ack (reads and writes)
+    required Logic mAckAux, // controller o_aux, aligned with o_wb_ack
     required Logic mData, // controller o_wb_data (wide)
     super.name = 'ddr3_burst_adapter',
   }) {
     assert(ddrDataWidth % busDataWidth == 0, 'ratio must be integral');
     assert(writeDrainCycles >= 1, 'writeDrainCycles must be at least 1');
     assert(flushIdleCycles >= 1, 'flushIdleCycles must be at least 1');
+    assert(auxWidth >= 1, 'auxWidth must be at least 1');
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
+    // Without a controller reset, every reset also resets the controller.
+    final hardReset = ctrlReset == null
+        ? reset
+        : addInput('ctrl_reset', ctrlReset);
     sCyc = addInput('s_cyc', sCyc);
     sStb = addInput('s_stb', sStb);
     sWe = addInput('s_we', sWe);
@@ -95,6 +110,7 @@ class Ddr3BurstAdapter extends Module {
     sSel = addInput('s_sel', sSel, width: busSelWidth);
     mStall = addInput('m_stall', mStall);
     mAck = addInput('m_ack', mAck);
+    mAckAux = addInput('m_ack_aux', mAckAux, width: auxWidth);
     mData = addInput('m_data', mData, width: ddrDataWidth);
 
     // Narrow slave responses.
@@ -130,6 +146,10 @@ class Ddr3BurstAdapter extends Module {
     final served = Logic(name: 'served');
     final drainCnt = Logic(name: 'wr_drain', width: drainW);
     final idleCnt = Logic(name: 'idle_cnt', width: idleW);
+    final seqW = auxWidth - 1;
+    final rdSeq = seqW > 0 ? Logic(name: 'rd_seq', width: seqW) : null;
+    final rdTag = (rdSeq == null ? Const(0) : [rdSeq, Const(0)].swizzle())
+        .named('rd_tag');
 
     // The one held dirty burst (write combining).
     final wbValid = Logic(name: 'wc_valid');
@@ -221,6 +241,7 @@ class Ddr3BurstAdapter extends Module {
           mAddr < burstAddr,
           mDataOut < placedData(wordSel),
           mSel < mux(isWrite, placedSel(wordSel), Const(0, width: ddrSelWidth)),
+          mAux < mux(isWrite, Const(1, width: auxWidth), rdTag),
         ],
       ),
       // Keep cyc while awaiting a read ack.
@@ -251,7 +272,7 @@ class Ddr3BurstAdapter extends Module {
 
     Sequential(clk, [
       If(
-        reset,
+        reset | hardReset,
         then: [
           st < Const(stIdle, width: 3),
           wordSel < Const(0, width: _ratioBits),
@@ -265,6 +286,19 @@ class Ddr3BurstAdapter extends Module {
           wbAddr < Const(0, width: ddrAddrWidth),
           wbData < Const(0, width: ddrDataWidth),
           wbSel < Const(0, width: ddrSelWidth),
+          // The controller can still return a read issued before a reset of
+          // this side only. Skip its tag so that ACK cannot match a new read.
+          if (rdSeq != null)
+            If(
+              hardReset,
+              then: [rdSeq < Const(0, width: seqW)],
+              orElse: [
+                If(
+                  st.eq(stIssue) | st.eq(stReadWait),
+                  then: [rdSeq < rdSeq + 1],
+                ),
+              ],
+            ),
         ],
         orElse: [
           ackReg < Const(0), // single-cycle ack pulse by default
@@ -365,12 +399,14 @@ class Ddr3BurstAdapter extends Module {
                 ),
               ]),
               CaseItem(Const(stReadWait, width: 3), [
-                // Capture the addressed word on the controller ack.
+                // Capture the addressed word on this read's ack. Write acks
+                // still in the pipe carry a different tag.
                 If(
-                  mAck,
+                  mAck & mAckAux.eq(rdTag),
                   then: [
                     rdData < pickWord(mData, wordSel),
                     ackReg < Const(1),
+                    if (rdSeq != null) rdSeq < rdSeq + 1,
                     st < Const(stIdle, width: 3),
                   ],
                 ),

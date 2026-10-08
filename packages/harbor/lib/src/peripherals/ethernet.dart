@@ -174,6 +174,8 @@ class HarborEthernetMac extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 8,
       dataWidth: 32,
     );
@@ -857,7 +859,7 @@ class HarborEthernetMac extends BridgeModule
                 // 0x000: MAC_CTRL
                 CaseItem(Const(0x00, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x00, 1),
                     then: [macEnable < bus.dataIn[0]],
                     orElse: [bus.dataOut < macEnable.zeroExtend(32)],
                   ),
@@ -872,7 +874,7 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x10, width: 8), [
                   If(
                     bus.we,
-                    then: [macAddrLo < bus.dataIn],
+                    then: [macAddrLo < bus.selMerge(macAddrLo, 0x10)],
                     orElse: [bus.dataOut < macAddrLo],
                   ),
                 ]),
@@ -880,7 +882,7 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x18, width: 8), [
                   If(
                     bus.we,
-                    then: [macAddrHi < bus.dataIn.getRange(0, 16)],
+                    then: [macAddrHi < bus.selMerge(macAddrHi, 0x18)],
                     orElse: [bus.dataOut < macAddrHi.zeroExtend(32)],
                   ),
                 ]),
@@ -888,9 +890,7 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x20, width: 8), [
                   If(
                     bus.we,
-                    then: [
-                      intStatus < (intStatus & ~bus.dataIn.getRange(0, 8)),
-                    ],
+                    then: [intStatus < (intStatus & ~bus.selMasked(0x20, 8))],
                     orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                   ),
                 ]),
@@ -898,14 +898,14 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x28, width: 8), [
                   If(
                     bus.we,
-                    then: [intEnable < bus.dataIn.getRange(0, 8)],
+                    then: [intEnable < bus.selMerge(intEnable, 0x28)],
                     orElse: [bus.dataOut < intEnable.zeroExtend(32)],
                   ),
                 ]),
                 // 0x040: TX_CTRL ([0] enable, [1] PIO start, [2] DMA start).
                 CaseItem(Const(0x40, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x40, 1),
                     then: [
                       txEnable < bus.dataIn[0],
                       If(
@@ -940,7 +940,7 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x58, width: 8), [
                   If(
                     bus.we,
-                    then: [txLenReg < bus.dataIn.getRange(0, 16)],
+                    then: [txLenReg < bus.selMerge(txLenReg, 0x58)],
                     orElse: [bus.dataOut < txLenReg.zeroExtend(32)],
                   ),
                 ]),
@@ -948,7 +948,10 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x90, width: 8), [
                   If(
                     bus.we,
-                    then: [txWord < bus.dataIn, txWordValid < Const(1)],
+                    then: [
+                      txWord < bus.selMerge(txWord, 0x90),
+                      txWordValid < Const(1),
+                    ],
                   ),
                 ]),
                 // 0x098: RX_DATA (first received word).
@@ -961,14 +964,14 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x50, width: 8), [
                   If(
                     bus.we,
-                    then: [txDescBase < bus.dataIn],
+                    then: [txDescBase < bus.selMerge(txDescBase, 0x50)],
                     orElse: [bus.dataOut < txDescBase],
                   ),
                 ]),
                 // 0x060: RX_CTRL ([0] enable, [1] RX DMA enable).
                 CaseItem(Const(0x60, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x60, 1),
                     then: [rxEnable < bus.dataIn[0], rxDmaEn < bus.dataIn[1]],
                     orElse: [
                       bus.dataOut <
@@ -988,7 +991,7 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x70, width: 8), [
                   If(
                     bus.we,
-                    then: [rxDescBase < bus.dataIn],
+                    then: [rxDescBase < bus.selMerge(rxDescBase, 0x70)],
                     orElse: [bus.dataOut < rxDescBase],
                   ),
                 ]),
@@ -998,9 +1001,11 @@ class HarborEthernetMac extends BridgeModule
                   If(
                     bus.we,
                     then: [
-                      mdioCtrl < bus.dataIn,
+                      mdioCtrl < bus.selMerge(mdioCtrl, 0x80),
+                      // The start bit lives in byte 1, so only fire the
+                      // engine when that byte was actually written.
                       If(
-                        bus.dataIn[11] & ~mdioBusy,
+                        bus.dataIn[11] & ~mdioBusy & bus.selAny(0x81, 1),
                         then: [
                           mdioOpRead < bus.dataIn[10],
                           mdioShift <
@@ -1027,7 +1032,7 @@ class HarborEthernetMac extends BridgeModule
                 CaseItem(Const(0x88, width: 8), [
                   If(
                     bus.we,
-                    then: [mdioData < bus.dataIn.getRange(0, 16)],
+                    then: [mdioData < bus.selMerge(mdioData, 0x88)],
                     orElse: [bus.dataOut < mdioData.zeroExtend(32)],
                   ),
                 ]),

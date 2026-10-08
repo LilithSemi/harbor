@@ -88,12 +88,27 @@ class BusSlavePort {
     required BusProtocol protocol,
     required int addressWidth,
     required int dataWidth,
+    Logic? clk,
+    Logic? reset,
   }) {
     switch (protocol) {
       case BusProtocol.wishbone:
         return _createWishbone(module, name, addressWidth, dataWidth);
       case BusProtocol.tilelink:
-        return _createTileLink(module, name, addressWidth, dataWidth);
+        if (clk == null || reset == null) {
+          throw ArgumentError(
+            'BusProtocol.tilelink needs clk and reset to hold a response '
+            'until D_READY',
+          );
+        }
+        return _createTileLink(
+          module,
+          name,
+          addressWidth,
+          dataWidth,
+          clk,
+          reset,
+        );
     }
   }
 
@@ -134,6 +149,8 @@ class BusSlavePort {
     String name,
     int addressWidth,
     int dataWidth,
+    Logic clk,
+    Logic reset,
   ) {
     final intf = TileLinkInterface(
       TileLinkConfig(addressWidth: addressWidth, dataWidth: dataWidth),
@@ -144,25 +161,49 @@ class BusSlavePort {
     final datOut = Logic(name: '${name}_dat_out', width: dataWidth);
     final ackOut = Logic(name: '${name}_ack_out');
 
-    // TileLink -> internal signals
-    final stb = busIntf.aValid;
+    // A response the peripheral has already produced but D_READY has not
+    // yet accepted. Held so it is never lost, and so the peripheral is not
+    // re-triggered against the same still-presented request while it waits.
+    final respValid = Logic(name: '${name}_resp_valid');
+    final respData = Logic(name: '${name}_resp_data', width: dataWidth);
+    final respWe = Logic(name: '${name}_resp_we');
+
     final we =
         busIntf.aOpcode.eq(Const(0, width: 3)) | // PutFullData
         busIntf.aOpcode.eq(Const(1, width: 3)); // PutPartialData
     final addr = busIntf.aAddress;
     final dataIn = busIntf.aData;
+    // Hide STB from the peripheral while a response is held: otherwise a
+    // request the master cannot yet advance past (A_READY withheld) would
+    // look like a fresh one and re-execute.
+    final stb = busIntf.aValid & ~respValid;
 
-    // Internal signals -> TileLink Channel D
-    busIntf.dValid <= ackOut;
-    busIntf.dOpcode <= mux(we, Const(0, width: 3), Const(1, width: 3));
+    final dValidNow = ackOut | respValid;
+    final dDataNow = mux(respValid, respData, datOut);
+    final dWeNow = mux(respValid, respWe, we);
+
+    Sequential(clk, reset: reset, [
+      If(
+        dValidNow & ~busIntf.dReady,
+        then: [respValid < Const(1), respData < dDataNow, respWe < dWeNow],
+        orElse: [respValid < Const(0)],
+      ),
+    ]);
+
+    // Internal signals -> TileLink Channel D, held until D_READY.
+    busIntf.dValid <= dValidNow;
+    busIntf.dOpcode <= mux(dWeNow, Const(0, width: 3), Const(1, width: 3));
     busIntf.dParam <= Const(0, width: 2);
     busIntf.dSize <= busIntf.aSize;
     busIntf.dSource <= busIntf.aSource;
     busIntf.dSink <= Const(0, width: intf.config.sinkWidth);
-    busIntf.dData <= datOut;
+    busIntf.dData <= dDataNow;
     busIntf.dCorrupt <= Const(0);
     busIntf.dDenied <= Const(0);
-    busIntf.aReady <= ackOut | ~busIntf.aValid;
+
+    // Accept a new Channel A request only once the previous response has
+    // drained: single outstanding, matching the Wishbone side.
+    busIntf.aReady <= (dValidNow & busIntf.dReady) | ~busIntf.aValid;
 
     return BusSlavePort._(
       addr: addr,
@@ -176,5 +217,80 @@ class BusSlavePort {
       protocol: BusProtocol.tilelink,
       interfaceRef: ref,
     );
+  }
+}
+
+/// Byte-lane write helpers for a [BusSlavePort].
+///
+/// On a bus wider than one register, a master aligns the address down to the
+/// bus word and shifts the write data and [BusSlavePort.sel] into the byte
+/// lane of the access (the River MMU convention; PLIC and CLINT decode this
+/// the same way). A register write must look at [BusSlavePort.sel], not just
+/// take the whole bus word, or a narrower store aliases other bytes of the
+/// same bus word and a store to another lane clobbers a register it was
+/// never addressed to.
+extension BusSlavePortByteLane on BusSlavePort {
+  /// Byte position of [offset] within the aligned bus word [sel] covers.
+  int _lane(int offset) => offset % (dataIn.width ~/ 8);
+
+  /// True when [sel] marks at least one of the [byteWidth] bytes a register
+  /// at byte address [offset] occupies. Gates a write so a store that lands
+  /// in a different lane, or a byte/halfword store that misses this
+  /// register entirely, leaves it alone.
+  Logic selAny(int offset, int byteWidth) {
+    final lane = _lane(offset);
+    return sel.getRange(lane, lane + byteWidth).or();
+  }
+
+  /// Next value for a register currently holding [oldValue], written from
+  /// the bus word at byte address [offset]. A byte [sel] does not mark keeps
+  /// its value from [oldValue]; a byte it marks takes the matching byte of
+  /// [BusSlavePort.dataIn]. This is the merge a byte or halfword store
+  /// needs: only the bytes [sel] selects change, and bytes outside this
+  /// register's lane are never touched.
+  Logic selMerge(Logic oldValue, int offset) {
+    final lane = _lane(offset);
+    final width = oldValue.width;
+    final byteCount = (width + 7) ~/ 8;
+    final bytes = <Logic>[
+      for (var b = 0; b < byteCount; b++)
+        mux(
+          sel[lane + b],
+          dataIn.getRange(
+            lane * 8 + b * 8,
+            lane * 8 + b * 8 + _byteBits(width, b),
+          ),
+          oldValue.getRange(b * 8, b * 8 + _byteBits(width, b)),
+        ),
+    ];
+    return bytes.rswizzle();
+  }
+
+  /// [BusSlavePort.dataIn] at byte address [offset], with every byte [sel]
+  /// does not mark forced to zero. For a write-1-to-clear register, this
+  /// keeps a store that does not select a byte from clearing any bit in it.
+  Logic selMasked(int offset, int width) {
+    final lane = _lane(offset);
+    final byteCount = (width + 7) ~/ 8;
+    final bytes = <Logic>[
+      for (var b = 0; b < byteCount; b++)
+        mux(
+          sel[lane + b],
+          dataIn.getRange(
+            lane * 8 + b * 8,
+            lane * 8 + b * 8 + _byteBits(width, b),
+          ),
+          Const(0, width: _byteBits(width, b)),
+        ),
+    ];
+    return bytes.rswizzle();
+  }
+
+  /// Width of byte [b] of a [width]-bit register: 8, except the last byte of
+  /// a register whose width is not a multiple of 8.
+  int _byteBits(int width, int b) {
+    final lo = b * 8;
+    final hi = lo + 8 > width ? width : lo + 8;
+    return hi - lo;
   }
 }

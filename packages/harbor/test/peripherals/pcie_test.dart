@@ -130,7 +130,7 @@ void main() {
       reset = Logic(name: 'reset');
       stb = Logic(name: 'stb');
       we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 8);
+      adr = Logic(name: 'adr', width: 12);
       mosi = Logic(name: 'mosi', width: 32);
       rxn0 = Logic(name: 'rxn0');
       estb = Logic(name: 'estb');
@@ -506,7 +506,7 @@ void main() {
       pcie.input('bus_CYC').srcConnection! <= Const(0);
       pcie.input('bus_STB').srcConnection! <= Const(0);
       pcie.input('bus_WE').srcConnection! <= Const(0);
-      pcie.input('bus_ADR').srcConnection! <= Const(0, width: 8);
+      pcie.input('bus_ADR').srcConnection! <= Const(0, width: 12);
       pcie.input('bus_DAT_MOSI').srcConnection! <= Const(0, width: 32);
       pcie.input('bus_SEL').srcConnection! <=
           Const(0xF, width: pcie.input('bus_SEL').width);

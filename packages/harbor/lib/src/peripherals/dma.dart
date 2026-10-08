@@ -219,6 +219,8 @@ class HarborDmaController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
     );
@@ -598,36 +600,38 @@ class HarborDmaController extends BridgeModule
 
               // The bus presents a BYTE address. Each block is 8 slots of 8
               // bytes (0x40): block 0 is the global registers, block ch+1 is
-              // channel ch. Address bits [5:3] pick the slot within a block.
+              // channel ch. Match the full in-block address, not just the
+              // slot bits, so a byte offset inside a slot other than the
+              // register's own first byte does not alias onto it.
               // Global registers (block 0)
               If(
                 bus.addr.getRange(6, 12).eq(Const(0, width: 6)),
                 then: [
-                  Case(bus.addr.getRange(3, 6), [
-                    // +0x00: CTRL
-                    CaseItem(Const(0, width: 3), [
+                  Case(bus.addr.getRange(0, 6), [
+                    // 0x00: CTRL
+                    CaseItem(Const(0x00, width: 6), [
                       If(
-                        bus.we,
+                        bus.we & bus.selAny(0x00, 1),
                         then: [globalEnable < bus.dataIn[0]],
                         orElse: [bus.dataOut < globalEnable.zeroExtend(32)],
                       ),
                     ]),
-                    // +0x08: INT_STATUS (W1C)
-                    CaseItem(Const(1, width: 3), [
+                    // 0x08: INT_STATUS (W1C)
+                    CaseItem(Const(0x08, width: 6), [
                       If(
                         bus.we,
                         then: [
                           intStatus <
-                              (intStatus & ~bus.dataIn.getRange(0, channels)),
+                              (intStatus & ~bus.selMasked(0x08, channels)),
                         ],
                         orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                       ),
                     ]),
-                    // +0x10: INT_ENABLE
-                    CaseItem(Const(2, width: 3), [
+                    // 0x10: INT_ENABLE
+                    CaseItem(Const(0x10, width: 6), [
                       If(
                         bus.we,
-                        then: [intEnable < bus.dataIn.getRange(0, channels)],
+                        then: [intEnable < bus.selMerge(intEnable, 0x10)],
                         orElse: [bus.dataOut < intEnable.zeroExtend(32)],
                       ),
                     ]),
@@ -640,22 +644,30 @@ class HarborDmaController extends BridgeModule
                 If(
                   bus.addr.getRange(6, 12).eq(Const(ch + 1, width: 6)),
                   then: [
-                    Case(bus.addr.getRange(3, 6), [
-                      // +0x00: CH_CTRL
-                      CaseItem(Const(0, width: 3), [
+                    Case(bus.addr.getRange(0, 6), [
+                      // 0x00: CH_CTRL
+                      CaseItem(Const(0x00, width: 6), [
                         If(
                           bus.we,
                           then: [
-                            chEnable[ch] < bus.dataIn[0],
-                            chType[ch] < bus.dataIn.getRange(4, 6),
-                            chWidth[ch] < bus.dataIn.getRange(8, 10),
-                            // Start transfer when enable written
                             If(
-                              bus.dataIn[0] & globalEnable,
+                              bus.selAny(0x00, 1),
                               then: [
-                                chBusy[ch] < Const(1),
-                                chComplete[ch] < Const(0),
+                                chEnable[ch] < bus.dataIn[0],
+                                chType[ch] < bus.dataIn.getRange(4, 6),
+                                // Start transfer when enable written
+                                If(
+                                  bus.dataIn[0] & globalEnable,
+                                  then: [
+                                    chBusy[ch] < Const(1),
+                                    chComplete[ch] < Const(0),
+                                  ],
+                                ),
                               ],
+                            ),
+                            If(
+                              bus.selAny(0x01, 1),
+                              then: [chWidth[ch] < bus.dataIn.getRange(8, 10)],
                             ),
                           ],
                           orElse: [
@@ -668,8 +680,8 @@ class HarborDmaController extends BridgeModule
                           ],
                         ),
                       ]),
-                      // +0x08: CH_STATUS
-                      CaseItem(Const(1, width: 3), [
+                      // 0x08: CH_STATUS
+                      CaseItem(Const(0x08, width: 6), [
                         bus.dataOut <
                             chBusy[ch].zeroExtend(32) |
                                 (chComplete[ch].zeroExtend(32) <<
@@ -677,31 +689,27 @@ class HarborDmaController extends BridgeModule
                                 (chError[ch].zeroExtend(32) <<
                                     Const(2, width: 32)),
                       ]),
-                      // +0x10: CH_SRC
-                      CaseItem(Const(2, width: 3), [
+                      // 0x10: CH_SRC
+                      CaseItem(Const(0x10, width: 6), [
                         If(
                           bus.we,
-                          then: [
-                            chSrc[ch] < bus.dataIn.getRange(0, addressWidth),
-                          ],
+                          then: [chSrc[ch] < bus.selMerge(chSrc[ch], 0x10)],
                           orElse: [bus.dataOut < chSrc[ch].zeroExtend(32)],
                         ),
                       ]),
-                      // +0x18: CH_DST
-                      CaseItem(Const(3, width: 3), [
+                      // 0x18: CH_DST
+                      CaseItem(Const(0x18, width: 6), [
                         If(
                           bus.we,
-                          then: [
-                            chDst[ch] < bus.dataIn.getRange(0, addressWidth),
-                          ],
+                          then: [chDst[ch] < bus.selMerge(chDst[ch], 0x18)],
                           orElse: [bus.dataOut < chDst[ch].zeroExtend(32)],
                         ),
                       ]),
-                      // +0x20: CH_LEN
-                      CaseItem(Const(4, width: 3), [
+                      // 0x20: CH_LEN
+                      CaseItem(Const(0x20, width: 6), [
                         If(
                           bus.we,
-                          then: [chLen[ch] < bus.dataIn.getRange(0, 24)],
+                          then: [chLen[ch] < bus.selMerge(chLen[ch], 0x20)],
                           orElse: [bus.dataOut < chLen[ch].zeroExtend(32)],
                         ),
                       ]),

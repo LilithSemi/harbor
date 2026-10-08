@@ -255,6 +255,8 @@ class HarborSpiFlashController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: addrWidth,
       dataWidth: busDataWidth ?? 32,
     );
@@ -381,26 +383,27 @@ class HarborSpiFlashController extends BridgeModule
                 ? bus.addr.getRange(0, 32)
                 : bus.addr.zeroExtend(32))
             .named('addr32');
-    // Line-aligned base of the requested address, and the requested word's index
-    // within the line.
-    final reqLineBase =
-        (addr32 & Const((config.size - 1) & ~(lineBytes - 1), width: 32)).named(
-          'req_line_base',
-        );
+    // The address is latched when a miss starts, so an aborted read still
+    // fills the line it was issued for. Its result is then not acked.
+    final reqAddr = Logic(name: 'req_addr', width: 32);
+    final orphan = Logic(name: 'orphan');
+    // Line-aligned base of an address, and the word's index within the line.
+    Logic lineBase(Logic a) =>
+        a & Const((config.size - 1) & ~(lineBytes - 1), width: 32);
     final lineWordSelBits = lineWords <= 1 ? 1 : (lineWords - 1).bitLength;
     final busByteShift = busBytes <= 1 ? 0 : (busBytes - 1).bitLength;
-    final reqWordSel = (lineWords <= 1)
+    Logic wordSel(Logic a) => (lineWords <= 1)
         ? Const(0, width: 8)
-        : addr32
+        : a
               .getRange(busByteShift, busByteShift + lineWordSelBits)
               .zeroExtend(8);
-    final lineHit = (lineValid & reqLineBase.eq(lineTag)).named('line_hit');
+    final reqWordSel = wordSel(addr32).named('req_word_sel');
+    final lineHit = (lineValid & lineBase(addr32).eq(lineTag)).named(
+      'line_hit',
+    );
 
     // The flash command reads from the LINE base (aligned to lineBytes).
-    final alignMask = (config.size - 1) & ~(lineBytes - 1);
-    final maskedAddr = (addr32 & Const(alignMask, width: 32)).zeroExtend(
-      busWidth,
-    );
+    final maskedAddr = lineBase(reqAddr).zeroExtend(busWidth);
     // Left shift that aligns the MSB of the address to bit busWidth-1, so the
     // 1-bit address phase shifts it out MSB-first.
     final addrAlign = Const(
@@ -444,9 +447,15 @@ class HarborSpiFlashController extends BridgeModule
           lineTag < Const(0, width: 32),
           wordIdx < Const(0, width: 8),
           for (final b in lineBuf) b < Const(0, width: busWidth),
+          reqAddr < Const(0, width: 32),
+          orphan < Const(0),
         ],
         orElse: [
           ack < Const(0),
+          If(
+            spiState.neq(Const(sIdle, width: 3)) & ~bus.stb,
+            then: [orphan < Const(1)],
+          ),
 
           // A flash write/erase can change the cached bytes: invalidate the
           // read-ahead line while the write engine is active.
@@ -489,6 +498,8 @@ class HarborSpiFlashController extends BridgeModule
                               ),
                           bitCount < Const(0, width: 8),
                           wordIdx < Const(0, width: 8),
+                          reqAddr < addr32,
+                          orphan < Const(0),
                           ioDir < Const(0), // output (drive DQ0)
                           spiState < Const(sSendCmd, width: 3),
                         ],
@@ -602,12 +613,12 @@ class HarborSpiFlashController extends BridgeModule
                   // line so subsequent in-line reads hit the buffer.
                   for (var i = 0; i < lineWords; i++)
                     If(
-                      reqWordSel.eq(Const(i, width: 8)),
+                      wordSel(reqAddr).eq(Const(i, width: 8)),
                       then: [datOut < lineBuf[i]],
                     ),
                   lineValid < Const(1),
-                  lineTag < reqLineBase,
-                  ack < Const(1),
+                  lineTag < lineBase(reqAddr),
+                  ack < ~orphan & bus.stb,
                   spiCsN < Const(1),
                   spiClk < Const(0),
                   ioDir < Const(0),

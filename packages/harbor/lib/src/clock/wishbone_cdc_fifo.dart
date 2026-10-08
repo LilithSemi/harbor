@@ -3,6 +3,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../soc/target.dart';
 import 'cdc.dart';
+import 'wishbone_cdc.dart' show stickyCdcError;
 
 /// Wishbone clock-domain-crossing bridge built on async gray-pointer FIFOs.
 ///
@@ -31,6 +32,11 @@ import 'cdc.dart';
 /// FIFO, so a read is always served after every write queued before it. The
 /// cost is that a write can no longer report an error, which is what "posted"
 /// means. Without the flag the bridge is strictly one transaction in flight.
+///
+/// A reset of either domain resets both sides and empties both FIFOs. A slave
+/// cycle that waits during a master domain reset gets ACK with all-ones data.
+/// When the slave aborts a cycle, the bridge drops its response.
+/// Each such poison ACK sets the sticky `s_bus_error` output.
 class HarborWishboneCdcFifoBridge extends BridgeModule {
   /// Address bus width.
   final int addressWidth;
@@ -103,9 +109,23 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     addOutput('m_sel', width: sw);
 
     final sClk = input('s_clk');
-    final sReset = input('s_reset');
     final mClk = input('m_clk');
-    final mReset = input('m_reset');
+    final sReset = harborCdcJoinReset(
+      sClk,
+      input('s_reset'),
+      input('m_reset'),
+      name: 's_join_reset',
+    );
+    final mReset = harborCdcJoinReset(
+      mClk,
+      input('m_reset'),
+      input('s_reset'),
+      name: 'm_join_reset',
+    );
+    // Logic on the master clock behind this bridge must reset with it.
+    addOutput('m_reset_joined') <= mReset;
+    // Reset only from the master domain while a slave cycle waits.
+    final sPeerReset = (sReset & ~input('s_reset')).named('s_peer_reset');
 
     // Request payload packed { we, adr, dat_w, sel } (MSB..LSB).
     final reqW = 1 + aw + dw + sw;
@@ -128,6 +148,8 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     addSubModule(respFifo);
 
     final pending = Logic(name: 'pending');
+    // The cycle that owns the pending response was aborted.
+    final orphan = Logic(name: 'orphan');
     final ackReg = Logic(name: 's_ack_reg');
     final sDatRReg = Logic(name: 's_dat_r_reg', width: dw);
 
@@ -158,13 +180,26 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     respFifo.input('rd_reset').srcConnection! <= sReset;
     respFifo.input('rd_en').srcConnection! <= respPop;
 
+    final poisonAck = (sPeerReset & pending & ~orphan & sReq).named(
+      'poison_ack',
+    );
+    stickyCdcError(this, sClk, input('s_reset'), poisonAck);
+
     Sequential(sClk, [
       If(
         sReset,
         then: [
           pending < Const(0),
-          ackReg < Const(0),
-          sDatRReg < Const(0, width: dw),
+          orphan < Const(0),
+          // A master domain reset ends the waiting cycle with poison data.
+          If(
+            poisonAck,
+            then: [
+              ackReg < Const(1),
+              sDatRReg < Const(1, width: dw, fill: true),
+            ],
+            orElse: [ackReg < Const(0)],
+          ),
         ],
         orElse: [
           ackReg < Const(0),
@@ -183,16 +218,21 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
           If(
             respPop,
             then: [
+              // The response of an aborted cycle is dropped.
               sDatRReg < respFifo.output('rd_data'),
-              ackReg < Const(1),
+              ackReg < sReq & ~orphan,
               pending < Const(0),
+              orphan < Const(0),
+            ],
+            orElse: [
+              If(pending & ~sReq, then: [orphan < Const(1)]),
             ],
           ),
         ],
       ),
     ]);
 
-    output('s_ack') <= ackReg;
+    output('s_ack') <= ackReg & sReq;
     output('s_dat_r') <= sDatRReg;
 
     final serving = Logic(name: 'serving');

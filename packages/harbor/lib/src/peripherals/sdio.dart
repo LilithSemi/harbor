@@ -400,6 +400,8 @@ class HarborSdioController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
     );
@@ -751,7 +753,9 @@ class HarborSdioController extends BridgeModule
                 ~bus.we &
                 cmdDataDir &
                 ~rxEmpty &
-                bus.addr.getRange(3, 8).eq(Const(0x09, width: 5)))
+                bus.addr
+                    .getRange(3, busAddressWidth)
+                    .eq(Const(0x09, width: busAddressWidth - 3)))
             .named('rx_pop_cpu');
     final rxPop = (rxPopAdma | rxPopCpu).named('rx_pop');
     // A word is only really taken when the FIFO had one to give.
@@ -1837,20 +1841,19 @@ class HarborSdioController extends BridgeModule
               busServed < Const(1),
               bus.ack < Const(1),
 
-              // The bus address arrives as a word index (the fabric strips the
-              // byte offset), matching every other Harbor peripheral, so the
-              // documented byte offsets map to indices 0,1,2,...
-              // Each register in its own 8-byte slot (byte offset >> 3), matching
-              // every other Harbor peripheral on the byte-addressed fabric. The
-              // documented byte offsets 0x00,0x08,0x10,... map to indices 0,1,2.
-              // (Was getRange(0,6) = a 4-byte/word-index assumption that aliased
-              // every register on the 64-bit fabric - CMD landed on INT_STATUS.)
-              Case(bus.addr.getRange(3, 8), [
+              // Each register sits in its own 8-byte slot (byte offset >> 3),
+              // matching every other Harbor peripheral on the byte-addressed
+              // fabric. The documented byte offsets 0x00,0x08,0x10,... map to
+              // indices 0,1,2. Match the full configured address width, not
+              // just enough low bits for the registers defined today, so an
+              // address outside the map reads 0 and ignores writes instead of
+              // aliasing a register.
+              Case(bus.addr.getRange(3, busAddressWidth), [
                 // 0x00: CTRL ([0] enable, [5:4] reports max bus width,
                 // [8] read-data sample edge 0:rising 1:falling).
-                CaseItem(Const(0x00, width: 5), [
+                CaseItem(Const(0x00, width: busAddressWidth - 3), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x00, 2),
                     then: [
                       ctrlEnable < bus.dataIn[0],
                       // [5:4] selects the active bus width (0:1-bit, 1:4-bit,
@@ -1872,7 +1875,7 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x08: STATUS ([0] card detect, [8] busy, [9] data ready).
-                CaseItem(Const(0x01, width: 5), [
+                CaseItem(Const(0x01, width: busAddressWidth - 3), [
                   bus.dataOut <
                       cardDetect.zeroExtend(dw) |
                           (busy.zeroExtend(dw) << Const(8, width: 32)) |
@@ -1884,10 +1887,10 @@ class HarborSdioController extends BridgeModule
                               Const(9, width: 32)),
                 ]),
                 // 0x10: CLK_DIV.
-                CaseItem(Const(0x02, width: 5), [
+                CaseItem(Const(0x02, width: busAddressWidth - 3), [
                   If(
                     bus.we,
-                    then: [clkDiv < bus.dataIn.getRange(0, 16)],
+                    then: [clkDiv < bus.selMerge(clkDiv, 0x10)],
                     orElse: [bus.dataOut < clkDiv.zeroExtend(dw)],
                   ),
                 ]),
@@ -1895,9 +1898,9 @@ class HarborSdioController extends BridgeModule
                 // [5:0] index, [7:6] response type (0 none, 1 short, 2 long
                 // R2, 3 short+busy), [8] data present, [9] data direction
                 // (0 write, 1 read).
-                CaseItem(Const(0x03, width: 5), [
+                CaseItem(Const(0x03, width: busAddressWidth - 3), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x18, 2),
                     then: [
                       If(
                         ~busy,
@@ -1969,25 +1972,25 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x20: CMD_ARG.
-                CaseItem(Const(0x04, width: 5), [
+                CaseItem(Const(0x04, width: busAddressWidth - 3), [
                   If(
                     bus.we,
-                    then: [cmdArg < bus.dataIn.getRange(0, 32)],
+                    then: [cmdArg < bus.selMerge(cmdArg, 0x20)],
                     orElse: [bus.dataOut < cmdArg.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x28-0x40: RESP0-3.
                 for (var i = 0; i < 4; i++)
-                  CaseItem(Const(0x05 + i, width: 5), [
+                  CaseItem(Const(0x05 + i, width: busAddressWidth - 3), [
                     bus.dataOut < resp[i].zeroExtend(dw),
                   ]),
                 // 0x48: DATA. One-word PIO buffer. CPU writes fill it (for a
                 // write transfer), reads drain it (for a read transfer).
-                CaseItem(Const(0x09, width: 5), [
+                CaseItem(Const(0x09, width: busAddressWidth - 3), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x48, 4),
                     then: [
-                      dataReg < bus.dataIn.getRange(0, 32),
+                      dataReg < bus.selMerge(dataReg, 0x48),
                       dataValid < Const(1),
                     ],
                     // A card read pops the RX FIFO (see `rxPopCpu`); a card write
@@ -1999,44 +2002,42 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x50: BLK_SIZE.
-                CaseItem(Const(0x0A, width: 5), [
+                CaseItem(Const(0x0A, width: busAddressWidth - 3), [
                   If(
                     bus.we,
-                    then: [blkSize < bus.dataIn.getRange(0, 12)],
+                    then: [blkSize < bus.selMerge(blkSize, 0x50)],
                     orElse: [bus.dataOut < blkSize.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x58: BLK_COUNT.
-                CaseItem(Const(0x0B, width: 5), [
+                CaseItem(Const(0x0B, width: busAddressWidth - 3), [
                   If(
                     bus.we,
-                    then: [blkCount < bus.dataIn.getRange(0, 16)],
+                    then: [blkCount < bus.selMerge(blkCount, 0x58)],
                     orElse: [bus.dataOut < blkCount.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x60: INT_STATUS (write-1-to-clear).
-                CaseItem(Const(0x0C, width: 5), [
+                CaseItem(Const(0x0C, width: busAddressWidth - 3), [
                   If(
                     bus.we,
-                    then: [
-                      intStatus < (intStatus & ~bus.dataIn.getRange(0, 8)),
-                    ],
+                    then: [intStatus < (intStatus & ~bus.selMasked(0x60, 8))],
                     orElse: [bus.dataOut < intStatus.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x68: INT_ENABLE.
-                CaseItem(Const(0x0D, width: 5), [
+                CaseItem(Const(0x0D, width: busAddressWidth - 3), [
                   If(
                     bus.we,
-                    then: [intEnable < bus.dataIn.getRange(0, 8)],
+                    then: [intEnable < bus.selMerge(intEnable, 0x68)],
                     orElse: [bus.dataOut < intEnable.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x70: ADMA_ADDR (descriptor table base for DMA transfers).
-                CaseItem(Const(0x0E, width: 5), [
+                CaseItem(Const(0x0E, width: busAddressWidth - 3), [
                   If(
                     bus.we,
-                    then: [admaBase < bus.dataIn.getRange(0, 32)],
+                    then: [admaBase < bus.selMerge(admaBase, 0x70)],
                     orElse: [bus.dataOut < admaBase.zeroExtend(dw)],
                   ),
                 ]),

@@ -231,6 +231,8 @@ class HarborAudioController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
     );
@@ -345,134 +347,132 @@ class HarborAudioController extends BridgeModule
             bus.stb & ~bus.ack,
             then: [
               bus.ack < Const(1),
-              Case(bus.addr.getRange(0, 9), [
-                CaseItem(Const(0x00, width: 9), [
+              Case(bus.addr, [
+                CaseItem(Const(0x00, width: 12), [
                   If(
                     bus.we,
-                    then: [ctrl < bus.dataIn],
+                    then: [ctrl < bus.selMerge(ctrl, 0x00)],
                     orElse: [bus.dataOut < ctrl],
                   ),
                 ]),
-                CaseItem(Const(0x08, width: 9), [
+                CaseItem(Const(0x08, width: 12), [
                   // STATUS: read-only
                   bus.dataOut < Const(0, width: 32), // placeholder
                 ]),
-                CaseItem(Const(0x10, width: 9), [
+                CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
-                    then: [clkCfg < bus.dataIn],
+                    then: [clkCfg < bus.selMerge(clkCfg, 0x10)],
                     orElse: [bus.dataOut < clkCfg],
                   ),
                 ]),
-                CaseItem(Const(0x18, width: 9), [
+                CaseItem(Const(0x18, width: 12), [
                   If(
                     bus.we,
-                    then: [format < bus.dataIn],
+                    then: [format < bus.selMerge(format, 0x18)],
                     orElse: [bus.dataOut < format],
                   ),
                 ]),
-                CaseItem(Const(0x20, width: 9), [
+                CaseItem(Const(0x20, width: 12), [
                   If(
                     bus.we,
-                    then: [txCtrl < bus.dataIn],
+                    then: [txCtrl < bus.selMerge(txCtrl, 0x20)],
                     orElse: [bus.dataOut < txCtrl],
                   ),
                 ]),
-                CaseItem(Const(0x28, width: 9), [
+                CaseItem(Const(0x28, width: 12), [
                   If(
                     bus.we,
-                    then: [rxCtrl < bus.dataIn],
+                    then: [rxCtrl < bus.selMerge(rxCtrl, 0x28)],
                     orElse: [bus.dataOut < rxCtrl],
                   ),
                 ]),
-                CaseItem(Const(0x30, width: 9), [
+                CaseItem(Const(0x30, width: 12), [
                   If(
                     bus.we,
-                    then: [txDmaAddr < bus.dataIn],
+                    then: [txDmaAddr < bus.selMerge(txDmaAddr, 0x30)],
                     orElse: [bus.dataOut < txDmaAddr],
                   ),
                 ]),
-                CaseItem(Const(0x38, width: 9), [
+                CaseItem(Const(0x38, width: 12), [
                   If(
                     bus.we,
-                    then: [txDmaSize < bus.dataIn],
+                    then: [txDmaSize < bus.selMerge(txDmaSize, 0x38)],
                     orElse: [bus.dataOut < txDmaSize],
                   ),
                 ]),
-                CaseItem(Const(0x40, width: 9), [
+                CaseItem(Const(0x40, width: 12), [
                   If(
                     bus.we,
-                    then: [txDmaWr < bus.dataIn],
+                    then: [txDmaWr < bus.selMerge(txDmaWr, 0x40)],
                     orElse: [bus.dataOut < txDmaWr],
                   ),
                 ]),
-                CaseItem(Const(0x48, width: 9), [bus.dataOut < txDmaRd]),
-                CaseItem(Const(0x50, width: 9), [
+                CaseItem(Const(0x48, width: 12), [bus.dataOut < txDmaRd]),
+                CaseItem(Const(0x50, width: 12), [
                   If(
                     bus.we,
-                    then: [rxDmaAddr < bus.dataIn],
+                    then: [rxDmaAddr < bus.selMerge(rxDmaAddr, 0x50)],
                     orElse: [bus.dataOut < rxDmaAddr],
                   ),
                 ]),
-                CaseItem(Const(0x58, width: 9), [
+                CaseItem(Const(0x58, width: 12), [
                   If(
                     bus.we,
-                    then: [rxDmaSize < bus.dataIn],
+                    then: [rxDmaSize < bus.selMerge(rxDmaSize, 0x58)],
                     orElse: [bus.dataOut < rxDmaSize],
                   ),
                 ]),
-                CaseItem(Const(0x60, width: 9), [bus.dataOut < rxDmaWr]),
-                CaseItem(Const(0x68, width: 9), [
+                CaseItem(Const(0x60, width: 12), [bus.dataOut < rxDmaWr]),
+                CaseItem(Const(0x68, width: 12), [
                   If(
                     bus.we,
-                    then: [rxDmaRd < bus.dataIn],
+                    then: [rxDmaRd < bus.selMerge(rxDmaRd, 0x68)],
                     orElse: [bus.dataOut < rxDmaRd],
                   ),
                 ]),
                 // INT_STATUS (W1C)
-                CaseItem(Const(0x70, width: 9), [
+                CaseItem(Const(0x70, width: 12), [
                   If(
                     bus.we,
-                    then: [
-                      intStatus < (intStatus & ~bus.dataIn.getRange(0, 8)),
-                    ],
+                    then: [intStatus < (intStatus & ~bus.selMasked(0x70, 8))],
                     orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                   ),
                 ]),
                 // INT_ENABLE
-                CaseItem(Const(0x78, width: 9), [
+                CaseItem(Const(0x78, width: 12), [
                   If(
                     bus.we,
-                    then: [intEnable < bus.dataIn.getRange(0, 8)],
+                    then: [intEnable < bus.selMerge(intEnable, 0x78)],
                     orElse: [bus.dataOut < intEnable.zeroExtend(32)],
                   ),
                 ]),
                 // VOLUME_L
-                CaseItem(Const(0x80, width: 9), [
+                CaseItem(Const(0x80, width: 12), [
                   If(
                     bus.we,
-                    then: [volumeL < bus.dataIn.getRange(0, 8)],
+                    then: [volumeL < bus.selMerge(volumeL, 0x80)],
                     orElse: [bus.dataOut < volumeL.zeroExtend(32)],
                   ),
                 ]),
                 // VOLUME_R
-                CaseItem(Const(0x88, width: 9), [
+                CaseItem(Const(0x88, width: 12), [
                   If(
                     bus.we,
-                    then: [volumeR < bus.dataIn.getRange(0, 8)],
+                    then: [volumeR < bus.selMerge(volumeR, 0x88)],
                     orElse: [bus.dataOut < volumeR.zeroExtend(32)],
                   ),
                 ]),
                 // MUTE
-                CaseItem(Const(0x90, width: 9), [
+                CaseItem(Const(0x90, width: 12), [
                   If(
                     bus.we,
-                    then: [muteReg < bus.dataIn.getRange(0, 2)],
+                    then: [muteReg < bus.selMerge(muteReg, 0x90)],
                     orElse: [bus.dataOut < muteReg.zeroExtend(32)],
                   ),
                 ]),
                 // CODEC_CAPS
-                CaseItem(Const(0x110, width: 9), [
+                CaseItem(Const(0x110, width: 12), [
                   bus.dataOut < Const(codecCaps, width: 32),
                 ]),
               ]),

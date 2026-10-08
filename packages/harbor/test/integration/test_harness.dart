@@ -73,7 +73,7 @@ class PeripheralTestBench extends BridgeModule {
   Logic get ack => master.output('m_ack');
   Logic get datIn => master.output('m_dat_in');
 
-  PeripheralTestBench(this.peripheral)
+  PeripheralTestBench(this.peripheral, {String busName = 'bus'})
     : super('PeripheralTestBench', name: 'tb') {
     final clkGen = SimpleClockGenerator(10);
     clk = clkGen.clk;
@@ -82,7 +82,7 @@ class PeripheralTestBench extends BridgeModule {
     createPort('reset', PortDirection.input);
 
     final wb =
-        peripheral.interface('bus').internalInterface! as WishboneInterface;
+        peripheral.interface(busName).internalInterface! as WishboneInterface;
     _selWidth = wb.config.effectiveSelWidth;
 
     master = WishboneMasterTestDriver(config: wb.config);
@@ -92,7 +92,7 @@ class PeripheralTestBench extends BridgeModule {
     connectPorts(port('clk'), master.port('clk'));
     connectPorts(port('clk'), peripheral.port('clk'));
     connectPorts(port('reset'), peripheral.port('reset'));
-    connectInterfaces(master.interface('bus'), peripheral.interface('bus'));
+    connectInterfaces(master.interface('bus'), peripheral.interface(busName));
 
     pullUpPort(master.port('m_cyc'), newPortName: 'cyc');
     pullUpPort(master.port('m_stb'), newPortName: 'stb');

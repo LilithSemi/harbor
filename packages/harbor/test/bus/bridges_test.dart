@@ -9,7 +9,12 @@ void main() {
       final tlConfig = TileLinkConfig(addressWidth: 32, dataWidth: 32);
       final wb = WishboneInterface(wbConfig);
       final tl = TileLinkInterface(tlConfig);
-      final bridge = WishboneToTileLinkBridge(wb, tl);
+      final bridge = WishboneToTileLinkBridge(
+        wb,
+        tl,
+        clk: Logic(name: 'clk'),
+        reset: Logic(name: 'reset'),
+      );
       expect(bridge, isNotNull);
     });
   });
@@ -20,7 +25,12 @@ void main() {
       final tlConfig = TileLinkConfig(addressWidth: 32, dataWidth: 32);
       final tl = TileLinkInterface(tlConfig);
       final wb = WishboneInterface(wbConfig);
-      final bridge = TileLinkToWishboneBridge(tl, wb);
+      final bridge = TileLinkToWishboneBridge(
+        tl,
+        wb,
+        clk: Logic(name: 'clk'),
+        reset: Logic(name: 'reset'),
+      );
       expect(bridge, isNotNull);
     });
   });

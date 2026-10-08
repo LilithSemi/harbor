@@ -4,9 +4,9 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-// Register word indices presented on the bus address lines.
-const _rand = 0x00 >> 2; // 0
-const _status = 0x04 >> 2; // 1
+// Register byte offsets presented on the bus address lines.
+const _rand = 0x00;
+const _status = 0x04;
 
 /// Golden reference for the deterministic seeded stream. Must match the
 /// hardware DRBG exactly (a 32-bit xorshift) when seed != 0 and the noise
@@ -49,8 +49,8 @@ void main() {
     late HarborTrng trng;
     late Logic clk, reset, cyc, stb, we, adr, mosi;
 
-    Future<int> busRead(int wordAddr) async {
-      adr.inject(wordAddr);
+    Future<int> busRead(int byteAddr) async {
+      adr.inject(byteAddr);
       mosi.inject(0);
       we.inject(0);
       cyc.inject(1);

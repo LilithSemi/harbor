@@ -68,6 +68,7 @@ void main() {
     cdc.input('s_sel').srcConnection! <= ds.output('m_sel');
     ds.input('m_ack').srcConnection! <= cdc.output('s_ack');
     ds.input('m_dat_r').srcConnection! <= cdc.output('s_dat_r');
+    ds.input('m_err').srcConnection! <= Const(0);
 
     // CDC fast master -> behavioral 32-bit WB memory (8 words at 0x00..0x1C).
     cdc.input('m_clk').srcConnection! <= mClk;

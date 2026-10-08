@@ -148,4 +148,145 @@ void main() {
       },
     );
   });
+
+  group('HarborSpiController byte-lane writes', () {
+    late HarborSpiController spi;
+    late Logic clk, reset, cyc, stb, we, adr, mosi, sel, miso;
+
+    int allSel() => (1 << sel.width) - 1;
+
+    Future<void> busWrite(int addr, int value) async {
+      adr.inject(addr);
+      mosi.inject(value);
+      sel.inject(allSel());
+      we.inject(1);
+      cyc.inject(1);
+      stb.inject(1);
+      await clk.nextPosedge;
+      while (spi.bus.ack.value.toInt() != 1) {
+        await clk.nextPosedge;
+      }
+      cyc.inject(0);
+      stb.inject(0);
+      we.inject(0);
+      await clk.nextPosedge;
+    }
+
+    Future<void> busWriteSel(int addr, int selMask, int value) async {
+      adr.inject(addr);
+      mosi.inject(value);
+      sel.inject(selMask);
+      we.inject(1);
+      cyc.inject(1);
+      stb.inject(1);
+      await clk.nextPosedge;
+      while (spi.bus.ack.value.toInt() != 1) {
+        await clk.nextPosedge;
+      }
+      cyc.inject(0);
+      stb.inject(0);
+      we.inject(0);
+      sel.inject(allSel());
+      await clk.nextPosedge;
+    }
+
+    Future<int> busRead(int addr) async {
+      adr.inject(addr);
+      we.inject(0);
+      cyc.inject(1);
+      stb.inject(1);
+      await clk.nextPosedge;
+      while (spi.bus.ack.value.toInt() != 1) {
+        await clk.nextPosedge;
+      }
+      final d = spi.bus.dataOut.value.toInt();
+      cyc.inject(0);
+      stb.inject(0);
+      await clk.nextPosedge;
+      return d;
+    }
+
+    Future<void> setUpDut({int dataWidth = 32}) async {
+      spi = HarborSpiController(baseAddress: 0x1000, busDataWidth: dataWidth);
+      clk = SimpleClockGenerator(10).clk;
+      reset = Logic(name: 'reset');
+      cyc = Logic(name: 'cyc');
+      stb = Logic(name: 'stb');
+      we = Logic(name: 'we');
+      adr = Logic(name: 'adr', width: spi.input('bus_ADR').width);
+      mosi = Logic(name: 'mosi', width: dataWidth);
+      sel = Logic(name: 'sel', width: dataWidth ~/ 8);
+      miso = Logic(name: 'miso');
+
+      spi.input('clk').srcConnection! <= clk;
+      spi.input('reset').srcConnection! <= reset;
+      spi.input('bus_CYC').srcConnection! <= cyc;
+      spi.input('bus_STB').srcConnection! <= stb;
+      spi.input('bus_WE').srcConnection! <= we;
+      spi.input('bus_ADR').srcConnection! <= adr;
+      spi.input('bus_DAT_MOSI').srcConnection! <= mosi;
+      spi.input('bus_SEL').srcConnection! <= sel;
+      spi.input('spi_miso').srcConnection! <= miso;
+
+      await spi.build();
+      reset.inject(1);
+      cyc.inject(0);
+      stb.inject(0);
+      we.inject(0);
+      adr.inject(0);
+      mosi.inject(0);
+      sel.inject(allSel());
+      miso.inject(0);
+      Simulator.setMaxSimTime(1000000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+    }
+
+    tearDown(() async => Simulator.reset());
+
+    test('a byte store changes only the selected byte (32-bit bus)', () async {
+      await setUpDut();
+
+      await busWrite(divider, 0x1234);
+      // SEL=0b0001: only byte 0 of the write data is live.
+      await busWriteSel(divider, 0x1, 0x00000099);
+      expect(await busRead(divider), equals(0x1299));
+      await Simulator.endSimulation();
+    });
+
+    test(
+      'a halfword store changes only the selected halfword (32-bit bus)',
+      () async {
+        await setUpDut();
+
+        await busWrite(divider, 0x1234);
+        await busWriteSel(divider, 0x3, 0x0000beef);
+        expect(await busRead(divider), equals(0xbeef));
+        await Simulator.endSimulation();
+      },
+    );
+
+    // Regression: River aligns ADR to 8 bytes on a 64-bit bus and puts the
+    // byte position of a narrower access in SEL, so a 32-bit store to
+    // DIVIDER+4 arrives with ADR=DIVIDER and SEL selecting the upper 4
+    // bytes. DIVIDER lives in the low 4 bytes of that 8-byte slot, so this
+    // store must leave it alone.
+    test('a store to the upper lane of a slot does not alias the register '
+        'below it (64-bit bus)', () async {
+      await setUpDut(dataWidth: 64);
+
+      await busWriteSel(divider, 0x0f, 0x1234);
+      final before = await busRead(divider);
+
+      await busWriteSel(divider, 0xf0, 0x5678 << 32);
+      final after = await busRead(divider);
+
+      expect(before, equals(0x1234));
+      expect(after, equals(before));
+      await Simulator.endSimulation();
+    });
+  });
 }

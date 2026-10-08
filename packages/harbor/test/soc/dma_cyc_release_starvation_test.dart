@@ -17,7 +17,6 @@
 import 'dart:async';
 
 import 'package:harbor/harbor.dart';
-import 'package:harbor/src/bus/wishbone/wishbone_register_stage.dart';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:test/test.dart';

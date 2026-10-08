@@ -276,4 +276,98 @@ void main() {
       );
     },
   );
+
+  test('an aborted read runs as issued, is not acked, and the next read '
+      'waits for it', () async {
+    final clk = SimpleClockGenerator(10).clk;
+    final reset = Logic(name: 'reset');
+    final stb = Logic(name: 'stb');
+    final addr = Logic(name: 'addr', width: 32);
+
+    final flash = HarborSpiFlashController(
+      config: const HarborSpiFlashConfig(
+        size: 1024 * 1024,
+        mode: HarborSpiFlashMode.standard,
+        readCommand: 0x03,
+        addressBytes: 3,
+        dummyCycles: 0,
+      ),
+      baseAddress: 0x20000000,
+      busAddressWidth: 32,
+      busDataWidth: 32,
+    );
+    flash.input('clk').srcConnection! <= clk;
+    flash.input('reset').srcConnection! <= reset;
+    flash.input('bus_CYC').srcConnection! <= stb;
+    flash.input('bus_STB').srcConnection! <= stb;
+    flash.input('bus_WE').srcConnection! <= Const(0);
+    flash.input('bus_ADR').srcConnection! <= addr;
+    flash.input('bus_DAT_MOSI').srcConnection! <= Const(0, width: 32);
+    flash.input('bus_SEL').srcConnection! <=
+        Const(0xF, width: flash.input('bus_SEL').width);
+    flash.input('spi_miso').srcConnection! <= Const(0);
+    flash.input('wr_req').srcConnection! <= Const(0);
+    flash.input('wr_op').srcConnection! <= Const(0);
+    flash.input('wr_addr').srcConnection! <= Const(0, width: 24);
+    flash.input('wr_len').srcConnection! <= Const(0, width: 9);
+    flash.input('wr_data').srcConnection! <= Const(0, width: 8);
+    await flash.build();
+
+    final spiClk = flash.output('spi_clk');
+    final csN = flash.output('spi_cs_n');
+    final mosi = flash.output('spi_mosi');
+    final ack = flash.output('bus_ACK');
+
+    reset.inject(1);
+    stb.inject(0);
+    addr.inject(0);
+    Simulator.setMaxSimTime(4000000);
+    unawaited(Simulator.run());
+    await clk.nextPosedge;
+    await clk.nextPosedge;
+    reset.inject(0);
+    await clk.nextPosedge;
+
+    // Bits on each SCK rise, one list per CS-low frame.
+    final frames = <List<int>>[];
+    final acksInFrame = <int>[];
+    var prevClk = 0;
+    var prevCs = 1;
+    Future<void> tick() async {
+      await clk.nextPosedge;
+      final cs = csN.value.toInt();
+      final sc = spiClk.value.toInt();
+      if (cs == 0 && prevCs == 1) frames.add([]);
+      if (cs == 0 && sc == 1 && prevClk == 0) {
+        frames.last.add(mosi.value.toInt());
+      }
+      if (ack.value.toBool()) acksInFrame.add(frames.length - 1);
+      prevClk = sc;
+      prevCs = cs;
+    }
+
+    addr.inject(0x40);
+    stb.inject(1);
+    for (var i = 0; i < 10; i++) {
+      await tick();
+    }
+    stb.inject(0);
+    await tick();
+    addr.inject(0x80);
+    stb.inject(1);
+    for (var i = 0; i < 600 && acksInFrame.isEmpty; i++) {
+      await tick();
+    }
+    stb.inject(0);
+    await Simulator.endSimulation();
+
+    int field(List<int> bits, int from, int n) =>
+        bits.sublist(from, from + n).fold(0, (a, b) => (a << 1) | b);
+    expect(frames.length, 2);
+    expect(field(frames[0], 0, 8), 0x03);
+    expect(field(frames[0], 8, 24), 0x40);
+    expect(field(frames[1], 0, 8), 0x03);
+    expect(field(frames[1], 8, 24), 0x80);
+    expect(acksInFrame, [1], reason: 'only the second read is acked');
+  });
 }

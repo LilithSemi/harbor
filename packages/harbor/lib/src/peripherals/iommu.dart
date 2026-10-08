@@ -104,6 +104,8 @@ class HarborIommu extends BridgeModule
       module: this,
       name: 'reg',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 12,
       dataWidth: 64,
     );
@@ -398,28 +400,31 @@ class HarborIommu extends BridgeModule
           ]),
 
           // Register access (64-bit registers, 8-byte aligned: index addr[6:3]).
+          // Match the full address, not just enough low bits for the registers
+          // defined today, so an address outside the map reads 0 and ignores
+          // writes instead of aliasing a register.
           regBus.ack < Const(0),
           regBus.dataOut < Const(0, width: 64),
           If(
             regBus.stb & ~regBus.ack,
             then: [
               regBus.ack < Const(1),
-              Case(regBus.addr.getRange(3, 7), [
+              Case(regBus.addr.getRange(3, 12), [
                 // 0x000: capabilities (read-only).
-                CaseItem(Const(0, width: 4), [regBus.dataOut < capabilities]),
+                CaseItem(Const(0, width: 9), [regBus.dataOut < capabilities]),
                 // 0x008: fctl.
-                CaseItem(Const(1, width: 4), [
+                CaseItem(Const(1, width: 9), [
                   If(
                     regBus.we,
-                    then: [fctl < regBus.dataIn],
+                    then: [fctl < regBus.selMerge(fctl, 0x008)],
                     orElse: [regBus.dataOut < fctl],
                   ),
                 ]),
                 // 0x010: ddtp.
-                CaseItem(Const(2, width: 4), [
+                CaseItem(Const(2, width: 9), [
                   If(
                     regBus.we,
-                    then: [ddtp < regBus.dataIn],
+                    then: [ddtp < regBus.selMerge(ddtp, 0x010)],
                     orElse: [regBus.dataOut < ddtp],
                   ),
                 ]),

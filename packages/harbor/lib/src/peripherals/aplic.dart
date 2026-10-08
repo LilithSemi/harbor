@@ -53,6 +53,8 @@ class HarborAplic extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 16,
       dataWidth: 32,
     );
@@ -148,7 +150,7 @@ class HarborAplic extends BridgeModule
                 then: [
                   If(
                     we,
-                    then: [domaincfg < datIn],
+                    then: [domaincfg < bus.selMerge(domaincfg, 0x0000)],
                     orElse: [datOut < domaincfg],
                   ),
                 ],
@@ -161,7 +163,10 @@ class HarborAplic extends BridgeModule
                   then: [
                     If(
                       we,
-                      then: [sourcecfg[i] < datIn.getRange(0, 10)],
+                      then: [
+                        sourcecfg[i] <
+                            bus.selMerge(sourcecfg[i], 0x0004 + i * 4),
+                      ],
                       orElse: [datOut < sourcecfg[i].zeroExtend(32)],
                     ),
                   ],
@@ -174,8 +179,14 @@ class HarborAplic extends BridgeModule
                   If(
                     we,
                     then: [
+                      // A bit whose byte SEL does not select stays as it
+                      // was: a byte store only reaches the sources in the
+                      // bytes it selects.
                       for (var i = 0; i < sources && i < 32; i++)
-                        If(datIn[i], then: [pending[i] < Const(1)]),
+                        If(
+                          datIn[i] & bus.sel[i ~/ 8],
+                          then: [pending[i] < Const(1)],
+                        ),
                     ],
                     orElse: [
                       datOut <
@@ -200,7 +211,10 @@ class HarborAplic extends BridgeModule
                     we,
                     then: [
                       for (var i = 0; i < sources && i < 32; i++)
-                        If(datIn[i], then: [pending[i] < Const(0)]),
+                        If(
+                          datIn[i] & bus.sel[i ~/ 8],
+                          then: [pending[i] < Const(0)],
+                        ),
                     ],
                   ),
                 ],
@@ -214,7 +228,10 @@ class HarborAplic extends BridgeModule
                     we,
                     then: [
                       for (var i = 0; i < sources && i < 32; i++)
-                        If(datIn[i], then: [enabled[i] < Const(1)]),
+                        If(
+                          datIn[i] & bus.sel[i ~/ 8],
+                          then: [enabled[i] < Const(1)],
+                        ),
                     ],
                     orElse: [
                       datOut <
@@ -239,7 +256,10 @@ class HarborAplic extends BridgeModule
                     we,
                     then: [
                       for (var i = 0; i < sources && i < 32; i++)
-                        If(datIn[i], then: [enabled[i] < Const(0)]),
+                        If(
+                          datIn[i] & bus.sel[i ~/ 8],
+                          then: [enabled[i] < Const(0)],
+                        ),
                     ],
                   ),
                 ],
@@ -252,7 +272,9 @@ class HarborAplic extends BridgeModule
                   then: [
                     If(
                       we,
-                      then: [target[i] < datIn],
+                      then: [
+                        target[i] < bus.selMerge(target[i], 0x3004 + i * 4),
+                      ],
                       orElse: [datOut < target[i]],
                     ),
                   ],
@@ -264,7 +286,7 @@ class HarborAplic extends BridgeModule
                   addr.eq(Const(0x4000 + h * 32, width: 16)),
                   then: [
                     If(
-                      we,
+                      we & bus.selAny(0x4000 + h * 32, 1),
                       then: [idelivery[h] < datIn[0]],
                       orElse: [datOut < idelivery[h].zeroExtend(32)],
                     ),
@@ -274,7 +296,7 @@ class HarborAplic extends BridgeModule
                   addr.eq(Const(0x4000 + h * 32 + 4, width: 16)),
                   then: [
                     If(
-                      we,
+                      we & bus.selAny(0x4000 + h * 32 + 4, 1),
                       then: [iforce[h] < datIn[0]],
                       orElse: [datOut < iforce[h].zeroExtend(32)],
                     ),
@@ -285,7 +307,10 @@ class HarborAplic extends BridgeModule
                   then: [
                     If(
                       we,
-                      then: [ithreshold[h] < datIn.getRange(0, priorityBits)],
+                      then: [
+                        ithreshold[h] <
+                            bus.selMerge(ithreshold[h], 0x4000 + h * 32 + 8),
+                      ],
                       orElse: [datOut < ithreshold[h].zeroExtend(32)],
                     ),
                   ],

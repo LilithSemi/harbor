@@ -4,7 +4,9 @@ import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../bus/bus.dart';
+import '../bus/bus_error_source.dart';
 import '../bus/wishbone/wishbone_arbiter.dart';
+import '../bus/wishbone/wishbone_connect.dart';
 import '../bus/wishbone/wishbone_decoder.dart';
 import '../bus/wishbone/wishbone_register_stage.dart';
 import '../bus/wishbone/wishbone_interface.dart';
@@ -94,9 +96,48 @@ class HarborSoC extends BridgeModule {
 
   /// The fabric arbiter, exposed after [buildFabric] when there is more than one
   /// master (null with a single master, which connects to the decoder directly).
-  /// Its `grant` output identifies the master currently owning the bus, which a
-  /// security peripheral can use as the unforgeable source identity.
+  /// Its `grant` output identifies the master that owns the bus while the
+  /// slave-side CYC is high, which a security peripheral can use as the
+  /// unforgeable source identity. While CYC is low it shows the last owner.
   WishboneArbiter? fabricArbiter;
+
+  /// Every fabric decoder, filled by [buildFabric].
+  final List<WishboneDecoder> fabricDecoders = [];
+
+  /// Sticky error flags of fabric register stages.
+  final List<Logic> _fabricErrorFlags = [];
+
+  /// Fabric links where a slave ERR or RTY folds into ACK with poison data.
+  final List<Logic> _fabricFolds = [];
+
+  /// Adds a `bus_error` output (or [portName]) to the SoC. It goes high after
+  /// an unmapped access, a bus timeout, a slave ERR or RTY that a master sees
+  /// as ACK with poison data, or an error in a peripheral that is a
+  /// [HarborBusErrorSource]. It stays high until reset. Call it after
+  /// [buildFabric].
+  Logic exposeBusError({String portName = 'bus_error'}) {
+    if (fabricDecoders.isEmpty) {
+      throw StateError('exposeBusError needs buildFabric first');
+    }
+    final sources = <Logic>[
+      for (final d in fabricDecoders) d.busError,
+      ..._fabricErrorFlags,
+      for (final e in _peripherals)
+        if (e.module case final HarborBusErrorSource m) m.busError,
+    ];
+    if (_fabricFolds.isNotEmpty) {
+      final (clk, reset) = defaultClock;
+      final folded = Logic(name: 'bus_fold_error');
+      final fold = _fabricFolds.reduce((a, b) => a | b);
+      Sequential(clk, [
+        If(reset, then: [folded < 0], orElse: [folded < (folded | fold)]),
+      ]);
+      sources.add(folded);
+    }
+    final port = addOutput(portName);
+    port <= sources.reduce((a, b) => a | b);
+    return port;
+  }
 
   /// Modules already added as submodules + clock-wired. A module may be BOTH a
   /// master and a peripheral (a dual-role device like a DMA or an accelerator
@@ -631,10 +672,18 @@ class HarborSoC extends BridgeModule {
   /// [converge] selects how a shared slave merges its channels. Only
   /// [HarborMemConverge.arbiter] is built. The other modes throw
   /// [UnimplementedError].
+  ///
+  /// The fabric gets ERR when [busConfig] asks for it or when every master has
+  /// ERR. [busTimeoutCycles] sets the decoder timeout (see
+  /// [WishboneDecoder.timeoutCycles]) and [maxGrantCycles] sets the arbiter
+  /// grant-hold cap (see [WishboneArbiter.maxGrantCycles]). Both are off by
+  /// default.
   void buildFabric({
     bool pipeline = false,
     Map<String, Set<String>>? channelSlaves,
     HarborMemConverge converge = HarborMemConverge.arbiter,
+    int? busTimeoutCycles,
+    int? maxGrantCycles,
   }) {
     final errors = validate();
     if (errors.isNotEmpty) {
@@ -645,8 +694,10 @@ class HarborSoC extends BridgeModule {
 
     switch (busConfig) {
       case WishboneConfig wbConfig:
+        _busTimeoutCycles = busTimeoutCycles;
+        _maxGrantCycles = maxGrantCycles;
         _buildWishboneFabric(
-          wbConfig,
+          _fabricConfig(wbConfig),
           pipeline: pipeline,
           channelSlaves: channelSlaves,
           converge: converge,
@@ -656,6 +707,39 @@ class HarborSoC extends BridgeModule {
           'Bus protocol ${busConfig.runtimeType} not yet supported in buildFabric',
         );
     }
+  }
+
+  int? _busTimeoutCycles;
+  int? _maxGrantCycles;
+
+  WishboneConfig _masterConfig(_MasterEntry m) =>
+      (m.module.interface(m.busInterfaceName).interface as WishboneInterface)
+          .config;
+
+  // Turn ERR on when every master can take it.
+  WishboneConfig _fabricConfig(WishboneConfig cfg) {
+    if (cfg.useErr) return cfg;
+    final allErr = _masters.every((m) => _masterConfig(m).useErr);
+    return allErr ? cfg.copyWith(useErr: true) : cfg;
+  }
+
+  WishboneDecoder _newDecoder(
+    WishboneConfig wbConfig,
+    List<HarborAddressMapping> mappings, {
+    String name = 'wishbone_decoder',
+  }) {
+    final decoder = WishboneDecoder(
+      wbConfig,
+      mappings,
+      timeoutCycles: _busTimeoutCycles,
+      name: name,
+    );
+    addSubModule(decoder);
+    final (clk, reset) = defaultClock;
+    decoder.input('clk').srcConnection! <= clk;
+    decoder.input('reset').srcConnection! <= reset;
+    fabricDecoders.add(decoder);
+    return decoder;
   }
 
   void _buildWishboneFabric(
@@ -721,18 +805,6 @@ class HarborSoC extends BridgeModule {
     );
   }
 
-  // ACK-only peripherals have no ERR response. Tie the missing signal low
-  // rather than leaving an error-enabled fabric input floating.
-  void _connectWishboneSlave(
-    InterfaceReference upstream,
-    InterfaceReference downstream,
-  ) {
-    final up = upstream.interface as WishboneInterface;
-    final down = downstream.interface as WishboneInterface;
-    if (up.err != null && down.err == null) up.err! <= Const(0);
-    connectInterfaces(upstream, downstream);
-  }
-
   /// The historic one-fabric path: all masters -> one arbiter -> one decoder ->
   /// all slaves. Kept verbatim so its emitted netlist stays byte identical.
   void _buildSingleChannelWishboneFabric(
@@ -744,8 +816,7 @@ class HarborSoC extends BridgeModule {
         .map((e) => HarborAddressMapping(range: e.$2.range, slaveIndex: e.$1))
         .toList();
 
-    final decoder = WishboneDecoder(wbConfig, mappings);
-    addSubModule(decoder);
+    final decoder = _newDecoder(wbConfig, mappings);
 
     // Whatever drives the decoder's master port: the decoder directly, or a
     // register slice interposed in front of it when [pipeline] is set.
@@ -753,6 +824,7 @@ class HarborSoC extends BridgeModule {
     if (pipeline) {
       final reg = WishboneRegisterStage(config: wbConfig);
       addSubModule(reg);
+      _fabricErrorFlags.add(reg.output('bus_error'));
       final (clk, reset) = defaultClock;
       reg.input('clk').srcConnection! <= clk;
       reg.input('reset').srcConnection! <= reset;
@@ -764,14 +836,12 @@ class HarborSoC extends BridgeModule {
     // through a WishboneArbiter first (round-robin, grant-locked) so they share
     // the single decoder/peripheral fabric without multi-driving it.
     if (_masters.length == 1) {
-      connectInterfaces(
-        _masterFabricPort(_masters[0], wbConfig),
-        decoderUpstream,
-      );
+      _connectFabric(_masterFabricPort(_masters[0], wbConfig), decoderUpstream);
     } else {
       final arbiter = WishboneArbiter(
         numMasters: _masters.length,
         config: wbConfig,
+        maxGrantCycles: _maxGrantCycles,
       );
       fabricArbiter = arbiter;
       addSubModule(arbiter);
@@ -779,7 +849,7 @@ class HarborSoC extends BridgeModule {
       arbiter.input('clk').srcConnection! <= clk;
       arbiter.input('reset').srcConnection! <= reset;
       for (var i = 0; i < _masters.length; i++) {
-        connectInterfaces(
+        _connectFabric(
           _masterFabricPort(_masters[i], wbConfig),
           arbiter.interface('master_$i'),
         );
@@ -789,7 +859,7 @@ class HarborSoC extends BridgeModule {
 
     // Connect decoder's slave interfaces to the primary + secondary slaves.
     for (var i = 0; i < slaves.length; i++) {
-      _connectWishboneSlave(
+      _connectFabric(
         decoder.interface('slave_$i'),
         slaves[i].module.interface(slaves[i].iface),
       );
@@ -837,12 +907,11 @@ class HarborSoC extends BridgeModule {
         for (final gi in reachable)
           HarborAddressMapping(range: slaves[gi].range, slaveIndex: gi),
       ];
-      final decoder = WishboneDecoder(
+      final decoder = _newDecoder(
         wbConfig,
         mappings,
         name: 'wishbone_decoder_$channel',
       );
-      addSubModule(decoder);
 
       // Optional per-channel register slice at the decoder master port, same as
       // the single-channel `pipeline` behaviour.
@@ -850,6 +919,7 @@ class HarborSoC extends BridgeModule {
       if (pipeline) {
         final reg = WishboneRegisterStage(config: wbConfig);
         addSubModule(reg);
+        _fabricErrorFlags.add(reg.output('bus_error'));
         reg.input('clk').srcConnection! <= clk;
         reg.input('reset').srcConnection! <= reset;
         connectInterfaces(reg.interface('down'), decoder.interface('master'));
@@ -859,7 +929,7 @@ class HarborSoC extends BridgeModule {
       // One master on the channel -> straight to its decoder. More than one ->
       // merge them through the channel arbiter first.
       if (masters.length == 1) {
-        connectInterfaces(
+        _connectFabric(
           _masterFabricPort(masters[0], wbConfig),
           decoderUpstream,
         );
@@ -867,13 +937,14 @@ class HarborSoC extends BridgeModule {
         final arbiter = WishboneArbiter(
           numMasters: masters.length,
           config: wbConfig,
+          maxGrantCycles: _maxGrantCycles,
           name: 'wishbone_arbiter_$channel',
         );
         addSubModule(arbiter);
         arbiter.input('clk').srcConnection! <= clk;
         arbiter.input('reset').srcConnection! <= reset;
         for (var i = 0; i < masters.length; i++) {
-          connectInterfaces(
+          _connectFabric(
             _masterFabricPort(masters[i], wbConfig),
             arbiter.interface('master_$i'),
           );
@@ -908,7 +979,7 @@ class HarborSoC extends BridgeModule {
       final ds = drivers[gi]!;
       final slaveIface = slaves[gi].module.interface(slaves[gi].iface);
       if (ds.length == 1) {
-        _connectWishboneSlave(ds[0], slaveIface);
+        _connectFabric(ds[0], slaveIface);
         continue;
       }
       if (converge != HarborMemConverge.arbiter) {
@@ -919,6 +990,7 @@ class HarborSoC extends BridgeModule {
       final conv = WishboneArbiter(
         numMasters: ds.length,
         config: wbConfig,
+        maxGrantCycles: _maxGrantCycles,
         name: 'wishbone_converge_${slaves[gi].module.name}',
       );
       addSubModule(conv);
@@ -927,8 +999,16 @@ class HarborSoC extends BridgeModule {
       for (var i = 0; i < ds.length; i++) {
         connectInterfaces(ds[i], conv.interface('master_$i'));
       }
-      _connectWishboneSlave(conv.interface('slave'), slaveIface);
+      _connectFabric(conv.interface('slave'), slaveIface);
     }
+  }
+
+  void _connectFabric(
+    InterfaceReference provider,
+    InterfaceReference consumer,
+  ) {
+    final fold = connectWishbone(provider, consumer);
+    if (fold != null) _fabricFolds.add(fold);
   }
 
   /// The interface the fabric (arbiter or lone decoder) connects to for master
@@ -942,8 +1022,12 @@ class HarborSoC extends BridgeModule {
   ) {
     final port = m.module.interface(m.busInterfaceName);
     if (!m.pipeline) return port;
-    final reg = WishboneRegisterStage(config: wbConfig);
+    final reg = WishboneRegisterStage(
+      config: wbConfig,
+      upConfig: _masterConfig(m),
+    );
     addSubModule(reg);
+    _fabricErrorFlags.add(reg.output('bus_error'));
     final (clk, reset) = defaultClock;
     reg.input('clk').srcConnection! <= clk;
     reg.input('reset').srcConnection! <= reset;

@@ -36,30 +36,47 @@ class WishboneToApbBridge extends Module {
     // Enable is only asserted during access phase
     apb.enable <= wb.cyc & wb.stb & apbPhase;
 
-    // APB -> Wishbone
-    wb.ack <= apb.ready & apbPhase;
+    // APB -> Wishbone. ACK and ERR are mutually exclusive, both gated by
+    // PREADY & the access phase and by CYC & STB so a stray pulse can
+    // never land on an unrelated later cycle. ERR ties low when the APB
+    // side has no PSLVERR at all.
+    final slvErr = apb.slvErr;
+    final errCond = slvErr != null ? (apb.ready & apbPhase & slvErr) : Const(0);
+    final ackCond = slvErr != null
+        ? (apb.ready & apbPhase & ~slvErr)
+        : (apb.ready & apbPhase);
+
+    wb.ack <= ackCond & wb.cyc & wb.stb;
     wb.datMiso <= apb.rData.getRange(0, wb.config.dataWidth);
 
-    if (wb.err != null && apb.slvErr != null) {
-      wb.err! <= apb.slvErr!;
+    if (wb.err != null) {
+      wb.err! <= errCond & wb.cyc & wb.stb;
     }
 
-    // Phase tracking: setup -> access on first cycle, hold during transfer
+    // Phase tracking: setup -> access on first cycle, hold during transfer.
+    // A dropped CYC clears the phase immediately so a later, unrelated
+    // transaction never inherits a stuck access phase.
     Sequential(clk, [
       If(
         ~reset,
         then: [apbPhase < Const(0)],
         orElse: [
           If(
-            wb.cyc & wb.stb & ~apbPhase,
-            then: [
-              apbPhase < Const(1), // setup -> access
-            ],
-          ),
-          If(
-            apb.ready & apbPhase,
-            then: [
-              apbPhase < Const(0), // complete, back to idle
+            ~wb.cyc,
+            then: [apbPhase < Const(0)],
+            orElse: [
+              If(
+                wb.cyc & wb.stb & ~apbPhase,
+                then: [
+                  apbPhase < Const(1), // setup -> access
+                ],
+              ),
+              If(
+                apb.ready & apbPhase,
+                then: [
+                  apbPhase < Const(0), // complete, back to idle
+                ],
+              ),
             ],
           ),
         ],

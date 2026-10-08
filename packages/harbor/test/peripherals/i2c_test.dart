@@ -38,11 +38,14 @@ void main() {
 
   group('HarborI2cController register access', () {
     late HarborI2cController i2c;
-    late Logic clk, reset, stb, we, adr, mosi;
+    late Logic clk, reset, stb, we, adr, mosi, sel;
+
+    int allSel() => (1 << sel.width) - 1;
 
     Future<void> busWrite(int addr, int data) async {
       adr.inject(addr);
       mosi.inject(data);
+      sel.inject(allSel());
       we.inject(1);
       stb.inject(1);
       await clk.nextPosedge;
@@ -51,6 +54,22 @@ void main() {
       }
       stb.inject(0);
       we.inject(0);
+      await clk.nextPosedge;
+    }
+
+    Future<void> busWriteSel(int addr, int selMask, int data) async {
+      adr.inject(addr);
+      mosi.inject(data);
+      sel.inject(selMask);
+      we.inject(1);
+      stb.inject(1);
+      await clk.nextPosedge;
+      while (i2c.output('bus_ACK').value.toInt() != 1) {
+        await clk.nextPosedge;
+      }
+      stb.inject(0);
+      we.inject(0);
+      sel.inject(allSel());
       await clk.nextPosedge;
     }
 
@@ -79,6 +98,7 @@ void main() {
       we = Logic(name: 'we');
       adr = Logic(name: 'adr', width: 8);
       mosi = Logic(name: 'mosi', width: dataWidth);
+      sel = Logic(name: 'sel', width: dataWidth ~/ 8);
 
       i2c.input('clk').srcConnection! <= clk;
       i2c.input('reset').srcConnection! <= reset;
@@ -87,8 +107,7 @@ void main() {
       i2c.input('bus_WE').srcConnection! <= we;
       i2c.input('bus_ADR').srcConnection! <= adr;
       i2c.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      i2c.input('bus_SEL').srcConnection! <=
-          Const(-1, width: i2c.input('bus_SEL').width);
+      i2c.input('bus_SEL').srcConnection! <= sel;
       i2c.input('scl_in').srcConnection! <= Const(1);
       i2c.input('sda_in').srcConnection! <= Const(1);
 
@@ -99,6 +118,7 @@ void main() {
       we.inject(0);
       adr.inject(0);
       mosi.inject(0);
+      sel.inject(allSel());
       Simulator.setMaxSimTime(200000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
@@ -437,6 +457,50 @@ void main() {
       await busWrite(_addr, 0x2a);
       expect(await busRead(_addr), equals(0x2a));
       expect(await busRead(_prescale), equals(0x4321));
+      await Simulator.endSimulation();
+    });
+
+    test('a byte store changes only the selected byte (32-bit bus)', () async {
+      await setUpDut();
+
+      await busWrite(_prescale, 0x1234);
+      // SEL=0b0001: only byte 0 of the write data is live.
+      await busWriteSel(_prescale, 0x1, 0x00000099);
+      expect(await busRead(_prescale), equals(0x1299));
+      await Simulator.endSimulation();
+    });
+
+    test(
+      'a halfword store changes only the selected halfword (32-bit bus)',
+      () async {
+        await setUpDut();
+
+        await busWrite(_prescale, 0x1234);
+        // SEL=0b0011: the low halfword of the write data is live, and that
+        // covers the whole 16-bit register.
+        await busWriteSel(_prescale, 0x3, 0x0000beef);
+        expect(await busRead(_prescale), equals(0xbeef));
+        await Simulator.endSimulation();
+      },
+    );
+
+    // Regression: River aligns ADR to 8 bytes on a 64-bit bus and puts the
+    // byte position of a narrower access in SEL, so a 32-bit store to
+    // PRESCALE+4 arrives with ADR=PRESCALE and SEL selecting the upper 4
+    // bytes. PRESCALE lives in the low 4 bytes of that 8-byte slot, so this
+    // store must leave it alone.
+    test('a store to the upper lane of a slot does not alias the register '
+        'below it (64-bit bus)', () async {
+      await setUpDut(dataWidth: 64);
+
+      await busWriteSel(_prescale, 0x0f, 0x1234);
+      final before = await busRead(_prescale);
+
+      await busWriteSel(_prescale, 0xf0, 0x5678 << 32);
+      final after = await busRead(_prescale);
+
+      expect(before, equals(0x1234));
+      expect(after, equals(before));
       await Simulator.endSimulation();
     });
   });

@@ -48,6 +48,29 @@ class WishboneConfig with HarborPrettyString {
   /// Default select width: one bit per byte lane.
   int get effectiveSelWidth => selWidth > 0 ? selWidth : dataWidth ~/ 8;
 
+  /// Returns a copy with the given fields replaced.
+  WishboneConfig copyWith({
+    int? addressWidth,
+    int? dataWidth,
+    int? selWidth,
+    bool? useErr,
+    bool? useRty,
+    bool? useCti,
+    bool? useBte,
+    int? tgaWidth,
+    int? tgdWidth,
+  }) => WishboneConfig(
+    addressWidth: addressWidth ?? this.addressWidth,
+    dataWidth: dataWidth ?? this.dataWidth,
+    selWidth: selWidth ?? this.selWidth,
+    useErr: useErr ?? this.useErr,
+    useRty: useRty ?? this.useRty,
+    useCti: useCti ?? this.useCti,
+    useBte: useBte ?? this.useBte,
+    tgaWidth: tgaWidth ?? this.tgaWidth,
+    tgdWidth: tgdWidth ?? this.tgdWidth,
+  );
+
   /// Validates parameters. Returns error messages (empty = valid).
   List<String> validate() {
     final errors = <String>[];
@@ -59,6 +82,9 @@ class WishboneConfig with HarborPrettyString {
     }
     if (useBte && !useCti) {
       errors.add('BTE requires CTI to be enabled');
+    }
+    if (tgaWidth < 0 || tgdWidth < 0) {
+      errors.add('tag widths must be >= 0');
     }
     return errors;
   }
@@ -87,10 +113,15 @@ class WishboneConfig with HarborPrettyString {
   }
 }
 
-/// A Wishbone B4 pipelined bus interface using [PairInterface].
+/// A Wishbone B4 classic bus interface using [PairInterface].
 ///
-/// Provider role = master (drives CYC, STB, WE, ADR, DAT_MOSI, SEL).
-/// Consumer role = slave (drives ACK, DAT_MISO, ERR, RTY).
+/// There is no STALL signal. A master holds STB and the request until the
+/// slave terminates the transfer with ACK, ERR or RTY.
+///
+/// Provider role = master (drives CYC, STB, WE, ADR, DAT_MOSI, SEL and the
+/// optional CTI, BTE, TGA, TGD_MOSI).
+/// Consumer role = slave (drives ACK, DAT_MISO and the optional ERR, RTY,
+/// TGD_MISO).
 ///
 /// Works with [BridgeModule.addInterface] and [connectInterfaces].
 ///
@@ -198,4 +229,21 @@ class WishboneInterface extends PairInterface {
 
   @override
   WishboneInterface clone() => WishboneInterface(config);
+}
+
+/// Request-side optional ports, driven by the master.
+const wishboneOptionalRequestPorts = ['CTI', 'BTE', 'TGA', 'TGD_MOSI'];
+
+/// Read data the fabric returns when it folds an ERR or RTY into an ACK for a
+/// master that has no such port. The 32-bit word 0xDEADBEEF repeats to fill
+/// the data width.
+const wishbonePoisonWord = 0xDEADBEEF;
+
+/// [wishbonePoisonWord] repeated and cut to [width] bits.
+Const wishbonePoison(int width) {
+  var v = BigInt.zero;
+  for (var i = 0; i < width; i += 32) {
+    v = (v << 32) | BigInt.from(wishbonePoisonWord);
+  }
+  return Const(v & ((BigInt.one << width) - BigInt.one), width: width);
 }

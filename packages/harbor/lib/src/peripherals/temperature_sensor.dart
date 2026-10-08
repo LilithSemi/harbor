@@ -135,6 +135,8 @@ class HarborTemperatureSensor extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 8,
       dataWidth: 32,
     );
@@ -267,57 +269,58 @@ class HarborTemperatureSensor extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              Case(bus.addr.getRange(0, 6), [
+              // Match the full address, not just enough low bits for the
+              // registers defined today, so an address outside the map
+              // reads 0 and ignores writes instead of aliasing a register.
+              Case(bus.addr, [
                 // 0x00: CTRL
-                CaseItem(Const(0x00, width: 6), [
+                CaseItem(Const(0x00, width: 8), [
                   If(
                     bus.we,
-                    then: [ctrl < bus.dataIn.getRange(0, 2)],
+                    then: [ctrl < bus.selMerge(ctrl, 0x00)],
                     orElse: [bus.dataOut < ctrl.zeroExtend(32)],
                   ),
                 ]),
                 // 0x08: STATUS
-                CaseItem(Const(0x08, width: 6), [
+                CaseItem(Const(0x08, width: 8), [
                   bus.dataOut <
                       [Const(0, width: 30), overTemp, dataValid].swizzle(),
                 ]),
                 // 0x10: TEMP_RAW
-                CaseItem(Const(0x10, width: 6), [
+                CaseItem(Const(0x10, width: 8), [
                   bus.dataOut < tempRaw.zeroExtend(32),
                 ]),
                 // 0x18: TEMP_C
-                CaseItem(Const(0x18, width: 6), [bus.dataOut < tempC]),
+                CaseItem(Const(0x18, width: 8), [bus.dataOut < tempC]),
                 // 0x20: ALARM_HI
-                CaseItem(Const(0x20, width: 6), [
+                CaseItem(Const(0x20, width: 8), [
                   If(
                     bus.we,
-                    then: [alarmHi < bus.dataIn],
+                    then: [alarmHi < bus.selMerge(alarmHi, 0x20)],
                     orElse: [bus.dataOut < alarmHi],
                   ),
                 ]),
                 // 0x28: ALARM_LO
-                CaseItem(Const(0x28, width: 6), [
+                CaseItem(Const(0x28, width: 8), [
                   If(
                     bus.we,
-                    then: [alarmLo < bus.dataIn],
+                    then: [alarmLo < bus.selMerge(alarmLo, 0x28)],
                     orElse: [bus.dataOut < alarmLo],
                   ),
                 ]),
                 // 0x30: INT_STATUS (write-1-to-clear)
-                CaseItem(Const(0x30, width: 6), [
+                CaseItem(Const(0x30, width: 8), [
                   If(
                     bus.we,
-                    then: [
-                      intStatus < (intStatus & ~bus.dataIn.getRange(0, 3)),
-                    ],
+                    then: [intStatus < (intStatus & ~bus.selMasked(0x30, 3))],
                     orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                   ),
                 ]),
                 // 0x38: INT_ENABLE
-                CaseItem(Const(0x38, width: 6), [
+                CaseItem(Const(0x38, width: 8), [
                   If(
                     bus.we,
-                    then: [intEnable < bus.dataIn.getRange(0, 3)],
+                    then: [intEnable < bus.selMerge(intEnable, 0x38)],
                     orElse: [bus.dataOut < intEnable.zeroExtend(32)],
                   ),
                 ]),

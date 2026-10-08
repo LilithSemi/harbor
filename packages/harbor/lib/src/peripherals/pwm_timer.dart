@@ -74,6 +74,8 @@ class HarborPwmTimer extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
     );
@@ -198,7 +200,7 @@ class HarborPwmTimer extends BridgeModule
                   Case(bus.addr.getRange(0, 5), [
                     CaseItem(Const(0x00, width: 5), [
                       If(
-                        bus.we,
+                        bus.we & bus.selAny(0x00, 1),
                         then: [globalEnable < bus.dataIn[0]],
                         orElse: [bus.dataOut < globalEnable.zeroExtend(32)],
                       ),
@@ -208,7 +210,7 @@ class HarborPwmTimer extends BridgeModule
                         bus.we,
                         then: [
                           intStatus <
-                              (intStatus & ~bus.dataIn.getRange(0, channels)),
+                              (intStatus & ~bus.selMasked(0x08, channels)),
                         ],
                         orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                       ),
@@ -229,10 +231,20 @@ class HarborPwmTimer extends BridgeModule
                         If(
                           bus.we,
                           then: [
-                            chEnable[ch] < bus.dataIn[0],
-                            chMode[ch] < bus.dataIn.getRange(2, 4),
-                            chIrqEn[ch] < bus.dataIn[4],
-                            chPrescale[ch] < bus.dataIn.getRange(8, 16),
+                            If(
+                              bus.selAny(0x00, 1),
+                              then: [
+                                chEnable[ch] < bus.dataIn[0],
+                                chMode[ch] < bus.dataIn.getRange(2, 4),
+                                chIrqEn[ch] < bus.dataIn[4],
+                              ],
+                            ),
+                            If(
+                              bus.selAny(0x01, 1),
+                              then: [
+                                chPrescale[ch] < bus.dataIn.getRange(8, 16),
+                              ],
+                            ),
                           ],
                           orElse: [
                             bus.dataOut <
@@ -249,9 +261,7 @@ class HarborPwmTimer extends BridgeModule
                       CaseItem(Const(0x08, width: 5), [
                         If(
                           bus.we,
-                          then: [
-                            chCount[ch] < bus.dataIn.getRange(0, counterWidth),
-                          ],
+                          then: [chCount[ch] < bus.selMerge(chCount[ch], 0x08)],
                           orElse: [bus.dataOut < chCount[ch].zeroExtend(32)],
                         ),
                       ]),
@@ -259,8 +269,7 @@ class HarborPwmTimer extends BridgeModule
                         If(
                           bus.we,
                           then: [
-                            chCompare[ch] <
-                                bus.dataIn.getRange(0, counterWidth),
+                            chCompare[ch] < bus.selMerge(chCompare[ch], 0x10),
                           ],
                           orElse: [bus.dataOut < chCompare[ch].zeroExtend(32)],
                         ),
@@ -268,9 +277,7 @@ class HarborPwmTimer extends BridgeModule
                       CaseItem(Const(0x18, width: 5), [
                         If(
                           bus.we,
-                          then: [
-                            chDuty[ch] < bus.dataIn.getRange(0, counterWidth),
-                          ],
+                          then: [chDuty[ch] < bus.selMerge(chDuty[ch], 0x18)],
                           orElse: [bus.dataOut < chDuty[ch].zeroExtend(32)],
                         ),
                       ]),

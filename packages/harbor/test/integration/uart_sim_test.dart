@@ -25,6 +25,21 @@ void main() {
       await Simulator.endSimulation();
     });
 
+    test('an address above the registers does not alias one', () async {
+      final uart = HarborUart(baseAddress: 0x4000);
+      uart.port('rx').getsLogic(Const(1));
+
+      final tb = PeripheralTestBench(uart);
+      await tb.init();
+
+      // 0x103 would alias LCR at 3 with a 3-bit decode.
+      await tb.write(0x103, 0x80);
+      expect(await tb.read(3) & 0x80, equals(0));
+      expect(await tb.read(0x103), equals(0));
+
+      await Simulator.endSimulation();
+    });
+
     test('write baud divisor via DLL when DLAB set', () async {
       final uart = HarborUart(baseAddress: 0x4000);
       uart.port('rx').getsLogic(Const(1));

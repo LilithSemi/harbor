@@ -46,6 +46,8 @@ class HarborFlash extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: addrWidth,
       dataWidth: dataWidth,
     );

@@ -67,7 +67,10 @@ class HarborUart extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
-      addressWidth: busAddressWidth ?? 3,
+      clk: input('clk'),
+      reset: input('reset'),
+      // The full 0x1000 window, so no address in it aliases a register.
+      addressWidth: busAddressWidth ?? 12,
       dataWidth: busDataWidth ?? 8,
     );
 
@@ -108,6 +111,11 @@ class HarborUart extends BridgeModule
       ]);
       datIn = laneData;
     }
+    // The registers span 8 bytes. An address above them matches nothing, so
+    // it reads 0 and ignores writes instead of aliasing a register.
+    final inWindow = bus.addr.width > 3
+        ? bus.addr.getRange(3).eq(0).named('uart_in_window')
+        : Const(1);
     final datOutW = Logic(name: 'uart_dat_out', width: bus.dataOut.width);
     bus.dataOut <= datOutW;
     final ack = bus.ack;
@@ -375,7 +383,7 @@ class HarborUart extends BridgeModule
               ack < Const(1),
 
               If(
-                we,
+                inWindow & we,
                 then: [
                   Case(addr, [
                     // 0x0: THR/DLL
@@ -401,7 +409,7 @@ class HarborUart extends BridgeModule
                     CaseItem(Const(7, width: 3), [scr < datIn]),
                   ]),
                 ],
-                orElse: readItems,
+                orElse: [If(inWindow, then: readItems)],
               ),
             ],
           ),

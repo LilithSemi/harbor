@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'package:harbor/harbor.dart';
-import 'package:harbor/src/bus/wishbone/wishbone_register_stage.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
@@ -53,31 +52,41 @@ void main() {
           slaveIndex: i,
         ),
     ]);
+    final clk = SimpleClockGenerator(10).clk;
     for (final input in dut.inputs.values) {
-      input.srcConnection!.put(0);
+      if (input.name != 'clk') input.srcConnection!.put(0);
     }
+    dut.input('clk').srcConnection! <= clk;
     await dut.build();
-    void drive(String name, int value) =>
-        dut.input(name).srcConnection!.put(value);
-    drive('master_CYC', 1);
-    drive('master_STB', 1);
-    drive('slave_1_ERR', 1);
+    Simulator.setMaxSimTime(1000);
+    unawaited(Simulator.run());
+    await clk.nextNegedge;
+    // Values settle by the next negedge.
+    Future<void> drive(String name, int value) async {
+      dut.input(name).srcConnection!.inject(value);
+      await clk.nextNegedge;
+    }
+
+    await drive('master_CYC', 1);
+    await drive('master_STB', 1);
+    await drive('slave_1_ERR', 1);
     expect(dut.output('master_ERR').value.toInt(), 0);
-    drive('master_ADR', 4096);
+    await drive('master_ADR', 4096);
     expect(dut.output('master_ERR').value.toInt(), 1);
     expect(dut.output('master_ACK').value.toInt(), 0);
-    drive('slave_1_ERR', 0);
-    drive('slave_1_ACK', 1);
+    await drive('slave_1_ERR', 0);
+    await drive('slave_1_ACK', 1);
     expect(dut.output('master_ERR').value.toInt(), 0);
     expect(dut.output('master_ACK').value.toInt(), 1);
-    drive('slave_1_ERR', 1);
-    drive('master_STB', 0);
+    await drive('slave_1_ERR', 1);
+    await drive('master_STB', 0);
     expect(dut.output('master_ERR').value.toInt(), 0);
-    drive('master_STB', 1);
-    drive('master_ADR', 8192);
+    await drive('master_STB', 1);
+    await drive('master_ADR', 8192);
     expect(dut.output('master_ERR').value.toInt(), 1);
-    drive('master_CYC', 0);
+    await drive('master_CYC', 0);
     expect(dut.output('master_ERR').value.toInt(), 0);
+    await Simulator.endSimulation();
   });
 
   test(

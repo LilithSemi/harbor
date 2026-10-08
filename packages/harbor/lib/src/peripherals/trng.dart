@@ -84,6 +84,8 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: wide ? 32 : 8,
       dataWidth: busDataWidth ?? 32,
     );
@@ -96,11 +98,15 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
     final datOut32 = Logic(name: 'trng_dat_out', width: 32);
     bus.dataOut <= datOut32.zeroExtend(bus.dataOut.width);
 
-    // Register address field + offsets: byte-addressed 8-byte stride on a 64-bit
-    // fabric, else the original word-addressed 4-byte map.
+    // Register address field + offsets: byte-addressed 8-byte stride on a
+    // 64-bit fabric, else byte-addressed 4-byte stride, matching the ADR
+    // convention every other Harbor peripheral uses. The narrow path used to
+    // compare a word index (addr >> 2) against the byte address on ADR, so
+    // only RAND at word index 0 (which is also byte address 0) ever matched
+    // and STATUS was unreachable.
     final addrField = wide ? bus.addr.getRange(0, 12) : bus.addr.getRange(0, 5);
     final randOff = Const(0x00, width: addrField.width);
-    final statusOff = Const(wide ? 0x08 : (0x04 >> 2), width: addrField.width);
+    final statusOff = Const(wide ? 0x08 : 0x04, width: addrField.width);
 
     // DRBG state (xorshift32).
     final state = Logic(name: 'drbg_state', width: 32);

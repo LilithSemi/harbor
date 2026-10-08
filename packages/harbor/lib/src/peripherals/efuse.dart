@@ -242,6 +242,8 @@ class HarborEfuseDevice extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 8,
       dataWidth: 32,
     );
@@ -349,11 +351,14 @@ class HarborEfuseDevice extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              Case(bus.addr.getRange(0, 6), [
+              // Match the full address, not just enough low bits for the
+              // registers defined today, so an address outside the map
+              // reads 0 and ignores writes instead of aliasing a register.
+              Case(bus.addr, [
                 // CTRL
-                CaseItem(Const(0x00, width: 6), [
+                CaseItem(Const(0x00, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x00, 1),
                     then: [
                       If(bus.dataIn[0], then: [reqRead < Const(1)]),
                       If(
@@ -364,7 +369,7 @@ class HarborEfuseDevice extends BridgeModule
                   ),
                 ]),
                 // STATUS
-                CaseItem(Const(0x08, width: 6), [
+                CaseItem(Const(0x08, width: 8), [
                   bus.dataOut <
                       [
                         Const(0, width: 28),
@@ -380,50 +385,48 @@ class HarborEfuseDevice extends BridgeModule
                   ),
                 ]),
                 // ADDR
-                CaseItem(Const(0x10, width: 6), [
+                CaseItem(Const(0x10, width: 8), [
                   If(
                     bus.we,
-                    then: [
-                      addr < bus.dataIn.getRange(0, config.words.bitLength),
-                    ],
+                    then: [addr < bus.selMerge(addr, 0x10)],
                     orElse: [bus.dataOut < addr.zeroExtend(32)],
                   ),
                 ]),
                 // RDATA
-                CaseItem(Const(0x18, width: 6), [
+                CaseItem(Const(0x18, width: 8), [
                   bus.dataOut < rdata.zeroExtend(32),
                 ]),
                 // WDATA
-                CaseItem(Const(0x20, width: 6), [
+                CaseItem(Const(0x20, width: 8), [
                   If(
                     bus.we,
-                    then: [wdata < bus.dataIn.getRange(0, config.bitsPerWord)],
+                    then: [wdata < bus.selMerge(wdata, 0x20)],
                     orElse: [bus.dataOut < wdata.zeroExtend(32)],
                   ),
                 ]),
                 // LOCK (write-1-to-lock)
-                CaseItem(Const(0x28, width: 6), [
+                CaseItem(Const(0x28, width: 8), [
                   If(
                     bus.we,
                     then: [
                       lockBits <
-                          (lockBits | bus.dataIn.getRange(0, config.regions)),
+                          (lockBits | bus.selMasked(0x28, config.regions)),
                     ],
                     orElse: [bus.dataOut < lockBits.zeroExtend(32)],
                   ),
                 ]),
                 // TIMING
-                CaseItem(Const(0x30, width: 6), [
+                CaseItem(Const(0x30, width: 8), [
                   If(
                     bus.we,
-                    then: [timing < bus.dataIn.getRange(0, 16)],
+                    then: [timing < bus.selMerge(timing, 0x30)],
                     orElse: [bus.dataOut < timing.zeroExtend(32)],
                   ),
                 ]),
                 // KEY
-                CaseItem(Const(0x38, width: 6), [
+                CaseItem(Const(0x38, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x38, 4),
                     then: [
                       If(
                         bus.dataIn.eq(Const(programUnlockKey, width: 32)),

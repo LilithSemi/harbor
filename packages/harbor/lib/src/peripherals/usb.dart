@@ -218,6 +218,8 @@ class HarborUsbController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
     );
@@ -673,15 +675,18 @@ class HarborUsbController extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              // Global registers (0x000-0x1FF)
+              // Global registers (0x000-0x1FF). Also checks the upper address
+              // bits above the page select, so an address past the two
+              // defined 512-byte pages reads 0 and ignores writes instead of
+              // aliasing a register.
               If(
-                ~bus.addr[9],
+                ~bus.addr[9] & bus.addr.getRange(10, 12).eq(Const(0, width: 2)),
                 then: [
                   Case(bus.addr.getRange(0, 9), [
                     // 0x000: CTRL ([0] enable, [1] host mode for OTG builds)
                     CaseItem(Const(0x00, width: 9), [
                       If(
-                        bus.we,
+                        bus.we & bus.selAny(0x00, 1),
                         then: [
                           ctrlEnable < bus.dataIn[0],
                           if (config.role == HarborUsbRole.otg)
@@ -726,7 +731,7 @@ class HarborUsbController extends BridgeModule
                     CaseItem(Const(0x10, width: 9), [
                       If(
                         bus.we,
-                        then: [deviceAddr < bus.dataIn.getRange(0, 7)],
+                        then: [deviceAddr < bus.selMerge(deviceAddr, 0x10)],
                         orElse: [bus.dataOut < deviceAddr.zeroExtend(32)],
                       ),
                     ]),
@@ -735,7 +740,7 @@ class HarborUsbController extends BridgeModule
                       If(
                         bus.we,
                         then: [
-                          intStatus < (intStatus & ~bus.dataIn.getRange(0, 8)),
+                          intStatus < (intStatus & ~bus.selMasked(0x18, 8)),
                         ],
                         orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                       ),
@@ -744,7 +749,7 @@ class HarborUsbController extends BridgeModule
                     CaseItem(Const(0x20, width: 9), [
                       If(
                         bus.we,
-                        then: [intEnable < bus.dataIn.getRange(0, 8)],
+                        then: [intEnable < bus.selMerge(intEnable, 0x20)],
                         orElse: [bus.dataOut < intEnable.zeroExtend(32)],
                       ),
                     ]),
@@ -763,7 +768,7 @@ class HarborUsbController extends BridgeModule
               // - 0x218: EP0_TXDATA  write pushes a payload byte
               // - 0x228: EP0_TXLEN   write sets payload length, resets FIFO
               If(
-                bus.addr[9],
+                bus.addr[9] & bus.addr.getRange(10, 12).eq(Const(0, width: 2)),
                 then: [
                   Case(bus.addr.getRange(0, 9), [
                     // EP0_CTRL: [7:4] PID, [2] arm-for-IN, [1] has-data,
@@ -771,7 +776,7 @@ class HarborUsbController extends BridgeModule
                     // token from the host transmits it.
                     CaseItem(Const(0x00, width: 9), [
                       If(
-                        bus.we,
+                        bus.we & bus.selAny(0x200, 1),
                         then: [
                           If(
                             bus.dataIn[2],
@@ -792,7 +797,7 @@ class HarborUsbController extends BridgeModule
                     // EP0_TXDATA
                     CaseItem(Const(0x18, width: 9), [
                       If(
-                        bus.we,
+                        bus.we & bus.selAny(0x218, 1),
                         then: [
                           for (var i = 0; i < fifoSize; i++)
                             If(
@@ -808,7 +813,7 @@ class HarborUsbController extends BridgeModule
                       If(
                         bus.we,
                         then: [
-                          txLen < bus.dataIn.getRange(0, ptrW),
+                          txLen < bus.selMerge(txLen, 0x228),
                           txWrPtr < Const(0, width: ptrW),
                         ],
                         orElse: [bus.dataOut < txLen.zeroExtend(32)],
@@ -842,7 +847,7 @@ class HarborUsbController extends BridgeModule
                     if (roleHasHost)
                       CaseItem(Const(0x100, width: 9), [
                         If(
-                          bus.we & hostMode,
+                          bus.we & hostMode & bus.selAny(0x300, 2),
                           then: [
                             hostBusy < Const(1),
                             hostDone < Const(0),

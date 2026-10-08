@@ -57,6 +57,8 @@ class HarborSram extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: effectiveAddrWidth,
       dataWidth: busDataWidth ?? dataWidth,
     );

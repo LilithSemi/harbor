@@ -74,6 +74,8 @@ class HarborGpio extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
     );
@@ -128,55 +130,59 @@ class HarborGpio extends BridgeModule
               bus.ack < Const(1),
 
               // Byte-address decode: registers sit 8 bytes apart (see the map
-              // above), so match the low 6 bits of the byte address directly.
-              Case(bus.addr.getRange(0, 6), [
+              // above). Match the full address, not just enough low bits for
+              // the registers defined today, so an address outside the map
+              // reads 0 and ignores writes instead of aliasing a register.
+              Case(bus.addr, [
                 // 0x00: INPUT
-                CaseItem(Const(0x00, width: 6), [
+                CaseItem(Const(0x00, width: busAddressWidth), [
                   bus.dataOut < gpioIn.zeroExtend(dw),
                 ]),
                 // 0x08: OUTPUT
-                CaseItem(Const(0x08, width: 6), [
+                CaseItem(Const(0x08, width: busAddressWidth), [
                   If(
                     bus.we,
-                    then: [outputReg < bus.dataIn.getRange(0, pinCount)],
+                    then: [outputReg < bus.selMerge(outputReg, 0x08)],
                     orElse: [bus.dataOut < outputReg.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x10: DIR
-                CaseItem(Const(0x10, width: 6), [
+                CaseItem(Const(0x10, width: busAddressWidth), [
                   If(
                     bus.we,
-                    then: [dirReg < bus.dataIn.getRange(0, pinCount)],
+                    then: [dirReg < bus.selMerge(dirReg, 0x10)],
                     orElse: [bus.dataOut < dirReg.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x18: IRQ_EN
-                CaseItem(Const(0x18, width: 6), [
+                CaseItem(Const(0x18, width: busAddressWidth), [
                   If(
                     bus.we,
-                    then: [irqEn < bus.dataIn.getRange(0, pinCount)],
+                    then: [irqEn < bus.selMerge(irqEn, 0x18)],
                     orElse: [bus.dataOut < irqEn.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x20: IRQ_STATUS (write-1-to-clear)
-                CaseItem(Const(0x20, width: 6), [
+                CaseItem(Const(0x20, width: busAddressWidth), [
                   If(
                     bus.we,
                     then: [
                       // Fold this cycle's sets back in, so a pin that raises
-                      // its status in the same cycle as the clear is not lost.
+                      // its status in the same cycle as the clear is not
+                      // lost. A byte SEL does not select stays clear of the
+                      // clear mask, so it is not cleared either.
                       irqStatus <
                           ((irqStatus | irqSet) &
-                              ~bus.dataIn.getRange(0, pinCount)),
+                              ~bus.selMasked(0x20, pinCount)),
                     ],
                     orElse: [bus.dataOut < irqStatus.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x28: IRQ_EDGE
-                CaseItem(Const(0x28, width: 6), [
+                CaseItem(Const(0x28, width: busAddressWidth), [
                   If(
                     bus.we,
-                    then: [irqEdge < bus.dataIn.getRange(0, pinCount)],
+                    then: [irqEdge < bus.selMerge(irqEdge, 0x28)],
                     orElse: [bus.dataOut < irqEdge.zeroExtend(dw)],
                   ),
                 ]),

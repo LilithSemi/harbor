@@ -96,6 +96,8 @@ class HarborTraceEncoder extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 8,
       dataWidth: 32,
     );
@@ -202,36 +204,41 @@ class HarborTraceEncoder extends BridgeModule
             bus.stb & ~bus.ack,
             then: [
               bus.ack < Const(1),
-              Case(bus.addr.getRange(0, 5), [
-                CaseItem(Const(0x00, width: 5), [
+              // Byte-address decode (see the register map above), matched
+              // against the full address so an address outside the map
+              // reads 0 and ignores writes instead of aliasing a register.
+              // This used to compare a word index (addr >> 2) against the
+              // byte address on ADR, so every register but 0x00 was dead.
+              Case(bus.addr, [
+                CaseItem(Const(0x00, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x00, 1),
                     then: [enabled < bus.dataIn[0]],
                     orElse: [bus.dataOut < enabled.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x04 >> 2, width: 5), [
+                CaseItem(Const(0x04, width: 8), [
                   bus.dataOut <
                       [Const(0, width: 30), overflowReg, enabled].swizzle(),
                 ]),
-                CaseItem(Const(0x10 >> 2, width: 5), [
+                CaseItem(Const(0x10, width: 8), [
                   If(
                     bus.we,
-                    then: [bufBase < bus.dataIn],
+                    then: [bufBase < bus.selMerge(bufBase, 0x10)],
                     orElse: [bus.dataOut < bufBase],
                   ),
                 ]),
-                CaseItem(Const(0x14 >> 2, width: 5), [
+                CaseItem(Const(0x14, width: 8), [
                   If(
                     bus.we,
-                    then: [bufSz < bus.dataIn],
+                    then: [bufSz < bus.selMerge(bufSz, 0x14)],
                     orElse: [bus.dataOut < bufSz],
                   ),
                 ]),
-                CaseItem(Const(0x18 >> 2, width: 5), [bus.dataOut < bufWrPtr]),
-                CaseItem(Const(0x1C >> 2, width: 5), [
+                CaseItem(Const(0x18, width: 8), [bus.dataOut < bufWrPtr]),
+                CaseItem(Const(0x1C, width: 8), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x1C, 2),
                     then: [syncCount < Const(0, width: 16)],
                     orElse: [bus.dataOut < syncCount.zeroExtend(32)],
                   ),

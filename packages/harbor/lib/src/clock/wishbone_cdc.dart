@@ -1,6 +1,8 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import 'cdc.dart';
+
 /// Single-outstanding Wishbone clock-domain-crossing bridge.
 ///
 /// Presents a Wishbone B4 SLAVE on the [s_clk] (slow) domain and drives a
@@ -33,6 +35,11 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 /// core/fabric: the slave side joins the fabric on the core clock, the master
 /// side drives the peripheral on its own clock. Latency is a few cycles per
 /// domain (synchronizer depth plus turnaround), irrelevant next to DRAM latency.
+///
+/// A reset of either domain resets both sides. A slave cycle that waits during
+/// a master domain reset gets ACK with all-ones data. When the slave aborts a
+/// cycle, the bridge drops its response.
+/// Each such poison ACK sets the sticky `s_bus_error` output.
 class HarborWishboneCdcBridge extends BridgeModule {
   /// Address bus width.
   final int addressWidth;
@@ -57,8 +64,9 @@ class HarborWishboneCdcBridge extends BridgeModule {
   /// the slave waits forever and the whole fabric wedges (observed on creek as a
   /// hung DRAM load, `wait_done_slow` stuck with the master bits idle). When set,
   /// force-complete an outstanding request after this many idle cycles so the
-  /// fabric can never hang forever. The read-retry above re-reads, so a transient
-  /// freeze self-heals and only genuinely dead master clocking returns poison.
+  /// fabric can never hang forever. The forced ACK carries all-ones data. The
+  /// next request waits until the old one is done, or gets the same forced
+  /// ACK, so the master side never sees a changed or repeated request.
   /// Keep it far above the real completion latency so it never trips in normal
   /// operation.
   final int completionTimeout;
@@ -101,17 +109,37 @@ class HarborWishboneCdcBridge extends BridgeModule {
     addOutput('m_sel', width: sw);
 
     final sClk = input('s_clk');
-    final sReset = input('s_reset');
     final mClk = input('m_clk');
-    final mReset = input('m_reset');
+    final sReset = harborCdcJoinReset(
+      sClk,
+      input('s_reset'),
+      input('m_reset'),
+      stages: syncStages,
+      name: 's_join_reset',
+    );
+    final mReset = harborCdcJoinReset(
+      mClk,
+      input('m_reset'),
+      input('s_reset'),
+      stages: syncStages,
+      name: 'm_join_reset',
+    );
+    // Logic on the master clock behind this bridge must reset with it.
+    addOutput('m_reset_joined') <= mReset;
+    // Reset only from the master domain while a slave cycle waits.
+    final sPeerReset = (sReset & ~input('s_reset')).named('s_peer_reset');
+    final poison = Const(1, width: dw, fill: true);
 
-    // 2-bit counters: single-outstanding keeps request and done within one of
-    // each other, so 2 bits (a full cyclic gray sequence 00-01-11-10) is ample.
+    // A new request issues only after the old one is done, so request and done
+    // counts differ by at most one and a 2-bit gray sequence never wraps.
     const cw = 2;
 
     // Slow (slave) domain state.
     final reqCnt = Logic(name: 'req_cnt', width: cw);
     final busy = Logic(name: 'busy');
+    // The outstanding request has no slave cycle to answer. Its result is
+    // dropped when it comes back.
+    final orphan = Logic(name: 'orphan');
     final ackReg = Logic(name: 's_ack_reg');
     final sDatRReg = Logic(name: 's_dat_r_reg', width: dw);
     final pWe = Logic(name: 'p_we');
@@ -141,25 +169,28 @@ class HarborWishboneCdcBridge extends BridgeModule {
     final doneGrayInSlow = doneSync.last;
     final reqGrayInFast = reqSync.last;
 
-    // Issue a new request when idle and the fabric has a cycle up. ACK when the
-    // fast side's done count (gray) has caught up to the request count.
+    final sReq = (input('s_cyc') & input('s_stb')).named('s_req');
     final allDone = doneGrayInSlow.eq(reqGray);
-    final issue = (~busy & input('s_cyc') & input('s_stb') & ~ackReg).named(
-      'issue',
-    );
+    final issue = (~busy & sReq & ~ackReg).named('issue');
 
-    // Liveness backstop (completionTimeout): count slave cycles an outstanding
-    // request has been waiting, force-complete once it exceeds the budget so a
-    // frozen master domain cannot wedge the fabric forever. Disabled (width 1,
-    // wdFire tied 0) when completionTimeout is 0.
+    // Liveness backstop (completionTimeout): count slave cycles a request has
+    // waited for its ACK. Disabled (width 1, wdFire tied 0) when 0.
     final wdOn = completionTimeout > 0;
     final wdW = wdOn ? completionTimeout.bitLength : 1;
     final waitCnt = Logic(name: 's_wait_cnt', width: wdW);
     final wdFire =
         (wdOn
-                ? busy & waitCnt.gte(Const(completionTimeout, width: wdW))
+                ? sReq &
+                      ~ackReg &
+                      waitCnt.gte(Const(completionTimeout, width: wdW))
                 : Const(0))
             .named('wd_fire');
+
+    final poisonAck =
+        ((sPeerReset & busy & ~orphan & sReq) |
+                (~sReset & ~(busy & allDone) & wdFire))
+            .named('poison_ack');
+    stickyCdcError(this, sClk, input('s_reset'), poisonAck);
 
     Sequential(sClk, [
       If(
@@ -168,40 +199,49 @@ class HarborWishboneCdcBridge extends BridgeModule {
           for (final s in doneSync) s < Const(0, width: cw),
           reqCnt < Const(0, width: cw),
           busy < Const(0),
-          ackReg < Const(0),
-          sDatRReg < Const(0, width: dw),
+          orphan < Const(0),
           pWe < Const(0),
           pAdr < Const(0, width: aw),
           pDatW < Const(0, width: dw),
           pSel < Const(0, width: sw),
           waitCnt < Const(0, width: wdW),
+          // A master domain reset ends the waiting cycle with poison data.
+          If(
+            sPeerReset & busy & ~orphan & sReq,
+            then: [ackReg < Const(1), sDatRReg < poison],
+            orElse: [ackReg < Const(0)],
+          ),
         ],
         orElse: [
           doneSync[0] < doneGray,
           for (var i = 1; i < syncStages; i++) doneSync[i] < doneSync[i - 1],
           ackReg < Const(0),
           If(
+            sReq & ~ackReg,
+            then: [waitCnt < waitCnt + 1],
+            orElse: [waitCnt < Const(0, width: wdW)],
+          ),
+          If(
             busy & allDone,
             then: [
-              // The outstanding request completed: capture the (quasi-static) read
-              // data and pulse ACK to the fabric.
+              // The request completed. Return its read data unless its cycle
+              // is gone.
               sDatRReg < rDat,
-              ackReg < Const(1),
+              ackReg < sReq & ~orphan,
               busy < Const(0),
+              orphan < Const(0),
               waitCnt < Const(0, width: wdW),
             ],
             orElse: [
               If(
                 wdFire,
                 then: [
-                  // Budget exhausted: the master never crossed a completion (its clock
-                  // or reset froze under marginal timing, desyncing the gray handshake).
-                  // Force-complete with whatever read data is latched (poison if the
-                  // master is genuinely dead) so the fabric makes progress. The
-                  // read-retry re-reads, healing a transient freeze.
-                  sDatRReg < rDat,
+                  // The master domain did not complete in time (a frozen
+                  // clock or reset). End the slave cycle with poison data. The
+                  // request stays outstanding and blocks new ones until done.
+                  sDatRReg < poison,
                   ackReg < Const(1),
-                  busy < Const(0),
+                  orphan < busy,
                   waitCnt < Const(0, width: wdW),
                 ],
                 orElse: [
@@ -216,11 +256,9 @@ class HarborWishboneCdcBridge extends BridgeModule {
                       pSel < input('s_sel'),
                       reqCnt < reqCnt + 1,
                       busy < Const(1),
-                      waitCnt < Const(0, width: wdW),
                     ],
                     orElse: [
-                      // Waiting on the master to complete: run the liveness counter.
-                      If(busy, then: [waitCnt < waitCnt + 1]),
+                      If(busy & ~sReq, then: [orphan < Const(1)]),
                     ],
                   ),
                 ],
@@ -231,7 +269,7 @@ class HarborWishboneCdcBridge extends BridgeModule {
       ),
     ]);
 
-    output('s_ack') <= ackReg;
+    output('s_ack') <= ackReg & sReq;
     output('s_dat_r') <= sDatRReg;
 
     // A new request is pending while the synchronized request gray differs from
@@ -318,4 +356,20 @@ class HarborWishboneCdcBridge extends BridgeModule {
           busy, // [0]
         ].swizzle();
   }
+}
+
+/// Adds the `s_bus_error` output to a CDC [bridge]. It goes high when
+/// [poisonAck] ends a slave cycle with poison data, and stays high until the
+/// slave domain's own [sReset].
+void stickyCdcError(
+  BridgeModule bridge,
+  Logic sClk,
+  Logic sReset,
+  Logic poisonAck,
+) {
+  final err = Logic(name: 's_bus_error_r');
+  Sequential(sClk, [
+    If(sReset, then: [err < Const(0)], orElse: [err < (err | poisonAck)]),
+  ]);
+  bridge.addOutput('s_bus_error') <= err;
 }

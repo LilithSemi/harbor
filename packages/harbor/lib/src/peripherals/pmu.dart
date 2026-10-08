@@ -135,6 +135,8 @@ class HarborPowerManagementUnit extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
     );
@@ -200,14 +202,17 @@ class HarborPowerManagementUnit extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              // Global registers
+              // Global registers. Match the full in-block address (not just
+              // enough bits for today's four registers), so an address with
+              // the extra bit the per-domain block needs does not alias back
+              // onto one of these.
               If(
                 bus.addr.getRange(6, 12).eq(Const(0, width: 6)),
                 then: [
-                  Case(bus.addr.getRange(0, 5), [
-                    CaseItem(Const(0x00, width: 5), [
+                  Case(bus.addr.getRange(0, 6), [
+                    CaseItem(Const(0x00, width: 6), [
                       If(
-                        bus.we,
+                        bus.we & bus.selAny(0x00, 1),
                         then: [
                           globalEnable < bus.dataIn[0],
                           sleepMode < bus.dataIn.getRange(4, 6),
@@ -220,22 +225,22 @@ class HarborPowerManagementUnit extends BridgeModule
                         ],
                       ),
                     ]),
-                    CaseItem(Const(0x08, width: 5), [
+                    CaseItem(Const(0x08, width: 6), [
                       bus.dataOut < sleepMode.zeroExtend(32),
                     ]),
-                    CaseItem(Const(0x10, width: 5), [
+                    CaseItem(Const(0x10, width: 6), [
                       If(
                         bus.we,
-                        then: [wakeupEn < bus.dataIn.getRange(0, 8)],
+                        then: [wakeupEn < bus.selMerge(wakeupEn, 0x10)],
                         orElse: [bus.dataOut < wakeupEn.zeroExtend(32)],
                       ),
                     ]),
-                    CaseItem(Const(0x18, width: 5), [
+                    CaseItem(Const(0x18, width: 6), [
                       If(
                         bus.we,
                         then: [
                           wakeupStatus <
-                              (wakeupStatus & ~bus.dataIn.getRange(0, 8)),
+                              (wakeupStatus & ~bus.selMasked(0x18, 8)),
                         ],
                         orElse: [bus.dataOut < wakeupStatus.zeroExtend(32)],
                       ),
@@ -255,7 +260,9 @@ class HarborPowerManagementUnit extends BridgeModule
                       CaseItem(Const(0x00, width: 5), [
                         If(
                           bus.we,
-                          then: [domTarget[d] < bus.dataIn.getRange(0, 2)],
+                          then: [
+                            domTarget[d] < bus.selMerge(domTarget[d], 0x00),
+                          ],
                           orElse: [bus.dataOut < domTarget[d].zeroExtend(32)],
                         ),
                       ]),
@@ -267,7 +274,7 @@ class HarborPowerManagementUnit extends BridgeModule
                       ]),
                       CaseItem(Const(0x10, width: 5), [
                         If(
-                          bus.we,
+                          bus.we & bus.selAny(0x10, 1),
                           then: [domIso[d] < bus.dataIn[0]],
                           orElse: [bus.dataOut < domIso[d].zeroExtend(32)],
                         ),

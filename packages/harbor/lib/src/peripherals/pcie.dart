@@ -234,7 +234,9 @@ class HarborPcieController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
-      addressWidth: 8,
+      clk: input('clk'),
+      reset: input('reset'),
+      addressWidth: 12,
       dataWidth: 32,
     );
 
@@ -246,6 +248,8 @@ class HarborPcieController extends BridgeModule
       module: this,
       name: 'ecam',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: 26,
       dataWidth: 32,
     );
@@ -641,17 +645,17 @@ class HarborPcieController extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              Case(bus.addr.getRange(0, 8), [
+              Case(bus.addr, [
                 // 0x000: CTRL
-                CaseItem(Const(0x00, width: 8), [
+                CaseItem(Const(0x00, width: 12), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x00, 1),
                     then: [enable < bus.dataIn[0]],
                     orElse: [bus.dataOut < enable.zeroExtend(32)],
                   ),
                 ]),
                 // 0x004: STATUS (link_up, neg gen/lanes, ltssm state)
-                CaseItem(Const(0x08, width: 8), [
+                CaseItem(Const(0x08, width: 12), [
                   bus.dataOut <
                       linkUp.zeroExtend(32) |
                           (negGen.zeroExtend(32) << Const(4, width: 32)) |
@@ -659,9 +663,9 @@ class HarborPcieController extends BridgeModule
                           (ltssm.zeroExtend(32) << Const(16, width: 32)),
                 ]),
                 // 0x008: LINK_CTRL ([0] retrain, [1] link disable)
-                CaseItem(Const(0x10, width: 8), [
+                CaseItem(Const(0x10, width: 12), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x10, 1),
                     then: [
                       retrainReq < bus.dataIn[0],
                       linkDisable < bus.dataIn[1],
@@ -673,111 +677,107 @@ class HarborPcieController extends BridgeModule
                   ),
                 ]),
                 // 0x00C: INT_STATUS (W1C)
-                CaseItem(Const(0x18, width: 8), [
+                CaseItem(Const(0x18, width: 12), [
                   If(
                     bus.we,
-                    then: [
-                      intStatus < (intStatus & ~bus.dataIn.getRange(0, 8)),
-                    ],
+                    then: [intStatus < (intStatus & ~bus.selMasked(0x18, 8))],
                     orElse: [bus.dataOut < intStatus.zeroExtend(32)],
                   ),
                 ]),
                 // 0x010: INT_ENABLE
-                CaseItem(Const(0x20, width: 8), [
+                CaseItem(Const(0x20, width: 12), [
                   If(
                     bus.we,
-                    then: [intEnable < bus.dataIn.getRange(0, 8)],
+                    then: [intEnable < bus.selMerge(intEnable, 0x20)],
                     orElse: [bus.dataOut < intEnable.zeroExtend(32)],
                   ),
                 ]),
                 // 0x014: ERR_STATUS
-                CaseItem(Const(0x28, width: 8), [
+                CaseItem(Const(0x28, width: 12), [
                   If(
                     bus.we,
-                    then: [
-                      errStatus < (errStatus & ~bus.dataIn.getRange(0, 8)),
-                    ],
+                    then: [errStatus < (errStatus & ~bus.selMasked(0x28, 8))],
                     orElse: [bus.dataOut < errStatus.zeroExtend(32)],
                   ),
                 ]),
                 // 0x020: BAR0_BASE
-                CaseItem(Const(0x40, width: 8), [
+                CaseItem(Const(0x40, width: 12), [
                   If(
                     bus.we,
-                    then: [bar0Base < bus.dataIn],
+                    then: [bar0Base < bus.selMerge(bar0Base, 0x40)],
                     orElse: [bus.dataOut < bar0Base],
                   ),
                 ]),
                 // 0x024: BAR0_MASK
-                CaseItem(Const(0x48, width: 8), [
+                CaseItem(Const(0x48, width: 12), [
                   If(
                     bus.we,
-                    then: [bar0Mask < bus.dataIn],
+                    then: [bar0Mask < bus.selMerge(bar0Mask, 0x48)],
                     orElse: [bus.dataOut < bar0Mask],
                   ),
                 ]),
                 // 0x028: BAR1_BASE
-                CaseItem(Const(0x50, width: 8), [
+                CaseItem(Const(0x50, width: 12), [
                   If(
                     bus.we,
-                    then: [bar1Base < bus.dataIn],
+                    then: [bar1Base < bus.selMerge(bar1Base, 0x50)],
                     orElse: [bus.dataOut < bar1Base],
                   ),
                 ]),
                 // 0x02C: BAR1_MASK
-                CaseItem(Const(0x58, width: 8), [
+                CaseItem(Const(0x58, width: 12), [
                   If(
                     bus.we,
-                    then: [bar1Mask < bus.dataIn],
+                    then: [bar1Mask < bus.selMerge(bar1Mask, 0x58)],
                     orElse: [bus.dataOut < bar1Mask],
                   ),
                 ]),
                 // 0x040: MSI_ADDR
-                CaseItem(Const(0x80, width: 8), [
+                CaseItem(Const(0x80, width: 12), [
                   If(
                     bus.we,
-                    then: [msiAddr < bus.dataIn],
+                    then: [msiAddr < bus.selMerge(msiAddr, 0x80)],
                     orElse: [bus.dataOut < msiAddr],
                   ),
                 ]),
                 // 0x044: MSI_DATA
-                CaseItem(Const(0x88, width: 8), [
+                CaseItem(Const(0x88, width: 12), [
                   If(
                     bus.we,
-                    then: [msiData < bus.dataIn.getRange(0, 16)],
+                    then: [msiData < bus.selMerge(msiData, 0x88)],
                     orElse: [bus.dataOut < msiData.zeroExtend(32)],
                   ),
                 ]),
                 // 0x048: MSI_MASK
-                CaseItem(Const(0x90, width: 8), [
+                CaseItem(Const(0x90, width: 12), [
                   If(
                     bus.we,
-                    then: [msiMask < bus.dataIn],
+                    then: [msiMask < bus.selMerge(msiMask, 0x90)],
                     orElse: [bus.dataOut < msiMask],
                   ),
                 ]),
                 // 0x04C: MSI_PEND
-                CaseItem(Const(0x98, width: 8), [bus.dataOut < msiPend]),
+                CaseItem(Const(0x98, width: 12), [bus.dataOut < msiPend]),
                 // 0x050: TLP_ADDR_LO (PCIe target address, low 32 bits)
-                CaseItem(Const(0xA0, width: 8), [
+                CaseItem(Const(0xA0, width: 12), [
                   If(
                     bus.we,
-                    then: [tlpAddrLo < bus.dataIn],
+                    then: [tlpAddrLo < bus.selMerge(tlpAddrLo, 0xA0)],
                     orElse: [bus.dataOut < tlpAddrLo],
                   ),
                 ]),
                 // 0x054: TLP_ADDR_HI
-                CaseItem(Const(0xA8, width: 8), [
+                CaseItem(Const(0xA8, width: 12), [
                   If(
                     bus.we,
-                    then: [tlpAddrHi < bus.dataIn],
+                    then: [tlpAddrHi < bus.selMerge(tlpAddrHi, 0xA8)],
                     orElse: [bus.dataOut < tlpAddrHi],
                   ),
                 ]),
                 // 0x058: TLP_LEN (DWords), a write resets the data pointers
-                CaseItem(Const(0xB0, width: 8), [
+                CaseItem(Const(0xB0, width: 12), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0xB0, 1),
                     then: [
                       tlpLen < bus.dataIn.getRange(0, 4),
                       tlpWrPtr < Const(0, width: 4),
@@ -787,9 +787,9 @@ class HarborPcieController extends BridgeModule
                   ),
                 ]),
                 // 0x05C: TLP_CTRL ([0] start, [1] is-write) assembles and sends
-                CaseItem(Const(0xB8, width: 8), [
+                CaseItem(Const(0xB8, width: 12), [
                   If(
-                    bus.we & bus.dataIn[0],
+                    bus.we & bus.dataIn[0] & bus.selAny(0xB8, 1),
                     then: [
                       tlpBusy < Const(1),
                       tlpDone < Const(0),
@@ -822,14 +822,14 @@ class HarborPcieController extends BridgeModule
                   ),
                 ]),
                 // 0x060: TLP_DATA (write fills the buffer, read drains it)
-                CaseItem(Const(0xC0, width: 8), [
+                CaseItem(Const(0xC0, width: 12), [
                   If(
                     bus.we,
                     then: [
                       for (var i = 0; i < tlpDepth; i++)
                         If(
                           tlpWrPtr.eq(Const(i, width: 4)),
-                          then: [dbuf[i] < bus.dataIn],
+                          then: [dbuf[i] < bus.selMerge(dbuf[i], 0xC0)],
                         ),
                       tlpWrPtr < (tlpWrPtr + Const(1, width: 4)),
                     ],
@@ -840,20 +840,20 @@ class HarborPcieController extends BridgeModule
                   ),
                 ]),
                 // 0x064: TLP_STATUS ([0] busy, [1] done, [15:8] tag)
-                CaseItem(Const(0xC8, width: 8), [
+                CaseItem(Const(0xC8, width: 12), [
                   bus.dataOut <
                       tlpBusy.zeroExtend(32) |
                           (tlpDone.zeroExtend(32) << Const(1, width: 32)) |
                           (tlpTag.zeroExtend(32) << Const(8, width: 32)),
                 ]),
                 // 0x068/0x06C/0x070: assembled TLP header DWords (read-only)
-                CaseItem(Const(0xD0, width: 8), [bus.dataOut < hdr0]),
-                CaseItem(Const(0xD8, width: 8), [bus.dataOut < hdr1]),
-                CaseItem(Const(0xE0, width: 8), [bus.dataOut < hdr2]),
+                CaseItem(Const(0xD0, width: 12), [bus.dataOut < hdr0]),
+                CaseItem(Const(0xD8, width: 12), [bus.dataOut < hdr1]),
+                CaseItem(Const(0xE0, width: 12), [bus.dataOut < hdr2]),
                 // 0x074: MSI_TRIGGER (write a vector to emit an MSI mem write)
-                CaseItem(Const(0xE8, width: 8), [
+                CaseItem(Const(0xE8, width: 12), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0xE8, 1),
                     then: [
                       tlpBusy < Const(1),
                       tlpDone < Const(0),
@@ -891,72 +891,75 @@ class HarborPcieController extends BridgeModule
                 // Only 00:00.0 (bus/dev/fn fields all zero) is the host bridge.
                 ecam.addr.getRange(10, 26).eq(Const(0, width: 16)),
                 then: [
-                  Case(ecam.addr.getRange(0, 6), [
+                  // Match the full dword index, not just its low bits, so a
+                  // reg field outside the map does not alias a defined
+                  // register.
+                  Case(ecam.addr, [
                     // 0x00: vendor / device ID
-                    CaseItem(Const(0x00, width: 6), [
+                    CaseItem(Const(0x00, width: 26), [
                       ecam.dataOut < Const(cfgVendorDevice, width: 32),
                     ]),
                     // 0x08: command / status
-                    CaseItem(Const(0x01, width: 6), [
+                    CaseItem(Const(0x01, width: 26), [
                       If(
                         ecam.we,
-                        then: [cfgCommand < ecam.dataIn.getRange(0, 16)],
+                        then: [cfgCommand < ecam.selMerge(cfgCommand, 0)],
                         orElse: [ecam.dataOut < cfgCommand.zeroExtend(32)],
                       ),
                     ]),
                     // 0x10: class code / revision
-                    CaseItem(Const(0x02, width: 6), [
+                    CaseItem(Const(0x02, width: 26), [
                       ecam.dataOut < Const(cfgClassRev, width: 32),
                     ]),
                     // 0x18: header type (0x01 = bridge)
-                    CaseItem(Const(0x03, width: 6), [
+                    CaseItem(Const(0x03, width: 26), [
                       ecam.dataOut < Const(cfgHeaderType, width: 32),
                     ]),
                     // 0x20: BAR0 (shared with the controller BAR0 register)
-                    CaseItem(Const(0x04, width: 6), [
+                    CaseItem(Const(0x04, width: 26), [
                       If(
                         ecam.we,
-                        then: [bar0Base < ecam.dataIn],
+                        then: [bar0Base < ecam.selMerge(bar0Base, 0)],
                         orElse: [ecam.dataOut < bar0Base],
                       ),
                     ]),
                     // 0x28: BAR1
-                    CaseItem(Const(0x05, width: 6), [
+                    CaseItem(Const(0x05, width: 26), [
                       If(
                         ecam.we,
-                        then: [bar1Base < ecam.dataIn],
+                        then: [bar1Base < ecam.selMerge(bar1Base, 0)],
                         orElse: [ecam.dataOut < bar1Base],
                       ),
                     ]),
                     // 0x30: primary/secondary/subordinate bus numbers
-                    CaseItem(Const(0x06, width: 6), [
+                    CaseItem(Const(0x06, width: 26), [
                       If(
                         ecam.we,
-                        then: [cfgBusNumbers < ecam.dataIn],
+                        then: [cfgBusNumbers < ecam.selMerge(cfgBusNumbers, 0)],
                         orElse: [ecam.dataOut < cfgBusNumbers],
                       ),
                     ]),
                     // 0x68: capabilities pointer
-                    CaseItem(Const(0x0D, width: 6), [
+                    CaseItem(Const(0x0D, width: 26), [
                       ecam.dataOut < Const(cfgCapPtr, width: 32),
                     ]),
                     // 0x80: MSI capability header
-                    CaseItem(Const(0x10, width: 6), [
+                    CaseItem(Const(0x10, width: 26), [
                       ecam.dataOut < Const(cfgMsiCap, width: 32),
                     ]),
                     // 0x88: MSI address (shared with MSI_ADDR register)
-                    CaseItem(Const(0x11, width: 6), [
+                    CaseItem(Const(0x11, width: 26), [
                       If(
                         ecam.we,
-                        then: [msiAddr < ecam.dataIn],
+                        then: [msiAddr < ecam.selMerge(msiAddr, 0)],
                         orElse: [ecam.dataOut < msiAddr],
                       ),
                     ]),
                     // 0x98: MSI data (shared with MSI_DATA register)
-                    CaseItem(Const(0x13, width: 6), [
+                    CaseItem(Const(0x13, width: 26), [
                       If(
                         ecam.we,
-                        then: [msiData < ecam.dataIn.getRange(0, 16)],
+                        then: [msiData < ecam.selMerge(msiData, 0)],
                         orElse: [ecam.dataOut < msiData.zeroExtend(32)],
                       ),
                     ]),

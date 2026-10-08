@@ -96,6 +96,8 @@ class HarborI2cController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
+      clk: input('clk'),
+      reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
     );
@@ -473,13 +475,16 @@ class HarborI2cController extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              // Byte-address decode: registers sit 8 bytes apart (see the map
-              // above), so match the low 6 bits of the byte address directly.
-              Case(bus.addr.getRange(0, 6), [
+              // Byte-address decode: registers sit 8 bytes apart (see the
+              // map above). Match the full address, not just enough low
+              // bits for the registers defined today, so an address outside
+              // the map reads 0 and ignores writes instead of aliasing a
+              // register.
+              Case(bus.addr, [
                 // 0x00: CTRL
-                CaseItem(Const(0x00, width: 6), [
+                CaseItem(Const(0x00, width: busAddressWidth), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x00, 1),
                     then: [enable < bus.dataIn[0], irqEn < bus.dataIn[1]],
                     orElse: [
                       bus.dataOut <
@@ -489,20 +494,21 @@ class HarborI2cController extends BridgeModule
                   ),
                 ]),
                 // 0x08: STATUS
-                CaseItem(Const(0x08, width: 6), [
+                CaseItem(Const(0x08, width: busAddressWidth), [
                   bus.dataOut < status,
-                  // Any write clears both sticky bits (write-1-to-clear;
-                  // the controller does not care what value is written).
+                  // Any write that selects the status byte clears both
+                  // sticky bits (write-1-to-clear; the controller does not
+                  // care what value is written).
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x08, 1),
                     then: [cmdDone < Const(0), cmdRejected < Const(0)],
                   ),
                 ]),
                 // 0x10: DATA
-                CaseItem(Const(0x10, width: 6), [
+                CaseItem(Const(0x10, width: busAddressWidth), [
                   If(
                     bus.we,
-                    then: [txData < bus.dataIn.getRange(0, 8)],
+                    then: [txData < bus.selMerge(txData, 0x10)],
                     orElse: [
                       bus.dataOut < rxData.zeroExtend(dw),
                       rxReady < Const(0),
@@ -510,27 +516,27 @@ class HarborI2cController extends BridgeModule
                   ),
                 ]),
                 // 0x18: ADDR
-                CaseItem(Const(0x18, width: 6), [
+                CaseItem(Const(0x18, width: busAddressWidth), [
                   If(
                     bus.we,
-                    then: [slaveAddr < bus.dataIn.getRange(0, 7)],
+                    then: [slaveAddr < bus.selMerge(slaveAddr, 0x18)],
                     orElse: [bus.dataOut < slaveAddr.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x20: PRESCALE
-                CaseItem(Const(0x20, width: 6), [
+                CaseItem(Const(0x20, width: busAddressWidth), [
                   If(
                     bus.we,
-                    then: [prescale < bus.dataIn.getRange(0, 16)],
+                    then: [prescale < bus.selMerge(prescale, 0x20)],
                     orElse: [bus.dataOut < prescale.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x28: CMD (write-only: trigger I2C operations). Bits
                 // combine in one write, for example START with WRITE to
                 // send an address byte. See the class doc for the map.
-                CaseItem(Const(0x28, width: 6), [
+                CaseItem(Const(0x28, width: busAddressWidth), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x28, 1),
                     then: [
                       // A write while a sequence is in flight, or before
                       // the controller is enabled, is ignored outright

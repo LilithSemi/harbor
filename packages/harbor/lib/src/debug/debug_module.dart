@@ -98,9 +98,13 @@ class HarborDebugModule extends BridgeModule
         module: this,
         name: 'sysbus',
         protocol: protocol,
+        clk: input('clk'),
+        reset: input('reset'),
         addressWidth: 32,
         dataWidth: 32,
       );
+    } else {
+      sysBus = null;
     }
 
     final clk = input('clk');
@@ -124,6 +128,8 @@ class HarborDebugModule extends BridgeModule
         Logic(name: 'data$i', width: 32),
     ];
 
+    final bus = sysBus;
+
     Sequential(clk, [
       If(
         reset,
@@ -143,8 +149,18 @@ class HarborDebugModule extends BridgeModule
           ],
           for (final p in progbuf) p < Const(0, width: 32),
           for (final d in abstractData) d < Const(0, width: 32),
+          if (bus != null) ...[
+            bus.ack < Const(0),
+            bus.dataOut < Const(0, width: 32),
+          ],
         ],
         orElse: [
+          if (bus != null) ...[
+            bus.ack < Const(0),
+            bus.dataOut < Const(0, width: 32),
+            // Debug memory is not designed yet. Every access gets ACK with 0.
+            If(bus.stb & ~bus.ack, then: [bus.ack < Const(1)]),
+          ],
           // DMI register access
           If(
             input('dmi_valid'),

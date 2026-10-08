@@ -519,6 +519,7 @@ class _Bench {
     // Controller-side handshake Logics (driven by the model below).
     final mStall = Logic(name: 'm_stall')..inject(0);
     final mAck = Logic(name: 'm_ack')..inject(0);
+    final mAckAux = Logic(name: 'm_ack_aux', width: 4)..inject(0);
     final mData = Logic(name: 'm_data', width: 128)..inject(0);
 
     // CDC master side -> burst adapter slave side (ddr clock).
@@ -537,6 +538,7 @@ class _Bench {
       sSel: cdc.output('m_sel'),
       mStall: mStall,
       mAck: mAck,
+      mAckAux: mAckAux,
       mData: mData,
     );
     cdc.input('m_ack').srcConnection! <= adapter.output('s_ack');
@@ -549,8 +551,10 @@ class _Bench {
     // The wide controller model: byte-masked backing store, one command per
     // `writeAcceptLatency+1` ddr cycles for writes (mStall backpressure),
     // fixed read latency for descriptor fetches. Commits on accept, exactly
-    // when the adapter drove the command and mStall was low.
-    final pendingReads = <List<int>>[]; // [burstAddr, cyclesLeft]
+    // when the adapter drove the command and mStall was low. Like the real
+    // controller, it acks reads and writes in order and echoes aux.
+    // Entries are [burstAddr or -1 for a write, cyclesLeft, aux].
+    final pendingAcks = <List<int>>[];
     var busy = 0; // remaining stall cycles
 
     _ctrl = clkDdr.posedge.listen((_) {
@@ -563,6 +567,7 @@ class _Bench {
             cycV == LogicValue.one &&
             adapter.output('m_stb').value == LogicValue.one) {
           final addr = adapter.output('m_addr').value.toInt();
+          final aux = adapter.output('m_aux').value.toInt();
           if (adapter.output('m_we').value == LogicValue.one) {
             final data = adapter.output('m_data_out').value.toBigInt();
             final sel = adapter.output('m_sel').value.toInt();
@@ -574,8 +579,9 @@ class _Bench {
                 ((store[addr] ?? BigInt.zero) & ~mask) | (data & mask);
             wideWrites++;
             busy = writeAcceptLatency; // pay the accept latency before the next
+            pendingAcks.add([-1, readLatency, aux]);
           } else {
-            pendingReads.add([addr, readLatency]);
+            pendingAcks.add([addr, readLatency, aux]);
             wideReads++;
           }
         }
@@ -584,14 +590,13 @@ class _Bench {
       }
       mStall.inject(busy > 0 ? 1 : 0);
 
-      for (final r in pendingReads) {
+      for (final r in pendingAcks) {
         r[1]--;
       }
-      final ready = pendingReads.where((r) => r[1] <= 0).toList();
-      if (ready.isNotEmpty) {
-        final r = ready.first;
-        pendingReads.remove(r);
-        mData.inject(store[r[0]] ?? BigInt.zero);
+      if (pendingAcks.isNotEmpty && pendingAcks.first[1] <= 0) {
+        final r = pendingAcks.removeAt(0);
+        mData.inject(r[0] < 0 ? BigInt.zero : store[r[0]] ?? BigInt.zero);
+        mAckAux.inject(r[2]);
         mAck.inject(1);
       }
     });

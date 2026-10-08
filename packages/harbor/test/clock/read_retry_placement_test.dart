@@ -87,6 +87,7 @@ void main() {
       ds.input('s_sel').srcConnection! <= rr.output('m_sel');
       rr.input('m_ack').srcConnection! <= ds.output('s_ack');
       rr.input('m_dat_r').srcConnection! <= ds.output('s_dat_r');
+      rr.input('m_err').srcConnection! <= ds.output('s_err');
     } else {
       // bus -> ds directly (wide)
       ds.input('clk').srcConnection! <= sClk;
@@ -112,6 +113,7 @@ void main() {
       rr.input('s_sel').srcConnection! <= ds.output('m_sel');
       ds.input('m_ack').srcConnection! <= rr.output('s_ack');
       ds.input('m_dat_r').srcConnection! <= rr.output('s_dat_r');
+      ds.input('m_err').srcConnection! <= rr.output('s_err');
       nCyc = rr.output('m_cyc') & rr.output('m_stb');
       nWe = rr.output('m_we');
       nAdr = rr.output('m_adr');
@@ -136,9 +138,11 @@ void main() {
     if (narrowRetry) {
       rr.input('m_ack').srcConnection! <= cdc.output('s_ack');
       rr.input('m_dat_r').srcConnection! <= cdc.output('s_dat_r');
+      rr.input('m_err').srcConnection! <= Const(0);
     } else {
       ds.input('m_ack').srcConnection! <= cdc.output('s_ack');
       ds.input('m_dat_r').srcConnection! <= cdc.output('s_dat_r');
+      ds.input('m_err').srcConnection! <= Const(0);
     }
 
     cdc.input('m_clk').srcConnection! <= mClk;
