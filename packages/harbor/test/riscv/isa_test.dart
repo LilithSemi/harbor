@@ -76,19 +76,19 @@ void main() {
     });
 
     test('findOperation matches ADD', () {
-      final add = rv32i.findOperation(0x33, funct3: 0x0, funct7: 0x00);
+      final add = rv32i.findOperation(0x00000033);
       expect(add, isNotNull);
       expect(add!.mnemonic, equals('add'));
     });
 
     test('findOperation matches SUB', () {
-      final sub = rv32i.findOperation(0x33, funct3: 0x0, funct7: 0x20);
+      final sub = rv32i.findOperation(0x40000033);
       expect(sub, isNotNull);
       expect(sub!.mnemonic, equals('sub'));
     });
 
     test('ADD has correct resources', () {
-      final add = rv32i.findOperation(0x33, funct3: 0x0, funct7: 0x00)!;
+      final add = rv32i.findOperation(0x00000033)!;
       expect(
         add.resources.whereType<RfResource>(),
         hasLength(3),
@@ -96,7 +96,7 @@ void main() {
     });
 
     test('LW has memory resource', () {
-      final lw = rv32i.findOperation(0x03, funct3: 0x2);
+      final lw = rv32i.findOperation(0x00002003);
       expect(lw, isNotNull);
       expect(lw!.resources.whereType<MemoryResource>(), hasLength(1));
     });
@@ -121,11 +121,7 @@ void main() {
     });
 
     test('has word-width ops', () {
-      final addw = rv64i.findOperation(
-        RiscvOpcode.op32,
-        funct3: 0x0,
-        funct7: 0x00,
-      );
+      final addw = rv64i.findOperation(0x0000003B);
       expect(addw, isNotNull);
       expect(addw!.mnemonic, equals('addw'));
     });
@@ -133,18 +129,12 @@ void main() {
 
   group('M extension', () {
     test('has mul/div operations', () {
-      expect(
-        rvM.findOperation(0x33, funct3: 0x0, funct7: 0x01)?.mnemonic,
-        equals('mul'),
-      );
-      expect(
-        rvM.findOperation(0x33, funct3: 0x4, funct7: 0x01)?.mnemonic,
-        equals('div'),
-      );
+      expect(rvM.findOperation(0x02000033)?.mnemonic, equals('mul'));
+      expect(rvM.findOperation(0x02004033)?.mnemonic, equals('div'));
     });
 
     test('mul/div are microcoded by default', () {
-      final div = rvM.findOperation(0x33, funct3: 0x4, funct7: 0x01)!;
+      final div = rvM.findOperation(0x02004033)!;
       expect(div.executionMode, equals(RiscVExecutionMode.microcoded));
     });
   });

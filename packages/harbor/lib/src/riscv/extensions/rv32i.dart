@@ -1,6 +1,7 @@
 import '../../encoding/riscv_formats.dart';
 import '../extension.dart';
 import '../micro_op.dart';
+import '../mxlen.dart';
 import '../operation.dart';
 import '../resource.dart';
 
@@ -107,12 +108,16 @@ final rv32i = RiscVExtension(
     _aluImm('ori', AluImmFunct3.ori, RiscVAluFunct.or_),
     _aluImm('andi', AluImmFunct3.andi, RiscVAluFunct.and_),
 
-    // Shifts with funct7
+    // Shifts with funct7.
     RiscVOperation(
       mnemonic: 'slli',
       opcode: RiscvOpcode.opImm,
       funct3: AluImmFunct3.slli,
       funct7: 0x00,
+      // RV32 has a 5-bit shamt, so bit 25 must be zero. RV64 uses rv64i.
+      xlenConstraint: {RiscVMxlen.rv32},
+      matchMask: 0x02000000,
+      matchValue: 0x00000000,
       format: iType,
       resources: [RfResource(_int, rs1), RfResource(_int, rd)],
       microcode: [
@@ -131,6 +136,10 @@ final rv32i = RiscVExtension(
       opcode: RiscvOpcode.opImm,
       funct3: AluImmFunct3.srli,
       funct7: 0x00,
+      // RV32 has a 5-bit shamt, so bit 25 must be zero. RV64 uses rv64i.
+      xlenConstraint: {RiscVMxlen.rv32},
+      matchMask: 0x02000000,
+      matchValue: 0x00000000,
       format: iType,
       resources: [RfResource(_int, rs1), RfResource(_int, rd)],
       microcode: [
@@ -149,6 +158,10 @@ final rv32i = RiscVExtension(
       opcode: RiscvOpcode.opImm,
       funct3: AluImmFunct3.srli,
       funct7: 0x20,
+      // RV32 has a 5-bit shamt, so bit 25 must be zero. RV64 uses rv64i.
+      xlenConstraint: {RiscVMxlen.rv32},
+      matchMask: 0x02000000,
+      matchValue: 0x00000000,
       format: iType,
       resources: [RfResource(_int, rs1), RfResource(_int, rd)],
       microcode: [
@@ -186,16 +199,14 @@ final rv32i = RiscVExtension(
         RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
       ],
     ),
+    // ecall and ebreak have no operands. All 32 bits are fixed.
     RiscVOperation(
       mnemonic: 'ecall',
       opcode: RiscvOpcode.system,
       funct3: 0x0,
       funct7: 0x00,
-      // ecall and ebreak share opcode/funct3/funct7 and differ only in funct12
-      // bit 20 (ecall=0, ebreak=1), without this discriminator both decode as
-      // the first-listed op (ecall), so ebreak would wrongly trap as ecall.
-      matchMask: 0x00100000,
-      matchValue: 0x00000000,
+      matchMask: 0xFFFFFFFF,
+      matchValue: 0x00000073,
       format: iType,
       // Environment call: cause is the originating privilege (U=8/S=9/VS=10/
       // M=11), so it re-encodes by mode at trap time, not a fixed 8.
@@ -206,8 +217,8 @@ final rv32i = RiscVExtension(
       opcode: RiscvOpcode.system,
       funct3: 0x0,
       funct7: 0x00,
-      matchMask: 0x00100000,
-      matchValue: 0x00100000,
+      matchMask: 0xFFFFFFFF,
+      matchValue: 0x00100073,
       format: iType,
       microcode: [RiscVTrapOp(3)], // Breakpoint
     ),
@@ -229,7 +240,6 @@ RiscVOperation _branch(
   microcode: [
     RiscVReadRegister(RiscVMicroOpField.rs1),
     RiscVReadRegister(RiscVMicroOpField.rs2),
-    RiscVAlu(RiscVAluFunct.sub, RiscVMicroOpField.rs1, RiscVMicroOpField.rs2),
     RiscVBranch(
       cond,
       RiscVMicroOpSource.alu,
@@ -256,7 +266,6 @@ RiscVOperation _load(
   ],
   microcode: [
     RiscVReadRegister(RiscVMicroOpField.rs1),
-    RiscVAlu(RiscVAluFunct.add, RiscVMicroOpField.rs1, RiscVMicroOpField.imm),
     RiscVMemLoad(
       RiscVMicroOpField.rs1,
       RiscVMicroOpField.rd,
@@ -282,11 +291,6 @@ RiscVOperation _store(String mnemonic, int funct3, RiscVMemSize size) =>
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
         RiscVReadRegister(RiscVMicroOpField.rs2),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemStore(RiscVMicroOpField.rs1, RiscVMicroOpField.rs2, size),
         RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
       ],

@@ -3,6 +3,14 @@
 /// Each [RiscVOperation] carries a list of [RiscVMicroOp]s describing its
 /// execution steps. These are pure data. The actual hardware
 /// implementation is provided by the CPU (e.g., River).
+///
+/// Each field latch starts with the decoded field value (a register index or
+/// the immediate). [RiscVReadRegister] replaces the index with the register
+/// value. [RiscVMemLoad] and [RiscVMemStore] use the base field plus the
+/// immediate as the address. [RiscVBranch] compares the rs1 and rs2 latches.
+///
+/// A sequence may use only the rd, rs1, rs2 and imm latches as scratch. The
+/// core can read rs3 and pc for other purposes (for example, rs3 as sp).
 
 /// Fields in the micro-op data path.
 ///
@@ -107,6 +115,12 @@ enum RiscVAluFunct {
   zextb,
   zextw,
   notOp,
+  // Zba: zero-extend the low word of a, then shift left by b.
+  slliUw,
+  // Zbc: carry-less multiply (low, high and reversed products).
+  clmul,
+  clmulh,
+  clmulr,
 }
 
 /// RiscVBranch conditions.
@@ -175,12 +189,16 @@ class RiscVReadRegister extends RiscVMicroOp {
 /// specification says a narrower value must have all upper bits set (NaN
 /// boxing). The micro-op that produced the value does not say how wide it is,
 /// so the write carries the flag.
+///
+/// Set [nanBoxHalf] together with [nanBox] for a 16-bit half-precision datum.
+/// Then bits 31:16 are also set.
 class RiscVWriteRegister extends RiscVMicroOp {
   final RiscVMicroOpField dest;
   final RiscVMicroOpSource source;
   final int valueOffset;
   final bool fp;
   final bool nanBox;
+  final bool nanBoxHalf;
 
   const RiscVWriteRegister(
     this.dest,
@@ -188,6 +206,7 @@ class RiscVWriteRegister extends RiscVMicroOp {
     this.valueOffset = 0,
     this.fp = false,
     this.nanBox = false,
+    this.nanBoxHalf = false,
   });
 }
 
@@ -271,6 +290,10 @@ class RiscVAtomicMemory extends RiscVMicroOp {
 }
 
 /// Conditional branch.
+///
+/// Compares the rs1 and rs2 latches. When the condition is true, the next pc
+/// is pc plus [offsetField] (or pc plus [offset] when [offsetField] is null).
+/// The core does not read [target].
 class RiscVBranch extends RiscVMicroOp {
   final RiscVBranchCondition condition;
   final RiscVMicroOpSource target;
@@ -393,6 +416,8 @@ enum RiscVFpuFunct {
   fmul,
   fdiv,
   fsqrt,
+  // The W converts also carry the unsigned and L forms. The core reads them
+  // from rs2 bit 0 (unsigned) and rs2 bit 1 (64-bit integer).
   fcvtWS,
   fcvtSW,
   fcvtLS,
@@ -419,6 +444,25 @@ enum RiscVFpuFunct {
   fmsub, // +(a*b)-c
   fnmsub, // -(a*b)+c
   fnmadd, // -(a*b)-c
+  // Zfhmin: half to single and single to half.
+  fcvtSH,
+  fcvtHS,
+  // Zfa: load constant (rs1 is the table index), min/max with NaN
+  // propagation, round to integer, and quiet compares.
+  fli,
+  fminm,
+  fmaxm,
+  fround,
+  froundnx,
+  fleq,
+  fltq,
+  // Zfa: convert double to a 32-bit integer with modular wrap (fcvtmod.w.d).
+  fcvtmodWD,
+  // Zfhmin with D: half to double and double to half.
+  fcvtDH,
+  fcvtHD,
+  // Zfhmin: move a half to an integer register, sign-extended from bit 15.
+  fmvXH,
 }
 
 class RiscVFpuOp extends RiscVMicroOp {
@@ -441,6 +485,10 @@ class RiscVFpuOp extends RiscVMicroOp {
 }
 
 /// Hypervisor load/store virtual (HLV/HSV).
+///
+/// The address is the [base] latch with no immediate. A load writes register
+/// [dest] directly, as [RiscVAtomicMemory] does, so no [RiscVWriteRegister]
+/// follows it.
 class RiscVHypervisorMemOp extends RiscVMicroOp {
   final RiscVMicroOpField base;
   final RiscVMicroOpField dest;

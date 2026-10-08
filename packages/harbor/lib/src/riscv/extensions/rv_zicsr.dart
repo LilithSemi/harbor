@@ -45,7 +45,7 @@ RiscVOperation _csrSet(String mnemonic, int funct3, {bool isImm = false}) =>
         RiscVAlu(
           RiscVAluFunct.or_,
           RiscVMicroOpField.imm,
-          isImm ? RiscVMicroOpField.rs1 : RiscVMicroOpField.rs1,
+          RiscVMicroOpField.rs1,
         ),
         RiscVWriteCsr(RiscVMicroOpField.rd, RiscVMicroOpSource.alu),
         RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.imm),
@@ -53,37 +53,32 @@ RiscVOperation _csrSet(String mnemonic, int funct3, {bool isImm = false}) =>
       ],
     );
 
-RiscVOperation _csrClear(String mnemonic, int funct3, {bool isImm = false}) =>
-    RiscVOperation(
-      mnemonic: mnemonic,
-      opcode: RiscvOpcode.system,
-      funct3: funct3,
-      format: iType,
-      resources: [
-        if (!isImm) RfResource(_int, rs1),
-        RfResource(_int, rd),
-        CsrResource(),
-      ],
-      microcode: [
-        if (!isImm) RiscVReadRegister(RiscVMicroOpField.rs1),
-        RiscVCopyField(RiscVMicroOpField.imm, RiscVMicroOpField.rd),
-        RiscVReadCsr(RiscVMicroOpField.imm),
-        RiscVAlu(
-          RiscVAluFunct.and_,
-          RiscVMicroOpField.imm,
-          isImm ? RiscVMicroOpField.rs1 : RiscVMicroOpField.rs1,
-        ),
-        RiscVSetField(RiscVMicroOpSource.alu, RiscVMicroOpField.rs2),
-        RiscVAlu(
-          RiscVAluFunct.xor_,
-          RiscVMicroOpField.imm,
-          RiscVMicroOpField.rs2,
-        ),
-        RiscVWriteCsr(RiscVMicroOpField.rd, RiscVMicroOpSource.alu),
-        RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.imm),
-        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
-      ],
-    );
+RiscVOperation _csrClear(
+  String mnemonic,
+  int funct3, {
+  bool isImm = false,
+}) => RiscVOperation(
+  mnemonic: mnemonic,
+  opcode: RiscvOpcode.system,
+  funct3: funct3,
+  format: iType,
+  resources: [
+    if (!isImm) RfResource(_int, rs1),
+    RfResource(_int, rd),
+    CsrResource(),
+  ],
+  microcode: [
+    if (!isImm) RiscVReadRegister(RiscVMicroOpField.rs1),
+    RiscVCopyField(RiscVMicroOpField.imm, RiscVMicroOpField.rd),
+    RiscVReadCsr(RiscVMicroOpField.imm),
+    RiscVAlu(RiscVAluFunct.and_, RiscVMicroOpField.imm, RiscVMicroOpField.rs1),
+    RiscVSetField(RiscVMicroOpSource.alu, RiscVMicroOpField.rs2),
+    RiscVAlu(RiscVAluFunct.xor_, RiscVMicroOpField.imm, RiscVMicroOpField.rs2),
+    RiscVWriteCsr(RiscVMicroOpField.rd, RiscVMicroOpSource.alu),
+    RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.imm),
+    RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
+  ],
+);
 
 final rvZicsr = RiscVExtension(
   name: 'Zicsr',

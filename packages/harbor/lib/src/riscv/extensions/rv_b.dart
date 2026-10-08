@@ -7,6 +7,7 @@ import '../resource.dart';
 
 const _int = RiscVIntRegFile(32);
 const _rv64 = {RiscVMxlen.rv64, RiscVMxlen.rv128};
+const _rv32 = {RiscVMxlen.rv32};
 
 // R-type bit-manip: rd = f(rs1, rs2).
 RiscVOperation _reg(
@@ -61,8 +62,39 @@ RiscVOperation _imm(
   ],
 );
 
-// Unary OP-IMM op: rd = f(rs1). clz/ctz/cpop/sext.b/sext.h share
+// Shift-immediate with a funct6 selector. RV64 has a 6-bit shamt, so bit 25
+// is free. RV32 has a 5-bit shamt, so bit 25 must be zero.
+List<RiscVOperation> _shamt(
+  String m,
+  int f3,
+  int funct6,
+  RiscVAluFunct f, {
+  int op = RiscvOpcode.opImm,
+  bool rv32 = true,
+}) => [
+  for (final xlen in [_rv64, if (rv32) _rv32])
+    RiscVOperation(
+      mnemonic: m,
+      opcode: op,
+      funct3: f3,
+      format: iType,
+      xlenConstraint: xlen,
+      matchMask: xlen == _rv32 ? 0xFE000000 : 0xFC000000,
+      matchValue: funct6 << 26,
+      resources: [RfResource(_int, rs1), RfResource(_int, rd)],
+      microcode: [
+        RiscVReadRegister(RiscVMicroOpField.rs1),
+        RiscVAlu(f, RiscVMicroOpField.rs1, RiscVMicroOpField.imm),
+        RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.alu),
+        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
+      ],
+    ),
+];
+
+// Unary op: rd = f(rs1). clz/ctz/cpop/sext.b/sext.h share
 // opcode+funct3+funct7 and are distinguished by the rs2 field (bits 24:20).
+// The match also pins bits 31:20 because some decoders only look at funct6
+// for OP-IMM shifts.
 RiscVOperation _unary(
   String m,
   int f3,
@@ -78,8 +110,8 @@ RiscVOperation _unary(
   funct7: f7,
   format: rType,
   xlenConstraint: xlen,
-  matchMask: 0x1F << 20,
-  matchValue: rs2sel << 20,
+  matchMask: 0xFFF00000,
+  matchValue: (f7 << 25) | (rs2sel << 20),
   resources: [RfResource(_int, rs1), RfResource(_int, rd)],
   microcode: [
     RiscVReadRegister(RiscVMicroOpField.rs1),
@@ -130,14 +162,13 @@ final rvZba = RiscVExtension(
       xlen: _rv64,
       op: RiscvOpcode.op32,
     ),
-    // slli.uw zero-extends rs1[31:0] then shifts. Approximated by sll for now.
-    _imm(
+    ..._shamt(
       'slli.uw',
       0x1,
-      0x04,
-      RiscVAluFunct.sll,
-      xlen: _rv64,
+      0x02,
+      RiscVAluFunct.slliUw,
       op: RiscvOpcode.opImm32,
+      rv32: false,
     ),
   ],
 );
@@ -176,7 +207,7 @@ final rvZbb = RiscVExtension(
       xlen: _rv64,
       op: RiscvOpcode.op32,
     ),
-    _imm('rori', 0x5, 0x30, RiscVAluFunct.ror),
+    ..._shamt('rori', 0x5, 0x18, RiscVAluFunct.ror),
     _imm(
       'roriw',
       0x5,
@@ -218,6 +249,7 @@ final rvZbb = RiscVExtension(
       xlen: _rv64,
       op: RiscvOpcode.opImm32,
     ),
+    // zext.h is OP-32 on RV64 and OP on RV32.
     _unary(
       'zext.h',
       0x4,
@@ -227,22 +259,32 @@ final rvZbb = RiscVExtension(
       xlen: _rv64,
       op: RiscvOpcode.op32,
     ),
-    // rev8: RV64 imm 0x6b8 → funct7 0x35, rs2 field 0x18.
-    _unary('rev8', 0x5, 0x35, 0x18, RiscVAluFunct.rev8),
+    _unary(
+      'zext.h',
+      0x4,
+      0x04,
+      0x00,
+      RiscVAluFunct.zexth,
+      xlen: _rv32,
+      op: RiscvOpcode.op,
+    ),
+    // rev8: imm 0x6B8 on RV64 and 0x698 on RV32.
+    _unary('rev8', 0x5, 0x35, 0x18, RiscVAluFunct.rev8, xlen: _rv64),
+    _unary('rev8', 0x5, 0x34, 0x18, RiscVAluFunct.rev8, xlen: _rv32),
     // orc.b: imm 0x287 → funct7 0x14, rs2 field 0x07.
     _unary('orc.b', 0x5, 0x14, 0x07, RiscVAluFunct.orcb),
   ],
 );
 
-/// Zbc: Carry-less multiplication (not in RVA22, placeholder functs).
+/// Zbc: Carry-less multiplication.
 final rvZbc = RiscVExtension(
   name: 'Zbc',
   key: null,
   misaBit: null,
   operations: [
-    _reg('clmul', 0x1, 0x05, RiscVAluFunct.mul),
-    _reg('clmulh', 0x3, 0x05, RiscVAluFunct.mulh),
-    _reg('clmulr', 0x2, 0x05, RiscVAluFunct.mulh),
+    _reg('clmul', 0x1, 0x05, RiscVAluFunct.clmul),
+    _reg('clmulh', 0x3, 0x05, RiscVAluFunct.clmulh),
+    _reg('clmulr', 0x2, 0x05, RiscVAluFunct.clmulr),
   ],
 );
 
@@ -256,22 +298,17 @@ final rvZbs = RiscVExtension(
     _reg('bext', 0x5, 0x24, RiscVAluFunct.bext),
     _reg('binv', 0x1, 0x34, RiscVAluFunct.binv),
     _reg('bset', 0x1, 0x14, RiscVAluFunct.bset),
-    _imm('bclri', 0x1, 0x24, RiscVAluFunct.bclr),
-    _imm('bexti', 0x5, 0x24, RiscVAluFunct.bext),
-    _imm('binvi', 0x1, 0x34, RiscVAluFunct.binv),
-    _imm('bseti', 0x1, 0x14, RiscVAluFunct.bset),
+    ..._shamt('bclri', 0x1, 0x12, RiscVAluFunct.bclr),
+    ..._shamt('bexti', 0x5, 0x12, RiscVAluFunct.bext),
+    ..._shamt('binvi', 0x1, 0x1A, RiscVAluFunct.binv),
+    ..._shamt('bseti', 0x1, 0x0A, RiscVAluFunct.bset),
   ],
 );
 
-/// Combined B extension: Zba + Zbb + Zbc + Zbs.
+/// Combined B extension: Zba + Zbb + Zbs. Zbc is not part of B.
 final rvB = RiscVExtension(
   name: 'B',
   key: 'B',
   misaBit: 1,
-  operations: [
-    ...rvZba.operations,
-    ...rvZbb.operations,
-    ...rvZbc.operations,
-    ...rvZbs.operations,
-  ],
+  operations: [...rvZba.operations, ...rvZbb.operations, ...rvZbs.operations],
 );

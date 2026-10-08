@@ -13,6 +13,7 @@ import '../extensions/rv_zicsr.dart';
 import '../extensions/rv_zifencei.dart';
 import '../extensions/rv_zfhmin.dart';
 import '../extensions/rv_misc.dart';
+import '../extensions/rv_priv.dart';
 import '../isa.dart';
 import '../mxlen.dart';
 import '../paging.dart';
@@ -26,9 +27,9 @@ final rva23u64 = RiscVIsaConfig(
     // Base
     rv32i, rv64i,
     // Standard
-    rvM, rvA, rvF, rvD, rvC, rvV, rvB,
+    rvM, rvA, rvF, rvD, rvC, rvZcd, rvV, rvB,
     // Floating-point
-    rvZfhmin, rvZfa,
+    rvZfhmin, rvZfhminD, rvZfa, rvZfaD,
     // CSR and fence
     rvZicsr, rvZicntr, rvZihpm,
     // Hints
@@ -66,6 +67,8 @@ final rva23s64 = RiscVIsaConfig(
     ...rva23u64.extensions,
     // Instruction fence (mandatory for S-mode)
     rvZifencei,
+    // Privileged instructions (sret, mret, wfi, sfence.vma)
+    rvPriv,
     // Hypervisor
     rvH, rvSha,
     // TLB management

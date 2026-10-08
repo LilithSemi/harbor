@@ -131,13 +131,34 @@ class RiscVOperation {
     this.fixedRs2,
   });
 
-  /// Whether [instruction] satisfies this op's raw-bit discriminators
-  /// ([matchMask]/[matchValue], [nonZeroMask], [zeroMask]). Ops with no
-  /// discriminators always pass.
-  bool matchesRaw(int instruction) {
-    if (matchMask != null && (instruction & matchMask!) != (matchValue ?? 0)) {
-      return false;
+  /// Whether this is a 16-bit compressed encoding (bits 1:0 are not 0b11).
+  bool get isCompressed => (opcode & 0x3) != 0x3;
+
+  /// Bits of the instruction word that this operation fixes: the opcode,
+  /// funct3, funct7 (funct5 for AMO) and [matchMask].
+  int get decodeMask {
+    var mask = isCompressed ? 0x3 : 0x7F;
+    if (funct3 != null) mask |= 0x7 << (isCompressed ? 13 : 12);
+    if (!isCompressed && funct7 != null) {
+      mask |= opcode == RiscvOpcode.amo ? 0x1F << 27 : 0x7F << 25;
     }
+    return mask | (matchMask ?? 0);
+  }
+
+  /// Values of the [decodeMask] bits.
+  int get decodeValue {
+    var value = opcode & (isCompressed ? 0x3 : 0x7F);
+    if (funct3 != null) value |= funct3! << (isCompressed ? 13 : 12);
+    if (!isCompressed && funct7 != null) {
+      value |= opcode == RiscvOpcode.amo ? (funct7! >> 2) << 27 : funct7! << 25;
+    }
+    return value | (matchValue ?? 0);
+  }
+
+  /// Whether the raw [instruction] word decodes as this operation. A
+  /// compressed operation only looks at bits 15:0.
+  bool matchesWord(int instruction) {
+    if ((instruction & decodeMask) != decodeValue) return false;
     if (nonZeroMask != null && (instruction & nonZeroMask!) == 0) return false;
     if (zeroMask != null && (instruction & zeroMask!) != 0) return false;
     return true;
@@ -146,25 +167,6 @@ class RiscVOperation {
   /// Whether this instruction is valid for the given [mxlen].
   bool isValidFor(RiscVMxlen mxlen) =>
       xlenConstraint == null || xlenConstraint!.contains(mxlen);
-
-  /// Whether this operation matches the given opcode/funct fields.
-  bool matches(int opcode, int? funct3, int? funct7) {
-    if (this.opcode != opcode) return false;
-    if (this.funct3 != null && this.funct3 != funct3) return false;
-    if (this.funct7 != null && funct7 != null) {
-      if (this.opcode == RiscvOpcode.amo) {
-        // AMO/LR/SC: funct7[1:0] are the aq/rl ordering hints, not part of the
-        // operation selector (funct5 = funct7[6:2]). Ignore them so ordered
-        // atomics match. Mirrors the hardware decoder.
-        if ((this.funct7! >> 2) != (funct7 >> 2)) return false;
-      } else if (this.funct7 != funct7) {
-        return false;
-      }
-    } else if (this.funct7 != null && this.funct7 != funct7) {
-      return false;
-    }
-    return true;
-  }
 
   @override
   String toString() => 'RiscVOperation($mnemonic)';

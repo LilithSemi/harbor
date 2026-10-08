@@ -86,23 +86,13 @@ class RiscVIsaConfig {
   /// The effective execution mode for a specific operation.
   RiscVExecutionMode executionModeFor(RiscVOperation op) => _effectiveMode(op);
 
-  /// Finds an operation matching the given instruction word.
+  /// Finds the first operation that decodes [instruction].
   ///
-  /// Extracts opcode, funct3, funct7 from the instruction and
-  /// searches all extensions.
+  /// A word with bits 1:0 not equal to 0b11 is a 16-bit compressed
+  /// instruction, and only its low 16 bits are used.
   RiscVOperation? findOperation(int instruction) {
-    final opcode = instruction & 0x7F;
-    final funct3 = (instruction >> 12) & 0x7;
-    final funct7 = (instruction >> 25) & 0x7F;
-
     for (final ext in extensions) {
-      final op = ext.findOperation(
-        opcode,
-        funct3: funct3,
-        funct7: funct7,
-        instruction: instruction,
-        mxlen: mxlen,
-      );
+      final op = ext.findOperation(instruction, mxlen: mxlen);
       if (op != null) return op;
     }
     return null;

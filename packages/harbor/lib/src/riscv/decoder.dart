@@ -11,7 +11,7 @@ import 'operation.dart';
 /// 16-bit (compressed) instructions.
 ///
 /// For each instruction in the ISA:
-/// - Generates match logic from opcode/funct3/funct7 patterns
+/// - Generates match logic from each operation's decode pattern
 /// - Outputs an operation index for microcode ROM lookup
 /// - Flags illegal instructions
 ///
@@ -144,25 +144,16 @@ class RiscVInstructionDecoder extends Module {
       final op = ops[i];
       final mode = isa.executionModeFor(op);
 
-      // Build match condition: opcode must match, funct3/funct7 if specified
-      Logic cond = instr.getRange(0, 7).eq(Const(op.opcode, width: 7));
-
-      if (op.funct3 != null) {
-        cond = cond & instr.getRange(12, 15).eq(Const(op.funct3!, width: 3));
+      // A compressed op only fixes bits 15:0, and its opcode in bits 1:0 is
+      // never 0b11, so the two encoding spaces stay apart.
+      Logic cond = (instr & Const(op.decodeMask, width: 32)).eq(
+        Const(op.decodeValue, width: 32),
+      );
+      if (op.nonZeroMask != null) {
+        cond = cond & (instr & Const(op.nonZeroMask!, width: 32)).neq(0);
       }
-
-      if (op.funct7 != null) {
-        if (op.opcode == RiscvOpcode.amo) {
-          // AMO/LR/SC: funct7[6:2] is funct5 (the operation selector) and
-          // funct7[1:0] are the aq/rl ordering hints. The hints do not select
-          // an operation, so decode MUST ignore them: match funct5 only. Else
-          // ordered atomics (sc.w.rl, amoadd.w.aqrl, ...) raise illegal.
-          cond =
-              cond &
-              instr.getRange(27, 32).eq(Const(op.funct7! >> 2, width: 5));
-        } else {
-          cond = cond & instr.getRange(25, 32).eq(Const(op.funct7!, width: 7));
-        }
+      if (op.zeroMask != null) {
+        cond = cond & (instr & Const(op.zeroMask!, width: 32)).eq(0);
       }
 
       conditions.add(

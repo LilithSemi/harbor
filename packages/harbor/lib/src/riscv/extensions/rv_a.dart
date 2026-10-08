@@ -55,6 +55,7 @@ final rvA = RiscVExtension(
       funct3: 0x2,
       funct7: 0x08,
       format: rType,
+      zeroMask: 0x01F00000, // rs2 must be x0
       resources: [
         RfResource(_int, rs1),
         RfResource(_int, rd),
@@ -111,6 +112,7 @@ final rvA = RiscVExtension(
       funct3: 0x3,
       funct7: 0x08,
       format: rType,
+      zeroMask: 0x01F00000, // rs2 must be x0
       xlenConstraint: {RiscVMxlen.rv64, RiscVMxlen.rv128},
       resources: [
         RfResource(_int, rs1),

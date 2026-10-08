@@ -15,19 +15,12 @@ const _cFsdsp320 = 0xA282; // c.fsdsp f0, 320(sp)
 RiscVOperation _op(String mnemonic) =>
     rvZcd.operations.firstWhere((o) => o.mnemonic == mnemonic);
 
-/// Looks an instruction word up the way a decoder does: quadrant from bits
-/// [1:0], funct3 from bits [15:13].
 RiscVOperation? _find(RiscVExtension ext, int word, {RiscVMxlen? mxlen}) =>
-    ext.findOperation(
-      word & 0x3,
-      funct3: (word >> 13) & 0x7,
-      instruction: word,
-      mxlen: mxlen ?? RiscVMxlen.rv64,
-    );
+    ext.findOperation(word, mxlen: mxlen ?? RiscVMxlen.rv64);
 
 void main() {
   group('Zcd extension shape', () {
-    test('defines the four RV64C floating-point memory operations', () {
+    test('defines the four compressed double-precision memory operations', () {
       expect(rvZcd.operations.map((o) => o.mnemonic), [
         'c.fld',
         'c.fsd',
@@ -43,10 +36,10 @@ void main() {
       expect(rvZcd.mask, equals(0));
     });
 
-    test('is RV64 only', () {
+    test('is valid on RV32 and RV64', () {
       for (final op in rvZcd.operations) {
         expect(op.isValidFor(RiscVMxlen.rv64), isTrue, reason: op.mnemonic);
-        expect(op.isValidFor(RiscVMxlen.rv32), isFalse, reason: op.mnemonic);
+        expect(op.isValidFor(RiscVMxlen.rv32), isTrue, reason: op.mnemonic);
       }
     });
 
@@ -123,9 +116,9 @@ void main() {
       expect(_find(rvZcd, _cFsdsp320)!.mnemonic, equals('c.fsdsp'));
     });
 
-    test('RV32 rejects the words', () {
+    test('RV32 with D decodes the words too', () {
       for (final word in [_cFld24, _cFsd24, _cFldsp8, _cFsdsp16]) {
-        expect(_find(rvZcd, word, mxlen: RiscVMxlen.rv32), isNull);
+        expect(_find(rvZcd, word, mxlen: RiscVMxlen.rv32), isNotNull);
       }
     });
   });
@@ -192,33 +185,28 @@ void main() {
   group('Zcd micro-op sequences', () {
     test('c.fld reads an integer base and writes a float destination', () {
       final mc = _op('c.fld').microcode;
-      expect(mc, hasLength(5));
+      expect(mc, hasLength(4));
 
       final base = mc[0] as RiscVReadRegister;
       expect(base.source, equals(RiscVMicroOpField.rs1));
       expect(base.fp, isFalse);
 
-      final add = mc[1] as RiscVAlu;
-      expect(add.funct, equals(RiscVAluFunct.add));
-      expect(add.a, equals(RiscVMicroOpField.rs1));
-      expect(add.b, equals(RiscVMicroOpField.imm));
-
-      final load = mc[2] as RiscVMemLoad;
+      final load = mc[1] as RiscVMemLoad;
       expect(load.base, equals(RiscVMicroOpField.rs1));
       expect(load.dest, equals(RiscVMicroOpField.rd));
       expect(load.size, equals(RiscVMemSize.dword));
 
-      final write = mc[3] as RiscVWriteRegister;
+      final write = mc[2] as RiscVWriteRegister;
       expect(write.dest, equals(RiscVMicroOpField.rd));
       expect(write.source, equals(RiscVMicroOpSource.rd));
       expect(write.fp, isTrue);
 
-      expect((mc[4] as RiscVUpdatePc).offset, equals(2));
+      expect((mc[3] as RiscVUpdatePc).offset, equals(2));
     });
 
     test('c.fsd reads an integer base and a float source', () {
       final mc = _op('c.fsd').microcode;
-      expect(mc, hasLength(5));
+      expect(mc, hasLength(4));
 
       final base = mc[0] as RiscVReadRegister;
       expect(base.source, equals(RiscVMicroOpField.rs1));
@@ -228,32 +216,30 @@ void main() {
       expect(data.source, equals(RiscVMicroOpField.rs2));
       expect(data.fp, isTrue);
 
-      expect((mc[2] as RiscVAlu).funct, equals(RiscVAluFunct.add));
-
-      final store = mc[3] as RiscVMemStore;
+      final store = mc[2] as RiscVMemStore;
       expect(store.base, equals(RiscVMicroOpField.rs1));
       expect(store.src, equals(RiscVMicroOpField.rs2));
       expect(store.size, equals(RiscVMemSize.dword));
 
-      expect((mc[4] as RiscVUpdatePc).offset, equals(2));
+      expect((mc[3] as RiscVUpdatePc).offset, equals(2));
     });
 
     test('c.fldsp matches c.fld with sp as the base', () {
       final mc = _op('c.fldsp').microcode;
-      expect(mc, hasLength(5));
+      expect(mc, hasLength(4));
       expect((mc[0] as RiscVReadRegister).fp, isFalse);
-      expect((mc[2] as RiscVMemLoad).size, equals(RiscVMemSize.dword));
-      expect((mc[3] as RiscVWriteRegister).fp, isTrue);
-      expect((mc[4] as RiscVUpdatePc).offset, equals(2));
+      expect((mc[1] as RiscVMemLoad).size, equals(RiscVMemSize.dword));
+      expect((mc[2] as RiscVWriteRegister).fp, isTrue);
+      expect((mc[3] as RiscVUpdatePc).offset, equals(2));
     });
 
     test('c.fsdsp matches c.fsd with sp as the base', () {
       final mc = _op('c.fsdsp').microcode;
-      expect(mc, hasLength(5));
+      expect(mc, hasLength(4));
       expect((mc[0] as RiscVReadRegister).fp, isFalse);
       expect((mc[1] as RiscVReadRegister).fp, isTrue);
-      expect((mc[3] as RiscVMemStore).size, equals(RiscVMemSize.dword));
-      expect((mc[4] as RiscVUpdatePc).offset, equals(2));
+      expect((mc[2] as RiscVMemStore).size, equals(RiscVMemSize.dword));
+      expect((mc[3] as RiscVUpdatePc).offset, equals(2));
     });
 
     test('exactly one micro-op per operation names a float register', () {

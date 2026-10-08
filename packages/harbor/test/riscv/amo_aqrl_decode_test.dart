@@ -60,7 +60,9 @@ void main() {
       for (var order = 0; order < 4; order++) {
         // order bit1=aq, bit0=rl; base funct7 already has aq=rl=0.
         final funct7 = entry.value | order;
-        instrIn.put(encAmo(funct7));
+        // lr.w reserves rs2, it must be x0.
+        final rs2 = entry.key == 'lr.w' ? 0 : 15;
+        instrIn.put(encAmo(funct7, rs2: rs2));
         expect(
           mod.output('illegal').value.toInt(),
           equals(0),

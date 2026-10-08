@@ -7,6 +7,7 @@ import '../operation.dart';
 import '../resource.dart';
 
 const _int = RiscVIntRegFile(32);
+const _fp32 = RiscVFloatRegFile(32);
 const _fp64 = RiscVFloatRegFile(64);
 
 /// C extension: Compressed instructions.
@@ -57,11 +58,6 @@ const rvC = RiscVExtension(
       ],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemLoad(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rd,
@@ -85,11 +81,6 @@ const rvC = RiscVExtension(
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
         RiscVReadRegister(RiscVMicroOpField.rs2),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemStore(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rs2,
@@ -113,11 +104,6 @@ const rvC = RiscVExtension(
       ],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemLoad(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rd,
@@ -142,11 +128,6 @@ const rvC = RiscVExtension(
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
         RiscVReadRegister(RiscVMicroOpField.rs2),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemStore(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rs2,
@@ -201,6 +182,7 @@ const rvC = RiscVExtension(
       immKind: RvcImm.ciAddi16sp,
       matchMask: 0xF80, // rd field
       matchValue: 0x100, // rd == x2 (2 << 7)
+      nonZeroMask: 0x107C, // nzimm != 0
       fixedRd: 2,
       fixedRs1: 2,
       resources: [RfResource(_int, rs1), RfResource(_int, rd)],
@@ -221,6 +203,7 @@ const rvC = RiscVExtension(
       funct3: C1Funct3.cLui,
       format: ciType,
       immKind: RvcImm.ciLui,
+      nonZeroMask: 0x107C, // nzimm != 0, imm 0 is reserved (Zcmop)
       resources: [RfResource(_int, rd)],
       microcode: [
         RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.imm),
@@ -261,6 +244,7 @@ const rvC = RiscVExtension(
       format: ciType,
       immKind: RvcImm.ciAddi,
       xlenConstraint: {RiscVMxlen.rv64},
+      nonZeroMask: 0xF80, // rd != 0
       resources: [RfResource(_int, rs1), RfResource(_int, rd)],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
@@ -316,6 +300,28 @@ const rvC = RiscVExtension(
       funct3: C1Funct3.cMisc,
       format: caType,
       immKind: RvcImm.cbShamt,
+      xlenConstraint: {RiscVMxlen.rv32},
+      matchMask: 0x1C00, // shamt[5] = 0
+      matchValue: 0x000,
+      resources: [RfResource(_int, rs1), RfResource(_int, rd)],
+      microcode: [
+        RiscVReadRegister(RiscVMicroOpField.rs1),
+        RiscVAlu(
+          RiscVAluFunct.srl,
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.imm,
+        ),
+        RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.alu),
+        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+      ],
+    ),
+    RiscVOperation(
+      mnemonic: 'c.srli',
+      opcode: CompressedOp.c1,
+      funct3: C1Funct3.cMisc,
+      format: caType,
+      immKind: RvcImm.cbShamt,
+      xlenConstraint: {RiscVMxlen.rv64},
       matchMask: 0xC00,
       matchValue: 0x000,
       resources: [RfResource(_int, rs1), RfResource(_int, rd)],
@@ -336,6 +342,28 @@ const rvC = RiscVExtension(
       funct3: C1Funct3.cMisc,
       format: caType,
       immKind: RvcImm.cbShamt,
+      xlenConstraint: {RiscVMxlen.rv32},
+      matchMask: 0x1C00, // shamt[5] = 0
+      matchValue: 0x400,
+      resources: [RfResource(_int, rs1), RfResource(_int, rd)],
+      microcode: [
+        RiscVReadRegister(RiscVMicroOpField.rs1),
+        RiscVAlu(
+          RiscVAluFunct.sra,
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.imm,
+        ),
+        RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.alu),
+        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+      ],
+    ),
+    RiscVOperation(
+      mnemonic: 'c.srai',
+      opcode: CompressedOp.c1,
+      funct3: C1Funct3.cMisc,
+      format: caType,
+      immKind: RvcImm.cbShamt,
+      xlenConstraint: {RiscVMxlen.rv64},
       matchMask: 0xC00,
       matchValue: 0x400,
       resources: [RfResource(_int, rs1), RfResource(_int, rd)],
@@ -521,12 +549,35 @@ const rvC = RiscVExtension(
     ),
 
     // Quadrant 2
+    // RV32 has a 5-bit shamt, so shamt[5] (bit 12) must be zero.
     RiscVOperation(
       mnemonic: 'c.slli',
       opcode: CompressedOp.c2,
       funct3: C2Funct3.cSlli,
       format: ciType,
       immKind: RvcImm.ciShamt,
+      xlenConstraint: {RiscVMxlen.rv32},
+      matchMask: 0x1000, // shamt[5] = 0
+      matchValue: 0x0000,
+      resources: [RfResource(_int, rs1), RfResource(_int, rd)],
+      microcode: [
+        RiscVReadRegister(RiscVMicroOpField.rs1),
+        RiscVAlu(
+          RiscVAluFunct.sll,
+          RiscVMicroOpField.rs1,
+          RiscVMicroOpField.imm,
+        ),
+        RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.alu),
+        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+      ],
+    ),
+    RiscVOperation(
+      mnemonic: 'c.slli',
+      opcode: CompressedOp.c2,
+      funct3: C2Funct3.cSlli,
+      format: ciType,
+      immKind: RvcImm.ciShamt,
+      xlenConstraint: {RiscVMxlen.rv64},
       resources: [RfResource(_int, rs1), RfResource(_int, rd)],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
@@ -546,6 +597,7 @@ const rvC = RiscVExtension(
       format: ciType,
       immKind: RvcImm.ciLwsp,
       fixedRs1: 2, // base is sp (x2)
+      nonZeroMask: 0xF80, // rd != 0
       resources: [
         RfResource(_int, rs1),
         RfResource(_int, rd),
@@ -553,11 +605,6 @@ const rvC = RiscVExtension(
       ],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemLoad(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rd,
@@ -582,11 +629,6 @@ const rvC = RiscVExtension(
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
         RiscVReadRegister(RiscVMicroOpField.rs2),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemStore(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rs2,
@@ -603,6 +645,7 @@ const rvC = RiscVExtension(
       format: ciType,
       immKind: RvcImm.ciLdsp,
       fixedRs1: 2, // base is sp (x2)
+      nonZeroMask: 0xF80, // rd != 0
       xlenConstraint: {RiscVMxlen.rv64},
       resources: [
         RfResource(_int, rs1),
@@ -611,11 +654,6 @@ const rvC = RiscVExtension(
       ],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemLoad(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rd,
@@ -641,11 +679,6 @@ const rvC = RiscVExtension(
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
         RiscVReadRegister(RiscVMicroOpField.rs2),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemStore(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rs2,
@@ -706,6 +739,7 @@ const rvC = RiscVExtension(
       matchMask: 0x1000,
       matchValue: 0,
       zeroMask: 0x7C, // rs2 == 0
+      nonZeroMask: 0xF80, // rs1 != 0
       resources: [RfResource(_int, rs1), PcResource()],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
@@ -770,11 +804,8 @@ const rvC = RiscVExtension(
 /// illegal, and it must not grow a floating-point register file because the
 /// C extension is enabled. Add this extension next to [rvC] and `rvD`.
 ///
-/// RV64 gives the funct3=011/111 encodings of quadrants 0 and 2 to c.ld / c.sd
-/// / c.ldsp / c.sdsp, so RV64 has no c.flw / c.fsw. Only the double-precision
-/// forms exist. The encodings below are RV64-only for that reason: on RV32 the
-/// same funct3 values are still c.fld / c.fsd, but this core family does not
-/// use RV32 with D.
+/// The funct3=001/101 encodings are c.fld / c.fsd on both RV32 and RV64. The
+/// RV32 single-precision forms are in [rvZcf].
 ///
 /// The address operand stays an integer register (rs1' or sp). Only the data
 /// operand comes from the floating-point file, so only that micro-op sets
@@ -791,7 +822,6 @@ const rvZcd = RiscVExtension(
       funct3: C0Funct3.cFld,
       format: clType,
       immKind: RvcImm.cldsd,
-      xlenConstraint: {RiscVMxlen.rv64},
       resources: [
         RfResource(_int, rs1),
         RfResource(_fp64, rd),
@@ -800,11 +830,6 @@ const rvZcd = RiscVExtension(
       ],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemLoad(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rd,
@@ -824,7 +849,6 @@ const rvZcd = RiscVExtension(
       funct3: C0Funct3.cFsd,
       format: csType,
       immKind: RvcImm.cldsd,
-      xlenConstraint: {RiscVMxlen.rv64},
       resources: [
         RfResource(_int, rs1),
         RfResource(_fp64, rs2),
@@ -834,11 +858,6 @@ const rvZcd = RiscVExtension(
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
         RiscVReadRegister(RiscVMicroOpField.rs2, fp: true),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemStore(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rs2,
@@ -857,7 +876,6 @@ const rvZcd = RiscVExtension(
       format: ciType,
       immKind: RvcImm.ciLdsp,
       fixedRs1: 2, // base is sp (x2)
-      xlenConstraint: {RiscVMxlen.rv64},
       resources: [
         RfResource(_int, rs1),
         RfResource(_fp64, rd),
@@ -866,11 +884,6 @@ const rvZcd = RiscVExtension(
       ],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemLoad(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rd,
@@ -891,7 +904,6 @@ const rvZcd = RiscVExtension(
       format: cssType,
       immKind: RvcImm.cssSdsp,
       fixedRs1: 2, // base is sp (x2)
-      xlenConstraint: {RiscVMxlen.rv64},
       resources: [
         RfResource(_int, rs1),
         RfResource(_fp64, rs2),
@@ -901,11 +913,6 @@ const rvZcd = RiscVExtension(
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1),
         RiscVReadRegister(RiscVMicroOpField.rs2, fp: true),
-        RiscVAlu(
-          RiscVAluFunct.add,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.imm,
-        ),
         RiscVMemStore(
           RiscVMicroOpField.rs1,
           RiscVMicroOpField.rs2,
@@ -916,3 +923,99 @@ const rvZcd = RiscVExtension(
     ),
   ],
 );
+
+/// Zcf: the RV32 compressed single-precision load and store instructions
+/// (c.flw, c.fsw, c.flwsp, c.fswsp). Add next to [rvC] and `rvF` on RV32. RV64
+/// gives these encodings to c.ld, c.sd, c.ldsp and c.sdsp.
+const rvZcf = RiscVExtension(
+  name: 'Zcf',
+  key: null,
+  misaBit: null,
+  operations: [
+    RiscVOperation(
+      mnemonic: 'c.flw',
+      opcode: CompressedOp.c0,
+      funct3: 0x3,
+      format: clType,
+      immKind: RvcImm.clwsw,
+      xlenConstraint: {RiscVMxlen.rv32},
+      resources: [
+        RfResource(_int, rs1),
+        RfResource(_fp32, rd),
+        MemoryResource.load(),
+        FpuResource(),
+      ],
+      microcode: _flwMicrocode,
+    ),
+    RiscVOperation(
+      mnemonic: 'c.fsw',
+      opcode: CompressedOp.c0,
+      funct3: 0x7,
+      format: csType,
+      immKind: RvcImm.clwsw,
+      xlenConstraint: {RiscVMxlen.rv32},
+      resources: [
+        RfResource(_int, rs1),
+        RfResource(_fp32, rs2),
+        MemoryResource.store(),
+        FpuResource(),
+      ],
+      microcode: _fswMicrocode,
+    ),
+    RiscVOperation(
+      mnemonic: 'c.flwsp',
+      opcode: CompressedOp.c2,
+      funct3: 0x3,
+      format: ciType,
+      immKind: RvcImm.ciLwsp,
+      fixedRs1: 2, // base is sp (x2)
+      xlenConstraint: {RiscVMxlen.rv32},
+      resources: [
+        RfResource(_int, rs1),
+        RfResource(_fp32, rd),
+        MemoryResource.load(),
+        FpuResource(),
+      ],
+      microcode: _flwMicrocode,
+    ),
+    RiscVOperation(
+      mnemonic: 'c.fswsp',
+      opcode: CompressedOp.c2,
+      funct3: 0x7,
+      format: cssType,
+      immKind: RvcImm.cssSwsp,
+      fixedRs1: 2, // base is sp (x2)
+      xlenConstraint: {RiscVMxlen.rv32},
+      resources: [
+        RfResource(_int, rs1),
+        RfResource(_fp32, rs2),
+        MemoryResource.store(),
+        FpuResource(),
+      ],
+      microcode: _fswMicrocode,
+    ),
+  ],
+);
+
+const _flwMicrocode = [
+  RiscVReadRegister(RiscVMicroOpField.rs1),
+  RiscVMemLoad(RiscVMicroOpField.rs1, RiscVMicroOpField.rd, RiscVMemSize.word),
+  RiscVWriteRegister(
+    RiscVMicroOpField.rd,
+    RiscVMicroOpSource.rd,
+    fp: true,
+    nanBox: true,
+  ),
+  RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+];
+
+const _fswMicrocode = [
+  RiscVReadRegister(RiscVMicroOpField.rs1),
+  RiscVReadRegister(RiscVMicroOpField.rs2, fp: true),
+  RiscVMemStore(
+    RiscVMicroOpField.rs1,
+    RiscVMicroOpField.rs2,
+    RiscVMemSize.word,
+  ),
+  RiscVUpdatePc(RiscVMicroOpField.pc, offset: 2),
+];

@@ -2,7 +2,9 @@ import '../../encoding/riscv_formats.dart';
 import '../extension.dart';
 import '../micro_op.dart';
 import '../operation.dart';
+import '../mxlen.dart';
 import '../resource.dart';
+import 'fp_ops.dart';
 
 const _fp64 = RiscVFloatRegFile(64);
 const _fp32 = RiscVFloatRegFile(32);
@@ -18,7 +20,7 @@ const _fmaResD = [
   FpuResource(),
 ];
 
-const rvD = RiscVExtension(
+final rvD = RiscVExtension(
   name: 'D',
   key: 'D',
   misaBit: 3,
@@ -303,6 +305,8 @@ const rvD = RiscVExtension(
       opcode: 0x53,
       funct7: 0x2D,
       format: rType,
+      matchMask: 0x01F00000, // rs2 = 0
+      matchValue: 0x00000000,
       resources: [RfResource(_fp64, rs1), RfResource(_fp64, rd), FpuResource()],
       executionMode: RiscVExecutionMode.microcoded,
       microcode: [
@@ -326,6 +330,8 @@ const rvD = RiscVExtension(
       opcode: 0x53,
       funct7: 0x20,
       format: rType,
+      matchMask: 0x01F00000,
+      matchValue: 0x00100000, // rs2 = 1 (source fmt D)
       resources: [RfResource(_fp64, rs1), RfResource(_fp32, rd), FpuResource()],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1, fp: true),
@@ -348,6 +354,8 @@ const rvD = RiscVExtension(
       opcode: 0x53,
       funct7: 0x21,
       format: rType,
+      matchMask: 0x01F00000,
+      matchValue: 0x00000000, // rs2 = 0 (source fmt S)
       resources: [RfResource(_fp32, rs1), RfResource(_fp64, rd), FpuResource()],
       microcode: [
         RiscVReadRegister(RiscVMicroOpField.rs1, fp: true),
@@ -364,45 +372,42 @@ const rvD = RiscVExtension(
         RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
       ],
     ),
-    RiscVOperation(
-      mnemonic: 'fcvt.w.d',
-      opcode: 0x53,
-      funct7: 0x61,
-      format: rType,
-      resources: [RfResource(_fp64, rs1), RfResource(_int, rd), FpuResource()],
-      microcode: [
-        RiscVReadRegister(RiscVMicroOpField.rs1, fp: true),
-        RiscVFpuOp(
-          RiscVFpuFunct.fcvtWD,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.rd,
-          doublePrecision: true,
-        ),
-        RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.rd),
-        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
-      ],
+    fpToIntCvt(
+      'fcvt.w.d',
+      0x61,
+      0,
+      RiscVFpuFunct.fcvtWD,
+      _fp64,
+      doublePrecision: true,
     ),
-    RiscVOperation(
-      mnemonic: 'fcvt.d.w',
-      opcode: 0x53,
-      funct7: 0x69,
-      format: rType,
-      resources: [RfResource(_int, rs1), RfResource(_fp64, rd), FpuResource()],
-      microcode: [
-        RiscVReadRegister(RiscVMicroOpField.rs1),
-        RiscVFpuOp(
-          RiscVFpuFunct.fcvtDW,
-          RiscVMicroOpField.rs1,
-          RiscVMicroOpField.rd,
-        ),
-        RiscVWriteRegister(
-          RiscVMicroOpField.rd,
-          RiscVMicroOpSource.rd,
-          fp: true,
-        ),
-        RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
-      ],
+    fpToIntCvt(
+      'fcvt.wu.d',
+      0x61,
+      1,
+      RiscVFpuFunct.fcvtWD,
+      _fp64,
+      doublePrecision: true,
     ),
+    fpToIntCvt(
+      'fcvt.l.d',
+      0x61,
+      2,
+      RiscVFpuFunct.fcvtWD,
+      _fp64,
+      doublePrecision: true,
+    ),
+    fpToIntCvt(
+      'fcvt.lu.d',
+      0x61,
+      3,
+      RiscVFpuFunct.fcvtWD,
+      _fp64,
+      doublePrecision: true,
+    ),
+    intToFpCvt('fcvt.d.w', 0x69, 0, RiscVFpuFunct.fcvtDW, _fp64),
+    intToFpCvt('fcvt.d.wu', 0x69, 1, RiscVFpuFunct.fcvtDW, _fp64),
+    intToFpCvt('fcvt.d.l', 0x69, 2, RiscVFpuFunct.fcvtDW, _fp64),
+    intToFpCvt('fcvt.d.lu', 0x69, 3, RiscVFpuFunct.fcvtDW, _fp64),
     RiscVOperation(
       mnemonic: 'feq.d',
       opcode: 0x53,
@@ -480,6 +485,70 @@ const rvD = RiscVExtension(
         RiscVWriteRegister(RiscVMicroOpField.rd, RiscVMicroOpSource.rd),
         RiscVUpdatePc(RiscVMicroOpField.pc, offset: 4),
       ],
+    ),
+    fpBinary(
+      'fsgnj.d',
+      0x11,
+      0x0,
+      RiscVFpuFunct.fsgnj,
+      _fp64,
+      doublePrecision: true,
+    ),
+    fpBinary(
+      'fsgnjn.d',
+      0x11,
+      0x1,
+      RiscVFpuFunct.fsgnjn,
+      _fp64,
+      doublePrecision: true,
+    ),
+    fpBinary(
+      'fsgnjx.d',
+      0x11,
+      0x2,
+      RiscVFpuFunct.fsgnjx,
+      _fp64,
+      doublePrecision: true,
+    ),
+    fpBinary(
+      'fmin.d',
+      0x15,
+      0x0,
+      RiscVFpuFunct.fmin,
+      _fp64,
+      doublePrecision: true,
+    ),
+    fpBinary(
+      'fmax.d',
+      0x15,
+      0x1,
+      RiscVFpuFunct.fmax,
+      _fp64,
+      doublePrecision: true,
+    ),
+    fpToIntUnary(
+      'fclass.d',
+      0x71,
+      0x1,
+      RiscVFpuFunct.fclass,
+      _fp64,
+      doublePrecision: true,
+    ),
+    fpToIntUnary(
+      'fmv.x.d',
+      0x71,
+      0x0,
+      RiscVFpuFunct.fmv,
+      _fp64,
+      doublePrecision: true,
+      xlen: {RiscVMxlen.rv64, RiscVMxlen.rv128},
+    ),
+    intToFpMove(
+      'fmv.d.x',
+      0x79,
+      _fp64,
+      doublePrecision: true,
+      xlen: {RiscVMxlen.rv64, RiscVMxlen.rv128},
     ),
   ],
 );
