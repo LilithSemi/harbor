@@ -281,18 +281,26 @@ class HarborCdcFifo extends BridgeModule {
     final rdPtrGray = Logic(name: 'rd_ptr_gray', width: ptrWidth);
     final wrPtrGraySync = Logic(name: 'wr_ptr_gray_sync', width: ptrWidth);
 
-    // Gray code conversion: binary ^ (binary >> 1)
-    wrPtrGray <= wrPtr ^ (wrPtr >>> 1);
-    rdPtrGray <= rdPtr ^ (rdPtr >>> 1);
+    Logic gray(Logic b) => b ^ (b >>> 1);
 
-    // Full: write gray == inverted top 2 bits of read gray, rest equal
-    output('wr_full') <=
-        wrPtrGray.eq(
+    // Each gray pointer is a flop of its own. The other domain samples it at any
+    // time, so it must change one bit for each step. A gray code made from the
+    // binary flops can glitch through codes that are more steps away.
+    final wrFull = Logic(name: 'wr_full_reg');
+    final wrPush = (input('wr_en') & ~wrFull).named('wr_push');
+    final wrPtrNext = mux(wrPush, wrPtr + 1, wrPtr).named('wr_ptr_next');
+    final wrGrayNext = gray(wrPtrNext).named('wr_ptr_gray_next');
+    // Full: the next write gray equals the read gray with the top 2 bits
+    // inverted. The flag is a flop, so it can only be late, never early.
+    final wrFullNext = wrGrayNext
+        .eq(
           [
             ~rdPtrGraySync.getRange(ptrWidth - 2, ptrWidth),
             rdPtrGraySync.getRange(0, ptrWidth - 2),
           ].swizzle(),
-        );
+        )
+        .named('wr_full_next');
+    output('wr_full') <= wrFull;
 
     // Almost-full (write domain): convert the synchronized read gray pointer
     // back to binary, compute the occupancy as the modulo-2*depth difference of
@@ -314,15 +322,11 @@ class HarborCdcFifo extends BridgeModule {
         .named('rd_ptr_bin_sync');
     // Occupancy modulo 2*depth (ptrWidth bits wrap correctly under subtraction).
     final occupancy = (wrPtr - rdPtrBinSync).named('fifo_occupancy');
-    // free < margin  <=>  occupancy > depth - margin.
+    // free < margin  <=>  occupancy > depth - margin. The registered full flag
+    // can stay high one cycle after the occupancy falls, so it is included and
+    // full always implies almost full.
     output('wr_almost_full') <=
-        occupancy.gt(Const(depth - almostFullMargin, width: ptrWidth));
-
-    // Empty (flop storage): read gray == write gray. The block RAM path drives
-    // `rd_empty` from its pre-fetch stage instead, further down.
-    if (_bram == null) {
-      output('rd_empty') <= rdPtrGray.eq(wrPtrGraySync);
-    }
+        occupancy.gt(Const(depth - almostFullMargin, width: ptrWidth)) | wrFull;
 
     // Write domain logic
     final wrClk = input('wr_clk');
@@ -344,7 +348,6 @@ class HarborCdcFifo extends BridgeModule {
               Logic(name: 'mem_$i', width: dataWidth),
           ];
     final wrAddr = wrPtr.getRange(0, addrWidth);
-    final wrPush = input('wr_en') & ~output('wr_full');
 
     // Synchronize read pointer gray to write domain
     final rdGraySync0 = Logic(name: 'rd_gray_sync0', width: ptrWidth);
@@ -353,16 +356,20 @@ class HarborCdcFifo extends BridgeModule {
         wrReset,
         then: [
           wrPtr < Const(0, width: ptrWidth),
+          wrPtrGray < Const(0, width: ptrWidth),
+          wrFull < Const(0),
           rdGraySync0 < Const(0, width: ptrWidth),
           rdPtrGraySync < Const(0, width: ptrWidth),
         ],
         orElse: [
           rdGraySync0 < rdPtrGray,
           rdPtrGraySync < rdGraySync0,
+          wrPtr < wrPtrNext,
+          wrPtrGray < wrGrayNext,
+          wrFull < wrFullNext,
           If(
             wrPush,
             then: [
-              wrPtr < wrPtr + 1,
               // Write data into the addressed memory entry. The block RAM has
               // its own write port, clocked by the same `wr_clk` and enabled by
               // the same `wrPush`, so it takes no statement here.
@@ -382,21 +389,31 @@ class HarborCdcFifo extends BridgeModule {
     final wrGraySync0 = Logic(name: 'wr_gray_sync0', width: ptrWidth);
 
     if (_bram == null) {
+      final rdEmpty = Logic(name: 'rd_empty_reg');
+      final rdPop = (input('rd_en') & ~rdEmpty).named('rd_pop');
+      final rdPtrNext = mux(rdPop, rdPtr + 1, rdPtr).named('rd_ptr_next');
+      final rdGrayNext = gray(rdPtrNext).named('rd_ptr_gray_next');
       Sequential(rdClk, [
         If(
           rdReset,
           then: [
             rdPtr < Const(0, width: ptrWidth),
+            rdPtrGray < Const(0, width: ptrWidth),
+            rdEmpty < Const(1),
             wrGraySync0 < Const(0, width: ptrWidth),
             wrPtrGraySync < Const(0, width: ptrWidth),
           ],
           orElse: [
             wrGraySync0 < wrPtrGray,
             wrPtrGraySync < wrGraySync0,
-            If(input('rd_en') & ~output('rd_empty'), then: [rdPtr < rdPtr + 1]),
+            rdPtr < rdPtrNext,
+            rdPtrGray < rdGrayNext,
+            // Empty is a flop like full, so it can only be late, never early.
+            rdEmpty < rdGrayNext.eq(wrPtrGraySync),
           ],
         ),
       ]);
+      output('rd_empty') <= rdEmpty;
 
       // Combinational read: mux the addressed memory entry onto rd_data using
       // the low (non-wrap) bits of the read pointer.
@@ -436,7 +453,7 @@ class HarborCdcFifo extends BridgeModule {
     // no fetch goes out (the read enable of the port is low), so `rd_data` also
     // cannot change under a consumer that does not read.
     final fetchPtr = Logic(name: 'fetch_ptr', width: ptrWidth);
-    final fetchPtrGray = (fetchPtr ^ (fetchPtr >>> 1)).named('fetch_ptr_gray');
+    final fetchPtrGray = gray(fetchPtr).named('fetch_ptr_gray');
     // No entry left to pre-fetch: the same gray comparison as `rd_empty` of the
     // flop path, but against the pointer of the pre-fetch instead.
     final memEmpty = fetchPtrGray.eq(wrPtrGraySync).named('mem_empty');
@@ -469,6 +486,7 @@ class HarborCdcFifo extends BridgeModule {
         rdReset,
         then: [
           rdPtr < Const(0, width: ptrWidth),
+          rdPtrGray < Const(0, width: ptrWidth),
           wrGraySync0 < Const(0, width: ptrWidth),
           wrPtrGraySync < Const(0, width: ptrWidth),
           fetchPtr < Const(0, width: ptrWidth),
@@ -477,7 +495,7 @@ class HarborCdcFifo extends BridgeModule {
         orElse: [
           wrGraySync0 < wrPtrGray,
           wrPtrGraySync < wrGraySync0,
-          If(pop, then: [rdPtr < rdPtr + 1]),
+          If(pop, then: [rdPtr < rdPtr + 1, rdPtrGray < gray(rdPtr + 1)]),
           If(fetch, then: [fetchPtr < fetchPtr + 1]),
           // A fetch of this cycle lands in the read port register at the next
           // edge, which is the same edge that sets `dataValid`.

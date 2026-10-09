@@ -205,6 +205,8 @@ class HarborDdr3 extends BridgeModule
       } else {
         _buildSim(clk, reset, busDW);
       }
+      // The sim memory has no CDC, so it has no bus error to report.
+      addOutput('bus_error') <= Const(0);
       return;
     }
 
@@ -538,11 +540,9 @@ struct DramStore {
         width: Ddr3Controller.wb2DataBits,
       );
       // The CDC carries the FULL bus width so it matches the fabric decoder.
-      // Its width + depth MUST match the main ddr_cdc, so ROHD dedupes both
-      // onto one definition (the class hardcodes its definition name; a
-      // differing config would collide at synth). Knob writes stay strictly
-      // ordered, so this one does not post writes; the class gives a posted
-      // bridge a different definition name, so the two do not collide.
+      // The same width and depth as the main ddr_cdc lets both share one
+      // definition. Knob writes stay strictly ordered, so this one does not
+      // post writes.
       trainCdc = HarborWishboneCdcFifoBridge(
         addressWidth: busAW,
         dataWidth: busDW,

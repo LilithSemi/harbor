@@ -153,9 +153,12 @@ class HarborWishboneCdcBridge extends BridgeModule {
     final mCycReg = Logic(name: 'm_cyc_reg');
     final rDat = Logic(name: 'r_dat', width: dw);
 
-    // Gray codes of the two counters (binary ^ binary>>1).
-    final reqGray = (reqCnt ^ (reqCnt >>> 1)).named('req_gray');
-    final doneGray = (doneCnt ^ (doneCnt >>> 1)).named('done_gray');
+    // Gray codes of the two counters. Each is a flop that loads with its
+    // counter, because the other domain samples it at any time and a code made
+    // from the counter flops can glitch through a wrong value.
+    Logic gray(Logic b) => b ^ (b >>> 1);
+    final reqGray = Logic(name: 'req_gray', width: cw);
+    final doneGray = Logic(name: 'done_gray', width: cw);
 
     // Synchronizer chains: done -> slow, req -> fast.
     final doneSync = [
@@ -198,6 +201,7 @@ class HarborWishboneCdcBridge extends BridgeModule {
         then: [
           for (final s in doneSync) s < Const(0, width: cw),
           reqCnt < Const(0, width: cw),
+          reqGray < Const(0, width: cw),
           busy < Const(0),
           orphan < Const(0),
           pWe < Const(0),
@@ -255,6 +259,7 @@ class HarborWishboneCdcBridge extends BridgeModule {
                       pDatW < input('s_dat_w'),
                       pSel < input('s_sel'),
                       reqCnt < reqCnt + 1,
+                      reqGray < gray(reqCnt + 1),
                       busy < Const(1),
                     ],
                     orElse: [
@@ -283,6 +288,7 @@ class HarborWishboneCdcBridge extends BridgeModule {
         then: [
           for (final s in reqSync) s < Const(0, width: cw),
           doneCnt < Const(0, width: cw),
+          doneGray < Const(0, width: cw),
           serving < Const(0),
           mCycReg < Const(0),
           rDat < Const(0, width: dw),
@@ -311,6 +317,7 @@ class HarborWishboneCdcBridge extends BridgeModule {
                   rDat < input('m_dat_r'),
                   mCycReg < Const(0),
                   doneCnt < doneCnt + 1,
+                  doneGray < gray(doneCnt + 1),
                   serving < Const(0),
                 ],
               ),

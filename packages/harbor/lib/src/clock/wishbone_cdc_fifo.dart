@@ -18,10 +18,10 @@ import 'wishbone_cdc.dart' show stickyCdcError;
 /// out after the gray write-pointer has safely crossed, rather than sampled as a
 /// quasi-static multi-cycle path.
 ///
-/// [target] + [blockRam] select FIFO storage: block RAM on an FPGA target that
+/// [target] + [blockRam] select request FIFO storage: block RAM on a target that
 /// supports it (keeps the depth off the flop budget), else flops. [depth] is the
-/// per-direction FIFO depth (power of two). Deeper buffers more in flight and
-/// gives the pointer synchronizers a moving target to latch.
+/// request FIFO depth and [respDepth] the response FIFO depth (powers of two).
+/// A deeper request FIFO holds more posted writes in flight.
 ///
 /// With [postedWrites], a WRITE is ACKed on the slave side as soon as its
 /// payload is captured into the request FIFO, and the master side pushes no
@@ -47,13 +47,17 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
   /// Byte-select width.
   final int selWidth;
 
-  /// Per-direction FIFO depth (power of two, >= 2).
+  /// Request FIFO depth (power of two, >= 2).
   final int depth;
+
+  /// Response FIFO depth (power of two, >= 2). One response at most is in
+  /// flight, because reads go one at a time and posted writes push none.
+  final int respDepth;
 
   /// FPGA target (selects block-RAM vs flop FIFO storage when [blockRam]).
   final HarborDeviceTarget? target;
 
-  /// Back the FIFO storage with block RAM where [target] supports it.
+  /// Back the request FIFO storage with block RAM where [target] supports it.
   final bool blockRam;
 
   /// ACK a write as soon as the request FIFO captures it, and drop its
@@ -66,21 +70,22 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     required this.dataWidth,
     int? selWidth,
     this.depth = 8,
+    this.respDepth = 2,
     this.target,
     this.blockRam = false,
     this.postedWrites = false,
     super.name = 'wishbone_cdc_fifo',
   }) : selWidth = selWidth ?? (dataWidth ~/ 8),
-       assert(
-         depth >= 2 && (depth & (depth - 1)) == 0,
-         'depth must be a power of two and >= 2',
-       ),
-       // Distinct definition name: two instances that differ only in this flag
-       // behave differently, so they must not dedupe onto one definition.
        super(
-         postedWrites
-             ? 'HarborWishboneCdcFifoBridgePosted'
-             : 'HarborWishboneCdcFifoBridge',
+         _definitionName(
+           addressWidth: addressWidth,
+           dataWidth: dataWidth,
+           selWidth: selWidth ?? (dataWidth ~/ 8),
+           depth: depth,
+           respDepth: respDepth,
+           blockRam: blockRam && target?.blockRam != null,
+           posted: postedWrites,
+         ),
        ) {
     final sw = this.selWidth;
     final aw = addressWidth;
@@ -137,11 +142,10 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
       blockRam: blockRam,
       name: 'req_fifo',
     );
+    // The response FIFO is small, so it always uses flops.
     final respFifo = HarborCdcFifo(
       dataWidth: dw,
-      depth: depth,
-      target: target,
-      blockRam: blockRam,
+      depth: respDepth,
       name: 'resp_fifo',
     );
     addSubModule(reqFifo);
@@ -244,12 +248,10 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
       'start_serve',
     );
     final complete = (serving & mCycReg & input('m_ack')).named('complete');
-    // The head carries { we, adr, dat_w, sel }, so its top bit says whether the
-    // transaction in flight is a write.
-    final headWe = reqFifo
-        .output('rd_data')
-        .slice(reqW - 1, reqW - 1)
-        .named('head_we');
+    // The top bit of the head says if the transaction in flight is a write.
+    // The head stays in the FIFO until completion, so a copy taken at the
+    // start of service stays correct and cuts the path from the read port.
+    final headWe = Logic(name: 'head_we');
     // A posted write was already ACKed on the slave side. Pushing a response
     // for it would desynchronize the response FIFO from the pending read.
     final respPush = postedWrites
@@ -270,11 +272,15 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     Sequential(mClk, [
       If(
         mReset,
-        then: [serving < Const(0), mCycReg < Const(0)],
+        then: [serving < Const(0), mCycReg < Const(0), headWe < Const(0)],
         orElse: [
           If(
             startServe,
-            then: [serving < Const(1), mCycReg < Const(1)],
+            then: [
+              serving < Const(1),
+              mCycReg < Const(1),
+              headWe < reqFifo.output('rd_data').slice(reqW - 1, reqW - 1),
+            ],
             orElse: [
               If(complete, then: [serving < Const(0), mCycReg < Const(0)]),
             ],
@@ -312,5 +318,45 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
           ackReg,
           pending,
         ].swizzle();
+  }
+
+  static void _checkDepth(int value, String field) {
+    if (value < 2 || (value & (value - 1)) != 0) {
+      throw ArgumentError.value(
+        value,
+        field,
+        'must be a power of two and >= 2',
+      );
+    }
+  }
+
+  /// The definition name holds every parameter that changes the structure,
+  /// because the name is reserved and two different bridges must not share it.
+  /// The configuration of the Arty S7 DDR3 bridge keeps the short name, so its
+  /// netlist does not change.
+  static String _definitionName({
+    required int addressWidth,
+    required int dataWidth,
+    required int selWidth,
+    required int depth,
+    required int respDepth,
+    required bool blockRam,
+    required bool posted,
+  }) {
+    _checkDepth(depth, 'depth');
+    _checkDepth(respDepth, 'respDepth');
+    final base = posted
+        ? 'HarborWishboneCdcFifoBridgePosted'
+        : 'HarborWishboneCdcFifoBridge';
+    final arty =
+        addressWidth == 64 &&
+        dataWidth == 64 &&
+        selWidth == 8 &&
+        depth == 16 &&
+        respDepth == 2 &&
+        !blockRam;
+    if (arty) return base;
+    return '${base}_${addressWidth}a${dataWidth}d${selWidth}s'
+        '${depth}q${respDepth}r${blockRam ? '_bram' : ''}';
   }
 }
