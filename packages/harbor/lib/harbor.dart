@@ -15,6 +15,10 @@ export 'src/fiber/retainer.dart';
 // Plugin system
 export 'src/plugin/plugin.dart';
 
+// Arithmetic units
+export 'src/arith/fp_divider.dart';
+export 'src/arith/scalar_divider.dart';
+
 // HarborPipeline
 export 'src/pipeline/builder.dart';
 export 'src/pipeline/link.dart';
