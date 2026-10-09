@@ -569,6 +569,15 @@ class HarborL1DCache extends BridgeModule {
   /// whose reads need pacing.
   final int cacheableBase;
 
+  /// Requests already carry physical addresses. The caller must perform
+  /// translation, permission and cacheability checks before every request,
+  /// including hits, and authorize the complete refill footprint.
+  ///
+  /// Physical aliases have the same index, so this opt-in removes the virtual
+  /// cache's page-size capacity bound. Tags must retain the full address width.
+  /// It does not translate addresses or change [cacheableBase].
+  final bool physicalAddresses;
+
   /// Bits of the address that translation does not change (log2 of the page
   /// size). Sv32, Sv39 and Sv48 all use 4 KB base pages, so 12. The store
   /// invalidate relies on the cache index being cut from these bits, because
@@ -657,6 +666,7 @@ class HarborL1DCache extends BridgeModule {
     required this.config,
     this.xlen = 64,
     this.cacheableBase = 0x80000000,
+    this.physicalAddresses = false,
     this.ctxBits = 0,
     Logic? memFaultIn,
     // Significant low bits of [reqAddr]. See the note on tag width below.
@@ -671,6 +681,11 @@ class HarborL1DCache extends BridgeModule {
     }
     if (ctxBits < 0) {
       throw ArgumentError('ctxBits must not be negative (got $ctxBits).');
+    }
+    if (physicalAddresses && reqAddrBits != null && reqAddrBits != xlen) {
+      throw ArgumentError(
+        'Physical cache tags must retain all $xlen address bits.',
+      );
     }
 
     createPort('clk', PortDirection.input);
@@ -760,7 +775,7 @@ class HarborL1DCache extends BridgeModule {
     // of the address, two aliases land on DIFFERENT lines, and a store can no
     // longer find the other one. This is the classic alias-free condition for a
     // virtually indexed cache.
-    if (tagLo > pageOffsetBits) {
+    if (!physicalAddresses && tagLo > pageOffsetBits) {
       throw ArgumentError(
         'the cache is virtually indexed, so one way (${config.size ~/ config.ways} '
         'bytes) must not exceed the ${1 << pageOffsetBits}-byte page: the index '
