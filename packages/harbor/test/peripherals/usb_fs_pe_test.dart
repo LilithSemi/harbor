@@ -4,71 +4,7 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-// Host-side line encoder (from usb_fs_phy_test.dart).
-int _crc5(int data, int nbits) {
-  var crc = 0x1F;
-  for (var i = 0; i < nbits; i++) {
-    final bit = (data >> i) & 1;
-    final xorIn = (crc & 1) ^ bit;
-    crc >>= 1;
-    if (xorIn != 0) crc ^= 0x14;
-  }
-  return (~crc) & 0x1F;
-}
-
-int _crc16(List<int> bytes) {
-  var crc = 0xFFFF;
-  for (final b in bytes) {
-    for (var i = 0; i < 8; i++) {
-      final bit = (b >> i) & 1;
-      final xorIn = (crc & 1) ^ bit;
-      crc >>= 1;
-      if (xorIn != 0) crc ^= 0xA001;
-    }
-  }
-  return (~crc) & 0xFFFF;
-}
-
-List<int> _tokenBytes(int addr, int endp) {
-  final field = (addr & 0x7F) | ((endp & 0xF) << 7);
-  final v = field | (_crc5(field, 11) << 11);
-  return [v & 0xFF, (v >> 8) & 0xFF];
-}
-
-int _pidByte(int nibble) => (nibble & 0xF) | ((~nibble & 0xF) << 4);
-
-List<List<int>> _encode(List<int> bytes) {
-  final raw = <int>[];
-  for (final b in [0x80, ...bytes]) {
-    for (var i = 0; i < 8; i++) {
-      raw.add((b >> i) & 1);
-    }
-  }
-  final stuffed = <int>[];
-  var ones = 0;
-  for (final bit in raw) {
-    stuffed.add(bit);
-    if (bit == 1) {
-      ones++;
-      if (ones == 6) {
-        stuffed.add(0);
-        ones = 0;
-      }
-    } else {
-      ones = 0;
-    }
-  }
-  final out = <List<int>>[];
-  var line = 1;
-  for (final bit in stuffed) {
-    if (bit == 0) line = 1 - line;
-    out.add(line == 1 ? [1, 0] : [0, 1]);
-  }
-  out.add([0, 0]);
-  out.add([0, 0]);
-  out.add([1, 0]);
-  return out;
-}
+import 'usb_test_host.dart';
 
 /// Decodes the packets that the engine drives on to the line.
 ///
@@ -188,15 +124,15 @@ void main() {
 
       // Host: OUT token (addr 0, endp 0) then DATA0 with a payload.
       final payload = <int>[0xC0, 0xFF, 0xEE];
-      final crc = _crc16(payload);
-      final tokenSyms = _encode([_pidByte(1), ..._tokenBytes(0, 0)]);
+      final crc = usbCrc16(payload);
+      final tokenSyms = usbEncode([usbPidByte(1), ...usbTokenBytes(0, 0)]);
       // Inter-packet gap: 2 bit times of idle J.
       tokenSyms.addAll([
         [1, 0],
         [1, 0],
       ]);
       tokenSyms.addAll(
-        _encode([_pidByte(3), ...payload, crc & 0xFF, (crc >> 8) & 0xFF]),
+        usbEncode([usbPidByte(3), ...payload, crc & 0xFF, (crc >> 8) & 0xFF]),
       );
 
       var ackedCount = 0;
@@ -314,14 +250,14 @@ void main() {
 
       // Host: SETUP token then DATA0 with an 8-byte request.
       final req = <int>[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
-      final crc = _crc16(req);
-      final syms = _encode([_pidByte(13), ..._tokenBytes(0, 0)]);
+      final crc = usbCrc16(req);
+      final syms = usbEncode([usbPidByte(13), ...usbTokenBytes(0, 0)]);
       syms.addAll([
         [1, 0],
         [1, 0],
       ]);
       syms.addAll(
-        _encode([_pidByte(3), ...req, crc & 0xFF, (crc >> 8) & 0xFF]),
+        usbEncode([usbPidByte(3), ...req, crc & 0xFF, (crc >> 8) & 0xFF]),
       );
 
       for (final s in syms) {
@@ -394,7 +330,7 @@ void main() {
       }
 
       // Host: IN token (addr 0, endp 0).
-      final syms = _encode([_pidByte(9), ..._tokenBytes(0, 0)]);
+      final syms = usbEncode([usbPidByte(9), ...usbTokenBytes(0, 0)]);
 
       var txEnabled = false;
       for (final s in syms) {
@@ -507,7 +443,7 @@ void main() {
       }
 
       // Host: IN token (addr 0, endp 0).
-      final syms = _encode([_pidByte(9), ..._tokenBytes(0, 0)]);
+      final syms = usbEncode([usbPidByte(9), ...usbTokenBytes(0, 0)]);
       for (final s in syms) {
         for (var t = 0; t < 4; t++) {
           dp.inject(s[0]);
@@ -537,5 +473,465 @@ void main() {
 
       await Simulator.endSimulation();
     });
+
+    test('a SETUP is accepted right after a stall', () async {
+      final pe = HarborUsbFsPe(
+        numOutEps: 1,
+        numInEps: 1,
+        name: 'pe_stall_setup_test',
+      );
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset');
+      final dp = Logic(name: 'dp');
+      final dm = Logic(name: 'dm');
+      final outStall = Logic(name: 'out_stall');
+
+      pe.input('clk').srcConnection! <= clk;
+      pe.input('reset').srcConnection! <= reset;
+      pe.input('dev_addr').srcConnection! <= Const(0, width: 7);
+      pe.input('usb_p_rx').srcConnection! <= dp;
+      pe.input('usb_n_rx').srcConnection! <= dm;
+
+      final avail = Logic(name: 'avail_tap')
+        ..gets(pe.output('out_ep_data_avail'));
+      final getSig = Logic(name: 'get_sig');
+      pe.input('out_ep_req').srcConnection! <= avail;
+      pe.input('out_ep_data_get').srcConnection! <= getSig;
+      pe.input('out_ep_stall').srcConnection! <= outStall;
+      pe.input('in_ep_req').srcConnection! <= Const(0);
+      pe.input('in_ep_data_put').srcConnection! <= Const(0);
+      pe.input('in_ep_data_done').srcConnection! <= Const(0);
+      pe.input('in_ep_stall').srcConnection! <= Const(0);
+
+      final watch = _watchLine(pe, clk, reset);
+
+      await pe.build();
+      await watch.rx.build();
+
+      reset.inject(1);
+      dp.inject(1);
+      dm.inject(0);
+      outStall.inject(0);
+      getSig.inject(0);
+      Simulator.setMaxSimTime(500000);
+      unawaited(Simulator.run());
+
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      for (var i = 0; i < 30; i++) {
+        await clk.nextPosedge;
+      }
+
+      // The stall is a level, not a one-shot latch, so hold it high
+      // for the rest of the test. A SETUP on a control endpoint is
+      // accepted no matter the stall, but a later OUT still gets STALL.
+      outStall.inject(1);
+      for (var i = 0; i < 10; i++) {
+        await clk.nextPosedge;
+        watch.sample();
+      }
+
+      // Host: SETUP token then an 8-byte DATA0 request, same as any
+      // other SETUP. USB 2.0 8.5.3.4 requires a SETUP to always be
+      // accepted, even while the endpoint is stalled.
+      final req = <int>[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00];
+      final crc = usbCrc16(req);
+      final syms = usbEncode([usbPidByte(13), ...usbTokenBytes(0, 0)]);
+      syms.addAll([
+        [1, 0],
+        [1, 0],
+      ]);
+      syms.addAll(
+        usbEncode([usbPidByte(3), ...req, crc & 0xFF, (crc >> 8) & 0xFF]),
+      );
+
+      for (final s in syms) {
+        for (var t = 0; t < 4; t++) {
+          dp.inject(s[0]);
+          dm.inject(s[1]);
+          await clk.nextPosedge;
+          watch.sample();
+        }
+      }
+
+      dp.inject(1);
+      dm.inject(0);
+      for (var i = 0; i < 300; i++) {
+        await clk.nextPosedge;
+        watch.sample();
+      }
+
+      expect(
+        pe.output('out_ep_setup').value.toInt(),
+        1,
+        reason: 'SETUP flag set',
+      );
+      expect(
+        watch.pids,
+        contains(2),
+        reason: 'the SETUP data is ACKed, not NAKed, while stalled',
+      );
+
+      // The SETUP bytes must also be readable: a stall exit that gets
+      // stuck short of the getting state leaves the engine ACKing on
+      // the wire while avail never rises, which silently drops the
+      // request.
+      final gotBytes = <int>[];
+      var guard = 0;
+      while (avail.value.toInt() == 1 && guard < 20) {
+        guard++;
+        gotBytes.add(pe.output('out_ep_data').value.toInt());
+        getSig.inject(1);
+        await clk.nextPosedge;
+        watch.sample();
+        getSig.inject(0);
+        await clk.nextPosedge;
+        watch.sample();
+        await clk.nextPosedge;
+        watch.sample();
+      }
+      expect(
+        gotBytes,
+        req,
+        reason: 'the SETUP bytes are readable after the stall',
+      );
+
+      // The stall is still held high, so a later non-SETUP transaction
+      // on the same endpoint gets STALL, not an ACK.
+      final pidsBeforeOut = watch.pids.length;
+      final outPayload = <int>[0x01];
+      final outCrc = usbCrc16(outPayload);
+      final outSyms = usbEncode([usbPidByte(1), ...usbTokenBytes(0, 0)]);
+      outSyms.addAll([
+        [1, 0],
+        [1, 0],
+      ]);
+      outSyms.addAll(
+        usbEncode([
+          usbPidByte(3),
+          ...outPayload,
+          outCrc & 0xFF,
+          (outCrc >> 8) & 0xFF,
+        ]),
+      );
+
+      for (final s in outSyms) {
+        for (var t = 0; t < 4; t++) {
+          dp.inject(s[0]);
+          dm.inject(s[1]);
+          await clk.nextPosedge;
+          watch.sample();
+        }
+      }
+
+      dp.inject(1);
+      dm.inject(0);
+      for (var i = 0; i < 300; i++) {
+        await clk.nextPosedge;
+        watch.sample();
+      }
+
+      expect(
+        watch.pids.sublist(pidsBeforeOut),
+        contains(14),
+        reason: 'a stalled endpoint still answers STALL after a SETUP',
+      );
+
+      await Simulator.endSimulation();
+    });
+
+    test('a full maxPacketSize OUT packet is received intact', () async {
+      final pe = HarborUsbFsPe(
+        numOutEps: 1,
+        numInEps: 1,
+        maxPacketSize: 64,
+        name: 'pe_full_packet_test',
+      );
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset');
+      final dp = Logic(name: 'dp');
+      final dm = Logic(name: 'dm');
+
+      pe.input('clk').srcConnection! <= clk;
+      pe.input('reset').srcConnection! <= reset;
+      pe.input('dev_addr').srcConnection! <= Const(0, width: 7);
+      pe.input('usb_p_rx').srcConnection! <= dp;
+      pe.input('usb_n_rx').srcConnection! <= dm;
+
+      final avail = Logic(name: 'avail_tap')
+        ..gets(pe.output('out_ep_data_avail'));
+      final getSig = Logic(name: 'get_sig');
+      pe.input('out_ep_req').srcConnection! <= avail;
+      pe.input('out_ep_data_get').srcConnection! <= getSig;
+      pe.input('out_ep_stall').srcConnection! <= Const(0);
+      pe.input('in_ep_req').srcConnection! <= Const(0);
+      pe.input('in_ep_data_put').srcConnection! <= Const(0);
+      pe.input('in_ep_data_done').srcConnection! <= Const(0);
+      pe.input('in_ep_stall').srcConnection! <= Const(0);
+
+      final watch = _watchLine(pe, clk, reset);
+
+      await pe.build();
+      await watch.rx.build();
+
+      reset.inject(1);
+      dp.inject(1);
+      dm.inject(0);
+      getSig.inject(0);
+      Simulator.setMaxSimTime(1000000);
+      unawaited(Simulator.run());
+
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      for (var i = 0; i < 30; i++) {
+        await clk.nextPosedge;
+      }
+
+      // Host: OUT token (addr 0, endp 0) then a full 64-byte DATA0
+      // payload, the largest full-speed packet.
+      final payload = List.generate(64, (i) => i & 0xFF);
+      final crc = usbCrc16(payload);
+      final tokenSyms = usbEncode([usbPidByte(1), ...usbTokenBytes(0, 0)]);
+      tokenSyms.addAll([
+        [1, 0],
+        [1, 0],
+      ]);
+      tokenSyms.addAll(
+        usbEncode([usbPidByte(3), ...payload, crc & 0xFF, (crc >> 8) & 0xFF]),
+      );
+
+      var ackedCount = 0;
+      final gotBytes = <int>[];
+
+      for (final s in tokenSyms) {
+        for (var t = 0; t < 4; t++) {
+          dp.inject(s[0]);
+          dm.inject(s[1]);
+          await clk.nextPosedge;
+          watch.sample();
+          if (pe.output('out_ep_acked').value.toInt() == 1) ackedCount++;
+        }
+      }
+
+      dp.inject(1);
+      dm.inject(0);
+      getSig.inject(0);
+      for (var i = 0; i < 240; i++) {
+        await clk.nextPosedge;
+        watch.sample();
+        if (pe.output('out_ep_acked').value.toInt() == 1) ackedCount++;
+      }
+      var guard = 0;
+      while (avail.value.toInt() == 1 && guard < 80) {
+        guard++;
+        gotBytes.add(pe.output('out_ep_data').value.toInt());
+        getSig.inject(1);
+        await clk.nextPosedge;
+        watch.sample();
+        getSig.inject(0);
+        await clk.nextPosedge;
+        watch.sample();
+        await clk.nextPosedge;
+        watch.sample();
+      }
+      for (var i = 0; i < 20; i++) {
+        await clk.nextPosedge;
+        watch.sample();
+        if (pe.output('out_ep_acked').value.toInt() == 1) ackedCount++;
+      }
+
+      expect(ackedCount, 1, reason: 'one ACK pulse');
+      expect(gotBytes, payload, reason: 'all 64 bytes, intact and in order');
+
+      await Simulator.endSimulation();
+    });
+
+    test(
+      'a new token landing the cycle a drain completes still gets through',
+      () async {
+        // Drives HarborUsbFsOutPe at its rx_* ports directly, bypassing
+        // the line PHY, so the drain's last get pulse and the next
+        // token's arrival can be placed on the exact same cycle.
+        final outPe = HarborUsbFsOutPe(numOutEps: 1, name: 'pe_race_test');
+        final clk = SimpleClockGenerator(10).clk;
+        final reset = Logic(name: 'reset');
+        final getSig = Logic(name: 'get_sig');
+        final rxPktStart = Logic(name: 'rx_pkt_start');
+        final rxPktEnd = Logic(name: 'rx_pkt_end');
+        final rxPktValid = Logic(name: 'rx_pkt_valid');
+        final rxPid = Logic(name: 'rx_pid', width: 4);
+        final rxDataPut = Logic(name: 'rx_data_put');
+        final rxData = Logic(name: 'rx_data', width: 8);
+
+        outPe.input('clk').srcConnection! <= clk;
+        outPe.input('reset').srcConnection! <= reset;
+        outPe.input('reset_ep').srcConnection! <= Const(0);
+        outPe.input('dev_addr').srcConnection! <= Const(0, width: 7);
+        outPe.input('out_ep_data_get').srcConnection! <= getSig;
+        outPe.input('out_ep_stall').srcConnection! <= Const(0);
+        outPe.input('out_ep_grant').srcConnection! <= Const(1);
+        outPe.input('rx_pkt_start').srcConnection! <= rxPktStart;
+        outPe.input('rx_pkt_end').srcConnection! <= rxPktEnd;
+        outPe.input('rx_pkt_valid').srcConnection! <= rxPktValid;
+        outPe.input('rx_pid').srcConnection! <= rxPid;
+        outPe.input('rx_addr').srcConnection! <= Const(0, width: 7);
+        outPe.input('rx_endp').srcConnection! <= Const(0, width: 4);
+        outPe.input('rx_frame_num').srcConnection! <= Const(0, width: 11);
+        outPe.input('rx_data_put').srcConnection! <= rxDataPut;
+        outPe.input('rx_data').srcConnection! <= rxData;
+        outPe.input('tx_pkt_end').srcConnection! <= Const(0);
+
+        await outPe.build();
+
+        reset.inject(1);
+        getSig.inject(0);
+        rxPktStart.inject(0);
+        rxPktEnd.inject(0);
+        rxPktValid.inject(0);
+        rxPid.inject(0);
+        rxDataPut.inject(0);
+        rxData.inject(0);
+        Simulator.setMaxSimTime(200000);
+        unawaited(Simulator.run());
+
+        await clk.nextPosedge;
+        await clk.nextPosedge;
+        reset.inject(0);
+        for (var i = 0; i < 10; i++) {
+          await clk.nextPosedge;
+        }
+
+        // out_ep_acked is a one-cycle pulse, so it is counted on every
+        // edge rather than sampled once after the fact.
+        var ackedCount = 0;
+        final sub = clk.posedge.listen((_) {
+          if (outPe.output('out_ep_acked').value.toInt() == 1) ackedCount++;
+        });
+
+        // First OUT transaction: a 3-byte DATA0 payload.
+        rxPktEnd.inject(1);
+        rxPktValid.inject(1);
+        rxPid.inject(1); // OUT token.
+        await clk.nextPosedge;
+        rxPktEnd.inject(0);
+        rxPktValid.inject(0);
+        await clk.nextPosedge;
+
+        rxPktStart.inject(1);
+        await clk.nextPosedge;
+        rxPktStart.inject(0);
+
+        final firstPayload = <int>[0xAA, 0xBB, 0xCC];
+        for (final b in firstPayload) {
+          rxDataPut.inject(1);
+          rxData.inject(b);
+          await clk.nextPosedge;
+        }
+        // Two CRC bytes: counted into the put address, not read back.
+        for (var i = 0; i < 2; i++) {
+          rxDataPut.inject(1);
+          rxData.inject(0);
+          await clk.nextPosedge;
+        }
+        rxDataPut.inject(0);
+
+        rxPktEnd.inject(1);
+        rxPktValid.inject(1);
+        rxPid.inject(3); // DATA0.
+        await clk.nextPosedge;
+        rxPktEnd.inject(0);
+        rxPktValid.inject(0);
+        for (var i = 0; i < 5; i++) {
+          await clk.nextPosedge;
+        }
+
+        expect(ackedCount, 1, reason: 'first packet ACKed');
+        ackedCount = 0;
+
+        // Drain all three bytes. out_ep_data already holds the byte at
+        // the current get address, so each one is sampled before the
+        // pulse that advances past it.
+        final gotBytes = <int>[];
+        for (var i = 0; i < 2; i++) {
+          gotBytes.add(outPe.output('out_ep_data').value.toInt());
+          getSig.inject(1);
+          await clk.nextPosedge;
+          getSig.inject(0);
+          await clk.nextPosedge;
+        }
+
+        // The last byte's sample, and the sample's own get pulse, land
+        // the same way. That pulse and the second OUT token's arrival
+        // for the same endpoint land one cycle apart: the drain only
+        // becomes visible (get address caught up to put address) the
+        // cycle after the pulse, which is exactly the cycle this
+        // token's own token-received pulse fires.
+        gotBytes.add(outPe.output('out_ep_data').value.toInt());
+        getSig.inject(1);
+        await clk.nextPosedge;
+        getSig.inject(0);
+        rxPktEnd.inject(1);
+        rxPktValid.inject(1);
+        rxPid.inject(1); // OUT token, same endpoint.
+        await clk.nextPosedge;
+        rxPktEnd.inject(0);
+        rxPktValid.inject(0);
+        await clk.nextPosedge;
+
+        rxPktStart.inject(1);
+        await clk.nextPosedge;
+        rxPktStart.inject(0);
+
+        const secondPayload = [0xDD];
+        for (final b in secondPayload) {
+          rxDataPut.inject(1);
+          rxData.inject(b);
+          await clk.nextPosedge;
+        }
+        for (var i = 0; i < 2; i++) {
+          rxDataPut.inject(1);
+          rxData.inject(0);
+          await clk.nextPosedge;
+        }
+        rxDataPut.inject(0);
+
+        rxPktEnd.inject(1);
+        rxPktValid.inject(1);
+        rxPid.inject(11); // DATA1: the toggle flipped after the first ACK.
+        await clk.nextPosedge;
+        rxPktEnd.inject(0);
+        rxPktValid.inject(0);
+        for (var i = 0; i < 10; i++) {
+          await clk.nextPosedge;
+        }
+
+        expect(ackedCount, 1, reason: 'second packet ACKed too');
+
+        // Drain the second packet's one byte.
+        var guard = 0;
+        while (outPe.output('out_ep_data_avail').value.toInt() == 1 &&
+            guard < 10) {
+          guard++;
+          gotBytes.add(outPe.output('out_ep_data').value.toInt());
+          getSig.inject(1);
+          await clk.nextPosedge;
+          getSig.inject(0);
+          await clk.nextPosedge;
+        }
+
+        expect(
+          gotBytes,
+          [...firstPayload, ...secondPayload],
+          reason:
+              'the second packet must still become available, not get '
+              'stuck in ready forever',
+        );
+
+        await sub.cancel();
+        await Simulator.endSimulation();
+      },
+    );
   });
 }

@@ -17,6 +17,22 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 
 import 'usb_fs_phy.dart';
 
+// Bus turnaround timeout in clock cycles at 4 cycles per bit (USB 2.0
+// 7.1.19.1). The response SYNC must start within 18 bit times. The
+// receiver flags it after the 8 SYNC bits and about 1 bit of delay.
+const _turnaroundCycles = (18 + 8 + 1) * 4;
+
+// Hard limit on the handshake wait, from the end of the IN data packet. A
+// legal handshake or token is flagged by the turnaround timeout and has at
+// most 24 more bits, 4 stuff bits and the EOP. That is 58 bit times.
+const _ackCeilingCycles = 64 * 4;
+
+// Hard limit on an OUT data wait, from the end of the token, at 4 cycles
+// per bit. The data packet starts by the turnaround timeout and has the
+// PID, the payload, the CRC16, a stuff bit per 6 bits, the EOP and margin.
+int _outCeilingCycles(int maxPacketSize) =>
+    (27 + ((maxPacketSize + 3) * 8 * 7 + 5) ~/ 6 + 2 + 8) * 4;
+
 /// IN endpoint protocol engine, ported from usb_fs_in_pe.v.
 class HarborUsbFsInPe extends BridgeModule {
   /// Number of IN endpoints this engine serves.
@@ -37,7 +53,10 @@ class HarborUsbFsInPe extends BridgeModule {
     createPort('in_ep_data', PortDirection.input, width: 8);
     createPort('in_ep_data_done', PortDirection.input, width: numInEps);
     createPort('in_ep_stall', PortDirection.input, width: numInEps);
+    createPort('setup_token', PortDirection.input, width: numInEps);
+    createPort('flush', PortDirection.input, width: numInEps);
     addOutput('in_ep_acked', width: numInEps);
+    addOutput('busy', width: numInEps);
 
     createPort('rx_pkt_start', PortDirection.input);
     createPort('rx_pkt_end', PortDirection.input);
@@ -62,18 +81,21 @@ class HarborUsbFsInPe extends BridgeModule {
     final inEpData = input('in_ep_data');
     final inEpDataDone = input('in_ep_data_done');
     final inEpStall = input('in_ep_stall');
+    final setupToken = input('setup_token');
+    final flush = input('flush');
+    final rxPktStart = input('rx_pkt_start');
     final rxPktEnd = input('rx_pkt_end');
     final rxPktValid = input('rx_pkt_valid');
     final rxPid = input('rx_pid');
     final rxAddr = input('rx_addr');
     final rxEndp = input('rx_endp');
+    final txPktEnd = input('tx_pkt_end');
     final txDataGet = input('tx_data_get');
 
     // Endpoint states.
     const stReady = 0;
     const stPutting = 1;
     const stGetting = 2;
-    const stStall = 3;
 
     final epState = List.generate(
       numInEps,
@@ -83,13 +105,16 @@ class HarborUsbFsInPe extends BridgeModule {
       numInEps,
       (ep) => Logic(name: 'ep_state_next_$ep', width: 2),
     );
+    // Wide enough to hold the full-packet sentinel value maxPacketSize
+    // itself, so put and get addresses never wrap before a packet fills.
+    final addrWidth = maxPacketSize.bitLength;
     final epPutAddr = List.generate(
       numInEps,
-      (ep) => Logic(name: 'ep_put_addr_$ep', width: 6),
+      (ep) => Logic(name: 'ep_put_addr_$ep', width: addrWidth),
     );
     final epGetAddr = List.generate(
       numInEps,
-      (ep) => Logic(name: 'ep_get_addr_$ep', width: 6),
+      (ep) => Logic(name: 'ep_get_addr_$ep', width: addrWidth),
     );
     final dataToggle = List.generate(
       numInEps,
@@ -103,6 +128,16 @@ class HarborUsbFsInPe extends BridgeModule {
         (i) => Logic(name: 'in_buf_${ep}_$i', width: 8),
       );
     });
+
+    // A put address at maxPacketSize means the buffer holds a full
+    // packet. A direct comparison replaces a fixed top-bit check, which
+    // only read true at maxPacketSize 32.
+    final epPutFull = List.generate(
+      numInEps,
+      (ep) => epPutAddr[ep]
+          .eq(Const(maxPacketSize, width: addrWidth))
+          .named('ep_put_full_$ep'),
+    );
 
     // Transfer states.
     const xfrIdle = 0;
@@ -134,11 +169,6 @@ class HarborUsbFsInPe extends BridgeModule {
                 rxEndp.lt(Const(numInEps, width: 4)))
             .named('token_received');
 
-    final setupTokenReceived =
-        (tokenReceived & rxPid.slice(3, 2).eq(Const(3, width: 2))).named(
-          'setup_token_received',
-        );
-
     final inTokenReceived =
         (tokenReceived & rxPid.slice(3, 2).eq(Const(2, width: 2))).named(
           'in_token_received',
@@ -147,12 +177,63 @@ class HarborUsbFsInPe extends BridgeModule {
     final ackReceived = (rxPktEnd & rxPktValid & rxPid.eq(Const(2, width: 4)))
         .named('ack_received');
 
+    // The handshake wait starts at the end of the data packet. With no
+    // packet start it ends at the turnaround timeout, and in any case at
+    // the ceiling.
+    final timerWidth = _ackCeilingCycles.bitLength;
+    final ackTimer = Logic(name: 'ack_timer', width: timerWidth);
+    final ackTimerRun = Logic(name: 'ack_timer_run');
+    final ackPktSeen = Logic(name: 'ack_pkt_seen');
+    final ackTimeout =
+        (ackTimerRun &
+                ((~ackPktSeen &
+                        ~rxPktStart &
+                        ackTimer.eq(
+                          Const(_turnaroundCycles - 1, width: timerWidth),
+                        )) |
+                    ackTimer.eq(
+                      Const(_ackCeilingCycles - 1, width: timerWidth),
+                    )))
+            .named('ack_timeout');
+    Sequential(clk, [
+      If(
+        reset | ~inXfrState.eq(Const(xfrWaitAck, width: 2)),
+        then: [
+          ackTimerRun < Const(0),
+          ackPktSeen < Const(0),
+          ackTimer < Const(0, width: timerWidth),
+        ],
+        orElse: [
+          If(
+            txPktEnd,
+            then: [
+              ackTimerRun < Const(1),
+              ackTimer < Const(0, width: timerWidth),
+            ],
+            orElse: [
+              If(
+                ackTimerRun,
+                then: [ackTimer < ackTimer + Const(1, width: timerWidth)],
+              ),
+            ],
+          ),
+          If(rxPktStart, then: [ackPktSeen < Const(1)]),
+        ],
+      ),
+    ]);
+
     // ------------------------------------------------------------------
     // Current-endpoint selects: state and data toggle.
     // ------------------------------------------------------------------
     Logic currentEpState = epState[0];
     Logic currentDataToggle = dataToggle[0];
+    Logic currentStall = inEpStall[0];
     for (var ep = 1; ep < numInEps; ep++) {
+      currentStall = mux(
+        currentEndp.eq(Const(ep, width: 4)),
+        inEpStall[ep],
+        currentStall,
+      );
       currentEpState = mux(
         currentEndp.eq(Const(ep, width: 4)),
         epState[ep],
@@ -174,28 +255,82 @@ class HarborUsbFsInPe extends BridgeModule {
       (ep) => Logic(name: 'data_free_$ep'),
     );
 
+    // An IN transaction on the endpoint is in progress. The token cycle
+    // itself is idle.
+    final busyBits = List.generate(
+      numInEps,
+      (ep) =>
+          (~inXfrState.eq(Const(xfrIdle, width: 2)) &
+                  currentEndp.eq(Const(ep, width: 4)))
+              .named('busy_$ep'),
+    );
+    output('busy') <= busyBits.rswizzle();
+
+    // A flush drops the packet and its bytes. It does nothing while the
+    // endpoint is busy.
+    final flushApply = List.generate(
+      numInEps,
+      (ep) => (flush[ep] & ~busyBits[ep]).named('flush_apply_$ep'),
+    );
+
+    // A toggle reset waits for the end of an IN transaction on its
+    // endpoint and then sets only the toggle. A SETUP drops it.
+    final togglePending = List.generate(
+      numInEps,
+      (ep) => Logic(name: 'toggle_pending_$ep'),
+    );
+    final toggleApply = List.generate(
+      numInEps,
+      (ep) =>
+          ((resetEp[ep] | togglePending[ep]) & ~setupToken[ep] & ~busyBits[ep])
+              .named('toggle_apply_$ep'),
+    );
+    for (var ep = 0; ep < numInEps; ep++) {
+      Sequential(clk, [
+        If(
+          reset | setupToken[ep] | toggleApply[ep],
+          then: [togglePending[ep] < Const(0)],
+          orElse: [
+            If(resetEp[ep], then: [togglePending[ep] < Const(1)]),
+          ],
+        ),
+      ]);
+    }
+
     for (var ep = 0; ep < numInEps; ep++) {
       Combinational([
         ackedBits[ep] < Const(0),
         epStateNext[ep] < epState[ep],
-        If(
-          inEpStall.slice(ep, ep),
-          then: [epStateNext[ep] < Const(stStall, width: 2)],
-          orElse: [
-            Case(
-              epState[ep],
-              [
-                CaseItem(Const(stReady, width: 2), [
-                  epStateNext[ep] < Const(stPutting, width: 2),
-                ]),
-                CaseItem(Const(stPutting, width: 2), [
+        Case(
+          epState[ep],
+          [
+            CaseItem(Const(stReady, width: 2), [
+              epStateNext[ep] < Const(stPutting, width: 2),
+            ]),
+            CaseItem(Const(stPutting, width: 2), [
+              // A SETUP preempts a packet the function is still
+              // writing (USB 2.0 8.5.3/9.2.6.4): drop it rather than
+              // let a stale write finish arming after the request it
+              // belonged to is already gone.
+              If(
+                setupToken[ep],
+                then: [epStateNext[ep] < Const(stReady, width: 2)],
+                orElse: [
                   If(
-                    inEpDataDone.slice(ep, ep) | epPutAddr[ep].slice(5, 5),
+                    inEpDataDone.slice(ep, ep) | epPutFull[ep],
                     then: [epStateNext[ep] < Const(stGetting, width: 2)],
                     orElse: [epStateNext[ep] < Const(stPutting, width: 2)],
                   ),
-                ]),
-                CaseItem(Const(stGetting, width: 2), [
+                ],
+              ),
+            ]),
+            CaseItem(Const(stGetting, width: 2), [
+              // Same rule for a packet already armed to send: a
+              // SETUP drops it unsent.
+              If(
+                setupToken[ep],
+                then: [epStateNext[ep] < Const(stReady, width: 2)],
+                orElse: [
                   If(
                     inXfrEnd & currentEndp.eq(Const(ep, width: 4)),
                     then: [
@@ -204,22 +339,15 @@ class HarborUsbFsInPe extends BridgeModule {
                     ],
                     orElse: [epStateNext[ep] < Const(stGetting, width: 2)],
                   ),
-                ]),
-                CaseItem(Const(stStall, width: 2), [
-                  If(
-                    setupTokenReceived & rxEndp.eq(Const(ep, width: 4)),
-                    then: [epStateNext[ep] < Const(stReady, width: 2)],
-                    orElse: [epStateNext[ep] < Const(stStall, width: 2)],
-                  ),
-                ]),
-              ],
-              defaultItem: [epStateNext[ep] < Const(stReady, width: 2)],
-            ),
+                ],
+              ),
+            ]),
           ],
+          defaultItem: [epStateNext[ep] < Const(stReady, width: 2)],
         ),
+        If(flushApply[ep], then: [epStateNext[ep] < Const(stReady, width: 2)]),
         dataFreeBits[ep] <
-            ~epPutAddr[ep].slice(5, 5) &
-                epState[ep].eq(Const(stPutting, width: 2)),
+            ~epPutFull[ep] & epState[ep].eq(Const(stPutting, width: 2)),
       ]);
     }
 
@@ -232,22 +360,24 @@ class HarborUsbFsInPe extends BridgeModule {
     for (var ep = 0; ep < numInEps; ep++) {
       Sequential(clk, [
         If(
-          reset | resetEp.slice(ep, ep),
+          reset,
           then: [
             epState[ep] < Const(stReady, width: 2),
             // The original gives ep_put_addr an initial value of 0.
-            epPutAddr[ep] < Const(0, width: 6),
+            epPutAddr[ep] < Const(0, width: addrWidth),
           ],
           orElse: [
             epState[ep] < epStateNext[ep],
             Case(epState[ep], [
               CaseItem(Const(stReady, width: 2), [
-                epPutAddr[ep] < Const(0, width: 6),
+                epPutAddr[ep] < Const(0, width: addrWidth),
               ]),
               CaseItem(Const(stPutting, width: 2), [
                 If(
-                  inEpDataPut.slice(ep, ep) & ~epPutAddr[ep].slice(5, 5),
-                  then: [epPutAddr[ep] < epPutAddr[ep] + Const(1, width: 6)],
+                  inEpDataPut.slice(ep, ep) & ~epPutFull[ep],
+                  then: [
+                    epPutAddr[ep] < epPutAddr[ep] + Const(1, width: addrWidth),
+                  ],
                 ),
               ]),
             ]),
@@ -277,8 +407,8 @@ class HarborUsbFsInPe extends BridgeModule {
             inEpNum.eq(Const(ep, width: 4)) &
                 epState[ep].eq(Const(stPutting, width: 2)) &
                 inEpDataPut.slice(ep, ep) &
-                ~epPutAddr[ep].slice(5, 5) &
-                epPutAddr[ep].slice(4, 0).eq(Const(i, width: 5)),
+                ~epPutFull[ep] &
+                epPutAddr[ep].eq(Const(i, width: addrWidth)),
             then: [buffer[ep][i] < inEpData],
           ),
         ]);
@@ -294,7 +424,7 @@ class HarborUsbFsInPe extends BridgeModule {
       Logic epMux = Const(0, width: 8);
       for (var i = 0; i < maxPacketSize; i++) {
         epMux = mux(
-          epGetAddr[ep].slice(4, 0).eq(Const(i, width: 5)),
+          epGetAddr[ep].eq(Const(i, width: addrWidth)),
           buffer[ep][i],
           epMux,
         );
@@ -345,7 +475,7 @@ class HarborUsbFsInPe extends BridgeModule {
           CaseItem(Const(xfrRcvdIn, width: 2), [
             txPktStart < Const(1),
             If(
-              currentEpState.eq(Const(stStall, width: 2)),
+              currentStall,
               then: [
                 inXfrStateNext < Const(xfrIdle, width: 2),
                 txPid < Const(14, width: 4),
@@ -389,7 +519,7 @@ class HarborUsbFsInPe extends BridgeModule {
                   ],
                   orElse: [
                     If(
-                      rxPktEnd,
+                      rxPktEnd | ackTimeout,
                       then: [
                         inXfrStateNext < Const(xfrIdle, width: 2),
                         rollbackInXfr < Const(1),
@@ -430,7 +560,7 @@ class HarborUsbFsInPe extends BridgeModule {
     ]);
 
     // ------------------------------------------------------------------
-    // Per-endpoint sequential: toggles and get addresses. The reset_ep
+    // Per-endpoint sequential: toggles and get addresses. The reset
     // override comes last so it wins, as in the original.
     // ------------------------------------------------------------------
     for (var ep = 0; ep < numInEps; ep++) {
@@ -439,20 +569,20 @@ class HarborUsbFsInPe extends BridgeModule {
         If(
           ~reset,
           then: [
-            If(
-              setupTokenReceived & rxEndp.eq(Const(ep, width: 4)),
-              then: [dataToggle[ep] < Const(1)],
-            ),
+            If(toggleApply[ep], then: [dataToggle[ep] < Const(0)]),
+            If(setupToken[ep], then: [dataToggle[ep] < Const(1)]),
             If(
               rollbackInXfr & isCurrent,
-              then: [epGetAddr[ep] < Const(0, width: 6)],
+              then: [epGetAddr[ep] < Const(0, width: addrWidth)],
             ),
             If(
               inXfrState.eq(Const(xfrSendData, width: 2)) &
                   txDataGet &
                   txDataAvail &
                   isCurrent,
-              then: [epGetAddr[ep] < epGetAddr[ep] + Const(1, width: 6)],
+              then: [
+                epGetAddr[ep] < epGetAddr[ep] + Const(1, width: addrWidth),
+              ],
             ),
             If(
               inXfrState.eq(Const(xfrWaitAck, width: 2)) &
@@ -463,8 +593,11 @@ class HarborUsbFsInPe extends BridgeModule {
           ],
         ),
         If(
-          reset | resetEp.slice(ep, ep),
-          then: [dataToggle[ep] < Const(0), epGetAddr[ep] < Const(0, width: 6)],
+          reset,
+          then: [
+            dataToggle[ep] < Const(0),
+            epGetAddr[ep] < Const(0, width: addrWidth),
+          ],
         ),
       ]);
     }
@@ -479,8 +612,33 @@ class HarborUsbFsOutPe extends BridgeModule {
   /// Maximum packet payload per endpoint, in bytes.
   final int maxPacketSize;
 
-  HarborUsbFsOutPe({this.numOutEps = 1, this.maxPacketSize = 32, String? name})
-    : super('HarborUsbFsOutPe', name: name ?? 'usb_fs_out_pe') {
+  /// Adds an `out_ep_length` output: each endpoint's payload length (put
+  /// address minus the 2 CRC bytes). It is valid from the `out_ep_acked`
+  /// cycle until the endpoint starts to receive its next packet.
+  final bool exposeLength;
+
+  /// Adds an `out_ep_release` input and an `out_ep_held` output. A received
+  /// packet then stays held, and the endpoint NAKs, until a release pulse.
+  /// Reading the last byte does not free the endpoint.
+  final bool exposeRelease;
+
+  /// Adds an `out_ep_setup_done` output: a one-cycle pulse per endpoint
+  /// on the cycle the engine ACKs a SETUP data packet. Off by default.
+  final bool exposeSetupDone;
+
+  /// Adds an `out_ep_control` input that marks the control endpoints. Off
+  /// by default, and then only endpoint 0 is a control endpoint.
+  final bool exposeControl;
+
+  HarborUsbFsOutPe({
+    this.numOutEps = 1,
+    this.maxPacketSize = 32,
+    this.exposeLength = false,
+    this.exposeRelease = false,
+    this.exposeSetupDone = false,
+    this.exposeControl = false,
+    String? name,
+  }) : super('HarborUsbFsOutPe', name: name ?? 'usb_fs_out_pe') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('reset_ep', PortDirection.input, width: numOutEps);
@@ -492,13 +650,29 @@ class HarborUsbFsOutPe extends BridgeModule {
     addOutput('out_ep_data', width: 8);
     createPort('out_ep_stall', PortDirection.input, width: numOutEps);
     addOutput('out_ep_acked', width: numOutEps);
-    // The size class of the packet that out_ep_acked reports. High when
-    // that packet carried a full maxPacketSize payload, low when it was
-    // shorter (a short packet or a zero-length packet). A bulk transfer
-    // ends on a short or zero-length packet, so this tells a consumer
-    // whether the next packet continues the same transfer.
+    // The size class of the packet out_ep_acked reports: high for a full
+    // maxPacketSize payload, low for a short or zero-length packet. A
+    // bulk transfer ends on a short or zero-length packet, so this tells
+    // a consumer whether the next packet continues the same transfer.
     addOutput('out_ep_pkt_full', width: numOutEps);
     createPort('out_ep_grant', PortDirection.input, width: numOutEps);
+    if (exposeLength) {
+      addOutput(
+        'out_ep_length',
+        width: numOutEps * (maxPacketSize + 2).bitLength,
+      );
+    }
+    if (exposeRelease) {
+      createPort('out_ep_release', PortDirection.input, width: numOutEps);
+      addOutput('out_ep_held', width: numOutEps);
+    }
+    addOutput('out_ep_setup_token', width: numOutEps);
+    if (exposeControl) {
+      createPort('out_ep_control', PortDirection.input, width: numOutEps);
+    }
+    if (exposeSetupDone) {
+      addOutput('out_ep_setup_done', width: numOutEps);
+    }
 
     createPort('rx_pkt_start', PortDirection.input);
     createPort('rx_pkt_end', PortDirection.input);
@@ -534,7 +708,6 @@ class HarborUsbFsOutPe extends BridgeModule {
     const stReady = 0;
     const stPutting = 1;
     const stGetting = 2;
-    const stStall = 3;
 
     final epState = List.generate(
       numOutEps,
@@ -544,17 +717,20 @@ class HarborUsbFsOutPe extends BridgeModule {
       numOutEps,
       (ep) => Logic(name: 'ep_state_next_$ep', width: 2),
     );
+    // Wide enough to hold a full packet's payload plus its 2 CRC bytes,
+    // so the put address never wraps before the packet is whole.
+    final addrWidth = (maxPacketSize + 2).bitLength;
     final epGetAddr = List.generate(
       numOutEps,
-      (ep) => Logic(name: 'ep_get_addr_$ep', width: 6),
+      (ep) => Logic(name: 'ep_get_addr_$ep', width: addrWidth),
     );
     final epGetAddrNext = List.generate(
       numOutEps,
-      (ep) => Logic(name: 'ep_get_addr_next_$ep', width: 6),
+      (ep) => Logic(name: 'ep_get_addr_next_$ep', width: addrWidth),
     );
     final epPutAddr = List.generate(
       numOutEps,
-      (ep) => Logic(name: 'ep_put_addr_$ep', width: 6),
+      (ep) => Logic(name: 'ep_put_addr_$ep', width: addrWidth),
     );
     final dataToggle = List.generate(
       numOutEps,
@@ -580,11 +756,16 @@ class HarborUsbFsOutPe extends BridgeModule {
     final newPktEnd = Logic(name: 'new_pkt_end');
     final rollbackData = Logic(name: 'rollback_data');
     final nakOutTransfer = Logic(name: 'nak_out_transfer');
+    final stallOutTransfer = Logic(name: 'stall_out_transfer');
+    final setupXfr = Logic(name: 'setup_xfr_q');
 
     final currentEndp = Logic(name: 'current_endp', width: 4);
 
     final txPktStart = Logic(name: 'tx_pkt_start_i');
     final txPid = Logic(name: 'tx_pid_i', width: 4);
+
+    // Set when the current packet has more bytes than the buffer holds.
+    final rxOverflow = Logic(name: 'rx_overflow');
 
     final outEpSetup = Logic(name: 'out_ep_setup_i', width: numOutEps);
     final ackedBits = List.generate(
@@ -616,10 +797,22 @@ class HarborUsbFsOutPe extends BridgeModule {
           'out_token_received',
         );
 
+    // SETUP is for control endpoints only (USB 2.0 8.5.3). A SETUP to
+    // another endpoint is ignored and gets no handshake.
+    final controlMask = exposeControl
+        ? input('out_ep_control')
+        : Const(1, width: numOutEps);
+    Logic rxIsControl = controlMask[0];
+    for (var ep = 1; ep < numOutEps; ep++) {
+      rxIsControl = mux(
+        rxEndp.eq(Const(ep, width: 4)),
+        controlMask[ep],
+        rxIsControl,
+      );
+    }
     final setupTokenReceived =
-        (tokenReceived & rxPid.slice(3, 2).eq(Const(3, width: 2))).named(
-          'setup_token_received',
-        );
+        (tokenReceived & rxPid.slice(3, 2).eq(Const(3, width: 2)) & rxIsControl)
+            .named('setup_token_received');
 
     final invalidPacketReceived = (rxPktEnd & ~rxPktValid).named(
       'invalid_packet_received',
@@ -653,24 +846,66 @@ class HarborUsbFsOutPe extends BridgeModule {
     // Current-endpoint state select.
     // ------------------------------------------------------------------
     Logic currentEpState = epState[0];
+    Logic currentStall = outEpStall[0];
     for (var ep = 1; ep < numOutEps; ep++) {
       currentEpState = mux(
         currentEndp.eq(Const(ep, width: 4)),
         epState[ep],
         currentEpState,
       );
+      currentStall = mux(
+        currentEndp.eq(Const(ep, width: 4)),
+        outEpStall[ep],
+        currentStall,
+      );
     }
 
-    final currentEpBusy =
-        (currentEpState.eq(Const(stGetting, width: 2)) |
-                currentEpState.eq(Const(stReady, width: 2)))
-            .named('current_ep_busy');
+    // Busy means a packet from before is still waiting to be read. A
+    // SETUP is never busy: the stGetting case below leaves busy for a
+    // SETUP before this flag is read.
+    final currentEpBusy = currentEpState
+        .eq(Const(stGetting, width: 2))
+        .named('current_ep_busy');
+
+    // The put address stops at a full payload plus CRC. One more byte
+    // means the packet is too long and is dropped with no handshake.
+    Logic currentPutFull = Const(0);
+    for (var ep = 0; ep < numOutEps; ep++) {
+      currentPutFull = mux(
+        currentEndp.eq(Const(ep, width: 4)),
+        epPutAddr[ep].eq(Const(maxPacketSize + 2, width: addrWidth)),
+        currentPutFull,
+      );
+    }
+
+    // The data packet must start within the turnaround time after the
+    // token and end before the ceiling, or the transaction ends with no
+    // handshake.
+    final outCeiling = _outCeilingCycles(maxPacketSize);
+    final timerWidth = outCeiling.bitLength;
+    final dataTimer = Logic(name: 'data_timer', width: timerWidth);
+    final dataTimeout =
+        (outXfrState.eq(Const(xfrRcvdOut, width: 2)) &
+                dataTimer.eq(Const(_turnaroundCycles - 1, width: timerWidth)) &
+                ~rxPktStart)
+            .named('data_timeout');
+    final dataCeiling =
+        (outXfrState.eq(Const(xfrRcvdDataStart, width: 2)) &
+                dataTimer.eq(Const(outCeiling - 1, width: timerWidth)))
+            .named('data_ceiling');
+    Sequential(clk, [
+      If(
+        reset |
+            ~(outXfrState.eq(Const(xfrRcvdOut, width: 2)) |
+                outXfrState.eq(Const(xfrRcvdDataStart, width: 2))),
+        then: [dataTimer < Const(0, width: timerWidth)],
+        orElse: [dataTimer < dataTimer + Const(1, width: timerWidth)],
+      ),
+    ]);
 
     // The ACK branch condition for the data-end state.
     final ackBranch =
-        (outXfrState.eq(Const(xfrRcvdDataEnd, width: 2)) &
-                ~currentEpState.eq(Const(stStall, width: 2)) &
-                ~nakOutTransfer)
+        (outXfrState.eq(Const(xfrRcvdDataEnd, width: 2)) & ~nakOutTransfer)
             .named('ack_branch');
 
     // ------------------------------------------------------------------
@@ -701,12 +936,21 @@ class HarborUsbFsOutPe extends BridgeModule {
             If(
               rxPktStart,
               then: [outXfrStateNext < Const(xfrRcvdDataStart, width: 2)],
-              orElse: [outXfrStateNext < Const(xfrRcvdOut, width: 2)],
+              orElse: [
+                If(
+                  dataTimeout,
+                  then: [
+                    outXfrStateNext < Const(xfrIdle, width: 2),
+                    rollbackData < Const(1),
+                  ],
+                  orElse: [outXfrStateNext < Const(xfrRcvdOut, width: 2)],
+                ),
+              ],
             ),
           ]),
           CaseItem(Const(xfrRcvdDataStart, width: 2), [
             If(
-              badDataToggle,
+              badDataToggle & ~stallOutTransfer,
               then: [
                 outXfrStateNext < Const(xfrIdle, width: 2),
                 rollbackData < Const(1),
@@ -715,7 +959,9 @@ class HarborUsbFsOutPe extends BridgeModule {
               ],
               orElse: [
                 If(
-                  invalidPacketReceived | nonDataPacketReceived,
+                  invalidPacketReceived |
+                      nonDataPacketReceived |
+                      (dataPacketReceived & rxOverflow),
                   then: [
                     outXfrStateNext < Const(xfrIdle, width: 2),
                     rollbackData < Const(1),
@@ -725,7 +971,16 @@ class HarborUsbFsOutPe extends BridgeModule {
                       dataPacketReceived,
                       then: [outXfrStateNext < Const(xfrRcvdDataEnd, width: 2)],
                       orElse: [
-                        outXfrStateNext < Const(xfrRcvdDataStart, width: 2),
+                        If(
+                          dataCeiling,
+                          then: [
+                            outXfrStateNext < Const(xfrIdle, width: 2),
+                            rollbackData < Const(1),
+                          ],
+                          orElse: [
+                            outXfrStateNext < Const(xfrRcvdDataStart, width: 2),
+                          ],
+                        ),
                       ],
                     ),
                   ],
@@ -737,8 +992,8 @@ class HarborUsbFsOutPe extends BridgeModule {
             outXfrStateNext < Const(xfrIdle, width: 2),
             txPktStart < Const(1),
             If(
-              currentEpState.eq(Const(stStall, width: 2)),
-              then: [txPid < Const(14, width: 4)],
+              stallOutTransfer,
+              then: [txPid < Const(14, width: 4), rollbackData < Const(1)],
               orElse: [
                 If(
                   nakOutTransfer,
@@ -756,6 +1011,66 @@ class HarborUsbFsOutPe extends BridgeModule {
     output('tx_pkt_start') <= txPktStart;
     output('tx_pid') <= txPid;
 
+    // A SETUP transfer is never stalled (USB 2.0 8.5.3).
+    Sequential(clk, [
+      If(
+        reset,
+        then: [setupXfr < Const(0)],
+        orElse: [
+          If(
+            outXfrStart,
+            then: [setupXfr < setupTokenReceived],
+            orElse: [
+              If(
+                outXfrStateNext.eq(Const(xfrIdle, width: 2)),
+                then: [setupXfr < Const(0)],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ]);
+    final setupTokenBits = List.generate(
+      numOutEps,
+      (ep) => setupTokenReceived & rxEndp.eq(Const(ep, width: 4)),
+    );
+    output('out_ep_setup_token') <= setupTokenBits.rswizzle();
+    if (exposeSetupDone) {
+      output('out_ep_setup_done') <=
+          List.generate(
+            numOutEps,
+            (ep) => newPktEnd & setupXfr & currentEndp.eq(Const(ep, width: 4)),
+          ).rswizzle();
+    }
+
+    // A toggle reset waits for the end of an OUT transaction on its
+    // endpoint and then sets only the toggle. A held packet stays held.
+    // A SETUP drops it.
+    final togglePending = List.generate(
+      numOutEps,
+      (ep) => Logic(name: 'toggle_pending_$ep'),
+    );
+    final toggleApply = List.generate(
+      numOutEps,
+      (ep) =>
+          ((resetEp[ep] | togglePending[ep]) &
+                  ~setupTokenBits[ep] &
+                  ~(~outXfrState.eq(Const(xfrIdle, width: 2)) &
+                      currentEndp.eq(Const(ep, width: 4))))
+              .named('toggle_apply_$ep'),
+    );
+    for (var ep = 0; ep < numOutEps; ep++) {
+      Sequential(clk, [
+        If(
+          reset | setupTokenBits[ep] | toggleApply[ep],
+          then: [togglePending[ep] < Const(0)],
+          orElse: [
+            If(resetEp[ep], then: [togglePending[ep] < Const(1)]),
+          ],
+        ),
+      ]);
+    }
+
     // ------------------------------------------------------------------
     // Per-endpoint combinational: acked, next state, get address next,
     // data available.
@@ -771,69 +1086,88 @@ class HarborUsbFsOutPe extends BridgeModule {
         // plus two bytes.
         pktFullBits[ep] <
             ackedBits[ep] &
-                epPutAddr[ep].eq(Const(maxPacketSize + 2, width: 6)),
+                epPutAddr[ep].eq(Const(maxPacketSize + 2, width: addrWidth)),
 
         epStateNext[ep] < epState[ep],
-        If(
-          outEpStall.slice(ep, ep),
-          then: [epStateNext[ep] < Const(stStall, width: 2)],
-          orElse: [
-            Case(
-              epState[ep],
-              [
-                CaseItem(Const(stReady, width: 2), [
+        Case(
+          epState[ep],
+          [
+            CaseItem(Const(stReady, width: 2), [
+              If(
+                outXfrStart & rxEndp.eq(Const(ep, width: 4)),
+                then: [epStateNext[ep] < Const(stPutting, width: 2)],
+                orElse: [epStateNext[ep] < Const(stReady, width: 2)],
+              ),
+            ]),
+            CaseItem(Const(stPutting, width: 2), [
+              If(
+                newPktEnd & currentEndp.eq(Const(ep, width: 4)),
+                then: [epStateNext[ep] < Const(stGetting, width: 2)],
+                orElse: [
                   If(
-                    outXfrStart & rxEndp.eq(Const(ep, width: 4)),
-                    then: [epStateNext[ep] < Const(stPutting, width: 2)],
-                    orElse: [epStateNext[ep] < Const(stReady, width: 2)],
+                    rollbackData & currentEndp.eq(Const(ep, width: 4)),
+                    then: [epStateNext[ep] < Const(stReady, width: 2)],
+                    orElse: [epStateNext[ep] < Const(stPutting, width: 2)],
                   ),
-                ]),
-                CaseItem(Const(stPutting, width: 2), [
+                ],
+              ),
+            ]),
+            CaseItem(Const(stGetting, width: 2), [
+              If(
+                outXfrStart &
+                    rxEndp.eq(Const(ep, width: 4)) &
+                    setupTokenReceived,
+                // A SETUP always preempts an unread packet from
+                // before (USB 2.0 8.5.3.4): leave busy immediately,
+                // whether or not that packet was ever drained.
+                then: [epStateNext[ep] < Const(stPutting, width: 2)],
+                orElse: [
                   If(
-                    newPktEnd & currentEndp.eq(Const(ep, width: 4)),
-                    then: [epStateNext[ep] < Const(stGetting, width: 2)],
-                    orElse: [
+                    exposeRelease
+                        ? input('out_ep_release').slice(ep, ep)
+                        : epGetAddr[ep].gte(
+                            epPutAddr[ep] - Const(2, width: addrWidth),
+                          ),
+                    then: [
+                      // A token landing on or before the release cycle
+                      // misses ready's one-cycle outXfrStart check, so
+                      // this goes straight to putting. That transaction
+                      // can fill it, NAK it, or end with no transfer.
                       If(
-                        rollbackData & currentEndp.eq(Const(ep, width: 4)),
-                        then: [epStateNext[ep] < Const(stReady, width: 2)],
-                        orElse: [epStateNext[ep] < Const(stPutting, width: 2)],
+                        (outXfrStart & rxEndp.eq(Const(ep, width: 4))) |
+                            (~outXfrState.eq(Const(xfrIdle, width: 2)) &
+                                currentEndp.eq(Const(ep, width: 4))),
+                        then: [epStateNext[ep] < Const(stPutting, width: 2)],
+                        orElse: [epStateNext[ep] < Const(stReady, width: 2)],
                       ),
                     ],
-                  ),
-                ]),
-                CaseItem(Const(stGetting, width: 2), [
-                  If(
-                    epGetAddr[ep].gte(epPutAddr[ep] - Const(2, width: 6)),
-                    then: [epStateNext[ep] < Const(stReady, width: 2)],
                     orElse: [epStateNext[ep] < Const(stGetting, width: 2)],
                   ),
-                ]),
-                CaseItem(Const(stStall, width: 2), [
-                  If(
-                    setupTokenReceived & rxEndp.eq(Const(ep, width: 4)),
-                    then: [epStateNext[ep] < Const(stReady, width: 2)],
-                    orElse: [epStateNext[ep] < Const(stStall, width: 2)],
-                  ),
-                ]),
-              ],
-              defaultItem: [epStateNext[ep] < Const(stReady, width: 2)],
-            ),
+                ],
+              ),
+            ]),
           ],
+          defaultItem: [epStateNext[ep] < Const(stReady, width: 2)],
         ),
+        // Any state other than getting starts the next packet's get
+        // address fresh at 0. Both the getting-to-ready move and a
+        // direct getting-to-putting move (the same-cycle token race
+        // above) must clear it, or the next packet reads back stale.
         If(
-          epStateNext[ep].eq(Const(stReady, width: 2)),
-          then: [epGetAddrNext[ep] < Const(0, width: 6)],
-          orElse: [
+          epStateNext[ep].eq(Const(stGetting, width: 2)),
+          then: [
             If(
-              epStateNext[ep].eq(Const(stGetting, width: 2)) &
-                  outEpDataGet.slice(ep, ep),
-              then: [epGetAddrNext[ep] < epGetAddr[ep] + Const(1, width: 6)],
+              outEpDataGet.slice(ep, ep),
+              then: [
+                epGetAddrNext[ep] < epGetAddr[ep] + Const(1, width: addrWidth),
+              ],
               orElse: [epGetAddrNext[ep] < epGetAddr[ep]],
             ),
           ],
+          orElse: [epGetAddrNext[ep] < Const(0, width: addrWidth)],
         ),
         availBits[ep] <
-            epGetAddr[ep].lt(epPutAddr[ep] - Const(2, width: 6)) &
+            epGetAddr[ep].lt(epPutAddr[ep] - Const(2, width: addrWidth)) &
                 epState[ep].eq(Const(stGetting, width: 2)),
       ]);
     }
@@ -842,13 +1176,29 @@ class HarborUsbFsOutPe extends BridgeModule {
     output('out_ep_acked') <= ackedBits.rswizzle();
     output('out_ep_pkt_full') <= pktFullBits.rswizzle();
 
+    if (exposeLength) {
+      final lengthBits = List.generate(
+        numOutEps,
+        (ep) =>
+            (epPutAddr[ep] - Const(2, width: addrWidth)).named('ep_length_$ep'),
+      );
+      output('out_ep_length') <= lengthBits.rswizzle();
+    }
+    if (exposeRelease) {
+      output('out_ep_held') <=
+          List.generate(
+            numOutEps,
+            (ep) => epState[ep].eq(Const(stGetting, width: 2)),
+          ).rswizzle();
+    }
+
     // ------------------------------------------------------------------
     // Per-endpoint sequential: state and get address.
     // ------------------------------------------------------------------
     for (var ep = 0; ep < numOutEps; ep++) {
       Sequential(clk, [
         If(
-          reset | resetEp.slice(ep, ep),
+          reset,
           then: [epState[ep] < Const(stReady, width: 2)],
           orElse: [epState[ep] < epStateNext[ep]],
         ),
@@ -879,11 +1229,6 @@ class HarborUsbFsOutPe extends BridgeModule {
           then: [outEpSetup < Const(0, width: numOutEps)],
           orElse: [outEpSetup < setupNext],
         ),
-        for (var ep = 0; ep < numOutEps; ep++)
-          If(
-            resetEp.slice(ep, ep),
-            then: [outEpSetup < outEpSetup & ~Const(1 << ep, width: numOutEps)],
-          ),
       ]);
     }
     output('out_ep_setup') <= outEpSetup;
@@ -907,7 +1252,7 @@ class HarborUsbFsOutPe extends BridgeModule {
       Logic epMux = Const(0, width: 8);
       for (var i = 0; i < maxPacketSize; i++) {
         epMux = mux(
-          epGetAddr[ep].slice(4, 0).eq(Const(i, width: 5)),
+          epGetAddr[ep].eq(Const(i, width: addrWidth)),
           buffer[ep][i],
           epMux,
         );
@@ -932,18 +1277,29 @@ class HarborUsbFsOutPe extends BridgeModule {
           // unknown and make the endpoint selects unknown.
           currentEndp < Const(0, width: 4),
           nakOutTransfer < Const(0),
+          stallOutTransfer < Const(0),
+          rxOverflow < Const(0),
         ],
         orElse: [
           outXfrState < outXfrStateNext,
           If(outXfrStart, then: [currentEndp < rxEndp]),
           If(
             outXfrState.eq(Const(xfrRcvdOut, width: 2)),
+            then: [rxOverflow < Const(0)],
+          ),
+          If(
+            outXfrState.eq(Const(xfrRcvdDataStart, width: 2)) &
+                ~nakOutTransfer &
+                rxDataPut &
+                currentPutFull,
+            then: [rxOverflow < Const(1)],
+          ),
+          If(
+            outXfrState.eq(Const(xfrRcvdOut, width: 2)),
             then: [
-              If(
-                currentEpBusy,
-                then: [nakOutTransfer < Const(1)],
-                orElse: [nakOutTransfer < Const(0)],
-              ),
+              // A stall blocks the buffer write the same way a NAK does.
+              nakOutTransfer < currentEpBusy | (currentStall & ~setupXfr),
+              stallOutTransfer < currentStall & ~setupXfr,
             ],
           ),
         ],
@@ -960,6 +1316,7 @@ class HarborUsbFsOutPe extends BridgeModule {
         If(
           ~reset,
           then: [
+            If(toggleApply[ep], then: [dataToggle[ep] < Const(0)]),
             If(newPktEnd & isCurrent, then: [dataToggle[ep] < ~dataToggle[ep]]),
             If(
               setupTokenReceived & rxEndp.eq(Const(ep, width: 4)),
@@ -969,7 +1326,7 @@ class HarborUsbFsOutPe extends BridgeModule {
               outXfrState.eq(Const(xfrRcvdOut, width: 2)) &
                   ~currentEpBusy &
                   isCurrent,
-              then: [epPutAddr[ep] < Const(0, width: 6)],
+              then: [epPutAddr[ep] < Const(0, width: addrWidth)],
             ),
             If(
               outXfrState.eq(Const(xfrRcvdDataStart, width: 2)),
@@ -980,21 +1337,33 @@ class HarborUsbFsOutPe extends BridgeModule {
                     ~nakOutTransfer &
                         isCurrent &
                         rxDataPut &
-                        ~epPutAddr[ep].slice(5, 5) &
-                        epPutAddr[ep].slice(4, 0).eq(Const(i, width: 5)),
+                        epPutAddr[ep].lt(
+                          Const(maxPacketSize, width: addrWidth),
+                        ) &
+                        epPutAddr[ep].eq(Const(i, width: addrWidth)),
                     then: [buffer[ep][i] < rxData],
                   ),
                 If(
-                  ~nakOutTransfer & isCurrent & rxDataPut,
-                  then: [epPutAddr[ep] < epPutAddr[ep] + Const(1, width: 6)],
+                  ~nakOutTransfer &
+                      isCurrent &
+                      rxDataPut &
+                      ~epPutAddr[ep].eq(
+                        Const(maxPacketSize + 2, width: addrWidth),
+                      ),
+                  then: [
+                    epPutAddr[ep] < epPutAddr[ep] + Const(1, width: addrWidth),
+                  ],
                 ),
               ],
             ),
           ],
         ),
         If(
-          reset | resetEp.slice(ep, ep),
-          then: [dataToggle[ep] < Const(0), epPutAddr[ep] < Const(0, width: 6)],
+          reset,
+          then: [
+            dataToggle[ep] < Const(0),
+            epPutAddr[ep] < Const(0, width: addrWidth),
+          ],
         ),
       ]);
     }
@@ -1060,6 +1429,11 @@ class HarborUsbFsResetDet extends BridgeModule {
 /// Wires the line receiver and transmitter with the IN and OUT endpoint
 /// protocol engines, the endpoint arbiters and the TX mux. Exposes the
 /// per-endpoint byte-stream interfaces plus the raw line signals.
+///
+/// The stall inputs are levels. A stalled endpoint answers STALL to a
+/// transaction that starts while its stall is high. A packet that is
+/// already held or armed stays. A SETUP to a control endpoint is always
+/// ACKed, and a SETUP to another endpoint gets no handshake.
 class HarborUsbFsPe extends BridgeModule {
   /// Number of OUT endpoints.
   final int numOutEps;
@@ -1070,15 +1444,53 @@ class HarborUsbFsPe extends BridgeModule {
   /// Maximum packet payload per endpoint, in bytes.
   final int maxPacketSize;
 
+  /// Adds `out_ep_toggle_reset`/`in_ep_toggle_reset` inputs. A pulse sets
+  /// the endpoint's next toggle to DATA0 (USB 2.0 9.4.5) when no
+  /// transaction on that endpoint is in progress. It does not change a
+  /// held packet, a buffer or a stall. Off by default.
+  final bool exposeEpToggleReset;
+
+  /// Adds an `out_ep_length` output (see [HarborUsbFsOutPe.exposeLength]).
+  /// Off by default: a caller that does not pass this keeps the exact
+  /// original port list.
+  final bool exposeEpLength;
+
+  /// Adds `out_ep_release` and `out_ep_held` (see
+  /// [HarborUsbFsOutPe.exposeRelease]). Off by default.
+  final bool exposeEpRelease;
+
+  /// Adds an `out_ep_setup_done` output (see
+  /// [HarborUsbFsOutPe.exposeSetupDone]). Off by default.
+  final bool exposeEpSetupDone;
+
+  /// Adds an `out_ep_control` input (see [HarborUsbFsOutPe.exposeControl]).
+  /// Off by default.
+  final bool exposeEpControl;
+
+  /// Adds an `in_ep_flush` input and an `in_ep_busy` output. A flush pulse
+  /// drops the endpoint's IN packet and buffered bytes, and is ignored
+  /// while `in_ep_busy` shows an IN transaction on it. Off by default.
+  final bool exposeEpFlush;
+
   HarborUsbFsPe({
     this.numOutEps = 1,
     this.numInEps = 1,
     this.maxPacketSize = 32,
+    this.exposeEpToggleReset = false,
+    this.exposeEpLength = false,
+    this.exposeEpRelease = false,
+    this.exposeEpSetupDone = false,
+    this.exposeEpControl = false,
+    this.exposeEpFlush = false,
     String? name,
   }) : super('HarborUsbFsPe', name: name ?? 'usb_fs_pe') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('dev_addr', PortDirection.input, width: 7);
+    if (exposeEpToggleReset) {
+      createPort('out_ep_toggle_reset', PortDirection.input, width: numOutEps);
+      createPort('in_ep_toggle_reset', PortDirection.input, width: numInEps);
+    }
 
     // OUT endpoint interface.
     createPort('out_ep_req', PortDirection.input, width: numOutEps);
@@ -1090,6 +1502,23 @@ class HarborUsbFsPe extends BridgeModule {
     createPort('out_ep_stall', PortDirection.input, width: numOutEps);
     addOutput('out_ep_acked', width: numOutEps);
     addOutput('out_ep_pkt_full', width: numOutEps);
+    if (exposeEpLength) {
+      addOutput(
+        'out_ep_length',
+        width: numOutEps * (maxPacketSize + 2).bitLength,
+      );
+    }
+    if (exposeEpRelease) {
+      createPort('out_ep_release', PortDirection.input, width: numOutEps);
+      addOutput('out_ep_held', width: numOutEps);
+    }
+    if (exposeEpSetupDone) {
+      addOutput('out_ep_setup_done', width: numOutEps);
+    }
+    addOutput('out_ep_setup_token', width: numOutEps);
+    if (exposeEpControl) {
+      createPort('out_ep_control', PortDirection.input, width: numOutEps);
+    }
 
     // IN endpoint interface.
     createPort('in_ep_req', PortDirection.input, width: numInEps);
@@ -1100,6 +1529,10 @@ class HarborUsbFsPe extends BridgeModule {
     createPort('in_ep_data_done', PortDirection.input, width: numInEps);
     createPort('in_ep_stall', PortDirection.input, width: numInEps);
     addOutput('in_ep_acked', width: numInEps);
+    if (exposeEpFlush) {
+      createPort('in_ep_flush', PortDirection.input, width: numInEps);
+      addOutput('in_ep_busy', width: numInEps);
+    }
 
     // SOF interface.
     addOutput('sof_valid');
@@ -1141,7 +1574,7 @@ class HarborUsbFsPe extends BridgeModule {
     output('frame_index') <= rx.output('frame_num');
 
     // ------------------------------------------------------------------
-    // The endpoint arbiters. The lowest requesting endpoint wins; the
+    // The endpoint arbiters. The lowest requesting endpoint wins. The
     // granted endpoint's data byte feeds the IN engine.
     // ------------------------------------------------------------------
     final outGrantBits = List.generate(
@@ -1194,13 +1627,18 @@ class HarborUsbFsPe extends BridgeModule {
     addSubModule(inPe);
     inPe.input('clk').srcConnection! <= clk;
     inPe.input('reset').srcConnection! <= reset;
-    inPe.input('reset_ep').srcConnection! <= Const(0, width: numInEps);
+    inPe.input('reset_ep').srcConnection! <=
+        (exposeEpToggleReset
+            ? input('in_ep_toggle_reset')
+            : Const(0, width: numInEps));
     inPe.input('dev_addr').srcConnection! <= devAddr;
 
     inPe.input('in_ep_data_put').srcConnection! <= inEpDataPut;
     inPe.input('in_ep_data').srcConnection! <= arbInEpData;
     inPe.input('in_ep_data_done').srcConnection! <= inEpDataDone;
     inPe.input('in_ep_stall').srcConnection! <= inEpStall;
+    inPe.input('flush').srcConnection! <=
+        (exposeEpFlush ? input('in_ep_flush') : Const(0, width: numInEps));
 
     inPe.input('rx_pkt_start').srcConnection! <= rx.output('pkt_start');
     inPe.input('rx_pkt_end').srcConnection! <= rx.output('pkt_end');
@@ -1215,6 +1653,7 @@ class HarborUsbFsPe extends BridgeModule {
 
     output('in_ep_data_free') <= inPe.output('in_ep_data_free');
     output('in_ep_acked') <= inPe.output('in_ep_acked');
+    if (exposeEpFlush) output('in_ep_busy') <= inPe.output('busy');
 
     // ------------------------------------------------------------------
     // The OUT protocol engine.
@@ -1222,12 +1661,19 @@ class HarborUsbFsPe extends BridgeModule {
     final outPe = HarborUsbFsOutPe(
       numOutEps: numOutEps,
       maxPacketSize: maxPacketSize,
+      exposeLength: exposeEpLength,
+      exposeRelease: exposeEpRelease,
+      exposeSetupDone: exposeEpSetupDone,
+      exposeControl: exposeEpControl,
       name: 'fs_out_pe',
     );
     addSubModule(outPe);
     outPe.input('clk').srcConnection! <= clk;
     outPe.input('reset').srcConnection! <= reset;
-    outPe.input('reset_ep').srcConnection! <= Const(0, width: numOutEps);
+    outPe.input('reset_ep').srcConnection! <=
+        (exposeEpToggleReset
+            ? input('out_ep_toggle_reset')
+            : Const(0, width: numOutEps));
     outPe.input('dev_addr').srcConnection! <= devAddr;
 
     outPe.input('out_ep_data_get').srcConnection! <= outEpDataGet;
@@ -1251,6 +1697,26 @@ class HarborUsbFsPe extends BridgeModule {
     output('out_ep_data') <= outPe.output('out_ep_data');
     output('out_ep_acked') <= outPe.output('out_ep_acked');
     output('out_ep_pkt_full') <= outPe.output('out_ep_pkt_full');
+    if (exposeEpLength) {
+      output('out_ep_length') <= outPe.output('out_ep_length');
+    }
+    if (exposeEpRelease) {
+      outPe.input('out_ep_release').srcConnection! <= input('out_ep_release');
+      output('out_ep_held') <= outPe.output('out_ep_held');
+    }
+    if (exposeEpSetupDone) {
+      output('out_ep_setup_done') <= outPe.output('out_ep_setup_done');
+    }
+    final outSetupToken = outPe.output('out_ep_setup_token');
+    output('out_ep_setup_token') <= outSetupToken;
+    inPe.input('setup_token').srcConnection! <=
+        List.generate(
+          numInEps,
+          (ep) => ep < numOutEps ? outSetupToken[ep] : Const(0),
+        ).rswizzle();
+    if (exposeEpControl) {
+      outPe.input('out_ep_control').srcConnection! <= input('out_ep_control');
+    }
 
     // ------------------------------------------------------------------
     // The TX mux: the OUT engine wins when it starts a packet.

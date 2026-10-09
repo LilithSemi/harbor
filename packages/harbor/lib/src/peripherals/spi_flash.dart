@@ -261,18 +261,12 @@ class HarborSpiFlashController extends BridgeModule
       dataWidth: busDataWidth ?? 32,
     );
 
-    // WRITE/ERASE command interface (DFU flash-provisioning side, NOT the CPU
-    // bus). The DFU flash sink (B5b) drives these to erase a sector or program
-    // a page. Program data is pulled byte-by-byte via a read-callback: the
-    // engine presents the next index on wr_data_index and the sink presents
-    // that byte combinationally on wr_data (same payload-source style as
-    // UsbPacketTx). Flash WRITES are always STANDARD single-bit (DQ0/spi_mosi),
-    // even when the read mode is quad.
-    // I3: the write address width tracks config.addressBytes (3 -> 24-bit,
-    // 4 -> 32-bit) so a 4-byte part (e.g. S25FL256, 32MB) lands the program /
-    // erase at the RIGHT sector instead of silently dropping the top byte and
-    // bricking. Only 3- and 4-byte address parts are supported, anything else
-    // fails LOUDLY at construction rather than mis-addressing flash.
+    // Write and erase command interface for the DFU flash sink, separate
+    // from the CPU bus. The engine presents the next index on wr_data_index
+    // and the sink returns that byte on wr_data in the same cycle. Writes
+    // always use single-bit mode on DQ0, even when reads use quad mode.
+    // The write address width follows config.addressBytes, so a 4-byte part
+    // programs the correct sector. Other address sizes fail at construction.
     if (config.addressBytes != 3 && config.addressBytes != 4) {
       throw ArgumentError.value(
         config.addressBytes,

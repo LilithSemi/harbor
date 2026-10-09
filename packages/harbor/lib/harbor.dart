@@ -366,10 +366,11 @@ export 'src/peripherals/sram.dart';
 export 'src/peripherals/temperature_sensor.dart';
 export 'src/peripherals/uart.dart';
 export 'src/peripherals/usb.dart';
-export 'src/peripherals/usb_dfu.dart';
+export 'src/peripherals/usb_core.dart';
+export 'src/peripherals/usb_descriptors.dart';
+export 'src/peripherals/usb_dfu_device.dart';
+export 'src/peripherals/usb_dfu_sinks.dart';
 export 'src/peripherals/usb_fs_phy.dart';
 export 'src/peripherals/usb_fs_pe.dart';
 export 'src/peripherals/usb_fs_device.dart';
-
-export 'src/peripherals/usb_phy.dart';
 export 'src/peripherals/watchdog.dart';

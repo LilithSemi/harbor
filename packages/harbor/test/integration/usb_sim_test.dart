@@ -1,8 +1,7 @@
-import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-import 'test_harness.dart';
+import '../peripherals/usb_controller_harness.dart';
 
 void main() {
   tearDown(() async {
@@ -11,78 +10,40 @@ void main() {
 
   group('USB sim', () {
     test('write CTRL and read back', () async {
-      final usb = HarborUsbController(
-        config: const HarborUsbConfig(),
-        baseAddress: 0xF000,
-      );
-      usb.port('usb_dp_in').getsLogic(Const(0));
-      usb.port('usb_dm_in').getsLogic(Const(0));
+      final (dut, _, clk, _, _) = await buildUsbControllerHarness();
 
-      final tb = PeripheralTestBench(usb);
-      await tb.init();
-
-      // CTRL byte offset 0x00, bit 0 = enable
-      await tb.write(0x00, 0x01);
-      final val = await tb.read(0x00);
+      await dut.write(clk, ctrlAddr, 0x01);
+      final val = await dut.read(clk, ctrlAddr);
       expect(val & 0x01, equals(0x01));
 
       await Simulator.endSimulation();
     });
 
     test('write INT_ENABLE and read back', () async {
-      final usb = HarborUsbController(
-        config: const HarborUsbConfig(),
-        baseAddress: 0xF000,
-      );
-      usb.port('usb_dp_in').getsLogic(Const(0));
-      usb.port('usb_dm_in').getsLogic(Const(0));
+      final (dut, _, clk, _, _) = await buildUsbControllerHarness();
 
-      final tb = PeripheralTestBench(usb);
-      await tb.init();
-
-      // INT_ENABLE byte offset 0x20
-      await tb.write(0x20, 0xA5);
-      final val = await tb.read(0x20);
+      await dut.write(clk, intEnableAddr, 0xA5);
+      final val = await dut.read(clk, intEnableAddr);
       expect(val, equals(0xA5));
 
       await Simulator.endSimulation();
     });
 
     test('read STATUS register', () async {
-      final usb = HarborUsbController(
-        config: const HarborUsbConfig(),
-        baseAddress: 0xF000,
-      );
-      usb.port('usb_dp_in').getsLogic(Const(0));
-      usb.port('usb_dm_in').getsLogic(Const(0));
+      final (dut, _, clk, _, _) = await buildUsbControllerHarness();
 
-      final tb = PeripheralTestBench(usb);
-      await tb.init();
-
-      // STATUS byte offset 0x08
-      final val = await tb.read(0x08);
-      // connected should be 0 after reset
+      final val = await dut.read(clk, statusAddr);
+      // bus reset active should be 0 right after reset.
       expect(val & 0x01, equals(0));
-      // speed field at bits [7:4] should be maxSpeed index (full = 1)
-      expect((val >> 4) & 0x0F, equals(HarborUsbSpeed.full.index));
 
       await Simulator.endSimulation();
     });
 
     test('write device address (ADDR) and read back', () async {
-      final usb = HarborUsbController(
-        config: const HarborUsbConfig(),
-        baseAddress: 0xF000,
-      );
-      usb.port('usb_dp_in').getsLogic(Const(0));
-      usb.port('usb_dm_in').getsLogic(Const(0));
+      final (dut, _, clk, _, _) = await buildUsbControllerHarness();
 
-      final tb = PeripheralTestBench(usb);
-      await tb.init();
-
-      // ADDR byte offset 0x10
-      await tb.write(0x10, 42);
-      final val = await tb.read(0x10);
+      await dut.write(clk, addrAddr, 42);
+      final val = await dut.read(clk, addrAddr);
       expect(val & 0x7F, equals(42));
 
       await Simulator.endSimulation();

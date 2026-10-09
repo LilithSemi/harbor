@@ -129,7 +129,7 @@ class HarborUsbFsRx extends BridgeModule {
     ]);
 
     // ------------------------------------------------------------------
-    // Clock recovery. Each DT resets the phase; the phase then counts 0,
+    // Clock recovery. Each DT resets the phase. The phase then counts 0,
     // 1, 2, 3 within each bit. The state is valid at phase 1 and the bit
     // strobe fires at phase 2.
     // ------------------------------------------------------------------
@@ -161,6 +161,49 @@ class HarborUsbFsRx extends BridgeModule {
     final lineHistory = Logic(name: 'line_history', width: 6);
     final packetValid = Logic(name: 'packet_valid');
     final nextPacketValid = Logic(name: 'next_packet_valid');
+    final stuffError = Logic(name: 'stuff_error');
+
+    // A bit stuff error or two SE1 bits end the packet as invalid.
+    final abort =
+        (packetValid &
+                lineStateValid &
+                (stuffError | lineHistory.slice(3, 0).eq(Const(15, width: 4))))
+            .named('rx_abort');
+
+    // After an abort, the sync search waits for SE0 or 8 idle J bits, so
+    // the rest of a broken packet cannot decode as a new one.
+    final syncHold = Logic(name: 'sync_hold');
+    final holdIdle = Logic(name: 'hold_idle', width: 3);
+    Sequential(clk, [
+      If(
+        reset,
+        then: [syncHold < Const(0), holdIdle < Const(0, width: 3)],
+        orElse: [
+          If(
+            abort,
+            then: [syncHold < Const(1), holdIdle < Const(0, width: 3)],
+            orElse: [
+              If(
+                syncHold & lineStateValid,
+                then: [
+                  If(
+                    lineState.eq(Const(stSe0, width: 3)) |
+                        (lineState.eq(Const(stDj, width: 3)) &
+                            holdIdle.eq(Const(7, width: 3))),
+                    then: [syncHold < Const(0)],
+                  ),
+                  If(
+                    lineState.eq(Const(stDj, width: 3)),
+                    then: [holdIdle < holdIdle + Const(1, width: 3)],
+                    orElse: [holdIdle < Const(0, width: 3)],
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ]);
 
     final packetStart = (nextPacketValid & ~packetValid).named(
       'packet_start_i',
@@ -174,11 +217,12 @@ class HarborUsbFsRx extends BridgeModule {
         lineStateValid,
         then: [
           If(
-            ~packetValid & lineHistory.eq(Const(37, width: 6)),
+            ~packetValid & ~syncHold & lineHistory.eq(Const(37, width: 6)),
             then: [nextPacketValid < Const(1)],
             orElse: [
               If(
-                packetValid & lineHistory.slice(3, 0).eq(Const(0, width: 4)),
+                (packetValid & lineHistory.slice(3, 0).eq(Const(0, width: 4))) |
+                    abort,
                 then: [nextPacketValid < Const(0)],
                 orElse: [nextPacketValid < packetValid],
               ),
@@ -201,23 +245,14 @@ class HarborUsbFsRx extends BridgeModule {
                   [lineHistory.slice(3, 0), lineState.slice(1, 0)].swizzle(),
             ],
           ),
-          // Deviation from usb_fs_rx.v:168-179. In the original, the
-          // statement packet_valid <= next_packet_valid is outside the
-          // if (reset) block, so it runs on every clock. This makes the
-          // reset assignment above it dead code. The original receiver
-          // keeps packet_valid during reset. It also holds line_history
-          // at 6'b101010 during reset, so the receiver keeps its
-          // in-packet state.
-          // This port clears packet_valid on reset. ROHD has no
-          // equivalent of a Verilog declaration initialiser, so the reset
-          // branch is the only way to give the register a defined
-          // power-on value.
-          // The deviation has a cost. A reset in the middle of a packet
-          // re-arms the sync detector, and the receiver can then send a
-          // pkt_start with no matching pkt_end. This is safe in this
-          // design. Reset comes from the chip reset or from
-          // usb_reset_det, and usb_reset_det needs more than 30000 clocks
-          // of SE0. No packet is in flight in either case.
+          // This port clears packet_valid on reset, because ROHD has no
+          // equivalent of a Verilog declaration initialiser, so the
+          // reset branch is the only way to give the register a defined
+          // power-on value. A reset mid-packet re-arms the sync detector
+          // and can emit a pkt_start with no matching pkt_end, but this
+          // is safe: reset only comes from the chip reset or from
+          // usb_reset_det, which needs over 30000 clocks of SE0, so no
+          // packet is ever in flight when it fires.
           packetValid < nextPacketValid,
         ],
       ),
@@ -259,13 +294,27 @@ class HarborUsbFsRx extends BridgeModule {
     ]);
 
     // ------------------------------------------------------------------
-    // Stuff-bit removal. Six consecutive one bits mark a stuff bit; it
+    // Stuff-bit removal. Six consecutive one bits mark a stuff bit. It
     // is dropped from the decoded stream.
     // ------------------------------------------------------------------
     final bitstuffHistory = Logic(name: 'bitstuff_history', width: 6);
     final dvalid = (dvalidRaw & ~bitstuffHistory.eq(Const(63, width: 6))).named(
       'dvalid',
     );
+
+    // A seventh one bit is a bit stuff error (USB 2.0 7.1.9). A packet cut
+    // with the line held at J or K ends with it.
+    stuffError <= dvalidRaw & din & bitstuffHistory.eq(Const(63, width: 6));
+    final abortQ = Logic(name: 'rx_abort_q');
+    Sequential(clk, [
+      If(
+        reset | packetStart,
+        then: [abortQ < Const(0)],
+        orElse: [
+          If(abort, then: [abortQ < Const(1)]),
+        ],
+      ),
+    ]);
 
     Sequential(clk, [
       If(
@@ -384,7 +433,9 @@ class HarborUsbFsRx extends BridgeModule {
         .named('pkt_is_handshake');
 
     output('valid_packet') <=
-        pidValid &
+        ~abort &
+            ~abortQ &
+            pidValid &
             (pktIsHandshake |
                 (pktIsData & crc16Valid) |
                 (pktIsToken & crc5Valid));
@@ -531,12 +582,11 @@ class HarborUsbFsTx extends BridgeModule {
     final bitstuff = bitHistory.eq(Const(63, width: 6)).named('bitstuff');
 
     // Stuff-pipeline: the CRC must skip a stuff bit when it reaches the
-    // serial output, which is 4 clock cycles after the insertion
-    // decision (usb_fs_tx.v:61-66). These registers are not gated by
-    // bit_strobe. 4 clock cycles are equal to one bit strobe only at the
-    // nominal 4-clock bit time. The strobe period is not constant,
-    // because the receive phase tracker makes the bit time longer or
-    // shorter at each line transition.
+    // serial output, 4 clock cycles after the insertion decision
+    // (usb_fs_tx.v:61-66). These registers are not gated by bit_strobe,
+    // because 4 clock cycles equal one bit strobe only at the nominal
+    // bit time. The receive phase tracker can make the real bit time
+    // longer or shorter at each line transition.
     final bitstuffQ = Logic(name: 'bitstuff_q');
     final bitstuffQq = Logic(name: 'bitstuff_qq');
     final bitstuffQqq = Logic(name: 'bitstuff_qqq');
@@ -746,21 +796,38 @@ class HarborUsbFsTx extends BridgeModule {
             ]),
           ]),
 
-          // Byte strobe: fires at the first bit of each byte time.
+          // Byte strobe fires at the first bit of each byte time, held
+          // off on the pkt_start cycle itself. bit_count is about to be
+          // re-primed below, so a strobe landing the same cycle as
+          // pkt_start must not also count as the old counter reaching a
+          // boundary, or the first byte comes out one bit short.
           If(
-            bitStrobe & ~bitstuff,
+            bitStrobe & ~bitstuff & ~pktStart,
             then: [byteStrobe < bitCount.eq(Const(0, width: 3))],
             orElse: [byteStrobe < Const(0)],
           ),
 
-          // Bit shifting. On pkt_start the counters prime. On each bit
-          // strobe either a stuff bit holds the shift or the registers
-          // advance.
+          // Bit shifting. On pkt_start the counters prime: bit_count
+          // primes to 7, one short of a boundary, so byte_strobe fires
+          // two bit strobes after pkt_start, every time.
+          //
+          // The wait from pkt_start to the boundary must stay even,
+          // because line driving toggles on every bit strobe while the
+          // shift registers read zero, same as a run of real zero
+          // bits. An odd wait would flip the line's sense by the time
+          // real data reaches oe.
+          //
+          // data_shift_reg, oe_shift_reg and se0_shift_reg clear here
+          // too, so a reply sent soon after a previous packet cannot
+          // toggle the line on that packet's leftover bits.
           If(
             pktStart,
             then: [
-              bitCount < Const(1, width: 3),
+              bitCount < Const(7, width: 3),
               bitHistoryQ < Const(0, width: 5),
+              dataShiftReg < Const(0, width: 8),
+              oeShiftReg < Const(0, width: 8),
+              se0ShiftReg < Const(0, width: 8),
             ],
             orElse: [
               If(

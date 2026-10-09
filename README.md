@@ -26,7 +26,7 @@ A composable, declarative framework for building RISC-V SoCs using [ROHD](https:
 
 | Category        | Peripherals                                                                                       |
 |-----------------|---------------------------------------------------------------------------------------------------|
-| Communication   | UART, SPI, I2C, Ethernet MAC, USB (host/device/OTG)                                               |
+| Communication   | UART, SPI, I2C, Ethernet MAC, USB full-speed device (controller, DFU bootloader)                  |
 | Storage         | Flash, SPI Flash (QSPI), SDIO, DDR3 controller (Xilinx 7-series and ECP5 PHYs), SRAM, MaskROM, eFuse (OTP) |
 | Display & Media | Display controller (DRM/KMS), media engine (H.264/H.265/VP9/AV1/JPEG), audio (I2S/TDM/S/PDIF/PDM) |
 | System          | GPIO, PWM/Timer, Watchdog, DMA, PCIe (host + endpoint), temperature sensor                        |
