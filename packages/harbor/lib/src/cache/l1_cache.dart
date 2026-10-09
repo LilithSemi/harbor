@@ -586,9 +586,10 @@ class HarborL1DCache extends BridgeModule {
 
   /// Width of the permission-context tag kept with each line. Zero disables it.
   ///
-  /// The cache is in FRONT of the MMU: the pipeline presents a VIRTUAL address,
-  /// and only a MISS goes on to the MMU, which translates it and checks the PTE.
-  /// A LOAD HIT is decided by the tag and the valid bit alone, so no permission
+  /// In the default virtual placement, the pipeline presents a virtual address
+  /// and only a miss reaches the MMU, which translates it and checks the PTE.
+  /// In that placement, a LOAD HIT is decided by the tag and valid bit alone,
+  /// so no permission
   /// check runs on it. A line that one privilege mode was allowed to fill
   /// therefore stays readable by a mode the page table forbids: user code read
   /// a supervisor-only page out of the cache, and a supervisor load with

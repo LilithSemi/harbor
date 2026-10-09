@@ -477,7 +477,8 @@ class HarborRegisterFile extends BridgeModule {
   }
 
   /// Xilinx 7-series RAMB36E1-backed storage. Like [_buildEcp5Ebr], one true
-  /// dual-port block (or `ceil(dataWidth/32)` in x36 mode) per read port: port
+  /// dual-port block (or `ceil(dataWidth/32)` in x36 mode) per read port and
+  /// 1024-word depth block: port
   /// A is the shared write port and port B is that port's read, both on the
   /// posedge of clk. The RAMB read is synchronous, so this is a registered
   /// full-cycle read ([readLatency] == 1), keeping the read off the
