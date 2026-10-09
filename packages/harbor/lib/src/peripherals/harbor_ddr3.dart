@@ -17,6 +17,7 @@ import 'ddr3_params.dart';
 import 'ddr3_phy.dart';
 import 'ddr3_phy_base.dart';
 import 'ddr3_phy_ecp5.dart';
+import 'sim_dram.dart';
 
 /// Clean SoC wrapper for the production [Ddr3Controller] + [Ddr3Phy] (the
 /// UberDDR3-derived, silicon-proven stack: read/write calibration + multi-row
@@ -252,7 +253,7 @@ class HarborDdr3 extends BridgeModule
   /// have reproduced anyway.
   void _buildSim(Logic clk, Logic reset, int busDW) {
     final words = usableSize ~/ (busDW ~/ 8);
-    final dram = _HarborSimDram(
+    final dram = HarborSimDram(
       addrWidth: bus.addr.width,
       dataWidth: busDW,
       words: words,
@@ -997,93 +998,4 @@ struct DramStore {
     baseAddress: baseAddress,
     size: config.size,
   );
-}
-
-/// Behavioral DRAM leaf for the Verilator build. Carries its own SystemVerilog
-/// body so the ports and the module they must match live in one place.
-class _HarborSimDram extends BridgeModule with HarborSimLeaf {
-  final int addrWidth;
-  final int dataWidth;
-  final int words;
-  final int byteSize;
-
-  _HarborSimDram({
-    required this.addrWidth,
-    required this.dataWidth,
-    required this.words,
-    required this.byteSize,
-  }) : super('harbor_sim_dram', name: 'sim_dram', isSystemVerilogLeaf: true) {
-    createPort('clk', PortDirection.input);
-    createPort('reset', PortDirection.input);
-    createPort('stb', PortDirection.input);
-    createPort('we', PortDirection.input);
-    createPort('adr', PortDirection.input, width: addrWidth);
-    createPort('dat_w', PortDirection.input, width: dataWidth);
-    createPort('sel', PortDirection.input, width: dataWidth ~/ 8);
-    addOutput('ack');
-    addOutput('dat_r', width: dataWidth);
-  }
-
-  @override
-  String get simRtl {
-    final dw = dataWidth;
-    final aw = addrWidth;
-    final lanes = dw ~/ 8;
-    final byteBits = (lanes - 1).bitLength;
-    final idxBits = (words - 1).bitLength;
-    final b = StringBuffer();
-    b.writeln('// Auto-generated behavioral DRAM for the Verilator build.');
-    b.writeln('// Replaces the DDR3 controller + PHY, which are vendor IP.');
-    b.writeln('//');
-    b.writeln('// Preload a boot image with a plusarg, e.g.');
-    b.writeln('//   ./obj_dir/Vtop +dram_image=fw.hex');
-    b.writeln('// where fw.hex is one $dw-bit word per line in hex');
-    b.writeln('// (objcopy -O verilog, or hexdump).');
-    b.writeln('module $definitionName (');
-    b.writeln('  input  logic            clk,');
-    b.writeln('  input  logic            reset,');
-    b.writeln('  input  logic            stb,');
-    b.writeln('  input  logic            we,');
-    b.writeln('  input  logic [${aw - 1}:0] adr,');
-    b.writeln('  input  logic [${dw - 1}:0] dat_w,');
-    b.writeln('  input  logic [${lanes - 1}:0]  sel,');
-    b.writeln('  output logic            ack,');
-    b.writeln('  output logic [${dw - 1}:0] dat_r');
-    b.writeln(');');
-    b.writeln('  // $words words of $dw bits ($byteSize bytes).');
-    b.writeln('  logic [${dw - 1}:0] mem [0:${words - 1}];');
-    b.writeln(
-      '  wire [${idxBits - 1}:0] widx = adr[${idxBits + byteBits - 1}:'
-      '$byteBits];',
-    );
-    b.writeln();
-    b.writeln('  string image;');
-    b.writeln('  initial begin');
-    b.writeln('    if (\$value\$plusargs("dram_image=%s", image))');
-    b.writeln('      \$readmemh(image, mem);');
-    b.writeln('  end');
-    b.writeln();
-    b.writeln(
-      '  // Single-cycle ACK. The bus master must drop STB on the ACK,',
-    );
-    b.writeln('  // so `ack` is gated on its own previous value.');
-    b.writeln('  always_ff @(posedge clk) begin');
-    b.writeln('    if (reset) begin');
-    b.writeln("      ack <= 1'b0;");
-    b.writeln('    end else begin');
-    b.writeln('      ack <= stb & ~ack;');
-    b.writeln('      if (stb & ~ack & we) begin');
-    for (var l = 0; l < lanes; l++) {
-      b.writeln(
-        '        if (sel[$l]) mem[widx][${l * 8 + 7}:${l * 8}] '
-        '<= dat_w[${l * 8 + 7}:${l * 8}];',
-      );
-    }
-    b.writeln('      end');
-    b.writeln('      dat_r <= mem[widx];');
-    b.writeln('    end');
-    b.writeln('  end');
-    b.writeln('endmodule');
-    return b.toString();
-  }
 }

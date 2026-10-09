@@ -88,8 +88,8 @@ class TmdsSerializer extends Module {
     // part, DDR_CLK_EDGE "SAME_EDGE" gives that, because it presents both bits
     // on the same rising edge.
     //
-    // A simulation build uses neither. Both hard cells are black boxes with no
-    // body, so a simulation cannot run them, and standing one vendor's cell in
+    // A simulation build uses neither hard cell, even where one has a sim
+    // body (Ecp5Oddrx1f's, added for sdram): standing one vendor's cell in
     // for another's would put a cell in the netlist that the part does not
     // have. [HarborDdrOutput] is the same gearing in plain logic.
     q <=

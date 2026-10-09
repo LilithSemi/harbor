@@ -450,8 +450,13 @@ class Ecp5Dtr extends BridgeModule {
   }
 }
 
-/// ECP5 ODDRX1F: 1:2 gearing DDR output register. [d0] launches on the
-/// rising edge of [sclk], [d1] on the falling edge.
+/// ECP5 ODDRX1F: 1:2 gearing DDR output register. Both [d0] and [d1] are
+/// captured on the rising edge of [sclk]. [q] then shows [d0] while [sclk]
+/// is high and [d1] while it is low. Capturing [d1] on the falling edge
+/// instead would send the wrong bit, because by then a source register
+/// driving [d1] from the same rising edge has already moved on to the next
+/// value ([HarborDdrOutput] documents the same fault for its own, vendor-
+/// neutral copy of this gearing).
 class Ecp5Oddrx1f extends BridgeModule {
   Logic get q => output('Q');
 
@@ -462,11 +467,19 @@ class Ecp5Oddrx1f extends BridgeModule {
     required Logic d1,
     super.name = 'oddr',
   }) : super('ODDRX1F', isSystemVerilogLeaf: true) {
-    addInput('SCLK', sclk);
+    sclk = addInput('SCLK', sclk);
     addInput('RST', rst);
-    addInput('D0', d0);
-    addInput('D1', d1);
-    addOutput('Q');
+    d0 = addInput('D0', d0);
+    d1 = addInput('D1', d1);
+    final q = addOutput('Q');
+    // sim-only: both halves latch together on the rise, then q just reads
+    // off whichever half is live. RST is not modeled (every caller ties it
+    // to a constant). No effect on synth: this leaf emits only the
+    // declared ports.
+    final qRise = Logic(name: '${name}_sim_rise');
+    final qFall = Logic(name: '${name}_sim_fall');
+    Sequential(sclk, [qRise < d0, qFall < d1]);
+    q <= mux(sclk, qRise, qFall);
   }
 }
 
@@ -499,7 +512,14 @@ class Ecp5Oddrx2f extends BridgeModule {
 }
 
 /// ECP5 IDDRX1F: 1:2 gearing DDR input register. [q0] is the bit captured
-/// on the rising edge of [sclk], [q1] the falling-edge bit.
+/// on the rising edge of [sclk], [q1] the falling-edge bit, and both move
+/// to the fabric together on the rise. No sim model ships for this cell in
+/// yosys or prjtrellis: this is the ordinary 1:2 DDR input gearbox shape
+/// FPGA-TN-02035 section 6.2 describes for the x2 family, applied to a
+/// single edge pair. [q0]'s own timing (whether it is really available
+/// with zero added latency past a plain rising-edge sample, the way this
+/// model gives it) is not checked against any vendor model either: none
+/// exists to check it against.
 class Ecp5Iddrx1f extends BridgeModule {
   Logic get q0 => output('Q0');
   Logic get q1 => output('Q1');
@@ -510,11 +530,123 @@ class Ecp5Iddrx1f extends BridgeModule {
     required Logic d,
     super.name = 'iddr',
   }) : super('IDDRX1F', isSystemVerilogLeaf: true) {
-    addInput('SCLK', sclk);
+    sclk = addInput('SCLK', sclk);
     addInput('RST', rst);
-    addInput('D', d);
-    addOutput('Q0');
-    addOutput('Q1');
+    d = addInput('D', d);
+    final q0 = addOutput('Q0');
+    final q1 = addOutput('Q1');
+    // sim-only: at a fall, d is latched into a holding bit (its own single-
+    // edge trigger, since sampling sclk itself as data in a block it also
+    // triggers reads back as x). At the next rise, q0 takes d right then and
+    // q1 takes that held falling-edge bit, so both outputs move together on
+    // the rise. RST is not modeled (every caller ties it to a constant). No
+    // effect on synth.
+    final fallHeld = Logic(name: '${name}_sim_fall');
+    final q0r = Logic(name: '${name}_sim_q0');
+    final q1r = Logic(name: '${name}_sim_q1');
+    Sequential.multi([], [fallHeld < d], negedgeTriggers: [sclk]);
+    Sequential(sclk, [q0r < d, q1r < fallHeld]);
+    q0 <= q0r;
+    q1 <= q1r;
+  }
+}
+
+/// Sim body shared by [Ecp5Ofs1p3bx], [Ecp5Ifs1p3bx] and [Ecp5Ofs1p3dx]: a
+/// flip-flop with an asynchronous set/clear. [sr] forces [q] to [srValue]
+/// the instant it goes high, and holds it even if [sr] drops before the
+/// next edge. [sp] gates capture (low holds the last value). [d] is
+/// captured through a `Sequential`, not a raw edge listener, so it always
+/// reads the pre-edge value no matter the build order.
+void _srFlopSim(Logic d, Logic sclk, Logic sp, Logic sr, Logic q, int srValue) {
+  final qr = Logic(name: 'sim_q');
+  final srConst = Const(srValue, width: 1);
+  Simulator.injectAction(() => qr.put(LogicValue.ofInt(srValue, 1)));
+  Sequential(sclk, [qr < mux(sr, srConst, mux(sp, d, qr))]);
+  sr.glitch.listen((_) {
+    if (sr.value == LogicValue.one) qr.put(srConst.value);
+  });
+  q <= qr;
+}
+
+/// ECP5 OFS1P3BX: plain (non-DDR) output IO register with asynchronous
+/// preset, from yosys `cells_ff.vh` (techmapped to a `TRELLIS_FF` with
+/// `syn_useioff`) and litex `lattice_common.py`, which ties [sp] high and
+/// [pd] low for a plain SDR output. [keep] adds a synthesis `(* keep *)`
+/// attribute, for an output-enable flop whose [d] can equal a sibling
+/// bit's and so risk being merged away.
+class Ecp5Ofs1p3bx extends BridgeModule {
+  Logic get q => output('Q');
+
+  final bool keep;
+
+  Ecp5Ofs1p3bx({
+    required Logic d,
+    required Logic sclk,
+    Logic? sp,
+    Logic? pd,
+    this.keep = false,
+    super.name = 'ofs1p3bx',
+  }) : super('OFS1P3BX', isSystemVerilogLeaf: true) {
+    d = addInput('D', d);
+    sclk = addInput('SCLK', sclk);
+    sp = addInput('SP', sp ?? Const(1));
+    pd = addInput('PD', pd ?? Const(0));
+    final q = addOutput('Q');
+    _srFlopSim(d, sclk, sp, pd, q, 1);
+  }
+
+  @override
+  String instantiationVerilog(
+    String instanceType,
+    String instanceName,
+    Map<String, String> ports,
+  ) {
+    final inst = super.instantiationVerilog(instanceType, instanceName, ports);
+    return keep ? '(* keep *)\n$inst' : inst;
+  }
+}
+
+/// ECP5 IFS1P3BX: plain (non-DDR) input IO register with asynchronous
+/// preset. Same ports and sim body as [Ecp5Ofs1p3bx].
+class Ecp5Ifs1p3bx extends BridgeModule {
+  Logic get q => output('Q');
+
+  Ecp5Ifs1p3bx({
+    required Logic d,
+    required Logic sclk,
+    Logic? sp,
+    Logic? pd,
+    super.name = 'ifs1p3bx',
+  }) : super('IFS1P3BX', isSystemVerilogLeaf: true) {
+    d = addInput('D', d);
+    sclk = addInput('SCLK', sclk);
+    sp = addInput('SP', sp ?? Const(1));
+    pd = addInput('PD', pd ?? Const(0));
+    final q = addOutput('Q');
+    _srFlopSim(d, sclk, sp, pd, q, 1);
+  }
+}
+
+/// ECP5 OFS1P3DX: plain (non-DDR) output IO register with asynchronous
+/// clear, so [q] powers up and resets to 0 instead of [Ecp5Ofs1p3bx]'s 1.
+/// Used for a pin that must idle low across a power-up (cke, so the device
+/// never samples a command before the init sequence raises it).
+class Ecp5Ofs1p3dx extends BridgeModule {
+  Logic get q => output('Q');
+
+  Ecp5Ofs1p3dx({
+    required Logic d,
+    required Logic sclk,
+    Logic? sp,
+    Logic? cd,
+    super.name = 'ofs1p3dx',
+  }) : super('OFS1P3DX', isSystemVerilogLeaf: true) {
+    d = addInput('D', d);
+    sclk = addInput('SCLK', sclk);
+    sp = addInput('SP', sp ?? Const(1));
+    cd = addInput('CD', cd ?? Const(0));
+    final q = addOutput('Q');
+    _srFlopSim(d, sclk, sp, cd, q, 0);
   }
 }
 

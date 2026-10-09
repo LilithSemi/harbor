@@ -4,9 +4,10 @@ import 'package:rohd/rohd.dart';
 ///
 /// Every FPGA family has a hard cell for this ([Ecp5Oddrx1f] on Lattice,
 /// [XilinxOddr] on Xilinx 7 series), and a build for a real part must use that
-/// cell, because only the cell can put the register in the pad. Those cells are
-/// black boxes with no body, so a simulation cannot run them. This module is
-/// what a simulation build uses instead.
+/// cell, because only the cell can put the register in the pad. A simulation
+/// build uses this module instead, so it never depends on a cell that stands
+/// for a part the build is not targeting (true even for [Ecp5Oddrx1f], which
+/// does have a sim body now, added for sdram).
 ///
 /// It is deliberately vendor neutral. A simulation of a Xilinx design must not
 /// pull in a Lattice primitive to stand in for a Xilinx one, because that hides

@@ -80,11 +80,6 @@ void main() {
   });
 
   group('HarborDdrConfig', () {
-    test('dataRate SDR is 1x frequency', () {
-      const config = HarborDdrConfig.sdr(frequency: 133000000);
-      expect(config.dataRate, equals(133000000));
-    });
-
     test('dataRate DDR is 2x frequency', () {
       const config = HarborDdrConfig.orangeCrab();
       expect(config.dataRate, equals(400000000 * 2));

@@ -154,8 +154,8 @@ class HarborBoard {
 ///
 /// Fully open toolchain (yosys + nextpnr + trellis) with GPDI/HDMI display
 /// output. The catalog covers the oscillator, the FTDI console UART, the GPDI
-/// TMDS lanes and sideband, the LEDs, and the buttons. Sites come from the
-/// upstream `ulx3s_v20.lpf` constraint file (emard/ulx3s).
+/// TMDS lanes and sideband, the LEDs, the buttons, and the sdram. Sites come
+/// from the upstream `ulx3s_v20.lpf` constraint file (emard/ulx3s).
 const _ulx3s85f = HarborBoard(
   name: 'ulx3s-85f',
   vendor: HarborFpgaVendor.ecp5,
@@ -210,6 +210,47 @@ const _ulx3s85f = HarborBoard(
     'btn_down': 'V1 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
     'btn_left': 'U1 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
     'btn_right': 'H16 LVCMOS33 DRIVE=4 PULLMODE=DOWN',
+    // sdram (AS4C16M16SB). The upstream names are sdram_csn, sdram_a and
+    // sdram_d. Here they follow the HarborSdram port names.
+    'sdram_clk': 'F19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_cke': 'F20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_cs_n': 'P20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_we_n': 'T20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_ras_n': 'R20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_cas_n': 'T19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[0]': 'M20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[1]': 'M19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[2]': 'L20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[3]': 'L19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[4]': 'K20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[5]': 'K19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[6]': 'K18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[7]': 'J20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[8]': 'J19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[9]': 'H20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[10]': 'N19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[11]': 'G20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_addr[12]': 'G19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_ba[0]': 'P19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_ba[1]': 'N20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dqm[0]': 'U19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dqm[1]': 'E20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[0]': 'J16 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[1]': 'L18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[2]': 'M18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[3]': 'N18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[4]': 'P18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[5]': 'T18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[6]': 'T17 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[7]': 'U20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[8]': 'E19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[9]': 'D20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[10]': 'D19 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[11]': 'C20 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[12]': 'E18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[13]': 'F18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[14]': 'J18 LVCMOS33 SLEWRATE=FAST',
+    'sdram_dq[15]': 'J17 LVCMOS33 SLEWRATE=FAST',
   },
   // openFPGALoader knows the ULX3S. Loads the bitstream over USB.
   progCommand: 'openFPGALoader -b ulx3s \$(TOP).bit',

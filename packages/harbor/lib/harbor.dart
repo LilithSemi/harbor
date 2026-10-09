@@ -325,6 +325,16 @@ export 'src/peripherals/ddr3_gearbox.dart';
 export 'src/peripherals/ddr3_phy_base.dart';
 export 'src/peripherals/ddr3_phy_ecp5.dart';
 export 'src/peripherals/harbor_ddr3.dart';
+export 'src/peripherals/harbor_sdram.dart';
+export 'src/peripherals/sdram_config.dart';
+export 'src/peripherals/sdram_cycles.dart';
+export 'src/peripherals/sdram_engine.dart'
+    hide debugSdramEngineWithoutRowAgeGuard;
+export 'src/peripherals/sdram_phy_base.dart';
+export 'src/peripherals/sdram_phy_ecp5.dart';
+export 'src/peripherals/sdram_port.dart';
+export 'src/peripherals/sdram_timing.dart';
+export 'src/peripherals/sdram_wishbone_port.dart';
 export 'src/peripherals/device_register.dart';
 export 'src/peripherals/display.dart';
 export 'src/peripherals/dma.dart';

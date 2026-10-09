@@ -3,9 +3,6 @@ import 'ddr3_timing.dart';
 
 /// SDRAM memory type.
 enum HarborDdrType {
-  /// SDR SDRAM (single data rate, legacy).
-  sdr,
-
   /// DDR SDRAM (double data rate, first generation).
   ddr,
 
@@ -81,20 +78,6 @@ class HarborDdrConfig with HarborPrettyString {
     this.dmRemapping,
   });
 
-  /// Generic SDR SDRAM config (e.g., IS42S16160G: 32MB, 16-bit, 133 MHz).
-  const HarborDdrConfig.sdr({
-    this.size = 32 * 1024 * 1024,
-    this.dataWidth = 16,
-    this.frequency = 133000000,
-    this.banks = 4,
-    this.rowWidth = 13,
-    this.colWidth = 9,
-    this.casLatency = 3,
-  }) : type = HarborDdrType.sdr,
-       ranks = 1,
-       density = DdrDensity.gb2,
-       dmRemapping = null;
-
   /// OrangeCrab r0.2 DDR3 config: Micron MT41K64M16, 1 Gb (128MB, 16-bit,
   /// 400 MHz). 8K rows, 1K columns, 8 banks (litedram `MT41K64M16`). The DM
   /// pads are crossed: litex-boards `gsd_orangecrab.py` (commit 8215d8d, line
@@ -127,17 +110,11 @@ class HarborDdrConfig with HarborPrettyString {
       density = DdrDensity.gb2,
       dmRemapping = null;
 
-  /// Whether this is single data rate (SDR) SDRAM.
-  bool get isSdr => type == HarborDdrType.sdr;
-
-  /// Whether this is any DDR variant (double data rate).
-  bool get isDdr => !isSdr;
-
   /// Frequency in MHz.
   double get frequencyMhz => frequency / 1e6;
 
-  /// Data rate in MT/s (DDR = 2x clock, SDR = 1x clock).
-  int get dataRate => isSdr ? frequency : frequency * 2;
+  /// Data rate in MT/s (ddr transfers on both clock edges).
+  int get dataRate => frequency * 2;
 
   /// Bandwidth in MB/s.
   double get bandwidthMBs => dataRate * dataWidth / 8 / 1e6;

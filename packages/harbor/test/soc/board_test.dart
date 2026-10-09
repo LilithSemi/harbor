@@ -189,6 +189,92 @@ void main() {
     });
   });
 
+  group('ulx3s sdram pins', () {
+    // Sites from emard/ulx3s doc/constraints/ulx3s_v20.lpf.
+    const expected = {
+      'sdram_clk': 'F19',
+      'sdram_cke': 'F20',
+      'sdram_cs_n': 'P20',
+      'sdram_we_n': 'T20',
+      'sdram_ras_n': 'R20',
+      'sdram_cas_n': 'T19',
+      'sdram_addr[0]': 'M20',
+      'sdram_addr[1]': 'M19',
+      'sdram_addr[2]': 'L20',
+      'sdram_addr[3]': 'L19',
+      'sdram_addr[4]': 'K20',
+      'sdram_addr[5]': 'K19',
+      'sdram_addr[6]': 'K18',
+      'sdram_addr[7]': 'J20',
+      'sdram_addr[8]': 'J19',
+      'sdram_addr[9]': 'H20',
+      'sdram_addr[10]': 'N19',
+      'sdram_addr[11]': 'G20',
+      'sdram_addr[12]': 'G19',
+      'sdram_ba[0]': 'P19',
+      'sdram_ba[1]': 'N20',
+      'sdram_dqm[0]': 'U19',
+      'sdram_dqm[1]': 'E20',
+      'sdram_dq[0]': 'J16',
+      'sdram_dq[1]': 'L18',
+      'sdram_dq[2]': 'M18',
+      'sdram_dq[3]': 'N18',
+      'sdram_dq[4]': 'P18',
+      'sdram_dq[5]': 'T18',
+      'sdram_dq[6]': 'T17',
+      'sdram_dq[7]': 'U20',
+      'sdram_dq[8]': 'E19',
+      'sdram_dq[9]': 'D20',
+      'sdram_dq[10]': 'D19',
+      'sdram_dq[11]': 'C20',
+      'sdram_dq[12]': 'E18',
+      'sdram_dq[13]': 'F18',
+      'sdram_dq[14]': 'J18',
+      'sdram_dq[15]': 'J17',
+    };
+
+    test('the ulx3s preset has the 39 sdram pins', () {
+      final pins = HarborBoard.get('ulx3s-85f').pins;
+      final sdram = pins.keys.where((k) => k.startsWith('sdram_')).toList();
+      expect(sdram, hasLength(39));
+      for (final e in expected.entries) {
+        expect(pins[e.key], equals('${e.value} LVCMOS33 SLEWRATE=FAST'));
+      }
+    });
+
+    test('the lpf has 39 sdram locate lines with fast slew', () {
+      final target = HarborBoard.get(
+        'ulx3s-85f',
+      ).fpgaTarget(pins: ['clk', ...expected.keys]);
+      final lpf = target.generateConstraints();
+      final locates = lpf
+          .split('\n')
+          .where((l) => l.startsWith('LOCATE COMP "sdram_'));
+      expect(locates, hasLength(39));
+      for (final e in expected.entries) {
+        expect(lpf, contains('LOCATE COMP "${e.key}" SITE "${e.value}";'));
+        expect(
+          lpf,
+          contains('IOBUF PORT "${e.key}" IO_TYPE=LVCMOS33 SLEWRATE=FAST;'),
+        );
+      }
+    });
+
+    test('no ulx3s site is used by two catalog entries', () {
+      final pins = HarborBoard.get('ulx3s-85f').pins;
+      final bySite = <String, String>{};
+      for (final e in pins.entries) {
+        final site = e.value.split(' ').first;
+        expect(
+          bySite[site],
+          isNull,
+          reason: '$site: ${bySite[site]}, ${e.key}',
+        );
+        bySite[site] = e.key;
+      }
+    });
+  });
+
   group('HarborBoard.fpgaTarget', () {
     late HarborBoard board;
 

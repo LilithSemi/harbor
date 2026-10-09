@@ -6,6 +6,7 @@ resolution: workspace
 environment:
   sdk: ^3.11.2
 dependencies:
+  meta: ^1.16.0
   rohd: ^0.6.8
   rohd_bridge: ^0.2.2
   rohd_hcl: ^0.2.1
