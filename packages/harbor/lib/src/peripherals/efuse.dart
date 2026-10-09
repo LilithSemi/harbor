@@ -244,7 +244,7 @@ class HarborEfuseDevice extends BridgeModule
       protocol: protocol,
       clk: input('clk'),
       reset: input('reset'),
-      addressWidth: 8,
+      addressWidth: 12,
       dataWidth: 32,
     );
 
@@ -351,12 +351,12 @@ class HarborEfuseDevice extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              // Match the full address, not just enough low bits for the
-              // registers defined today, so an address outside the map
-              // reads 0 and ignores writes instead of aliasing a register.
-              Case(bus.addr, [
+              // Decode every address bit of the 0x1000 window and ignore the
+              // bits above it, so absolute and relative addresses both work. An
+              // unused offset reads 0 and ignores writes.
+              Case(bus.windowAddr(0x1000), [
                 // CTRL
-                CaseItem(Const(0x00, width: 8), [
+                CaseItem(Const(0x00, width: 12), [
                   If(
                     bus.we & bus.selAny(0x00, 1),
                     then: [
@@ -369,7 +369,7 @@ class HarborEfuseDevice extends BridgeModule
                   ),
                 ]),
                 // STATUS
-                CaseItem(Const(0x08, width: 8), [
+                CaseItem(Const(0x08, width: 12), [
                   bus.dataOut <
                       [
                         Const(0, width: 28),
@@ -385,7 +385,7 @@ class HarborEfuseDevice extends BridgeModule
                   ),
                 ]),
                 // ADDR
-                CaseItem(Const(0x10, width: 8), [
+                CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
                     then: [addr < bus.selMerge(addr, 0x10)],
@@ -393,11 +393,11 @@ class HarborEfuseDevice extends BridgeModule
                   ),
                 ]),
                 // RDATA
-                CaseItem(Const(0x18, width: 8), [
+                CaseItem(Const(0x18, width: 12), [
                   bus.dataOut < rdata.zeroExtend(32),
                 ]),
                 // WDATA
-                CaseItem(Const(0x20, width: 8), [
+                CaseItem(Const(0x20, width: 12), [
                   If(
                     bus.we,
                     then: [wdata < bus.selMerge(wdata, 0x20)],
@@ -405,7 +405,7 @@ class HarborEfuseDevice extends BridgeModule
                   ),
                 ]),
                 // LOCK (write-1-to-lock)
-                CaseItem(Const(0x28, width: 8), [
+                CaseItem(Const(0x28, width: 12), [
                   If(
                     bus.we,
                     then: [
@@ -416,7 +416,7 @@ class HarborEfuseDevice extends BridgeModule
                   ),
                 ]),
                 // TIMING
-                CaseItem(Const(0x30, width: 8), [
+                CaseItem(Const(0x30, width: 12), [
                   If(
                     bus.we,
                     then: [timing < bus.selMerge(timing, 0x30)],
@@ -424,7 +424,7 @@ class HarborEfuseDevice extends BridgeModule
                   ),
                 ]),
                 // KEY
-                CaseItem(Const(0x38, width: 8), [
+                CaseItem(Const(0x38, width: 12), [
                   If(
                     bus.we & bus.selAny(0x38, 4),
                     then: [

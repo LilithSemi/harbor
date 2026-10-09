@@ -151,7 +151,7 @@ void main() {
       final reset = Logic(name: 'reset');
       final stb = Logic(name: 'stb');
       final we = Logic(name: 'we');
-      final adr = Logic(name: 'adr', width: 8);
+      final adr = Logic(name: 'adr', width: 12);
       final mosi = Logic(name: 'mosi', width: 32);
 
       disp.input('clk').srcConnection! <= clk;

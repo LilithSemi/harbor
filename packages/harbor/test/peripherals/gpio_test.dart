@@ -103,7 +103,7 @@ void main() {
       reset = Logic(name: 'reset');
       stb = Logic(name: 'stb');
       we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 8);
+      adr = Logic(name: 'adr', width: 12);
       mosi = Logic(name: 'mosi', width: dataWidth);
       sel = Logic(name: 'sel', width: dataWidth ~/ 8);
       pins = Logic(name: 'gpio_in', width: 32);

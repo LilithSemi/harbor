@@ -307,7 +307,7 @@ class _I2cHarness {
     reset = Logic(name: 'reset');
     stb = Logic(name: 'stb');
     we = Logic(name: 'we');
-    adr = Logic(name: 'adr', width: 8);
+    adr = Logic(name: 'adr', width: 12);
     mosi = Logic(name: 'mosi', width: 32);
     sclLine = Logic(name: 'scl_line');
     sdaLine = Logic(name: 'sda_line');

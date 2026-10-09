@@ -61,7 +61,9 @@ class HarborAplic extends BridgeModule
 
     final clk = input('clk');
     final reset = input('reset');
-    final addr = bus.addr;
+    // Decode only the bits of the 0x8000 window, so absolute and relative
+    // addresses both work.
+    final addr = bus.windowAddr(0x8000);
     final datIn = bus.dataIn;
     final datOut = bus.dataOut;
     final ack = bus.ack;
@@ -146,7 +148,7 @@ class HarborAplic extends BridgeModule
 
               // domaincfg
               If(
-                addr.eq(Const(0x0000, width: 16)),
+                addr.eq(Const(0x0000, width: 15)),
                 then: [
                   If(
                     we,
@@ -159,7 +161,7 @@ class HarborAplic extends BridgeModule
               // sourcecfg
               for (var i = 0; i < sources; i++)
                 If(
-                  addr.eq(Const(0x0004 + i * 4, width: 16)),
+                  addr.eq(Const(0x0004 + i * 4, width: 15)),
                   then: [
                     If(
                       we,
@@ -174,7 +176,7 @@ class HarborAplic extends BridgeModule
 
               // setip
               If(
-                addr.eq(Const(0x1C00, width: 16)),
+                addr.eq(Const(0x1C00, width: 15)),
                 then: [
                   If(
                     we,
@@ -205,7 +207,7 @@ class HarborAplic extends BridgeModule
 
               // clrip
               If(
-                addr.eq(Const(0x1D00, width: 16)),
+                addr.eq(Const(0x1D00, width: 15)),
                 then: [
                   If(
                     we,
@@ -222,7 +224,7 @@ class HarborAplic extends BridgeModule
 
               // setie
               If(
-                addr.eq(Const(0x1E00, width: 16)),
+                addr.eq(Const(0x1E00, width: 15)),
                 then: [
                   If(
                     we,
@@ -250,7 +252,7 @@ class HarborAplic extends BridgeModule
 
               // clrie
               If(
-                addr.eq(Const(0x1F00, width: 16)),
+                addr.eq(Const(0x1F00, width: 15)),
                 then: [
                   If(
                     we,
@@ -268,7 +270,7 @@ class HarborAplic extends BridgeModule
               // target
               for (var i = 0; i < sources; i++)
                 If(
-                  addr.eq(Const(0x3004 + i * 4, width: 16)),
+                  addr.eq(Const(0x3004 + i * 4, width: 15)),
                   then: [
                     If(
                       we,
@@ -283,7 +285,7 @@ class HarborAplic extends BridgeModule
               // IDC per hart
               for (var h = 0; h < harts; h++) ...[
                 If(
-                  addr.eq(Const(0x4000 + h * 32, width: 16)),
+                  addr.eq(Const(0x4000 + h * 32, width: 15)),
                   then: [
                     If(
                       we & bus.selAny(0x4000 + h * 32, 1),
@@ -293,7 +295,7 @@ class HarborAplic extends BridgeModule
                   ],
                 ),
                 If(
-                  addr.eq(Const(0x4000 + h * 32 + 4, width: 16)),
+                  addr.eq(Const(0x4000 + h * 32 + 4, width: 15)),
                   then: [
                     If(
                       we & bus.selAny(0x4000 + h * 32 + 4, 1),
@@ -303,7 +305,7 @@ class HarborAplic extends BridgeModule
                   ],
                 ),
                 If(
-                  addr.eq(Const(0x4000 + h * 32 + 8, width: 16)),
+                  addr.eq(Const(0x4000 + h * 32 + 8, width: 15)),
                   then: [
                     If(
                       we,
@@ -317,7 +319,7 @@ class HarborAplic extends BridgeModule
                 ),
                 // claimi
                 If(
-                  addr.eq(Const(0x4000 + h * 32 + 0x1C, width: 16)),
+                  addr.eq(Const(0x4000 + h * 32 + 0x1C, width: 15)),
                   then: [
                     for (var src = 0; src < sources; src++)
                       If(

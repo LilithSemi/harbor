@@ -32,7 +32,7 @@ class HarborGpio extends BridgeModule
   /// Base address in the SoC memory map.
   final int baseAddress;
 
-  /// Wishbone slave address width. Defaults to 8 (256-byte register window).
+  /// Wishbone slave address width. Defaults to 12 (the 0x1000 window).
   final int busAddressWidth;
 
   /// Wishbone slave data width. Must match the SoC fabric (e.g. 64 on an RV64
@@ -53,7 +53,7 @@ class HarborGpio extends BridgeModule
   HarborGpio({
     required this.baseAddress,
     this.pinCount = 32,
-    this.busAddressWidth = 8,
+    this.busAddressWidth = 12,
     this.busDataWidth = 32,
     BusProtocol protocol = BusProtocol.wishbone,
     String? name,
@@ -129,17 +129,17 @@ class HarborGpio extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              // Byte-address decode: registers sit 8 bytes apart (see the map
-              // above). Match the full address, not just enough low bits for
-              // the registers defined today, so an address outside the map
-              // reads 0 and ignores writes instead of aliasing a register.
-              Case(bus.addr, [
+              // Registers sit 8 bytes apart (see the map above). Decode every
+              // address bit of the 0x1000 window and ignore the bits above it,
+              // so absolute and relative addresses both work. An unused offset
+              // reads 0 and ignores writes.
+              Case(bus.windowAddr(0x1000), [
                 // 0x00: INPUT
-                CaseItem(Const(0x00, width: busAddressWidth), [
+                CaseItem(Const(0x00, width: 12), [
                   bus.dataOut < gpioIn.zeroExtend(dw),
                 ]),
                 // 0x08: OUTPUT
-                CaseItem(Const(0x08, width: busAddressWidth), [
+                CaseItem(Const(0x08, width: 12), [
                   If(
                     bus.we,
                     then: [outputReg < bus.selMerge(outputReg, 0x08)],
@@ -147,7 +147,7 @@ class HarborGpio extends BridgeModule
                   ),
                 ]),
                 // 0x10: DIR
-                CaseItem(Const(0x10, width: busAddressWidth), [
+                CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
                     then: [dirReg < bus.selMerge(dirReg, 0x10)],
@@ -155,7 +155,7 @@ class HarborGpio extends BridgeModule
                   ),
                 ]),
                 // 0x18: IRQ_EN
-                CaseItem(Const(0x18, width: busAddressWidth), [
+                CaseItem(Const(0x18, width: 12), [
                   If(
                     bus.we,
                     then: [irqEn < bus.selMerge(irqEn, 0x18)],
@@ -163,7 +163,7 @@ class HarborGpio extends BridgeModule
                   ),
                 ]),
                 // 0x20: IRQ_STATUS (write-1-to-clear)
-                CaseItem(Const(0x20, width: busAddressWidth), [
+                CaseItem(Const(0x20, width: 12), [
                   If(
                     bus.we,
                     then: [
@@ -179,7 +179,7 @@ class HarborGpio extends BridgeModule
                   ),
                 ]),
                 // 0x28: IRQ_EDGE
-                CaseItem(Const(0x28, width: busAddressWidth), [
+                CaseItem(Const(0x28, width: 12), [
                   If(
                     bus.we,
                     then: [irqEdge < bus.selMerge(irqEdge, 0x28)],

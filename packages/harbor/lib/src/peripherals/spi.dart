@@ -38,7 +38,7 @@ class HarborSpiController extends BridgeModule
   /// Data width in bits (typically 8).
   final int spiDataWidth;
 
-  /// Wishbone slave address width. Defaults to 8 (256-byte register window).
+  /// Wishbone slave address width. Defaults to 12 (the 0x1000 window).
   final int busAddressWidth;
 
   /// Wishbone slave data width. Must match the SoC fabric (e.g. 64 on an RV64
@@ -88,7 +88,7 @@ class HarborSpiController extends BridgeModule
     this.isMaster = true,
     this.csCount = 1,
     this.spiDataWidth = 8,
-    this.busAddressWidth = 8,
+    this.busAddressWidth = 12,
     this.busDataWidth = 32,
     this.sdCard = false,
     this.sdMaxFrequency = 12000000,
@@ -352,14 +352,13 @@ class HarborSpiController extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              // Byte-address decode: registers sit 8 bytes apart (see the
-              // map above). Match the full address, not just enough low
-              // bits for the registers defined today, so an address outside
-              // the map reads 0 and ignores writes instead of aliasing a
-              // register.
-              Case(bus.addr, [
+              // Registers sit 8 bytes apart (see the map above). Decode every
+              // address bit of the 0x1000 window and ignore the bits above it,
+              // so absolute and relative addresses both work. An unused offset
+              // reads 0 and ignores writes.
+              Case(bus.windowAddr(0x1000), [
                 // 0x00: CTRL
-                CaseItem(Const(0x00, width: busAddressWidth), [
+                CaseItem(Const(0x00, width: 12), [
                   If(
                     bus.we & bus.selAny(0x00, 1),
                     then: [
@@ -381,7 +380,7 @@ class HarborSpiController extends BridgeModule
                 // write-1-to-clear on a DMA build so a driver can acknowledge a
                 // finished transfer without waiting for the next START to clear
                 // it. Reading still returns the full status word.
-                CaseItem(Const(0x08, width: busAddressWidth), [
+                CaseItem(Const(0x08, width: 12), [
                   if (dma)
                     If(
                       bus.we & bus.selAny(0x08, 1),
@@ -394,7 +393,7 @@ class HarborSpiController extends BridgeModule
                     bus.dataOut < status,
                 ]),
                 // 0x10: DATA
-                CaseItem(Const(0x10, width: busAddressWidth), [
+                CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
                     then: [
@@ -411,7 +410,7 @@ class HarborSpiController extends BridgeModule
                   ),
                 ]),
                 // 0x18: DIVIDER
-                CaseItem(Const(0x18, width: busAddressWidth), [
+                CaseItem(Const(0x18, width: 12), [
                   If(
                     bus.we,
                     then: [divider < bus.selMerge(divider, 0x18)],
@@ -419,7 +418,7 @@ class HarborSpiController extends BridgeModule
                   ),
                 ]),
                 // 0x20: CS
-                CaseItem(Const(0x20, width: busAddressWidth), [
+                CaseItem(Const(0x20, width: 12), [
                   If(
                     bus.we,
                     then: [csReg < bus.selMerge(csReg, 0x20)],
@@ -429,7 +428,7 @@ class HarborSpiController extends BridgeModule
                 // The DMA register block exists only on a DMA-capable build.
                 if (dma) ...[
                   // 0x28: DMA_ADDR (word-aligned target/source in memory).
-                  CaseItem(Const(0x28, width: busAddressWidth), [
+                  CaseItem(Const(0x28, width: 12), [
                     If(
                       bus.we,
                       then: [dmaAddr < bus.selMerge(dmaAddr, 0x28)],
@@ -437,7 +436,7 @@ class HarborSpiController extends BridgeModule
                     ),
                   ]),
                   // 0x30: DMA_LEN (byte count, must be a multiple of 4).
-                  CaseItem(Const(0x30, width: busAddressWidth), [
+                  CaseItem(Const(0x30, width: 12), [
                     If(
                       bus.we,
                       then: [dmaLen < bus.selMerge(dmaLen, 0x30)],
@@ -447,7 +446,7 @@ class HarborSpiController extends BridgeModule
                   // 0x38: DMA_CTRL. Write bit0=START (self-clearing kick),
                   // bit1=DIR (0 = SD->mem read, 1 = mem->SD write). Read returns
                   // {dma_done<<1, dma_busy<<0} for polling without STATUS.
-                  CaseItem(Const(0x38, width: busAddressWidth), [
+                  CaseItem(Const(0x38, width: 12), [
                     If(
                       bus.we & bus.selAny(0x38, 1),
                       then: [

@@ -86,7 +86,7 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
       protocol: protocol,
       clk: input('clk'),
       reset: input('reset'),
-      addressWidth: wide ? 32 : 8,
+      addressWidth: wide ? 32 : 12,
       dataWidth: busDataWidth ?? 32,
     );
 
@@ -103,8 +103,9 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
     // convention every other Harbor peripheral uses. The narrow path used to
     // compare a word index (addr >> 2) against the byte address on ADR, so
     // only RAND at word index 0 (which is also byte address 0) ever matched
-    // and STATUS was unreachable.
-    final addrField = wide ? bus.addr.getRange(0, 12) : bus.addr.getRange(0, 5);
+    // and STATUS was unreachable. Only the bits of the 0x1000 window are
+    // decoded, so absolute and relative addresses both work.
+    final addrField = bus.windowAddr(0x1000);
     final randOff = Const(0x00, width: addrField.width);
     final statusOff = Const(wide ? 0x08 : 0x04, width: addrField.width);
 

@@ -84,7 +84,7 @@ class HarborResetController extends BridgeModule
       module: this,
       name: 'bus',
       protocol: protocol,
-      addressWidth: 8,
+      addressWidth: 12,
       dataWidth: 32,
       clk: input('clk'),
       reset: input('por'),
@@ -177,11 +177,11 @@ class HarborResetController extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              // Match the full address, not just enough low bits for the
-              // registers defined today, so an address outside the map
-              // reads 0 and ignores writes instead of aliasing a register.
-              Case(bus.addr, [
-                CaseItem(Const(0x00, width: 8), [
+              // Decode every address bit of the 0x1000 window and ignore the
+              // bits above it, so absolute and relative addresses both work. An
+              // unused offset reads 0 and ignores writes.
+              Case(bus.windowAddr(0x1000), [
+                CaseItem(Const(0x00, width: 12), [
                   If(
                     bus.we & bus.selAny(0x00, 1),
                     then: [
@@ -191,7 +191,7 @@ class HarborResetController extends BridgeModule
                     orElse: [bus.dataOut < Const(0, width: 32)],
                   ),
                 ]),
-                CaseItem(Const(0x08, width: 8), [
+                CaseItem(Const(0x08, width: 12), [
                   bus.dataOut <
                       [
                         Const(0, width: 23),
@@ -199,28 +199,28 @@ class HarborResetController extends BridgeModule
                         cause,
                       ].swizzle().zeroExtend(32),
                 ]),
-                CaseItem(Const(0x10, width: 8), [
+                CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
                     then: [holdTime < bus.selMerge(holdTime, 0x10)],
                     orElse: [bus.dataOut < holdTime.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x18, width: 8), [
+                CaseItem(Const(0x18, width: 12), [
                   If(
                     bus.we,
                     then: [domainRstReg < bus.selMerge(domainRstReg, 0x18)],
                     orElse: [bus.dataOut < domainRstReg.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x28, width: 8), [
+                CaseItem(Const(0x28, width: 12), [
                   If(
                     bus.we,
                     then: [wdogEn < bus.selMerge(wdogEn, 0x28)],
                     orElse: [bus.dataOut < wdogEn.zeroExtend(32)],
                   ),
                 ]),
-                CaseItem(Const(0x30, width: 8), [
+                CaseItem(Const(0x30, width: 12), [
                   If(
                     bus.we & bus.selAny(0x30, 2),
                     then: [

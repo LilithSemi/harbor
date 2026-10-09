@@ -294,3 +294,41 @@ extension BusSlavePortByteLane on BusSlavePort {
     return hi - lo;
   }
 }
+
+/// Address decode inside the window of a [BusSlavePort].
+///
+/// A fabric can give a slave its address relative to the window base, or the
+/// absolute address. A peripheral decodes only the address bits inside its
+/// window, so both work.
+extension BusSlavePortWindow on BusSlavePort {
+  /// The address bits inside a window of [windowBytes] bytes, zero-extended
+  /// when the port is narrower than the window. [windowBytes] must be a power
+  /// of two.
+  Logic windowAddr(int windowBytes) {
+    if (windowBytes <= 0 || windowBytes & (windowBytes - 1) != 0) {
+      throw ArgumentError.value(
+        windowBytes,
+        'windowBytes',
+        'must be a power of two',
+      );
+    }
+    final bits = windowBytes.bitLength - 1;
+    if (bits == 0) return Const(0);
+    return addr.width >= bits ? addr.getRange(0, bits) : addr.zeroExtend(bits);
+  }
+
+  /// High when the address is in the first [spanBytes] of a window of
+  /// [windowBytes] bytes. Gate register access on it, so an offset past the
+  /// registers reads 0 and ignores writes.
+  Logic inSpan(int spanBytes, int windowBytes) {
+    if (spanBytes <= 0 || spanBytes > windowBytes) {
+      throw ArgumentError.value(spanBytes, 'spanBytes', 'must fit the window');
+    }
+    final offset = windowAddr(windowBytes);
+    if (spanBytes == windowBytes) return Const(1);
+    if (spanBytes & (spanBytes - 1) == 0) {
+      return offset.getRange(spanBytes.bitLength - 1).eq(0);
+    }
+    return offset.lt(Const(spanBytes, width: offset.width));
+  }
+}

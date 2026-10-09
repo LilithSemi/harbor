@@ -176,7 +176,7 @@ class HarborEthernetMac extends BridgeModule
       protocol: protocol,
       clk: input('clk'),
       reset: input('reset'),
-      addressWidth: 8,
+      addressWidth: 12,
       dataWidth: 32,
     );
 
@@ -467,8 +467,8 @@ class HarborEthernetMac extends BridgeModule
                   mdioOutReg < mdioShift[63],
                   mdioShift < [mdioShift.getRange(0, 63), Const(0)].swizzle(),
                   mdioBitCnt < (mdioBitCnt - Const(1, width: 7)),
-                  // For a read, release the line for the TA + data window (last 18
-                  // bits), a write drives the whole frame.
+                  // For a read, release the line for the TA + data window (last
+                  // 18 bits), a write drives the whole frame.
                   mdioOeReg <
                       (~mdioOpRead | mdioBitCnt.gt(Const(18, width: 7))),
                   If(
@@ -855,9 +855,12 @@ class HarborEthernetMac extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              Case(bus.addr.getRange(0, 8), [
+              // Decode every address bit of the 0x1000 window and ignore the
+              // bits above it, so absolute and relative addresses both work. An
+              // unused offset reads 0 and ignores writes.
+              Case(bus.windowAddr(0x1000), [
                 // 0x000: MAC_CTRL
-                CaseItem(Const(0x00, width: 8), [
+                CaseItem(Const(0x00, width: 12), [
                   If(
                     bus.we & bus.selAny(0x00, 1),
                     then: [macEnable < bus.dataIn[0]],
@@ -865,13 +868,13 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x008: MAC_STATUS
-                CaseItem(Const(0x08, width: 8), [
+                CaseItem(Const(0x08, width: 12), [
                   bus.dataOut <
                       txEnable.zeroExtend(32) |
                           (rxEnable.zeroExtend(32) << Const(1, width: 32)),
                 ]),
                 // 0x010: MAC_ADDR_LO
-                CaseItem(Const(0x10, width: 8), [
+                CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
                     then: [macAddrLo < bus.selMerge(macAddrLo, 0x10)],
@@ -879,7 +882,7 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x018: MAC_ADDR_HI
-                CaseItem(Const(0x18, width: 8), [
+                CaseItem(Const(0x18, width: 12), [
                   If(
                     bus.we,
                     then: [macAddrHi < bus.selMerge(macAddrHi, 0x18)],
@@ -887,7 +890,7 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x020: INT_STATUS (W1C)
-                CaseItem(Const(0x20, width: 8), [
+                CaseItem(Const(0x20, width: 12), [
                   If(
                     bus.we,
                     then: [intStatus < (intStatus & ~bus.selMasked(0x20, 8))],
@@ -895,7 +898,7 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x028: INT_ENABLE
-                CaseItem(Const(0x28, width: 8), [
+                CaseItem(Const(0x28, width: 12), [
                   If(
                     bus.we,
                     then: [intEnable < bus.selMerge(intEnable, 0x28)],
@@ -903,7 +906,7 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x040: TX_CTRL ([0] enable, [1] PIO start, [2] DMA start).
-                CaseItem(Const(0x40, width: 8), [
+                CaseItem(Const(0x40, width: 12), [
                   If(
                     bus.we & bus.selAny(0x40, 1),
                     then: [
@@ -933,11 +936,11 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x048: TX_STATUS ([0] busy).
-                CaseItem(Const(0x48, width: 8), [
+                CaseItem(Const(0x48, width: 12), [
                   bus.dataOut < txBusy.zeroExtend(32),
                 ]),
                 // 0x058: TX_LEN (payload byte count).
-                CaseItem(Const(0x58, width: 8), [
+                CaseItem(Const(0x58, width: 12), [
                   If(
                     bus.we,
                     then: [txLenReg < bus.selMerge(txLenReg, 0x58)],
@@ -945,7 +948,7 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x090: TX_DATA (PIO payload, one word at a time).
-                CaseItem(Const(0x90, width: 8), [
+                CaseItem(Const(0x90, width: 12), [
                   If(
                     bus.we,
                     then: [
@@ -955,13 +958,13 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x098: RX_DATA (first received word).
-                CaseItem(Const(0x98, width: 8), [bus.dataOut < rxData0]),
+                CaseItem(Const(0x98, width: 12), [bus.dataOut < rxData0]),
                 // 0x0A0: RX_LEN (received payload byte count).
-                CaseItem(Const(0xA0, width: 8), [
+                CaseItem(Const(0xA0, width: 12), [
                   bus.dataOut < rxLenReg.zeroExtend(32),
                 ]),
                 // 0x050: TX_DESC_BASE
-                CaseItem(Const(0x50, width: 8), [
+                CaseItem(Const(0x50, width: 12), [
                   If(
                     bus.we,
                     then: [txDescBase < bus.selMerge(txDescBase, 0x50)],
@@ -969,7 +972,7 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x060: RX_CTRL ([0] enable, [1] RX DMA enable).
-                CaseItem(Const(0x60, width: 8), [
+                CaseItem(Const(0x60, width: 12), [
                   If(
                     bus.we & bus.selAny(0x60, 1),
                     then: [rxEnable < bus.dataIn[0], rxDmaEn < bus.dataIn[1]],
@@ -981,14 +984,14 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x068: RX_STATUS ([0] FCS good, [1] FCS bad, [2] busy).
-                CaseItem(Const(0x68, width: 8), [
+                CaseItem(Const(0x68, width: 12), [
                   bus.dataOut <
                       rxGood.zeroExtend(32) |
                           (rxBad.zeroExtend(32) << Const(1, width: 32)) |
                           (rxBusy.zeroExtend(32) << Const(2, width: 32)),
                 ]),
                 // 0x070: RX_DESC_BASE
-                CaseItem(Const(0x70, width: 8), [
+                CaseItem(Const(0x70, width: 12), [
                   If(
                     bus.we,
                     then: [rxDescBase < bus.selMerge(rxDescBase, 0x70)],
@@ -997,7 +1000,7 @@ class HarborEthernetMac extends BridgeModule
                 ]),
                 // 0x080: MDIO_CTRL. [4:0] reg, [9:5] phy, [10] read, [11]
                 // start (kicks the engine), [12] busy (read-only).
-                CaseItem(Const(0x80, width: 8), [
+                CaseItem(Const(0x80, width: 12), [
                   If(
                     bus.we,
                     then: [
@@ -1029,7 +1032,7 @@ class HarborEthernetMac extends BridgeModule
                   ),
                 ]),
                 // 0x088: MDIO_DATA
-                CaseItem(Const(0x88, width: 8), [
+                CaseItem(Const(0x88, width: 12), [
                   If(
                     bus.we,
                     then: [mdioData < bus.selMerge(mdioData, 0x88)],

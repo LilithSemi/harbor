@@ -317,7 +317,7 @@ class HarborSdioController extends BridgeModule
     this.fabricDma = false,
     this.dmaAddressWidth = 32,
     this.dmaDataWidth = 32,
-    this.busAddressWidth = 8,
+    this.busAddressWidth = 12,
     this.busDataWidth = 32,
     this.clockFrequency = 0,
     this.rxFifoDepth = 16,
@@ -593,16 +593,16 @@ class HarborSdioController extends BridgeModule
     final dmaAck = fabricDma ? dmaWb!.ack : input('dma_ack');
     // The last address the card-read ADMA wrote, re-read after the transfer to
     // fence the posted writes (see [readBackBarrier]). Only built when the
-    // barrier is enabled, so the RTL is byte-identical otherwise.
-    // Cycles to hold the DMA master fully idle after a card-read's last write,
-    // before data-done. The idle bus lets the burst adapter's idle-flush land
-    // its held write burst and the controller commit it (write + tWR), so
-    // data-done MEANS the block is durable in DRAM. The wait injects NO new bus
-    // transaction (an earlier read-back approach deadlocked the DRAM CDC bridge,
-    // which needs CYC to drop between transactions); the CPU polls the SDIO
-    // STATUS MMIO meanwhile, so DRAM is idle and the flush proceeds. Sized well
-    // above the adapter idle-flush window + controller commit. Only built when
-    // the barrier is enabled, so the RTL is byte-identical otherwise.
+    // barrier is enabled, so the RTL is byte-identical otherwise. Cycles to
+    // hold the DMA master fully idle after a card-read's last write, before
+    // data-done. The idle bus lets the burst adapter's idle-flush land its held
+    // write burst and the controller commit it (write + tWR), so data-done
+    // MEANS the block is durable in DRAM. The wait injects NO new bus
+    // transaction (an earlier read-back approach deadlocked the DRAM CDC
+    // bridge, which needs CYC to drop between transactions); the CPU polls the
+    // SDIO STATUS MMIO meanwhile, so DRAM is idle and the flush proceeds. Sized
+    // well above the adapter idle-flush window + controller commit. Only built
+    // when the barrier is enabled, so the RTL is byte-identical otherwise.
     final barrierWait = readBackBarrier
         ? Logic(name: 'dma_barrier_wait', width: 9)
         : null;
@@ -753,9 +753,7 @@ class HarborSdioController extends BridgeModule
                 ~bus.we &
                 cmdDataDir &
                 ~rxEmpty &
-                bus.addr
-                    .getRange(3, busAddressWidth)
-                    .eq(Const(0x09, width: busAddressWidth - 3)))
+                bus.windowAddr(0x1000).getRange(3).eq(Const(0x09, width: 9)))
             .named('rx_pop_cpu');
     final rxPop = (rxPopAdma | rxPopCpu).named('rx_pop');
     // A word is only really taken when the FIFO had one to give.
@@ -882,8 +880,8 @@ class HarborSdioController extends BridgeModule
     final dmaNextMore = dmaNextBytes
         .neq(Const(0, width: 16))
         .named('dma_next_more');
-    // Fairness boundary: the last beat of a burst window still drops CYC for one
-    // cycle so a waiting master gets in, so streaming pauses there.
+    // Fairness boundary: the last beat of a burst window still drops CYC for
+    // one cycle so a waiting master gets in, so streaming pauses there.
     final dmaBurstBoundary = dmaBurstCnt
         .eq(Const(dmaBurstBeats - 1, width: burstBits))
         .named('dma_burst_boundary');
@@ -1744,10 +1742,10 @@ class HarborSdioController extends BridgeModule
                         // The descriptor still owes bytes and the next beat's
                         // word(s) are already in the FIFO: KEEP STB/WE asserted
                         // and re-arm the next beat in place, so the burst
-                        // adapter never sees a gap and keeps combining. Draining
-                        // the whole buffered batch back to back (not one word
-                        // per SD clock) is what lands the words inside the
-                        // adapter's combine window.
+                        // adapter never sees a gap and keeps combining.
+                        // Draining the whole buffered batch back to back (not
+                        // one word per SD clock) is what lands the words inside
+                        // the adapter's combine window.
                         then: [
                           dmaAddrReg < dmaNextAddr,
                           dmaWdataReg < dmaNextHead,
@@ -1844,14 +1842,14 @@ class HarborSdioController extends BridgeModule
               // Each register sits in its own 8-byte slot (byte offset >> 3),
               // matching every other Harbor peripheral on the byte-addressed
               // fabric. The documented byte offsets 0x00,0x08,0x10,... map to
-              // indices 0,1,2. Match the full configured address width, not
-              // just enough low bits for the registers defined today, so an
-              // address outside the map reads 0 and ignores writes instead of
-              // aliasing a register.
-              Case(bus.addr.getRange(3, busAddressWidth), [
+              // indices 0,1,2. Decode every address bit of the 0x1000 window
+              // and ignore the bits above it, so absolute and relative
+              // addresses both work. An unused offset reads 0 and ignores
+              // writes.
+              Case(bus.windowAddr(0x1000).getRange(3), [
                 // 0x00: CTRL ([0] enable, [5:4] reports max bus width,
                 // [8] read-data sample edge 0:rising 1:falling).
-                CaseItem(Const(0x00, width: busAddressWidth - 3), [
+                CaseItem(Const(0x00, width: 9), [
                   If(
                     bus.we & bus.selAny(0x00, 2),
                     then: [
@@ -1875,7 +1873,7 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x08: STATUS ([0] card detect, [8] busy, [9] data ready).
-                CaseItem(Const(0x01, width: busAddressWidth - 3), [
+                CaseItem(Const(0x01, width: 9), [
                   bus.dataOut <
                       cardDetect.zeroExtend(dw) |
                           (busy.zeroExtend(dw) << Const(8, width: 32)) |
@@ -1887,7 +1885,7 @@ class HarborSdioController extends BridgeModule
                               Const(9, width: 32)),
                 ]),
                 // 0x10: CLK_DIV.
-                CaseItem(Const(0x02, width: busAddressWidth - 3), [
+                CaseItem(Const(0x02, width: 9), [
                   If(
                     bus.we,
                     then: [clkDiv < bus.selMerge(clkDiv, 0x10)],
@@ -1898,7 +1896,7 @@ class HarborSdioController extends BridgeModule
                 // [5:0] index, [7:6] response type (0 none, 1 short, 2 long
                 // R2, 3 short+busy), [8] data present, [9] data direction
                 // (0 write, 1 read).
-                CaseItem(Const(0x03, width: busAddressWidth - 3), [
+                CaseItem(Const(0x03, width: 9), [
                   If(
                     bus.we & bus.selAny(0x18, 2),
                     then: [
@@ -1929,13 +1927,14 @@ class HarborSdioController extends BridgeModule
                               dmaWeReg < Const(0),
                             ],
                           ),
-                          // Pre-fetch the ADMA descriptor NOW, at command issue,
-                          // so the two descriptor reads from memory overlap the
-                          // command+response window. The engine then parks in its
-                          // memory state, ready, before the first data word. If it
-                          // waited until the command completed, the descriptor
-                          // fetch latency dropped the first several data words and
-                          // shifted the whole block early.
+                          // Pre-fetch the ADMA descriptor NOW, at command
+                          // issue, so the two descriptor reads from memory
+                          // overlap the command+response window. The engine
+                          // then parks in its memory state, ready, before the
+                          // first data word. If it waited until the command
+                          // completed, the descriptor fetch latency dropped the
+                          // first several data words and shifted the whole
+                          // block early.
                           If(
                             bus.dataIn[10] & bus.dataIn[8],
                             then: [
@@ -1972,7 +1971,7 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x20: CMD_ARG.
-                CaseItem(Const(0x04, width: busAddressWidth - 3), [
+                CaseItem(Const(0x04, width: 9), [
                   If(
                     bus.we,
                     then: [cmdArg < bus.selMerge(cmdArg, 0x20)],
@@ -1981,12 +1980,12 @@ class HarborSdioController extends BridgeModule
                 ]),
                 // 0x28-0x40: RESP0-3.
                 for (var i = 0; i < 4; i++)
-                  CaseItem(Const(0x05 + i, width: busAddressWidth - 3), [
+                  CaseItem(Const(0x05 + i, width: 9), [
                     bus.dataOut < resp[i].zeroExtend(dw),
                   ]),
                 // 0x48: DATA. One-word PIO buffer. CPU writes fill it (for a
                 // write transfer), reads drain it (for a read transfer).
-                CaseItem(Const(0x09, width: busAddressWidth - 3), [
+                CaseItem(Const(0x09, width: 9), [
                   If(
                     bus.we & bus.selAny(0x48, 4),
                     then: [
@@ -2002,7 +2001,7 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x50: BLK_SIZE.
-                CaseItem(Const(0x0A, width: busAddressWidth - 3), [
+                CaseItem(Const(0x0A, width: 9), [
                   If(
                     bus.we,
                     then: [blkSize < bus.selMerge(blkSize, 0x50)],
@@ -2010,7 +2009,7 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x58: BLK_COUNT.
-                CaseItem(Const(0x0B, width: busAddressWidth - 3), [
+                CaseItem(Const(0x0B, width: 9), [
                   If(
                     bus.we,
                     then: [blkCount < bus.selMerge(blkCount, 0x58)],
@@ -2018,7 +2017,7 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x60: INT_STATUS (write-1-to-clear).
-                CaseItem(Const(0x0C, width: busAddressWidth - 3), [
+                CaseItem(Const(0x0C, width: 9), [
                   If(
                     bus.we,
                     then: [intStatus < (intStatus & ~bus.selMasked(0x60, 8))],
@@ -2026,7 +2025,7 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x68: INT_ENABLE.
-                CaseItem(Const(0x0D, width: busAddressWidth - 3), [
+                CaseItem(Const(0x0D, width: 9), [
                   If(
                     bus.we,
                     then: [intEnable < bus.selMerge(intEnable, 0x68)],
@@ -2034,7 +2033,7 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x70: ADMA_ADDR (descriptor table base for DMA transfers).
-                CaseItem(Const(0x0E, width: busAddressWidth - 3), [
+                CaseItem(Const(0x0E, width: 9), [
                   If(
                     bus.we,
                     then: [admaBase < bus.selMerge(admaBase, 0x70)],

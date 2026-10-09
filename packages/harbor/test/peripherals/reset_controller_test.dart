@@ -83,7 +83,7 @@ void main() {
       por = Logic(name: 'por');
       stb = Logic(name: 'stb');
       we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 8);
+      adr = Logic(name: 'adr', width: rc.input('bus_ADR').width);
       mosi = Logic(name: 'mosi', width: 32);
       sel = Logic(name: 'sel', width: 4);
 
@@ -152,6 +152,15 @@ void main() {
       await busWrite(_wdogEn, 0x1);
       expect(await busRead(_wdogEn), equals(0x1));
       expect(await busRead(_ctrl), equals(0));
+      await Simulator.endSimulation();
+    });
+
+    test('an absolute address decodes inside the window', () async {
+      // The 12-bit port carries the low bits of 0x10005000 + offset.
+      const base = 0x10005000 & 0xFFF;
+      await busWrite(base + _holdTime, 0x4321);
+      expect(await busRead(base + _holdTime), equals(0x4321));
+      expect(await busRead(base + 0x100 + _holdTime), equals(0));
       await Simulator.endSimulation();
     });
   });

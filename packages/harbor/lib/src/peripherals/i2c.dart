@@ -55,7 +55,7 @@ class HarborI2cController extends BridgeModule
   /// 0 leaves the property out.
   int clockFrequency;
 
-  /// Wishbone slave address width. Defaults to 8 (256-byte register window).
+  /// Wishbone slave address width. Defaults to 12 (the 0x1000 window).
   final int busAddressWidth;
 
   /// Wishbone slave data width. Must match the SoC fabric (e.g. 64 on an RV64
@@ -71,7 +71,7 @@ class HarborI2cController extends BridgeModule
   HarborI2cController({
     required this.baseAddress,
     this.clockFrequency = 0,
-    this.busAddressWidth = 8,
+    this.busAddressWidth = 12,
     this.busDataWidth = 32,
     BusProtocol protocol = BusProtocol.wishbone,
     String? name,
@@ -475,14 +475,13 @@ class HarborI2cController extends BridgeModule
             then: [
               bus.ack < Const(1),
 
-              // Byte-address decode: registers sit 8 bytes apart (see the
-              // map above). Match the full address, not just enough low
-              // bits for the registers defined today, so an address outside
-              // the map reads 0 and ignores writes instead of aliasing a
-              // register.
-              Case(bus.addr, [
+              // Registers sit 8 bytes apart (see the map above). Decode every
+              // address bit of the 0x1000 window and ignore the bits above it,
+              // so absolute and relative addresses both work. An unused offset
+              // reads 0 and ignores writes.
+              Case(bus.windowAddr(0x1000), [
                 // 0x00: CTRL
-                CaseItem(Const(0x00, width: busAddressWidth), [
+                CaseItem(Const(0x00, width: 12), [
                   If(
                     bus.we & bus.selAny(0x00, 1),
                     then: [enable < bus.dataIn[0], irqEn < bus.dataIn[1]],
@@ -494,7 +493,7 @@ class HarborI2cController extends BridgeModule
                   ),
                 ]),
                 // 0x08: STATUS
-                CaseItem(Const(0x08, width: busAddressWidth), [
+                CaseItem(Const(0x08, width: 12), [
                   bus.dataOut < status,
                   // Any write that selects the status byte clears both
                   // sticky bits (write-1-to-clear; the controller does not
@@ -505,7 +504,7 @@ class HarborI2cController extends BridgeModule
                   ),
                 ]),
                 // 0x10: DATA
-                CaseItem(Const(0x10, width: busAddressWidth), [
+                CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
                     then: [txData < bus.selMerge(txData, 0x10)],
@@ -516,7 +515,7 @@ class HarborI2cController extends BridgeModule
                   ),
                 ]),
                 // 0x18: ADDR
-                CaseItem(Const(0x18, width: busAddressWidth), [
+                CaseItem(Const(0x18, width: 12), [
                   If(
                     bus.we,
                     then: [slaveAddr < bus.selMerge(slaveAddr, 0x18)],
@@ -524,7 +523,7 @@ class HarborI2cController extends BridgeModule
                   ),
                 ]),
                 // 0x20: PRESCALE
-                CaseItem(Const(0x20, width: busAddressWidth), [
+                CaseItem(Const(0x20, width: 12), [
                   If(
                     bus.we,
                     then: [prescale < bus.selMerge(prescale, 0x20)],
@@ -534,7 +533,7 @@ class HarborI2cController extends BridgeModule
                 // 0x28: CMD (write-only: trigger I2C operations). Bits
                 // combine in one write, for example START with WRITE to
                 // send an address byte. See the class doc for the map.
-                CaseItem(Const(0x28, width: busAddressWidth), [
+                CaseItem(Const(0x28, width: 12), [
                   If(
                     bus.we & bus.selAny(0x28, 1),
                     then: [

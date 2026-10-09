@@ -111,11 +111,10 @@ class HarborUart extends BridgeModule
       ]);
       datIn = laneData;
     }
-    // The registers span 8 bytes. An address above them matches nothing, so
-    // it reads 0 and ignores writes instead of aliasing a register.
-    final inWindow = bus.addr.width > 3
-        ? bus.addr.getRange(3).eq(0).named('uart_in_window')
-        : Const(1);
+    // The registers span 8 bytes of the 0x1000 window. Other offsets in the
+    // window read 0 and ignore writes. Address bits above the window are
+    // ignored, so absolute and window-relative addresses both work.
+    final inWindow = bus.inSpan(8, 0x1000).named('uart_in_window');
     final datOutW = Logic(name: 'uart_dat_out', width: bus.dataOut.width);
     bus.dataOut <= datOutW;
     final ack = bus.ack;
