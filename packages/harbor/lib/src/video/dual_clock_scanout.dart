@@ -1,5 +1,6 @@
 import 'package:rohd/rohd.dart';
 
+import '../soc/target.dart';
 import 'double_line_buffer.dart';
 import 'line_fetcher.dart';
 
@@ -17,8 +18,10 @@ import 'line_fetcher.dart';
 /// [lineStart] swaps to the prefetched buffer and requests the next line into
 /// the freed one. [pixel] is `buffer[col]`, [underrun] latches if a requested
 /// line had not completed by the swap.
+///
+/// [pixel] is registered: it is the word at the [col] of the cycle before.
 class HarborDualClockScanout extends Module {
-  /// Pixel word for [col] in the active buffer.
+  /// Pixel word for the previous cycle's [col] in the active buffer.
   Logic get pixel => output('pixel');
 
   /// Latches if a line was not ready at a swap.
@@ -34,6 +37,9 @@ class HarborDualClockScanout extends Module {
 
   final int maxWords;
 
+  /// The block RAM cell for the line buffers, or null for flops.
+  final HarborBlockRam? blockRam;
+
   HarborDualClockScanout({
     required Logic pixelClk,
     required Logic pixelReset,
@@ -48,6 +54,7 @@ class HarborDualClockScanout extends Module {
     required Logic mDataIn,
     required Logic mAck,
     this.maxWords = 1024,
+    this.blockRam,
     super.name = 'dual_clock_scanout',
   }) : super(definitionName: 'HarborDualClockScanout') {
     pixelClk = addInput('pixel_clk', pixelClk);
@@ -116,9 +123,12 @@ class HarborDualClockScanout extends Module {
       wrSel: fetcher.wrSel,
       wrIdx: fetcher.wrIdx,
       wrData: fetcher.wrData,
+      rdClk: pixelClk,
+      rdReset: pixelReset,
       rdSel: readSel,
       rdCol: col,
       maxWords: maxWords,
+      blockRam: blockRam,
     );
 
     mStb <= fetcher.mStb;

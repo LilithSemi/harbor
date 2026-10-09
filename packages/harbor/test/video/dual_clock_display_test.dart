@@ -270,4 +270,109 @@ void main() {
     }
     expect(checked, equals(8));
   });
+
+  // Every output must equal the timing generator from pipelineDelay cycles
+  // before, and the word must be the one for that position. A one-stage slip
+  // in de, hsync, vsync, x, y or the data fails here.
+  test('sync, de and data leave the pipeline together', () async {
+    const timing = HarborDisplayTiming(
+      hActive: 4,
+      hFrontPorch: 1,
+      hSyncWidth: 2,
+      hBackPorch: 1,
+      vActive: 2,
+      vFrontPorch: 1,
+      vSyncWidth: 1,
+      vBackPorch: 1,
+      pixelClock: 1000000,
+    );
+    const hTotal = 8;
+    const vTotal = 5;
+    const stride = 16;
+    const fbBase = 0x100;
+
+    final pixelClk = SimpleClockGenerator(14).clk;
+    final sysClk = SimpleClockGenerator(6).clk;
+    final pixelReset = Logic(name: 'pixel_reset');
+    final sysReset = Logic(name: 'sys_reset');
+    final enable = Logic(name: 'enable');
+    final base = Logic(name: 'fb_base', width: 32);
+    final mDataIn = Logic(name: 'm_dat_i', width: 32);
+    final mAck = Logic(name: 'm_ack');
+
+    final disp = HarborDualClockDisplay(
+      target: const HarborSimTarget(),
+      timing: timing,
+      pixelClk: pixelClk,
+      pixelReset: pixelReset,
+      shiftClk: sysClk,
+      shiftReset: sysReset,
+      sysClk: sysClk,
+      sysReset: sysReset,
+      enable: enable,
+      fbBase: base,
+      mDataIn: mDataIn,
+      mAck: mAck,
+    );
+    mAck <= disp.mStb;
+    mDataIn <= disp.mAddr;
+    await disp.build();
+    final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
+
+    pixelReset.inject(1);
+    sysReset.inject(1);
+    enable.inject(1);
+    base.inject(fbBase);
+    Simulator.setMaxSimTime(50000000);
+    unawaited(Simulator.run());
+    addTearDown(() async {
+      if (!Simulator.simulationHasEnded) {
+        await Simulator.endSimulation();
+      }
+      Simulator.reset();
+    });
+    await pixelClk.nextPosedge;
+    await pixelClk.nextPosedge;
+    pixelReset.inject(0);
+    sysReset.inject(0);
+    await pixelClk.nextNegedge;
+
+    for (var i = 0; i < hTotal * vTotal * 2; i++) {
+      await pixelClk.nextPosedge;
+    }
+
+    List<int> sample(List<Logic> signals) => [
+      for (final s in signals) s.value.toInt(),
+    ];
+    final history = <List<int>>[];
+    var active = 0;
+    var syncEdges = 0;
+    for (var i = 0; i < hTotal * vTotal * 2; i++) {
+      await pixelClk.nextNegedge;
+      history.add(sample([gen.de, gen.hsync, gen.vsync, gen.x, gen.y]));
+      if (history.length > HarborDualClockDisplay.pipelineDelay + 1) {
+        final want =
+            history[history.length - 1 - HarborDualClockDisplay.pipelineDelay];
+        final got = sample([disp.de, disp.hsync, disp.vsync, disp.x, disp.y]);
+        expect(got, equals(want), reason: 'cycle $i: de, hsync, vsync, x, y');
+        if (got[0] == 1) {
+          expect(
+            disp.pixelWord.value.toInt(),
+            equals(fbBase + got[4] * stride + got[3] * 4),
+            reason: 'cycle $i: word for (${got[3]},${got[4]})',
+          );
+          active++;
+        }
+        final before =
+            history[history.length - 2 - HarborDualClockDisplay.pipelineDelay];
+        if (before[1] != want[1] || before[2] != want[2]) syncEdges++;
+      }
+    }
+    expect(active, greaterThanOrEqualTo(timing.hActive * timing.vActive));
+    expect(
+      syncEdges,
+      greaterThan(4),
+      reason: 'the window must hold sync edges',
+    );
+  });
 }

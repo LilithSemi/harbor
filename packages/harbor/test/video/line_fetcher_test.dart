@@ -53,6 +53,8 @@ class _Harness extends Module {
       wrSel: fetcher.wrSel,
       wrIdx: fetcher.wrIdx,
       wrData: fetcher.wrData,
+      rdClk: clk,
+      rdReset: reset,
       rdSel: rdSel,
       rdCol: rdCol,
       maxWords: 4,

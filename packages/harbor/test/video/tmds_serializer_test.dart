@@ -9,22 +9,25 @@ import 'package:test/test.dart';
 /// five shift-clock cycles. The ODDRX1F output itself is a vendor blackbox, so
 /// these tests target the fabric gearing that feeds it.
 void main() {
-  late Logic shiftClk, reset, symbol;
+  late Logic shiftClk, reset, symbol, align;
   late TmdsSerializer ser;
 
   Future<void> setup() async {
     shiftClk = SimpleClockGenerator(10).clk;
     reset = Logic(name: 'reset');
     symbol = Logic(name: 'symbol', width: 10);
+    align = Logic(name: 'align');
     ser = TmdsSerializer(
       shiftClk: shiftClk,
       reset: reset,
       symbol: symbol,
+      align: align,
       target: const HarborSimTarget(),
     );
     await ser.build();
     reset.inject(1);
     symbol.inject(0);
+    align.inject(0);
     Simulator.setMaxSimTime(1000000);
     unawaited(Simulator.run());
     await shiftClk.nextPosedge;
@@ -48,7 +51,8 @@ void main() {
   test('shifts a symbol out LSB first as DDR bit pairs', () async {
     await setup();
     symbol.inject(0x101); // bits: bit0=1, bit8=1, rest 0
-    await tick(5); // load the symbol (phase wraps to 0)
+    // The load takes five cycles, and d0/d1 follow the shift register by one.
+    await tick(6);
 
     final d0s = <int>[];
     final d1s = <int>[];
@@ -65,8 +69,29 @@ void main() {
   test('an all-ones symbol drives both DDR phases high', () async {
     await setup();
     symbol.inject(0x3FF);
-    await tick(5);
+    await tick(6);
     expect(ser.d0.value.toInt(), equals(1));
     expect(ser.d1.value.toInt(), equals(1));
+  });
+
+  test('an align pulse moves the word border to the next edge', () async {
+    await setup();
+    symbol.inject(0x003);
+    await tick(7);
+    // Each pass starts the pulse at a different phase of the gearbox.
+    for (var shift = 0; shift < 5; shift++) {
+      align.inject(1);
+      await tick(1);
+      align.inject(0);
+      // The next edge loads, and the output pair follows one edge later.
+      await tick(2);
+      final d0s = <int>[];
+      for (var i = 0; i < 10; i++) {
+        d0s.add(ser.d0.value.toInt());
+        await tick(1);
+      }
+      expect(d0s, equals([1, 0, 0, 0, 0, 1, 0, 0, 0, 0]));
+      await tick(shift);
+    }
   });
 }

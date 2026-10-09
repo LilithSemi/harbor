@@ -18,6 +18,7 @@ void main() {
     shiftClk: Logic(name: 'shift_clk'),
     reset: Logic(name: 'reset'),
     symbol: Logic(name: 'symbol', width: 10),
+    align: Logic(name: 'align'),
     target: target,
   );
 

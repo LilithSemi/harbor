@@ -9,10 +9,13 @@ import 'package:rohd/rohd.dart';
 /// four fixed control symbols selected by [ctrl] (`{c1, c0}`) and resets the
 /// disparity.
 ///
-/// The output [q] is the 10-bit symbol with `q[0]` the first bit to serialize.
-/// The disparity counter is registered, so [q] is combinational on the current
-/// disparity and the counter advances on each [clk] edge.
+/// The encoder is a two-register pipeline. The first register holds `q_m` and
+/// its ones count, the second holds [q]. So [q] is the symbol for the inputs
+/// of [latency] [clk] cycles before, and it comes straight from a register.
 class TmdsEncoder extends Module {
+  /// Clock cycles from an input to its symbol on [q].
+  static const latency = 2;
+
   /// The 10-bit TMDS symbol (q[0] serialized first).
   Logic get q => output('q');
 
@@ -31,9 +34,6 @@ class TmdsEncoder extends Module {
     ctrl = addInput('ctrl', ctrl, width: 2);
     addOutput('q', width: 10);
 
-    // Running disparity, 8-bit two's complement (|disparity| stays small).
-    final cnt = Logic(name: 'disparity', width: 8);
-
     // --- Stage 1: transition minimization ---
     final ones = _popcount(data);
     final useXnor = ones.gt(4) | (ones.eq(4) & ~data[0]);
@@ -42,11 +42,23 @@ class TmdsEncoder extends Module {
     for (var i = 1; i < 8; i++) {
       qm.add(mux(useXnor, ~(qm[i - 1] ^ data[i]), qm[i - 1] ^ data[i]));
     }
-    final qm8 = ~useXnor; // 1 on the XOR path
-    final qmLow = [for (var i = 7; i >= 0; i--) qm[i]].swizzle();
+    final qmLowNext = [for (var i = 7; i >= 0; i--) qm[i]].swizzle();
+
+    final deS1 = Logic(name: 'de_s1');
+    final ctrlS1 = Logic(name: 'ctrl_s1', width: 2);
+    final qmLow = Logic(name: 'qm_low', width: 8);
+    final qm8 = Logic(name: 'qm8'); // 1 on the XOR path
+    final n1 = Logic(name: 'qm_ones', width: 4);
+    Sequential(clk, reset: reset, [
+      deS1 < de,
+      ctrlS1 < ctrl,
+      qmLow < qmLowNext,
+      qm8 < ~useXnor,
+      n1 < _popcount(qmLowNext),
+    ]);
 
     // --- Stage 2: DC balancing ---
-    final n1 = _popcount(qmLow); // ones in q_m[7:0]
+    final cnt = Logic(name: 'disparity', width: 8);
     final n0 = Const(8, width: 4) - n1;
     final n1e = n1.zeroExtend(8);
     final n0e = n0.zeroExtend(8);
@@ -60,7 +72,6 @@ class TmdsEncoder extends Module {
     final balanced = isZero | n1.eq(n0);
     final invert = (isPos & n1.gt(n0)) | (isNeg & n0.gt(n1));
 
-    // Symbol bits.
     final dataLow = mux(
       balanced,
       mux(qm8, qmLow, ~qmLow),
@@ -77,19 +88,21 @@ class TmdsEncoder extends Module {
 
     // Control symbols, selected by {c1, c0}.
     final ctrlSymbol = mux(
-      ctrl.eq(0),
+      ctrlS1.eq(0),
       Const(0x354, width: 10),
       mux(
-        ctrl.eq(1),
+        ctrlS1.eq(1),
         Const(0x0AB, width: 10),
-        mux(ctrl.eq(2), Const(0x154, width: 10), Const(0x2AB, width: 10)),
+        mux(ctrlS1.eq(2), Const(0x154, width: 10), Const(0x2AB, width: 10)),
       ),
     );
 
-    q <= mux(de, dataSymbol, ctrlSymbol);
-
-    final cntNext = mux(de, dataCnt, Const(0, width: 8));
-    Sequential(clk, reset: reset, [cnt < cntNext]);
+    final qReg = Logic(name: 'q_reg', width: 10);
+    Sequential(clk, reset: reset, [
+      cnt < mux(deS1, dataCnt, Const(0, width: 8)),
+      qReg < mux(deS1, dataSymbol, ctrlSymbol),
+    ]);
+    q <= qReg;
   }
 
   /// Counts the set bits of [v] as a 4-bit value (v is at most 8 bits wide).

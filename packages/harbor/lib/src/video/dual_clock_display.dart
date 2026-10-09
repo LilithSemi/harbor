@@ -7,6 +7,7 @@ import '../peripherals/display.dart';
 import 'display_output.dart';
 import 'dual_clock_scanout.dart';
 import 'dvi_transmitter.dart';
+import 'tmds_encoder.dart';
 import 'video_timing.dart';
 
 /// A framebuffer display that streams from shared main memory across clock
@@ -17,7 +18,16 @@ import 'video_timing.dart';
 /// double line buffer. Emits parallel RGB+sync (for a VGA-style backend or
 /// observation) and the four GPDI lanes. See [HarborFramebufferDisplay] for the
 /// single-clock variant used by the test-pattern path.
+///
+/// The parallel outputs ([de], [hsync], [vsync], [red], [green], [blue], [x],
+/// [y], [pixelWord]) are registered and aligned with each other. They come
+/// [pipelineDelay] pixel cycles after the timing generator. The TMDS lanes add
+/// the [TmdsEncoder.latency] of the encoders on top of that.
 class HarborDualClockDisplay extends Module {
+  /// Pixel cycles from the timing generator to the parallel outputs: one for
+  /// the line buffer read and one for the output register.
+  static const pipelineDelay = 2;
+
   Logic get gpdi => output('gpdi');
 
   /// The four complement lanes, present only on a target that drives its own
@@ -121,8 +131,9 @@ class HarborDualClockDisplay extends Module {
     final tx = timingGen.x;
     final ty = timingGen.y;
     final deActive = timingGen.de & enable;
-    x <= tx;
-    y <= ty;
+
+    Logic delay(Logic v, String name) =>
+        flop(pixelClk, v, reset: pixelReset).named(name);
 
     final frameStart = enable & tx.eq(0) & ty.eq(timing.vActive);
     // End of an active line: swap to the prefetched buffer and start the next
@@ -136,7 +147,7 @@ class HarborDualClockDisplay extends Module {
         enable & tx.eq(timing.hActive) & ty.lt(timing.vActive - 1);
 
     // rgb565 packs two pixels in each word. The word is tx >> 1 and the half
-    // is tx bit 0. The buffer read is combinational, so no extra register.
+    // is tx bit 0.
     final wordsPerLine = rgb565 ? timing.hActive ~/ 2 : timing.hActive;
     final scanoutCol = rgb565 ? tx.getRange(1, tx.width) : tx;
 
@@ -154,6 +165,7 @@ class HarborDualClockDisplay extends Module {
       mDataIn: mDataIn,
       mAck: mAck,
       maxWords: wordsPerLine,
+      blockRam: target.blockRam,
     );
 
     mStb <= scanout.mStb;
@@ -164,8 +176,10 @@ class HarborDualClockDisplay extends Module {
     mDataOut <= scanout.mDataOut;
     underrun <= scanout.underrun;
 
+    // The line buffer read is registered, so the word comes one cycle after
+    // tx. Stage 1 delays the timing signals to match it.
     final word = scanout.pixel;
-    pixelWord <= word;
+    final de1 = delay(deActive, 'de_s1');
 
     Logic r;
     Logic g;
@@ -173,29 +187,38 @@ class HarborDualClockDisplay extends Module {
     if (rgb565) {
       // Column 0 is the low half (bits 15..0), column 1 the high half
       // (bits 31..16): little-endian memory order.
-      final halfSel = tx.getRange(0, 1);
+      final halfSel = delay(tx[0], 'half_s1');
       final half = mux(halfSel, word.getRange(16, 32), word.getRange(0, 16));
       final r5 = half.getRange(11, 16);
       final g6 = half.getRange(5, 11);
       final b5 = half.getRange(0, 5);
-      final r8 = [r5, r5.getRange(2, 5)].swizzle();
-      final g8 = [g6, g6.getRange(4, 6)].swizzle();
-      final b8 = [b5, b5.getRange(2, 5)].swizzle();
-      r = mux(deActive, r8, Const(0, width: 8));
-      g = mux(deActive, g8, Const(0, width: 8));
-      b = mux(deActive, b8, Const(0, width: 8));
+      r = [r5, r5.getRange(2, 5)].swizzle();
+      g = [g6, g6.getRange(4, 6)].swizzle();
+      b = [b5, b5.getRange(2, 5)].swizzle();
     } else {
       // argb8888 behaves like xrgb8888: alpha is ignored.
-      r = mux(deActive, word.getRange(16, 24), Const(0, width: 8));
-      g = mux(deActive, word.getRange(8, 16), Const(0, width: 8));
-      b = mux(deActive, word.getRange(0, 8), Const(0, width: 8));
+      r = word.getRange(16, 24);
+      g = word.getRange(8, 16);
+      b = word.getRange(0, 8);
     }
-    red <= r;
-    green <= g;
-    blue <= b;
-    de <= deActive;
-    hsync <= timingGen.hsync;
-    vsync <= timingGen.vsync;
+    final zero = Const(0, width: 8);
+
+    // Stage 2 registers every parallel output.
+    final de2 = delay(de1, 'de_s2');
+    final hsync2 = delay(delay(timingGen.hsync, 'hsync_s1'), 'hsync_s2');
+    final vsync2 = delay(delay(timingGen.vsync, 'vsync_s1'), 'vsync_s2');
+    final r2 = delay(mux(de1, r, zero), 'red_s2');
+    final g2 = delay(mux(de1, g, zero), 'green_s2');
+    final b2 = delay(mux(de1, b, zero), 'blue_s2');
+    red <= r2;
+    green <= g2;
+    blue <= b2;
+    de <= de2;
+    hsync <= hsync2;
+    vsync <= vsync2;
+    x <= delay(delay(tx, 'x_s1'), 'x_s2');
+    y <= delay(delay(ty, 'y_s1'), 'y_s2');
+    pixelWord <= delay(word, 'pixel_word_s2');
 
     final transmitter = DviTransmitter(
       target: target,
@@ -203,12 +226,12 @@ class HarborDualClockDisplay extends Module {
       shiftClk: shiftClk, // 5x pixel clock from the SoC's display PLL
       pixelReset: pixelReset,
       shiftReset: shiftReset,
-      de: deActive,
-      hsync: timingGen.hsync,
-      vsync: timingGen.vsync,
-      red: r,
-      green: g,
-      blue: b,
+      de: de2,
+      hsync: hsync2,
+      vsync: vsync2,
+      red: r2,
+      green: g2,
+      blue: b2,
     );
     gpdi <= transmitter.gpdi;
     if (tmdsComplement) {

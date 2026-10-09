@@ -69,10 +69,34 @@ class DviTransmitter extends Module {
     final sym1 = encode(green, Const(0, width: 2));
     final sym2 = encode(red, Const(0, width: 2));
 
+    // The shift reset can come from a far corner of the chip (the PLL lock and
+    // the reset pin). Three flops let the placer cover that distance in short
+    // hops at the shift clock rate.
+    var shiftRst = shiftReset;
+    for (var i = 0; i < 3; i++) {
+      shiftRst = flop(shiftClk, shiftRst).named('shift_reset_q$i');
+    }
+
+    // The pixel and shift edges line up, so a symbol sample on the edge where
+    // the symbol changes is a race. A toggle from the pixel domain marks each
+    // pixel edge, and one align pulse sets the load phase for all lanes.
+    final toggle = Logic(name: 'pixel_toggle');
+    Sequential(pixelClk, reset: pixelReset, [toggle < ~toggle]);
+    // No reset on the synchronizer, so it holds real samples at reset release.
+    final sync0 = flop(shiftClk, toggle).named('pixel_toggle_s0');
+    final sync1 = flop(shiftClk, sync0).named('pixel_toggle_s1');
+    final sync2 = flop(shiftClk, sync1).named('pixel_toggle_s2');
+    final locked = Logic(name: 'phase_locked');
+    // The first edge seen after reset aligns the gearboxes. The clocks come
+    // from one PLL, so the phase stays correct after that.
+    final align = (sync1 ^ sync2) & ~locked;
+    Sequential(shiftClk, reset: shiftRst, [locked < locked | align]);
+
     TmdsSerializer serialize(Logic symbol) => TmdsSerializer(
       shiftClk: shiftClk,
-      reset: shiftReset,
+      reset: shiftRst,
       symbol: symbol,
+      align: align,
       target: target,
     );
 
