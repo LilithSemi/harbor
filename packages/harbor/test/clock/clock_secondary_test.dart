@@ -58,6 +58,53 @@ void main() {
     });
   });
 
+  group('ecp5CoSecondaryDividers', () {
+    test('125 MHz primary + 50 MHz secondary from 25 MHz: even CLKOP_DIV, '
+        'exact secondary', () {
+      final sol = HarborClockGenerator.ecp5CoSecondaryDividers(
+        25000000,
+        125000000,
+        50000000,
+      );
+      final vco = 125000000 * sol.clkopDiv;
+      expect(25000000 * sol.clkfbDiv / sol.clkiDiv, equals(125000000));
+      expect(vco % 50000000, equals(0));
+      expect(vco / sol.clkosDiv, equals(50000000));
+      expect(sol.clkopDiv % 2, equals(0));
+    });
+
+    test('100 MHz primary + 50 MHz secondary from 25 MHz: any CLKOP_DIV '
+        'is exact, picks the VCO closest to 600 MHz', () {
+      final sol = HarborClockGenerator.ecp5CoSecondaryDividers(
+        25000000,
+        100000000,
+        50000000,
+      );
+      final vco = 100000000 * sol.clkopDiv;
+      expect(vco, equals(600000000));
+      expect(vco / sol.clkosDiv, equals(50000000));
+    });
+
+    test('impossible pair throws naming both frequencies', () {
+      // Every in-band VCO for a 125 MHz primary (500/625/750 MHz) is unable
+      // to divide evenly by 33 MHz, so no CLKOP_DIV shares the VCO exactly.
+      expect(
+        () => HarborClockGenerator.ecp5CoSecondaryDividers(
+          25000000,
+          125000000,
+          33000000,
+        ),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.toString(),
+            'message',
+            allOf(contains('125000000'), contains('33000000')),
+          ),
+        ),
+      );
+    });
+  });
+
   group('createDomainWithSecondary (ECP5)', () {
     test('returns primary and secondary domains at the right rates', () async {
       final h = _ClkHarness(

@@ -100,11 +100,12 @@ class HarborClockConfig with HarborPrettyString {
   /// Optional CLKOS secondary clock derived from the same PLL as this domain.
   ///
   /// When set, this domain is the PLL primary (CLKOP) and the named secondary
-  /// is a CLKOS output off the same VCO, sharing one EHXPLLL and one LOCK. This
-  /// exists because a SECOND EHXPLLL on the ECP5 may not lock on silicon (the
-  /// 2nd PLL site's clock-input routing): collapsing two related clocks (e.g. a
-  /// 144 MHz DDR CK and a 24 MHz core) into one PLL avoids that failure. The
-  /// VCO is `frequency * CLKOP_DIV` and must be an integer multiple of the
+  /// is a CLKOS output off the same VCO, sharing one EHXPLLL and one LOCK and
+  /// saving a PLL block. A second EHXPLLL once failed to lock in River's
+  /// OrangeCrab r0.2 work, but a ULX3S build runs three off one pin, so that
+  /// was one site, not the ECP5.
+  ///
+  /// The VCO is `frequency * CLKOP_DIV` and must be an integer multiple of the
   /// secondary frequency (e.g. 144*4 = 576 MHz, 576/24 = 24). The generator
   /// emits both domains, see [HarborClockGenerator.createDomainWithSecondary].
   final ({String name, int frequency})? coClkosSecondary;
@@ -836,6 +837,57 @@ class HarborClockGenerator {
     return (vco / secondaryFreq).round();
   }
 
+  /// Finds dividers for an exact CLKOP at [primaryFreq] and an exact CLKOS at
+  /// [secondaryFreq] off one VCO, preferring a VCO near 600 MHz. Throws
+  /// [ArgumentError] naming both rates when no in-band choice is exact.
+  static ({int clkiDiv, int clkfbDiv, int clkopDiv, int clkosDiv})
+  ecp5CoSecondaryDividers(int sourceFreq, int primaryFreq, int secondaryFreq) {
+    _ecp5CheckInOut(sourceFreq, primaryFreq);
+    _ecp5CheckInOut(sourceFreq, secondaryFreq);
+
+    int? bClkiDiv, bClkfbDiv, bClkopDiv, bClkosDiv;
+    var bestVcoDiff = -1;
+    for (var clkiDiv = 1; clkiDiv <= _ecp5ClkiDivMax; clkiDiv++) {
+      final pfd = sourceFreq / clkiDiv;
+      if (pfd < _ecp5PfdMinHz || pfd > _ecp5PfdMaxHz) continue;
+      // Integer math, so an exact match is never lost to rounding.
+      final fbNum = primaryFreq * clkiDiv;
+      if (fbNum % sourceFreq != 0) continue;
+      final clkfbDiv = fbNum ~/ sourceFreq;
+      if (clkfbDiv < 1 || clkfbDiv > _ecp5ClkfbDivMax) continue;
+
+      for (var clkopDiv = 1; clkopDiv <= _ecp5OutDivMax; clkopDiv++) {
+        final vco = primaryFreq * clkopDiv;
+        if (vco < _ecp5VcoMinHz || vco > _ecp5VcoMaxHz) continue;
+        if (vco % secondaryFreq != 0) continue;
+        final clkosDiv = vco ~/ secondaryFreq;
+        if (clkosDiv < 1 || clkosDiv > _ecp5OutDivMax) continue;
+        final diff = (vco - 600000000).abs();
+        if (bClkiDiv == null || diff < bestVcoDiff) {
+          bestVcoDiff = diff;
+          bClkiDiv = clkiDiv;
+          bClkfbDiv = clkfbDiv;
+          bClkopDiv = clkopDiv;
+          bClkosDiv = clkosDiv;
+        }
+      }
+    }
+
+    if (bClkiDiv == null) {
+      throw ArgumentError(
+        'No ECP5 EHXPLLL solution shares one VCO exactly between a '
+        '$primaryFreq Hz CLKOP primary and a $secondaryFreq Hz CLKOS '
+        'secondary: no in-band CLKOP_DIV divides the VCO evenly by both.',
+      );
+    }
+    return (
+      clkiDiv: bClkiDiv,
+      clkfbDiv: bClkfbDiv!,
+      clkopDiv: bClkopDiv!,
+      clkosDiv: bClkosDiv!,
+    );
+  }
+
   /// Solves a Xilinx 7-series MMCME2 for two related outputs off one VCO:
   /// CLKOUT0 = primary (fractional, 0.125 steps), CLKOUT1 = secondary (integer).
   /// Searches CLKFBOUT_MULT_F (2..64, /8) x DIVCLK_DIVIDE (1..8) keeping the VCO
@@ -955,8 +1007,7 @@ class HarborClockGenerator {
       throw ArgumentError('Clock "${config.name}" requires sourceFrequency');
     }
 
-    final dividers = ecp5PllDividers(sourceFreq, config.frequency);
-    final clkosDiv = ecp5ClkosDiv(
+    final sol = ecp5CoSecondaryDividers(
       sourceFreq,
       config.frequency,
       secondaryFrequency,
@@ -964,17 +1015,17 @@ class HarborClockGenerator {
 
     final feedback = Logic(name: '${config.name}_pll_fb');
     final pll = Ecp5Ehxplll(
-      clkiDiv: dividers.clkiDiv,
-      clkfbDiv: dividers.clkfbDiv,
-      clkopDiv: dividers.clkopDiv,
+      clkiDiv: sol.clkiDiv,
+      clkfbDiv: sol.clkfbDiv,
+      clkopDiv: sol.clkopDiv,
       clk: inputClk,
       clkfb: feedback,
-      clkosDiv: clkosDiv,
+      clkosDiv: sol.clkosDiv,
       // CLKOS_CPHASE ~= CLKOS_DIV/2 gives a centered 50%-duty 0-degree output,
       // matching the CLKOP convention. Leaving it at the default 0 produces a
       // degenerate CLKOS edge so the secondary domain's flops never clock and
       // that whole domain is dead: the cause of the silent single-PLL bring-up.
-      clkosCphase: clkosDiv ~/ 2,
+      clkosCphase: sol.clkosDiv ~/ 2,
       name: '${config.name}_pll',
     );
     feedback <= pll.output('CLKOP');
