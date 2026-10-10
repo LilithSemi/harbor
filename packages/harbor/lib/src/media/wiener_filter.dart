@@ -42,7 +42,7 @@ int wienerMidWidth(int bd) =>
 /// feeds [HarborWienerVert]. Combinational.
 class HarborWienerHorz extends BridgeModule {
   HarborWienerHorz({int bd = 8, String? name})
-    : super('HarborWienerHorz', name: name ?? 'wiener_h') {
+    : super('HarborWienerHorz_B$bd', name: name ?? 'wiener_h') {
     final w = bd + 16; // signed working width (bd8 -> 24)
     final rounds = wienerRounds(bd);
     final round0 = rounds.round0;
@@ -112,7 +112,7 @@ class HarborWienerHorz extends BridgeModule {
 /// Combinational.
 class HarborWienerVert extends BridgeModule {
   HarborWienerVert({int bd = 8, String? name})
-    : super('HarborWienerVert', name: name ?? 'wiener_v') {
+    : super('HarborWienerVert_B$bd', name: name ?? 'wiener_v') {
     final w = bd + 20; // signed working width (bd8 -> 28)
     final rounds = wienerRounds(bd);
     final round1 = rounds.round1;
@@ -179,7 +179,7 @@ class HarborWienerVert extends BridgeModule {
 /// LSB-first. `out` is the restored centre pixel ([bd]-bit). Combinational.
 class HarborWienerFilter2D extends BridgeModule {
   HarborWienerFilter2D({int bd = 8, String? name})
-    : super('HarborWienerFilter2D', name: name ?? 'wiener2d') {
+    : super('HarborWienerFilter2D_B$bd', name: name ?? 'wiener2d') {
     createPort('region', PortDirection.input, width: 7 * 7 * bd);
     for (final t in ['h0', 'h1', 'h2', 'v0', 'v1', 'v2']) {
       createPort(t, PortDirection.input, width: 8);

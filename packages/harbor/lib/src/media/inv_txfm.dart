@@ -123,7 +123,7 @@ class HarborInvTxfm extends BridgeModule {
          'runtimeTxType: square TX_4X4/8X8/16X16 or rect dims<=16 only',
        ),
        super(
-         'HarborInvTxfm',
+         'HarborInvTxfm_T${txSize}_${runtimeTxType ? "Rt" : "Y$txType"}_B$bitDepth',
          name:
              name ??
              'inv_txfm_${txSize}_${runtimeTxType ? "rt" : txType}_$bitDepth',

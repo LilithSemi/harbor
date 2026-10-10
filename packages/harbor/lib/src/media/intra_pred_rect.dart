@@ -64,7 +64,10 @@ class HarborIntraPredRect extends BridgeModule {
   HarborIntraPredRect({required this.bw, required this.bh, String? name})
     : assert(bw == 4 || bw == 8 || bw == 16, 'bw in {4,8,16}'),
       assert(bh == 4 || bh == 8 || bh == 16, 'bh in {4,8,16}'),
-      super('HarborIntraPredRect', name: name ?? 'intra_pred_rect_${bw}x$bh') {
+      super(
+        'HarborIntraPredRect_${bw}x$bh',
+        name: name ?? 'intra_pred_rect_${bw}x$bh',
+      ) {
     createPort('mode', PortDirection.input, width: 4);
     createPort('have_above', PortDirection.input);
     createPort('have_left', PortDirection.input);

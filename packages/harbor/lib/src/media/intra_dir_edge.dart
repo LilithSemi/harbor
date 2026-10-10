@@ -39,7 +39,7 @@ class HarborIntraDirEdge extends BridgeModule {
 
   HarborIntraDirEdge({required this.bs, String? name})
     : assert(bs == 4 || bs == 8 || bs == 16, 'bs 4/8/16'),
-      super('HarborIntraDirEdge', name: name ?? 'intra_dir_edge_$bs') {
+      super('HarborIntraDirEdge_S$bs', name: name ?? 'intra_dir_edge_$bs') {
     createPort('mode', PortDirection.input, width: 4);
     createPort('angle_delta', PortDirection.input, width: 4);
     createPort('above', PortDirection.input, width: 2 * bs * 8);

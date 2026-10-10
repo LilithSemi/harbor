@@ -71,6 +71,19 @@ class HarborWishboneCdcBridge extends BridgeModule {
   /// operation.
   final int completionTimeout;
 
+  /// The definition name carries every parameter that changes the generated
+  /// body, so two structurally-different bridges never collide onto one
+  /// reserved module name.
+  static String _definitionName({
+    required int addressWidth,
+    required int dataWidth,
+    required int selWidth,
+    required int syncStages,
+    required int completionTimeout,
+  }) =>
+      'HarborWishboneCdcBridge_A${addressWidth}_D${dataWidth}_S${selWidth}_'
+      'Y${syncStages}_T$completionTimeout';
+
   HarborWishboneCdcBridge({
     required this.addressWidth,
     required this.dataWidth,
@@ -81,7 +94,15 @@ class HarborWishboneCdcBridge extends BridgeModule {
   }) : selWidth = selWidth ?? (dataWidth ~/ 8),
        assert(syncStages >= 2, 'CDC synchronizer needs >= 2 stages'),
        assert(completionTimeout >= 0, 'completionTimeout must be >= 0'),
-       super('HarborWishboneCdcBridge') {
+       super(
+         _definitionName(
+           addressWidth: addressWidth,
+           dataWidth: dataWidth,
+           selWidth: selWidth ?? (dataWidth ~/ 8),
+           syncStages: syncStages,
+           completionTimeout: completionTimeout,
+         ),
+       ) {
     final sw = this.selWidth;
     final aw = addressWidth;
     final dw = dataWidth;

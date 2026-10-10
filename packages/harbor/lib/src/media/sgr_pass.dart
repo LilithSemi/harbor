@@ -37,7 +37,11 @@ class HarborSgrPass extends BridgeModule {
     bool fast = false,
     int bd = 8,
     String? name,
-  }) : super('HarborSgrPass', name: name ?? 'sgr_pass') {
+  }) : super(
+         'HarborSgrPass_R${radius}_W${width}_H${height}_B${bd}_'
+         'F${fast ? 1 : 0}',
+         name: name ?? 'sgr_pass',
+       ) {
     final r = radius;
     // A/B grid is the body plus a one-pixel ring: positions (-1..width).
     final gw = width + 2;

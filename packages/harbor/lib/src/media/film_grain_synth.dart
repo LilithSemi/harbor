@@ -51,7 +51,12 @@ class HarborFilmGrainSynth extends BridgeModule {
     this.chromaFromLuma = false,
     this.lumaCross = true,
     String? name,
-  }) : super('HarborFilmGrainSynth', name: name ?? 'film_grain_synth') {
+  }) : super(
+         'HarborFilmGrainSynth_SX${ssx}_SY${ssy}_B${bd}_AR${arCoeffLag}_'
+         'CB${genCb ? 1 : 0}_CR${genCr ? 1 : 0}_CFL${chromaFromLuma ? 1 : 0}_'
+         'LX${lumaCross ? 1 : 0}',
+         name: name ?? 'film_grain_synth',
+       ) {
     const leftPad = 3, rightPad = 3, topPad = 3, bottomPad = 0, arPadding = 3;
     const lumaSubY = 32, lumaSubX = 32;
     final chromaSubY = lumaSubY >> ssy, chromaSubX = lumaSubX >> ssx;

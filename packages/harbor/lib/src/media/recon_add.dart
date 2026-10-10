@@ -16,7 +16,7 @@ class HarborReconAdd extends BridgeModule {
 
   HarborReconAdd({required this.n, this.bitDepth = 8, String? name})
     : assert(bitDepth == 8 || bitDepth == 10 || bitDepth == 12, 'bit depth'),
-      super('HarborReconAdd', name: name ?? 'recon_add') {
+      super('HarborReconAdd_N${n}_B$bitDepth', name: name ?? 'recon_add') {
     final bd = bitDepth;
     final rw = bd + 8; // signed residual element width (16 at bd8)
     final sumW = rw + 2; // 18 at bd8; holds pred + sign-extended residual

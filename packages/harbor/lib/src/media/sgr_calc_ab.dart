@@ -57,7 +57,7 @@ class HarborSgrCalcAb extends BridgeModule {
   ];
 
   HarborSgrCalcAb({int radius = 1, int bd = 8, String? name})
-    : super('HarborSgrCalcAb', name: name ?? 'sgr_calc_ab') {
+    : super('HarborSgrCalcAb_R${radius}_B$bd', name: name ?? 'sgr_calc_ab') {
     const w = 48; // p*s reaches ~1.3e11 (38 bits)
     final n = (2 * radius + 1) * (2 * radius + 1);
     final recip = oneByX[n - 1];

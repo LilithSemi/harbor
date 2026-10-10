@@ -173,7 +173,10 @@ class HarborCoeffContext extends BridgeModule {
     this.memBacked = false,
     String? name,
   }) : assert(_bhlFor[txSize] != null, 'unsupported TX_SIZE'),
-       super('HarborCoeffContext', name: name ?? 'coeff_ctx_$txSize') {
+       super(
+         'HarborCoeffContext_T${txSize}_M${memBacked ? 1 : 0}',
+         name: name ?? 'coeff_ctx_$txSize',
+       ) {
     const txPadHor = 4, txPadHorLog2 = 2;
     final bhl = _bhlFor[txSize]!;
     final width = _widthFor[txSize]!;

@@ -54,7 +54,10 @@ class HarborIntraPred extends BridgeModule {
   HarborIntraPred({required this.bs, this.bitDepth = 8, String? name})
     : assert(bs == 4 || bs == 8 || bs == 16 || bs == 32, 'bs in {4,8,16,32}'),
       assert(bitDepth == 8 || bitDepth == 10 || bitDepth == 12, 'bit depth'),
-      super('HarborIntraPred', name: name ?? 'intra_pred_${bs}_$bitDepth') {
+      super(
+        'HarborIntraPred_S${bs}_B$bitDepth',
+        name: name ?? 'intra_pred_${bs}_$bitDepth',
+      ) {
     final pw = bitDepth; // pixel width
     createPort('mode', PortDirection.input, width: 4);
     createPort('above', PortDirection.input, width: bs * pw);

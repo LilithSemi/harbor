@@ -71,7 +71,11 @@ class HarborDeblockFrame extends BridgeModule {
     int subY = 1,
     int bd = 8,
     String? name,
-  }) : super('HarborDeblockFrame', name: name ?? 'deblock_frame') {
+  }) : super(
+         'HarborDeblockFrame_W${width}_H${height}_P${numPlanes}_'
+         'SX${subX}_SY${subY}_B$bd',
+         name: name ?? 'deblock_frame',
+       ) {
     if (width <= 0 || height <= 0) {
       throw ArgumentError('width/height must be positive');
     }

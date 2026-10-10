@@ -58,7 +58,11 @@ class HarborCdefFrame extends BridgeModule {
     int cdefBits = 0,
     int bd = 8,
     String? name,
-  }) : super('HarborCdefFrame', name: name ?? 'cdef_frame') {
+  }) : super(
+         'HarborCdefFrame_W${lumaW}_H${lumaH}_SX${subX}_SY${subY}_'
+         'P${numPlanes}_C${cdefBits}_B$bd',
+         name: name ?? 'cdef_frame',
+       ) {
     if (lumaW <= 0 || lumaW % 8 != 0 || lumaH <= 0 || lumaH % 8 != 0) {
       throw ArgumentError(
         'HarborCdefFrame.lumaW/lumaH must be positive '

@@ -88,7 +88,8 @@ class HarborIntraReconWalk extends BridgeModule {
        // caller only sends leaves that fit `sbSize` (a runtime contract). The
        // pre-parameter code always used 16x16 lanes for an 8x8 plane this way.
        super(
-         'HarborIntraReconWalk',
+         'HarborIntraReconWalk_S${sbSize}_L${maxLeaves}_'
+         'T${tiled ? 1 : 0}_G$maxLog2',
          name: name ?? 'intra_recon_walk_${sbSize}_$maxLeaves',
        ) {
     final f = sbSize; // frame side in pixels

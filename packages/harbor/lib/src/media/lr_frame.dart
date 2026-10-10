@@ -95,7 +95,11 @@ class HarborLrFrame extends BridgeModule {
        bd = bd,
        horzUnits = _countUnits(unitSize, planeW),
        vertUnits = _countUnits(unitSize, planeH),
-       super('HarborLrFrame', name: name ?? 'lr_frame') {
+       super(
+         'HarborLrFrame_W${planeW}_H${planeH}_U${unitSize}_'
+         'SX${ssX}_SY${ssY}_P${procUnitSize}_O${unitOffset}_B$bd',
+         name: name ?? 'lr_frame',
+       ) {
     if (planeW <= 0) {
       throw ArgumentError('HarborLrFrame.planeW must be positive: $planeW');
     }

@@ -29,7 +29,7 @@ class HarborCdefFilterSentinel extends BridgeModule {
   /// (`pri[coeffShift]`) and the stored-pixel width (`out` = [bd] bits) depend
   /// on the bit-depth.
   HarborCdefFilterSentinel({int bd = 8, String? name})
-    : super('HarborCdefFilterSentinel', name: name ?? 'cdef_sentinel') {
+    : super('HarborCdefFilterSentinel_B$bd', name: name ?? 'cdef_sentinel') {
     final int coeffShift = bd - 8;
     const sw = 15; // sample width (so 0x4000 is representable)
     const w = 24; // signed working width

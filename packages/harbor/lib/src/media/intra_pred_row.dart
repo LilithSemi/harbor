@@ -115,7 +115,10 @@ class HarborIntraPredRow extends BridgeModule {
         'bs in {4,8,16,32,64}',
       ),
       assert(bitDepth == 8 || bitDepth == 10 || bitDepth == 12, 'bit depth'),
-      super('HarborIntraPredRow', name: name ?? 'intra_pred_row_$bs') {
+      super(
+        'HarborIntraPredRow_S${bs}_B$bitDepth',
+        name: name ?? 'intra_pred_row_$bs',
+      ) {
     final pw = bitDepth; // pixel width
     final rowBits = (bs - 1).bitLength;
     createPort('mode', PortDirection.input, width: 4);

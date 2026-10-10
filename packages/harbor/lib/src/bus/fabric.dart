@@ -1,5 +1,6 @@
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import 'bus.dart';
 import 'bus_slave_port.dart';
 
@@ -103,13 +104,39 @@ class HarborBusFabric extends BridgeModule {
   /// Generated slave-side bus ports (directly connectable to peripherals).
   late final List<BusSlavePort> slavePorts;
 
+  /// The SystemVerilog module name. It carries every field of [topology],
+  /// [masters], [slaves] and [defaultSlaveIndex] that changes the generated
+  /// port list or body, so two structurally-different fabrics never collide
+  /// onto one reserved module name.
+  static String _definitionName(
+    HarborFabricTopology topology,
+    List<HarborFabricMasterPort> masters,
+    List<HarborFabricSlavePort> slaves,
+    int defaultSlaveIndex,
+  ) {
+    final parts = [
+      topology.name,
+      'Def$defaultSlaveIndex',
+      for (final m in masters)
+        'M${m.name}_${m.protocol.name}_A${m.addressWidth}_D${m.dataWidth}_'
+            'P${m.priority}',
+      for (final s in slaves)
+        'S${s.name}_${s.protocol.name}_D${s.dataWidth}_'
+            'R${s.addressRange.start}x${s.addressRange.size}',
+    ];
+    return harborStableDefinitionName('HarborBusFabric', parts);
+  }
+
   HarborBusFabric({
     required this.topology,
     required this.masters,
     required this.slaves,
     this.defaultSlaveIndex = -1,
     String? name,
-  }) : super('HarborBusFabric', name: name ?? 'fabric') {
+  }) : super(
+         _definitionName(topology, masters, slaves, defaultSlaveIndex),
+         name: name ?? 'fabric',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 

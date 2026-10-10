@@ -144,7 +144,10 @@ class HarborSuperresUpscale extends BridgeModule {
     int height = 1,
     int bd = 8,
     String? name,
-  }) : super('HarborSuperresUpscale', name: name ?? 'superres_upscale') {
+  }) : super(
+         'HarborSuperresUpscale_D${downW}_U${upW}_H${height}_B$bd',
+         name: name ?? 'superres_upscale',
+       ) {
     if (downW <= 0) {
       throw ArgumentError('downW must be positive, got $downW');
     }

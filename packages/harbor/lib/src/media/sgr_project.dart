@@ -24,7 +24,7 @@ import 'sgr_cross_sum.dart';
 /// estimates), `xq0`/`xq1` (8b signed) -> `out` ([bd]-bit).
 class HarborSgrProject extends BridgeModule {
   HarborSgrProject({int bd = 8, String? name})
-    : super('HarborSgrProject', name: name ?? 'sgr_project') {
+    : super('HarborSgrProject_B$bd', name: name ?? 'sgr_project') {
     final w = bd + 20 < 28 ? 28 : bd + 20; // signed working width (bd8 -> 28)
     const rstBits = 4;
     const prjBits = 7;

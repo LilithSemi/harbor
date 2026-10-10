@@ -27,7 +27,10 @@ class HarborPaletteRecon extends BridgeModule {
   static const _maxColors = 8;
 
   HarborPaletteRecon({required this.n, this.bitDepth = 8, String? name})
-    : super('HarborPaletteRecon', name: name ?? 'palette_recon') {
+    : super(
+        'HarborPaletteRecon_N${n}_B$bitDepth',
+        name: name ?? 'palette_recon',
+      ) {
     final bd = bitDepth;
     createPort('colors', PortDirection.input, width: _maxColors * bd);
     createPort('indices', PortDirection.input, width: n * 3);

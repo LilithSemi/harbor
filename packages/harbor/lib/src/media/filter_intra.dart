@@ -88,7 +88,7 @@ class HarborFilterIntra extends BridgeModule {
   static const int _w = 24;
 
   HarborFilterIntra({int bw = 8, int bh = 8, String? name})
-    : super('HarborFilterIntra', name: name ?? 'filter_intra') {
+    : super('HarborFilterIntra_${bw}x$bh', name: name ?? 'filter_intra') {
     if (bw <= 0 || bw % 4 != 0) {
       throw ArgumentError(
         'HarborFilterIntra.bw must be a positive multiple of '

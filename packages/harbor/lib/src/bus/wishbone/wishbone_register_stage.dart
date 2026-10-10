@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../../arith/fpu_config.dart' show harborStableDefinitionName;
 import 'wishbone_interface.dart';
 
 /// A one-deep register slice for a classic Wishbone link.
@@ -22,11 +23,36 @@ import 'wishbone_interface.dart';
 /// or RTY, the slice returns that termination as ACK with [wishbonePoison]
 /// read data, and sets the sticky `bus_error` output.
 class WishboneRegisterStage extends BridgeModule {
+  /// The SystemVerilog module name. It carries every up/down config field
+  /// that alters the generated body so structurally-distinct stages (for
+  /// example a plain stage and a DMA-master stage with extra tags) never
+  /// collide onto one reserved module name.
+  static String _definitionName(WishboneConfig config, WishboneConfig upCfg) {
+    List<String> side(String tag, WishboneConfig c) => [
+      '${tag}A${c.addressWidth}',
+      '${tag}D${c.dataWidth}',
+      '${tag}S${c.effectiveSelWidth}',
+      if (c.useErr) '${tag}Err',
+      if (c.useRty) '${tag}Rty',
+      if (c.useCti) '${tag}Cti',
+      if (c.useBte) '${tag}Bte',
+      if (c.tgaWidth > 0) '${tag}Tga${c.tgaWidth}',
+      if (c.tgdWidth > 0) '${tag}Tgd${c.tgdWidth}',
+    ];
+    return harborStableDefinitionName('WishboneRegisterStage', [
+      ...side('Up', upCfg),
+      ...side('Dn', config),
+    ]);
+  }
+
   WishboneRegisterStage({
     required WishboneConfig config,
     WishboneConfig? upConfig,
     String? name,
-  }) : super('WishboneRegisterStage', name: name ?? 'wishbone_reg') {
+  }) : super(
+         _definitionName(config, upConfig ?? config),
+         name: name ?? 'wishbone_reg',
+       ) {
     final upCfg = upConfig ?? config;
     if (upCfg.addressWidth != config.addressWidth ||
         upCfg.dataWidth != config.dataWidth ||

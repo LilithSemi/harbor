@@ -30,7 +30,7 @@ import 'wiener_filter.dart';
 /// signed, `s0`/`s1` are 12b, `xq0`/`xq1` are 8b signed. Combinational.
 class HarborLrUnit extends BridgeModule {
   HarborLrUnit({int width = 8, int height = 8, int bd = 8, String? name})
-    : super('HarborLrUnit', name: name ?? 'lr_unit') {
+    : super('HarborLrUnit_W${width}_H${height}_B$bd', name: name ?? 'lr_unit') {
     final pw = width + 6;
     final ph = height + 6;
 

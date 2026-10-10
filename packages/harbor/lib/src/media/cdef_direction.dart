@@ -20,7 +20,7 @@ class HarborCdefDirection extends BridgeModule {
   /// an 8-bit range) before the `^0x80` centring. Everything downstream
   /// (partial-sum width, costs, variance) is therefore unchanged from 8-bit.
   HarborCdefDirection({int bd = 8, String? name})
-    : super('HarborCdefDirection', name: name ?? 'cdef_dir') {
+    : super('HarborCdefDirection_B$bd', name: name ?? 'cdef_dir') {
     final int coeffShift = bd - 8;
     const pw = 13; // partial-sum signed width
     const cw = 40; // cost width (all non-negative)

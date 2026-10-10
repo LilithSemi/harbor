@@ -40,7 +40,10 @@ class HarborCdefBlock extends BridgeModule {
     bool sentinel = false,
     int bd = 8,
     String? name,
-  }) : super('HarborCdefBlock', name: name ?? 'cdef_block') {
+  }) : super(
+         'HarborCdefBlock_B${bd}_L${luma ? 1 : 0}_S${sentinel ? 1 : 0}',
+         name: name ?? 'cdef_block',
+       ) {
     // Non-sentinel (interior) samples widen to [bd] bits. Sentinel samples stay
     // 15 bits (they must also hold CDEF_VERY_LARGE = 0x4000).
     final int sampleW = sentinel ? 15 : bd;

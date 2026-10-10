@@ -199,7 +199,9 @@ class HarborIntraReconWalkSeq extends BridgeModule {
        // has_top_right / has_bottom_left assume a 64x64 SB (sbMiSize=16).
        assert(!edgeFilter || sbSize == 64, 'edgeFilter requires a 64x64 SB'),
        super(
-         'HarborIntraReconWalkSeq',
+         'HarborIntraReconWalkSeq_S${sbSize}_L${maxLeaves}_G${maxLog2}_'
+         'T${tiled ? 1 : 0}_E${edgeFilter ? 1 : 0}_R${rect ? 1 : 0}_'
+         'F${filterIntra ? 1 : 0}_P${palette ? 1 : 0}_B$bitDepth',
          name: name ?? 'intra_recon_walk_seq_${sbSize}_$maxLeaves',
        ) {
     final f = sbSize;

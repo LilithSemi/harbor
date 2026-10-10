@@ -12,7 +12,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 /// Combinational.
 class HarborDeblock6 extends BridgeModule {
   HarborDeblock6({String? name, int bd = 8})
-    : super('HarborDeblock6', name: name ?? 'deblock6') {
+    : super('HarborDeblock6_B$bd', name: name ?? 'deblock6') {
     for (final p in ['p2', 'p1', 'p0', 'q0', 'q1', 'q2']) {
       createPort(p, PortDirection.input, width: bd);
     }

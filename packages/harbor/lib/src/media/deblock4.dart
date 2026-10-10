@@ -15,7 +15,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 /// bd scaling `<< (bd-8)` happens inside the masks). Combinational.
 class HarborDeblock4 extends BridgeModule {
   HarborDeblock4({String? name, int bd = 8})
-    : super('HarborDeblock4', name: name ?? 'deblock4') {
+    : super('HarborDeblock4_B$bd', name: name ?? 'deblock4') {
     for (final p in ['p1', 'p0', 'q0', 'q1']) {
       createPort(p, PortDirection.input, width: bd);
     }

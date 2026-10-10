@@ -24,7 +24,7 @@ import 'sgr_project.dart';
 /// output `(i,j)` at index `i*width + j` (8b each).
 class HarborSgrProcUnit extends BridgeModule {
   HarborSgrProcUnit({int width = 8, int height = 8, int bd = 8, String? name})
-    : super('HarborSgrProcUnit', name: name ?? 'sgr_proc') {
+    : super('HarborSgrProcUnit_W${width}_H${height}_B$bd', name: name ?? 'sgr_proc') {
     final pw = width + 6; // radius-2 reach: body at (3,3), ring (r+1)=3 wide
     final ph = height + 6;
     final fltW = sgrFltWidth(bd);

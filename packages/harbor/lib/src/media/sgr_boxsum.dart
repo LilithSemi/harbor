@@ -35,7 +35,10 @@ class HarborSgrBoxsum extends BridgeModule {
     int height = 8,
     int bd = 8,
     String? name,
-  }) : super('HarborSgrBoxsum', name: name ?? 'sgr_boxsum') {
+  }) : super(
+         'HarborSgrBoxsum_R${radius}_W${width}_H${height}_B$bd',
+         name: name ?? 'sgr_boxsum',
+       ) {
     final r = radius;
     final win = 2 * r + 1;
     final side = width + 2 * r;

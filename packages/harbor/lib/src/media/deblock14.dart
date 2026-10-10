@@ -12,7 +12,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 /// `limit`,`blimit`,`thresh` stay 8 bits. Combinational.
 class HarborDeblock14 extends BridgeModule {
   HarborDeblock14({String? name, int bd = 8})
-    : super('HarborDeblock14', name: name ?? 'deblock14') {
+    : super('HarborDeblock14_B$bd', name: name ?? 'deblock14') {
     for (final p in [
       'p6', 'p5', 'p4', 'p3', 'p2', 'p1', 'p0', //
       'q0', 'q1', 'q2', 'q3', 'q4', 'q5', 'q6', //

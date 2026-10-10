@@ -24,7 +24,7 @@ class HarborIntraModePred extends BridgeModule {
     : assert(bs == 4 || bs == 8 || bs == 16 || bs == 32, 'bs 4/8/16/32'),
       assert(bitDepth == 8 || bitDepth == 10 || bitDepth == 12, 'bit depth'),
       super(
-        'HarborIntraModePred',
+        'HarborIntraModePred_S${bs}_B$bitDepth',
         name: name ?? 'intra_mode_pred_${bs}_$bitDepth',
       ) {
     final pw = bitDepth;

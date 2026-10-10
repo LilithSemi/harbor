@@ -16,7 +16,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 /// the `n`-bit field right-aligned (top bits zero). Combinational.
 class HarborBitReader extends BridgeModule {
   HarborBitReader({int maxBytes = 16, String? name})
-    : super('HarborBitReader', name: name ?? 'bit_reader') {
+    : super('HarborBitReader_B$maxBytes', name: name ?? 'bit_reader') {
     final totalBits = maxBytes * 8;
     final offW = (totalBits).bitLength; // enough to index every bit + end
 

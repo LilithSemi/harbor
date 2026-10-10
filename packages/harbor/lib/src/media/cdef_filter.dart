@@ -26,7 +26,7 @@ class HarborCdefFilter extends BridgeModule {
   /// [bd] bits wide and the primary tap set is selected by bit `coeffShift` of
   /// `pri` (libaom `cdef_pri_taps[(pri_strength >> coeff_shift) & 1]`).
   HarborCdefFilter({int bd = 8, String? name})
-    : super('HarborCdefFilter', name: name ?? 'cdef') {
+    : super('HarborCdefFilter_B$bd', name: name ?? 'cdef') {
     final int coeffShift = bd - 8;
     const w = 24; // signed working width
 

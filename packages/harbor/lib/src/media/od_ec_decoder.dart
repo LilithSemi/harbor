@@ -42,7 +42,10 @@ class HarborOdEcDecoder extends BridgeModule {
   Logic get symbol => output('symbol');
 
   HarborOdEcDecoder({this.maxSyms = 16, this.numCtx = 8, String? name})
-    : super('HarborOdEcDecoder', name: name ?? 'od_ec') {
+    : super(
+        'HarborOdEcDecoder_S${maxSyms}_C$numCtx',
+        name: name ?? 'od_ec',
+      ) {
     const w = 32; // OD_EC_WINDOW_SIZE
     const probShift = 6; // EC_PROB_SHIFT
     const minProb = 4; // EC_MIN_PROB

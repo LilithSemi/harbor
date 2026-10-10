@@ -23,7 +23,7 @@ int sgrFltWidth(int bd) => bd + 10;
 /// values), `center` ([bd]-bit pixel), `mode` (2b) -> `flt` (`sgrFltWidth(bd)`).
 class HarborSgrCrossSum extends BridgeModule {
   HarborSgrCrossSum({int bd = 8, String? name})
-    : super('HarborSgrCrossSum', name: name ?? 'sgr_cross') {
+    : super('HarborSgrCrossSum_B$bd', name: name ?? 'sgr_cross') {
     const w = 32;
     final bW = sgrBWidth(bd);
     final fltW = sgrFltWidth(bd);
