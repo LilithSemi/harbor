@@ -36,6 +36,13 @@ class HarborBoard {
   /// need not hand-enter Pmod sites. SPI roles: `sck`, `mosi`, `miso`, `cs`.
   final Map<String, Map<String, String>> interfaces;
 
+  /// DLL-OFF DQS# override for a board whose DDR3 DQS pad is DLL-dependent
+  /// (e.g. OrangeCrab). Keyed like [pins]. [ddrPinsFor] merges these in and
+  /// drops the matching `sdram_dqs[*]` entries to single-ended when
+  /// `dllOn: false`. Empty for a board with no such pad (its DQS mapping does
+  /// not change with the DDR3 controller's DLL mode).
+  final Map<String, String> ddrDqsComplementPins;
+
   /// Bitstream programming command for the generated `prog` Makefile target.
   final String? progCommand;
 
@@ -72,6 +79,7 @@ class HarborBoard {
     required this.oscillatorHz,
     required this.pins,
     this.interfaces = const {},
+    this.ddrDqsComplementPins = const {},
     this.progCommand,
     this.clockPortName = 'clk',
     this.clockCapableSites = const {},
@@ -86,6 +94,31 @@ class HarborBoard {
   /// the build moved is judged on the ball it moved to.
   bool siteIsClockCapable(String pin) =>
       clockCapableSites.contains(pin.trim().split(RegExp(r'\s+')).first);
+
+  /// The DDR3 pin catalog for a given DLL engagement.
+  ///
+  /// DLL-on (default [pins]) uses a true differential SSTL135D_I pad for
+  /// `sdram_dqs[*]` on the LDQS _p ball, so nextpnr derives the _n rail and
+  /// there is no `sdram_dqs_n`. DLL-off drops `sdram_dqs[*]` to single-ended
+  /// SSTL135_I (keeping its site and other attributes) and merges in
+  /// [ddrDqsComplementPins], the explicit `sdram_dqs_n[*]` the controller
+  /// drives when the DLL is off. A board with no [ddrDqsComplementPins]
+  /// returns [pins] unchanged either way, since its DQS mapping has nothing
+  /// to switch.
+  Map<String, String> ddrPinsFor({required bool dllOn}) {
+    if (dllOn || ddrDqsComplementPins.isEmpty) return pins;
+    final out = <String, String>{};
+    for (final e in pins.entries) {
+      // A single-ended pad takes no differential resistor.
+      out[e.key] = e.key.startsWith('sdram_dqs[')
+          ? e.value
+                .replaceFirst('SSTL135D_I', 'SSTL135_I')
+                .replaceFirst(' DIFFRESISTOR=100', '')
+          : e.value;
+    }
+    out.addAll(ddrDqsComplementPins);
+    return out;
+  }
 
   /// Built-in board presets, keyed by [name].
   static const byName = <String, HarborBoard>{
@@ -118,19 +151,39 @@ class HarborBoard {
   /// them), requesting a signal not in the catalog throws. [extraPins] adds
   /// board-specific pins not in the catalog. [frequency] overrides the target
   /// clock (defaults to [oscillatorHz]).
+  ///
+  /// [ddrDllOn] picks the DDR3 DQS mapping (see [ddrPinsFor]) for a board
+  /// with [ddrDqsComplementPins]. Pass the DLL mode the DDR3 controller
+  /// config actually builds with; this preset does not assume one, so
+  /// selecting any `sdram_dqs*` pin on such a board without it throws.
   HarborFpgaTarget fpgaTarget({
     Iterable<String>? pins,
     int? frequency,
     Map<String, String> extraPins = const {},
+    bool? ddrDllOn,
   }) {
-    final selected = pins ?? this.pins.keys;
+    // "All pins" (pins: null) includes the ambiguous sdram_dqs* entries
+    // whenever this board has any, same as naming them explicitly.
+    final wantsDdrDqs =
+        ddrDqsComplementPins.isNotEmpty &&
+        (pins == null || pins.any((s) => s.startsWith('sdram_dqs')));
+    if (wantsDdrDqs && ddrDllOn == null) {
+      throw ArgumentError(
+        'Board "$name" has a DLL-dependent DDR3 DQS pad; pass ddrDllOn '
+        '(the DDR3 controller\'s DLL mode) to fpgaTarget.',
+      );
+    }
+    final catalog = ddrDqsComplementPins.isEmpty
+        ? this.pins
+        : ddrPinsFor(dllOn: ddrDllOn ?? true);
+    final selected = pins ?? catalog.keys;
     final pinMap = <String, String>{};
     for (final signal in selected) {
-      final site = this.pins[signal];
+      final site = catalog[signal];
       if (site == null) {
         throw ArgumentError(
           'Pin "$signal" is not in board "$name"\'s catalog. '
-          'Known: ${this.pins.keys.join(', ')}.',
+          'Known: ${catalog.keys.join(', ')}.',
         );
       }
       pinMap[signal] = site;
@@ -261,11 +314,39 @@ const _ulx3s85f = HarborBoard(
 /// Fully open toolchain (yosys + nextpnr-ecp5 + trellis). The catalog covers the
 /// oscillator, the DirtyJTAG CDC UART, the config SPI flash (quad, clock via
 /// the ECP5 USRMCLK macro so there is no spi_clk pad), the USB device pads, the
-/// button, and the green LED. Sites come from the litex-boards
-/// `gsd_orangecrab` `_io_r0_2` table and are proven on hardware: a bitstream
-/// with these pins enumerates over USB. DDR3L sdram_* sites are added with
-/// their SSTL135 attributes when the DDR weight backend lands (the OrangeCrab
-/// DDR path is not yet hardware-proven). Loaded over DirtyJTAG.
+/// button, and the green LED, plus the DDR3 sdram_* pad map shared with
+/// River and Glacier. Sites come from the litex-boards `gsd_orangecrab`
+/// `_io_r0_2` table (checked against litex-boards commit 6f70475) and are
+/// proven on hardware for the non-DDR pins: a bitstream with those pins
+/// enumerates over USB. Loaded over DirtyJTAG.
+///
+/// The DDR3 sites are for board revision r0.2 only: r0.1 moves CKE and
+/// RESET# and reshuffles the address bus, so this map must never be used on
+/// an r0.1 board.
+///
+/// The ECP5 DDR3 PHY (`Ddr3PhyEcp5`) is simulation-proven only. OrangeCrab
+/// DDR3 calibration has not passed on real hardware (writes failed at write
+/// leveling).
+///
+/// DQS has two valid pad maps, picked by [ddrPinsFor]/[fpgaTarget]'s
+/// `ddrDllOn`:
+/// - DLL-on (default [pins]): `sdram_dqs[*]` is a true differential
+///   SSTL135D_I pad on the LDQS _p ball (B15/G18); nextpnr derives the LDQSN
+///   _n rail, so there is no `sdram_dqs_n`.
+/// - DLL-off ([ddrDqsComplementPins]): `sdram_dqs[*]` drops to single-ended
+///   SSTL135_I, and the explicit `sdram_dqs_n[*]` LDQSN _n pads (A16/H17,
+///   from the prjtrellis LFE5U-25F/CSFBGA285 pair database) are added for
+///   the controller's own complement ODDR. Never flatten the two: an SSTL135D_I
+///   `sdram_dqs[*]` with no `sdram_dqs_n` constraint on a DLL-off build routes
+///   fine and fails on the board.
+///
+/// `sdram_ck`/`sdram_ck_n` are the opposite of DQS: both balls (J18/K18) are
+/// single-ended SSTL135_I in both DLL modes, because the RTL drives the CK
+/// complement explicitly (nextpnr does not auto-pair the B side of a "D"
+/// output type the way it does for a differential input like DQS).
+///
+/// `ddr_vccio[*]`/`ddr_gnd[*]` complete the OrangeCrab's fake-VTT network (no
+/// onboard VTT regulator): 6 pins driven high and 2 driven low.
 const _orangeCrab25f = HarborBoard(
   name: 'orangecrab-25f',
   vendor: HarborFpgaVendor.ecp5,
@@ -335,6 +416,82 @@ const _orangeCrab25f = HarborBoard(
     'sd_dat1': 'K3 LVCMOS33 PULLMODE=UP',
     'sd_dat2': 'L3 LVCMOS33 PULLMODE=UP',
     'sd_dat3': 'M1 LVCMOS33 PULLMODE=UP',
+    // DDR3 (Micron MT41K64M16, r0.2 only). sdram_ck/_n are both single-ended
+    // SSTL135_I: the RTL drives the CK complement itself, because nextpnr does
+    // not build the B side of a D-suffixed output type. sdram_dqs[*] is
+    // the DLL-on true-differential SSTL135D_I map; [ddrPinsFor] rewrites it
+    // for DLL-off.
+    'sdram_ck': 'J18 SSTL135_I SLEWRATE=FAST',
+    'sdram_ck_n': 'K18 SSTL135_I SLEWRATE=FAST',
+    'sdram_cke': 'D18 SSTL135_I SLEWRATE=FAST',
+    'sdram_cs_n': 'A12 SSTL135_I SLEWRATE=FAST',
+    'sdram_ras_n': 'C12 SSTL135_I SLEWRATE=FAST',
+    'sdram_cas_n': 'D13 SSTL135_I SLEWRATE=FAST',
+    'sdram_we_n': 'B12 SSTL135_I SLEWRATE=FAST',
+    'sdram_odt': 'C13 SSTL135_I SLEWRATE=FAST',
+    'sdram_reset_n': 'L18 SSTL135_I SLEWRATE=FAST',
+    'sdram_ba[0]': 'D6 SSTL135_I SLEWRATE=FAST',
+    'sdram_ba[1]': 'B7 SSTL135_I SLEWRATE=FAST',
+    'sdram_ba[2]': 'A6 SSTL135_I SLEWRATE=FAST',
+    // 13 of the platform's 16 reserved address sites (the MT41K64M16 is a
+    // 1Gb part); the rest float. Litex order.
+    'sdram_addr[0]': 'C4 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[1]': 'D2 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[2]': 'D3 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[3]': 'A3 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[4]': 'A4 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[5]': 'D4 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[6]': 'C3 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[7]': 'B2 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[8]': 'B1 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[9]': 'D1 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[10]': 'A7 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[11]': 'C2 SSTL135_I SLEWRATE=FAST',
+    'sdram_addr[12]': 'B6 SSTL135_I SLEWRATE=FAST',
+    // DM sites in litex order so each lane's DM shares its lane's DQS group
+    // (D16=lane0, G16=lane1).
+    'sdram_dm[0]': 'D16 SSTL135_I SLEWRATE=FAST',
+    'sdram_dm[1]': 'G16 SSTL135_I SLEWRATE=FAST',
+    'sdram_dq[0]': 'C17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[1]': 'D15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[2]': 'B17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[3]': 'C16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[4]': 'A15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[5]': 'B13 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[6]': 'A17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[7]': 'A13 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[8]': 'F17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[9]': 'F16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[10]': 'G15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[11]': 'F15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[12]': 'J16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[13]': 'C18 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[14]': 'H16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dq[15]': 'F18 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    // DLL-on: true differential strobe on the LDQS _p ball. [ddrPinsFor]
+    // drops this to SSTL135_I for DLL-off. Termination follows litex-boards.
+    // River used TERMINATION=75 here with no recorded reason, not validated.
+    'sdram_dqs[0]':
+        'B15 SSTL135D_I SLEWRATE=FAST TERMINATION=OFF DIFFRESISTOR=100',
+    'sdram_dqs[1]':
+        'G18 SSTL135D_I SLEWRATE=FAST TERMINATION=OFF DIFFRESISTOR=100',
+    // Fake-VTT network (no onboard VTT regulator): 6 pins driven high, 2
+    // driven low, sites from litex-boards' vccio/gnd ddram subsignals.
+    'ddr_vccio[0]': 'K16 SSTL135_II SLEWRATE=FAST',
+    'ddr_vccio[1]': 'D17 SSTL135_II SLEWRATE=FAST',
+    'ddr_vccio[2]': 'K15 SSTL135_II SLEWRATE=FAST',
+    'ddr_vccio[3]': 'K17 SSTL135_II SLEWRATE=FAST',
+    'ddr_vccio[4]': 'B18 SSTL135_II SLEWRATE=FAST',
+    'ddr_vccio[5]': 'C6 SSTL135_II SLEWRATE=FAST',
+    'ddr_gnd[0]': 'L15 SSTL135_II SLEWRATE=FAST',
+    'ddr_gnd[1]': 'L16 SSTL135_II SLEWRATE=FAST',
+  },
+  // DLL-off explicit DQS# complement: the LDQSN _n balls (A16/H17), single-
+  // ended SSTL135_I. ddrPinsFor(dllOn: false) adds these and drops
+  // sdram_dqs[*] to SSTL135_I; DLL-on uses the SSTL135D_I pad above alone.
+  ddrDqsComplementPins: {
+    'sdram_dqs_n[0]': 'A16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    'sdram_dqs_n[1]': 'H17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
   },
   // The 48 MHz oscillator ball is the one confirmed clock input of this
   // board. Every other ball the catalog carries is a general I/O, so a clock

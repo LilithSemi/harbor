@@ -375,4 +375,223 @@ void main() {
       expect(target.generateConstraints(), contains('FREQUENCY PORT "clk_in"'));
     });
   });
+
+  group('orangecrab-25f DDR3 pins', () {
+    // Sites and attributes from River's packages/river_hdl/lib/src/boards.dart
+    // DdrBoard._orangeCrab (r0.2), checked against litex-boards gsd_orangecrab
+    // commit 6f70475. Non-DQS pins do not change with the DLL mode.
+    const common = {
+      'sdram_ck': 'J18 SSTL135_I SLEWRATE=FAST',
+      'sdram_ck_n': 'K18 SSTL135_I SLEWRATE=FAST',
+      'sdram_cke': 'D18 SSTL135_I SLEWRATE=FAST',
+      'sdram_cs_n': 'A12 SSTL135_I SLEWRATE=FAST',
+      'sdram_ras_n': 'C12 SSTL135_I SLEWRATE=FAST',
+      'sdram_cas_n': 'D13 SSTL135_I SLEWRATE=FAST',
+      'sdram_we_n': 'B12 SSTL135_I SLEWRATE=FAST',
+      'sdram_odt': 'C13 SSTL135_I SLEWRATE=FAST',
+      'sdram_reset_n': 'L18 SSTL135_I SLEWRATE=FAST',
+      'sdram_ba[0]': 'D6 SSTL135_I SLEWRATE=FAST',
+      'sdram_ba[1]': 'B7 SSTL135_I SLEWRATE=FAST',
+      'sdram_ba[2]': 'A6 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[0]': 'C4 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[1]': 'D2 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[2]': 'D3 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[3]': 'A3 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[4]': 'A4 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[5]': 'D4 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[6]': 'C3 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[7]': 'B2 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[8]': 'B1 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[9]': 'D1 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[10]': 'A7 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[11]': 'C2 SSTL135_I SLEWRATE=FAST',
+      'sdram_addr[12]': 'B6 SSTL135_I SLEWRATE=FAST',
+      'sdram_dm[0]': 'D16 SSTL135_I SLEWRATE=FAST',
+      'sdram_dm[1]': 'G16 SSTL135_I SLEWRATE=FAST',
+      'sdram_dq[0]': 'C17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[1]': 'D15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[2]': 'B17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[3]': 'C16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[4]': 'A15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[5]': 'B13 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[6]': 'A17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[7]': 'A13 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[8]': 'F17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[9]': 'F16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[10]': 'G15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[11]': 'F15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[12]': 'J16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[13]': 'C18 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[14]': 'H16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dq[15]': 'F18 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'ddr_vccio[0]': 'K16 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[1]': 'D17 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[2]': 'K15 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[3]': 'K17 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[4]': 'B18 SSTL135_II SLEWRATE=FAST',
+      'ddr_vccio[5]': 'C6 SSTL135_II SLEWRATE=FAST',
+      'ddr_gnd[0]': 'L15 SSTL135_II SLEWRATE=FAST',
+      'ddr_gnd[1]': 'L16 SSTL135_II SLEWRATE=FAST',
+    };
+
+    const dllOnDqs = {
+      'sdram_dqs[0]':
+          'B15 SSTL135D_I SLEWRATE=FAST TERMINATION=OFF DIFFRESISTOR=100',
+      'sdram_dqs[1]':
+          'G18 SSTL135D_I SLEWRATE=FAST TERMINATION=OFF DIFFRESISTOR=100',
+    };
+
+    const dllOffDqs = {
+      'sdram_dqs[0]': 'B15 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dqs[1]': 'G18 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dqs_n[0]': 'A16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+      'sdram_dqs_n[1]': 'H17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF',
+    };
+
+    test('DLL-on gives the exact expected site and IO type for every pin', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      final pins = board.ddrPinsFor(dllOn: true);
+      for (final e in {...common, ...dllOnDqs}.entries) {
+        expect(pins[e.key], equals(e.value), reason: e.key);
+      }
+      expect(pins.containsKey('sdram_dqs_n[0]'), isFalse);
+      expect(pins.containsKey('sdram_dqs_n[1]'), isFalse);
+    });
+
+    test('DLL-off gives the exact expected site and IO type for every pin', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      final pins = board.ddrPinsFor(dllOn: false);
+      for (final e in {...common, ...dllOffDqs}.entries) {
+        expect(pins[e.key], equals(e.value), reason: e.key);
+      }
+    });
+
+    test(
+      'DLL-off adds sdram_dqs_n and changes the IO standard of sdram_dqs',
+      () {
+        final board = HarborBoard.get('orangecrab-25f');
+        final on = board.ddrPinsFor(dllOn: true);
+        final off = board.ddrPinsFor(dllOn: false);
+
+        expect(on.containsKey('sdram_dqs_n[0]'), isFalse);
+        expect(on.containsKey('sdram_dqs_n[1]'), isFalse);
+        expect(
+          off['sdram_dqs_n[0]'],
+          equals('A16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF'),
+        );
+        expect(
+          off['sdram_dqs_n[1]'],
+          equals('H17 SSTL135_I SLEWRATE=FAST TERMINATION=OFF'),
+        );
+
+        expect(on['sdram_dqs[0]'], contains('SSTL135D_I'));
+        expect(on['sdram_dqs[1]'], contains('SSTL135D_I'));
+        expect(off['sdram_dqs[0]'], isNot(contains('SSTL135D_I')));
+        expect(off['sdram_dqs[0]'], contains('SSTL135_I'));
+        expect(off['sdram_dqs[1]'], isNot(contains('SSTL135D_I')));
+        expect(off['sdram_dqs[1]'], contains('SSTL135_I'));
+
+        // The site stays the same across both modes, only the IO type changes.
+        expect(
+          on['sdram_dqs[0]']!.split(' ').first,
+          equals(off['sdram_dqs[0]']!.split(' ').first),
+        );
+      },
+    );
+
+    test('non-DQS DDR3 pins are identical in both DLL modes', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      final on = board.ddrPinsFor(dllOn: true);
+      final off = board.ddrPinsFor(dllOn: false);
+      for (final key in common.keys) {
+        expect(off[key], equals(on[key]), reason: key);
+      }
+    });
+
+    test('fpgaTarget requires ddrDllOn when sdram_dqs pins are selected', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      expect(
+        () => board.fpgaTarget(pins: ['clk', 'sdram_dqs[0]']),
+        throwsArgumentError,
+      );
+      expect(() => board.fpgaTarget(), throwsArgumentError);
+    });
+
+    test('fpgaTarget builds the DLL-on target when asked', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      final target = board.fpgaTarget(ddrDllOn: true);
+      expect(target.pinMap['sdram_dqs[0]'], contains('SSTL135D_I'));
+      expect(target.pinMap.containsKey('sdram_dqs_n[0]'), isFalse);
+    });
+
+    test('fpgaTarget builds the DLL-off target when asked', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      final target = board.fpgaTarget(ddrDllOn: false);
+      expect(target.pinMap['sdram_dqs[0]'], isNot(contains('SSTL135D_I')));
+      expect(
+        target.pinMap['sdram_dqs_n[0]'],
+        equals('A16 SSTL135_I SLEWRATE=FAST TERMINATION=OFF'),
+      );
+    });
+
+    test('fpgaTarget does not require ddrDllOn for non-DQS DDR3 pins', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      final target = board.fpgaTarget(pins: ['clk', 'sdram_ck', 'sdram_cke']);
+      expect(target.pinMap['sdram_ck'], equals('J18 SSTL135_I SLEWRATE=FAST'));
+    });
+
+    test('no DDR3 pin collides with an existing orangecrab-25f pin', () {
+      final board = HarborBoard.get('orangecrab-25f');
+      bool isDdr(String key) =>
+          key.startsWith('sdram_') ||
+          key.startsWith('ddr_vccio') ||
+          key.startsWith('ddr_gnd');
+
+      // The non-DDR3 sites are fixed: neither DLL mode touches them.
+      final nonDdrSites = board.pins.entries
+          .where((e) => !isDdr(e.key))
+          .map((e) => e.value.split(' ').first)
+          .toSet();
+      expect(nonDdrSites, hasLength(20)); // the preset's pre-existing pins
+
+      for (final mode in [true, false]) {
+        final ddrSites = board
+            .ddrPinsFor(dllOn: mode)
+            .entries
+            .where((e) => isDdr(e.key))
+            .map((e) => e.value.split(' ').first)
+            .toSet();
+        expect(
+          nonDdrSites.intersection(ddrSites),
+          isEmpty,
+          reason: 'dllOn: $mode',
+        );
+        // No two DDR3 pins share a site either.
+        final ddrPins = board
+            .ddrPinsFor(dllOn: mode)
+            .entries
+            .where((e) => isDdr(e.key))
+            .toList();
+        final bySite = <String, String>{};
+        for (final e in ddrPins) {
+          final site = e.value.split(' ').first;
+          expect(
+            bySite[site],
+            isNull,
+            reason: '$site: ${bySite[site]}, ${e.key}',
+          );
+          bySite[site] = e.key;
+        }
+      }
+    });
+
+    test('a board with no DLL-dependent DQS pad ignores ddrDllOn', () {
+      // ulx3s-85f has no ddrDqsComplementPins, so ddrPinsFor is a no-op and
+      // fpgaTarget never demands ddrDllOn.
+      final board = HarborBoard.get('ulx3s-85f');
+      expect(board.ddrPinsFor(dllOn: true), same(board.pins));
+      expect(board.ddrPinsFor(dllOn: false), same(board.pins));
+      expect(() => board.fpgaTarget(), returnsNormally);
+    });
+  });
 }
