@@ -206,7 +206,8 @@ class HarborSdram extends BridgeModule
     HarborFpgaTarget fpgaTarget,
   ) {
     final busDW = busDataWidth;
-    Logic frontReset, engineAbort, pickAbort, wbCyc, wbWe, wbAdr, wbDatW, wbSel;
+    Logic frontReset, engineAbort, wbCyc, wbWe, wbAdr, wbDatW, wbSel;
+    Logic? abortNext;
     HarborWishboneCdcFifoBridge? cdc;
     final memClk = busClockSync ? clk : memClkPort!;
     final memReset = _releaseSync(memClk, memResetPort, 'mem_reset_sync');
@@ -242,7 +243,6 @@ class HarborSdram extends BridgeModule
     if (busClockSync) {
       frontReset = (reset | frontLocalReset).named('front_reset');
       engineAbort = frontReset;
-      pickAbort = frontReset;
       wbCyc = bus.stb;
       wbWe = bus.we;
       wbAdr = bus.addr;
@@ -298,19 +298,14 @@ class HarborSdram extends BridgeModule
           orElse: [abort0 < joined, frontReset < abort0],
         ),
       ]);
-      // Copies of [frontReset] for the engine and for its command select,
-      // which the placer can keep next to their loads.
+      // A copy of [frontReset] for the engine, which the placer can keep
+      // next to its loads. The engine also gets its next value.
+      abortNext = frontLocalReset | abort0;
       engineAbort = Ecp5Fd1s3bx(
-        d: frontLocalReset | abort0,
+        d: abortNext,
         ck: memClk,
         pd: Const(0),
         name: 'engine_abort',
-      ).q;
-      pickAbort = Ecp5Fd1s3bx(
-        d: frontLocalReset | abort0,
-        ck: memClk,
-        pd: Const(0),
-        name: 'pick_abort',
       ).q;
       // One register stage between the cdc fifo head and the front end, so
       // neither the fifo read mux nor the front end has to sit next to the
@@ -386,7 +381,7 @@ class HarborSdram extends BridgeModule
       clk: memClk,
       reset: engineReset,
       abort: engineAbort,
-      pickAbort: pickAbort,
+      abortNext: abortNext,
       coldReset: coldReset,
       timersReset: timersReset,
       port: enginePort,

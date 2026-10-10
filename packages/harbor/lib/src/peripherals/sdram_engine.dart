@@ -108,7 +108,7 @@ class SdramEngine extends Module {
     required Logic phyRdData,
     required int phyReadLatency,
     Logic? abort,
-    Logic? pickAbort,
+    Logic? abortNext,
     Logic? coldReset,
     Logic? timersReset,
     int maxGrantWords = 8,
@@ -123,7 +123,7 @@ class SdramEngine extends Module {
          phyRdData: phyRdData,
          phyReadLatency: phyReadLatency,
          abort: abort,
-         pickAbort: pickAbort,
+         abortNext: abortNext,
          coldReset: coldReset,
          timersReset: timersReset,
          maxGrantWords: maxGrantWords,
@@ -141,7 +141,7 @@ class SdramEngine extends Module {
     required Logic phyRdData,
     required int phyReadLatency,
     required Logic? abort,
-    required Logic? pickAbort,
+    required Logic? abortNext,
     required Logic? coldReset,
     required Logic? timersReset,
     required this.maxGrantWords,
@@ -195,12 +195,12 @@ class SdramEngine extends Module {
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
     phyRdData = addInput('phy_rd_data', phyRdData, width: dataW);
-    // A copy of [abort] for the command select only, so the select does
-    // not wait on a net that spans every place abort goes. It must equal
-    // [abort] every cycle.
-    final externalAbort = abort ?? Const(0);
-    final pickAbortSig = addInput('pick_abort', pickAbort ?? externalAbort);
-    abort = addInput('abort', externalAbort);
+    // The value [abort] takes at the next edge. With it, the select reads
+    // the abort from its gate registers and not from the abort net.
+    final abortNextSig = abortNext == null
+        ? null
+        : addInput('abort_next', abortNext);
+    abort = addInput('abort', abort ?? Const(0));
     // Only a real power-on clears [warmReset] below. With no [coldReset]
     // given, every reset counts as cold, so warmReset never latches and
     // init always takes the cold path: unchanged from before this input
@@ -344,14 +344,6 @@ class SdramEngine extends Module {
         Logic(name: 'open_row_$b', width: rowW),
     ];
 
-    // One-cycle blocks, each named for the command it holds back, for what
-    // the last pick forbids. The timers see that pick one cycle late.
-    final blkAct = Logic(name: 'blk_act');
-    final blkRead = Logic(name: 'blk_read');
-    final blkWrite = Logic(name: 'blk_write');
-    final blkPre = Logic(name: 'blk_pre');
-    final blkPreAllRef = Logic(name: 'blk_pre_all_ref');
-
     // Registered refresh and force requests.
     final forceAny = Logic(name: 'force_any');
     final forceRef = Logic(name: 'force_ref');
@@ -364,9 +356,6 @@ class SdramEngine extends Module {
     // The arbiter learns of a taken write word one cycle late, so right
     // after a take the word to use is its second one.
     final wrTook = Logic(name: 'wr_took');
-    // A registered copy of mux(wrTook, wr_next_valid, wr_valid), loaded
-    // from the arbiter's next values, so the select starts from one flop.
-    final wrValidNow = Logic(name: 'wr_valid_now');
     final wrDataNow = mux(wrTook, port.wrNextData, port.wrData);
     final wrMaskNow = mux(wrTook, port.wrNextMask, port.wrMask);
 
@@ -385,8 +374,8 @@ class SdramEngine extends Module {
     // --- command select, one hot ---
     // The select picks a command from registers and loads it into the
     // sel_* registers, which drive the pins and the entry state one cycle
-    // later. The timers and the one-cycle blocks see the pick itself, so
-    // the rules count from the pick. The entry state does not yet hold the
+    // later. The timers see the pick itself, so the rules count from the
+    // pick. The entry state does not yet hold the
     // command on sel_*, so an entry is not picked while sel_* holds a
     // command for it, except the next column of the same request. A
     // finishing column, a precharge all and a refresh hold back both.
@@ -401,8 +390,8 @@ class SdramEngine extends Module {
 
     // The refresh wants and the hold that keeps the entries out of their
     // way come from registers, one cycle behind the state they read. The
-    // one-cycle blocks cover that cycle. The hold is folded into [curGo]
-    // and [laBase].
+    // hold is folded into [curGo] and [laBase], so no pick runs in that
+    // cycle.
     final wantPreAll = Logic(name: 'want_pre_all');
     final wantRef = Logic(name: 'want_ref');
     final idleNow = ~cur.valid & ~la.valid & idleRefWant;
@@ -412,59 +401,55 @@ class SdramEngine extends Module {
     final wantRefNext = initDone & (forceRef | idleNow | refCommit);
     final holdNext = ~initDone | wantPreAllNext | wantRefNext;
 
+    // The sel_* registers and free flags cover the cycle the timers miss.
+    // This needs want_* to hold curGo and laBase low in that cycle, and no
+    // promote after a column of cur that is not its last. If either rule
+    // breaks, the removed one-cycle blocks must come back.
     final pickPreAll =
-        (selIdle &
-                wantPreAll &
-                ~blkPre &
-                ~blkPreAllRef &
-                timers.anyOpen &
-                timers.canPreAll)
-            .named('pick_pre_all');
-    final pickRef =
-        (selIdle & wantRef & ~blkPreAllRef & ~timers.anyOpen & timers.canRef)
-            .named('pick_ref');
+        (selIdle & wantPreAll & timers.anyOpen & timers.canPreAll).named(
+          'pick_pre_all',
+        );
+    final pickRef = (selIdle & wantRef & ~timers.anyOpen & timers.canRef).named(
+      'pick_ref',
+    );
 
     final readIssue = (selCurCol & ~cur.write).named('read_issue');
     final writeIssue = (selCurCol & cur.write).named('write_issue');
     // An abort drops queued reads at the next edge, so none is picked.
-    final curKeep = ~(pickAbortSig & ~cur.write);
-    final laKeep = ~(pickAbortSig & ~la.write);
+    // Given [abortNextSig], cur_go and la_base hold this.
+    final curKeep = abortNextSig == null ? ~(abort & ~cur.write) : Const(1);
+    final laKeep = abortNextSig == null ? ~(abort & ~la.write) : Const(1);
     // Registers loaded with the pick, so the select reads flops only.
-    // cur_free and la_free: the entry state is up to date for that entry.
-    // write_more: a write word that is not the last is on sel_*.
-    // read_more: a 1-beat read is on sel_* and the last word of its request
-    // follows, so the beats of the next read are known.
-    // wr_more: the next write word is ready behind the one on sel_*: the
-    // arbiter's wr_next, or wr_next2 while the last take is in flight.
+    // cur_free: the entry state is up to date for cur.
+    // cur_free_act: cur_free, and la picked no activate.
+    // la_free: no precharge all, refresh or finishing column was picked.
+    // col_ready: cur_free with a write word ready if cur writes, or a
+    // column on sel_* that is not the last, with the next write word ready
+    // or a 1-beat read followed by the last word of its request.
+    // col_holds_pre: the column on sel_* is a write or a read longer than 1
+    // beat, which holds back a precharge.
     final curFree = Logic(name: 'cur_free');
+    final curFreeAct = Logic(name: 'cur_free_act');
     final laFree = Logic(name: 'la_free');
-    final writeMore = Logic(name: 'write_more');
-    final readMore = Logic(name: 'read_more');
-    final wrMore = Logic(name: 'wr_more');
-    final curColReady = mux(
-      cur.write,
-      ((writeMore & wrMore) | (curFree & wrValidNow)) & ~blkWrite,
-      (curFree | readMore) & ~blkRead,
-    );
-    final pickCurCol = (curGo & curKeep & cur.hit & curCanColR & curColReady)
+    final colReady = Logic(name: 'col_ready');
+    final colHoldsPre = Logic(name: 'col_holds_pre');
+    final pickCurCol = (curGo & curKeep & cur.hit & curCanColR & colReady)
         .named('pick_cur_col');
-    final curRowGo = curFree & curGo & curKeep;
-    final pickCurPre = (curRowGo & cur.miss & ~blkPre & curCanPre).named(
+    final pickCurPre = (curFree & curGo & curKeep & cur.miss & curCanPre).named(
       'pick_cur_pre',
     );
-    final pickCurAct = (curRowGo & ~cur.hit & ~cur.miss & ~blkAct & curCanAct)
-        .named('pick_cur_act');
+    final pickCurAct =
+        (curFreeAct & curGo & curKeep & ~cur.hit & ~cur.miss & curCanAct).named(
+          'pick_cur_act',
+        );
     final curAny = pickCurCol | pickCurPre | pickCurAct;
 
     // la issues a row command only when cur picks nothing.
-    final laGo = laFree & laBase & laKeep & ~curAny;
-    final pickLaPre = (laGo & la.miss & ~blkPre & laCanPre).named(
-      'pick_la_pre',
-    );
-    final pickLaAct = (laGo & ~la.hit & ~la.miss & ~blkAct & laCanAct).named(
-      'pick_la_act',
-    );
-    final pickAny = curAny | pickLaPre | pickLaAct | pickPreAll | pickRef;
+    final laRowGo = laFree & ~selLaPre & ~selLaAct & laBase & laKeep;
+    final laPreOk = laRowGo & la.miss & ~(selCurCol & colHoldsPre) & laCanPre;
+    final laActOk = laRowGo & ~la.hit & ~la.miss & ~selCurAct & laCanAct;
+    final pickLaPre = (laPreOk & ~curAny).named('pick_la_pre');
+    final pickLaAct = (laActOk & ~curAny).named('pick_la_act');
     final pickRead = pickCurCol & ~cur.write;
     final pickWrite = pickCurCol & cur.write;
     // The fin flag of the picked column. A column picked while one is on
@@ -472,7 +457,6 @@ class SdramEngine extends Module {
     // read is always its last word.
     final pickFin =
         pickCurCol & mux(selCurCol, ~cur.write | cur.rem.eq(2), cur.fin);
-    final pickMore = pickCurCol & ~pickFin;
 
     final isPre = selCurPre | selLaPre;
     final curCmd = selCurCol | selCurPre | selCurAct;
@@ -829,21 +813,30 @@ class SdramEngine extends Module {
 
     _checkRequests(clk, port, accept, inCol, colW);
 
-    // A read longer than 1 beat holds back the next read and a precharge.
-    // A read picked while a read is on sel_* is the last word of cur.
+    // The beats of the picked read. A read picked while a read is on sel_*
+    // is the last word of cur.
     final pickBeats = mux(readIssue, Const(1, width: 4), cur.beats);
-    final longRead = pickRead & pickBeats.neq(1);
     lastBeatsNext <= mux(pickRead, pickBeats, Const(0, width: 4));
 
     // These read the next valid bits, so they are split on [curFinish] too.
+    Logic keepNext(Logic write) =>
+        abortNextSig == null ? Const(1) : ~(abortNextSig & ~write);
     Logic goFor(({List<Logic> cur, List<Logic> la, Logic promote}) e) =>
-        e.cur[0] & ~holdNext;
+        e.cur[0] & ~holdNext & keepNext(e.cur[1]);
     Logic laBaseFor(({List<Logic> cur, List<Logic> la, Logic promote}) e) =>
         ~holdNext &
         e.la[0] &
         ~accept &
         ~(laSameBankNext & e.cur[0]) &
-        ~forceAnyNext;
+        ~forceAnyNext &
+        keepNext(e.la[1]);
+    final wrValidNowNext = mux(writeIssue, port.wrNextValidD, port.wrValidD);
+    final wrMoreNext = mux(writeIssue, port.wrNext2ValidD, port.wrNextValidD);
+    final curFreeNext = ~(curAny | pickPreAll | pickRef);
+    final colMore = mux(cur.write, wrMoreNext, cur.beats.eq(1) & cur.rem.eq(2));
+    final colReadyNext =
+        (pickCurCol & ~pickFin & colMore) |
+        (curFreeNext & (~curNext[1] | wrValidNowNext));
     Logic roomFor(({List<Logic> cur, List<Logic> la, Logic promote}) e) =>
         ~forceAnyNext & (~e.cur[0] | ~e.la[0]);
 
@@ -865,11 +858,13 @@ class SdramEngine extends Module {
       (selCurAct, pickCurAct, 0),
       (selLaPre, pickLaPre, 0),
       (selLaAct, pickLaAct, 0),
-      (selIdle, ~pickAny, 1),
-      (curFree, ~(curAny | pickPreAll | pickRef), 1),
-      (laFree, ~(pickLaPre | pickLaAct | pickPreAll | pickRef | pickFin), 1),
-      (writeMore, pickMore & cur.write, 0),
-      (readMore, pickMore & ~cur.write & cur.beats.eq(1) & cur.rem.eq(2), 0),
+      (curFree, curFreeNext, 1),
+      // la_*_ok without the cur gate: the OR is the same.
+      (selIdle, ~(curAny | laPreOk | laActOk | pickPreAll | pickRef), 1),
+      (curFreeAct, ~(curAny | laActOk | pickPreAll | pickRef), 1),
+      (laFree, ~(pickPreAll | pickRef | pickFin), 1),
+      (colReady, colReadyNext, 0),
+      (colHoldsPre, cur.write | (~readIssue & cur.beats.neq(1)), 0),
       (lastAct, actNext, 0),
       (lastPre, preNext, 0),
       (lastRead, readNext, 0),
@@ -886,11 +881,6 @@ class SdramEngine extends Module {
       (laBase, byFinish(laBaseFor), 0),
       (laCanAct, mux(accept, canActFor(inBank), canActFor(la.bank)), 0),
       (laCanPre, mux(accept, canPreFor(inBank), canPreFor(la.bank)), 0),
-      (blkAct, ~initDone | pickPreAll | pickRef | pickLaAct | pickCurAct, 1),
-      (blkRead, ~initDone | pickPreAll | pickRef | longRead, 1),
-      (blkWrite, ~initDone | pickPreAll | pickRef | pickRead, 1),
-      (blkPre, ~initDone | pickPreAll | pickRef | longRead | pickWrite, 1),
-      (blkPreAllRef, ~initDone | pickAny, 1),
       (forceAny, forceAnyNext, 0),
       (forceRef, forceRefNext, 0),
       (idleRefWant, idleRefWantNext, 0),
@@ -927,11 +917,6 @@ class SdramEngine extends Module {
       (genFin, genFinNext, 0),
       (genPort, genPortNext, 0),
     ];
-
-    Sequential(clk, [
-      wrValidNow < mux(writeIssue & ~reset, port.wrNextValidD, port.wrValidD),
-      wrMore < mux(writeIssue & ~reset, port.wrNext2ValidD, port.wrNextValidD),
-    ]);
 
     Sequential(clk, [
       If(
@@ -1013,7 +998,7 @@ SdramEngine debugSdramEngineWithoutRowAgeGuard(
   phyRdData: phyRdData,
   phyReadLatency: phyReadLatency,
   abort: abort,
-  pickAbort: null,
+  abortNext: null,
   coldReset: coldReset,
   timersReset: null,
   maxGrantWords: maxGrantWords,

@@ -4,8 +4,8 @@ import 'dart:math';
 
 import 'package:harbor/harbor.dart';
 import 'package:harbor/src/peripherals/sdram_bank_timers.dart';
-import 'package:harbor/src/peripherals/sdram_engine.dart' show
-    debugSdramEngineWithoutRowAgeGuard;
+import 'package:harbor/src/peripherals/sdram_engine.dart'
+    show debugSdramEngineWithoutRowAgeGuard;
 import 'package:harbor/src/peripherals/sdram_refresh.dart';
 import 'package:rohd/rohd.dart';
 
@@ -16,6 +16,10 @@ import 'sdram_pin_model.dart';
 /// stack builds as one hierarchy. [ports] is one or more client ports. The
 /// arbiter sits between them and the engine, the way a real build always
 /// has it, so a one-port run also proves the arbiter is a clean passthrough.
+///
+/// [abort] and [abortNext] are null by default, so every existing caller
+/// keeps today's untested abort net. A caller that passes them wires the
+/// engine (and the arbiter's [abort]) exactly like [HarborSdram] does.
 class SdramEngineStackTop extends Module {
   late final SdramEngine engine;
   late final SdramArbiter arbiter;
@@ -31,9 +35,15 @@ class SdramEngineStackTop extends Module {
     required int maxGrantWords,
     List<int>? portMaxGrantWords,
     bool rowAgeGuard = true,
+    Logic? abort,
+    Logic? abortNext,
   }) : super(name: 'sdram_engine_stack') {
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
+    final abortIn = abort == null ? null : addInput('abort', abort);
+    final abortNextIn = abortNext == null
+        ? null
+        : addInput('abort_next', abortNext);
     final outer = [
       for (var i = 0; i < ports.length; i++)
         ports[i].clone()..pairConnectIO(
@@ -89,6 +99,8 @@ class SdramEngineStackTop extends Module {
             phyRdData: phy.rdData,
             phyReadLatency: phy.readLatency,
             maxGrantWords: maxGrantWords,
+            abort: abortIn,
+            abortNext: abortNextIn,
           )
         : debugSdramEngineWithoutRowAgeGuard(
             config,
@@ -99,10 +111,12 @@ class SdramEngineStackTop extends Module {
             phyRdData: phy.rdData,
             phyReadLatency: phy.readLatency,
             maxGrantWords: maxGrantWords,
+            abort: abortIn,
           );
     arbiter = SdramArbiter(
       clk: clk,
       reset: reset,
+      abort: abortIn,
       ports: outer,
       configs: [
         for (var i = 0; i < outer.length; i++)
@@ -402,7 +416,10 @@ class SdramEngineStack {
     final weN = top.engine.phyWeN.value;
     final ba = top.engine.phyBa.value;
     final addr = top.engine.phyAddr.value;
-    if (!rasN.isValid || !casN.isValid || !weN.isValid || !ba.isValid ||
+    if (!rasN.isValid ||
+        !casN.isValid ||
+        !weN.isValid ||
+        !ba.isValid ||
         !addr.isValid) {
       return;
     }
