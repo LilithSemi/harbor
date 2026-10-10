@@ -234,13 +234,25 @@ class HarborL1ICache extends BridgeModule {
         ? Const(0, width: 1)
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits);
 
-    // Per-line VALID + TAG in flops: valid must flush in one cycle, and the tag
-    // compare is cheap. Read combinationally at the (registered) index.
+    // Valid bits flush in one cycle; tags and data share registered read timing.
     final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
-    final lineTag = List.generate(
-      numLines,
-      (i) => Logic(name: 'tag_$i', width: lineTagBits),
+    final tagRam = HarborRegisterFile(
+      numEntries: numLines,
+      dataWidth: lineTagBits,
+      numReadPorts: dualPort ? 2 : 1,
+      numWritePorts: 1,
+      reservedZero: false,
+      target: target,
+      forceReadLatency: 1,
+      name: 'l1i_tags',
     );
+    addSubModule(tagRam);
+    tagRam.input('clk').srcConnection! <= clk;
+    tagRam.input('reset').srcConnection! <= reset;
+    tagRam.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
+    if (dualPort) {
+      tagRam.input('rd1_addr').srcConnection! <= idxOf(reqAddr1);
+    }
 
     // Balanced mux tree (log2(numLines) deep) when the line count is a power of
     // two; see the matching helper in HarborL1DCache. Replaces a numLines-deep
@@ -323,9 +335,8 @@ class HarborL1ICache extends BridgeModule {
 
     final blockHit = (filling | fillSettle).named('blockHit');
 
-    Logic committedHit(Logic a) =>
-        muxLine(lineValid, idxOf(a)) &
-        muxLine(lineTag, idxOf(a)).eq(fullTagOf(a));
+    Logic committedHit(Logic a, [int port = 0]) =>
+        muxLine(lineValid, idxOf(a)) & tagRam.readData(port).eq(fullTagOf(a));
 
     final ans = (reqValid & reqAddr.eq(addrQ)).named('ans');
     final hit = (ans & committedHit(addrQ) & ~blockHit).named('hit');
@@ -334,10 +345,10 @@ class HarborL1ICache extends BridgeModule {
         ? (reqValid1 & reqAddr1.eq(addrQ1!)).named('ans1')
         : Const(0);
     final hit1 = dualPort
-        ? (ans1 & committedHit(addrQ1!) & ~blockHit).named('hit1')
+        ? (ans1 & committedHit(addrQ1!, 1) & ~blockHit).named('hit1')
         : Const(0);
     final miss1 = dualPort
-        ? (ans1 & ~committedHit(addrQ1!) & ~blockHit).named('miss1')
+        ? (ans1 & ~committedHit(addrQ1!, 1) & ~blockHit).named('miss1')
         : Const(0);
     // The faulting fetch is held by the FetchUnit at [faultAddr]; do not restart a
     // fill for it (it would just fault again), let respFault deliver the fault.
@@ -373,7 +384,9 @@ class HarborL1ICache extends BridgeModule {
     }
 
     // Data block-RAM write port: one fill word per MMU response.
-    final fillWrEn = (filling & memDone & memValid).named('fillWrEn');
+    final fillWrEn = (filling & memDone & memValid & ~flush & ~reset).named(
+      'fillWrEn',
+    );
     final Logic fillEntry;
     if (offBits == 0) {
       fillEntry = fillIdx;
@@ -387,6 +400,9 @@ class HarborL1ICache extends BridgeModule {
     dataRam.input('wr_data').srcConnection! <= memRdata;
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
+    tagRam.input('wr_en').srcConnection! <= fillWrEn & fillWord.eq(lastWord);
+    tagRam.input('wr_addr').srcConnection! <= fillIdx;
+    tagRam.input('wr_data').srcConnection! <= fillTag;
 
     Sequential(clk, [
       addrQ < reqAddr,
@@ -455,13 +471,8 @@ class HarborL1ICache extends BridgeModule {
                               fillSettle < 1,
                               ...List.generate(
                                 numLines,
-                                (l) => If(
-                                  fillIdx.eq(l),
-                                  then: [
-                                    lineValid[l] < 1,
-                                    lineTag[l] < fillTag,
-                                  ],
-                                ),
+                                (l) =>
+                                    If(fillIdx.eq(l), then: [lineValid[l] < 1]),
                               ),
                             ],
                             orElse: [
@@ -558,6 +569,15 @@ class HarborL1DCache extends BridgeModule {
   /// whose reads need pacing.
   final int cacheableBase;
 
+  /// Requests already carry physical addresses. The caller must perform
+  /// translation, permission and cacheability checks before every request,
+  /// including hits, and authorize the complete refill footprint.
+  ///
+  /// Physical aliases have the same index, so this opt-in removes the virtual
+  /// cache's page-size capacity bound. Tags must retain the full address width.
+  /// It does not translate addresses or change [cacheableBase].
+  final bool physicalAddresses;
+
   /// Bits of the address that translation does not change (log2 of the page
   /// size). Sv32, Sv39 and Sv48 all use 4 KB base pages, so 12. The store
   /// invalidate relies on the cache index being cut from these bits, because
@@ -566,9 +586,10 @@ class HarborL1DCache extends BridgeModule {
 
   /// Width of the permission-context tag kept with each line. Zero disables it.
   ///
-  /// The cache is in FRONT of the MMU: the pipeline presents a VIRTUAL address,
-  /// and only a MISS goes on to the MMU, which translates it and checks the PTE.
-  /// A LOAD HIT is decided by the tag and the valid bit alone, so no permission
+  /// In the default virtual placement, the pipeline presents a virtual address
+  /// and only a miss reaches the MMU, which translates it and checks the PTE.
+  /// In that placement, a LOAD HIT is decided by the tag and valid bit alone,
+  /// so no permission
   /// check runs on it. A line that one privilege mode was allowed to fill
   /// therefore stays readable by a mode the page table forbids: user code read
   /// a supervisor-only page out of the cache, and a supervisor load with
@@ -646,6 +667,7 @@ class HarborL1DCache extends BridgeModule {
     required this.config,
     this.xlen = 64,
     this.cacheableBase = 0x80000000,
+    this.physicalAddresses = false,
     this.ctxBits = 0,
     Logic? memFaultIn,
     // Significant low bits of [reqAddr]. See the note on tag width below.
@@ -660,6 +682,11 @@ class HarborL1DCache extends BridgeModule {
     }
     if (ctxBits < 0) {
       throw ArgumentError('ctxBits must not be negative (got $ctxBits).');
+    }
+    if (physicalAddresses && reqAddrBits != null && reqAddrBits != xlen) {
+      throw ArgumentError(
+        'Physical cache tags must retain all $xlen address bits.',
+      );
     }
 
     createPort('clk', PortDirection.input);
@@ -749,7 +776,7 @@ class HarborL1DCache extends BridgeModule {
     // of the address, two aliases land on DIFFERENT lines, and a store can no
     // longer find the other one. This is the classic alias-free condition for a
     // virtually indexed cache.
-    if (tagLo > pageOffsetBits) {
+    if (!physicalAddresses && tagLo > pageOffsetBits) {
       throw ArgumentError(
         'the cache is virtually indexed, so one way (${config.size ~/ config.ways} '
         'bytes) must not exceed the ${1 << pageOffsetBits}-byte page: the index '
@@ -774,10 +801,20 @@ class HarborL1DCache extends BridgeModule {
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits);
 
     final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
-    final lineTag = List.generate(
-      numLines,
-      (i) => Logic(name: 'tag_$i', width: lineTagBits),
+    final tagRam = HarborRegisterFile(
+      numEntries: numLines,
+      dataWidth: lineTagBits,
+      numReadPorts: 1,
+      numWritePorts: 1,
+      reservedZero: false,
+      target: target,
+      forceReadLatency: 1,
+      name: 'l1d_tags',
     );
+    addSubModule(tagRam);
+    tagRam.input('clk').srcConnection! <= clk;
+    tagRam.input('reset').srcConnection! <= reset;
+    tagRam.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
 
     // Select arr[idx]. A balanced mux tree (log2(numLines) deep) when the line
     // count is a power of two, folding pairs on one index bit per level. The
@@ -805,21 +842,10 @@ class HarborL1DCache extends BridgeModule {
       return r;
     }
 
-    // Address-only residency: the line holds this address, whatever context
-    // filled it. Store invalidation uses this, so a write-through store always
-    // drops the resident copy even when another context owns it.
-    Logic addrHitOf(Logic a) =>
-        muxLine(lineValid, idxOf(a)) &
-        muxLine(lineTag, idxOf(a)).getRange(0, tagBits).eq(tagOf(a));
-    // Load residency: the address AND the permission context must match, so a
-    // load from another context misses and the MMU checks the page.
-    Logic committedHitOf(Logic a) => ctxBits == 0
-        ? addrHitOf(a)
-        : addrHitOf(a) &
-              muxLine(
-                lineTag,
-                idxOf(a),
-              ).getRange(tagBits, lineTagBits).eq(reqCtx);
+    // Match address and permission context. Stores invalidate by index and
+    // require no asynchronous tag read.
+    Logic committedHitOf(Logic a) =>
+        muxLine(lineValid, idxOf(a)) & tagRam.readData(0).eq(fullTagOf(a));
 
     final dataRam = HarborRegisterFile(
       numEntries: numLines * lineWords,
@@ -940,7 +966,9 @@ class HarborL1DCache extends BridgeModule {
     miss <= loadMiss;
     busy <= (filling | storing | bypassing | drain);
 
-    final fillWrEn = (filling & memDone & memValid).named('fillWrEn');
+    final fillWrEn = (filling & memDone & memValid & ~flush & ~reset).named(
+      'fillWrEn',
+    );
     final Logic fillEntry;
     if (offBits == 0) {
       fillEntry = fillIdx;
@@ -954,6 +982,9 @@ class HarborL1DCache extends BridgeModule {
     dataRam.input('wr_data').srcConnection! <= memRdata;
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
+    tagRam.input('wr_en').srcConnection! <= fillWrEn & fillWord.eq(lastWord);
+    tagRam.input('wr_addr').srcConnection! <= fillIdx;
+    tagRam.input('wr_data').srcConnection! <= fillTag;
 
     Sequential(clk, [
       addrQ < reqAddr,
@@ -1028,13 +1059,8 @@ class HarborL1DCache extends BridgeModule {
                               fillSettle < 1,
                               ...List.generate(
                                 numLines,
-                                (l) => If(
-                                  fillIdx.eq(l),
-                                  then: [
-                                    lineValid[l] < 1,
-                                    lineTag[l] < fillTag,
-                                  ],
-                                ),
+                                (l) =>
+                                    If(fillIdx.eq(l), then: [lineValid[l] < 1]),
                               ),
                             ],
                             orElse: [

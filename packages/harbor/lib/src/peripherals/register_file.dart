@@ -477,7 +477,8 @@ class HarborRegisterFile extends BridgeModule {
   }
 
   /// Xilinx 7-series RAMB36E1-backed storage. Like [_buildEcp5Ebr], one true
-  /// dual-port block (or `ceil(dataWidth/32)` in x36 mode) per read port: port
+  /// dual-port block (or `ceil(dataWidth/32)` in x36 mode) per read port and
+  /// 1024-word depth block: port
   /// A is the shared write port and port B is that port's read, both on the
   /// posedge of clk. The RAMB read is synchronous, so this is a registered
   /// full-cycle read ([readLatency] == 1), keeping the read off the
@@ -495,56 +496,78 @@ class HarborRegisterFile extends BridgeModule {
   ) {
     const blockDataWidth = 32;
     final widthBlocks = (dataWidth + blockDataWidth - 1) ~/ blockDataWidth;
-    // x36 addressing: the entry index sits in AD[14:5], a 1-bit pad above it
-    // and the low 5 bits tied zero.
+    // Each x36 block holds 1024 words. Deeper files stripe contiguous ranges
+    // across blocks; select the read block with the same latency as its data.
+    final depthBlocks = (numEntries + 1023) ~/ 1024;
+    Logic depthOf(Logic a) => a.getRange(10, addrWidth);
     Logic toAd(Logic a) => [
       Const(0, width: 1),
-      a.zeroExtend(10),
+      a.width > 10 ? a.getRange(0, 10) : a.zeroExtend(10),
       Const(0, width: 5),
     ].swizzle().getRange(0, 16);
     final wrAd = toAd(wrAddr);
 
     for (var r = 0; r < rdAddrs.length; r++) {
       final rdAd = toAd(rdAddrs[r]);
-      final slices = <Logic>[];
+      final depthWords = <Logic>[];
+      for (var d = 0; d < depthBlocks; d++) {
+        final blockWrite = depthBlocks == 1
+            ? wrEn
+            : wrEn & depthOf(wrAddr).eq(d);
+        final slices = <Logic>[];
 
-      for (var w = 0; w < widthBlocks; w++) {
-        final lo = w * blockDataWidth;
-        final hi = (lo + blockDataWidth) > dataWidth
-            ? dataWidth
-            : lo + blockDataWidth;
-        final sliceWidth = hi - lo;
+        for (var w = 0; w < widthBlocks; w++) {
+          final lo = w * blockDataWidth;
+          final hi = (lo + blockDataWidth) > dataWidth
+              ? dataWidth
+              : lo + blockDataWidth;
+          final sliceWidth = hi - lo;
 
-        final bram = XilinxRamb36e1(name: 'rf_bram_r${r}_w$w');
-        addSubModule(bram);
+          final bram = XilinxRamb36e1(name: 'rf_bram_r${r}_d${d}_w$w');
+          addSubModule(bram);
 
-        // Port A: shared write port (posedge), whole-word write.
-        bram.input('CLKARDCLK').srcConnection! <= clk;
-        bram.input('ENARDEN').srcConnection! <= Const(1);
-        bram.input('ADDRARDADDR').srcConnection! <= wrAd;
-        bram.input('DIADI').srcConnection! <=
-            wrData.getRange(lo, hi).zeroExtend(blockDataWidth);
-        bram.input('DIPADIP').srcConnection! <= Const(0, width: 4);
-        bram.input('WEA').srcConnection! <= [wrEn, wrEn, wrEn, wrEn].swizzle();
-        bram.input('REGCEAREGCE').srcConnection! <= Const(0);
-        bram.input('RSTRAMARSTRAM').srcConnection! <= Const(0);
+          // Port A: shared write port (posedge), whole-word write.
+          bram.input('CLKARDCLK').srcConnection! <= clk;
+          bram.input('ENARDEN').srcConnection! <= Const(1);
+          bram.input('ADDRARDADDR').srcConnection! <= wrAd;
+          bram.input('DIADI').srcConnection! <=
+              wrData.getRange(lo, hi).zeroExtend(blockDataWidth);
+          bram.input('DIPADIP').srcConnection! <= Const(0, width: 4);
+          bram.input('WEA').srcConnection! <=
+              [blockWrite, blockWrite, blockWrite, blockWrite].swizzle();
+          bram.input('REGCEAREGCE').srcConnection! <= Const(0);
+          bram.input('RSTRAMARSTRAM').srcConnection! <= Const(0);
 
-        // Port B: this read port (posedge -> registered full-cycle read).
-        bram.input('CLKBWRCLK').srcConnection! <= clk;
-        bram.input('ENBWREN').srcConnection! <= Const(1);
-        bram.input('WEBWE').srcConnection! <= Const(0, width: 8);
-        bram.input('ADDRBWRADDR').srcConnection! <= rdAd;
-        bram.input('DIBDI').srcConnection! <= Const(0, width: 32);
-        bram.input('DIPBDIP').srcConnection! <= Const(0, width: 4);
-        bram.input('REGCEB').srcConnection! <= Const(0);
-        bram.input('RSTRAMB').srcConnection! <= Const(0);
+          // Port B: this read port (posedge -> registered full-cycle read).
+          bram.input('CLKBWRCLK').srcConnection! <= clk;
+          bram.input('ENBWREN').srcConnection! <= Const(1);
+          bram.input('WEBWE').srcConnection! <= Const(0, width: 8);
+          bram.input('ADDRBWRADDR').srcConnection! <= rdAd;
+          bram.input('DIBDI').srcConnection! <= Const(0, width: 32);
+          bram.input('DIPBDIP').srcConnection! <= Const(0, width: 4);
+          bram.input('REGCEB').srcConnection! <= Const(0);
+          bram.input('RSTRAMB').srcConnection! <= Const(0);
 
-        slices.add(bram.output('DOBDO').getRange(0, sliceWidth));
+          slices.add(bram.output('DOBDO').getRange(0, sliceWidth));
+        }
+
+        final word = slices.length == 1
+            ? slices.first.zeroExtend(dataWidth)
+            : slices.rswizzle().getRange(0, dataWidth);
+        depthWords.add(word);
       }
-
-      final rawBram = slices.length == 1
-          ? slices.first.zeroExtend(dataWidth)
-          : slices.rswizzle().getRange(0, dataWidth);
+      var rawBram = depthWords.first;
+      if (depthBlocks > 1) {
+        final depthQ = _registerN(
+          clk,
+          depthOf(rdAddrs[r]),
+          readLatency,
+          'rfBramDepthQ_$r',
+        );
+        for (var d = 1; d < depthBlocks; d++) {
+          rawBram = mux(depthQ.eq(d), depthWords[d], rawBram);
+        }
+      }
 
       // Read-during-write bypass. Port A (write) and port B (read) are both
       // permanently enabled, so a same-cycle write and read of the SAME entry
