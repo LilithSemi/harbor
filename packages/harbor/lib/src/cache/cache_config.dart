@@ -179,18 +179,24 @@ class HarborL1dCacheConfig extends HarborCacheConfig {
   });
 }
 
-/// Combined L1 cache configuration (split or unified).
+/// L1 cache configuration (split, unified, or instruction-only).
 class HarborL1CacheConfig with HarborPrettyString {
   /// Instruction cache (null for unified).
   final HarborL1iCacheConfig? i;
 
   /// Data cache (or unified cache when [i] is null).
-  final HarborL1dCacheConfig d;
+  /// Null only for an instruction-only configuration.
+  final HarborL1dCacheConfig? d;
 
-  const HarborL1CacheConfig({this.i, required this.d});
+  const HarborL1CacheConfig({this.i, required HarborL1dCacheConfig d}) : d = d;
+
+  /// Creates an instruction-only L1 cache, leaving data accesses uncached.
+  const HarborL1CacheConfig.instructionOnly(HarborL1iCacheConfig i)
+    : i = i,
+      d = null;
 
   /// Creates a unified L1 cache.
-  const HarborL1CacheConfig.unified(this.d) : i = null;
+  const HarborL1CacheConfig.unified(HarborL1dCacheConfig d) : d = d, i = null;
 
   /// Creates a split I/D L1 cache.
   HarborL1CacheConfig.split({
@@ -205,7 +211,11 @@ class HarborL1CacheConfig with HarborPrettyString {
   bool get isUnified => i == null;
 
   @override
-  String toString() => isUnified ? 'L1(unified: $d)' : 'L1(I: $i, D: $d)';
+  String toString() => isUnified
+      ? 'L1(unified: $d)'
+      : d == null
+      ? 'L1(I: $i)'
+      : 'L1(I: $i, D: $d)';
 
   @override
   String toPrettyString([
@@ -218,8 +228,10 @@ class HarborL1CacheConfig with HarborPrettyString {
       buf.writeln('${c}I-cache:');
       buf.writeln(i!.toPrettyString(options.nested()));
     }
-    buf.writeln('${c}D-cache:');
-    buf.writeln(d.toPrettyString(options.nested()));
+    if (d != null) {
+      buf.writeln('${c}D-cache:');
+      buf.writeln(d!.toPrettyString(options.nested()));
+    }
     buf.write('$p)');
     return buf.toString();
   }
