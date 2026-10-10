@@ -15,9 +15,11 @@ import 'video_timing.dart';
 ///
 /// The system-domain Wishbone master ([mStb] etc.) joins the SoC fabric
 /// directly (no per-word CDC bridge). The clock crossing lives inside the
-/// double line buffer. Emits parallel RGB+sync (for a VGA-style backend or
-/// observation) and the four GPDI lanes. See [HarborFramebufferDisplay] for the
-/// single-clock variant used by the test-pattern path.
+/// double line buffer. The master gives the bus back after every
+/// `burstWords` words, see [HarborDualClockScanout]. Emits parallel RGB+sync
+/// (for a VGA-style backend or observation) and the four GPDI lanes. See
+/// [HarborFramebufferDisplay] for the single-clock variant used by the
+/// test-pattern path.
 ///
 /// The parallel outputs ([de], [hsync], [vsync], [red], [green], [blue], [x],
 /// [y], [pixelWord]) are registered and aligned with each other. They come
@@ -70,6 +72,7 @@ class HarborDualClockDisplay extends Module {
     required Logic fbBase,
     required Logic mDataIn,
     required Logic mAck,
+    int burstWords = 16,
     this.outputType = HarborDisplayInterface.hdmi,
     this.pixelFormat = HarborPixelFormat.xrgb8888,
     required HarborDeviceTarget target,
@@ -165,6 +168,7 @@ class HarborDualClockDisplay extends Module {
       mDataIn: mDataIn,
       mAck: mAck,
       maxWords: wordsPerLine,
+      burstWords: burstWords,
       blockRam: target.blockRam,
     );
 

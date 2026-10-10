@@ -3,13 +3,14 @@ import 'package:rohd/rohd.dart';
 /// System-domain burst fetcher: reads a scanline from memory over a
 /// Wishbone-style master and streams it into an external line buffer.
 ///
-/// On a [fetchStart] pulse it bursts [words] sequential 32-bit words from
+/// On a [fetchStart] pulse it reads [words] sequential 32-bit words from
 /// [fetchAddr] (advancing on each `ack`), driving [wrEn]/[wrIdx]/[wrData] to
 /// write each word into the buffer selected by [fillSel]. [busy] is high during
-/// the burst, [done] pulses for one cycle when the line is complete.
+/// the line, [done] pulses for one cycle when the line is complete.
 ///
-/// Pairs with [HarborDoubleLineBuffer]: the fetcher runs at full bus speed in
-/// the system domain, so a whole line lands well within one scanline of time.
+/// After every [burstWords] words the fetcher drops `cyc` for one cycle, so a
+/// shared bus arbiter that locks its grant on `cyc` can serve other masters
+/// inside a line.
 class HarborLineFetcher extends Module {
   /// Wishbone master outputs.
   Logic get mStb => output('m_stb');
@@ -33,6 +34,9 @@ class HarborLineFetcher extends Module {
 
   final int maxWords;
 
+  /// Words read under one `cyc` before the fetcher gives the bus back.
+  final int burstWords;
+
   HarborLineFetcher({
     required Logic clk,
     required Logic reset,
@@ -43,8 +47,12 @@ class HarborLineFetcher extends Module {
     required Logic mDataIn,
     required Logic mAck,
     this.maxWords = 1024,
+    this.burstWords = 16,
     super.name = 'line_fetcher',
-  }) : super(definitionName: 'HarborLineFetcher') {
+  }) : super(definitionName: 'HarborLineFetcher_b$burstWords') {
+    if (burstWords < 1) {
+      throw ArgumentError.value(burstWords, 'burstWords', 'must be >= 1');
+    }
     final idxW = (maxWords - 1).bitLength < 1 ? 1 : (maxWords - 1).bitLength;
 
     clk = addInput('clk', clk);
@@ -75,12 +83,16 @@ class HarborLineFetcher extends Module {
     final idx = Logic(name: 'idx', width: idxW);
     final fillReg = Logic(name: 'fill_reg');
     final doneReg = Logic(name: 'done_reg');
+    final burstW = burstWords.bitLength;
+    final beat = Logic(name: 'beat', width: burstW);
+    final yieldBus = Logic(name: 'yield_bus');
+    final active = (reading & ~yieldBus).named('active');
 
-    final capture = reading & mAck;
+    final capture = active & mAck;
 
     // Master port.
-    mStb <= reading;
-    mCyc <= reading;
+    mStb <= active;
+    mCyc <= active;
     mWe <= Const(0);
     mAddr <= addr;
     mSel <= Const(0xF, width: 4);
@@ -97,6 +109,7 @@ class HarborLineFetcher extends Module {
 
     Sequential(clk, reset: reset, [
       doneReg < Const(0),
+      yieldBus < Const(0),
       If(
         ~reading,
         then: [
@@ -107,16 +120,25 @@ class HarborLineFetcher extends Module {
               cnt < words,
               idx < Const(0, width: idxW),
               fillReg < fillSel,
+              beat < Const(0, width: burstW),
               reading < Const(1),
             ],
           ),
         ],
         orElse: [
           If(
-            mAck,
+            capture,
             then: [
               addr < (addr + Const(4, width: 32)),
               idx < (idx + Const(1, width: idxW)),
+              If(
+                beat.eq(burstWords - 1),
+                then: [
+                  beat < Const(0, width: burstW),
+                  yieldBus < Const(1),
+                ],
+                orElse: [beat < beat + 1],
+              ),
               If(
                 cnt.eq(1),
                 then: [reading < Const(0), doneReg < Const(1)],

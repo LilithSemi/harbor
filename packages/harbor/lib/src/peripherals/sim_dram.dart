@@ -7,25 +7,52 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../soc/target.dart';
 
-/// Single-cycle wishbone b4 ram leaf for a [HarborSimTarget] build. It
-/// replaces the cdc, front end and phy of a memory controller, which a host
-/// Verilator build cannot usefully simulate.
+/// Wishbone b4 ram leaf for a [HarborSimTarget] build. It replaces the cdc,
+/// front end and phy of a memory controller, which a host Verilator build
+/// cannot usefully simulate.
+///
+/// By default it acks one cycle after the strobe. [readLatency] and
+/// [writeLatency] set the cycles from the strobe to the ack, so a build can
+/// show the per access cost of the real controller. [latencyFor] gives that
+/// cost for a controller clock behind a clock crossing.
 class HarborSimDram extends BridgeModule with HarborSimLeaf {
   final int addrWidth;
   final int dataWidth;
   final int words;
   final int byteSize;
 
+  /// Bus cycles from a read strobe to its ack.
+  final int readLatency;
+
+  /// Bus cycles from a write strobe to its ack.
+  final int writeLatency;
+
   HarborSimDram({
     required this.addrWidth,
     required this.dataWidth,
     required this.words,
     required this.byteSize,
+    this.readLatency = 1,
+    this.writeLatency = 1,
   }) : super(
-         _definitionName(addrWidth: addrWidth, dataWidth: dataWidth, words: words),
+         _definitionName(
+           addrWidth: addrWidth,
+           dataWidth: dataWidth,
+           words: words,
+           readLatency: readLatency,
+           writeLatency: writeLatency,
+         ),
          name: 'sim_dram',
          isSystemVerilogLeaf: true,
        ) {
+    for (final (v, n) in [
+      (readLatency, 'readLatency'),
+      (writeLatency, 'writeLatency'),
+    ]) {
+      if (v < 1 || v > 1024) {
+        throw ArgumentError.value(v, n, 'must be from 1 to 1024');
+      }
+    }
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('stb', PortDirection.input);
@@ -37,13 +64,33 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     addOutput('dat_r', width: dataWidth);
   }
 
-  /// Holds every parameter that changes the generated module's ports, so
-  /// two instances with different widths or sizes never share a name.
+  /// The bus cycles of one access to a memory controller that runs on
+  /// [memHz] behind a clock crossing from a bus on [busHz]: [crossingCycles]
+  /// bus cycles for the crossing and [memCycles] controller cycles.
+  ///
+  /// The defaults match [HarborSdram] with its clock crossing, measured with
+  /// back to back 32-bit reads from a 25 MHz bus: 10 cycles at 100 MHz and 9
+  /// at 125 MHz.
+  static int latencyFor({
+    required int busHz,
+    required int memHz,
+    int memCycles = 19,
+    int crossingCycles = 5,
+  }) => crossingCycles + (memCycles * busHz + memHz - 1) ~/ memHz;
+
+  /// Holds every parameter that changes the generated module, so two
+  /// instances with different widths, sizes or latencies never share a name.
   static String _definitionName({
     required int addrWidth,
     required int dataWidth,
     required int words,
-  }) => 'harbor_sim_dram_${addrWidth}a${dataWidth}d${words}w';
+    required int readLatency,
+    required int writeLatency,
+  }) {
+    final base = 'harbor_sim_dram_${addrWidth}a${dataWidth}d${words}w';
+    if (readLatency == 1 && writeLatency == 1) return base;
+    return '${base}_r${readLatency}w$writeLatency';
+  }
 
   @override
   String get simRtl {
@@ -84,6 +131,11 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     b.writeln('      \$readmemh(image, mem);');
     b.writeln('  end');
     b.writeln();
+    if (readLatency > 1 || writeLatency > 1) {
+      _writeSlowAccess(b, lanes);
+      b.writeln('endmodule');
+      return b.toString();
+    }
     b.writeln(
       '  // Single-cycle ack. The bus master must drop stb on the ack,',
     );
@@ -106,5 +158,52 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     b.writeln('  end');
     b.writeln('endmodule');
     return b.toString();
+  }
+
+  /// The access logic with a wait counter: the ack comes [readLatency] or
+  /// [writeLatency] cycles after the strobe. A strobe that drops first
+  /// cancels the access.
+  void _writeSlowAccess(StringBuffer b, int lanes) {
+    final cw =
+        (readLatency > writeLatency ? readLatency : writeLatency).bitLength;
+    b.writeln(
+      '  // Ack $readLatency cycles after a read strobe and '
+      '$writeLatency after a write strobe.',
+    );
+    b.writeln('  logic busy;');
+    b.writeln('  logic [${cw - 1}:0] left;');
+    b.writeln('  wire start = stb & ~ack & ~busy;');
+    b.writeln(
+      '  wire [${cw - 1}:0] lat = we ? $cw\'d$writeLatency : '
+      '$cw\'d$readLatency;',
+    );
+    b.writeln(
+      "  wire fire = start ? lat == $cw'd1 : "
+      "busy & stb & left == $cw'd0;",
+    );
+    b.writeln('  always_ff @(posedge clk) begin');
+    b.writeln('    if (reset) begin');
+    b.writeln("      ack <= 1'b0;");
+    b.writeln("      busy <= 1'b0;");
+    b.writeln('    end else begin');
+    b.writeln('      ack <= fire;');
+    b.writeln('      if (start & ~fire) begin');
+    b.writeln("        busy <= 1'b1;");
+    b.writeln("        left <= lat - $cw'd2;");
+    b.writeln('      end else if (busy) begin');
+    b.writeln("        if (fire | ~stb) busy <= 1'b0;");
+    b.writeln("        else left <= left - $cw'd1;");
+    b.writeln('      end');
+    b.writeln('      if (fire & we) begin');
+    for (var l = 0; l < lanes; l++) {
+      b.writeln(
+        '        if (sel[$l]) mem[widx][${l * 8 + 7}:${l * 8}] '
+        '<= dat_w[${l * 8 + 7}:${l * 8}];',
+      );
+    }
+    b.writeln('      end');
+    b.writeln('      dat_r <= mem[widx];');
+    b.writeln('    end');
+    b.writeln('  end');
   }
 }

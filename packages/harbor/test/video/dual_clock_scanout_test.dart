@@ -147,6 +147,8 @@ void main() {
         // not from the buffer's storage size, so a small buffer keeps
         // elaboration cheap here.
         maxWords: 4,
+        // One bus burst per line, so a line is one unbroken strobe.
+        burstWords: wordsPerLine,
       );
       // Fake memory: 0-latency ack, data unused (only the burst length matters).
       mAck <= so.mStb;

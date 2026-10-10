@@ -20,6 +20,8 @@ import 'line_fetcher.dart';
 /// line had not completed by the swap.
 ///
 /// [pixel] is registered: it is the word at the [col] of the cycle before.
+/// The fetcher gives the bus back after every [burstWords] words, see
+/// [HarborLineFetcher].
 class HarborDualClockScanout extends Module {
   /// Pixel word for the previous cycle's [col] in the active buffer.
   Logic get pixel => output('pixel');
@@ -36,6 +38,9 @@ class HarborDualClockScanout extends Module {
   Logic get mDataOut => output('m_dat_o');
 
   final int maxWords;
+
+  /// Words the fetcher reads under one `cyc`.
+  final int burstWords;
 
   /// The block RAM cell for the line buffers, or null for flops.
   final HarborBlockRam? blockRam;
@@ -54,6 +59,7 @@ class HarborDualClockScanout extends Module {
     required Logic mDataIn,
     required Logic mAck,
     this.maxWords = 1024,
+    this.burstWords = 16,
     this.blockRam,
     super.name = 'dual_clock_scanout',
   }) : super(definitionName: 'HarborDualClockScanout') {
@@ -116,6 +122,7 @@ class HarborDualClockScanout extends Module {
       mDataIn: mDataIn,
       mAck: mAck,
       maxWords: maxWords,
+      burstWords: burstWords,
     );
     final buffer = HarborDoubleLineBuffer(
       wrClk: sysClk,
