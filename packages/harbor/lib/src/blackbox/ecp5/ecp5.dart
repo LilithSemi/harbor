@@ -237,9 +237,228 @@ class Ecp5Ob extends BridgeModule {
   }
 }
 
+/// The accesses of one DP16KD port at its last edge. The two ports use it to
+/// find a collision on one edge, whichever port runs first.
+class _Dp16kdAccess {
+  late final Logic latch;
+  int readTime = -1;
+  int readWord = 0;
+  int readBits = 0;
+  int writeTime = -1;
+  int writeWord = 0;
+  int writeBits = 0;
+}
+
+/// Sim body for one DP16KD port over the shared [storage] of x18 words.
+///
+/// A `Sequential` takes the inputs at the edge, and the array access runs
+/// at the end of that tick with those values. So the access always sees the
+/// pre-edge inputs, whatever the build order. A set bit in [unknown] makes
+/// that storage bit X.
+///
+/// A write and a read of the same bits by the two ports on one edge make the
+/// read X. Two writes of the same bits on one edge make those bits X.
+void _dp16kdPortSim({
+  required List<int> storage,
+  required List<int> unknown,
+  required _Dp16kdAccess self,
+  required _Dp16kdAccess other,
+  required Logic clk,
+  required Logic ce,
+  required Logic oce,
+  required Logic we,
+  required Logic rst,
+  required Logic cs,
+  required Logic ad,
+  required Logic di,
+  required List<Logic> dout,
+  required int width,
+  required bool outReg,
+  required String writeMode,
+  required int csValue,
+  required bool asyncReset,
+  required String name,
+}) {
+  final sAd = Logic(name: '${name}_ad', width: 14);
+  final sDi = Logic(name: '${name}_di', width: 18);
+  final sCe = Logic(name: '${name}_ce');
+  final sOce = Logic(name: '${name}_oce');
+  final sWe = Logic(name: '${name}_we');
+  final sRst = Logic(name: '${name}_rst');
+  final sCs = Logic(name: '${name}_cs', width: 3);
+  final latch = Logic(name: '${name}_latch', width: 18);
+  final outQ = Logic(name: '${name}_outreg', width: 18);
+  self.latch = latch;
+  Simulator.injectAction(() {
+    latch.put(0);
+    outQ.put(0);
+  });
+  Sequential(clk, [
+    sAd < ad,
+    sDi < di,
+    sCe < ce,
+    sOce < oce,
+    sWe < we,
+    sRst < rst,
+    sCs < cs,
+  ]);
+
+  // A port of [width] bits takes AD[13:shift] as its index, and an x18 word
+  // holds perWord of its entries.
+  final (int shift, int perWord) = switch (width) {
+    18 => (4, 1),
+    9 => (3, 2),
+    4 => (2, 4),
+    2 => (1, 8),
+    _ => (0, 16),
+  };
+  List<int> bitsOf(int slot) {
+    if (width == 18) return [for (var i = 0; i < 18; i++) i];
+    if (width == 9) return [for (var i = 0; i < 9; i++) slot * 9 + i];
+    // Narrow widths use only the 8 data bits of each 9-bit half.
+    final perHalf = perWord ~/ 2;
+    final base = (slot ~/ perHalf) * 9 + (slot % perHalf) * width;
+    return [for (var i = 0; i < width; i++) base + i];
+  }
+
+  LogicValue read(int word, int slot) {
+    final w = storage[word];
+    final bits = bitsOf(slot);
+    var v = 0;
+    for (var i = 0; i < bits.length; i++) {
+      if ((unknown[word] >> bits[i]) & 1 == 1) {
+        return LogicValue.filled(18, LogicValue.x);
+      }
+      v |= ((w >> bits[i]) & 1) << i;
+    }
+    return LogicValue.ofInt(v, 18);
+  }
+
+  void access() {
+    final resetNow = !asyncReset && sRst.value == LogicValue.one;
+    if (outReg) {
+      if (resetNow) {
+        outQ.put(0);
+      } else if (!sOce.value.isValid) {
+        outQ.put(LogicValue.x);
+      } else if (sOce.value.toBool()) {
+        outQ.put(latch.value);
+      }
+    }
+    final enable = sCe.value.isValid && sCs.value.isValid
+        ? sCe.value.toBool() && sCs.value.toInt() == csValue
+        : null;
+    if (enable == false) {
+      if (resetNow) latch.put(0);
+      return;
+    }
+    if (resetNow) {
+      // A synchronous reset also blocks the write (yosys: block_wr).
+      latch.put(0);
+      return;
+    }
+    if (enable == null || !sAd.value.isValid || !sWe.value.isValid) {
+      latch.put(LogicValue.x);
+      return;
+    }
+    final adv = sAd.value.toInt();
+    final index = adv >> shift;
+    final word = index ~/ perWord;
+    final slot = index % perWord;
+    final bits = bitsOf(slot);
+    final now = Simulator.time;
+    var mask = 0;
+    for (final b in bits) {
+      mask |= 1 << b;
+    }
+
+    // Records a read of this port and gives X if the other port wrote the
+    // same bits on this edge.
+    void readOut(LogicValue v) {
+      self
+        ..readTime = now
+        ..readWord = word
+        ..readBits = mask;
+      final hit =
+          other.writeTime == now &&
+          other.writeWord == word &&
+          other.writeBits & mask != 0;
+      latch.put(hit ? LogicValue.filled(18, LogicValue.x) : v);
+    }
+
+    if (!sWe.value.toBool()) {
+      readOut(read(word, slot));
+      return;
+    }
+    final before = read(word, slot);
+    final data = sDi.value;
+    var next = storage[word];
+    var nextUnknown = unknown[word];
+    var written = 0;
+    for (var i = 0; i < bits.length; i++) {
+      // x18 writes a 9-bit half only when its byte enable is high.
+      if (width == 18 && (adv >> (i ~/ 9)) & 1 == 0) continue;
+      written |= 1 << bits[i];
+    }
+    for (var i = 0; i < bits.length; i++) {
+      final bit = 1 << bits[i];
+      if (written & bit == 0) continue;
+      if (data[i].isValid) {
+        next = (next & ~bit) | (data[i].toBool() ? bit : 0);
+        nextUnknown &= ~bit;
+      } else {
+        nextUnknown |= bit;
+      }
+    }
+    if (other.writeTime == now && other.writeWord == word) {
+      nextUnknown |= other.writeBits & written;
+    }
+    storage[word] = next;
+    unknown[word] = nextUnknown;
+    self
+      ..writeTime = now
+      ..writeWord = word
+      ..writeBits = written;
+    if (other.readTime == now &&
+        other.readWord == word &&
+        other.readBits & written != 0) {
+      other.latch.put(LogicValue.filled(18, LogicValue.x));
+    }
+    switch (writeMode) {
+      case 'WRITETHROUGH':
+        readOut(read(word, slot));
+      case 'READBEFOREWRITE':
+        readOut(before);
+    }
+  }
+
+  // ROHD sends posedge at the end of the tick, after the Sequential above.
+  clk.posedge.listen((_) => access());
+
+  if (asyncReset) {
+    rst.glitch.listen((_) {
+      if (rst.value == LogicValue.one) {
+        latch.put(0);
+        outQ.put(0);
+      }
+    });
+  }
+
+  final q = outReg ? outQ : latch;
+  for (var i = 0; i < 18; i++) {
+    dout[i] <= q[i];
+  }
+}
+
 /// ECP5 DP16KD: 16Kbit dual-port block RAM.
 ///
-/// Ports use per-bit naming to match Yosys's cells_sim.v definition.
+/// Ports use per-bit naming to match Yosys's cells_sim.v definition. The sim
+/// body follows the ECP5 memory usage guide (FPGA-TN-02204). Both ports share
+/// one array of 1024 x18 words. A port takes AD, DI, CE, WE and CS at the
+/// rising edge of its clock. With REGMODE NOREG the read shows on DO after
+/// that edge. OUTREG adds one more register, which loads when OCE is high.
+/// In x18 mode AD[1:0] are the byte enables of the write, so a write with
+/// them low changes nothing.
 class Ecp5Dp16kd extends BridgeModule {
   Ecp5Dp16kd({
     required Logic clkA,
@@ -270,10 +489,53 @@ class Ecp5Dp16kd extends BridgeModule {
     // [Ecp5Dp16kd.initVals] to compute these from a flat contents list. nextpnr
     // bakes these into the bitstream so the block powers up pre-loaded.
     List<BigInt>? initVals,
+    // Cell options. A value equal to the yosys default is not emitted.
+    String regModeA = 'NOREG',
+    String regModeB = 'NOREG',
+    String writeModeA = 'NORMAL',
+    String writeModeB = 'NORMAL',
+    String csDecodeA = '0b000',
+    String csDecodeB = '0b000',
+    String resetMode = 'SYNC',
     super.name = 'bram',
   }) : super('DP16KD', isSystemVerilogLeaf: true) {
+    for (final w in [dataWidthA, dataWidthB]) {
+      if (!const [1, 2, 4, 9, 18].contains(w)) {
+        throw ArgumentError('DP16KD port width must be 1, 2, 4, 9 or 18: $w');
+      }
+    }
+    for (final m in [regModeA, regModeB]) {
+      if (m != 'NOREG' && m != 'OUTREG') {
+        throw ArgumentError('DP16KD REGMODE must be NOREG or OUTREG: $m');
+      }
+    }
+    for (final m in [writeModeA, writeModeB]) {
+      if (!const ['NORMAL', 'WRITETHROUGH', 'READBEFOREWRITE'].contains(m)) {
+        throw ArgumentError(
+          'DP16KD WRITEMODE must be NORMAL, WRITETHROUGH or '
+          'READBEFOREWRITE: $m',
+        );
+      }
+    }
+    if (resetMode != 'SYNC' && resetMode != 'ASYNC') {
+      throw ArgumentError('DP16KD RESETMODE must be SYNC or ASYNC: $resetMode');
+    }
+    final csValueA = _parseCsDecode(csDecodeA);
+    final csValueB = _parseCsDecode(csDecodeB);
+
     createParameter('DATA_WIDTH_A', '$dataWidthA');
     createParameter('DATA_WIDTH_B', '$dataWidthB');
+    void option(String key, String value, String byDefault) {
+      if (value != byDefault) createParameter(key, '"$value"');
+    }
+
+    option('REGMODE_A', regModeA, 'NOREG');
+    option('REGMODE_B', regModeB, 'NOREG');
+    option('WRITEMODE_A', writeModeA, 'NORMAL');
+    option('WRITEMODE_B', writeModeB, 'NORMAL');
+    option('CSDECODE_A', csDecodeA, '0b000');
+    option('CSDECODE_B', csDecodeB, '0b000');
+    option('RESETMODE', resetMode, 'SYNC');
     if (initVals != null) {
       assert(initVals.length == 64, 'DP16KD needs exactly 64 INITVAL words');
       for (var i = 0; i < 64; i++) {
@@ -323,6 +585,52 @@ class Ecp5Dp16kd extends BridgeModule {
     for (var i = 0; i < 18; i++) {
       addOutput('DOB$i');
     }
+
+    // sim-only: the emitted SV has only the ports.
+    final mask18 = (BigInt.one << 18) - BigInt.one;
+    final storage = List<int>.filled(1024, 0);
+    final unknown = List<int>.filled(1024, 0);
+    if (initVals != null) {
+      for (var idx = 0; idx < 64; idx++) {
+        for (var i = 0; i < 16; i++) {
+          storage[idx * 16 + i] = ((initVals[idx] >> (i * 20)) & mask18)
+              .toInt();
+        }
+      }
+    }
+    final access = [_Dp16kdAccess(), _Dp16kdAccess()];
+    for (final p in ['A', 'B']) {
+      final isA = p == 'A';
+      _dp16kdPortSim(
+        storage: storage,
+        unknown: unknown,
+        self: access[isA ? 0 : 1],
+        other: access[isA ? 1 : 0],
+        clk: input('CLK$p'),
+        ce: input('CE$p'),
+        oce: input('OCE$p'),
+        we: input('WE$p'),
+        rst: input('RST$p'),
+        cs: [for (var i = 2; i >= 0; i--) input('CS$p$i')].swizzle(),
+        ad: [for (var i = 13; i >= 0; i--) input('AD$p$i')].swizzle(),
+        di: [for (var i = 17; i >= 0; i--) input('DI$p$i')].swizzle(),
+        dout: [for (var i = 0; i < 18; i++) output('DO$p$i')],
+        width: isA ? dataWidthA : dataWidthB,
+        outReg: (isA ? regModeA : regModeB) == 'OUTREG',
+        writeMode: isA ? writeModeA : writeModeB,
+        csValue: isA ? csValueA : csValueB,
+        asyncReset: resetMode == 'ASYNC',
+        name: '${name}_sim_$p',
+      );
+    }
+  }
+
+  static int _parseCsDecode(String s) {
+    final m = RegExp(r'^0b([01]{3})$').firstMatch(s);
+    if (m == null) {
+      throw ArgumentError('DP16KD CSDECODE must look like 0b000: $s');
+    }
+    return int.parse(m.group(1)!, radix: 2);
   }
 
   /// Port A read data as a bus.
@@ -359,9 +667,9 @@ class Ecp5Dp16kd extends BridgeModule {
 /// INITVAL (baked into the bitstream). `ceil(width/18)` DP16KD blocks in x18
 /// mode hold an 18-bit slice of each word. Port B is the registered read
 /// ([rdData] is one cycle behind [rdAddr], readLatency == 1) and port A is an
-/// optional single write port (for runtime patching). DP16KD is a SV blackbox
-/// with no simulation model, so this is FPGA-only. The consumer keeps a flop
-/// model (e.g. a resetValue RegisterFile) for simulation at the same latency.
+/// optional single write port (for runtime patching). It simulates through
+/// the [Ecp5Dp16kd] sim body. A read of the word that is written on the same
+/// edge gives X in [rdData] for that cycle, as on silicon.
 class Ecp5InitRom extends Module {
   /// Registered read data, one cycle behind [rdAddr].
   Logic get rdData => output('rd_data');
@@ -394,11 +702,12 @@ class Ecp5InitRom extends Module {
     const ebrWidth = 18;
     const ebrAddrBits = 14;
     final blocks = (width + ebrWidth - 1) ~/ ebrWidth;
-    // x18 addressing: the word index sits in AD[13:4], low 4 bits tied zero.
-    Logic toAd(Logic a) =>
-        [a.zeroExtend(ebrAddrBits - 4), Const(0, width: 4)].swizzle();
-    final rdAd = toAd(rdAddr);
-    final wrAd = hasWrite ? toAd(wrAddr!) : Const(0, width: ebrAddrBits);
+    // x18 addressing: the word index sits in AD[13:4]. AD[1:0] are the byte
+    // enables of a write, so the write port drives them high.
+    Logic toAd(Logic a, int byteEnables) =>
+        [a.zeroExtend(ebrAddrBits - 4), Const(byteEnables, width: 4)].swizzle();
+    final rdAd = toAd(rdAddr, 0);
+    final wrAd = hasWrite ? toAd(wrAddr!, 3) : Const(0, width: ebrAddrBits);
 
     final slices = <Logic>[];
     for (var b = 0; b < blocks; b++) {

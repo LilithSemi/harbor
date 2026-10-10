@@ -269,10 +269,7 @@ class HarborSram extends BridgeModule
       datOut <= readMux;
     }
 
-    Sequential(clk, [
-      ack < Const(0),
-      If(stb & ~ack, then: [ack < Const(1)]),
-    ]);
+    _ackOnce(clk, stb, ack);
   }
 
   void _buildEcp5Bram(
@@ -382,10 +379,7 @@ class HarborSram extends BridgeModule
       datOut <= readMux;
     }
 
-    Sequential(clk, [
-      ack < Const(0),
-      If(stb & ~ack, then: [ack < Const(1)]),
-    ]);
+    _ackOnce(clk, stb, ack);
   }
 
   void _buildIce40Bram(
@@ -487,10 +481,7 @@ class HarborSram extends BridgeModule
       datOut <= readMux;
     }
 
-    Sequential(clk, [
-      ack < Const(0),
-      If(stb & ~ack, then: [ack < Const(1)]),
-    ]);
+    _ackOnce(clk, stb, ack);
   }
 
   void _buildWithAsicSram(
@@ -541,10 +532,7 @@ class HarborSram extends BridgeModule
 
     datOut <= sramBlock.output(dataOutPin);
 
-    Sequential(clk, [
-      ack < Const(0),
-      If(stb & ~ack, then: [ack < Const(1)]),
-    ]);
+    _ackOnce(clk, stb, ack);
   }
 
   /// A behavioral memory array for a Verilator build.
@@ -647,13 +635,12 @@ class HarborSram extends BridgeModule
       );
     }
 
+    _ackOnce(clk, stb, ack);
     Sequential(clk, [
-      ack < Const(0),
       datOut < Const(0, width: dataWidth),
       If(
         stb & ~ack,
         then: [
-          ack < Const(1),
           If(
             we,
             then: [
@@ -667,6 +654,16 @@ class HarborSram extends BridgeModule
           ),
         ],
       ),
+    ]);
+  }
+
+  /// The bus handshake every storage path shares: ACK goes high the cycle
+  /// after STB and drops for one cycle, so a held STB gets one ACK per
+  /// access. [HarborSramArray] has the same logic in its SystemVerilog.
+  static void _ackOnce(Logic clk, Logic stb, Logic ack) {
+    Sequential(clk, [
+      ack < Const(0),
+      If(stb & ~ack, then: [ack < Const(1)]),
     ]);
   }
 
