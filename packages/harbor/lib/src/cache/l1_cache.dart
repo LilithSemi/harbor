@@ -267,8 +267,9 @@ class HarborL1ICache extends BridgeModule {
     }
 
     // Per-line DATA in a block RAM (one read port, one write port for fills).
-    // readLatency forced to 1 so the sim flop model behaves exactly like a
-    // registered EBR read.
+    // The cache expects read latency 1. The iCE40 block RAM reads at latency
+    // 0, so one flop after it gives the same timing.
+    final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
     final dataRam = HarborRegisterFile(
       numEntries: numLines * lineWords,
       dataWidth: xlen,
@@ -276,7 +277,7 @@ class HarborL1ICache extends BridgeModule {
       numWritePorts: 1,
       reservedZero: false,
       target: target,
-      forceReadLatency: 1,
+      forceReadLatency: ramLatency,
       name: 'l1i_data',
     );
     addSubModule(dataRam);
@@ -358,7 +359,10 @@ class HarborL1ICache extends BridgeModule {
     memEn <= memEnR;
     memAddr <= memAddrR;
 
-    respData <= dataRam.readData(0);
+    Logic ramRead(int r) => ramLatency == 1
+        ? dataRam.readData(r)
+        : flop(clk, dataRam.readData(r));
+    respData <= ramRead(0);
     respValid <= hit;
     // A faulting fetch presents as done (in core.dart: done = respValid |
     // respFault) with valid low, so the FetchUnit raises the instruction page
@@ -368,7 +372,7 @@ class HarborL1ICache extends BridgeModule {
     respFaultIsAccess <= faultHeld & ~faultIsPage;
     miss <= miss0;
     if (dualPort) {
-      respData1 <= dataRam.readData(1);
+      respData1 <= ramRead(1);
       respValid1 <= hit1;
     }
 
@@ -821,6 +825,7 @@ class HarborL1DCache extends BridgeModule {
                 idxOf(a),
               ).getRange(tagBits, lineTagBits).eq(reqCtx);
 
+    final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
     final dataRam = HarborRegisterFile(
       numEntries: numLines * lineWords,
       dataWidth: xlen,
@@ -828,7 +833,7 @@ class HarborL1DCache extends BridgeModule {
       numWritePorts: 1,
       reservedZero: false,
       target: target,
-      forceReadLatency: 1,
+      forceReadLatency: ramLatency,
       name: 'l1d_data',
     );
     addSubModule(dataRam);
@@ -933,7 +938,10 @@ class HarborL1DCache extends BridgeModule {
     final rdShift = byteBits == 0
         ? Const(0, width: 1)
         : [addrQ.slice(byteBits - 1, 0), Const(0, width: 3)].swizzle();
-    respData <= mux(bypassDone, bypassData, dataRam.readData(0) >> rdShift);
+    final ramRead = ramLatency == 1
+        ? dataRam.readData(0)
+        : flop(clk, dataRam.readData(0));
+    respData <= mux(bypassDone, bypassData, ramRead >> rdShift);
     respValid <= (loadHit | storeDone | bypassDone);
     respFault <= faultDone;
     respFaultIsAccess <= faultDone & ~faultIsPage;

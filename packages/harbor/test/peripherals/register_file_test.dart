@@ -4,10 +4,9 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-/// Backend-selection tests for HarborRegisterFile across FPGA targets. The BRAM
-/// and EBR primitives are blackboxes with no simulation model, so these are
-/// elaboration plus emitted-primitive checks (functional verification of the
-/// flop model lives in River's core tests).
+/// Backend-selection tests for HarborRegisterFile across FPGA targets. These
+/// are elaboration and emitted-primitive checks. register_file_rdw_test.dart
+/// simulates the flop and ECP5 paths.
 void main() {
   tearDown(() async {
     await Simulator.reset();
