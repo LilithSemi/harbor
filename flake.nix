@@ -71,6 +71,8 @@
         {
           harbor = callPackages ./nix { };
 
+          testfloat = callPackage ./nix/testfloat.nix { };
+
           linuxKernel = prev.linuxKernel // {
             packages = lib.mapAttrs (
               _name: prevLinuxPackages:
@@ -94,6 +96,7 @@
               yq
               dart
               flutter
+              testfloat
             ];
           };
         }
@@ -145,7 +148,10 @@
 
       packages = forAllSystems (
         { pkgs, ... }:
-        lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        {
+          inherit (pkgs) testfloat;
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           inherit (pkgs.linuxPackages_latest) harbor-kmod;
         }
       );

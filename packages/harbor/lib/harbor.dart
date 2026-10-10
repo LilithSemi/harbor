@@ -15,9 +15,18 @@ export 'src/fiber/retainer.dart';
 // Plugin system
 export 'src/plugin/plugin.dart';
 
-// Arithmetic units
-export 'src/arith/fp_divider.dart';
-export 'src/arith/scalar_divider.dart';
+// Arithmetic units for River and Glacier. HarborFpu, HarborDivSqrtRecurrence
+// and HarborIntMulDiv are the ports a caller builds against; fp_unpack,
+// fp_round_pack, fp_cuts, fp_lzc and the rest of fp_*_path stay internal.
+export 'src/arith/fp_format.dart';
+// harborFpOpWidth sizes an `in_op` port, matching harborIntOpWidth below.
+export 'src/arith/fp_fma_path.dart' show harborFpOpWidth;
+export 'src/arith/fp_pipe_stage.dart' show harborKillAll;
+export 'src/arith/fpu.dart';
+export 'src/arith/fpu_config.dart';
+export 'src/arith/int_mul_div.dart';
+export 'src/arith/recurrence.dart';
+export 'src/arith/vector_lane.dart';
 
 // HarborPipeline
 export 'src/pipeline/builder.dart';
