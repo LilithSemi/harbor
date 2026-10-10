@@ -19,6 +19,10 @@ import 'package:rohd/rohd.dart';
 /// consumer shows the next word on `wr_*` and the word after it on
 /// `wr_next_*`, and reads `wr_next_*` for one cycle right after taking a
 /// word, while the client catches up.
+/// `wr_valid_d` and `wr_next_valid_d` are the values `wr_valid` and
+/// `wr_next_valid` take after this edge, so the engine can keep its own
+/// registered copy. `wr_next2_valid_d` is high when a third word waits
+/// behind `wr_next_*` after this edge.
 class SdramPortInterface extends PairInterface {
   /// Word address width.
   final int addrWidth;
@@ -34,6 +38,9 @@ class SdramPortInterface extends PairInterface {
   final bool wrLookahead;
 
   Logic get wrNextValid => port('wr_next_valid');
+  Logic get wrValidD => port('wr_valid_d');
+  Logic get wrNextValidD => port('wr_next_valid_d');
+  Logic get wrNext2ValidD => port('wr_next2_valid_d');
   Logic get wrNextData => port('wr_next_data');
   Logic get wrNextMask => port('wr_next_mask');
 
@@ -75,6 +82,9 @@ class SdramPortInterface extends PairInterface {
            if (portIdWidth > 0) Logic.port('req_port', portIdWidth),
            if (wrLookahead) ...[
              Logic.port('wr_next_valid'),
+             Logic.port('wr_valid_d'),
+             Logic.port('wr_next_valid_d'),
+             Logic.port('wr_next2_valid_d'),
              Logic.port('wr_next_data', 16),
              Logic.port('wr_next_mask', 2),
            ],
@@ -375,6 +385,12 @@ class SdramArbiter extends Module {
       pickBySel([for (final c in clients) c.reqWrite]),
       heldWrite,
     );
+    final out0ValidD = ~fillNext[0];
+    final out1ValidD = ~fillNext[0] & ~fillNext[1];
+    eng.wrValidD <= mux(reset, Const(0), out0ValidD);
+    eng.wrNextValidD <= mux(reset, Const(0), out1ValidD);
+    eng.wrNext2ValidD <=
+        mux(reset, Const(0), ~fillNext[0] & ~fillNext[1] & ~fillNext[2]);
     final regs = <(Logic, Logic, int)>[
       (grant, mux(loadNow, grantNext, grant), 0),
       (
@@ -398,8 +414,8 @@ class SdramArbiter extends Module {
         0,
       ),
       (heldPort, mux(loadNow, sel.zeroExtend(portW), heldPort), 0),
-      (out0Valid, ~fillNext[0], 0),
-      (out1Valid, ~fillNext[0] & ~fillNext[1], 0),
+      (out0Valid, out0ValidD, 0),
+      (out1Valid, out1ValidD, 0),
       (notFull, ~fillNext[depth], 1),
       for (var i = 0; i < depth; i++) (slot[i], slotNext[i], 0),
       for (var k = 0; k <= depth; k++) (fill[k], fillNext[k], k == 0 ? 1 : 0),

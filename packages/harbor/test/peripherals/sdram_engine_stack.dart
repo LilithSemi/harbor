@@ -127,6 +127,20 @@ class SdramEngineStackTop extends Module {
   }
 }
 
+/// Command kinds in cs#/ras#/cas#/we# encoding order, cmd3 = (ras << 2) |
+/// (cas << 1) | we. Index 7 (nop while selected) is never logged, the
+/// same rule [SdramPinModel] uses on the pins.
+const _engineCmdKinds = [
+  'mrs',
+  'refresh',
+  'precharge',
+  'activate',
+  'write',
+  'read',
+  'burst-stop',
+  'nop',
+];
+
 class _Req {
   _Req(this.write, this.addr, this.words, this.expected);
 
@@ -199,6 +213,13 @@ class SdramEngineStack {
 
   /// Rising edges of the refresh credit force and the row-age force.
   int forceEdges = 0, rowAgeEdges = 0;
+
+  /// Every command decoded from the engine's own phy_* wires, before the
+  /// PHY's fabric pad stage and output register: (time in ps, kind, bank,
+  /// address field). Same cs#/ras#/cas#/we# decode as [SdramPinModel],
+  /// run one stage earlier, so a test can tell the engine's own command
+  /// timing apart from the PHY's output delay.
+  final List<(int, String, int, int)> engineCommandLog = [];
 
   /// Every model error and scoreboard error so far.
   List<String> get errors => [...model.errors, ..._errors];
@@ -347,6 +368,7 @@ class SdramEngineStack {
     );
 
     clk.negedge.listen((_) => _onNegedge());
+    clk.posedge.listen((_) => _onEngineCmdPosedge());
     final credit = top.engine.subModules.whereType<SdramRefreshCredit>().single;
     final timers = top.engine.subModules.whereType<SdramBankTimers>().single;
     var lastForce = false, lastAge = false;
@@ -368,6 +390,30 @@ class SdramEngineStack {
     while (top.engine.initDone.value != LogicValue.one) {
       await clk.nextPosedge;
     }
+  }
+
+  /// Decodes the engine's own phy_* command wires on every clk posedge,
+  /// the same way [SdramPinModel] decodes the pins after the PHY.
+  void _onEngineCmdPosedge() {
+    final csN = top.engine.phyCsN.value;
+    if (!csN.isValid || csN.toInt() != 0) return;
+    final rasN = top.engine.phyRasN.value;
+    final casN = top.engine.phyCasN.value;
+    final weN = top.engine.phyWeN.value;
+    final ba = top.engine.phyBa.value;
+    final addr = top.engine.phyAddr.value;
+    if (!rasN.isValid || !casN.isValid || !weN.isValid || !ba.isValid ||
+        !addr.isValid) {
+      return;
+    }
+    final cmd3 = (rasN.toInt() << 2) | (casN.toInt() << 1) | weN.toInt();
+    if (cmd3 == 7) return;
+    engineCommandLog.add((
+      Simulator.time,
+      _engineCmdKinds[cmd3],
+      ba.toInt(),
+      addr.toInt(),
+    ));
   }
 
   void _onNegedge() {

@@ -6,6 +6,7 @@ import 'package:meta/meta.dart';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../blackbox/ecp5/ecp5.dart';
 import '../bus/bus.dart';
 import '../bus/bus_error_source.dart';
 import '../bus/bus_slave_port.dart';
@@ -26,7 +27,8 @@ import 'sim_dram.dart';
 /// SoC wrapper for the sdr sdram controller.
 ///
 ///   bus (sys clk, wishbone B4 32b) -> HarborWishboneCdcFifoBridge 'sdram_cdc'
-///     (skipped when [busClockSync]) -> SdramWishbonePort -> SdramArbiter
+///     and one register stage (both skipped when [busClockSync])
+///     -> SdramWishbonePort -> SdramArbiter
 ///     (one port in v1) -> SdramEngine -> SdramPhyEcp5 -> sdram_* pads
 ///
 /// Everything from the wishbone front end down runs on `mem_clk`. The target
@@ -204,22 +206,43 @@ class HarborSdram extends BridgeModule
     HarborFpgaTarget fpgaTarget,
   ) {
     final busDW = busDataWidth;
-    Logic frontReset, wbCyc, wbWe, wbAdr, wbDatW, wbSel;
+    Logic frontReset, engineAbort, pickAbort, wbCyc, wbWe, wbAdr, wbDatW, wbSel;
     HarborWishboneCdcFifoBridge? cdc;
     final memClk = busClockSync ? clk : memClkPort!;
     final memReset = _releaseSync(memClk, memResetPort, 'mem_reset_sync');
+    // One copy of the reset per block, so no single reset net spans the
+    // die. Each copy follows [memReset] one cycle later. Only the two
+    // synchronizer flops see the raw reset, so the placer can keep that
+    // async path short. Every block resets synchronously anyway.
+    Logic localReset(String n) => Ecp5Fd1s3bx(
+      d: memReset,
+      ck: memClk,
+      pd: Const(0),
+      name: '${n}_reset',
+    ).q;
+    final frontLocalReset = localReset('front');
+    final cdcReset = localReset('cdc');
+    final wbReset = localReset('wb');
+    final arbiterReset = localReset('arbiter');
+    final engineReset = localReset('engine');
+    final timersReset = localReset('timers');
+    final phyReset = localReset('phy');
     // The true power-on reset, synced into mem_clk, separate from a later
     // standalone mem_reset. The engine uses it to tell a fresh power-up
     // from a reset that may find a bank still open.
-    final coldReset = harborCdcJoinReset(
-      memClk,
-      Const(0),
-      reset,
-      name: 'sdram_cold_reset',
-    );
+    // One more flop after the synchronizer, so the flops on the raw bus
+    // reset drive one load and can sit near its source.
+    final coldReset = Ecp5Fd1s3bx(
+      d: harborCdcJoinReset(memClk, Const(0), reset, name: 'sdram_cold_reset'),
+      ck: memClk,
+      pd: Const(0),
+      name: 'sdram_cold_reset_copy',
+    ).q;
 
     if (busClockSync) {
-      frontReset = (reset | memReset).named('front_reset');
+      frontReset = (reset | frontLocalReset).named('front_reset');
+      engineAbort = frontReset;
+      pickAbort = frontReset;
       wbCyc = bus.stb;
       wbWe = bus.we;
       wbAdr = bus.addr;
@@ -234,8 +257,8 @@ class HarborSdram extends BridgeModule
           reset,
           then: [armed < Const(0), busErr < Const(0)],
           orElse: [
-            If(~memReset, then: [armed < Const(1)]),
-            If(memReset & armed, then: [busErr < Const(1)]),
+            If(~frontLocalReset, then: [armed < Const(1)]),
+            If(frontLocalReset & armed, then: [busErr < Const(1)]),
           ],
         ),
       ]);
@@ -262,7 +285,7 @@ class HarborSdram extends BridgeModule
       bus.ack <= cdc.output('s_ack');
       bus.dataOut <= cdc.output('s_dat_r');
       cdc.input('m_clk').srcConnection! <= memClk;
-      cdc.input('m_reset').srcConnection! <= memReset;
+      cdc.input('m_reset').srcConnection! <= cdcReset;
       // The joined reset asserts without the clock, so it goes through two
       // flops before the front end uses it.
       final joined = cdc.output('m_reset_joined');
@@ -270,18 +293,48 @@ class HarborSdram extends BridgeModule
       frontReset = Logic(name: 'front_reset');
       Sequential(memClk, [
         If(
-          memReset,
+          frontLocalReset,
           then: [abort0 < Const(1), frontReset < Const(1)],
           orElse: [abort0 < joined, frontReset < abort0],
         ),
       ]);
-      // The cdc can start a request before the front reset ends. Hold it
-      // back until then.
-      wbCyc = cdc.output('m_cyc') & cdc.output('m_stb') & ~frontReset;
-      wbWe = cdc.output('m_we');
-      wbAdr = cdc.output('m_adr');
-      wbDatW = cdc.output('m_dat_w');
-      wbSel = cdc.output('m_sel');
+      // Copies of [frontReset] for the engine and for its command select,
+      // which the placer can keep next to their loads.
+      engineAbort = Ecp5Fd1s3bx(
+        d: frontLocalReset | abort0,
+        ck: memClk,
+        pd: Const(0),
+        name: 'engine_abort',
+      ).q;
+      pickAbort = Ecp5Fd1s3bx(
+        d: frontLocalReset | abort0,
+        ck: memClk,
+        pd: Const(0),
+        name: 'pick_abort',
+      ).q;
+      // One register stage between the cdc fifo head and the front end, so
+      // neither the fifo read mux nor the front end has to sit next to the
+      // other. Each request starts one mem_clk cycle later.
+      wbCyc = Logic(name: 'wb_slice_cyc');
+      wbWe = Logic(name: 'wb_slice_we');
+      wbAdr = Logic(name: 'wb_slice_adr', width: busAW);
+      wbDatW = Logic(name: 'wb_slice_dat_w', width: busDW);
+      wbSel = Logic(name: 'wb_slice_sel', width: busDW ~/ 8);
+      Sequential(memClk, [
+        // The cdc can start a request before the front reset ends. Hold it
+        // back until then.
+        If(
+          frontLocalReset,
+          then: [wbCyc < Const(0)],
+          orElse: [
+            wbCyc < cdc.output('m_cyc') & cdc.output('m_stb') & ~frontReset,
+          ],
+        ),
+        wbWe < cdc.output('m_we'),
+        wbAdr < cdc.output('m_adr'),
+        wbDatW < cdc.output('m_dat_w'),
+        wbSel < cdc.output('m_sel'),
+      ]);
       addOutput('bus_error') <= cdc.output('s_bus_error');
     }
 
@@ -292,7 +345,7 @@ class HarborSdram extends BridgeModule
 
     final wbPort = SdramWishbonePort(
       clk: memClk,
-      reset: memReset,
+      reset: wbReset,
       abort: frontReset,
       cyc: wbCyc,
       we: wbWe,
@@ -331,9 +384,11 @@ class HarborSdram extends BridgeModule
       config,
       cycles,
       clk: memClk,
-      reset: memReset,
-      abort: frontReset,
+      reset: engineReset,
+      abort: engineAbort,
+      pickAbort: pickAbort,
       coldReset: coldReset,
+      timersReset: timersReset,
       port: enginePort,
       phyRdData: phyRdData,
       phyReadLatency: phyReadLatency,
@@ -342,7 +397,7 @@ class HarborSdram extends BridgeModule
 
     SdramArbiter(
       clk: memClk,
-      reset: memReset,
+      reset: arbiterReset,
       abort: frontReset,
       ports: [clientPort],
       configs: const [HarborSdramPortConfig(name: 'wishbone')],
@@ -354,7 +409,7 @@ class HarborSdram extends BridgeModule
       config,
       casLatency: cycles.casLatency,
       clk: memClk,
-      reset: memReset,
+      reset: phyReset,
       cke: engineInst.phyCke,
       csN: engineInst.phyCsN,
       rasN: engineInst.phyRasN,

@@ -108,7 +108,9 @@ class SdramEngine extends Module {
     required Logic phyRdData,
     required int phyReadLatency,
     Logic? abort,
+    Logic? pickAbort,
     Logic? coldReset,
+    Logic? timersReset,
     int maxGrantWords = 8,
     int pullInIdleCycles = 16,
     String name = 'sdram_engine',
@@ -121,7 +123,9 @@ class SdramEngine extends Module {
          phyRdData: phyRdData,
          phyReadLatency: phyReadLatency,
          abort: abort,
+         pickAbort: pickAbort,
          coldReset: coldReset,
+         timersReset: timersReset,
          maxGrantWords: maxGrantWords,
          pullInIdleCycles: pullInIdleCycles,
          rowAgeGuard: true,
@@ -137,7 +141,9 @@ class SdramEngine extends Module {
     required Logic phyRdData,
     required int phyReadLatency,
     required Logic? abort,
+    required Logic? pickAbort,
     required Logic? coldReset,
+    required Logic? timersReset,
     required this.maxGrantWords,
     required this.pullInIdleCycles,
     required this.rowAgeGuard,
@@ -189,12 +195,23 @@ class SdramEngine extends Module {
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
     phyRdData = addInput('phy_rd_data', phyRdData, width: dataW);
-    abort = addInput('abort', abort ?? Const(0));
+    // A copy of [abort] for the command select only, so the select does
+    // not wait on a net that spans every place abort goes. It must equal
+    // [abort] every cycle.
+    final externalAbort = abort ?? Const(0);
+    final pickAbortSig = addInput('pick_abort', pickAbort ?? externalAbort);
+    abort = addInput('abort', externalAbort);
     // Only a real power-on clears [warmReset] below. With no [coldReset]
     // given, every reset counts as cold, so warmReset never latches and
     // init always takes the cold path: unchanged from before this input
     // existed.
     final coldResetSig = addInput('cold_reset', coldReset ?? externalReset);
+    // A copy of [reset] for the bank timers, so neither reset net carries
+    // every flop in the engine. It must assert and release with [reset].
+    final timersResetSig = addInput(
+      'timers_reset',
+      timersReset ?? externalReset,
+    );
     if (!port.wrLookahead) {
       throw ArgumentError('the engine port needs wrLookahead');
     }
@@ -244,22 +261,39 @@ class SdramEngine extends Module {
     addOutput('init_done') <= initDone;
     Sequential(
       clk,
-      [If(initDone, then: [warmReset < Const(1)])],
+      [
+        If(initDone, then: [warmReset < Const(1)]),
+      ],
       reset: coldResetSig,
       asyncReset: true,
       resetValues: {warmReset: Const(0)},
     );
 
-    final lastCmd = Logic(name: 'last_cmd', width: 3);
-    final lastBank = Logic(name: 'last_bank', width: bankBits);
+    // The last command as one registered strobe per command and bank, so
+    // the timers need no decode.
+    final banks = config.banks;
+    final lastAct = Logic(name: 'last_act', width: banks);
+    final lastPre = Logic(name: 'last_pre', width: banks);
+    final lastRead = Logic(name: 'last_read', width: banks);
+    final lastWrite = Logic(name: 'last_write', width: banks);
+    final lastPreAll = Logic(name: 'last_pre_all');
+    final lastMrs = Logic(name: 'last_mrs');
     final lastBeats = Logic(name: 'last_beats', width: 4);
-    final timers = SdramBankTimers(
+    final lastRefCmd = Logic(name: 'last_ref_cmd');
+    final lastBeatsNext = Logic(name: 'last_beats_next', width: 4);
+    final timers = SdramBankTimers.strobes(
       cycles,
       clk: clk,
-      reset: reset,
-      cmd: lastCmd,
-      cmdBank: lastBank,
+      reset: timersResetSig,
+      act: lastAct,
+      pre: lastPre,
+      read: lastRead,
+      write: lastWrite,
+      preAll: lastPreAll,
+      ref: lastRefCmd,
+      mrs: lastMrs,
       cmdBeats: lastBeats,
+      cmdBeatsNext: lastBeatsNext,
     );
 
     final lastRef = Logic(name: 'last_ref');
@@ -297,12 +331,10 @@ class SdramEngine extends Module {
     // Set in the cycle after la was filled, while its hit and miss are
     // still being worked out from the registered open row compare.
     final laFresh = Logic(name: 'la_fresh');
-    final laHitBits = [
-      for (var b = 0; b < config.banks; b++) Logic(name: 'la_hit_bit_$b'),
-    ];
-    final laOpenBits = [
-      for (var b = 0; b < config.banks; b++) Logic(name: 'la_open_bit_$b'),
-    ];
+    // The open row compare and the bank open flag for the bank of the new
+    // entry, registered when it was filled.
+    final laFreshHit = Logic(name: 'la_fresh_hit');
+    final laFreshOpen = Logic(name: 'la_fresh_open');
 
     final bankOpen = [
       for (var b = 0; b < config.banks; b++) Logic(name: 'bank_open_$b'),
@@ -313,7 +345,7 @@ class SdramEngine extends Module {
     ];
 
     // One-cycle blocks, each named for the command it holds back, for what
-    // the last command forbids. The timers see that command one cycle late.
+    // the last pick forbids. The timers see that pick one cycle late.
     final blkAct = Logic(name: 'blk_act');
     final blkRead = Logic(name: 'blk_read');
     final blkWrite = Logic(name: 'blk_write');
@@ -332,17 +364,47 @@ class SdramEngine extends Module {
     // The arbiter learns of a taken write word one cycle late, so right
     // after a take the word to use is its second one.
     final wrTook = Logic(name: 'wr_took');
-    final wrValidNow = mux(wrTook, port.wrNextValid, port.wrValid);
+    // A registered copy of mux(wrTook, wr_next_valid, wr_valid), loaded
+    // from the arbiter's next values, so the select starts from one flop.
+    final wrValidNow = Logic(name: 'wr_valid_now');
     final wrDataNow = mux(wrTook, port.wrNextData, port.wrData);
     final wrMaskNow = mux(wrTook, port.wrNextMask, port.wrMask);
 
+    // Timer flags picked by the bank of each entry, one register each.
+    // They load from the timers' next flags and each entry's next bank.
+    final curCanAct = Logic(name: 'cur_can_act');
+    final curCanPre = Logic(name: 'cur_can_pre');
+    final curCanColR = Logic(name: 'cur_can_col');
+    // The parts of the cur and la gates that come from registers only,
+    // loaded one cycle early from their next values.
+    final curGo = Logic(name: 'cur_go');
+    final laBase = Logic(name: 'la_base');
+    final laCanAct = Logic(name: 'la_can_act');
+    final laCanPre = Logic(name: 'la_can_pre');
+
     // --- command select, one hot ---
+    // The select picks a command from registers and loads it into the
+    // sel_* registers, which drive the pins and the entry state one cycle
+    // later. The timers and the one-cycle blocks see the pick itself, so
+    // the rules count from the pick. The entry state does not yet hold the
+    // command on sel_*, so an entry is not picked while sel_* holds a
+    // command for it, except the next column of the same request. A
+    // finishing column, a precharge all and a refresh hold back both.
+    final selPreAll = Logic(name: 'sel_pre_all');
+    final selRef = Logic(name: 'sel_ref');
+    final selCurCol = Logic(name: 'sel_cur_col');
+    final selCurPre = Logic(name: 'sel_cur_pre');
+    final selCurAct = Logic(name: 'sel_cur_act');
+    final selLaPre = Logic(name: 'sel_la_pre');
+    final selLaAct = Logic(name: 'sel_la_act');
+    final selIdle = Logic(name: 'sel_idle');
+
     // The refresh wants and the hold that keeps the entries out of their
     // way come from registers, one cycle behind the state they read. The
-    // one-cycle blocks cover that cycle.
+    // one-cycle blocks cover that cycle. The hold is folded into [curGo]
+    // and [laBase].
     final wantPreAll = Logic(name: 'want_pre_all');
     final wantRef = Logic(name: 'want_ref');
-    final hold = Logic(name: 'hold');
     final idleNow = ~cur.valid & ~la.valid & idleRefWant;
     // A force does not wait for the current request to end. Its precharge
     // all can cut that request, which opens its row again afterwards.
@@ -350,69 +412,74 @@ class SdramEngine extends Module {
     final wantRefNext = initDone & (forceRef | idleNow | refCommit);
     final holdNext = ~initDone | wantPreAllNext | wantRefNext;
 
-    final selPreAll =
-        (wantPreAll &
+    final pickPreAll =
+        (selIdle &
+                wantPreAll &
                 ~blkPre &
                 ~blkPreAllRef &
                 timers.anyOpen &
                 timers.canPreAll)
-            .named('sel_pre_all');
-    final selRef = (wantRef & ~blkPreAllRef & ~timers.anyOpen & timers.canRef)
-        .named('sel_ref');
-
-    final curGo = cur.valid & ~hold;
-    final curCanCol = mux(
-      cur.write,
-      pick(timers.canWrite, cur.bank) & wrValidNow & ~blkWrite,
-      pick(timers.canRead, cur.bank) & ~blkRead,
-    );
-    final selCurCol = (curGo & cur.hit & curCanCol).named('sel_cur_col');
-    final selCurPre =
-        (curGo & cur.miss & ~blkPre & pick(timers.canPre, cur.bank)).named(
-          'sel_cur_pre',
-        );
-    final selCurAct =
-        (curGo & ~cur.hit & ~cur.miss & ~blkAct & pick(timers.canAct, cur.bank))
-            .named('sel_cur_act');
-    final curAny = selCurCol | selCurPre | selCurAct;
-
-    final laGo =
-        ~hold &
-        la.valid &
-        ~laFresh &
-        ~(laSameBank & cur.valid) &
-        ~forceAny &
-        ~curAny;
-    final selLaPre = (laGo & la.miss & ~blkPre & pick(timers.canPre, la.bank))
-        .named('sel_la_pre');
-    final selLaAct =
-        (laGo & ~la.hit & ~la.miss & ~blkAct & pick(timers.canAct, la.bank))
-            .named('sel_la_act');
+            .named('pick_pre_all');
+    final pickRef =
+        (selIdle & wantRef & ~blkPreAllRef & ~timers.anyOpen & timers.canRef)
+            .named('pick_ref');
 
     final readIssue = (selCurCol & ~cur.write).named('read_issue');
     final writeIssue = (selCurCol & cur.write).named('write_issue');
-    final isAct = selCurAct | selLaAct;
+    // An abort drops queued reads at the next edge, so none is picked.
+    final curKeep = ~(pickAbortSig & ~cur.write);
+    final laKeep = ~(pickAbortSig & ~la.write);
+    // Registers loaded with the pick, so the select reads flops only.
+    // cur_free and la_free: the entry state is up to date for that entry.
+    // write_more: a write word that is not the last is on sel_*.
+    // read_more: a 1-beat read is on sel_* and the last word of its request
+    // follows, so the beats of the next read are known.
+    // wr_more: the next write word is ready behind the one on sel_*: the
+    // arbiter's wr_next, or wr_next2 while the last take is in flight.
+    final curFree = Logic(name: 'cur_free');
+    final laFree = Logic(name: 'la_free');
+    final writeMore = Logic(name: 'write_more');
+    final readMore = Logic(name: 'read_more');
+    final wrMore = Logic(name: 'wr_more');
+    final curColReady = mux(
+      cur.write,
+      ((writeMore & wrMore) | (curFree & wrValidNow)) & ~blkWrite,
+      (curFree | readMore) & ~blkRead,
+    );
+    final pickCurCol = (curGo & curKeep & cur.hit & curCanColR & curColReady)
+        .named('pick_cur_col');
+    final curRowGo = curFree & curGo & curKeep;
+    final pickCurPre = (curRowGo & cur.miss & ~blkPre & curCanPre).named(
+      'pick_cur_pre',
+    );
+    final pickCurAct = (curRowGo & ~cur.hit & ~cur.miss & ~blkAct & curCanAct)
+        .named('pick_cur_act');
+    final curAny = pickCurCol | pickCurPre | pickCurAct;
+
+    // la issues a row command only when cur picks nothing.
+    final laGo = laFree & laBase & laKeep & ~curAny;
+    final pickLaPre = (laGo & la.miss & ~blkPre & laCanPre).named(
+      'pick_la_pre',
+    );
+    final pickLaAct = (laGo & ~la.hit & ~la.miss & ~blkAct & laCanAct).named(
+      'pick_la_act',
+    );
+    final pickAny = curAny | pickLaPre | pickLaAct | pickPreAll | pickRef;
+    final pickRead = pickCurCol & ~cur.write;
+    final pickWrite = pickCurCol & cur.write;
+    // The fin flag of the picked column. A column picked while one is on
+    // sel_* is the next word of cur: a write ends at 2 words left, and a
+    // read is always its last word.
+    final pickFin =
+        pickCurCol & mux(selCurCol, ~cur.write | cur.rem.eq(2), cur.fin);
+    final pickMore = pickCurCol & ~pickFin;
+
     final isPre = selCurPre | selLaPre;
     final curCmd = selCurCol | selCurPre | selCurAct;
+    final rowAny = selCurPre | selCurAct | selLaPre | selLaAct;
 
-    Logic oneHot(List<(Logic, Logic)> terms, int width) =>
-        terms.map((t) => t.$1.replicate(width) & t.$2).reduce((a, b) => a | b);
-    Const code(SdramCommand c) => Const(c.index, width: 3);
-
-    final cmdNext = mux(
-      initDone,
-      oneHot([
-        (selPreAll, code(SdramCommand.preAll)),
-        (selRef, code(SdramCommand.ref)),
-        (readIssue, code(SdramCommand.read)),
-        (writeIssue, code(SdramCommand.write)),
-        (isPre, code(SdramCommand.pre)),
-        (isAct, code(SdramCommand.act)),
-      ], 3),
-      init.cmd,
-    );
     // Bank and address come from whichever side issues. With no command
-    // they are don't care, so the select only needs curAny and selPreAll.
+    // they are don't care, so the select only needs curCmd and selPreAll.
     final baNext = mux(initDone, mux(curCmd, cur.bank, la.bank), init.cmdBa);
     // a10 picks precharge all.
     final a10 = Const(1 << 10, width: rowW);
@@ -444,13 +511,8 @@ class SdramEngine extends Module {
       width: 4,
       conditionalType: ConditionalType.unique,
     );
-    final anySel = selPreAll | selRef | selCurCol | isPre | isAct;
-    final csNNext = mux(initDone, ~anySel, initPins[3]);
-    final rasNNext = mux(
-      initDone,
-      ~(isAct | isPre | selPreAll | selRef),
-      initPins[2],
-    );
+    final csNNext = mux(initDone, selIdle, initPins[3]);
+    final rasNNext = mux(initDone, ~(rowAny | selPreAll | selRef), initPins[2]);
     final casNNext = mux(initDone, ~(selCurCol | selRef), initPins[1]);
     final weNNext = mux(
       initDone,
@@ -459,9 +521,10 @@ class SdramEngine extends Module {
     );
 
     // --- enqueue, always into the look-ahead entry ---
-    final reqReady = (initDone & ~forceAny & (~la.valid | ~cur.valid)).named(
-      'req_ready_c',
-    );
+    // An entry is free unless a force waits. This comes from a register
+    // loaded with the next values, so the ready has no logic path in it.
+    final roomR = Logic(name: 'room_r');
+    final reqReady = (initDone & roomR).named('req_ready_c');
     port.reqReady <= reqReady;
     final accept = port.reqValid & reqReady;
 
@@ -484,16 +547,17 @@ class SdramEngine extends Module {
     // The new entry is compared with the entry that is current after this
     // edge: cur, or la when cur is empty and la moves up. Its hit and miss
     // are worked out in the next cycle: this cycle only registers the open
-    // row compare per bank. A bank command in this cycle can only be for
+    // row compare for its bank. A bank command in this cycle can only be for
     // the target entry's bank, so it is applied in the next cycle too, and
     // nothing here waits on the command select.
     final tgtBank = mux(cur.valid, cur.bank, la.bank);
     final tgtRow = mux(cur.valid, cur.row, la.row);
     final sameBank = inBank.eq(tgtBank);
     final sameRow = inRow.eq(tgtRow);
-    final inHitBits = [
+    final inOpen = pick(bankOpen, inBank);
+    final inHit = pick([
       for (var b = 0; b < config.banks; b++) bankOpen[b] & openRow[b].eq(inRow),
-    ];
+    ], inBank);
     final inFields = [
       Const(1),
       port.reqWrite,
@@ -522,13 +586,8 @@ class SdramEngine extends Module {
     // Apply the bank command that issued in the cycle la was filled.
     final laEvClosed = laEvAll | (laEvPre & laSameBank);
     final laEvOpened = laEvAct & laSameBank;
-    final freshHit = pick(laHitBits, la.bank);
-    final laHitRaw = mux(laFresh, freshHit, la.hit);
-    final laMissRaw = mux(
-      laFresh,
-      pick(laOpenBits, la.bank) & ~freshHit,
-      la.miss,
-    );
+    final laHitRaw = mux(laFresh, laFreshHit, la.hit);
+    final laMissRaw = mux(laFresh, laFreshOpen & ~laFreshHit, la.miss);
     final laHitBase = mux(
       laEvClosed,
       Const(0),
@@ -570,39 +629,61 @@ class SdramEngine extends Module {
     final finAfter = mux(cur.write, remAfter.eq(1), remAfter.lte(eight));
 
     final curFinish = selCurCol & cur.fin;
-    final promote = (la.valid & (~cur.valid | curFinish)).named('promote');
-
+    final Logic abortIn = abort;
     final laFieldsNext = [...la.fields.sublist(0, 9), laHitNext, laMissNext];
-    final curNext = <Logic>[];
-    for (var i = 0; i < cur.fields.length; i++) {
-      final f = cur.fields[i];
-      Logic keep;
-      if (f == cur.valid) {
-        keep = cur.valid & ~curFinish;
-      } else if (f == cur.col) {
-        keep = mux(selCurCol, colAfter, cur.col);
-      } else if (f == cur.rem) {
-        keep = mux(selCurCol, remAfter, cur.rem);
-      } else if (f == cur.beats) {
-        keep = mux(selCurCol, beatsAfter, cur.beats);
-      } else if (f == cur.fin) {
-        keep = mux(selCurCol, finAfter, cur.fin);
-      } else if (f == cur.hit) {
-        keep = curHitNext;
-      } else if (f == cur.miss) {
-        keep = curMissNext;
-      } else {
-        keep = f;
+
+    // The entry state after this edge for one value of [curFinish]. Both
+    // cases come from registers and the late [curFinish] only selects
+    // between them at the end, so the promote does not add to the loop.
+    ({List<Logic> cur, List<Logic> la, Logic promote}) entryNext(Logic fin) {
+      final promote = la.valid & (~cur.valid | fin);
+      final curN = <Logic>[];
+      for (var i = 0; i < cur.fields.length; i++) {
+        final f = cur.fields[i];
+        Logic keep;
+        if (f == cur.valid) {
+          keep = cur.valid & ~fin;
+        } else if (f == cur.col) {
+          keep = mux(selCurCol, colAfter, cur.col);
+        } else if (f == cur.rem) {
+          keep = mux(selCurCol, remAfter, cur.rem);
+        } else if (f == cur.beats) {
+          keep = mux(selCurCol, beatsAfter, cur.beats);
+        } else if (f == cur.fin) {
+          keep = mux(selCurCol, finAfter, cur.fin);
+        } else if (f == cur.hit) {
+          keep = curHitNext;
+        } else if (f == cur.miss) {
+          keep = curMissNext;
+        } else {
+          keep = f;
+        }
+        curN.add(mux(promote, laFieldsNext[i], keep));
       }
-      curNext.add(mux(promote, laFieldsNext[i], keep));
+      final laN = <Logic>[];
+      for (var i = 0; i < la.fields.length; i++) {
+        final f = la.fields[i];
+        final keep = f == la.valid ? la.valid & ~promote : laFieldsNext[i];
+        laN.add(mux(accept, inFields[i], keep));
+      }
+      // An abort drops a queued read but keeps a queued write.
+      curN[0] = curN[0] & ~(abortIn & ~curN[1]);
+      laN[0] = laN[0] & ~(abortIn & ~laN[1]);
+      return (cur: curN, la: laN, promote: promote);
     }
 
-    final laNext = <Logic>[];
-    for (var i = 0; i < la.fields.length; i++) {
-      final f = la.fields[i];
-      final keep = f == la.valid ? la.valid & ~promote : laFieldsNext[i];
-      laNext.add(mux(accept, inFields[i], keep));
-    }
+    final finYes = entryNext(Const(1));
+    final finNo = entryNext(Const(0));
+    Logic byFinish(
+      Logic Function(({List<Logic> cur, List<Logic> la, Logic promote}) e) f,
+    ) => mux(curFinish, f(finYes), f(finNo));
+    final curNext = [
+      for (var i = 0; i < cur.fields.length; i++) byFinish((e) => e.cur[i]),
+    ];
+    final laNext = [
+      for (var i = 0; i < la.fields.length; i++) byFinish((e) => e.la[i]),
+    ];
+
     final laSameBankNext = mux(accept, sameBank, laSameBank);
     final tgtAct = mux(cur.valid, selCurAct, selLaAct);
     final tgtPre = mux(cur.valid, selCurPre, selLaPre);
@@ -630,10 +711,54 @@ class SdramEngine extends Module {
       );
     }
 
+    Logic initIs(SdramCommand c) => init.cmd.eq(c.index);
+    Logic strobes(Logic Function(int b) engine, SdramCommand c) => [
+      for (var b = 0; b < banks; b++)
+        mux(initDone, engine(b), initIs(c) & init.cmdBa.eq(b)),
+    ].rswizzle();
+    final actNext = strobes(
+      (b) => (pickCurAct & cur.bank.eq(b)) | (pickLaAct & la.bank.eq(b)),
+      SdramCommand.act,
+    );
+    final preNext = strobes(
+      (b) => (pickCurPre & cur.bank.eq(b)) | (pickLaPre & la.bank.eq(b)),
+      SdramCommand.pre,
+    );
+    final readNext = strobes(
+      (b) => pickRead & cur.bank.eq(b),
+      SdramCommand.read,
+    );
+    final writeNext = strobes(
+      (b) => pickWrite & cur.bank.eq(b),
+      SdramCommand.write,
+    );
+    final preAllNext = mux(initDone, pickPreAll, initIs(SdramCommand.preAll));
+    final refNext = mux(initDone, pickRef, initIs(SdramCommand.ref));
+    final mrsNext = ~initDone & initIs(SdramCommand.mrs);
+
+    // A flag for the entry that is current after this edge. Both picks run
+    // from registers and the promote only selects at the end, so the pick
+    // does not wait on the command select.
+    Logic forNextCur(Logic Function(Logic write, Logic bank) f) {
+      final forLa = f(la.write, la.bank);
+      final forCur = f(cur.write, cur.bank);
+      return byFinish((e) => mux(e.promote, forLa, forCur));
+    }
+
+    // Timer flags at the next edge for one bank. Only the per-bank part
+    // goes through the bank pick.
+    Logic canActFor(Logic b) =>
+        pick(timers.actBankNext, b) & timers.actCommonNext;
+    Logic canPreFor(Logic b) =>
+        pick(timers.preBankNext, b) & timers.preCommonNext;
+    Logic canColFor(Logic w, Logic b) =>
+        pick(timers.colBankNext, b) &
+        mux(w, timers.writeCommonNext, timers.readCommonNext);
+
     // --- refresh policy ---
     // A precharge all for a refresh commits to that refresh, so rows are
     // never closed for nothing.
-    final refCommitNext = (refCommit | (selPreAll & wantRef)) & ~selRef;
+    final refCommitNext = (refCommit | (pickPreAll & wantRef)) & ~selRef;
     final busy = cur.valid | la.valid;
     final idleCntNext = mux(
       busy,
@@ -705,7 +830,22 @@ class SdramEngine extends Module {
     _checkRequests(clk, port, accept, inCol, colW);
 
     // A read longer than 1 beat holds back the next read and a precharge.
-    final longRead = readIssue & cur.beats.neq(1);
+    // A read picked while a read is on sel_* is the last word of cur.
+    final pickBeats = mux(readIssue, Const(1, width: 4), cur.beats);
+    final longRead = pickRead & pickBeats.neq(1);
+    lastBeatsNext <= mux(pickRead, pickBeats, Const(0, width: 4));
+
+    // These read the next valid bits, so they are split on [curFinish] too.
+    Logic goFor(({List<Logic> cur, List<Logic> la, Logic promote}) e) =>
+        e.cur[0] & ~holdNext;
+    Logic laBaseFor(({List<Logic> cur, List<Logic> la, Logic promote}) e) =>
+        ~holdNext &
+        e.la[0] &
+        ~accept &
+        ~(laSameBankNext & e.cur[0]) &
+        ~forceAnyNext;
+    Logic roomFor(({List<Logic> cur, List<Logic> la, Logic promote}) e) =>
+        ~forceAnyNext & (~e.cur[0] | ~e.la[0]);
 
     final regs = <(Logic, Logic, int)>[
       (phyCsNR, csNNext, 1),
@@ -718,46 +858,59 @@ class SdramEngine extends Module {
       (phyDqOutR, wrDataNow, 0),
       (wrTook, writeIssue, 0),
       (phyDqOeR, writeIssue, 0),
-      (lastCmd, cmdNext, 0),
-      (lastBank, baNext, 0),
-      (lastBeats, mux(readIssue, cur.beats, Const(0, width: 4)), 0),
+      (selPreAll, pickPreAll, 0),
+      (selRef, pickRef, 0),
+      (selCurCol, pickCurCol, 0),
+      (selCurPre, pickCurPre, 0),
+      (selCurAct, pickCurAct, 0),
+      (selLaPre, pickLaPre, 0),
+      (selLaAct, pickLaAct, 0),
+      (selIdle, ~pickAny, 1),
+      (curFree, ~(curAny | pickPreAll | pickRef), 1),
+      (laFree, ~(pickLaPre | pickLaAct | pickPreAll | pickRef | pickFin), 1),
+      (writeMore, pickMore & cur.write, 0),
+      (readMore, pickMore & ~cur.write & cur.beats.eq(1) & cur.rem.eq(2), 0),
+      (lastAct, actNext, 0),
+      (lastPre, preNext, 0),
+      (lastRead, readNext, 0),
+      (lastWrite, writeNext, 0),
+      (lastPreAll, preAllNext, 0),
+      (lastRefCmd, refNext, 0),
       (lastRef, selRef, 0),
-      (blkAct, ~initDone | selPreAll | selRef | isAct, 1),
-      (blkRead, ~initDone | selPreAll | selRef | longRead, 1),
-      (blkWrite, ~initDone | selPreAll | selRef | readIssue, 1),
-      (blkPre, ~initDone | selPreAll | selRef | longRead | writeIssue, 1),
-      (blkPreAllRef, ~initDone | anySel, 1),
+      (lastMrs, mrsNext, 0),
+      (lastBeats, lastBeatsNext, 0),
+      (curCanAct, forNextCur((_, b) => canActFor(b)), 0),
+      (curCanPre, forNextCur((_, b) => canPreFor(b)), 0),
+      (curCanColR, forNextCur(canColFor), 0),
+      (curGo, byFinish(goFor), 0),
+      (laBase, byFinish(laBaseFor), 0),
+      (laCanAct, mux(accept, canActFor(inBank), canActFor(la.bank)), 0),
+      (laCanPre, mux(accept, canPreFor(inBank), canPreFor(la.bank)), 0),
+      (blkAct, ~initDone | pickPreAll | pickRef | pickLaAct | pickCurAct, 1),
+      (blkRead, ~initDone | pickPreAll | pickRef | longRead, 1),
+      (blkWrite, ~initDone | pickPreAll | pickRef | pickRead, 1),
+      (blkPre, ~initDone | pickPreAll | pickRef | longRead | pickWrite, 1),
+      (blkPreAllRef, ~initDone | pickAny, 1),
       (forceAny, forceAnyNext, 0),
       (forceRef, forceRefNext, 0),
       (idleRefWant, idleRefWantNext, 0),
       (refCommit, refCommitNext, 0),
       (wantPreAll, wantPreAllNext, 0),
       (wantRef, wantRefNext, 0),
-      (hold, holdNext, 1),
       (idleCnt, idleCntNext, 0),
       (idleLong, idleLongNext, 0),
       for (var i = 0; i < cur.fields.length; i++)
-        (
-          cur.fields[i],
-          i == 0 ? curNext[0] & ~(abort & ~curNext[1]) : curNext[i],
-          0,
-        ),
-      for (var i = 0; i < la.fields.length; i++)
-        (
-          la.fields[i],
-          i == 0 ? laNext[0] & ~(abort & ~laNext[1]) : laNext[i],
-          0,
-        ),
+        (cur.fields[i], curNext[i], 0),
+      for (var i = 0; i < la.fields.length; i++) (la.fields[i], laNext[i], 0),
+      (roomR, byFinish(roomFor), 1),
       (laSameBank, laSameBankNext, 0),
       (laSameRow, laSameRowNext, 0),
       (laEvAct, laEvActNext, 0),
       (laEvPre, laEvPreNext, 0),
       (laEvAll, laEvAllNext, 0),
       (laFresh, accept, 0),
-      for (var b = 0; b < config.banks; b++) ...[
-        (laHitBits[b], inHitBits[b], 0),
-        (laOpenBits[b], bankOpen[b], 0),
-      ],
+      (laFreshHit, inHit, 0),
+      (laFreshOpen, inOpen, 0),
       for (var b = 0; b < config.banks; b++) ...[
         (bankOpen[b], bankOpenNext[b], 0),
         (openRow[b], openRowNext[b], 0),
@@ -776,6 +929,11 @@ class SdramEngine extends Module {
     ];
 
     Sequential(clk, [
+      wrValidNow < mux(writeIssue & ~reset, port.wrNextValidD, port.wrValidD),
+      wrMore < mux(writeIssue & ~reset, port.wrNext2ValidD, port.wrNextValidD),
+    ]);
+
+    Sequential(clk, [
       If(
         reset,
         then: [
@@ -785,10 +943,7 @@ class SdramEngine extends Module {
           phyCkeR < mux(warmReset, Const(1), Const(0)),
           for (final r in regs) r.$1 < Const(r.$3, width: r.$1.width),
         ],
-        orElse: [
-          phyCkeR < init.cke,
-          for (final r in regs) r.$1 < r.$2,
-        ],
+        orElse: [phyCkeR < init.cke, for (final r in regs) r.$1 < r.$2],
       ),
     ]);
   }
@@ -858,7 +1013,9 @@ SdramEngine debugSdramEngineWithoutRowAgeGuard(
   phyRdData: phyRdData,
   phyReadLatency: phyReadLatency,
   abort: abort,
+  pickAbort: null,
   coldReset: coldReset,
+  timersReset: null,
   maxGrantWords: maxGrantWords,
   pullInIdleCycles: pullInIdleCycles,
   rowAgeGuard: false,

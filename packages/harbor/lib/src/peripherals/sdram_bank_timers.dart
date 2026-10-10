@@ -51,6 +51,33 @@ class SdramBankTimers extends Module {
   /// At least one bank is open.
   Logic get anyOpen => output('any_open');
 
+  /// The values the can flags take at the next edge, for a caller that
+  /// registers its own copy of a flag picked by bank. Each flag is split
+  /// into a per-bank part and a part common to all banks: for example
+  /// `canAct[b]` at the next edge is `actBankNext[b] & actCommonNext`.
+  List<Logic> get actBankNext =>
+      List.generate(banks, (b) => output('act_bank_next_$b'));
+
+  /// Per-bank part of [canRead] and [canWrite] at the next edge.
+  List<Logic> get colBankNext =>
+      List.generate(banks, (b) => output('col_bank_next_$b'));
+
+  /// Per-bank part of [canPre] at the next edge.
+  List<Logic> get preBankNext =>
+      List.generate(banks, (b) => output('pre_bank_next_$b'));
+
+  /// Common part of [canAct] at the next edge.
+  Logic get actCommonNext => output('act_common_next');
+
+  /// Common part of [canRead] at the next edge.
+  Logic get readCommonNext => output('read_common_next');
+
+  /// Common part of [canWrite] at the next edge.
+  Logic get writeCommonNext => output('write_common_next');
+
+  /// Common part of [canPre] at the next edge.
+  Logic get preCommonNext => output('pre_common_next');
+
   SdramBankTimers(
     this.cycles, {
     required Logic clk,
@@ -65,15 +92,98 @@ class SdramBankTimers extends Module {
     cmd = addInput('cmd', cmd, width: 3);
     final bankBits = cycles.config.bankBits;
     cmdBank = addInput('cmd_bank', cmdBank, width: bankBits);
-    const beatsWidth = 4;
-    cmdBeats = addInput('cmd_beats', cmdBeats, width: beatsWidth);
+    cmdBeats = addInput('cmd_beats', cmdBeats, width: _beatsWidth);
 
+    Logic isCmd(SdramCommand c) => cmd.eq(c.index);
+    Logic forBank(SdramCommand c, int b) =>
+        isCmd(c) & cmdBank.eq(Const(b, width: bankBits));
+    _build(
+      clk,
+      reset,
+      cmdBeats,
+      act: [for (var b = 0; b < banks; b++) forBank(SdramCommand.act, b)],
+      pre: [for (var b = 0; b < banks; b++) forBank(SdramCommand.pre, b)],
+      read: [for (var b = 0; b < banks; b++) forBank(SdramCommand.read, b)],
+      write: [for (var b = 0; b < banks; b++) forBank(SdramCommand.write, b)],
+      preAll: isCmd(SdramCommand.preAll),
+      ref: isCmd(SdramCommand.ref),
+      mrs: isCmd(SdramCommand.mrs),
+    );
+  }
+
+  /// Takes the registered command as one strobe per command, and per bank
+  /// for the bank commands, so no decode sits in front of the timers.
+  /// [act], [pre], [read] and [write] have one bit per bank.
+  /// [cmdBeatsNext], when given, is the value [cmdBeats] takes at the next
+  /// edge. The timers then keep their beats flags in registers.
+  SdramBankTimers.strobes(
+    this.cycles, {
+    required Logic clk,
+    required Logic reset,
+    required Logic act,
+    required Logic pre,
+    required Logic read,
+    required Logic write,
+    required Logic preAll,
+    required Logic ref,
+    required Logic mrs,
+    required Logic cmdBeats,
+    Logic? cmdBeatsNext,
+    super.name = 'sdram_bank_timers',
+  }) {
+    clk = addInput('clk', clk);
+    reset = addInput('reset', reset);
+    act = addInput('cmd_act', act, width: banks);
+    pre = addInput('cmd_pre', pre, width: banks);
+    read = addInput('cmd_read', read, width: banks);
+    write = addInput('cmd_write', write, width: banks);
+    cmdBeats = addInput('cmd_beats', cmdBeats, width: _beatsWidth);
+    _build(
+      clk,
+      reset,
+      cmdBeats,
+      cmdBeatsNext: cmdBeatsNext == null
+          ? null
+          : addInput('cmd_beats_next', cmdBeatsNext, width: _beatsWidth),
+      act: [for (var b = 0; b < banks; b++) act[b]],
+      pre: [for (var b = 0; b < banks; b++) pre[b]],
+      read: [for (var b = 0; b < banks; b++) read[b]],
+      write: [for (var b = 0; b < banks; b++) write[b]],
+      preAll: addInput('cmd_pre_all', preAll),
+      ref: addInput('cmd_ref', ref),
+      mrs: addInput('cmd_mrs', mrs),
+    );
+  }
+
+  static const _beatsWidth = 4;
+
+  void _build(
+    Logic clk,
+    Logic reset,
+    Logic cmdBeats, {
+    Logic? cmdBeatsNext,
+    required List<Logic> act,
+    required List<Logic> pre,
+    required List<Logic> read,
+    required List<Logic> write,
+    required Logic preAll,
+    required Logic ref,
+    required Logic mrs,
+  }) {
+    const beatsWidth = _beatsWidth;
     for (var b = 0; b < banks; b++) {
       addOutput('can_act_$b');
       addOutput('can_read_$b');
       addOutput('can_write_$b');
       addOutput('can_pre_$b');
+      addOutput('act_bank_next_$b');
+      addOutput('col_bank_next_$b');
+      addOutput('pre_bank_next_$b');
     }
+    addOutput('act_common_next');
+    addOutput('read_common_next');
+    addOutput('write_common_next');
+    addOutput('pre_common_next');
     addOutput('can_pre_all');
     addOutput('can_ref');
     addOutput('row_age_force');
@@ -81,15 +191,9 @@ class SdramBankTimers extends Module {
 
     int widthFor(int v) => v <= 0 ? 1 : v.bitLength;
 
-    Logic isCmd(SdramCommand c) => cmd.eq(c.index);
-    final isAct = isCmd(SdramCommand.act);
-    final isRead = isCmd(SdramCommand.read);
-    final isWrite = isCmd(SdramCommand.write);
-    final isPre = isCmd(SdramCommand.pre);
-    final isPreAll = isCmd(SdramCommand.preAll);
-    final isRef = isCmd(SdramCommand.ref);
-    final isMrs = isCmd(SdramCommand.mrs);
-    Logic bankIs(int b) => cmdBank.eq(Const(b, width: bankBits));
+    final anyAct = act.reduce((a, b) => a | b);
+    final anyRead = read.reduce((a, b) => a | b);
+    final preB = [for (var b = 0; b < banks; b++) pre[b] | preAll];
 
     // The next value of a down-counter: reload to [reloadValue] when
     // [reload] fires this cycle, else decrement and floor at 0.
@@ -209,94 +313,83 @@ class SdramBankTimers extends Module {
     // and the can* gating below ---
     final bankOpenNext = [
       for (var b = 0; b < banks; b++)
-        mux(
-          isAct & bankIs(b),
-          Const(1),
-          mux((isPre & bankIs(b)) | isPreAll, Const(0), bankOpen[b]),
-        ),
+        mux(act[b], Const(1), mux(preB[b], Const(0), bankOpen[b])),
     ];
     final rcTimerNext = [
       for (var b = 0; b < banks; b++)
-        downNextC(
-          rcTimer[b],
-          isAct & bankIs(b),
-          cycles.rc,
-          widthFor(cycles.rc),
-        ),
+        downNextC(rcTimer[b], act[b], cycles.rc, widthFor(cycles.rc)),
     ];
     final rpTimerNext = [
       for (var b = 0; b < banks; b++)
-        downNextC(
-          rpTimer[b],
-          (isPre & bankIs(b)) | isPreAll,
-          cycles.rp,
-          widthFor(cycles.rp),
-        ),
+        downNextC(rpTimer[b], preB[b], cycles.rp, widthFor(cycles.rp)),
     ];
     final rcdTimerNext = [
       for (var b = 0; b < banks; b++)
-        downNextC(
-          rcdTimer[b],
-          isAct & bankIs(b),
-          cycles.rcd,
-          widthFor(cycles.rcd),
-        ),
+        downNextC(rcdTimer[b], act[b], cycles.rcd, widthFor(cycles.rcd)),
     ];
     final rasTimerNext = [
       for (var b = 0; b < banks; b++)
-        downNextC(
-          rasTimer[b],
-          isAct & bankIs(b),
-          cycles.rasMin,
-          widthFor(cycles.rasMin),
-        ),
+        downNextC(rasTimer[b], act[b], cycles.rasMin, widthFor(cycles.rasMin)),
     ];
     final wrTimerNext = [
       for (var b = 0; b < banks; b++)
-        downNextC(
-          wrTimer[b],
-          isWrite & bankIs(b),
-          cycles.wr,
-          widthFor(cycles.wr),
-        ),
+        downNextC(wrTimer[b], write[b], cycles.wr, widthFor(cycles.wr)),
     ];
-    final beatsSpan = mux(
-      cmdBeats.gt(2),
-      cmdBeats - 2,
-      Const(0, width: beatsWidth),
+    Logic spanOf(Logic beats) =>
+        mux(beats.gt(2), beats - 2, Const(0, width: beatsWidth));
+    final beatsSpan = spanOf(cmdBeats);
+    // Flags on the reload values that come from [cmdBeats]. Given
+    // [cmdBeatsNext], they are registers loaded one cycle early.
+    final beatsRegs = <(Logic, Logic, Logic)>[];
+    Logic beatsFlag(String n, Logic Function(Logic beats) f) {
+      if (cmdBeatsNext == null) return f(cmdBeats);
+      final r = Logic(name: n);
+      beatsRegs.add((r, f(cmdBeatsNext), f(Const(0, width: beatsWidth))));
+      return r;
+    }
+
+    final spanZero = beatsFlag('beats_span_zero', (b) => spanOf(b).eq(0));
+    final spanLe1 = beatsFlag('beats_span_le1', (b) => spanOf(b).lte(1));
+    final readToWriteZero = beatsFlag(
+      'read_to_write_zero',
+      (b) => readToWriteFor(b).eq(0),
+    );
+    final readToWriteLe1 = beatsFlag(
+      'read_to_write_le1',
+      (b) => readToWriteFor(b).lte(1),
     );
     final readBeatsTimerNext = [
       for (var b = 0; b < banks; b++)
-        downNext(readBeatsTimer[b], isRead & bankIs(b), beatsSpan, beatsWidth),
+        downNext(readBeatsTimer[b], read[b], beatsSpan, beatsWidth),
     ];
 
     final rrdTimerNext = downNextC(
       rrdTimer,
-      isAct,
+      anyAct,
       cycles.rrd,
       widthFor(cycles.rrd),
     );
     final mrdTimerNext = downNextC(
       mrdTimer,
-      isMrs,
+      mrs,
       cycles.mrd,
       widthFor(cycles.mrd),
     );
     final rfcTimerNext = downNextC(
       rfcTimer,
-      isRef,
+      ref,
       cycles.rfc,
       widthFor(cycles.rfc),
     );
     final readToWriteTimerNext = downNext(
       readToWriteTimer,
-      isRead,
+      anyRead,
       readToWriteFor(cmdBeats),
       readToWriteWidth,
     );
     final readSpacingTimerNext = downNext(
       readSpacingTimer,
-      isRead,
+      anyRead,
       beatsSpan,
       beatsWidth,
     );
@@ -313,41 +406,98 @@ class SdramBankTimers extends Module {
     );
     final rowAgeForceNext = rowAgeAtLimit;
 
+    // True when a counter is 0 after this edge. Each counter keeps a
+    // register that says it is at most 1, loaded one cycle early, so a flag
+    // needs only the reload and that register.
+    final le1Regs = <(Logic, Logic)>[];
+    Logic zeroNext(
+      Logic counter,
+      Logic reload,
+      Logic reloadZero,
+      Logic reloadLe1,
+    ) {
+      final le1 = Logic(name: '${counter.name}_le1');
+      final le2 = counter.width < 2 ? Const(1) : counter.lte(2);
+      le1Regs.add((le1, mux(reload, reloadLe1, le2)));
+      return mux(reload, reloadZero, le1);
+    }
+
+    Logic zeroNextC(Logic counter, Logic reload, int n) => zeroNext(
+      counter,
+      reload,
+      Const(span(n) == 0 ? 1 : 0),
+      Const(span(n) <= 1 ? 1 : 0),
+    );
+
+    final rcZero = [
+      for (var b = 0; b < banks; b++) zeroNextC(rcTimer[b], act[b], cycles.rc),
+    ];
+    final rpZero = [
+      for (var b = 0; b < banks; b++) zeroNextC(rpTimer[b], preB[b], cycles.rp),
+    ];
+    final rcdZero = [
+      for (var b = 0; b < banks; b++)
+        zeroNextC(rcdTimer[b], act[b], cycles.rcd),
+    ];
+    final rasZero = [
+      for (var b = 0; b < banks; b++)
+        zeroNextC(rasTimer[b], act[b], cycles.rasMin),
+    ];
+    final wrZero = [
+      for (var b = 0; b < banks; b++)
+        zeroNextC(wrTimer[b], write[b], cycles.wr),
+    ];
+    final readBeatsZero = [
+      for (var b = 0; b < banks; b++)
+        zeroNext(readBeatsTimer[b], read[b], spanZero, spanLe1),
+    ];
+    final rrdZero = zeroNextC(rrdTimer, anyAct, cycles.rrd);
+    final readSpacingZero = zeroNext(
+      readSpacingTimer,
+      anyRead,
+      spanZero,
+      spanLe1,
+    );
+    final readToWriteZeroNext = zeroNext(
+      readToWriteTimer,
+      anyRead,
+      readToWriteZero,
+      readToWriteLe1,
+    );
+
     // Only a nop is legal while either blackout window is open.
     // as4c16m16sb datasheet rev 2.0, command 8 text p13, command 12 p17.
-    final cmdBlackoutNext = mrdTimerNext.neq(0) | rfcTimerNext.neq(0);
+    final cmdBlackoutNext =
+        ~zeroNextC(mrdTimer, mrs, cycles.mrd) |
+        ~zeroNextC(rfcTimer, ref, cycles.rfc);
 
-    final canActNext = [
-      for (var b = 0; b < banks; b++)
-        ~bankOpenNext[b] &
-            rcTimerNext[b].eq(0) &
-            rpTimerNext[b].eq(0) &
-            rrdTimerNext.eq(0) &
-            ~cmdBlackoutNext,
+    final actBankNext = [
+      for (var b = 0; b < banks; b++) ~bankOpenNext[b] & rcZero[b] & rpZero[b],
     ];
-    final canReadNext = [
-      for (var b = 0; b < banks; b++)
-        bankOpenNext[b] &
-            rcdTimerNext[b].eq(0) &
-            readSpacingTimerNext.eq(0) &
-            ~cmdBlackoutNext,
-    ];
-    final canWriteNext = [
-      for (var b = 0; b < banks; b++)
-        bankOpenNext[b] &
-            rcdTimerNext[b].eq(0) &
-            readToWriteTimerNext.eq(0) &
-            ~cmdBlackoutNext,
+    final colBankNext = [
+      for (var b = 0; b < banks; b++) bankOpenNext[b] & rcdZero[b],
     ];
     final bankClearToPreNext = [
-      for (var b = 0; b < banks; b++)
-        rasTimerNext[b].eq(0) &
-            wrTimerNext[b].eq(0) &
-            readBeatsTimerNext[b].eq(0),
+      for (var b = 0; b < banks; b++) rasZero[b] & wrZero[b] & readBeatsZero[b],
+    ];
+    final preBankNext = [
+      for (var b = 0; b < banks; b++) bankOpenNext[b] & bankClearToPreNext[b],
+    ];
+    final actCommonNext = rrdZero & ~cmdBlackoutNext;
+    final readCommonNext = readSpacingZero & ~cmdBlackoutNext;
+    final writeCommonNext = readToWriteZeroNext & ~cmdBlackoutNext;
+    final preCommonNext = ~cmdBlackoutNext;
+    final canActNext = [
+      for (var b = 0; b < banks; b++) actBankNext[b] & actCommonNext,
+    ];
+    final canReadNext = [
+      for (var b = 0; b < banks; b++) colBankNext[b] & readCommonNext,
+    ];
+    final canWriteNext = [
+      for (var b = 0; b < banks; b++) colBankNext[b] & writeCommonNext,
     ];
     final canPreNext = [
-      for (var b = 0; b < banks; b++)
-        bankOpenNext[b] & bankClearToPreNext[b] & ~cmdBlackoutNext,
+      for (var b = 0; b < banks; b++) preBankNext[b] & preCommonNext,
     ];
     final canPreAllNext =
         [
@@ -359,9 +509,18 @@ class SdramBankTimers extends Module {
     // not just closed. as4c16m16sb datasheet rev 2.0, command 12 p17,
     // fig 15 p14.
     final rpAllClearNext = [
-      for (var b = 0; b < banks; b++) rpTimerNext[b].eq(0),
+      for (var b = 0; b < banks; b++) rpZero[b],
     ].reduce((a, b) => a & b);
     final canRefNext = ~anyOpenNext & rpAllClearNext & ~cmdBlackoutNext;
+    for (var b = 0; b < banks; b++) {
+      output('act_bank_next_$b') <= actBankNext[b];
+      output('col_bank_next_$b') <= colBankNext[b];
+      output('pre_bank_next_$b') <= preBankNext[b];
+    }
+    output('act_common_next') <= actCommonNext;
+    output('read_common_next') <= readCommonNext;
+    output('write_common_next') <= writeCommonNext;
+    output('pre_common_next') <= preCommonNext;
 
     Sequential(clk, [
       If(
@@ -391,6 +550,8 @@ class SdramBankTimers extends Module {
             anyOpenReg,
           ])
             r < Const(0, width: r.width),
+          for (final r in le1Regs) r.$1 < Const(1),
+          for (final r in beatsRegs) r.$1 < r.$3,
         ],
         orElse: [
           for (var b = 0; b < banks; b++) ...[
@@ -416,6 +577,8 @@ class SdramBankTimers extends Module {
           canRefReg < canRefNext,
           rowAgeForceReg < rowAgeForceNext,
           anyOpenReg < anyOpenNext,
+          for (final r in le1Regs) r.$1 < r.$2,
+          for (final r in beatsRegs) r.$1 < r.$2,
         ],
       ),
     ]);

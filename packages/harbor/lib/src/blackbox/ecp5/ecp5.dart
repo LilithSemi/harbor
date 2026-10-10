@@ -959,6 +959,46 @@ class Ecp5Ofs1p3dx extends BridgeModule {
   }
 }
 
+/// ECP5 FD1S3BX: fabric flip-flop with asynchronous preset, so [q] powers
+/// up and presets to 1. Yosys does not merge two of these with the same
+/// inputs, so it can make a local copy of a reset for each block.
+class Ecp5Fd1s3bx extends BridgeModule {
+  Logic get q => output('Q');
+
+  Ecp5Fd1s3bx({
+    required Logic d,
+    required Logic ck,
+    required Logic pd,
+    super.name = 'fd1s3bx',
+  }) : super('FD1S3BX', isSystemVerilogLeaf: true) {
+    d = addInput('D', d);
+    ck = addInput('CK', ck);
+    pd = addInput('PD', pd);
+    final q = addOutput('Q');
+    _srFlopSim(d, ck, Const(1), pd, q, 1);
+  }
+}
+
+/// ECP5 FD1S3DX: fabric flip-flop with asynchronous clear, so [q] powers
+/// up and clears to 0. Like [Ecp5Fd1s3bx], yosys does not merge two of
+/// these with the same inputs.
+class Ecp5Fd1s3dx extends BridgeModule {
+  Logic get q => output('Q');
+
+  Ecp5Fd1s3dx({
+    required Logic d,
+    required Logic ck,
+    required Logic cd,
+    super.name = 'fd1s3dx',
+  }) : super('FD1S3DX', isSystemVerilogLeaf: true) {
+    d = addInput('D', d);
+    ck = addInput('CK', ck);
+    cd = addInput('CD', cd);
+    final q = addOutput('Q');
+    _srFlopSim(d, ck, Const(1), cd, q, 0);
+  }
+}
+
 /// ECP5 DELAYG: static input delay line (128 taps of ~25ps). Used to move
 /// the read-data sampling point into the eye. The tap count is fixed at
 /// synthesis ([delValue]), so read training picks a value per board/build.

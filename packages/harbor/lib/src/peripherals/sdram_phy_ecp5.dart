@@ -1,5 +1,6 @@
 /// ECP5 PHY for sdr sdram: every pin through an `OFS1P3BX`/`IFS1P3BX`/
-/// `IDDRX1F` io register, and an inverted sdram_clk from an `ODDRX1F`.
+/// `IDDRX1F` io register, outputs fed from one fabric pad stage, and an
+/// inverted sdram_clk from an `ODDRX1F`.
 library;
 
 import 'package:rohd/rohd.dart';
@@ -45,9 +46,10 @@ class HarborSdramPhyConfig {
   });
 }
 
-/// Sdr sdram PHY for the ULX3S ECP5. Every output pin is registered
-/// through an `OFS1P3BX` (`OFS1P3DX` for cke, so it idles low across
-/// power-up), the dq output-enable through its own `OFS1P3BX` driving a
+/// Sdr sdram PHY for the ULX3S ECP5. Every output pin goes through one
+/// fabric register (the pad stage) and then an `OFS1P3BX` (`OFS1P3DX` for
+/// cke, so it idles low across power-up), the dq output-enable through
+/// its own pad stage and `OFS1P3BX` driving a
 /// `BB.T` directly, and dq capture through an `IFS1P3BX` or `IDDRX1F` per
 /// [HarborSdramPhyConfig.captureEdge]. sdram_clk is an `ODDRX1F` inverting
 /// the controller clock.
@@ -67,13 +69,14 @@ class SdramPhyEcp5 extends SdramPhyBase {
   final int _casLatency;
   final HarborSdramPhyConfig _phyConfig;
 
-  /// 1 output register cycle, plus the chip's cas latency, plus the
-  /// capture-point cycle offset, plus the dq capture pipeline. The single
+  /// 1 fabric pad stage cycle and 1 output register cycle, plus the chip's
+  /// cas latency, plus the capture-point cycle offset, plus the dq capture
+  /// pipeline. The single
   /// source for this formula: a caller that needs the number before this
   /// phy is built (to size a pipeline ahead of it) calls this instead of
   /// repeating it.
   static int computeReadLatency(int casLatency, HarborSdramPhyConfig phy) =>
-      1 + casLatency + phy.captureCycleOffset + phy.captureCycles;
+      2 + casLatency + phy.captureCycleOffset + phy.captureCycles;
 
   @override
   int get readLatency => computeReadLatency(_casLatency, _phyConfig);
@@ -174,22 +177,43 @@ class SdramPhyEcp5 extends SdramPhyBase {
     final oAddr = addOutput('o_sdram_addr', width: config.rowWidth);
     final oDqm = addOutput('o_sdram_dqm', width: dqmBits);
 
-    Logic ofs(Logic d, String n) => Ecp5Ofs1p3bx(d: d, sclk: clk, name: n).q;
+    // Every output goes through one fabric pad stage before its io
+    // register. The controller can then sit away from the pads, which span
+    // most of a die edge, and each long route is register to register.
+    // Pins that idle high use a preset flop, so they power up high too.
+    Logic stage(Logic d, String n, {bool high = false}) {
+      if (high) return Ecp5Fd1s3bx(d: d, ck: clk, pd: Const(0), name: n).q;
+      final q = Logic(name: n, width: d.width);
+      Sequential(clk, [q < d]);
+      return q;
+    }
+
+    Logic ofs(Logic d, String n) => Ecp5Ofs1p3bx(
+      d: stage(d, '${n}_stage', high: true),
+      sclk: clk,
+      name: n,
+    ).q;
+    Logic ofsData(Logic d, String n) =>
+        Ecp5Ofs1p3bx(d: stage(d, '${n}_stage'), sclk: clk, name: n).q;
 
     // cke alone uses the clear (power-up-low) variant: every other pin
     // idling high at config is fine (cs# deselected, dqm masked, dq
     // high-z), but cke must stay low until the init sequence raises it,
     // or the device could sample a command before init even starts.
-    oCke <= Ecp5Ofs1p3dx(d: cke, sclk: clk, name: 'cke_ofs').q;
+    oCke <=
+        Ecp5Ofs1p3dx(d: stage(cke, 'cke_stage'), sclk: clk, name: 'cke_ofs').q;
     oCsN <= ofs(csN, 'cs_n_ofs');
     oRasN <= ofs(rasN, 'ras_n_ofs');
     oCasN <= ofs(casN, 'cas_n_ofs');
     oWeN <= ofs(weN, 'we_n_ofs');
     oBa <=
-        [for (var i = 0; i < bankBits; i++) ofs(ba[i], 'ba_ofs_$i')].rswizzle();
+        [
+          for (var i = 0; i < bankBits; i++) ofsData(ba[i], 'ba_ofs_$i'),
+        ].rswizzle();
     oAddr <=
         [
-          for (var i = 0; i < config.rowWidth; i++) ofs(addr[i], 'addr_ofs_$i'),
+          for (var i = 0; i < config.rowWidth; i++)
+            ofsData(addr[i], 'addr_ofs_$i'),
         ].rswizzle();
     oDqm <=
         [
@@ -200,12 +224,20 @@ class SdramPhyEcp5 extends SdramPhyBase {
 
     final captured = <Logic>[];
     for (var i = 0; i < config.dataWidth; i++) {
-      final dOut = ofs(dqOut[i], 'dq_out_ofs_$i');
+      final dOut = ofsData(dqOut[i], 'dq_out_ofs_$i');
       // The oe flop's d can equal a sibling bit's (one shared engine-side
       // enable, broadcast to every dq bit), which risks a yosys merge of
-      // otherwise-distinct per-bit flops, so it is kept.
+      // otherwise-distinct per-bit flops, so it is kept. The pad stage
+      // holds the enable itself and powers up low, so each bit inverts
+      // its own copy and one shared inverter does not fan out to every pin.
+      final oeStage = Ecp5Fd1s3dx(
+        d: dqOe[i],
+        ck: clk,
+        cd: Const(0),
+        name: 'dq_oe_stage_$i',
+      ).q;
       final tReg = Ecp5Ofs1p3bx(
-        d: ~dqOe[i],
+        d: ~oeStage,
         sclk: clk,
         keep: true,
         name: 'dq_oe_ofs_$i',

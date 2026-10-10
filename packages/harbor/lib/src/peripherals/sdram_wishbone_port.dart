@@ -119,20 +119,16 @@ class SdramWishbonePort extends Module {
         (phase.eq(st(pReq)) & reqWriteReg & port.reqReady);
     final drop = (reset | (abort & ~committed)).named('drop');
 
+    // Only the control registers clear on drop. The data registers clear
+    // on reset alone, so drop has a small fanout.
     Sequential(clk, [
       If(
         drop,
         then: [
           phase < st(pIdle),
-          reqAddrReg < Const(0, width: wordAddrWidth),
           reqWriteReg < Const(0),
           reqValidReg < Const(0),
           wrValidReg < Const(0),
-          wrDataReg < Const(0, width: 16),
-          wrMaskReg < Const(0, width: 2),
-          loWordReg < Const(0, width: 16),
-          datRReg < Const(0, width: 32),
-          hiWordReg < Const(0, width: 18),
           ackReg < Const(0),
           aborted < Const(0),
         ],
@@ -147,12 +143,8 @@ class SdramWishbonePort extends Module {
                   cyc,
                   then: [
                     phase < st(pReq),
-                    reqAddrReg < evenWordAddr,
                     reqWriteReg < we,
                     reqValidReg < Const(1),
-                    wrDataReg < loData,
-                    wrMaskReg < loMask,
-                    hiWordReg < hiWord,
                   ],
                 ),
               ]),
@@ -170,14 +162,7 @@ class SdramWishbonePort extends Module {
                 ),
               ]),
               CaseItem(st(pWr0), [
-                If(
-                  port.wrReady,
-                  then: [
-                    phase < st(pWr1),
-                    wrDataReg < hiWordReg.getRange(0, 16),
-                    wrMaskReg < hiWordReg.getRange(16, 18),
-                  ],
-                ),
+                If(port.wrReady, then: [phase < st(pWr1)]),
               ]),
               CaseItem(st(pWr1), [
                 If(
@@ -185,25 +170,17 @@ class SdramWishbonePort extends Module {
                   then: [
                     phase < st(pAck),
                     wrValidReg < Const(0),
-                    datRReg < Const(0, width: 32),
                     ackReg < cyc & ~aborted & ~abort,
                   ],
                 ),
               ]),
               CaseItem(st(pRd0), [
-                If(
-                  port.rdValid,
-                  then: [phase < st(pRd1), loWordReg < port.rdData],
-                ),
+                If(port.rdValid, then: [phase < st(pRd1)]),
               ]),
               CaseItem(st(pRd1), [
                 If(
                   port.rdValid & port.rdLast,
-                  then: [
-                    phase < st(pAck),
-                    datRReg < [port.rdData, loWordReg].swizzle(),
-                    ackReg < cyc & ~aborted & ~abort,
-                  ],
+                  then: [phase < st(pAck), ackReg < cyc & ~aborted & ~abort],
                 ),
               ]),
               CaseItem(st(pAck), [phase < st(pGap)]),
@@ -211,6 +188,58 @@ class SdramWishbonePort extends Module {
             ],
             defaultItem: [phase < st(pIdle)],
           ),
+        ],
+      ),
+    ]);
+
+    Sequential(clk, [
+      If(
+        reset,
+        then: [
+          reqAddrReg < Const(0, width: wordAddrWidth),
+          wrDataReg < Const(0, width: 16),
+          wrMaskReg < Const(0, width: 2),
+          loWordReg < Const(0, width: 16),
+          datRReg < Const(0, width: 32),
+          hiWordReg < Const(0, width: 18),
+        ],
+        orElse: [
+          Case(phase, [
+            CaseItem(st(pIdle), [
+              If(
+                cyc,
+                then: [
+                  reqAddrReg < evenWordAddr,
+                  wrDataReg < loData,
+                  wrMaskReg < loMask,
+                  hiWordReg < hiWord,
+                ],
+              ),
+            ]),
+            CaseItem(st(pWr0), [
+              If(
+                port.wrReady,
+                then: [
+                  wrDataReg < hiWordReg.getRange(0, 16),
+                  wrMaskReg < hiWordReg.getRange(16, 18),
+                ],
+              ),
+            ]),
+            CaseItem(st(pWr1), [
+              If(port.wrReady, then: [datRReg < Const(0, width: 32)]),
+            ]),
+            CaseItem(st(pRd0), [
+              If(port.rdValid, then: [loWordReg < port.rdData]),
+            ]),
+            CaseItem(st(pRd1), [
+              If(
+                port.rdValid & port.rdLast,
+                then: [
+                  datRReg < [port.rdData, loWordReg].swizzle(),
+                ],
+              ),
+            ]),
+          ]),
         ],
       ),
     ]);
