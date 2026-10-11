@@ -1955,11 +1955,17 @@ void main() {
     });
 
     group('div-only, illegal mul ops contend with older div ops', () {
-      // Pipelined stages 1 and 2 are left out: each hangs the simulator
-      // on its own, with no absent path and no contention involved, from
-      // a bug in HarborDivSqrtRecurrence's pipelined mode, fixed
-      // separately there.
       for (final spec in [
+        (
+          name: 'pipelined stages 1',
+          b: _build(32, mulMode: null, divMode: _divPipe, divStages: 1),
+          seed: 820,
+        ),
+        (
+          name: 'pipelined stages 2',
+          b: _build(32, mulMode: null, divMode: _divPipe, divStages: 2),
+          seed: 822,
+        ),
         (
           name: 'pipelined stages 4',
           b: _build(32, mulMode: null, divMode: _divPipe, divStages: 4),

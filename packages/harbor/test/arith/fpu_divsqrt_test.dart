@@ -363,7 +363,8 @@ class _Trace {
 /// [stall] share. Every kill mask bit is high on the cycles in [kills]. An
 /// op on the input in a kill cycle is accepted as usual, and no result may
 /// come out in a kill cycle. With [serial], an op goes in only when no
-/// other op is in flight.
+/// other op is in flight. With [garbage], the inputs hold random bits in
+/// each cycle with `in_valid` low.
 Future<_Trace> _clocked(
   _Spec spec,
   List<_Op> ops, {
@@ -372,6 +373,7 @@ Future<_Trace> _clocked(
   double stall = 0.3,
   Set<int> kills = const {},
   bool serial = false,
+  bool garbage = false,
 }) => Isolate.run(() async {
   final clk = SimpleClockGenerator(10).clk;
   final rig = _Rig(spec, clk: clk);
@@ -411,7 +413,15 @@ Future<_Trace> _clocked(
     km?.put(kill ? (BigInt.one << km.width) - BigInt.one : BigInt.zero);
     rig.inValid.put(valid ? 1 : 0);
     rig.outReady.put(ready ? 1 : 0);
-    if (next < ops.length) {
+    if (garbage && !valid) {
+      rig.inOp.put(r.nextInt(4));
+      rig.inFmt.put(r.nextInt(1 << rig.inFmt.width));
+      rig.inRm.put(r.nextInt(8));
+      rig.inA.put(LogicValue.ofBigInt(_bits(r, rig.inA.width), rig.inA.width));
+      rig.inB.put(LogicValue.ofBigInt(_bits(r, rig.inB.width), rig.inB.width));
+      rig.inTag.put(r.nextInt(1 << _tagWidth));
+      rig.inNarrow.put(r.nextInt(2));
+    } else if (next < ops.length) {
       rig.put(ops[next], next);
     }
     final inReady = dut.inReady.value.toBool();
@@ -915,6 +925,47 @@ void main() {
     });
   });
 
+  // The simulation runs a private copy of each step's gates. The gates in
+  // the hierarchy make the SystemVerilog, and both must agree.
+  group('step cells', () {
+    for (final spec in const [
+      _Spec(intWidth: 3),
+      _Spec(intWidth: 8),
+      _Spec(intWidth: 32, narrowWidth: 16),
+      _Spec(formats: [_fp16]),
+      _Spec(formats: [_fp16], fpOps: {HarborFpOp.sqrt}),
+      _Spec(formats: [_fp16, _fp32], intWidth: 16),
+    ]) {
+      test('$spec: the copy agrees with the gates', () async {
+        final rig = _Rig(spec);
+        await rig.dut.build();
+        final cells = [
+          for (final m in rig.dut.subModules)
+            if (m.definitionName.endsWith('_Step')) m,
+        ];
+        expect(cells, isNotEmpty);
+        final r = Random(spec.width);
+        var bad = 0;
+        for (var i = 0; i < 3000; i++) {
+          rig.inOp.put(r.nextInt(4));
+          rig.inFmt.put(r.nextInt(1 << rig.inFmt.width));
+          rig.inRm.put(r.nextInt(8));
+          rig.inNarrow.put(r.nextInt(2));
+          rig.inA.put(LogicValue.ofBigInt(_bits(r, spec.width), spec.width));
+          rig.inB.put(LogicValue.ofBigInt(_bits(r, spec.width), spec.width));
+          for (final c in cells) {
+            final hold = c.subModules.singleWhere((m) => m.name == 'hold');
+            final gates = hold.input('v').value;
+            if (c.output('next').value != gates) {
+              bad++;
+            }
+          }
+        }
+        expect(bad, 0);
+      });
+    }
+  });
+
   group('integer, zero stages', () {
     for (final w in [32, 64]) {
       test('$w bit against BigInt', () async {
@@ -1179,6 +1230,66 @@ void main() {
         expect(tags.toSet().containsAll(after), isTrue);
         _check(spec, ops, [for (final (_, o) in t.taken) o], tags: tags);
       });
+    }
+  });
+
+  // Random bits sit on the inputs while in_valid is low. Each run has a
+  // hard timeout, so a simulator that does not settle fails fast.
+  group('garbage while idle', () {
+    const timeout = Timeout(Duration(minutes: 3));
+    final specs = [
+      for (final stages in [1, 2, 3, 4, 8, 67])
+        _Spec(intWidth: 64, narrowWidth: 32, stages: stages),
+      for (final stages in [1, 2, 3, 4, 35])
+        _Spec(intWidth: 32, stages: stages),
+      for (final radix in [2, 4]) ...[
+        _Spec(intWidth: 64, narrowWidth: 32, mode: _iterative, radix: radix),
+        _Spec(intWidth: 32, mode: _iterative, radix: radix),
+      ],
+    ];
+    for (final spec in specs) {
+      for (var seed = 0; seed < 6; seed++) {
+        test('$spec seed $seed', () async {
+          final r = Random(100 + seed);
+          final w = spec.intWidth;
+          final ops = [
+            ..._intOps(w, r, 40),
+            if (spec.narrowWidth > 0) ..._narrowOps(w, spec.narrowWidth, r, 40),
+          ]..shuffle(r);
+          final t = await _clocked(
+            spec,
+            ops.sublist(0, 80),
+            seed: seed,
+            gap: 0.4,
+            garbage: true,
+          );
+          _checkAll(spec, ops.sublist(0, 80), t);
+        }, timeout: timeout);
+      }
+    }
+    for (final spec in const [
+      _Spec(formats: [_fp32, _fp64], intWidth: 64, stages: 1),
+      _Spec(formats: [_fp32, _fp64], intWidth: 64, stages: 2),
+      _Spec(formats: [_fp32, _fp64], intWidth: 64, stages: 3),
+      _Spec(formats: [_fp32, _fp64], intWidth: 64, stages: 4),
+      _Spec(formats: [_fp32, _fp64], intWidth: 64, mode: _iterative),
+      _Spec(formats: [_fp32, _fp64], intWidth: 64, mode: _iterative, radix: 4),
+    ]) {
+      for (var seed = 0; seed < 3; seed++) {
+        test('$spec seed $seed', () async {
+          final r = Random(200 + seed);
+          final ops = [..._randomFp(spec, r, 30), ..._intOps(64, r, 30)]
+            ..shuffle(r);
+          final t = await _clocked(
+            spec,
+            ops.sublist(0, 60),
+            seed: seed,
+            gap: 0.4,
+            garbage: true,
+          );
+          _checkAll(spec, ops.sublist(0, 60), t);
+        }, timeout: timeout);
+      }
     }
   });
 }

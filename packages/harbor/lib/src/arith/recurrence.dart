@@ -912,9 +912,42 @@ class HarborDivSqrtRecurrence extends Module {
       hasFp ? 2 : 1,
     ];
     final ends = _cuts(weights, stages);
+    // Each step runs in a _HarborRecurStep cell. The loop signals go in and
+    // out as one bus, and a step right after another takes that bus as it
+    // is, so a step sees one input change for each change before it.
+    Logic? lastBus;
+    _State stepCell(_State s) {
+      final keys = [
+        for (final key in const ['r', 'q', 'x'])
+          if (s.containsKey(key)) key,
+      ];
+      final bus = lastBus ?? [for (final key in keys) s[key]!].rswizzle();
+      final cell = _HarborRecurStep(
+        bus,
+        {if (s.containsKey('d')) 'd': s['d']!, if (hasSqrt) 'op': s['op']!},
+        (state, side) {
+          var at = 0;
+          final inner = Map.of(side);
+          for (final key in keys) {
+            inner[key] = state.getRange(at, at += s[key]!.width);
+          }
+          final out = step(inner, 0);
+          return [for (final key in keys) out[key]!].rswizzle();
+        },
+        definitionName: '${definitionName}_Step',
+      );
+      final out = Map.of(s);
+      var at = 0;
+      for (final key in keys) {
+        out[key] = cell.next.getRange(at, at += s[key]!.width);
+      }
+      lastBus = cell.next;
+      return out;
+    }
+
     _State unit(_State s, int u) => switch (u) {
       0 => pre(s),
-      _ when u <= n => step(s, u - 1),
+      _ when u <= n => stepCell(s),
       _ when u == n + 1 => postA(s),
       _ => postB(s),
     };
@@ -941,6 +974,7 @@ class HarborDivSqrtRecurrence extends Module {
         for (final e in state.entries)
           e.key: flop(clk, e.value, en: en).named('${e.key}_s$c'),
       };
+      lastBus = null;
       if (tagW > 0) {
         tags.add(state['tag']!);
       }
@@ -1018,4 +1052,66 @@ class HarborDivSqrtRecurrence extends Module {
     ];
     return parts.join('_');
   }
+}
+
+/// One unrolled recurrence step. The step gates connect the ports for
+/// SystemVerilog. In simulation a private copy of the gates sets the output
+/// once for each input change.
+///
+/// The sign of the remainder selects the next add, so each step sees its
+/// input on two paths. In ROHD each path change runs the add again, and the
+/// changes grow by a factor at each step of a long unrolled chain. With
+/// this cell the count grows linearly.
+class _HarborRecurStep extends Module {
+  Logic get next => output('next');
+
+  _HarborRecurStep(
+    Logic state,
+    Map<String, Logic> side,
+    Logic Function(Logic state, Map<String, Logic> side) body, {
+    required String definitionName,
+  }) : super(
+         name: 'step',
+         definitionName: definitionName,
+         reserveDefinitionName: false,
+       ) {
+    state = addInput('state', state, width: state.width);
+    final ins = {
+      for (final e in side.entries)
+        e.key: addInput(e.key, e.value, width: e.value.width),
+    };
+    final ports = [state, ...ins.values];
+    // The copy is outside the hierarchy, so it is not in the SystemVerilog.
+    final copies = [for (final p in ports) Logic(width: p.width)];
+    final copyOut = body(copies.first, {
+      for (final (i, key) in ins.keys.indexed) key: copies[i + 1],
+    });
+    final hold = _HarborRecurHold(body(state, ins));
+    addOutput('next', width: hold.out.width) <= hold.out;
+    void update() {
+      for (var i = 0; i < ports.length; i++) {
+        copies[i].put(ports[i].value);
+      }
+      hold.out.put(copyOut.value);
+    }
+
+    for (final p in ports) {
+      p.glitch.listen((_) => update());
+    }
+    update();
+  }
+}
+
+/// A wire that the simulation does not drive from its input. Its owner puts
+/// the output. In SystemVerilog it is a plain assign.
+class _HarborRecurHold extends Module with InlineSystemVerilog {
+  Logic get out => output('out');
+
+  _HarborRecurHold(Logic v) : super(name: 'hold') {
+    addInput('v', v, width: v.width);
+    addOutput('out', width: v.width);
+  }
+
+  @override
+  String inlineVerilog(Map<String, String> inputs) => inputs['v']!;
 }

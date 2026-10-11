@@ -9,7 +9,7 @@ import 'package:rohd/rohd.dart';
 /// simulator runs a gate again for each input change, which is very slow for
 /// a compression tree.
 ///
-/// Only plain ROHD gates and [FlipFlop]s are supported. A Combinational,
+/// Only plain ROHD gates, wires and [FlipFlop]s are supported. A Combinational,
 /// Sequential or any other module with its own behavior throws at
 /// construction. A flop output is state: [clock] loads it, and each lane
 /// starts at 0. A flop must have a synchronous reset to 0, if any. Every
@@ -414,6 +414,18 @@ class LaneSim {
           }
         }
       };
+    }
+    // A module whose SystemVerilog is its one input is a wire.
+    if (g is InlineSystemVerilog && g.inputs.length == 1) {
+      final name = g.inputs.keys.single;
+      if (g.inlineVerilog({name: name}) == name) {
+        final a = ins[0];
+        return () {
+          for (var i = 0; i < w; i++) {
+            out[i] = a[i];
+          }
+        };
+      }
     }
     throw UnsupportedError('LaneSim: ${g.runtimeType} is not supported');
   }
