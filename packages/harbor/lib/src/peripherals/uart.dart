@@ -190,11 +190,8 @@ class HarborUart extends BridgeModule
 
     // Read mux. On a multi-byte bus every byte register of the addressed word
     // is returned in its lane and the master extracts the byte it wants. On a
-    // byte-wide bus each register is returned individually. Reading the word
-    // holding the RBR pops the receive buffer, and with word-grouped reads
-    // that also fires for IIR/LCR reads of the same word, an accepted quirk
-    // of byte registers on a word bus (LSR polling, in the other word, is
-    // unaffected).
+    // byte-wide bus each register is returned individually. Only a read that
+    // selects byte lane 0 (the RBR) pops the receive buffer.
     final List<Conditional> readItems;
     if (lanes == 1) {
       readItems = [
@@ -228,7 +225,7 @@ class HarborUart extends BridgeModule
       if (lanes >= 8) {
         readItems = [
           datOutW < [word1, word0].swizzle().zeroExtend(bus.dataOut.width),
-          If(~dlab, then: [rxReady < Const(0)]),
+          If(~dlab & bus.sel[0], then: [rxReady < Const(0)]),
         ];
       } else {
         readItems = [
@@ -237,7 +234,7 @@ class HarborUart extends BridgeModule
             then: [datOutW < word1.zeroExtend(bus.dataOut.width)],
             orElse: [
               datOutW < word0.zeroExtend(bus.dataOut.width),
-              If(~dlab, then: [rxReady < Const(0)]),
+              If(~dlab & bus.sel[0], then: [rxReady < Const(0)]),
             ],
           ),
         ];
