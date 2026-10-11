@@ -378,6 +378,7 @@ class HarborSoC extends BridgeModule {
           clkConfig,
           secondaryFrequency: sec.frequency,
           secondaryName: sec.name,
+          secondaryTolerancePpm: sec.tolerancePpm,
         );
         // Register the secondary FIRST so a 'sys'-named secondary stays the
         // default clock (values.first), then the CLKOP primary.

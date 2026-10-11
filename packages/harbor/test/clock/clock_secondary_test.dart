@@ -103,6 +103,69 @@ void main() {
         ),
       );
     });
+
+    test('125 MHz primary + 48 MHz secondary at 0 ppm tolerance still '
+        'throws, naming the best error found', () {
+      // The old solver rounded this to 48.08 MHz without an error.
+      expect(
+        () => HarborClockGenerator.ecp5CoSecondaryDividers(
+          25000000,
+          125000000,
+          48000000,
+        ),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.toString(),
+            'message',
+            allOf(
+              contains('125000000'),
+              contains('48000000'),
+              contains('0 ppm'),
+              contains('The best is'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('125.875 MHz CLKOP (TMDS shift) + 25.175 MHz CLKOS (pixel) from 25 '
+        'MHz: no exact solution, but 7000 ppm on both solves', () {
+      // CLKOP can only be a multiple of 3.125 MHz here, so 125 MHz is the
+      // closest to 125.875 MHz, 6951 ppm low.
+      final sol = HarborClockGenerator.ecp5CoSecondaryDividers(
+        25000000,
+        125875000,
+        25175000,
+        primaryTolPpm: 7000,
+        secondaryTolPpm: 7000,
+      );
+      expect(sol.achievedPrimaryHz, 125000000);
+      expect(sol.achievedSecondaryHz, 25000000);
+      expect(sol.clkiDiv * 125000000, 25000000 * sol.clkfbDiv);
+    });
+
+    test('125.875 MHz + 25.175 MHz at 0 ppm tolerance still throws, naming '
+        'the best error found', () {
+      expect(
+        () => HarborClockGenerator.ecp5CoSecondaryDividers(
+          25000000,
+          125875000,
+          25175000,
+        ),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.toString(),
+            'message',
+            allOf(
+              contains('125875000'),
+              contains('25175000'),
+              contains('0 ppm'),
+              contains('The best is 6951.3 ppm primary'),
+            ),
+          ),
+        ),
+      );
+    });
   });
 
   group('createDomainWithSecondary (ECP5)', () {

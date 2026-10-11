@@ -106,9 +106,10 @@ class HarborClockConfig with HarborPrettyString {
   /// was one site, not the ECP5.
   ///
   /// The VCO is `frequency * CLKOP_DIV` and must be an integer multiple of the
-  /// secondary frequency (e.g. 144*4 = 576 MHz, 576/24 = 24). The generator
-  /// emits both domains, see [HarborClockGenerator.createDomainWithSecondary].
-  final ({String name, int frequency})? coClkosSecondary;
+  /// secondary frequency (e.g. 144*4 = 576 MHz, 576/24 = 24), unless
+  /// [tolerancePpm] authorises an approximate pair. The generator emits both
+  /// domains, see [HarborClockGenerator.createDomainWithSecondary].
+  final ({String name, int frequency, int tolerancePpm})? coClkosSecondary;
 
   /// Run this domain off the shared Xilinx DDR3-fast clock tree's spare core
   /// CLKOUT instead of a dedicated PLL/MMCM. On a single-oscillator board (Arty
@@ -118,6 +119,11 @@ class HarborClockConfig with HarborPrettyString {
   /// The domain is then clocked by that tree's `coreClk`. Ignored otherwise.
   final bool providedByDdr3Tree;
 
+  /// Allowed error of the achieved frequency, in parts per million. 0 (the
+  /// default) demands an exact PLL solution. A pixel clock may set this.
+  /// System and memory clocks keep 0.
+  final int tolerancePpm;
+
   const HarborClockConfig({
     required this.name,
     required this.rate,
@@ -126,6 +132,7 @@ class HarborClockConfig with HarborPrettyString {
     this.forcePll = false,
     this.coClkosSecondary,
     this.providedByDdr3Tree = false,
+    this.tolerancePpm = 0,
   });
 
   /// Convenience factory for fixed-frequency clocks.
@@ -135,12 +142,14 @@ class HarborClockConfig with HarborPrettyString {
     int? sourceFrequency,
     bool isPrimary = false,
     bool forcePll = false,
+    int tolerancePpm = 0,
   }) => HarborClockConfig(
     name: name,
     rate: HarborFixedClockRate(frequency),
     sourceFrequency: sourceFrequency,
     isPrimary: isPrimary,
     forcePll: forcePll,
+    tolerancePpm: tolerancePpm,
   );
 
   /// Convenience factory for dynamic-frequency clocks.
@@ -234,6 +243,9 @@ class HarborClockDomain {
   /// would bind a port that does not exist.
   final String? simPort;
 
+  /// The achieved frequency in Hz when a PLL tolerance was used, else null.
+  final double? achievedFrequencyHz;
+
   const HarborClockDomain({
     required this.config,
     required this.clk,
@@ -241,6 +253,7 @@ class HarborClockDomain {
     this.locked,
     this.frequencySelect,
     this.simPort,
+    this.achievedFrequencyHz,
   });
 
   /// The domain name.
@@ -837,47 +850,169 @@ class HarborClockGenerator {
     return (vco / secondaryFreq).round();
   }
 
-  /// Finds dividers for an exact CLKOP at [primaryFreq] and an exact CLKOS at
-  /// [secondaryFreq] off one VCO, preferring a VCO near 600 MHz. Throws
-  /// [ArgumentError] naming both rates when no in-band choice is exact.
-  static ({int clkiDiv, int clkfbDiv, int clkopDiv, int clkosDiv})
-  ecp5CoSecondaryDividers(int sourceFreq, int primaryFreq, int secondaryFreq) {
+  /// Finds dividers for a CLKOP at [primaryFreq] and a CLKOS at
+  /// [secondaryFreq] off one VCO, preferring a VCO near 600 MHz. CLKOP is the
+  /// feedback, so it can only be `sourceFreq * CLKFB_DIV / CLKI_DIV`.
+  ///
+  /// With both tolerances 0 (the default) both outputs must be exact. Else
+  /// the solution with the smallest worst error inside both tolerances wins.
+  /// Throws [ArgumentError] with the best error found when none fits.
+  static ({
+    int clkiDiv,
+    int clkfbDiv,
+    int clkopDiv,
+    int clkosDiv,
+    double achievedPrimaryHz,
+    double achievedSecondaryHz,
+  })
+  ecp5CoSecondaryDividers(
+    int sourceFreq,
+    int primaryFreq,
+    int secondaryFreq, {
+    int primaryTolPpm = 0,
+    int secondaryTolPpm = 0,
+  }) {
     _ecp5CheckInOut(sourceFreq, primaryFreq);
     _ecp5CheckInOut(sourceFreq, secondaryFreq);
 
+    if (primaryTolPpm == 0 && secondaryTolPpm == 0) {
+      int? bClkiDiv, bClkfbDiv, bClkopDiv, bClkosDiv;
+      var bestVcoDiff = -1;
+      for (var clkiDiv = 1; clkiDiv <= _ecp5ClkiDivMax; clkiDiv++) {
+        final pfd = sourceFreq / clkiDiv;
+        if (pfd < _ecp5PfdMinHz || pfd > _ecp5PfdMaxHz) continue;
+        // Integer math, so an exact match is never lost to rounding.
+        final fbNum = primaryFreq * clkiDiv;
+        if (fbNum % sourceFreq != 0) continue;
+        final clkfbDiv = fbNum ~/ sourceFreq;
+        if (clkfbDiv < 1 || clkfbDiv > _ecp5ClkfbDivMax) continue;
+
+        for (var clkopDiv = 1; clkopDiv <= _ecp5OutDivMax; clkopDiv++) {
+          final vco = primaryFreq * clkopDiv;
+          if (vco < _ecp5VcoMinHz || vco > _ecp5VcoMaxHz) continue;
+          if (vco % secondaryFreq != 0) continue;
+          final clkosDiv = vco ~/ secondaryFreq;
+          if (clkosDiv < 1 || clkosDiv > _ecp5OutDivMax) continue;
+          final diff = (vco - 600000000).abs();
+          if (bClkiDiv == null || diff < bestVcoDiff) {
+            bestVcoDiff = diff;
+            bClkiDiv = clkiDiv;
+            bClkfbDiv = clkfbDiv;
+            bClkopDiv = clkopDiv;
+            bClkosDiv = clkosDiv;
+          }
+        }
+      }
+
+      if (bClkiDiv == null) {
+        final best = ecp5CoSecondaryDividers(
+          sourceFreq,
+          primaryFreq,
+          secondaryFreq,
+          primaryTolPpm: 1000000,
+          secondaryTolPpm: 1000000,
+        );
+        String ppm(double hz, int want) =>
+            ((hz - want).abs() / want * 1e6).toStringAsFixed(1);
+        throw ArgumentError(
+          'No ECP5 EHXPLLL solution shares one VCO exactly between a '
+          '$primaryFreq Hz CLKOP primary and a $secondaryFreq Hz CLKOS '
+          'secondary (tolerance 0 ppm on both). The best is '
+          '${ppm(best.achievedPrimaryHz, primaryFreq)} ppm primary / '
+          '${ppm(best.achievedSecondaryHz, secondaryFreq)} ppm secondary.',
+        );
+      }
+      return (
+        clkiDiv: bClkiDiv,
+        clkfbDiv: bClkfbDiv!,
+        clkopDiv: bClkopDiv!,
+        clkosDiv: bClkosDiv!,
+        achievedPrimaryHz: primaryFreq.toDouble(),
+        achievedSecondaryHz: secondaryFreq.toDouble(),
+      );
+    }
+
+    // Only the dividers the VCO band allows are tried, so this stays fast.
+    final primaryTol = primaryTolPpm / 1e6;
+    final secondaryTol = secondaryTolPpm / 1e6;
+    const tolEpsilon = 1e-9; // absorbs float noise on an exact ratio.
+
     int? bClkiDiv, bClkfbDiv, bClkopDiv, bClkosDiv;
-    var bestVcoDiff = -1;
+    var bestWorstErr = double.infinity;
+    var bestVcoDiff = double.infinity;
+    var bAchievedPrimary = 0.0, bAchievedSecondary = 0.0;
+
+    var trackedBestErr = double.infinity;
+    var trackedPrimaryErr = 0.0, trackedSecondaryErr = 0.0;
+
     for (var clkiDiv = 1; clkiDiv <= _ecp5ClkiDivMax; clkiDiv++) {
       final pfd = sourceFreq / clkiDiv;
       if (pfd < _ecp5PfdMinHz || pfd > _ecp5PfdMaxHz) continue;
-      // Integer math, so an exact match is never lost to rounding.
-      final fbNum = primaryFreq * clkiDiv;
-      if (fbNum % sourceFreq != 0) continue;
-      final clkfbDiv = fbNum ~/ sourceFreq;
-      if (clkfbDiv < 1 || clkfbDiv > _ecp5ClkfbDivMax) continue;
+      for (var clkfbDiv = 1; clkfbDiv <= _ecp5ClkfbDivMax; clkfbDiv++) {
+        final achievedPrimary = pfd * clkfbDiv;
+        final primaryErr = (achievedPrimary - primaryFreq).abs() / primaryFreq;
 
-      for (var clkopDiv = 1; clkopDiv <= _ecp5OutDivMax; clkopDiv++) {
-        final vco = primaryFreq * clkopDiv;
-        if (vco < _ecp5VcoMinHz || vco > _ecp5VcoMaxHz) continue;
-        if (vco % secondaryFreq != 0) continue;
-        final clkosDiv = vco ~/ secondaryFreq;
-        if (clkosDiv < 1 || clkosDiv > _ecp5OutDivMax) continue;
-        final diff = (vco - 600000000).abs();
-        if (bClkiDiv == null || diff < bestVcoDiff) {
-          bestVcoDiff = diff;
-          bClkiDiv = clkiDiv;
-          bClkfbDiv = clkfbDiv;
-          bClkopDiv = clkopDiv;
-          bClkosDiv = clkosDiv;
+        final opLo = (_ecp5VcoMinHz / achievedPrimary).ceil().clamp(
+          1,
+          _ecp5OutDivMax,
+        );
+        final opHi = (_ecp5VcoMaxHz / achievedPrimary).floor().clamp(
+          1,
+          _ecp5OutDivMax,
+        );
+        for (var clkopDiv = opLo; clkopDiv <= opHi; clkopDiv++) {
+          final vco = achievedPrimary * clkopDiv;
+          if (vco < _ecp5VcoMinHz || vco > _ecp5VcoMaxHz) continue;
+
+          // The nearest divider is not always the rounded one, so try a
+          // small window.
+          final ideal = vco / secondaryFreq;
+          final lo = (ideal.floor() - 2).clamp(1, _ecp5OutDivMax);
+          final hi = (ideal.ceil() + 2).clamp(1, _ecp5OutDivMax);
+          for (var clkosDiv = lo; clkosDiv <= hi; clkosDiv++) {
+            final achievedSecondary = vco / clkosDiv;
+            final secondaryErr =
+                (achievedSecondary - secondaryFreq).abs() / secondaryFreq;
+            final worstErr = primaryErr > secondaryErr
+                ? primaryErr
+                : secondaryErr;
+
+            if (worstErr < trackedBestErr) {
+              trackedBestErr = worstErr;
+              trackedPrimaryErr = primaryErr;
+              trackedSecondaryErr = secondaryErr;
+            }
+
+            if (primaryErr > primaryTol + tolEpsilon ||
+                secondaryErr > secondaryTol + tolEpsilon) {
+              continue;
+            }
+
+            final vcoDiff = (vco - 600000000).abs();
+            if (worstErr < bestWorstErr ||
+                (worstErr == bestWorstErr && vcoDiff < bestVcoDiff)) {
+              bestWorstErr = worstErr;
+              bestVcoDiff = vcoDiff;
+              bClkiDiv = clkiDiv;
+              bClkfbDiv = clkfbDiv;
+              bClkopDiv = clkopDiv;
+              bClkosDiv = clkosDiv;
+              bAchievedPrimary = achievedPrimary;
+              bAchievedSecondary = achievedSecondary;
+            }
+          }
         }
       }
     }
 
     if (bClkiDiv == null) {
       throw ArgumentError(
-        'No ECP5 EHXPLLL solution shares one VCO exactly between a '
-        '$primaryFreq Hz CLKOP primary and a $secondaryFreq Hz CLKOS '
-        'secondary: no in-band CLKOP_DIV divides the VCO evenly by both.',
+        'No ECP5 EHXPLLL solution shares one VCO within tolerance between a '
+        '$primaryFreq Hz CLKOP primary (tolerance $primaryTolPpm ppm) and a '
+        '$secondaryFreq Hz CLKOS secondary (tolerance $secondaryTolPpm ppm): '
+        'best found was ${(trackedPrimaryErr * 1e6).toStringAsFixed(1)} ppm '
+        'primary / ${(trackedSecondaryErr * 1e6).toStringAsFixed(1)} ppm '
+        'secondary error.',
       );
     }
     return (
@@ -885,6 +1020,8 @@ class HarborClockGenerator {
       clkfbDiv: bClkfbDiv!,
       clkopDiv: bClkopDiv!,
       clkosDiv: bClkosDiv!,
+      achievedPrimaryHz: bAchievedPrimary,
+      achievedSecondaryHz: bAchievedSecondary,
     );
   }
 
@@ -948,12 +1085,14 @@ class HarborClockGenerator {
     HarborClockConfig config, {
     required int secondaryFrequency,
     String? secondaryName,
+    int secondaryTolerancePpm = 0,
   }) {
     final secName = secondaryName ?? '${config.name}_s';
     final secConfig = HarborClockConfig.fixed(
       name: secName,
       frequency: secondaryFrequency,
       sourceFrequency: config.sourceFrequency,
+      tolerancePpm: secondaryTolerancePpm,
     );
 
     final t = target;
@@ -1011,6 +1150,8 @@ class HarborClockGenerator {
       sourceFreq,
       config.frequency,
       secondaryFrequency,
+      primaryTolPpm: config.tolerancePpm,
+      secondaryTolPpm: secondaryTolerancePpm,
     );
 
     final feedback = Logic(name: '${config.name}_pll_fb');
@@ -1031,17 +1172,21 @@ class HarborClockGenerator {
     feedback <= pll.output('CLKOP');
     final lock = pll.output('LOCK');
 
+    final tolerant = config.tolerancePpm > 0 || secondaryTolerancePpm > 0;
+
     final primary = HarborClockDomain(
       config: config,
       clk: pll.output('CLKOP'),
       reset: _domainReset(pll.output('CLKOP'), inputReset | ~lock, config.name),
       locked: lock,
+      achievedFrequencyHz: tolerant ? sol.achievedPrimaryHz : null,
     );
     final secondary = HarborClockDomain(
       config: secConfig,
       clk: pll.output('CLKOS'),
       reset: _domainReset(pll.output('CLKOS'), inputReset | ~lock, secName),
       locked: lock,
+      achievedFrequencyHz: tolerant ? sol.achievedSecondaryHz : null,
     );
     _domains
       ..add(primary)

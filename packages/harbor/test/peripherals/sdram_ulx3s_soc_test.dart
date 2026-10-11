@@ -33,7 +33,7 @@ void main() {
           name: 'sdram',
           rate: HarborFixedClockRate(125000000),
           sourceFrequency: 25000000,
-          coClkosSecondary: (name: 'sys', frequency: 62500000),
+          coClkosSecondary: (name: 'sys', frequency: 62500000, tolerancePpm: 0),
         ),
       ],
     );
