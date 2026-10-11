@@ -213,12 +213,15 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
       b.writeln('  // Scanout port $i.');
       b.writeln('  logic [${sw - 1}:0] ${p}_addr;');
       b.writeln('  logic [3:0] ${p}_left;');
-      b.writeln("  assign ${p}_rq_ready = ${p}_left <= 4'd1;");
+      b.writeln('  logic ${p}_took;');
+      b.writeln("  assign ${p}_rq_ready = (${p}_left <= 4'd1) & ~${p}_took;");
       b.writeln('  always_ff @(posedge clk) begin');
       b.writeln('    if (reset) begin');
       b.writeln("      ${p}_left <= 4'd0;");
+      b.writeln("      ${p}_took <= 1'b0;");
       b.writeln("      ${p}_rd_valid <= 1'b0;");
       b.writeln('    end else begin');
+      b.writeln('      ${p}_took <= ${p}_rq_valid & ${p}_rq_ready;');
       b.writeln("      ${p}_rd_valid <= ${p}_left != 4'd0;");
       b.writeln(
         '      ${p}_rd_data <= ${p}_addr[0] ? $word[31:16] : $word[15:0];',

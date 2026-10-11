@@ -26,11 +26,15 @@ const _memMinMhzSpread = 130;
 
 /// nextpnr pre-place script for the spread run. It pins the bus master and
 /// the reset sources mid-die, far from the sdram pads on the right edge, as
-/// a soc bus and reset tree are. Paths that only meet timing when the whole
-/// controller packs next to its pads fail in this run.
+/// a soc bus and reset tree are. It pins the scanout client in another
+/// region far from the pads, as a display with its line buffer and video
+/// pads is. Paths that only meet timing when the whole controller and its
+/// clients pack next to its pads fail in this run.
 const _spreadScript = '''
 ctx.createRectangularRegion("mid", 45, 15, 60, 30)
+ctx.createRectangularRegion("disp", 20, 10, 40, 25)
 n = 0
+d = 0
 for name, cell in ctx.cells:
     for pname, port in cell.ports:
         net = port.net
@@ -40,7 +44,12 @@ for name, cell in ctx.cells:
             ctx.constrainCellToRegion(name, "mid")
             n += 1
             break
+        if net.name.startswith(("scanout_fetcher.", "scan_fold", "scan_start", "scan_line_addr")):
+            ctx.constrainCellToRegion(name, "disp")
+            d += 1
+            break
 print("spread cells: %d" % n)
+print("scanout cells: %d" % d)
 ''';
 
 bool _onPath(String tool) =>
@@ -120,6 +129,10 @@ void main() {
               r'spread cells: (\d+)',
             ).firstMatch('${r.stdout}${r.stderr}');
             expect(int.parse(m!.group(1)!), greaterThan(0), reason: tag);
+            final sc = RegExp(
+              r'scanout cells: (\d+)',
+            ).firstMatch('${r.stdout}${r.stderr}');
+            expect(int.parse(sc!.group(1)!), greaterThan(0), reason: tag);
           }
 
           final report =

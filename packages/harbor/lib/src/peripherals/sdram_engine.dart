@@ -5,6 +5,7 @@ library;
 import 'package:meta/meta.dart';
 import 'package:rohd/rohd.dart';
 
+import '../blackbox/ecp5/ecp5.dart';
 import 'sdram_bank_timers.dart';
 import 'sdram_command.dart';
 import 'sdram_config.dart';
@@ -274,6 +275,17 @@ class SdramEngine extends Module {
     );
     final initDone = init.done;
     addOutput('init_done') <= initDone;
+    // Local copies of init done, each with the same timing, so no single
+    // net reaches every block. yosys does not merge these flops.
+    Logic initDoneCopy(String n) => Ecp5Fd1s3dx(
+      d: init.doneNext,
+      ck: clk,
+      cd: Const(0),
+      name: 'init_done_$n',
+    ).q;
+    final initDoneReq = initDoneCopy('req');
+    final initDonePins = initDoneCopy('pins');
+    final initDonePick = initDoneCopy('pick');
     Sequential(
       clk,
       [
@@ -412,9 +424,9 @@ class SdramEngine extends Module {
     final idleNow = ~cur.valid & ~la.valid & idleRefWant;
     // A force does not wait for the current request to end. Its precharge
     // all can cut that request, which opens its row again afterwards.
-    final wantPreAllNext = initDone & (forceAny | idleNow);
-    final wantRefNext = initDone & (forceRef | idleNow | refCommit);
-    final holdNext = ~initDone | wantPreAllNext | wantRefNext;
+    final wantPreAllNext = initDonePick & (forceAny | idleNow);
+    final wantRefNext = initDonePick & (forceRef | idleNow | refCommit);
+    final holdNext = ~initDonePick | wantPreAllNext | wantRefNext;
 
     // The sel_* registers and free flags cover the cycle the timers miss.
     // This needs want_* to hold curGo and laBase low in that cycle, and no
@@ -483,7 +495,11 @@ class SdramEngine extends Module {
 
     // Bank and address come from whichever side issues. With no command
     // they are don't care, so the select only needs curCmd and selPreAll.
-    final baNext = mux(initDone, mux(curCmd, cur.bank, la.bank), init.cmdBa);
+    final baNext = mux(
+      initDonePins,
+      mux(curCmd, cur.bank, la.bank),
+      init.cmdBa,
+    );
     // a10 picks precharge all.
     final a10 = Const(1 << 10, width: rowW);
     final initAddr =
@@ -497,7 +513,7 @@ class SdramEngine extends Module {
     );
     final laAddr = mux(la.miss, zeroAddr, la.row);
     final addrNext = mux(
-      initDone,
+      initDonePins,
       mux(curCmd, curAddr, mux(selPreAll, a10, laAddr)),
       initAddr,
     );
@@ -514,11 +530,15 @@ class SdramEngine extends Module {
       width: 4,
       conditionalType: ConditionalType.unique,
     );
-    final csNNext = mux(initDone, selIdle, initPins[3]);
-    final rasNNext = mux(initDone, ~(rowAny | selPreAll | selRef), initPins[2]);
-    final casNNext = mux(initDone, ~(selCurCol | selRef), initPins[1]);
+    final csNNext = mux(initDonePins, selIdle, initPins[3]);
+    final rasNNext = mux(
+      initDonePins,
+      ~(rowAny | selPreAll | selRef),
+      initPins[2],
+    );
+    final casNNext = mux(initDonePins, ~(selCurCol | selRef), initPins[1]);
     final weNNext = mux(
-      initDone,
+      initDonePins,
       ~(writeIssue | isPre | selPreAll),
       initPins[0],
     );
@@ -527,7 +547,7 @@ class SdramEngine extends Module {
     // An entry is free unless a force waits. This comes from a register
     // loaded with the next values, so the ready has no logic path in it.
     final roomR = Logic(name: 'room_r');
-    final reqReady = (initDone & roomR).named('req_ready_c');
+    final reqReady = (initDoneReq & roomR).named('req_ready_c');
     port.reqReady <= reqReady;
     final accept = port.reqValid & reqReady;
 
@@ -718,7 +738,7 @@ class SdramEngine extends Module {
     Logic initIs(SdramCommand c) => init.cmd.eq(c.index);
     Logic strobes(Logic Function(int b) engine, SdramCommand c) => [
       for (var b = 0; b < banks; b++)
-        mux(initDone, engine(b), initIs(c) & init.cmdBa.eq(b)),
+        mux(initDonePick, engine(b), initIs(c) & init.cmdBa.eq(b)),
     ].rswizzle();
     final actNext = strobes(
       (b) => (pickCurAct & cur.bank.eq(b)) | (pickLaAct & la.bank.eq(b)),
@@ -736,9 +756,13 @@ class SdramEngine extends Module {
       (b) => pickWrite & cur.bank.eq(b),
       SdramCommand.write,
     );
-    final preAllNext = mux(initDone, pickPreAll, initIs(SdramCommand.preAll));
-    final refNext = mux(initDone, pickRef, initIs(SdramCommand.ref));
-    final mrsNext = ~initDone & initIs(SdramCommand.mrs);
+    final preAllNext = mux(
+      initDonePick,
+      pickPreAll,
+      initIs(SdramCommand.preAll),
+    );
+    final refNext = mux(initDonePick, pickRef, initIs(SdramCommand.ref));
+    final mrsNext = ~initDonePick & initIs(SdramCommand.mrs);
 
     // A flag for the entry that is current after this edge. Both picks run
     // from registers and the promote only selects at the end, so the pick
@@ -774,9 +798,9 @@ class SdramEngine extends Module {
     // closed. An owed refresh does not wait.
     final idleRefWantNext =
         credit.need | (credit.mayPullIn & (idleLong | ~timers.anyOpen));
-    final forceRefNext = initDone & credit.force;
+    final forceRefNext = initDonePick & credit.force;
     final rowAgeForce = rowAgeGuard ? timers.rowAgeForce : Const(0);
-    final forceAnyNext = initDone & (credit.force | rowAgeForce);
+    final forceAnyNext = initDonePick & (credit.force | rowAgeForce);
 
     // --- read return ---
     final pipeDepth = phyReadLatency + 1;

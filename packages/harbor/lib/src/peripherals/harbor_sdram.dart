@@ -51,8 +51,10 @@ import 'sim_dram.dart';
 /// [HarborSimTarget]). Port `i` has `scan<i>_rq_valid`, `scan<i>_rq_addr`
 /// (a byte address in the SoC memory map), `scan<i>_rq_words` and
 /// `scan<i>_rq_ready` for requests, and `scan<i>_rd_valid` and
-/// `scan<i>_rd_data` for the 16-bit words that come back. A request is at
-/// most [scanoutMaxWords] words and must not cross a page. A port has at
+/// `scan<i>_rd_data` for the 16-bit words that come back. Every port output
+/// comes from a register, and `scan<i>_rq_ready` is low on the cycle after
+/// a take. A request is at most [scanoutMaxWords] words and must not cross
+/// a page. A port has at
 /// most [scanoutMaxInFlight] requests in flight, which bounds the wait of
 /// the bus port, see [busWaitBound]. A bus `reset` drops only the reads of
 /// the bus port. `scan_reset` follows `mem_reset` only (the bus reset on a
@@ -371,7 +373,9 @@ class HarborSdram extends BridgeModule
         addressWidth: busAW,
         dataWidth: busDW,
         selWidth: busDW ~/ 8,
-        depth: 8,
+        // Without posted writes only one request is in the fifo at a time.
+        // Two entries keep the head read mux to one LUT level.
+        depth: postedWrites ? 8 : 2,
         target: fpgaTarget,
         postedWrites: postedWrites,
         name: 'sdram_cdc',
@@ -615,27 +619,38 @@ class HarborSdram extends BridgeModule
   /// `mem_clk` cycles. It adds to the bus access time with no scanout.
   int get busWaitBound => bestEffortWaitBound(cycles, scanoutMaxInFlight);
 
-  /// Joins scanout port [i] to [sp], an arbiter port. A request is held back
-  /// while [scanoutMaxInFlight] requests are in flight, so the bus port gets
-  /// the grant points between them.
+  /// Joins scanout port [i] to [sp], an arbiter port. Every port output
+  /// comes from a register, and a taken request waits in a one-entry slot
+  /// that drives the arbiter. A take is held back while
+  /// [scanoutMaxInFlight] requests are taken and not yet read back to the
+  /// last word, so the bus port gets the grant points between them.
   void _buildScanPort(int i, Logic clk, Logic rst, SdramPortInterface sp) {
     final cw = scanoutMaxInFlight.bitLength;
     final count = Logic(name: 'scan${i}_in_flight', width: cw);
-    final full = Logic(name: 'scan${i}_full');
-    sp.reqValid <= input('scan${i}_rq_valid') & ~full;
+    final ready = Logic(name: 'scan${i}_ready');
+    final slotValid = Logic(name: 'scan${i}_slot_valid');
+    final slotAddr = Logic(name: 'scan${i}_slot_addr', width: sp.addrWidth);
+    final slotWords = Logic(name: 'scan${i}_slot_words', width: 4);
+    final rdValid = Logic(name: 'scan${i}_rd_valid_reg');
+    final rdData = Logic(name: 'scan${i}_rd_data_reg', width: 16);
+    sp.reqValid <= slotValid;
     sp.reqWrite <= Const(0);
-    sp.reqAddr <= _scanWordAddr(input('scan${i}_rq_addr'));
-    sp.reqWords <= input('scan${i}_rq_words');
+    sp.reqAddr <= slotAddr;
+    sp.reqWords <= slotWords;
     sp.wrValid <= Const(0);
     sp.wrData <= Const(0, width: 16);
     sp.wrMask <= Const(0, width: 2);
-    output('scan${i}_rq_ready') <= sp.reqReady;
-    output('scan${i}_rd_valid') <= sp.rdValid;
-    output('scan${i}_rd_data') <= sp.rdData;
+    output('scan${i}_rq_ready') <= ready;
+    output('scan${i}_rd_valid') <= rdValid;
+    output('scan${i}_rd_data') <= rdData;
 
-    final take = sp.reqValid & sp.reqReady;
+    // [ready] is high only while the slot is empty, so the slot loads
+    // whenever it is empty and the port inputs never drive a clock enable.
+    final take = (input('scan${i}_rq_valid') & ready).named('scan${i}_take');
+    // A finish counts on the edge that puts the last word on the port.
     final fin = sp.rdValid & sp.rdLast;
-    // [full] holds back a take at the limit, and a finish needs a take
+    final slotNext = take | (slotValid & ~sp.reqReady);
+    // [ready] holds back a take at the limit, and a finish needs a take
     // before it, so the count stays in 0..[scanoutMaxInFlight]. The sim
     // check below stops the run if that breaks.
     final countNext = mux(
@@ -643,15 +658,36 @@ class HarborSdram extends BridgeModule
       count + 1,
       mux(fin & ~take, count - 1, count),
     ).named('scan${i}_in_flight_next');
-    _checkInFlight(clk, rst, i, take & ~fin & full, fin & ~take & count.eq(0));
+    _checkInFlight(
+      clk,
+      rst,
+      i,
+      take & ~fin & count.eq(scanoutMaxInFlight),
+      fin & ~take & count.eq(0),
+    );
     Sequential(clk, [
+      If(
+        ~slotValid,
+        then: [
+          slotAddr < _scanWordAddr(input('scan${i}_rq_addr')),
+          slotWords < input('scan${i}_rq_words'),
+        ],
+      ),
+      rdData < sp.rdData,
       If(
         rst,
         then: [
           count < Const(0, width: cw),
-          full < Const(0),
+          ready < Const(0),
+          slotValid < Const(0),
+          rdValid < Const(0),
         ],
-        orElse: [count < countNext, full < countNext.eq(scanoutMaxInFlight)],
+        orElse: [
+          count < countNext,
+          ready < ~slotNext & countNext.neq(scanoutMaxInFlight),
+          slotValid < slotNext,
+          rdValid < sp.rdValid,
+        ],
       ),
     ]);
   }

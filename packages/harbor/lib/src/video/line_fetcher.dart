@@ -161,9 +161,11 @@ class HarborLineFetcher extends Module {
 /// `rd_data` with no back pressure. A request never crosses an aligned group
 /// of [maxBurst] words, so it never crosses a memory page.
 ///
-/// The `rq_*` outputs come from registers. The fetcher offers the next
-/// request on the cycle after a take, so the port can keep many requests in
-/// flight. Each pair of 16-bit words, low word first, makes one 32-bit line
+/// Every port signal goes straight to or from a register, so the port
+/// can be far from the fetcher. The fetcher sees a take one cycle late and
+/// offers the next request two cycles after it, so `rq_ready` must be low
+/// on the cycle after a take. The data reaches the line buffer one cycle
+/// after `rd_valid`. Each pair of 16-bit words, low word first, makes one 32-bit line
 /// buffer write. The fetcher ignores the low 2 bits of [fetchAddr], so a
 /// line always starts on a 4-byte word. Pulse [fetchStart]
 /// only while [busy] is low. The [words], [fillSel], [busy] and [done] ports
@@ -271,13 +273,13 @@ class HarborScanoutFetcher extends Module {
                 startAddr.getRange(1, 1 + burstBits).zeroExtend(lw))
             .named('to_group_end');
     final firstLen = minOf(total, toGroupEnd).named('first_len');
-    // Every later request starts on a group.
-    final nextLen = minOf(
-      reqLeft,
-      Const(maxBurst, width: lw),
-    ).named('next_len');
-    final take = (valid & rqReady).named('take');
-    final got = (reading & rdValid).named('got');
+    // Every later request starts on a group. The next length comes from a
+    // register: a take acts at least one cycle after req_left changes.
+    final nextLen = Logic(name: 'next_len', width: lw);
+    final take = Logic(name: 'take');
+    final rdValidReg = Logic(name: 'rd_valid_reg');
+    final rdDataReg = Logic(name: 'rd_data_reg', width: 16);
+    final got = (reading & rdValidReg).named('got');
 
     rqValid <= valid;
     rqAddr <= addr;
@@ -295,6 +297,15 @@ class HarborScanoutFetcher extends Module {
     Sequential(clk, [
       doneReg < Const(0),
       wrEnReg < Const(0),
+      take < valid & rqReady,
+      nextLen <
+          mux(
+            reqLeft.getRange(burstBits).eq(0),
+            reqLeft,
+            Const(maxBurst, width: lw),
+          ),
+      rdValidReg < rdValid,
+      rdDataReg < rdData,
       If(
         fetchStart,
         then: [
@@ -326,11 +337,11 @@ class HarborScanoutFetcher extends Module {
                 odd,
                 then: [
                   wrEnReg < Const(1),
-                  wrDataReg < [rdData, low].swizzle(),
+                  wrDataReg < [rdDataReg, low].swizzle(),
                   wrIdxReg < idx,
                   idx < idx + 1,
                 ],
-                orElse: [low < rdData],
+                orElse: [low < rdDataReg],
               ),
               rdLeft < rdLeft - 1,
               If(rdLeft.eq(1), then: [reading < Const(0), doneReg < Const(1)]),
@@ -338,7 +349,15 @@ class HarborScanoutFetcher extends Module {
           ),
         ],
       ),
-      If(reset, then: [reading < Const(0), valid < Const(0)]),
+      If(
+        reset,
+        then: [
+          reading < Const(0),
+          valid < Const(0),
+          take < Const(0),
+          rdValidReg < Const(0),
+        ],
+      ),
     ]);
   }
 }

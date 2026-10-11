@@ -29,6 +29,10 @@ class SdramInitSequencer extends Module {
   /// High once the init sequence has run its last auto refresh.
   Logic get done => output('done');
 
+  /// The value [done] takes after this edge, so a block can keep its own
+  /// copy of [done] with the same timing.
+  Logic get doneNext => output('done_next');
+
   SdramInitSequencer(
     this.cycles, {
     required Logic clk,
@@ -47,6 +51,7 @@ class SdramInitSequencer extends Module {
     addOutput('cmd_ba', width: bankBits);
     addOutput('cke');
     addOutput('done');
+    addOutput('done_next');
 
     const stPowerUp = 0;
     const stCkeHigh = 1;
@@ -81,6 +86,9 @@ class SdramInitSequencer extends Module {
     output('cmd_ba') <= cmdBaReg;
     output('cke') <= ckeReg;
     output('done') <= doneReg;
+    // The sequence stays in stDone until a reset, so this is done_reg's
+    // next value.
+    output('done_next') <= ~reset & st.eq(stDone);
 
     Const nopCode() => Const(SdramCommand.nop.index, width: 3);
 
@@ -89,11 +97,7 @@ class SdramInitSequencer extends Module {
         reset,
         then: [
           st <
-              mux(
-                warm,
-                Const(stWarmPre, width: 4),
-                Const(stPowerUp, width: 4),
-              ),
+              mux(warm, Const(stWarmPre, width: 4), Const(stPowerUp, width: 4)),
           counter < Const(0, width: counterWidth),
           refreshesLeft < Const(cycles.initRefreshes, width: refreshWidth),
           cmdReg < nopCode(),

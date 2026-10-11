@@ -7,7 +7,7 @@ import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
 /// Lines through one [HarborScanoutFetcher] against a port model with a
-/// random `rq_ready` and a read latency. Each job is a start byte address
+/// random `rq_ready`, low after each take, and a read latency. Each job is a start byte address
 /// and a count of 32-bit words. Returns the requests taken for each line.
 Future<List<List<(int, int)>>> _lines(
   List<(int, int)> jobs, {
@@ -42,6 +42,7 @@ Future<List<List<(int, int)>>> _lines(
   final pipe = Queue<(int, int)>();
   var written = <int, int>{};
   var doneSeen = false;
+  var took = false;
   var cycle = 0;
 
   // Everything is driven and sampled on the falling edge, so a value seen
@@ -53,9 +54,11 @@ Future<List<List<(int, int)>>> _lines(
       written[f.wrIdx.value.toInt()] = f.wrData.value.toInt();
     }
     if (f.done.value == LogicValue.one) doneSeen = true;
-    final ready = rng.nextInt(3) != 0;
+    // A port holds rq_ready low on the cycle after a take.
+    final ready = !took && rng.nextInt(3) != 0;
     rqReady.put(ready ? 1 : 0);
-    if (ready && f.rqValid.value == LogicValue.one) {
+    took = ready && f.rqValid.value == LogicValue.one;
+    if (took) {
       final a = f.rqAddr.value.toInt();
       final n = f.rqWords.value.toInt();
       taken.add((a, n));
