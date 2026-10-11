@@ -16,10 +16,17 @@ import 'video_timing.dart';
 /// The system-domain Wishbone master ([mStb] etc.) joins the SoC fabric
 /// directly (no per-word CDC bridge). The clock crossing lives inside the
 /// double line buffer. The master gives the bus back after every
-/// `burstWords` words, see [HarborDualClockScanout]. Emits parallel RGB+sync
-/// (for a VGA-style backend or observation) and the four GPDI lanes. See
-/// [HarborFramebufferDisplay] for the single-clock variant used by the
-/// test-pattern path.
+/// `burstWords` words, see [HarborDualClockScanout]. Give [rqReady],
+/// [rdValid] and [rdData] in place of [mDataIn] and [mAck] to read through a
+/// scanout port (`rq_*`), such as a [HarborSdram] scanout port. Then
+/// [sysClk] and [sysReset] are that port's clock and reset, and the display
+/// ignores the low 2 bits of `fb_base`. [lineStride] is the bytes from one
+/// line to the next, the line size by default. Use
+/// [HarborSdram.scanoutStride] to start each line on a new sdram row.
+///
+/// Emits parallel RGB+sync (for a VGA-style backend or observation) and the
+/// four GPDI lanes. See [HarborFramebufferDisplay] for the single-clock
+/// variant used by the test-pattern path.
 ///
 /// The parallel outputs ([de], [hsync], [vsync], [red], [green], [blue], [x],
 /// [y], [pixelWord]) are registered and aligned with each other. They come
@@ -54,11 +61,19 @@ class HarborDualClockDisplay extends Module {
   Logic get mSel => output('m_sel');
   Logic get mDataOut => output('m_dat_o');
 
+  /// Scanout port requests (system domain).
+  Logic get rqValid => output('rq_valid');
+  Logic get rqAddr => output('rq_addr');
+  Logic get rqWords => output('rq_words');
+
   final HarborDisplayTiming timing;
   final HarborDisplayInterface outputType;
 
   /// Pixel format read from the framebuffer.
   final HarborPixelFormat pixelFormat;
+
+  /// Bytes from the start of one line to the start of the next.
+  final int lineStride;
 
   HarborDualClockDisplay({
     required this.timing,
@@ -70,15 +85,34 @@ class HarborDualClockDisplay extends Module {
     required Logic sysReset,
     required Logic enable,
     required Logic fbBase,
-    required Logic mDataIn,
-    required Logic mAck,
+    Logic? mDataIn,
+    Logic? mAck,
+    Logic? rqReady,
+    Logic? rdValid,
+    Logic? rdData,
+    int? lineStride,
     int burstWords = 16,
     this.outputType = HarborDisplayInterface.hdmi,
     this.pixelFormat = HarborPixelFormat.xrgb8888,
     required HarborDeviceTarget target,
     super.name = 'dual_clock_display',
-  }) : super(definitionName: 'HarborDualClockDisplay') {
+  }) : lineStride = lineStride ?? _lineBytes(timing, pixelFormat),
+       super(
+         definitionName: rqReady != null
+             ? 'HarborDualClockDisplayPort'
+                   '_s${lineStride ?? _lineBytes(timing, pixelFormat)}'
+                   '_w${_lineBytes(timing, pixelFormat) ~/ 4}'
+             : 'HarborDualClockDisplay',
+       ) {
     requireDisplayOutputSupported(outputType);
+    final lineBytes = _lineBytes(timing, pixelFormat);
+    if (this.lineStride < lineBytes || this.lineStride % 4 != 0) {
+      throw ArgumentError.value(
+        this.lineStride,
+        'lineStride',
+        'must be a multiple of 4 and at least the line size $lineBytes',
+      );
+    }
     if (pixelFormat == HarborPixelFormat.rgb888) {
       throw ArgumentError(
         'rgb888 does not fit the 32-bit scanout word layout.',
@@ -99,8 +133,11 @@ class HarborDualClockDisplay extends Module {
     sysReset = addInput('sys_reset', sysReset);
     enable = addInput('enable', enable);
     fbBase = addInput('fb_base', fbBase, width: 32);
-    mDataIn = addInput('m_dat_i', mDataIn, width: 32);
-    mAck = addInput('m_ack', mAck);
+    if (mDataIn != null) mDataIn = addInput('m_dat_i', mDataIn, width: 32);
+    if (mAck != null) mAck = addInput('m_ack', mAck);
+    if (rqReady != null) rqReady = addInput('rq_ready', rqReady);
+    if (rdValid != null) rdValid = addInput('rd_valid', rdValid);
+    if (rdData != null) rdData = addInput('rd_data', rdData, width: 16);
 
     final hbits = (timing.hTotal - 1).bitLength;
     final vbits = (timing.vTotal - 1).bitLength;
@@ -119,12 +156,6 @@ class HarborDualClockDisplay extends Module {
     addOutput('y', width: vbits);
     addOutput('pixel_word', width: 32);
     addOutput('underrun');
-    addOutput('m_stb');
-    addOutput('m_cyc');
-    addOutput('m_we');
-    addOutput('m_adr', width: 32);
-    addOutput('m_sel', width: 4);
-    addOutput('m_dat_o', width: 32);
 
     final timingGen = VideoTimingGenerator(
       timing: timing,
@@ -163,21 +194,30 @@ class HarborDualClockDisplay extends Module {
       lineStart: lineStart,
       col: scanoutCol,
       fbBase: fbBase,
-      stride: Const(timing.hActive * (rgb565 ? 2 : 4), width: 32),
+      stride: Const(this.lineStride, width: 32),
       wordsPerLine: Const(wordsPerLine, width: 16),
       mDataIn: mDataIn,
       mAck: mAck,
+      rqReady: rqReady,
+      rdValid: rdValid,
+      rdData: rdData,
       maxWords: wordsPerLine,
       burstWords: burstWords,
       blockRam: target.blockRam,
     );
 
-    mStb <= scanout.mStb;
-    mCyc <= scanout.mCyc;
-    mWe <= scanout.mWe;
-    mAddr <= scanout.mAddr;
-    mSel <= scanout.mSel;
-    mDataOut <= scanout.mDataOut;
+    if (scanout.scanoutPort) {
+      addOutput('rq_valid') <= scanout.rqValid;
+      addOutput('rq_addr', width: 32) <= scanout.rqAddr;
+      addOutput('rq_words', width: scanout.rqWords.width) <= scanout.rqWords;
+    } else {
+      addOutput('m_stb') <= scanout.mStb;
+      addOutput('m_cyc') <= scanout.mCyc;
+      addOutput('m_we') <= scanout.mWe;
+      addOutput('m_adr', width: 32) <= scanout.mAddr;
+      addOutput('m_sel', width: 4) <= scanout.mSel;
+      addOutput('m_dat_o', width: 32) <= scanout.mDataOut;
+    }
     underrun <= scanout.underrun;
 
     // The line buffer read is registered, so the word comes one cycle after
@@ -242,4 +282,7 @@ class HarborDualClockDisplay extends Module {
       gpdiN <= transmitter.gpdiN;
     }
   }
+
+  static int _lineBytes(HarborDisplayTiming t, HarborPixelFormat f) =>
+      t.hActive * (f == HarborPixelFormat.rgb565 ? 2 : 4);
 }

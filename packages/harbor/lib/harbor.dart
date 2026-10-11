@@ -348,6 +348,7 @@ export 'src/peripherals/sdram_phy_ecp5.dart';
 export 'src/peripherals/sdram_port.dart';
 export 'src/peripherals/sdram_timing.dart';
 export 'src/peripherals/sdram_wishbone_port.dart';
+export 'src/peripherals/sim_dram.dart';
 export 'src/peripherals/device_register.dart';
 export 'src/peripherals/display.dart';
 export 'src/peripherals/dma.dart';

@@ -111,9 +111,9 @@ class SdramPortInterface extends PairInterface {
   );
 }
 
-/// One arbiter port: its name, used as the prefix of its signal names, and
-/// its largest request. [SdramArbiter] stops the simulation if the port
-/// sends a larger request.
+/// One arbiter port: its name, used as the prefix of its signal names, its
+/// largest request and its class. [SdramArbiter] stops the simulation if
+/// the port sends a larger request.
 class HarborSdramPortConfig {
   /// Name used in logic and signal names for this port.
   final String name;
@@ -121,7 +121,20 @@ class HarborSdramPortConfig {
   /// Largest request this port may send, in words.
   final int maxGrantWords;
 
-  const HarborSdramPortConfig({required this.name, this.maxGrantWords = 8});
+  /// A realtime port wins against every best effort port at each grant
+  /// point. It never takes a grant that was already given.
+  final bool realtime;
+
+  /// False for a port with its own reset, such as a scanout port. Then the
+  /// arbiter and engine `abort` keep its reads.
+  final bool abortable;
+
+  const HarborSdramPortConfig({
+    required this.name,
+    this.maxGrantWords = 8,
+    this.realtime = false,
+    this.abortable = true,
+  });
 }
 
 /// Smallest bit width that indexes `0 .. n - 1`.
@@ -130,6 +143,14 @@ int _arbiterIndexWidth(int n) => n <= 1 ? 1 : (n - 1).bitLength;
 /// Round robin arbiter in front of [SdramEngine]. [ports] is the list of
 /// client ports, [engine] is the single port the engine sees.
 ///
+/// A grant point is a cycle where the request register can load. There,
+/// a waiting realtime port ([HarborSdramPortConfig.realtime]) wins against
+/// every best effort port, and round robin picks inside each class. A
+/// request that has been taken always runs. Nothing preempts it. A best
+/// effort port can wait as long as realtime ports keep a request ready, so
+/// a realtime client must limit its own load, as [HarborSdram] does for
+/// its scanout ports.
+///
 /// Every signal the arbiter drives into [engine] comes straight from a
 /// register: the winning request is latched into a one-entry request
 /// register, and write words go through a 4-word buffer that is filled
@@ -137,9 +158,10 @@ int _arbiterIndexWidth(int n) => n <= 1 ? 1 : (n - 1).bitLength;
 /// `req_ready`, `rd_valid`, `rd_data`, `rd_last` and `rd_port` outputs
 /// are only muxed and demuxed toward the clients.
 ///
-/// `abort` is the bus side reset. It drops a held read request only. Taken
-/// writes stay in the request register, the write queue and the buffer,
-/// and still drain to the engine.
+/// `abort` is the bus side reset. It drops a held read request of an
+/// abortable port only ([HarborSdramPortConfig.abortable]). Taken writes
+/// stay in the request register, the write queue and the buffer, and still
+/// drain to the engine.
 class SdramArbiter extends Module {
   SdramArbiter({
     required Logic clk,
@@ -202,13 +224,21 @@ class SdramArbiter extends Module {
 
     // --- request arbitration: priority search starting at grant, one
     // mux chain per possible grant value, so grant itself never needs
-    // hardware modulo math ---
+    // hardware modulo math. Realtime ports come first in every chain, so
+    // the class costs no logic. ---
     final grant = Logic(name: 'grant', width: idxWidth);
+
+    List<int> orderFor(int g) {
+      final rotated = [for (var k = 0; k < n; k++) (g + k) % n];
+      return [
+        ...rotated.where((i) => configs[i].realtime),
+        ...rotated.where((i) => !configs[i].realtime),
+      ];
+    }
 
     Logic selFor(int g) {
       Logic v = Const(0, width: idxWidth);
-      for (var k = n - 1; k >= 0; k--) {
-        final idx = (g + k) % n;
+      for (final idx in orderFor(g).reversed) {
         v = mux(clients[idx].reqValid, Const(idx, width: idxWidth), v);
       }
       return v;
@@ -216,8 +246,7 @@ class SdramArbiter extends Module {
 
     Logic selValidFor(int g) {
       Logic v = Const(0);
-      for (var k = n - 1; k >= 0; k--) {
-        final idx = (g + k) % n;
+      for (final idx in orderFor(g).reversed) {
         v = mux(clients[idx].reqValid, Const(1), v);
       }
       return v;
@@ -385,6 +414,16 @@ class SdramArbiter extends Module {
       pickBySel([for (final c in clients) c.reqWrite]),
       heldWrite,
     );
+    final keep = [
+      for (var i = 0; i < n; i++)
+        if (!configs[i].abortable) i,
+    ];
+    final heldAbort = keep.isEmpty
+        ? abort
+        : abort &
+              ~[
+                for (final k in keep) mux(loadNow, sel.eq(k), heldPort.eq(k)),
+              ].reduce((x, y) => x | y);
     final out0ValidD = ~fillNext[0];
     final out1ValidD = ~fillNext[0] & ~fillNext[1];
     eng.wrValidD <= mux(reset, Const(0), out0ValidD);
@@ -395,7 +434,7 @@ class SdramArbiter extends Module {
       (grant, mux(loadNow, grantNext, grant), 0),
       (
         heldValid,
-        mux(canLoad, selValid, heldValid) & ~(abort & ~heldWriteNext),
+        mux(canLoad, selValid, heldValid) & ~(heldAbort & ~heldWriteNext),
         0,
       ),
       (heldWrite, heldWriteNext, 0),

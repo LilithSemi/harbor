@@ -28,8 +28,8 @@ import 'sim_dram.dart';
 ///
 ///   bus (sys clk, wishbone B4 32b) -> HarborWishboneCdcFifoBridge 'sdram_cdc'
 ///     and one register stage (both skipped when [busClockSync])
-///     -> SdramWishbonePort -> SdramArbiter
-///     (one port in v1) -> SdramEngine -> SdramPhyEcp5 -> sdram_* pads
+///     -> SdramWishbonePort -> SdramArbiter -> SdramEngine -> SdramPhyEcp5
+///     -> sdram_* pads
 ///
 /// Everything from the wishbone front end down runs on `mem_clk`. The target
 /// must be a Lattice ecp5 or a [HarborSimTarget], which replaces the whole
@@ -44,6 +44,24 @@ import 'sim_dram.dart';
 /// reset. With it true, writes are posted (about 3x faster back to
 /// back), but a posted write still in the clock-crossing fifo is lost on
 /// a bus reset.
+///
+/// A scanout port ([scanoutPorts] is 0 or 1) is a read port for a display,
+/// such as [HarborDualClockDisplay], that joins the arbiter next to the bus
+/// port as a realtime port. It runs on `scan_clk` (`mem_clk`, or `clk` on a
+/// [HarborSimTarget]). Port `i` has `scan<i>_rq_valid`, `scan<i>_rq_addr`
+/// (a byte address in the SoC memory map), `scan<i>_rq_words` and
+/// `scan<i>_rq_ready` for requests, and `scan<i>_rd_valid` and
+/// `scan<i>_rd_data` for the 16-bit words that come back. A request is at
+/// most [scanoutMaxWords] words and must not cross a page. A port has at
+/// most [scanoutMaxInFlight] requests in flight, which bounds the wait of
+/// the bus port, see [busWaitBound]. A bus `reset` drops only the reads of
+/// the bus port. `scan_reset` follows `mem_reset` only (the bus reset on a
+/// [HarborSimTarget] build), and a scanout port client must reset on it.
+///
+/// Two items of the scanout design are not done yet. A page-size CSR would
+/// let software pick a framebuffer stride that starts each line on a new
+/// row. A refresh hint from the display blanking would move refreshes out
+/// of the line fetch, but it adds logic to the command pick.
 class HarborSdram extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -84,6 +102,26 @@ class HarborSdram extends BridgeModule
   /// Bus data width. Only 32 is supported.
   final int busDataWidth;
 
+  /// Number of scanout ports, 0 or 1.
+  final int scanoutPorts;
+
+  /// Requests a scanout port may have in flight, taken and not yet read
+  /// back to the last word, 1 to 3. More can keep the bus port waiting for
+  /// a whole line. With 1, a line streams at about 74 MB/s at 100 MHz and
+  /// 80 MB/s at 125 MHz, which is at or below the 80.5 MB/s of a 640x480
+  /// 32 bpp display.
+  final int scanoutMaxInFlight;
+
+  /// Largest scanout request, in 16-bit words.
+  static const scanoutMaxWords = 8;
+
+  /// Bus cycles from a read strobe to its ack on a [HarborSimTarget] build.
+  /// [HarborSimDram.latencyFor] gives the cost of the real controller.
+  final int simReadLatency;
+
+  /// Bus cycles from a write strobe to its ack on a [HarborSimTarget] build.
+  final int simWriteLatency;
+
   /// Bus slave port, wishbone, `clk`/`reset`.
   late final BusSlavePort bus;
 
@@ -111,10 +149,39 @@ class HarborSdram extends BridgeModule
     this.postedWrites = false,
     int? busAddressWidth,
     this.busDataWidth = 32,
+    this.scanoutPorts = 0,
+    this.scanoutMaxInFlight = 3,
+    this.simReadLatency = 1,
+    this.simWriteLatency = 1,
     super.name = 'sdram',
   }) : super('HarborSdram') {
     if (busDataWidth != 32) {
       throw ArgumentError('HarborSdram needs a 32-bit bus, got $busDataWidth');
+    }
+    if (scanoutPorts < 0) {
+      throw ArgumentError.value(scanoutPorts, 'scanoutPorts', 'must be 0 or 1');
+    }
+    if (scanoutPorts > 1) {
+      throw ArgumentError.value(
+        scanoutPorts,
+        'scanoutPorts',
+        'multiple scanout ports are not supported yet, the bus wait bound '
+            'holds for one port only',
+      );
+    }
+    if (scanoutMaxInFlight < 1 || scanoutMaxInFlight > 3) {
+      throw ArgumentError.value(
+        scanoutMaxInFlight,
+        'scanoutMaxInFlight',
+        'must be 1..3, more can keep the bus port waiting for a whole line',
+      );
+    }
+    if (scanoutPorts > 0 && baseAddress % config.sizeBytes != 0) {
+      throw ArgumentError.value(
+        baseAddress,
+        'baseAddress',
+        'must be aligned to the sdram size for scanout ports',
+      );
     }
 
     final clk = addInput('clk', Logic());
@@ -141,6 +208,7 @@ class HarborSdram extends BridgeModule
           : null,
     );
 
+    _addScanPorts();
     if (target is HarborSimTarget) {
       _buildSim(clk, reset, busAW);
       return;
@@ -182,6 +250,9 @@ class HarborSdram extends BridgeModule
       dataWidth: busDataWidth,
       words: words,
       byteSize: config.sizeBytes,
+      readLatency: simReadLatency,
+      writeLatency: simWriteLatency,
+      scanoutPorts: scanoutPorts,
     );
     addSubModule(dram);
     dram.input('clk').srcConnection! <= clk;
@@ -194,7 +265,38 @@ class HarborSdram extends BridgeModule
     bus.ack <= dram.output('ack');
     bus.dataOut <= dram.output('dat_r');
     addOutput('bus_error') <= Const(0);
+    if (scanoutPorts == 0) return;
+    addOutput('scan_clk') <= clk;
+    addOutput('scan_reset') <= reset;
+    for (var i = 0; i < scanoutPorts; i++) {
+      dram.input('scan${i}_rq_valid').srcConnection! <=
+          input('scan${i}_rq_valid');
+      dram.input('scan${i}_rq_addr').srcConnection! <=
+          _scanWordAddr(input('scan${i}_rq_addr'));
+      dram.input('scan${i}_rq_words').srcConnection! <=
+          input('scan${i}_rq_words');
+      output('scan${i}_rq_ready') <= dram.output('scan${i}_rq_ready');
+      output('scan${i}_rd_valid') <= dram.output('scan${i}_rd_valid');
+      output('scan${i}_rd_data') <= dram.output('scan${i}_rd_data');
+    }
   }
+
+  /// Adds the scanout port pins.
+  void _addScanPorts() {
+    for (var i = 0; i < scanoutPorts; i++) {
+      addInput('scan${i}_rq_valid', Logic());
+      addInput('scan${i}_rq_addr', Logic(width: 32), width: 32);
+      addInput('scan${i}_rq_words', Logic(width: 4), width: 4);
+      addOutput('scan${i}_rq_ready');
+      addOutput('scan${i}_rd_valid');
+      addOutput('scan${i}_rd_data', width: 16);
+    }
+  }
+
+  /// The 16-bit word address of a scanout byte address. The base is aligned
+  /// to the size, so the low bits are the offset.
+  Logic _scanWordAddr(Logic byteAddr) =>
+      byteAddr.getRange(1, 1 + config.wordAddrWidth);
 
   /// Full stack build: wishbone front end -> arbiter -> engine -> ecp5 phy.
   void _build(
@@ -226,6 +328,7 @@ class HarborSdram extends BridgeModule
     final wbReset = localReset('wb');
     final arbiterReset = localReset('arbiter');
     final engineReset = localReset('engine');
+    final engineDataReset = localReset('engine_data');
     final timersReset = localReset('timers');
     final phyReset = localReset('phy');
     // The true power-on reset, synced into mem_clk, separate from a later
@@ -358,10 +461,25 @@ class HarborSdram extends BridgeModule
       cdc.input('m_dat_r').srcConnection! <= wbPort.datR;
     }
 
+    final scanPorts = [
+      for (var i = 0; i < scanoutPorts; i++)
+        SdramPortInterface(addrWidth: config.wordAddrWidth, wordsWidth: 4),
+    ];
+    if (scanoutPorts > 0) {
+      // The bus reset keeps scanout reads, so only mem_reset resets the
+      // scanout side.
+      final scanReset = localReset('scan');
+      addOutput('scan_clk') <= memClk;
+      addOutput('scan_reset') <= scanReset;
+      for (var i = 0; i < scanoutPorts; i++) {
+        _buildScanPort(i, memClk, scanReset, scanPorts[i]);
+      }
+    }
+
     final enginePort = SdramPortInterface(
       addrWidth: config.wordAddrWidth,
       wordsWidth: clientPort.wordsWidth,
-      portIdWidth: 1,
+      portIdWidth: scanoutPorts.bitLength.clamp(1, 3),
       wrLookahead: true,
     );
 
@@ -380,6 +498,8 @@ class HarborSdram extends BridgeModule
       cycles,
       clk: memClk,
       reset: engineReset,
+      dataReset: engineDataReset,
+      keepReadsOnAbort: {for (var i = 1; i <= scanoutPorts; i++) i},
       abort: engineAbort,
       abortNext: abortNext,
       coldReset: coldReset,
@@ -394,8 +514,17 @@ class HarborSdram extends BridgeModule
       clk: memClk,
       reset: arbiterReset,
       abort: frontReset,
-      ports: [clientPort],
-      configs: const [HarborSdramPortConfig(name: 'wishbone')],
+      ports: [clientPort, ...scanPorts],
+      configs: [
+        const HarborSdramPortConfig(name: 'wishbone'),
+        for (var i = 0; i < scanoutPorts; i++)
+          HarborSdramPortConfig(
+            name: 'scan$i',
+            maxGrantWords: scanoutMaxWords,
+            realtime: true,
+            abortable: false,
+          ),
+      ],
       engine: enginePort,
     );
 
@@ -435,6 +564,117 @@ class HarborSdram extends BridgeModule
     output('sdram_addr') <= phyInst.oSdramAddr;
     output('sdram_dqm') <= phyInst.oSdramDqm;
     output('init_done') <= engineInst.initDone;
+  }
+
+  /// Bytes from one line to the next for a line of [lineBytes]: the line
+  /// size rounded up to a page, so every line starts on a new row.
+  int scanoutStride(int lineBytes) =>
+      (lineBytes + config.pageBytes - 1) ~/ config.pageBytes * config.pageBytes;
+
+  /// The most `mem_clk` cycles one request of up to [words] words keeps the
+  /// engine busy: a row miss after a write in the same bank, with the bus
+  /// turned around after a read.
+  static int entryCycles(HarborSdramCycles c, int words) {
+    final open = c.rcd + words;
+    return c.rp + (open > c.rasMin ? open : c.rasMin) + c.wr + c.casLatency + 2;
+  }
+
+  /// The most `mem_clk` cycles a forced refresh and a row age precharge add
+  /// between two requests.
+  static int refreshCycles(HarborSdramCycles c) => 2 * c.rp + c.rfc;
+
+  /// The longest wait of a realtime request at the arbiter, in `mem_clk`
+  /// cycles, from `req_valid` up to the take: the request in progress, a
+  /// refresh and the arbiter and engine registers.
+  static int realtimeWaitBound(HarborSdramCycles c) =>
+      entryCycles(c, scanoutMaxWords) + refreshCycles(c) + 3;
+
+  /// The longest wait of a best effort request at the arbiter, in `mem_clk`
+  /// cycles, with one realtime port that keeps at most [maxInFlight]
+  /// requests in flight, 1 to 3.
+  ///
+  /// The request waits for the entry ahead of it and for one entry per
+  /// realtime win. The realtime port wins at most [maxInFlight] grant points
+  /// in a row, because its oldest read is still in flight at the next one.
+  /// At 3, a forced refresh or row age precharge can let that read finish
+  /// first, so each of the two stalls can add one more win and one entry.
+  /// The last term covers the registers and the short grant gaps after a
+  /// stall.
+  static int bestEffortWaitBound(HarborSdramCycles c, int maxInFlight) {
+    if (maxInFlight < 1 || maxInFlight > 3) {
+      throw ArgumentError.value(maxInFlight, 'maxInFlight', 'must be 1..3');
+    }
+    final entries = maxInFlight + 1 + (maxInFlight == 3 ? 2 : 0);
+    return entries * entryCycles(c, scanoutMaxWords) + refreshCycles(c) + 9;
+  }
+
+  /// [realtimeWaitBound] for this controller.
+  int get scanoutWaitBound => realtimeWaitBound(cycles);
+
+  /// [bestEffortWaitBound] for the bus port of this controller, in
+  /// `mem_clk` cycles. It adds to the bus access time with no scanout.
+  int get busWaitBound => bestEffortWaitBound(cycles, scanoutMaxInFlight);
+
+  /// Joins scanout port [i] to [sp], an arbiter port. A request is held back
+  /// while [scanoutMaxInFlight] requests are in flight, so the bus port gets
+  /// the grant points between them.
+  void _buildScanPort(int i, Logic clk, Logic rst, SdramPortInterface sp) {
+    final cw = scanoutMaxInFlight.bitLength;
+    final count = Logic(name: 'scan${i}_in_flight', width: cw);
+    final full = Logic(name: 'scan${i}_full');
+    sp.reqValid <= input('scan${i}_rq_valid') & ~full;
+    sp.reqWrite <= Const(0);
+    sp.reqAddr <= _scanWordAddr(input('scan${i}_rq_addr'));
+    sp.reqWords <= input('scan${i}_rq_words');
+    sp.wrValid <= Const(0);
+    sp.wrData <= Const(0, width: 16);
+    sp.wrMask <= Const(0, width: 2);
+    output('scan${i}_rq_ready') <= sp.reqReady;
+    output('scan${i}_rd_valid') <= sp.rdValid;
+    output('scan${i}_rd_data') <= sp.rdData;
+
+    final take = sp.reqValid & sp.reqReady;
+    final fin = sp.rdValid & sp.rdLast;
+    // [full] holds back a take at the limit, and a finish needs a take
+    // before it, so the count stays in 0..[scanoutMaxInFlight]. The sim
+    // check below stops the run if that breaks.
+    final countNext = mux(
+      take & ~fin,
+      count + 1,
+      mux(fin & ~take, count - 1, count),
+    ).named('scan${i}_in_flight_next');
+    _checkInFlight(clk, rst, i, take & ~fin & full, fin & ~take & count.eq(0));
+    Sequential(clk, [
+      If(
+        rst,
+        then: [
+          count < Const(0, width: cw),
+          full < Const(0),
+        ],
+        orElse: [count < countNext, full < countNext.eq(scanoutMaxInFlight)],
+      ),
+    ]);
+  }
+
+  /// Stops the simulation when the in-flight count of scanout port [i]
+  /// would go past [scanoutMaxInFlight] or below 0.
+  void _checkInFlight(Logic clk, Logic rst, int i, Logic over, Logic under) {
+    clk.glitch.listen((args) {
+      if (!LogicValue.isPosedge(
+            args.previousValue,
+            args.newValue,
+            ignoreInvalid: true,
+          ) ||
+          rst.value != LogicValue.zero) {
+        return;
+      }
+      if (over.value == LogicValue.one || under.value == LogicValue.one) {
+        Simulator.throwException(
+          Exception('scanout port $i in-flight count out of range'),
+          StackTrace.current,
+        );
+      }
+    });
   }
 
   /// Asserts with [rst] at once and releases it on a [clk] edge.

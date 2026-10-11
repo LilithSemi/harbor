@@ -64,7 +64,8 @@ class _Entry {
 ///
 /// `abort` is the bus side reset: it drops queued reads and in-flight read
 /// data, but queued writes still run and init, refresh and bank state
-/// keep going, so the sdram keeps its contents.
+/// keep going, so the sdram keeps its contents. It keeps the reads of the
+/// ports in `keepReadsOnAbort`, which have their own reset.
 class SdramEngine extends Module {
   final HarborSdramConfig config;
   final HarborSdramCycles cycles;
@@ -111,6 +112,8 @@ class SdramEngine extends Module {
     Logic? abortNext,
     Logic? coldReset,
     Logic? timersReset,
+    Logic? dataReset,
+    Set<int> keepReadsOnAbort = const {},
     int maxGrantWords = 8,
     int pullInIdleCycles = 16,
     String name = 'sdram_engine',
@@ -126,6 +129,8 @@ class SdramEngine extends Module {
          abortNext: abortNext,
          coldReset: coldReset,
          timersReset: timersReset,
+         dataReset: dataReset,
+         keepReadsOnAbort: keepReadsOnAbort,
          maxGrantWords: maxGrantWords,
          pullInIdleCycles: pullInIdleCycles,
          rowAgeGuard: true,
@@ -144,6 +149,8 @@ class SdramEngine extends Module {
     required Logic? abortNext,
     required Logic? coldReset,
     required Logic? timersReset,
+    required Logic? dataReset,
+    required Set<int> keepReadsOnAbort,
     required this.maxGrantWords,
     required this.pullInIdleCycles,
     required this.rowAgeGuard,
@@ -212,6 +219,9 @@ class SdramEngine extends Module {
       'timers_reset',
       timersReset ?? externalReset,
     );
+    // A copy of [reset] for the command, entry and read return registers.
+    // It must assert and release with [reset].
+    final dataResetSig = addInput('data_reset', dataReset ?? externalReset);
     if (!port.wrLookahead) {
       throw ArgumentError('the engine port needs wrLookahead');
     }
@@ -224,6 +234,11 @@ class SdramEngine extends Module {
 
     final remW = port.wordsWidth < 4 ? 4 : port.wordsWidth;
     final portW = port.portIdWidth;
+    // The abort for a read of port [p]: low for a port that keeps its reads.
+    final keep = keepReadsOnAbort.where((k) => k < (1 << portW)).toList();
+    Logic abortFor(Logic a, Logic p) => keep.isEmpty
+        ? a
+        : a & ~[for (final k in keep) p.eq(k)].reduce((x, y) => x | y);
 
     final phyCkeR = Logic(name: 'phy_cke_r');
     final phyCsNR = Logic(name: 'phy_cs_n_r');
@@ -417,8 +432,12 @@ class SdramEngine extends Module {
     final writeIssue = (selCurCol & cur.write).named('write_issue');
     // An abort drops queued reads at the next edge, so none is picked.
     // Given [abortNextSig], cur_go and la_base hold this.
-    final curKeep = abortNextSig == null ? ~(abort & ~cur.write) : Const(1);
-    final laKeep = abortNextSig == null ? ~(abort & ~la.write) : Const(1);
+    final curKeep = abortNextSig == null
+        ? ~(abortFor(abort, cur.port) & ~cur.write)
+        : Const(1);
+    final laKeep = abortNextSig == null
+        ? ~(abortFor(abort, la.port) & ~la.write)
+        : Const(1);
     // Registers loaded with the pick, so the select reads flops only.
     // cur_free: the entry state is up to date for cur.
     // cur_free_act: cur_free, and la picked no activate.
@@ -615,6 +634,7 @@ class SdramEngine extends Module {
     final curFinish = selCurCol & cur.fin;
     final Logic abortIn = abort;
     final laFieldsNext = [...la.fields.sublist(0, 9), laHitNext, laMissNext];
+    final portIdx = cur.fields.indexOf(cur.port);
 
     // The entry state after this edge for one value of [curFinish]. Both
     // cases come from registers and the late [curFinish] only selects
@@ -651,8 +671,8 @@ class SdramEngine extends Module {
         laN.add(mux(accept, inFields[i], keep));
       }
       // An abort drops a queued read but keeps a queued write.
-      curN[0] = curN[0] & ~(abortIn & ~curN[1]);
-      laN[0] = laN[0] & ~(abortIn & ~laN[1]);
+      curN[0] = curN[0] & ~(abortFor(abortIn, curN[portIdx]) & ~curN[1]);
+      laN[0] = laN[0] & ~(abortFor(abortIn, laN[portIdx]) & ~laN[1]);
       return (cur: curN, la: laN, promote: promote);
     }
 
@@ -819,17 +839,17 @@ class SdramEngine extends Module {
     lastBeatsNext <= mux(pickRead, pickBeats, Const(0, width: 4));
 
     // These read the next valid bits, so they are split on [curFinish] too.
-    Logic keepNext(Logic write) =>
-        abortNextSig == null ? Const(1) : ~(abortNextSig & ~write);
+    Logic keepNext(Logic write, Logic p) =>
+        abortNextSig == null ? Const(1) : ~(abortFor(abortNextSig, p) & ~write);
     Logic goFor(({List<Logic> cur, List<Logic> la, Logic promote}) e) =>
-        e.cur[0] & ~holdNext & keepNext(e.cur[1]);
+        e.cur[0] & ~holdNext & keepNext(e.cur[1], e.cur[portIdx]);
     Logic laBaseFor(({List<Logic> cur, List<Logic> la, Logic promote}) e) =>
         ~holdNext &
         e.la[0] &
         ~accept &
         ~(laSameBankNext & e.cur[0]) &
         ~forceAnyNext &
-        keepNext(e.la[1]);
+        keepNext(e.la[1], e.la[portIdx]);
     final wrValidNowNext = mux(writeIssue, port.wrNextValidD, port.wrValidD);
     final wrMoreNext = mux(writeIssue, port.wrNext2ValidD, port.wrNextValidD);
     final curFreeNext = ~(curAny | pickPreAll | pickRef);
@@ -905,18 +925,58 @@ class SdramEngine extends Module {
         (bankOpen[b], bankOpenNext[b], 0),
         (openRow[b], openRowNext[b], 0),
       ],
-      (pipeValid[0], pipe0ValidNext & ~abort, 0),
+      (pipeValid[0], pipe0ValidNext & ~abortFor(abort, pipe0PortNext), 0),
       (pipeLast[0], pipe0LastNext, 0),
       (pipePort[0], pipe0PortNext, 0),
       for (var i = 1; i < pipeDepth; i++) ...[
-        (pipeValid[i], pipeValid[i - 1] & ~abort, 0),
+        (pipeValid[i], pipeValid[i - 1] & ~abortFor(abort, pipePort[i - 1]), 0),
         (pipeLast[i], pipeLast[i - 1], 0),
         (pipePort[i], pipePort[i - 1], 0),
       ],
-      (genLeft, mux(abort, Const(0, width: 4), genLeftNext), 0),
+      (
+        genLeft,
+        mux(abortFor(abort, genPortNext), Const(0, width: 4), genLeftNext),
+        0,
+      ),
       (genFin, genFinNext, 0),
       (genPort, genPortNext, 0),
     ];
+
+    // The command, entry and read return registers reset on [dataResetSig],
+    // so neither reset net carries every flop in the engine.
+    final dataRegs = {
+      phyCsNR,
+      phyRasNR,
+      phyCasNR,
+      phyWeNR,
+      phyBaR,
+      phyAddrR,
+      phyDqmR,
+      phyDqOutR,
+      phyDqOeR,
+      wrTook,
+      ...cur.fields,
+      ...la.fields,
+      ...pipeValid,
+      ...pipeLast,
+      ...pipePort,
+      genLeft,
+      genFin,
+      genPort,
+    };
+    List<Conditional> resetOrNext(Logic rst, bool data) {
+      final rs = [
+        for (final r in regs)
+          if (dataRegs.contains(r.$1) == data) r,
+      ];
+      return [
+        If(
+          rst,
+          then: [for (final r in rs) r.$1 < Const(r.$3, width: r.$1.width)],
+          orElse: [for (final r in rs) r.$1 < r.$2],
+        ),
+      ];
+    }
 
     Sequential(clk, [
       If(
@@ -926,10 +986,11 @@ class SdramEngine extends Module {
           // still be open, so cke must stay high through [reset] and into
           // the init sequencer's own precharge, not drop at once.
           phyCkeR < mux(warmReset, Const(1), Const(0)),
-          for (final r in regs) r.$1 < Const(r.$3, width: r.$1.width),
         ],
-        orElse: [phyCkeR < init.cke, for (final r in regs) r.$1 < r.$2],
+        orElse: [phyCkeR < init.cke],
       ),
+      ...resetOrNext(reset, false),
+      ...resetOrNext(dataResetSig, true),
     ]);
   }
 
@@ -1001,6 +1062,8 @@ SdramEngine debugSdramEngineWithoutRowAgeGuard(
   abortNext: null,
   coldReset: coldReset,
   timersReset: null,
+  dataReset: null,
+  keepReadsOnAbort: const {},
   maxGrantWords: maxGrantWords,
   pullInIdleCycles: pullInIdleCycles,
   rowAgeGuard: false,

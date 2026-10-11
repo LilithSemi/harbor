@@ -67,7 +67,7 @@ void main() {
           ...sdramPins,
         ],
       );
-      final top = SdramUlx3sTop(target: target);
+      final top = SdramUlx3sTop(target: target, scanout: true);
       await top.build();
 
       final dir = Directory.systemTemp.createTempSync('harbor_sdram_pnr_');

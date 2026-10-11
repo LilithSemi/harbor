@@ -151,3 +151,194 @@ class HarborLineFetcher extends Module {
     ]);
   }
 }
+
+/// Line fetcher for a read port that bursts, such as a [HarborSdram]
+/// scanout port.
+///
+/// The port carries 16-bit words. A request asks for `rq_words` of them
+/// from the byte address `rq_addr` and is taken on a cycle with `rq_valid`
+/// and `rq_ready` high. The data comes back in order on `rd_valid` and
+/// `rd_data` with no back pressure. A request never crosses an aligned group
+/// of [maxBurst] words, so it never crosses a memory page.
+///
+/// The `rq_*` outputs come from registers. The fetcher offers the next
+/// request on the cycle after a take, so the port can keep many requests in
+/// flight. Each pair of 16-bit words, low word first, makes one 32-bit line
+/// buffer write. The fetcher ignores the low 2 bits of [fetchAddr], so a
+/// line always starts on a 4-byte word. Pulse [fetchStart]
+/// only while [busy] is low. The [words], [fillSel], [busy] and [done] ports
+/// work as in [HarborLineFetcher].
+class HarborScanoutFetcher extends Module {
+  Logic get rqValid => output('rq_valid');
+  Logic get rqAddr => output('rq_addr');
+  Logic get rqWords => output('rq_words');
+
+  /// Line-buffer write stream.
+  Logic get wrEn => output('wr_en');
+  Logic get wrSel => output('wr_sel');
+  Logic get wrIdx => output('wr_idx');
+  Logic get wrData => output('wr_data');
+
+  /// High from the start of a line until its last word is back.
+  Logic get busy => output('busy');
+
+  /// Pulses for one cycle when a line finishes.
+  Logic get done => output('done');
+
+  final int maxWords;
+
+  /// Largest request in 16-bit words, a power of two.
+  final int maxBurst;
+
+  /// Width of `rq_words`.
+  static const rqWordsWidth = 4;
+
+  HarborScanoutFetcher({
+    required Logic clk,
+    required Logic reset,
+    required Logic fetchStart,
+    required Logic fetchAddr,
+    required Logic words,
+    required Logic fillSel,
+    required Logic rqReady,
+    required Logic rdValid,
+    required Logic rdData,
+    this.maxWords = 1024,
+    this.maxBurst = 8,
+    super.name = 'scanout_fetcher',
+  }) : super(definitionName: 'HarborScanoutFetcher_b${maxBurst}_w$maxWords') {
+    if (maxBurst < 2 ||
+        (maxBurst & (maxBurst - 1)) != 0 ||
+        maxBurst >= (1 << rqWordsWidth)) {
+      throw ArgumentError.value(
+        maxBurst,
+        'maxBurst',
+        'must be a power of two from 2 to ${1 << (rqWordsWidth - 1)}',
+      );
+    }
+    final idxW = (maxWords - 1).bitLength < 1 ? 1 : (maxWords - 1).bitLength;
+
+    clk = addInput('clk', clk);
+    reset = addInput('reset', reset);
+    fetchStart = addInput('fetch_start', fetchStart);
+    fetchAddr = addInput('fetch_addr', fetchAddr, width: 32);
+    words = addInput('words', words, width: 16);
+    fillSel = addInput('fill_sel', fillSel);
+    rqReady = addInput('rq_ready', rqReady);
+    rdValid = addInput('rd_valid', rdValid);
+    rdData = addInput('rd_data', rdData, width: 16);
+
+    addOutput('rq_valid');
+    addOutput('rq_addr', width: 32);
+    addOutput('rq_words', width: rqWordsWidth);
+    addOutput('wr_en');
+    addOutput('wr_sel');
+    addOutput('wr_idx', width: idxW);
+    addOutput('wr_data', width: 32);
+    addOutput('busy');
+    addOutput('done');
+
+    const lw = 17;
+    final burstBits = maxBurst.bitLength - 1;
+
+    final reading = Logic(name: 'reading');
+    final fillReg = Logic(name: 'fill_reg');
+    final doneReg = Logic(name: 'done_reg');
+    // The request on offer, and the 16-bit words after it.
+    final valid = Logic(name: 'rq_valid_reg');
+    final addr = Logic(name: 'addr', width: 32);
+    final len = Logic(name: 'len', width: rqWordsWidth);
+    final reqLeft = Logic(name: 'req_left', width: lw);
+    // 16-bit words not yet back, and the low half of a pair.
+    final rdLeft = Logic(name: 'rd_left', width: lw);
+    final odd = Logic(name: 'odd');
+    final low = Logic(name: 'low', width: 16);
+    final idx = Logic(name: 'idx', width: idxW);
+    final wrEnReg = Logic(name: 'wr_en_reg');
+    final wrDataReg = Logic(name: 'wr_data_reg', width: 32);
+    final wrIdxReg = Logic(name: 'wr_idx_reg', width: idxW);
+
+    Logic minOf(Logic a, Logic b) => mux(a.lt(b), a, b);
+
+    final startAddr = [
+      fetchAddr.getRange(2),
+      Const(0, width: 2),
+    ].swizzle().named('start_addr');
+    // The first request runs to the end of its group.
+    final total = [words, Const(0)].swizzle().named('total');
+    final toGroupEnd =
+        (Const(maxBurst, width: lw) -
+                startAddr.getRange(1, 1 + burstBits).zeroExtend(lw))
+            .named('to_group_end');
+    final firstLen = minOf(total, toGroupEnd).named('first_len');
+    // Every later request starts on a group.
+    final nextLen = minOf(
+      reqLeft,
+      Const(maxBurst, width: lw),
+    ).named('next_len');
+    final take = (valid & rqReady).named('take');
+    final got = (reading & rdValid).named('got');
+
+    rqValid <= valid;
+    rqAddr <= addr;
+    rqWords <= len;
+    wrEn <= wrEnReg;
+    wrSel <= fillReg;
+    wrIdx <= wrIdxReg;
+    wrData <= wrDataReg;
+    busy <= reading;
+    done <= doneReg;
+
+    // Only the control flops reset, so the reset net stays small. A start
+    // loads the data flops straight from fetch_start, so a synthesis tool
+    // that turns a constant load into a set or reset uses that flop.
+    Sequential(clk, [
+      doneReg < Const(0),
+      wrEnReg < Const(0),
+      If(
+        fetchStart,
+        then: [
+          addr < startAddr,
+          len < firstLen.getRange(0, rqWordsWidth),
+          valid < words.neq(0),
+          reqLeft < total - firstLen,
+          rdLeft < total,
+          idx < Const(0, width: idxW),
+          odd < Const(0),
+          fillReg < fillSel,
+          reading < words.neq(0),
+        ],
+        orElse: [
+          If(
+            take,
+            then: [
+              addr < addr + [len, Const(0)].swizzle().zeroExtend(32),
+              len < nextLen.getRange(0, rqWordsWidth),
+              valid < reqLeft.neq(0),
+              reqLeft < reqLeft - nextLen,
+            ],
+          ),
+          If(
+            got,
+            then: [
+              odd < ~odd,
+              If(
+                odd,
+                then: [
+                  wrEnReg < Const(1),
+                  wrDataReg < [rdData, low].swizzle(),
+                  wrIdxReg < idx,
+                  idx < idx + 1,
+                ],
+                orElse: [low < rdData],
+              ),
+              rdLeft < rdLeft - 1,
+              If(rdLeft.eq(1), then: [reading < Const(0), doneReg < Const(1)]),
+            ],
+          ),
+        ],
+      ),
+      If(reset, then: [reading < Const(0), valid < Const(0)]),
+    ]);
+  }
+}

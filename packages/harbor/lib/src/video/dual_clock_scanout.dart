@@ -20,8 +20,13 @@ import 'line_fetcher.dart';
 /// line had not completed by the swap.
 ///
 /// [pixel] is registered: it is the word at the [col] of the cycle before.
-/// The fetcher gives the bus back after every [burstWords] words, see
-/// [HarborLineFetcher].
+/// The system side reads memory through one of two ports. Give [mDataIn]
+/// and [mAck] for a Wishbone master (`m_*`, a [HarborLineFetcher]), which
+/// gives the bus back after every [burstWords] words. Give [rqReady],
+/// [rdValid] and [rdData] for a scanout port (`rq_*`, a
+/// [HarborScanoutFetcher]), such as a [HarborSdram] scanout port. Then
+/// [sysClk] and [sysReset] are the clock and reset of that port, and the
+/// low 2 bits of [fbBase] and [stride] are ignored.
 class HarborDualClockScanout extends Module {
   /// Pixel word for the previous cycle's [col] in the active buffer.
   Logic get pixel => output('pixel');
@@ -36,6 +41,14 @@ class HarborDualClockScanout extends Module {
   Logic get mAddr => output('m_adr');
   Logic get mSel => output('m_sel');
   Logic get mDataOut => output('m_dat_o');
+
+  /// Scanout port requests (system domain).
+  Logic get rqValid => output('rq_valid');
+  Logic get rqAddr => output('rq_addr');
+  Logic get rqWords => output('rq_words');
+
+  /// True when the system side is a scanout port.
+  final bool scanoutPort;
 
   final int maxWords;
 
@@ -56,13 +69,30 @@ class HarborDualClockScanout extends Module {
     required Logic fbBase,
     required Logic stride,
     required Logic wordsPerLine,
-    required Logic mDataIn,
-    required Logic mAck,
+    Logic? mDataIn,
+    Logic? mAck,
+    Logic? rqReady,
+    Logic? rdValid,
+    Logic? rdData,
     this.maxWords = 1024,
     this.burstWords = 16,
     this.blockRam,
     super.name = 'dual_clock_scanout',
-  }) : super(definitionName: 'HarborDualClockScanout') {
+  }) : scanoutPort = rqReady != null,
+       super(
+         definitionName: rqReady != null
+             ? 'HarborDualClockScanoutPort_w$maxWords'
+             : 'HarborDualClockScanout',
+       ) {
+    final wishbone = mDataIn != null && mAck != null;
+    final port = rqReady != null && rdValid != null && rdData != null;
+    if (wishbone == port ||
+        (!wishbone && (mDataIn != null || mAck != null)) ||
+        (!port && (rdValid != null || rdData != null))) {
+      throw ArgumentError(
+        'give either mDataIn and mAck, or rqReady, rdValid and rdData',
+      );
+    }
     pixelClk = addInput('pixel_clk', pixelClk);
     pixelReset = addInput('pixel_reset', pixelReset);
     sysClk = addInput('sys_clk', sysClk);
@@ -72,18 +102,16 @@ class HarborDualClockScanout extends Module {
     col = addInput('col', col, width: col.width);
     fbBase = addInput('fb_base', fbBase, width: 32);
     stride = addInput('stride', stride, width: 32);
+    if (port) {
+      // fb_base can come from a CSR, so a scanout port forces both to whole
+      // 32-bit words.
+      fbBase = [fbBase.getRange(2), Const(0, width: 2)].swizzle();
+      stride = [stride.getRange(2), Const(0, width: 2)].swizzle();
+    }
     wordsPerLine = addInput('words_per_line', wordsPerLine, width: 16);
-    mDataIn = addInput('m_dat_i', mDataIn, width: 32);
-    mAck = addInput('m_ack', mAck);
 
     addOutput('pixel', width: 32);
     addOutput('underrun');
-    addOutput('m_stb');
-    addOutput('m_cyc');
-    addOutput('m_we');
-    addOutput('m_adr', width: 32);
-    addOutput('m_sel', width: 4);
-    addOutput('m_dat_o', width: 32);
 
     final reqToggle = Logic(name: 'req_toggle'); // pixel domain
     final reqAddr = Logic(name: 'req_addr', width: 32); // pixel, quasi-static
@@ -112,24 +140,67 @@ class HarborDualClockScanout extends Module {
     final rPrev = Logic(name: 'r_prev');
     final reqEdge = rSync1 ^ rPrev;
 
-    final fetcher = HarborLineFetcher(
-      clk: sysClk,
-      reset: sysReset,
-      fetchStart: fetchStartReg,
-      fetchAddr: reqAddrLatched,
-      words: wordsPerLine,
-      fillSel: reqFillLatched,
-      mDataIn: mDataIn,
-      mAck: mAck,
-      maxWords: maxWords,
-      burstWords: burstWords,
-    );
+    final Logic fetchDone;
+    final Logic wrEn;
+    final Logic wrSel;
+    final Logic wrIdx;
+    final Logic wrData;
+    if (port) {
+      final f = HarborScanoutFetcher(
+        clk: sysClk,
+        reset: sysReset,
+        fetchStart: fetchStartReg,
+        fetchAddr: reqAddrLatched,
+        words: wordsPerLine,
+        fillSel: reqFillLatched,
+        rqReady: addInput('rq_ready', rqReady),
+        rdValid: addInput('rd_valid', rdValid),
+        rdData: addInput('rd_data', rdData, width: 16),
+        maxWords: maxWords,
+      );
+      addOutput('rq_valid') <= f.rqValid;
+      addOutput('rq_addr', width: 32) <= f.rqAddr;
+      addOutput('rq_words', width: f.rqWords.width) <= f.rqWords;
+      (fetchDone, wrEn, wrSel, wrIdx, wrData) = (
+        f.done,
+        f.wrEn,
+        f.wrSel,
+        f.wrIdx,
+        f.wrData,
+      );
+    } else {
+      final f = HarborLineFetcher(
+        clk: sysClk,
+        reset: sysReset,
+        fetchStart: fetchStartReg,
+        fetchAddr: reqAddrLatched,
+        words: wordsPerLine,
+        fillSel: reqFillLatched,
+        mDataIn: addInput('m_dat_i', mDataIn!, width: 32),
+        mAck: addInput('m_ack', mAck!),
+        maxWords: maxWords,
+        burstWords: burstWords,
+      );
+      addOutput('m_stb') <= f.mStb;
+      addOutput('m_cyc') <= f.mCyc;
+      addOutput('m_we') <= f.mWe;
+      addOutput('m_adr', width: 32) <= f.mAddr;
+      addOutput('m_sel', width: 4) <= f.mSel;
+      addOutput('m_dat_o', width: 32) <= f.mDataOut;
+      (fetchDone, wrEn, wrSel, wrIdx, wrData) = (
+        f.done,
+        f.wrEn,
+        f.wrSel,
+        f.wrIdx,
+        f.wrData,
+      );
+    }
     final buffer = HarborDoubleLineBuffer(
       wrClk: sysClk,
-      wrEn: fetcher.wrEn,
-      wrSel: fetcher.wrSel,
-      wrIdx: fetcher.wrIdx,
-      wrData: fetcher.wrData,
+      wrEn: wrEn,
+      wrSel: wrSel,
+      wrIdx: wrIdx,
+      wrData: wrData,
       rdClk: pixelClk,
       rdReset: pixelReset,
       rdSel: readSel,
@@ -138,12 +209,6 @@ class HarborDualClockScanout extends Module {
       blockRam: blockRam,
     );
 
-    mStb <= fetcher.mStb;
-    mCyc <= fetcher.mCyc;
-    mWe <= fetcher.mWe;
-    mAddr <= fetcher.mAddr;
-    mSel <= fetcher.mSel;
-    mDataOut <= fetcher.mDataOut;
     pixel <= buffer.rdData;
     underrun <= underrunReg;
 
@@ -219,10 +284,7 @@ class HarborDualClockScanout extends Module {
           ),
         ],
         orElse: [
-          If(
-            fetcher.done,
-            then: [doneToggle < ~doneToggle, sysBusy < Const(0)],
-          ),
+          If(fetchDone, then: [doneToggle < ~doneToggle, sysBusy < Const(0)]),
         ],
       ),
     ]);

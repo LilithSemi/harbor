@@ -159,7 +159,9 @@ class SdramBistMaster extends Module {
     Sequential(clk, reset: reset, [
       If(
         ~started,
-        then: [If(readySync, then: [started < 1, cyc < 1])],
+        then: [
+          If(readySync, then: [started < 1, cyc < 1]),
+        ],
         orElse: [
           If(
             cyc & ack,
@@ -169,7 +171,10 @@ class SdramBistMaster extends Module {
               reading < reading ^ last,
               If(
                 last & reading,
-                then: [loops < loops + 1, If(~fail, then: [pass < 1])],
+                then: [
+                  loops < loops + 1,
+                  If(~fail, then: [pass < 1]),
+                ],
               ),
               cyc < 0,
             ],
@@ -186,6 +191,10 @@ class SdramBistMaster extends Module {
 /// One ehxplll makes the 125 MHz sdram clock (clkop) and the 62.5 MHz sys
 /// clock (clkos). A [SdramBistMaster] on sys drives [HarborSdram] through
 /// the cdc. Leds: 0 init done, 1 pass, 2 fail, 7..3 loop count.
+///
+/// With [scanout], a [HarborScanoutFetcher] also reads 640-word lines
+/// without a pause through a scanout port, and led 7 also shows the parity
+/// of the data it reads, so the place and route keeps the port.
 class SdramUlx3sTop extends BridgeModule {
   late final HarborSdram sdram;
   late final HarborClockDomain memDomain;
@@ -195,6 +204,7 @@ class SdramUlx3sTop extends BridgeModule {
     required HarborFpgaTarget target,
     int bistWords = 65536,
     bool bistAddressLineWalk = false,
+    bool scanout = false,
   }) : super('SdramUlx3sTop', name: 'top') {
     createPort('clk', PortDirection.input);
     createPort('rst_n', PortDirection.input);
@@ -223,6 +233,7 @@ class SdramUlx3sTop extends BridgeModule {
       baseAddress: 0,
       clockHz: 125000000,
       target: target,
+      scanoutPorts: scanout ? 1 : 0,
     );
     addSubModule(sdram);
     sdram.input('clk').srcConnection! <= sysDomain.clk;
@@ -247,9 +258,12 @@ class SdramUlx3sTop extends BridgeModule {
     sdram.input('bus_DAT_MOSI').srcConnection! <= bist.datW;
     sdram.input('bus_SEL').srcConnection! <= Const(0xf, width: 4);
 
+    var top = bist.loops[4];
+    if (scanout) top = top ^ _scanParity();
     output('led') <=
         [
-          bist.loops.getRange(0, 5),
+          top,
+          bist.loops.getRange(0, 4),
           bist.fail,
           bist.pass,
           sdram.output('init_done'),
@@ -258,5 +272,36 @@ class SdramUlx3sTop extends BridgeModule {
     for (final p in sdramPadPorts) {
       pullUpPort(sdram.port(p), newPortName: p);
     }
+  }
+
+  /// Streams 640-word lines with a 3072-byte stride from scanout port 0
+  /// and returns the parity of every word read.
+  Logic _scanParity() {
+    final clk = sdram.output('scan_clk');
+    final rst = sdram.output('scan_reset');
+    final start = Logic(name: 'scan_start');
+    final lineAddr = Logic(name: 'scan_line_addr', width: 32);
+    final f = HarborScanoutFetcher(
+      clk: clk,
+      reset: rst,
+      fetchStart: start,
+      fetchAddr: lineAddr,
+      words: Const(640, width: 16),
+      fillSel: Const(0),
+      rqReady: sdram.output('scan0_rq_ready'),
+      rdValid: sdram.output('scan0_rd_valid'),
+      rdData: sdram.output('scan0_rd_data'),
+      maxWords: 640,
+    );
+    sdram.input('scan0_rq_valid').srcConnection! <= f.rqValid;
+    sdram.input('scan0_rq_addr').srcConnection! <= f.rqAddr;
+    sdram.input('scan0_rq_words').srcConnection! <= f.rqWords;
+    final fold = Logic(name: 'scan_fold', width: 32);
+    Sequential(clk, reset: rst, [
+      start < ~f.busy & ~start & sdram.output('init_done'),
+      If(f.done, then: [lineAddr < lineAddr + 3072]),
+      If(f.wrEn, then: [fold < fold ^ f.wrData]),
+    ]);
+    return fold.xor();
   }
 }

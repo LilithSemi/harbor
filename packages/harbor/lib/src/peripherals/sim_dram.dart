@@ -15,6 +15,9 @@ import '../soc/target.dart';
 /// [writeLatency] set the cycles from the strobe to the ack, so a build can
 /// show the per access cost of the real controller. [latencyFor] gives that
 /// cost for a controller clock behind a clock crossing.
+///
+/// [scanoutPorts] adds read ports as on [HarborSdram], on `clk`. Each gives
+/// one 16-bit word a cycle. Their `rq_addr` is a 16-bit word address.
 class HarborSimDram extends BridgeModule with HarborSimLeaf {
   final int addrWidth;
   final int dataWidth;
@@ -27,6 +30,9 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
   /// Bus cycles from a write strobe to its ack.
   final int writeLatency;
 
+  /// Number of scanout read ports.
+  final int scanoutPorts;
+
   HarborSimDram({
     required this.addrWidth,
     required this.dataWidth,
@@ -34,6 +40,7 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     required this.byteSize,
     this.readLatency = 1,
     this.writeLatency = 1,
+    this.scanoutPorts = 0,
   }) : super(
          _definitionName(
            addrWidth: addrWidth,
@@ -41,6 +48,7 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
            words: words,
            readLatency: readLatency,
            writeLatency: writeLatency,
+           scanoutPorts: scanoutPorts,
          ),
          name: 'sim_dram',
          isSystemVerilogLeaf: true,
@@ -62,7 +70,24 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     createPort('sel', PortDirection.input, width: dataWidth ~/ 8);
     addOutput('ack');
     addOutput('dat_r', width: dataWidth);
+    if (scanoutPorts > 0 && dataWidth != 32) {
+      throw ArgumentError('scanout ports need a 32-bit data width');
+    }
+    for (var i = 0; i < scanoutPorts; i++) {
+      createPort('scan${i}_rq_valid', PortDirection.input);
+      createPort(
+        'scan${i}_rq_addr',
+        PortDirection.input,
+        width: _scanAddrWidth,
+      );
+      createPort('scan${i}_rq_words', PortDirection.input, width: 4);
+      addOutput('scan${i}_rq_ready');
+      addOutput('scan${i}_rd_valid');
+      addOutput('scan${i}_rd_data', width: 16);
+    }
   }
+
+  int get _scanAddrWidth => (byteSize - 1).bitLength - 1;
 
   /// The bus cycles of one access to a memory controller that runs on
   /// [memHz] behind a clock crossing from a bus on [busHz]: [crossingCycles]
@@ -86,10 +111,14 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     required int words,
     required int readLatency,
     required int writeLatency,
+    required int scanoutPorts,
   }) {
-    final base = 'harbor_sim_dram_${addrWidth}a${dataWidth}d${words}w';
-    if (readLatency == 1 && writeLatency == 1) return base;
-    return '${base}_r${readLatency}w$writeLatency';
+    var name = 'harbor_sim_dram_${addrWidth}a${dataWidth}d${words}w';
+    if (readLatency != 1 || writeLatency != 1) {
+      name = '${name}_r${readLatency}w$writeLatency';
+    }
+    if (scanoutPorts > 0) name = '${name}_s$scanoutPorts';
+    return name;
   }
 
   @override
@@ -116,7 +145,19 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     b.writeln('  input  logic [${dw - 1}:0] dat_w,');
     b.writeln('  input  logic [${lanes - 1}:0]  sel,');
     b.writeln('  output logic            ack,');
-    b.writeln('  output logic [${dw - 1}:0] dat_r');
+    b.writeln(
+      '  output logic [${dw - 1}:0] dat_r${scanoutPorts > 0 ? ',' : ''}',
+    );
+    final sw = _scanAddrWidth;
+    for (var i = 0; i < scanoutPorts; i++) {
+      final last = i == scanoutPorts - 1;
+      b.writeln('  input  logic            scan${i}_rq_valid,');
+      b.writeln('  input  logic [${sw - 1}:0] scan${i}_rq_addr,');
+      b.writeln('  input  logic [3:0]      scan${i}_rq_words,');
+      b.writeln('  output logic            scan${i}_rq_ready,');
+      b.writeln('  output logic            scan${i}_rd_valid,');
+      b.writeln('  output logic [15:0]     scan${i}_rd_data${last ? '' : ','}');
+    }
     b.writeln(');');
     b.writeln('  // $words words of $dw bits ($byteSize bytes).');
     b.writeln('  logic [${dw - 1}:0] mem [0:${words - 1}];');
@@ -133,6 +174,7 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     b.writeln();
     if (readLatency > 1 || writeLatency > 1) {
       _writeSlowAccess(b, lanes);
+      _writeScanPorts(b);
       b.writeln('endmodule');
       return b.toString();
     }
@@ -156,8 +198,42 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     b.writeln('      dat_r <= mem[widx];');
     b.writeln('    end');
     b.writeln('  end');
+    _writeScanPorts(b);
     b.writeln('endmodule');
     return b.toString();
+  }
+
+  /// One 16-bit word a cycle per scanout port, low half of a word first.
+  void _writeScanPorts(StringBuffer b) {
+    final sw = _scanAddrWidth;
+    for (var i = 0; i < scanoutPorts; i++) {
+      final p = 'scan$i';
+      final word = 'mem[${p}_addr[${sw - 1}:1]]';
+      b.writeln();
+      b.writeln('  // Scanout port $i.');
+      b.writeln('  logic [${sw - 1}:0] ${p}_addr;');
+      b.writeln('  logic [3:0] ${p}_left;');
+      b.writeln("  assign ${p}_rq_ready = ${p}_left <= 4'd1;");
+      b.writeln('  always_ff @(posedge clk) begin');
+      b.writeln('    if (reset) begin');
+      b.writeln("      ${p}_left <= 4'd0;");
+      b.writeln("      ${p}_rd_valid <= 1'b0;");
+      b.writeln('    end else begin');
+      b.writeln("      ${p}_rd_valid <= ${p}_left != 4'd0;");
+      b.writeln(
+        '      ${p}_rd_data <= ${p}_addr[0] ? $word[31:16] : $word[15:0];',
+      );
+      b.writeln("      if (${p}_left != 4'd0) begin");
+      b.writeln("        ${p}_addr <= ${p}_addr + 1'b1;");
+      b.writeln("        ${p}_left <= ${p}_left - 4'd1;");
+      b.writeln('      end');
+      b.writeln('      if (${p}_rq_valid & ${p}_rq_ready) begin');
+      b.writeln('        ${p}_addr <= ${p}_rq_addr;');
+      b.writeln('        ${p}_left <= ${p}_rq_words;');
+      b.writeln('      end');
+      b.writeln('    end');
+      b.writeln('  end');
+    }
   }
 
   /// The access logic with a wait counter: the ack comes [readLatency] or

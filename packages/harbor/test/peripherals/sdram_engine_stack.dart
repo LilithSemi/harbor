@@ -34,6 +34,7 @@ class SdramEngineStackTop extends Module {
     required LogicNet dqPad,
     required int maxGrantWords,
     List<int>? portMaxGrantWords,
+    List<bool>? portRealtime,
     bool rowAgeGuard = true,
     Logic? abort,
     Logic? abortNext,
@@ -123,6 +124,7 @@ class SdramEngineStackTop extends Module {
           HarborSdramPortConfig(
             name: 'p$i',
             maxGrantWords: portMaxGrantWords?[i] ?? maxGrantWords,
+            realtime: portRealtime?[i] ?? false,
           ),
       ],
       engine: enginePort,
@@ -181,6 +183,18 @@ class SdramEngineStack {
 
   /// Per-port request limits for the arbiter, or null for [maxGrantWords].
   final List<int>? portMaxGrantWords;
+
+  /// Realtime ports, see [HarborSdramPortConfig.realtime]. Null for none.
+  final List<bool>? portRealtime;
+
+  /// The longest wait of each port, from `req_valid` up to the cycle the
+  /// arbiter takes the request, in cycles.
+  late final List<int> maxWait = List.filled(ports, 0);
+  late final List<int> _waitFor = List.filled(ports, 0);
+
+  /// Ports of the reads taken and not yet read back, in the order the
+  /// arbiter took them.
+  final Queue<int> _readOrder = Queue();
 
   /// Off only for the row-age negative test: a real build never does this.
   final bool rowAgeGuard;
@@ -241,6 +255,12 @@ class SdramEngineStack {
   /// Requests queued and not done yet, on every port.
   int get pending => _pending;
 
+  /// Reads queued on [port] and not read back yet.
+  int pendingReads(int port) =>
+      _toSend[port].where((r) => !r.write).length +
+      (_pendingReq[port] != null && !_pendingReq[port]!.write ? 1 : 0) +
+      _reads[port].length;
+
   /// Controller cycles since [start] began.
   int get cycle => _cycle;
 
@@ -253,6 +273,7 @@ class SdramEngineStack {
     this.maxGrantWords = 8,
     this.ports = 1,
     this.portMaxGrantWords,
+    this.portRealtime,
     this.rowAgeGuard = true,
     HarborSdramAddressMap map = HarborSdramAddressMap.rowBankCol,
     this.tRasMaxNs,
@@ -336,6 +357,7 @@ class SdramEngineStack {
       dqPad: dqPad,
       maxGrantWords: maxGrantWords,
       portMaxGrantWords: portMaxGrantWords,
+      portRealtime: portRealtime,
       rowAgeGuard: rowAgeGuard,
     );
     await top.build();
@@ -446,6 +468,30 @@ class SdramEngineStack {
     for (var p = 0; p < ports; p++) {
       _samplePort(p);
     }
+    for (var p = 0; p < ports; p++) {
+      if (!waiting[p]) continue;
+      _waitFor[p]++;
+      if (_pendingReq[p] == null) {
+        maxWait[p] = max(maxWait[p], _waitFor[p]);
+        _waitFor[p] = 0;
+      }
+    }
+    // A realtime port that waits must win every grant over a best effort
+    // port.
+    final rt = portRealtime;
+    if (rt != null) {
+      final rtLost = [
+        for (var p = 0; p < ports; p++)
+          if (rt[p] && waiting[p] && _pendingReq[p] != null) p,
+      ];
+      for (var q = 0; q < ports; q++) {
+        if (!rt[q] && waiting[q] && _pendingReq[q] == null) {
+          for (final p in rtLost) {
+            _errors.add('cycle $_cycle: best effort port $q won over $p');
+          }
+        }
+      }
+    }
     // Count the grants other ports get while a port waits.
     for (var p = 0; p < ports; p++) {
       final accepted = waiting[p] && _pendingReq[p] == null;
@@ -472,6 +518,9 @@ class SdramEngineStack {
         _errors.add('cycle $_cycle: port $p rd_valid with no read pending');
       } else {
         final r = _reads[p].first;
+        if (_readOrder.isEmpty || _readOrder.first != p) {
+          _errors.add('cycle $_cycle: port $p read data out of take order');
+        }
         r.got.add(iface.rdData.value.isValid ? iface.rdData.value.toInt() : -1);
         final last = r.got.length == r.words;
         if ((iface.rdLast.value == LogicValue.one) != last) {
@@ -481,6 +530,7 @@ class SdramEngineStack {
         }
         if (last) {
           _reads[p].removeFirst();
+          if (_readOrder.isNotEmpty) _readOrder.removeFirst();
           _finish(r);
         }
       }
@@ -515,7 +565,10 @@ class SdramEngineStack {
     final iface = portIfaces[p];
     final offered = _pendingReq[p];
     if (offered != null && iface.reqReady.value == LogicValue.one) {
-      if (!offered.write) _reads[p].add(offered);
+      if (!offered.write) {
+        _reads[p].add(offered);
+        _readOrder.add(p);
+      }
       _pendingReq[p] = null;
     }
     if (iface.wrReady.value == LogicValue.one) {
