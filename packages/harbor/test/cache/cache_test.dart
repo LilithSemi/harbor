@@ -47,7 +47,10 @@ void main() {
       expect(l1.isUnified, isFalse);
       expect(l1.i, isNotNull);
       expect(l1.i!.size, equals(32 * 1024));
-      expect(l1.d.size, equals(32 * 1024));
+      expect(
+        l1.d,
+        isA<HarborL1dCacheConfig>().having((d) => d.size, 'size', 32 * 1024),
+      );
     });
 
     test('unified', () {
