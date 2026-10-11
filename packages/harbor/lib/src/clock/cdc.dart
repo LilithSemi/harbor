@@ -85,6 +85,29 @@ Logic harborCdcJoinReset(
   return chain.last.named(name);
 }
 
+/// A copy of the join reset [join] that changes only on edges of [clk].
+///
+/// [join] can assert between edges. Logic that must see one value for each
+/// cycle uses this copy, which is [stages] cycles late. The raw [reset] of
+/// the [clk] domain holds the copy high.
+Logic harborCdcSyncReset(
+  Logic clk,
+  Logic reset,
+  Logic join, {
+  int stages = 2,
+  String name = 'join_sync',
+}) {
+  assert(stages >= 2, 'reset synchronizer needs >= 2 stages');
+  final chain = [for (var i = 0; i < stages; i++) Logic(name: '${name}_$i')];
+  Sequential(
+    clk,
+    [chain[0] < join, for (var i = 1; i < stages; i++) chain[i] < chain[i - 1]],
+    reset: reset,
+    resetValues: {for (final c in chain) c: Const(1)},
+  );
+  return chain.last.named(name);
+}
+
 /// Clock domain crossing with handshake protocol.
 ///
 /// Safely transfers multi-bit data between two clock domains

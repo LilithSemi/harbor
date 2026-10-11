@@ -131,14 +131,14 @@ class HarborWishboneCdcBridge extends BridgeModule {
 
     final sClk = input('s_clk');
     final mClk = input('m_clk');
-    final sReset = harborCdcJoinReset(
+    final sJoinReset = harborCdcJoinReset(
       sClk,
       input('s_reset'),
       input('m_reset'),
       stages: syncStages,
       name: 's_join_reset',
     );
-    final mReset = harborCdcJoinReset(
+    final mJoinReset = harborCdcJoinReset(
       mClk,
       input('m_reset'),
       input('s_reset'),
@@ -146,7 +146,21 @@ class HarborWishboneCdcBridge extends BridgeModule {
       name: 'm_join_reset',
     );
     // Logic on the master clock behind this bridge must reset with it.
-    addOutput('m_reset_joined') <= mReset;
+    addOutput('m_reset_joined') <= mJoinReset;
+    // The join can assert between edges, so the handshake logic reads a copy
+    // that changes only on its own clock.
+    final sReset = harborCdcSyncReset(
+      sClk,
+      input('s_reset'),
+      sJoinReset,
+      name: 's_reset_synced',
+    );
+    final mReset = harborCdcSyncReset(
+      mClk,
+      input('m_reset'),
+      mJoinReset,
+      name: 'm_reset_synced',
+    );
     // Reset only from the master domain while a slave cycle waits.
     final sPeerReset = (sReset & ~input('s_reset')).named('s_peer_reset');
     final poison = Const(1, width: dw, fill: true);
