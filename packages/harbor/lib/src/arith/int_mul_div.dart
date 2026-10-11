@@ -181,6 +181,11 @@ typedef _State = Map<String, Logic>;
 /// Which one it wants travels as an extra bit in the tag given to the
 /// recurrence, so the recurrence does not need to know about it.
 ///
+/// [mulMode] or [divMode] can be null to skip that path's hardware, for a
+/// unit built as a multiplier only or a divider only. An op for the
+/// missing path completes the cycle it is accepted, with an all-zero
+/// result and `out_illegal` set, so it can never hang a caller.
+///
 /// An op is accepted only in a cycle with `in_valid` and `in_ready` high.
 ///
 /// Kill is per slot. The slots are the multiply slots and then the divide
@@ -248,8 +253,10 @@ class HarborIntMulDiv extends Module {
   /// Operand and result width, 32 or 64.
   final int width;
 
-  /// Multiply iteration strategy.
-  final HarborIntMulMode mulMode;
+  /// Multiply iteration strategy. Null builds no multiplier: a mul-class
+  /// op then completes at once with an all-zero result and `out_illegal`
+  /// set. At least one of [mulMode] and [divMode] must be non-null.
+  final HarborIntMulMode? mulMode;
 
   /// Multiply pipeline stages, 1 to 3. Only used in pipelined mode.
   final int mulStages;
@@ -258,8 +265,11 @@ class HarborIntMulDiv extends Module {
   /// mode.
   final int mulRadix;
 
-  /// Divider iteration strategy, passed to the recurrence.
-  final HarborFpDivMode divMode;
+  /// Divider iteration strategy, passed to the recurrence. Null builds no
+  /// divider: a div-class op then completes at once with an all-zero
+  /// result and `out_illegal` set. At least one of [mulMode] and [divMode]
+  /// must be non-null. [shareRecurrence] needs a non-null [divMode].
+  final HarborFpDivMode? divMode;
 
   /// Divider radix, 2 or 4, passed to the recurrence.
   final int divRadix;
@@ -276,6 +286,11 @@ class HarborIntMulDiv extends Module {
   Logic get outResult => output('out_result');
   Logic get outTag => output('out_tag');
   Logic get slotValid => output('slot_valid');
+
+  /// High with `out_valid` when the completed op targeted the path this
+  /// instance did not build, so `out_result` is all zero. Only present
+  /// when [mulMode] or [divMode] is null.
+  Logic get outIllegal => output('out_illegal');
 
   /// Only present when `in_tag` is given.
   Logic get slotTag => output('slot_tag');
@@ -295,35 +310,45 @@ class HarborIntMulDiv extends Module {
   Logic get sharedOutReady => output('shared_out_ready');
   Logic get sharedKillMask => output('shared_kill_mask');
 
-  /// Number of multiply slots.
-  static int mulSlotCountOf(HarborIntMulMode mulMode, int mulStages) =>
-      mulMode == HarborIntMulMode.pipelined ? mulStages : 1;
+  /// Number of multiply slots. Zero when [mulMode] is null, since an
+  /// absent path completes with no register to hold it.
+  static int mulSlotCountOf(HarborIntMulMode? mulMode, int mulStages) =>
+      switch (mulMode) {
+        null => 0,
+        HarborIntMulMode.pipelined => mulStages,
+        HarborIntMulMode.iterative => 1,
+      };
 
   /// Number of divide slots, the same with or without [shareRecurrence].
-  static int divSlotCountOf(HarborFpDivMode divMode, int divStages) =>
-      HarborDivSqrtRecurrence.slotCountOf(divMode, divStages);
+  /// Zero when [divMode] is null.
+  static int divSlotCountOf(HarborFpDivMode? divMode, int divStages) =>
+      divMode == null
+      ? 0
+      : HarborDivSqrtRecurrence.slotCountOf(divMode, divStages);
 
-  /// Width of `kill_mask` and `slot_valid`.
+  /// Width of `kill_mask` and `slot_valid`: the present path or paths'
+  /// slots only.
   static int slotCountOf(
-    HarborIntMulMode mulMode,
+    HarborIntMulMode? mulMode,
     int mulStages,
-    HarborFpDivMode divMode,
+    HarborFpDivMode? divMode,
     int divStages,
   ) => mulSlotCountOf(mulMode, mulStages) + divSlotCountOf(divMode, divStages);
 
-  /// Slot names in slot order.
+  /// Slot names in slot order. Empty for a path whose mode is null.
   static List<String> slotNamesOf(
-    HarborIntMulMode mulMode,
+    HarborIntMulMode? mulMode,
     int mulStages,
-    HarborFpDivMode divMode,
+    HarborFpDivMode? divMode,
     int divStages,
   ) => [
     if (mulMode == HarborIntMulMode.pipelined)
       for (var c = 1; c <= mulStages; c++) 'mul_$c'
-    else
+    else if (mulMode == HarborIntMulMode.iterative)
       'mul',
-    for (final n in HarborDivSqrtRecurrence.slotNamesOf(divMode, divStages))
-      'div_$n',
+    if (divMode != null)
+      for (final n in HarborDivSqrtRecurrence.slotNamesOf(divMode, divStages))
+        'div_$n',
   ];
 
   int get mulSlots => mulSlotCountOf(mulMode, mulStages);
@@ -335,19 +360,34 @@ class HarborIntMulDiv extends Module {
   /// Cycles from accept to `out_valid` for a multiply, `out_ready` high. In
   /// iterative mode the `+ 1` is the merge cycle after the last shift-add
   /// step, where the sign correction and word select land in `resultReg`.
-  int get mulLatency => mulMode == HarborIntMulMode.pipelined
-      ? mulStages
-      : (width + mulRadix - 1) ~/ mulRadix + 1;
+  /// Zero when [mulMode] is null: a mul-class op then leaves the same
+  /// cycle it is accepted.
+  int get mulLatency => switch (mulMode) {
+    null => 0,
+    HarborIntMulMode.pipelined => mulStages,
+    HarborIntMulMode.iterative => (width + mulRadix - 1) ~/ mulRadix + 1,
+  };
 
   /// Cycles from accept to `out_valid` for a wide divide or remainder.
+  /// Zero when [divMode] is null.
   int get divLatency => _divLatency(width);
 
   /// Cycles from accept to `out_valid` for a narrow (w-form) divide or
-  /// remainder. Only meaningful when [width] is 64.
+  /// remainder. Only meaningful when [width] is 64. Zero when [divMode]
+  /// is null.
   int get divNarrowLatency => _divLatency(32);
 
-  int _divLatency(int w) =>
-      HarborDivSqrtRecurrence.integerLatencyOf(divMode, divRadix, divStages, w);
+  int _divLatency(int w) {
+    final mode = divMode;
+    return mode == null
+        ? 0
+        : HarborDivSqrtRecurrence.integerLatencyOf(
+            mode,
+            divRadix,
+            divStages,
+            w,
+          );
+  }
 
   /// [killMask] has [slotCountOf] bits. With [shareRecurrence],
   /// [sharedSlotValid] has [divSlotCountOf] bits.
@@ -392,27 +432,41 @@ class HarborIntMulDiv extends Module {
     if (width != 32 && width != 64) {
       throw ArgumentError.value(width, 'width', 'must be 32 or 64');
     }
-    if (mulRadix < 1 || mulRadix > width) {
-      throw ArgumentError.value(mulRadix, 'mulRadix', 'must be 1 to width');
+    if (mulMode == null && divMode == null) {
+      throw ArgumentError(
+        'at least one of mulMode and divMode must be '
+        'non-null',
+      );
     }
-    if (mulMode == HarborIntMulMode.pipelined &&
-        (mulStages < 1 || mulStages > 3)) {
-      throw ArgumentError.value(mulStages, 'mulStages', 'must be 1 to 3');
-    }
-    if (divRadix != 2 && divRadix != 4) {
-      throw ArgumentError.value(divRadix, 'divRadix', 'must be 2 or 4');
-    }
-    if (divMode == HarborFpDivMode.pipelined) {
-      final k = divRadix == 4 ? 2 : 1;
-      final steps = (width + k - 1) ~/ k * k;
-      final units = steps + 3;
-      if (divStages < 1 || divStages > units) {
-        throw ArgumentError.value(
-          divStages,
-          'divStages',
-          'must be 1 to $units',
-        );
+    // An absent path's stage and radix parameters build no hardware, so
+    // they are not validated.
+    if (mulMode != null) {
+      if (mulRadix < 1 || mulRadix > width) {
+        throw ArgumentError.value(mulRadix, 'mulRadix', 'must be 1 to width');
       }
+      if (mulMode == HarborIntMulMode.pipelined &&
+          (mulStages < 1 || mulStages > 3)) {
+        throw ArgumentError.value(mulStages, 'mulStages', 'must be 1 to 3');
+      }
+    }
+    if (divMode != null) {
+      if (divRadix != 2 && divRadix != 4) {
+        throw ArgumentError.value(divRadix, 'divRadix', 'must be 2 or 4');
+      }
+      if (divMode == HarborFpDivMode.pipelined) {
+        final k = divRadix == 4 ? 2 : 1;
+        final steps = (width + k - 1) ~/ k * k;
+        final units = steps + 3;
+        if (divStages < 1 || divStages > units) {
+          throw ArgumentError.value(
+            divStages,
+            'divStages',
+            'must be 1 to $units',
+          );
+        }
+      }
+    } else if (shareRecurrence) {
+      throw ArgumentError('shareRecurrence needs a non-null divMode');
     }
     final nMul = mulSlots;
     final nDiv = divSlots;
@@ -475,6 +529,10 @@ class HarborIntMulDiv extends Module {
     if (tagW > 0) {
       addOutput('slot_tag', width: nSlots * tagW);
     }
+    final hasAbsentPath = mulMode == null || divMode == null;
+    if (hasAbsentPath) {
+      addOutput('out_illegal');
+    }
 
     if (shareRecurrence) {
       sharedInReady = addInput('shared_in_ready', sharedInReady!);
@@ -515,27 +573,16 @@ class HarborIntMulDiv extends Module {
     final isDivClassOp = inOp
         .gte(Const(HarborIntOp.div.index, width: opW))
         .named('is_div_class');
-    final isWFormOp =
-        (_isOp(inOp, HarborIntOp.mulw) |
-                inOp.gte(Const(HarborIntOp.divw.index, width: opW)))
-            .named('is_w_form');
-    final wantsRemainderOp =
-        (_isOp(inOp, HarborIntOp.rem) |
-                _isOp(inOp, HarborIntOp.remu) |
-                _isOp(inOp, HarborIntOp.remw) |
-                _isOp(inOp, HarborIntOp.remuw))
-            .named('wants_remainder');
-    final signedDivOp =
-        (_isOp(inOp, HarborIntOp.div) |
-                _isOp(inOp, HarborIntOp.rem) |
-                _isOp(inOp, HarborIntOp.divw) |
-                _isOp(inOp, HarborIntOp.remw))
-            .named('signed_div');
 
     final nextSeq = Logic(name: 'next_seq', width: seqW);
     final ageOk = Logic(name: 'age_ok');
     final selMul = Logic(name: 'sel_mul');
     final selDiv = Logic(name: 'sel_div');
+    // The oldest-valid signal of each path. Driven in the Merge section
+    // below, but read here: an absent path's illegal-op branch must not
+    // let its op leave ahead of an older op still held by the other path.
+    final mulOldV = Logic(name: 'mul_old_v');
+    final divOldV = Logic(name: 'div_old_v');
 
     final busyReg = shareRecurrence ? Logic(name: 'busy_reg') : null;
     final busyFree = busyReg == null ? Const(1) : ~busyReg;
@@ -556,8 +603,29 @@ class HarborIntMulDiv extends Module {
     final mulSlotValids = <Logic>[];
     final mulSlotTags = <Logic>[];
     final mulSlotSeqs = <Logic>[];
+    // Feeds the oldest-op arbitration below. Equal to the exposed slot
+    // lists above when a multiplier is built, otherwise a single entry
+    // for the op completing this cycle, which holds no slot of its own.
+    final List<Logic> mulArbValids;
+    final List<Logic> mulArbSeqs;
 
-    if (mulMode == HarborIntMulMode.pipelined) {
+    if (mulMode == null) {
+      // No multiplier is built. A mul-class op completes the instant it
+      // is accepted: in_ready waits for out_ready and for the divide
+      // path to hold nothing older, since there is no slot to hold this
+      // op while it waits its turn. out_result is all zero and
+      // out_illegal is set.
+      final illegalReady = (outReady & ~divOldV).named('mul_illegal_ready');
+      final illegalAccept = (mulValid & illegalReady).named(
+        'mul_illegal_accept',
+      );
+      mulOutValid = illegalAccept;
+      mulOutResult = Const(0, width: width);
+      mulOutTag = tagW > 0 ? inTag! : null;
+      mulInReady = illegalReady;
+      mulArbValids = [illegalAccept];
+      mulArbSeqs = [nextSeq];
+    } else if (mulMode == HarborIntMulMode.pipelined) {
       _State preMulS(_State s) {
         final (absA, absB, sign) = _mulMagnitudes(
           width,
@@ -617,6 +685,8 @@ class HarborIntMulDiv extends Module {
       mulOutResult = state['result']!;
       mulOutTag = side['tag'];
       mulInReady = en;
+      mulArbValids = mulSlotValids;
+      mulArbSeqs = mulSlotSeqs;
     } else {
       final kk = mulRadix;
       final cycles = (width + kk - 1) ~/ kk;
@@ -725,20 +795,11 @@ class HarborIntMulDiv extends Module {
       mulOutResult = resultReg;
       mulOutTag = heldTag;
       mulInReady = inReadyEngine;
+      mulArbValids = mulSlotValids;
+      mulArbSeqs = mulSlotSeqs;
     }
 
     // --- Divide path ---
-
-    final combinedTagIn = [
-      if (tagW > 0) inTag!,
-      if (!shareRecurrence) nextSeq,
-      wantsRemainderOp,
-    ].swizzle();
-    final divOpSel = mux(
-      signedDivOp,
-      Const(HarborDivSqrtOp.divSigned.index, width: 2),
-      Const(HarborDivSqrtOp.divUnsigned.index, width: 2),
-    );
 
     final Logic divInReady;
     final Logic divOutValid;
@@ -747,87 +808,156 @@ class HarborIntMulDiv extends Module {
     final divSlotValids = <Logic>[];
     final divSlotTags = <Logic>[];
     final divSlotSeqs = <Logic>[];
+    // Feeds the oldest-op arbitration below. Equal to the exposed slot
+    // lists above when a divider is built, otherwise a single entry for
+    // the op completing this cycle, which holds no slot of its own.
+    final List<Logic> divArbValids;
+    final List<Logic> divArbSeqs;
 
-    if (!shareRecurrence) {
-      final rec = HarborDivSqrtRecurrence.integer(
-        width,
-        divMode,
-        divRadix,
-        divStages,
-        clk: clk,
-        reset: reset,
-        killMask: divKillMask,
-        inValid: divValid,
-        inOp: divOpSel,
-        inA: inA,
-        inB: inB,
-        inNarrow: width == 64 ? isWFormOp : null,
-        inTag: combinedTagIn,
-        outReady: divOutReady,
-        narrowWidth: width == 64 ? 32 : 0,
+    if (divMode == null) {
+      // No divider is built. A div-class op completes the instant it is
+      // accepted: in_ready waits for out_ready and for the multiply path
+      // to hold nothing older, since there is no slot to hold this op
+      // while it waits its turn. out_result is all zero and out_illegal
+      // is set.
+      final illegalReady = (outReady & ~mulOldV).named('div_illegal_ready');
+      final illegalAccept = (divValid & illegalReady).named(
+        'div_illegal_accept',
       );
-      divInReady = rec.inReady;
-      divOutValid = rec.outValid;
-      divOutTag = tagW > 0 ? rec.outTag.getRange(1 + seqW, divTagW) : null;
-      divResult = mux(rec.outTag[0], rec.outRemainder, rec.outResult);
-      for (var i = 0; i < nDiv; i++) {
-        final t = rec.slotTag.getRange(i * divTagW, (i + 1) * divTagW);
-        divSlotValids.add(rec.slotValid[i]);
-        divSlotSeqs.add(t.getRange(1, 1 + seqW));
-        if (tagW > 0) {
-          divSlotTags.add(t.getRange(1 + seqW, divTagW));
-        }
-      }
+      divInReady = illegalReady;
+      divOutValid = illegalAccept;
+      divResult = Const(0, width: width);
+      divOutTag = tagW > 0 ? inTag! : null;
+      divArbValids = [illegalAccept];
+      divArbSeqs = [nextSeq];
     } else {
-      sharedInValid <= divValid;
-      sharedInOp <= divOpSel;
-      sharedInA <= inA;
-      sharedInB <= inB;
-      if (width == 64) {
-        sharedInNarrow <= isWFormOp;
-      }
-      sharedInTag <= combinedTagIn;
-      sharedOutReady <= divOutReady;
-      final busyNow = busyReg!;
-      sharedKillMask <= divKillMask & busyNow.replicate(nDiv);
+      final mode = divMode!;
+      final isWFormOp =
+          (_isOp(inOp, HarborIntOp.mulw) |
+                  inOp.gte(Const(HarborIntOp.divw.index, width: opW)))
+              .named('is_w_form');
+      final wantsRemainderOp =
+          (_isOp(inOp, HarborIntOp.rem) |
+                  _isOp(inOp, HarborIntOp.remu) |
+                  _isOp(inOp, HarborIntOp.remw) |
+                  _isOp(inOp, HarborIntOp.remuw))
+              .named('wants_remainder');
+      final signedDivOp =
+          (_isOp(inOp, HarborIntOp.div) |
+                  _isOp(inOp, HarborIntOp.rem) |
+                  _isOp(inOp, HarborIntOp.divw) |
+                  _isOp(inOp, HarborIntOp.remw))
+              .named('signed_div');
+      final combinedTagIn = [
+        if (tagW > 0) inTag!,
+        if (!shareRecurrence) nextSeq,
+        wantsRemainderOp,
+      ].swizzle();
+      final divOpSel = mux(
+        signedDivOp,
+        Const(HarborDivSqrtOp.divSigned.index, width: 2),
+        Const(HarborDivSqrtOp.divUnsigned.index, width: 2),
+      );
 
-      divInReady = (sharedInReady! & busyFree).named('div_in_ready_shared');
-      divOutValid = sharedOutValid!;
-      divOutTag = tagW > 0 ? sharedOutTag!.getRange(1, divTagW) : null;
-      divResult = mux(sharedOutTag![0], sharedOutRemainder!, sharedOutResult!);
+      if (!shareRecurrence) {
+        final rec = HarborDivSqrtRecurrence.integer(
+          width,
+          mode,
+          divRadix,
+          divStages,
+          clk: clk,
+          reset: reset,
+          killMask: divKillMask,
+          inValid: divValid,
+          inOp: divOpSel,
+          inA: inA,
+          inB: inB,
+          inNarrow: width == 64 ? isWFormOp : null,
+          inTag: combinedTagIn,
+          outReady: divOutReady,
+          narrowWidth: width == 64 ? 32 : 0,
+        );
+        divInReady = rec.inReady;
+        divOutValid = rec.outValid;
+        divOutTag = tagW > 0 ? rec.outTag.getRange(1 + seqW, divTagW) : null;
+        divResult = mux(rec.outTag[0], rec.outRemainder, rec.outResult);
+        for (var i = 0; i < nDiv; i++) {
+          final t = rec.slotTag.getRange(i * divTagW, (i + 1) * divTagW);
+          divSlotValids.add(rec.slotValid[i]);
+          divSlotSeqs.add(t.getRange(1, 1 + seqW));
+          if (tagW > 0) {
+            divSlotTags.add(t.getRange(1 + seqW, divTagW));
+          }
+        }
+      } else {
+        sharedInValid <= divValid;
+        sharedInOp <= divOpSel;
+        sharedInA <= inA;
+        sharedInB <= inB;
+        if (width == 64) {
+          sharedInNarrow <= isWFormOp;
+        }
+        sharedInTag <= combinedTagIn;
+        sharedOutReady <= divOutReady;
+        final busyNow = busyReg!;
+        sharedKillMask <= divKillMask & busyNow.replicate(nDiv);
 
-      final issue = (divValid & divInReady).named('div_issue');
-      final seqReg = flop(
-        clk,
-        nextSeq,
-        en: issue,
-        reset: reset,
-      ).named('div_seq_h');
-      final tagReg = tagW > 0
-          ? flop(clk, inTag!, en: issue, reset: reset).named('div_tag_h')
-          : null;
-      final killed = (divKillMask & sharedSlotValid!).or() & busyNow;
-      final drain = (divOutValid & divOutReady).named('div_drain');
-      busyNow <= flop(clk, issue | (busyNow & ~drain & ~killed), reset: reset);
-      busy <= busyNow;
-      for (var i = 0; i < nDiv; i++) {
-        divSlotValids.add(sharedSlotValid[i] & busyNow);
-        divSlotSeqs.add(seqReg);
-        if (tagReg != null) {
-          divSlotTags.add(tagReg);
+        divInReady = (sharedInReady! & busyFree).named('div_in_ready_shared');
+        divOutValid = sharedOutValid!;
+        divOutTag = tagW > 0 ? sharedOutTag!.getRange(1, divTagW) : null;
+        divResult = mux(
+          sharedOutTag![0],
+          sharedOutRemainder!,
+          sharedOutResult!,
+        );
+
+        final issue = (divValid & divInReady).named('div_issue');
+        final seqReg = flop(
+          clk,
+          nextSeq,
+          en: issue,
+          reset: reset,
+        ).named('div_seq_h');
+        final tagReg = tagW > 0
+            ? flop(clk, inTag!, en: issue, reset: reset).named('div_tag_h')
+            : null;
+        final killed = (divKillMask & sharedSlotValid!).or() & busyNow;
+        final drain = (divOutValid & divOutReady).named('div_drain');
+        busyNow <=
+            flop(clk, issue | (busyNow & ~drain & ~killed), reset: reset);
+        busy <= busyNow;
+        for (var i = 0; i < nDiv; i++) {
+          divSlotValids.add(sharedSlotValid[i] & busyNow);
+          divSlotSeqs.add(seqReg);
+          if (tagReg != null) {
+            divSlotTags.add(tagReg);
+          }
         }
       }
+      divArbValids = divSlotValids;
+      divArbSeqs = divSlotSeqs;
     }
 
     // --- Merge ---
 
     // Ages count back from next_seq, so the larger age is the older op.
-    final (mulOldV, mulOldSeq) = _oldest(mulSlotValids, mulSlotSeqs);
-    final (divOldV, divOldSeq) = _oldest(divSlotValids, divSlotSeqs);
+    final (mv, mulOldSeq) = _oldest(mulArbValids, mulArbSeqs);
+    final (dv, divOldSeq) = _oldest(divArbValids, divArbSeqs);
+    mulOldV <= mv;
+    divOldV <= dv;
     final mulAge = (nextSeq - mulOldSeq).named('mul_age');
     final divAge = (nextSeq - divOldSeq).named('div_age');
     final maxAge = Const((1 << seqW) - 1, width: seqW);
-    ageOk <= ~(mulOldV & mulAge.eq(maxAge)) & ~(divOldV & divAge.eq(maxAge));
+    // An absent path's age is always zero (it never waits), so its term
+    // would never trip the overflow guard. Leaving the term out instead
+    // of relying on that avoids ageOk depending on that path's own
+    // instant-complete accept, which would otherwise feed back into the
+    // accept decision in the same cycle.
+    final overflowGuards = [
+      if (mulMode != null) ~(mulOldV & mulAge.eq(maxAge)),
+      if (divMode != null) ~(divOldV & divAge.eq(maxAge)),
+    ];
+    ageOk <= overflowGuards.reduce((a, b) => a & b);
     selMul <= mulOldV & (~divOldV | mulAge.gt(divAge));
     selDiv <= divOldV & (~mulOldV | divAge.gt(mulAge));
 
@@ -841,6 +971,10 @@ class HarborIntMulDiv extends Module {
     if (tagW > 0) {
       outTag <= mux(selDiv, divOutTag!, mulOutTag!);
     }
+    if (hasAbsentPath) {
+      outIllegal <=
+          (mulMode == null ? selMul & mulOutValid : selDiv & divOutValid);
+    }
     inReady <= inReadyVal;
     slotValid <= [...mulSlotValids, ...divSlotValids].rswizzle();
     if (tagW > 0) {
@@ -850,10 +984,10 @@ class HarborIntMulDiv extends Module {
 
   static String _definitionName(
     int width,
-    HarborIntMulMode mulMode,
+    HarborIntMulMode? mulMode,
     int mulStages,
     int mulRadix,
-    HarborFpDivMode divMode,
+    HarborFpDivMode? divMode,
     int divRadix,
     int divStages,
     bool shareRecurrence,
@@ -861,10 +995,16 @@ class HarborIntMulDiv extends Module {
     final parts = [
       'HarborIntMulDiv',
       'W$width',
-      mulMode == HarborIntMulMode.pipelined
-          ? 'MulS$mulStages'
-          : 'MulR$mulRadix',
-      divMode == HarborFpDivMode.iterative ? 'DivR$divRadix' : 'DivS$divStages',
+      switch (mulMode) {
+        null => 'NoMul',
+        HarborIntMulMode.pipelined => 'MulS$mulStages',
+        HarborIntMulMode.iterative => 'MulR$mulRadix',
+      },
+      switch (divMode) {
+        null => 'NoDiv',
+        HarborFpDivMode.iterative => 'DivR$divRadix',
+        HarborFpDivMode.pipelined => 'DivS$divStages',
+      },
       if (shareRecurrence) 'Shared',
     ];
     return parts.join('_');
