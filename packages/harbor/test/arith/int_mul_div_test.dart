@@ -329,6 +329,7 @@ class _Trace {
   final Set<int> killed;
   final List<int> slotValids;
   final _KillStats stats;
+
   /// Tags taken while `out_illegal` was high. Empty when the build has no
   /// `out_illegal` output.
   final Set<int> illegal;
@@ -351,7 +352,9 @@ class _Trace {
 /// [stall] share of cycles for 1 to [stallBurst] cycles. Each cycle, with
 /// [killRate], one random slot is killed (a random subset one time in
 /// four), and with [flushRate] every slot is killed. [killAt], [validAt]
-/// and [readyAt] replace the random choices when given.
+/// and [readyAt] replace the random choices when given. With [consumer],
+/// `out_ready` is the consumer's enable ANDed with `out_valid`, and the
+/// harness drives the enable.
 ///
 /// The harness checks that every accepted op that is not killed comes out
 /// once, in order, and that a killed op never comes out.
@@ -367,6 +370,7 @@ Future<_Trace> _clocked(
   int Function(_View v)? killAt,
   bool Function(_View v)? validAt,
   bool Function(_View v)? readyAt,
+  bool consumer = false,
 }) => Isolate.run(() async {
   final width = b.width;
   final nSlots = _slotsOf(b);
@@ -400,6 +404,11 @@ Future<_Trace> _clocked(
     inTag: inTag,
     outReady: outReady,
   );
+  final enable = Logic(name: 'consumer_enable');
+  if (consumer) {
+    outReady <= enable & dut.outValid;
+  }
+  final readyIn = consumer ? enable : outReady;
   await dut.build();
   final illegalOut = dut.tryOutput('out_illegal');
   final r = Random(seed);
@@ -425,7 +434,7 @@ Future<_Trace> _clocked(
   reset.put(1);
   killMask.put(0);
   inValid.put(0);
-  outReady.put(0);
+  readyIn.put(0);
   if (ops.isNotEmpty) {
     put(0);
   }
@@ -480,7 +489,7 @@ Future<_Trace> _clocked(
     }
     killMask.put(0);
     inValid.put(valid ? 1 : 0);
-    outReady.put(ready ? 1 : 0);
+    readyIn.put(ready ? 1 : 0);
     if (next < ops.length) {
       put(next);
     }
@@ -540,10 +549,6 @@ Future<_Trace> _clocked(
         );
       }
     }
-    // An absent path's op is accepted and taken in the same cycle (no
-    // slot holds it), so the op this cycle accepts must already be in
-    // inFlight before the take check below, or a same-cycle take would
-    // look out of order against an inFlight that has not seen it yet.
     if (accepted) {
       inFlight.add(next);
       acceptCycles[next] = cycle;
@@ -779,18 +784,19 @@ void main() {
       );
     });
 
-    test('an absent path has zero slots', () {
-      expect(HarborIntMulDiv.mulSlotCountOf(null, 3), 0);
-      expect(HarborIntMulDiv.divSlotCountOf(null, 4), 0);
+    test('an absent path has one illegal slot', () {
+      expect(HarborIntMulDiv.mulSlotCountOf(null, 3), 1);
+      expect(HarborIntMulDiv.divSlotCountOf(null, 4), 1);
       expect(
         HarborIntMulDiv.slotCountOf(null, 3, _divIter, 1),
-        HarborIntMulDiv.divSlotCountOf(_divIter, 1),
+        HarborIntMulDiv.divSlotCountOf(_divIter, 1) + 1,
       );
       expect(
         HarborIntMulDiv.slotCountOf(_pipelined, 3, null, 1),
-        HarborIntMulDiv.mulSlotCountOf(_pipelined, 3),
+        HarborIntMulDiv.mulSlotCountOf(_pipelined, 3) + 1,
       );
       expect(HarborIntMulDiv.slotNamesOf(null, 3, _divIter, 1), [
+        'illegal',
         'div_in',
         'div_step',
         'div_post',
@@ -799,15 +805,16 @@ void main() {
       expect(HarborIntMulDiv.slotNamesOf(_pipelined, 2, null, 1), [
         'mul_1',
         'mul_2',
+        'illegal',
       ]);
     });
 
-    test('an absent path has zero latency', () {
+    test('an absent path has a latency of one', () {
       final mulOnly = build(divMode: null);
-      expect(mulOnly.divLatency, 0);
-      expect(mulOnly.divNarrowLatency, 0);
+      expect(mulOnly.divLatency, 1);
+      expect(mulOnly.divNarrowLatency, 1);
       final divOnly = build(mulMode: null);
-      expect(divOnly.mulLatency, 0);
+      expect(divOnly.mulLatency, 1);
     });
 
     test('definition name encodes an absent path', () {
@@ -821,13 +828,16 @@ void main() {
       expect(noMul.definitionName, contains('NoMul'));
     });
 
-    test('default build definitionName is unchanged from before null paths', () {
-      // Pinned to the string the pre-nullable _definitionName produced for
-      // these defaults (width 32, pipelined mulStages 2, iterative divRadix
-      // 2, no shareRecurrence), so a future change cannot silently rename
-      // the default build's definition.
-      expect(build().definitionName, 'HarborIntMulDiv_W32_MulS2_DivR2');
-    });
+    test(
+      'default build definitionName is unchanged from before null paths',
+      () {
+        // Pinned to the string the pre-nullable _definitionName produced for
+        // these defaults (width 32, pipelined mulStages 2, iterative divRadix
+        // 2, no shareRecurrence), so a future change cannot silently rename
+        // the default build's definition.
+        expect(build().definitionName, 'HarborIntMulDiv_W32_MulS2_DivR2');
+      },
+    );
 
     test('out_illegal only exists with an absent path', () {
       final both = build();
@@ -1640,105 +1650,131 @@ void main() {
       return dut;
     }
 
-    test('mul-only: a div-class op completes at once as illegal', () async {
-      final width = 32;
-      final clk = SimpleClockGenerator(10).clk;
-      final reset = Logic(name: 'reset');
-      final nSlots = HarborIntMulDiv.slotCountOf(_pipelined, 2, null, 0);
-      final killMask = Logic(name: 'kill_mask', width: nSlots);
-      final inValid = Logic(name: 'in_valid');
-      final inOp = Logic(name: 'in_op', width: harborIntOpWidth);
-      final inA = Logic(name: 'in_a', width: width);
-      final inB = Logic(name: 'in_b', width: width);
-      final outReady = Logic(name: 'out_ready');
-      final dut = HarborIntMulDiv(
-        width: width,
-        divMode: null,
-        clk: clk,
-        reset: reset,
-        killMask: killMask,
-        inValid: inValid,
-        inOp: inOp,
-        inA: inA,
-        inB: inB,
-        outReady: outReady,
-      );
-      await dut.build();
+    test(
+      'mul-only: a div-class op completes one cycle later as illegal',
+      () async {
+        final width = 32;
+        final clk = SimpleClockGenerator(10).clk;
+        final reset = Logic(name: 'reset');
+        final nSlots = HarborIntMulDiv.slotCountOf(_pipelined, 2, null, 0);
+        final killMask = Logic(name: 'kill_mask', width: nSlots);
+        final inValid = Logic(name: 'in_valid');
+        final inOp = Logic(name: 'in_op', width: harborIntOpWidth);
+        final inA = Logic(name: 'in_a', width: width);
+        final inB = Logic(name: 'in_b', width: width);
+        final outReady = Logic(name: 'out_ready');
+        final dut = HarborIntMulDiv(
+          width: width,
+          divMode: null,
+          clk: clk,
+          reset: reset,
+          killMask: killMask,
+          inValid: inValid,
+          inOp: inOp,
+          inA: inA,
+          inB: inB,
+          outReady: outReady,
+        );
+        await dut.build();
 
-      reset.put(1);
-      killMask.put(0);
-      inValid.put(0);
-      outReady.put(1);
-      unawaited(Simulator.run());
-      await clk.nextNegedge;
-      await clk.nextNegedge;
-      reset.put(0);
+        reset.put(1);
+        killMask.put(0);
+        inValid.put(0);
+        outReady.put(1);
+        unawaited(Simulator.run());
+        await clk.nextNegedge;
+        await clk.nextNegedge;
+        reset.put(0);
 
-      inOp.put(HarborIntOp.div.index);
-      inA.put(123);
-      inB.put(7);
-      inValid.put(1);
-      await clk.nextNegedge;
+        inOp.put(HarborIntOp.div.index);
+        inA.put(123);
+        inB.put(7);
+        inValid.put(1);
+        expect(dut.inReady.value.toBool(), isTrue);
+        expect(dut.outValid.value.toBool(), isFalse);
+        await clk.nextNegedge;
+        inValid.put(0);
 
-      expect(dut.inReady.value.toBool(), isTrue, reason: 'no hang');
-      expect(dut.outValid.value.toBool(), isTrue);
-      expect(dut.outResult.value.toBigInt(), BigInt.zero);
-      expect(dut.outIllegal.value.toBool(), isTrue);
+        expect(dut.inReady.value.toBool(), isFalse, reason: 'slot is full');
+        expect(dut.outValid.value.toBool(), isTrue);
+        expect(dut.outResult.value.toBigInt(), BigInt.zero);
+        expect(dut.outIllegal.value.toBool(), isTrue);
+        expect(
+          dut.slotValid.value.toInt(),
+          1 << dut.slotNames.indexOf('illegal'),
+        );
+        await clk.nextNegedge;
+        expect(dut.outValid.value.toBool(), isFalse);
+        expect(dut.inReady.value.toBool(), isTrue);
 
-      inValid.put(0);
-      await clk.nextNegedge;
-      await Simulator.endSimulation();
-    });
+        inValid.put(0);
+        await clk.nextNegedge;
+        await Simulator.endSimulation();
+      },
+    );
 
-    test('div-only: a mul-class op completes at once as illegal', () async {
-      final width = 32;
-      final clk = SimpleClockGenerator(10).clk;
-      final reset = Logic(name: 'reset');
-      final nSlots = HarborIntMulDiv.slotCountOf(null, 0, _divIter, 1);
-      final killMask = Logic(name: 'kill_mask', width: nSlots);
-      final inValid = Logic(name: 'in_valid');
-      final inOp = Logic(name: 'in_op', width: harborIntOpWidth);
-      final inA = Logic(name: 'in_a', width: width);
-      final inB = Logic(name: 'in_b', width: width);
-      final outReady = Logic(name: 'out_ready');
-      final dut = HarborIntMulDiv(
-        width: width,
-        mulMode: null,
-        clk: clk,
-        reset: reset,
-        killMask: killMask,
-        inValid: inValid,
-        inOp: inOp,
-        inA: inA,
-        inB: inB,
-        outReady: outReady,
-      );
-      await dut.build();
+    test(
+      'div-only: a mul-class op completes one cycle later as illegal',
+      () async {
+        final width = 32;
+        final clk = SimpleClockGenerator(10).clk;
+        final reset = Logic(name: 'reset');
+        final nSlots = HarborIntMulDiv.slotCountOf(null, 0, _divIter, 1);
+        final killMask = Logic(name: 'kill_mask', width: nSlots);
+        final inValid = Logic(name: 'in_valid');
+        final inOp = Logic(name: 'in_op', width: harborIntOpWidth);
+        final inA = Logic(name: 'in_a', width: width);
+        final inB = Logic(name: 'in_b', width: width);
+        final outReady = Logic(name: 'out_ready');
+        final dut = HarborIntMulDiv(
+          width: width,
+          mulMode: null,
+          clk: clk,
+          reset: reset,
+          killMask: killMask,
+          inValid: inValid,
+          inOp: inOp,
+          inA: inA,
+          inB: inB,
+          outReady: outReady,
+        );
+        await dut.build();
 
-      reset.put(1);
-      killMask.put(0);
-      inValid.put(0);
-      outReady.put(1);
-      unawaited(Simulator.run());
-      await clk.nextNegedge;
-      await clk.nextNegedge;
-      reset.put(0);
+        reset.put(1);
+        killMask.put(0);
+        inValid.put(0);
+        outReady.put(1);
+        unawaited(Simulator.run());
+        await clk.nextNegedge;
+        await clk.nextNegedge;
+        reset.put(0);
 
-      inOp.put(HarborIntOp.mul.index);
-      inA.put(3);
-      inB.put(4);
-      inValid.put(1);
-      await clk.nextNegedge;
+        inOp.put(HarborIntOp.mul.index);
+        inA.put(3);
+        inB.put(4);
+        inValid.put(1);
+        expect(dut.inReady.value.toBool(), isTrue);
+        expect(dut.outValid.value.toBool(), isFalse);
+        await clk.nextNegedge;
+        inValid.put(0);
 
-      expect(dut.inReady.value.toBool(), isTrue, reason: 'no hang');
-      expect(dut.outValid.value.toBool(), isTrue);
-      expect(dut.outResult.value.toBigInt(), BigInt.zero);
-      expect(dut.outIllegal.value.toBool(), isTrue);
+        expect(dut.inReady.value.toBool(), isFalse, reason: 'slot is full');
+        expect(dut.outValid.value.toBool(), isTrue);
+        expect(dut.outResult.value.toBigInt(), BigInt.zero);
+        expect(dut.outIllegal.value.toBool(), isTrue);
+        expect(
+          dut.slotValid.value.toInt(),
+          1 << dut.slotNames.indexOf('illegal'),
+        );
+        await clk.nextNegedge;
+        expect(dut.outValid.value.toBool(), isFalse);
+        expect(dut.inReady.value.toBool(), isTrue);
 
-      inValid.put(0);
-      await clk.nextNegedge;
-      await Simulator.endSimulation();
-    });
+        inValid.put(0);
+        await clk.nextNegedge;
+        await Simulator.endSimulation();
+      },
+    );
 
     test(
       'mul-only build: present path matches oracle, kill still works',
@@ -1818,10 +1854,8 @@ void main() {
     // _clocked keeps driving the same op until it is accepted, so an
     // illegal op that must wait does so right behind an older legal op
     // still in flight: this is exactly the contention case. Swept over
-    // the present path's corner slot counts, since that is what sizes
-    // the age window the absent path's instant completions share: a
-    // present path with very few slots of its own is the case that can
-    // hang if that window is too narrow.
+    // the present path's corner slot counts, since that sizes the age
+    // window the absent path's slot shares.
     Future<void> contention(
       _Build b, {
       required bool Function(HarborIntOp) isLegal,
@@ -1832,7 +1866,11 @@ void main() {
       final ops = _opsFor(width);
       final cases = <_Case>[
         for (var i = 0; i < 300; i++)
-          (ops[r.nextInt(ops.length)], _randBits(r, width), _randBits(r, width)),
+          (
+            ops[r.nextInt(ops.length)],
+            _randBits(r, width),
+            _randBits(r, width),
+          ),
       ];
       final t = await _clocked(
         b,
@@ -1850,7 +1888,10 @@ void main() {
       // (or vice versa), and every surviving op appears exactly once.
       expect(
         [for (final (tag, _) in t.taken) tag],
-        [for (var i = 0; i < cases.length; i++) if (!t.killed.contains(i)) i],
+        [
+          for (var i = 0; i < cases.length; i++)
+            if (!t.killed.contains(i)) i,
+        ],
       );
       for (final (tag, got) in t.taken) {
         final (op, a, bOperand) = cases[tag];
@@ -1940,5 +1981,175 @@ void main() {
         }, timeout: const Timeout(Duration(seconds: 30)));
       }
     });
+  });
+
+  group('outputs come from registers', () {
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    // Between two clock edges, changes on the inputs must not move
+    // out_valid or the out_* signals. The in_ready of an absent-path op
+    // must also not move with out_ready.
+    Future<void> between(_Build b, int seed) async {
+      final width = b.width;
+      final nSlots = _slotsOf(b);
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset');
+      final killMask = Logic(name: 'kill_mask', width: nSlots);
+      final inValid = Logic(name: 'in_valid');
+      final inOp = Logic(name: 'in_op', width: harborIntOpWidth);
+      final inA = Logic(name: 'in_a', width: width);
+      final inB = Logic(name: 'in_b', width: width);
+      final inTag = Logic(name: 'in_tag', width: _tagWidth);
+      final outReady = Logic(name: 'out_ready');
+      final dut = HarborIntMulDiv(
+        width: width,
+        mulMode: b.mulMode,
+        mulStages: b.mulStages,
+        mulRadix: b.mulRadix,
+        divMode: b.divMode,
+        divRadix: b.divRadix,
+        divStages: b.divStages,
+        clk: clk,
+        reset: reset,
+        killMask: killMask,
+        inValid: inValid,
+        inOp: inOp,
+        inA: inA,
+        inB: inB,
+        inTag: inTag,
+        outReady: outReady,
+      );
+      await dut.build();
+      final illegalOut = dut.tryOutput('out_illegal');
+      final watched = [dut.outValid, dut.outResult, dut.outTag, ?illegalOut];
+      bool absent(HarborIntOp o) => o.index < HarborIntOp.div.index
+          ? b.mulMode == null
+          : b.divMode == null;
+
+      final r = Random(seed);
+      final ops = _opsFor(width);
+      reset.put(1);
+      killMask.put(0);
+      inValid.put(0);
+      outReady.put(0);
+      inOp.put(0);
+      inA.put(0);
+      inB.put(0);
+      inTag.put(0);
+      unawaited(Simulator.run());
+      await clk.nextNegedge;
+      await clk.nextNegedge;
+      reset.put(0);
+
+      var outs = 0;
+      var absentChecks = 0;
+      for (var cycle = 0; cycle < 400; cycle++) {
+        await clk.nextNegedge;
+        final held = [for (final s in watched) s.value];
+        for (var k = 0; k < 6; k++) {
+          final op = ops[r.nextInt(ops.length)];
+          inOp.put(op.index);
+          inA.put(_randBits(r, width));
+          inB.put(_randBits(r, width));
+          inTag.put(r.nextInt(1 << _tagWidth));
+          inValid.put(r.nextInt(2));
+          outReady.put(0);
+          final readyLow = dut.inReady.value;
+          outReady.put(1);
+          if (absent(op)) {
+            absentChecks++;
+            expect(
+              dut.inReady.value,
+              readyLow,
+              reason: 'cycle $cycle: in_ready of $op moved with out_ready',
+            );
+          }
+          for (var i = 0; i < watched.length; i++) {
+            expect(
+              watched[i].value,
+              held[i],
+              reason: 'cycle $cycle: ${watched[i].name} moved between edges',
+            );
+          }
+        }
+        outReady.put(r.nextInt(4) == 0 ? 0 : 1);
+        if (dut.outValid.value.toBool()) {
+          outs++;
+        }
+      }
+      expect(outs, greaterThan(10), reason: 'ops came out');
+      if (b.mulMode == null || b.divMode == null) {
+        expect(absentChecks, greaterThan(0));
+      }
+      await Simulator.endSimulation();
+    }
+
+    test('mul-only', () async {
+      await between(_build(32, divMode: null), 901);
+    });
+    test('mul-only iterative', () async {
+      await between(_build(32, mulMode: _iterative, divMode: null), 902);
+    });
+    test('div-only', () async {
+      await between(_build(32, mulMode: null), 903);
+    });
+    test('default', () async {
+      await between(_build(32), 904);
+    });
+  });
+
+  group('consumer with out_ready from out_valid', () {
+    // The Glacier shape: out_ready is the consumer enable ANDed with
+    // out_valid. A combinational loop would hang the simulator here.
+    for (final spec in [
+      (name: 'mul-only', b: _build(32, divMode: null), seed: 920),
+      (
+        name: 'mul-only iterative',
+        b: _build(32, mulMode: _iterative, divMode: null),
+        seed: 922,
+      ),
+      (name: 'div-only', b: _build(32, mulMode: null), seed: 924),
+      (
+        name: 'div-only pipelined',
+        b: _build(32, mulMode: null, divMode: _divPipe, divStages: 4),
+        seed: 926,
+      ),
+      (name: 'default', b: _build(32), seed: 928),
+    ]) {
+      test(spec.name, () async {
+        final r = Random(spec.seed);
+        final cases = _mixed(32, r, 300, 0.5);
+        final t = await _clocked(
+          spec.b,
+          cases,
+          seed: spec.seed + 1,
+          gap: 0.2,
+          stall: 0.3,
+          stallBurst: 6,
+          consumer: true,
+        );
+        expect(t.errors, isEmpty, reason: t.errors.take(10).join('\n'));
+        expect(t.killed, isEmpty);
+        expect(
+          [for (final (tag, _) in t.taken) tag],
+          [for (var i = 0; i < cases.length; i++) i],
+        );
+        for (final (tag, got) in t.taken) {
+          final (op, a, b) = cases[tag];
+          final isMul = op.index < HarborIntOp.div.index;
+          final illegal = isMul
+              ? spec.b.mulMode == null
+              : spec.b.divMode == null;
+          expect(t.illegal.contains(tag), illegal, reason: '$op tag $tag');
+          expect(
+            got,
+            illegal ? BigInt.zero : _oracle(op, a, b, 32),
+            reason: '$op tag $tag',
+          );
+        }
+      }, timeout: const Timeout(Duration(minutes: 2)));
+    }
   });
 }

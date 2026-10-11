@@ -183,8 +183,8 @@ typedef _State = Map<String, Logic>;
 ///
 /// [mulMode] or [divMode] can be null to skip that path's hardware, for a
 /// unit built as a multiplier only or a divider only. An op for the
-/// missing path completes the cycle it is accepted, with an all-zero
-/// result and `out_illegal` set, so it can never hang a caller.
+/// missing path goes into a one-entry `illegal` slot and leaves in order,
+/// one cycle or more later, with an all-zero result and `out_illegal` set.
 ///
 /// An op is accepted only in a cycle with `in_valid` and `in_ready` high.
 ///
@@ -192,9 +192,9 @@ typedef _State = Map<String, Logic>;
 /// slots ([slotNames]). The multiply slots are the stage registers
 /// (`mul_1` to `mul_S`) in pipelined mode, or the one engine (`mul`) in
 /// iterative mode. The divide slots are the recurrence slots with a `div_`
-/// prefix. In each path index order is age order, the lowest index the
-/// youngest. Ops on different paths have no fixed order, so a core compares
-/// `slot_tag`. `slot_valid` has one bit per slot and `slot_tag` has the tag
+/// prefix. An absent path has the one slot `illegal`. In each path index
+/// order is age order, the lowest index the youngest. Ops on different
+/// paths have no fixed order, so a core compares `slot_tag`. `slot_valid` has one bit per slot and `slot_tag` has the tag
 /// of each slot, slot 0 in the low bits. Both come from registers. A set bit
 /// of `kill_mask` drops the op of that slot in the same cycle with no result
 /// and frees the slot, so a killed iterative engine can take a new op in
@@ -254,8 +254,9 @@ class HarborIntMulDiv extends Module {
   final int width;
 
   /// Multiply iteration strategy. Null builds no multiplier: a mul-class
-  /// op then completes at once with an all-zero result and `out_illegal`
-  /// set. At least one of [mulMode] and [divMode] must be non-null.
+  /// op then completes from the `illegal` slot with an all-zero result and
+  /// `out_illegal` set. At least one of [mulMode] and [divMode] must be
+  /// non-null.
   final HarborIntMulMode? mulMode;
 
   /// Multiply pipeline stages, 1 to 3. Only used in pipelined mode.
@@ -266,9 +267,9 @@ class HarborIntMulDiv extends Module {
   final int mulRadix;
 
   /// Divider iteration strategy, passed to the recurrence. Null builds no
-  /// divider: a div-class op then completes at once with an all-zero
-  /// result and `out_illegal` set. At least one of [mulMode] and [divMode]
-  /// must be non-null. [shareRecurrence] needs a non-null [divMode].
+  /// divider: a div-class op then completes from the `illegal` slot with an
+  /// all-zero result and `out_illegal` set. At least one of [mulMode] and
+  /// [divMode] must be non-null. [shareRecurrence] needs a non-null [divMode].
   final HarborFpDivMode? divMode;
 
   /// Divider radix, 2 or 4, passed to the recurrence.
@@ -310,24 +311,23 @@ class HarborIntMulDiv extends Module {
   Logic get sharedOutReady => output('shared_out_ready');
   Logic get sharedKillMask => output('shared_kill_mask');
 
-  /// Number of multiply slots. Zero when [mulMode] is null, since an
-  /// absent path completes with no register to hold it.
+  /// Number of multiply slots. One when [mulMode] is null, the `illegal`
+  /// slot.
   static int mulSlotCountOf(HarborIntMulMode? mulMode, int mulStages) =>
       switch (mulMode) {
-        null => 0,
+        null => 1,
         HarborIntMulMode.pipelined => mulStages,
         HarborIntMulMode.iterative => 1,
       };
 
   /// Number of divide slots, the same with or without [shareRecurrence].
-  /// Zero when [divMode] is null.
+  /// One when [divMode] is null, the `illegal` slot.
   static int divSlotCountOf(HarborFpDivMode? divMode, int divStages) =>
       divMode == null
-      ? 0
+      ? 1
       : HarborDivSqrtRecurrence.slotCountOf(divMode, divStages);
 
-  /// Width of `kill_mask` and `slot_valid`: the present path or paths'
-  /// slots only.
+  /// Width of `kill_mask` and `slot_valid`.
   static int slotCountOf(
     HarborIntMulMode? mulMode,
     int mulStages,
@@ -335,7 +335,7 @@ class HarborIntMulDiv extends Module {
     int divStages,
   ) => mulSlotCountOf(mulMode, mulStages) + divSlotCountOf(divMode, divStages);
 
-  /// Slot names in slot order. Empty for a path whose mode is null.
+  /// Slot names in slot order. A path whose mode is null has `illegal`.
   static List<String> slotNamesOf(
     HarborIntMulMode? mulMode,
     int mulStages,
@@ -345,10 +345,14 @@ class HarborIntMulDiv extends Module {
     if (mulMode == HarborIntMulMode.pipelined)
       for (var c = 1; c <= mulStages; c++) 'mul_$c'
     else if (mulMode == HarborIntMulMode.iterative)
-      'mul',
+      'mul'
+    else
+      'illegal',
     if (divMode != null)
       for (final n in HarborDivSqrtRecurrence.slotNamesOf(divMode, divStages))
-        'div_$n',
+        'div_$n'
+    else
+      'illegal',
   ];
 
   int get mulSlots => mulSlotCountOf(mulMode, mulStages);
@@ -360,27 +364,26 @@ class HarborIntMulDiv extends Module {
   /// Cycles from accept to `out_valid` for a multiply, `out_ready` high. In
   /// iterative mode the `+ 1` is the merge cycle after the last shift-add
   /// step, where the sign correction and word select land in `resultReg`.
-  /// Zero when [mulMode] is null: a mul-class op then leaves the same
-  /// cycle it is accepted.
+  /// One when [mulMode] is null, the `illegal` slot.
   int get mulLatency => switch (mulMode) {
-    null => 0,
+    null => 1,
     HarborIntMulMode.pipelined => mulStages,
     HarborIntMulMode.iterative => (width + mulRadix - 1) ~/ mulRadix + 1,
   };
 
   /// Cycles from accept to `out_valid` for a wide divide or remainder.
-  /// Zero when [divMode] is null.
+  /// One when [divMode] is null.
   int get divLatency => _divLatency(width);
 
   /// Cycles from accept to `out_valid` for a narrow (w-form) divide or
-  /// remainder. Only meaningful when [width] is 64. Zero when [divMode]
+  /// remainder. Only meaningful when [width] is 64. One when [divMode]
   /// is null.
   int get divNarrowLatency => _divLatency(32);
 
   int _divLatency(int w) {
     final mode = divMode;
     return mode == null
-        ? 0
+        ? 1
         : HarborDivSqrtRecurrence.integerLatencyOf(
             mode,
             divRadix,
@@ -578,9 +581,6 @@ class HarborIntMulDiv extends Module {
     final ageOk = Logic(name: 'age_ok');
     final selMul = Logic(name: 'sel_mul');
     final selDiv = Logic(name: 'sel_div');
-    // The oldest-valid signal of each path. Driven in the Merge section
-    // below, but read here: an absent path's illegal-op branch must not
-    // let its op leave ahead of an older op still held by the other path.
     final mulOldV = Logic(name: 'mul_old_v');
     final divOldV = Logic(name: 'div_old_v');
 
@@ -594,6 +594,31 @@ class HarborIntMulDiv extends Module {
     final mulOutReady = (outReady & selMul).named('mul_out_ready');
     final divOutReady = (outReady & selDiv).named('div_out_ready');
 
+    // The one slot of an absent path. Its op waits here so that out_valid
+    // comes from a register, and in_ready does not look at out_ready.
+    ({Logic live, Logic ready, Logic valid, Logic seq, Logic? tag}) illegalSlot(
+      String p,
+      Logic inV,
+      Logic kill,
+      Logic pathOutReady,
+    ) {
+      final v = Logic(name: '${p}_illegal_v');
+      final live = (v & ~kill).named('${p}_illegal_live');
+      final start = (inV & ~v).named('${p}_illegal_start');
+      final drain = live & pathOutReady;
+      v <= flop(clk, start | (v & ~drain & ~kill), reset: reset);
+      final seq = flop(
+        clk,
+        nextSeq,
+        en: start,
+        reset: reset,
+      ).named('${p}_illegal_seq');
+      final tag = tagW > 0
+          ? flop(clk, inTag!, en: start, reset: reset).named('${p}_illegal_tag')
+          : null;
+      return (live: live, ready: ~v, valid: v, seq: seq, tag: tag);
+    }
+
     // --- Multiply path ---
 
     final Logic mulOutValid;
@@ -603,28 +628,18 @@ class HarborIntMulDiv extends Module {
     final mulSlotValids = <Logic>[];
     final mulSlotTags = <Logic>[];
     final mulSlotSeqs = <Logic>[];
-    // Feeds the oldest-op arbitration below. Equal to the exposed slot
-    // lists above when a multiplier is built, otherwise a single entry
-    // for the op completing this cycle, which holds no slot of its own.
-    final List<Logic> mulArbValids;
-    final List<Logic> mulArbSeqs;
 
     if (mulMode == null) {
-      // No multiplier is built. A mul-class op completes the instant it
-      // is accepted: in_ready waits for out_ready and for the divide
-      // path to hold nothing older, since there is no slot to hold this
-      // op while it waits its turn. out_result is all zero and
-      // out_illegal is set.
-      final illegalReady = (outReady & ~divOldV).named('mul_illegal_ready');
-      final illegalAccept = (mulValid & illegalReady).named(
-        'mul_illegal_accept',
-      );
-      mulOutValid = illegalAccept;
+      final s = illegalSlot('mul', mulValid, mulKill[0], mulOutReady);
+      mulOutValid = s.live;
       mulOutResult = Const(0, width: width);
-      mulOutTag = tagW > 0 ? inTag! : null;
-      mulInReady = illegalReady;
-      mulArbValids = [illegalAccept];
-      mulArbSeqs = [nextSeq];
+      mulOutTag = s.tag;
+      mulInReady = s.ready;
+      mulSlotValids.add(s.valid);
+      mulSlotSeqs.add(s.seq);
+      if (s.tag != null) {
+        mulSlotTags.add(s.tag!);
+      }
     } else if (mulMode == HarborIntMulMode.pipelined) {
       _State preMulS(_State s) {
         final (absA, absB, sign) = _mulMagnitudes(
@@ -685,8 +700,6 @@ class HarborIntMulDiv extends Module {
       mulOutResult = state['result']!;
       mulOutTag = side['tag'];
       mulInReady = en;
-      mulArbValids = mulSlotValids;
-      mulArbSeqs = mulSlotSeqs;
     } else {
       final kk = mulRadix;
       final cycles = (width + kk - 1) ~/ kk;
@@ -795,8 +808,6 @@ class HarborIntMulDiv extends Module {
       mulOutResult = resultReg;
       mulOutTag = heldTag;
       mulInReady = inReadyEngine;
-      mulArbValids = mulSlotValids;
-      mulArbSeqs = mulSlotSeqs;
     }
 
     // --- Divide path ---
@@ -808,28 +819,18 @@ class HarborIntMulDiv extends Module {
     final divSlotValids = <Logic>[];
     final divSlotTags = <Logic>[];
     final divSlotSeqs = <Logic>[];
-    // Feeds the oldest-op arbitration below. Equal to the exposed slot
-    // lists above when a divider is built, otherwise a single entry for
-    // the op completing this cycle, which holds no slot of its own.
-    final List<Logic> divArbValids;
-    final List<Logic> divArbSeqs;
 
     if (divMode == null) {
-      // No divider is built. A div-class op completes the instant it is
-      // accepted: in_ready waits for out_ready and for the multiply path
-      // to hold nothing older, since there is no slot to hold this op
-      // while it waits its turn. out_result is all zero and out_illegal
-      // is set.
-      final illegalReady = (outReady & ~mulOldV).named('div_illegal_ready');
-      final illegalAccept = (divValid & illegalReady).named(
-        'div_illegal_accept',
-      );
-      divInReady = illegalReady;
-      divOutValid = illegalAccept;
+      final s = illegalSlot('div', divValid, divKillMask[0], divOutReady);
+      divInReady = s.ready;
+      divOutValid = s.live;
       divResult = Const(0, width: width);
-      divOutTag = tagW > 0 ? inTag! : null;
-      divArbValids = [illegalAccept];
-      divArbSeqs = [nextSeq];
+      divOutTag = s.tag;
+      divSlotValids.add(s.valid);
+      divSlotSeqs.add(s.seq);
+      if (s.tag != null) {
+        divSlotTags.add(s.tag!);
+      }
     } else {
       final mode = divMode!;
       final isWFormOp =
@@ -934,30 +935,19 @@ class HarborIntMulDiv extends Module {
           }
         }
       }
-      divArbValids = divSlotValids;
-      divArbSeqs = divSlotSeqs;
     }
 
     // --- Merge ---
 
     // Ages count back from next_seq, so the larger age is the older op.
-    final (mv, mulOldSeq) = _oldest(mulArbValids, mulArbSeqs);
-    final (dv, divOldSeq) = _oldest(divArbValids, divArbSeqs);
+    final (mv, mulOldSeq) = _oldest(mulSlotValids, mulSlotSeqs);
+    final (dv, divOldSeq) = _oldest(divSlotValids, divSlotSeqs);
     mulOldV <= mv;
     divOldV <= dv;
     final mulAge = (nextSeq - mulOldSeq).named('mul_age');
     final divAge = (nextSeq - divOldSeq).named('div_age');
     final maxAge = Const((1 << seqW) - 1, width: seqW);
-    // An absent path's age is always zero (it never waits), so its term
-    // would never trip the overflow guard. Leaving the term out instead
-    // of relying on that avoids ageOk depending on that path's own
-    // instant-complete accept, which would otherwise feed back into the
-    // accept decision in the same cycle.
-    final overflowGuards = [
-      if (mulMode != null) ~(mulOldV & mulAge.eq(maxAge)),
-      if (divMode != null) ~(divOldV & divAge.eq(maxAge)),
-    ];
-    ageOk <= overflowGuards.reduce((a, b) => a & b);
+    ageOk <= ~(mulOldV & mulAge.eq(maxAge)) & ~(divOldV & divAge.eq(maxAge));
     selMul <= mulOldV & (~divOldV | mulAge.gt(divAge));
     selDiv <= divOldV & (~mulOldV | divAge.gt(mulAge));
 
