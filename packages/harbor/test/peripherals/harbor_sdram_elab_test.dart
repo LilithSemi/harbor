@@ -112,6 +112,12 @@ void main() {
     final sv = sdram.generateSynth();
 
     expect(sv, contains('harbor_sim_dram'));
+    final dramLine = sv.split('\n').firstWhere((l) => l.contains('sim_dram('));
+    expect(
+      RegExp(r'\.\w+\(\)').allMatches(dramLine).map((m) => m.group(0)),
+      isEmpty,
+      reason: 'empty port(s) in: $dramLine',
+    );
     expect(() => sdram.output('sdram_clk'), throwsA(anything));
     expect(() => sdram.inOut('sdram_dq'), throwsA(anything));
     expect(() => sdram.output('init_done'), throwsA(anything));

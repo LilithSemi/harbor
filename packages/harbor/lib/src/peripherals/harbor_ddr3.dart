@@ -267,6 +267,9 @@ class HarborDdr3 extends BridgeModule
     dram.input('adr').srcConnection! <= bus.addr;
     dram.input('dat_w').srcConnection! <= bus.dataIn;
     dram.input('sel').srcConnection! <= bus.sel;
+    // No classic/registered-feedback burst from the fabric yet, so this
+    // leaf always sees a classic cycle.
+    dram.input('cti').srcConnection! <= Const(0, width: 3);
     bus.ack <= dram.output('ack');
     bus.dataOut <= dram.output('dat_r');
   }

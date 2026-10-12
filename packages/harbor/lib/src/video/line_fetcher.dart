@@ -162,10 +162,10 @@ class HarborLineFetcher extends Module {
 /// of [maxBurst] words, so it never crosses a memory page.
 ///
 /// Every port signal goes straight to or from a register, so the port
-/// can be far from the fetcher. The fetcher sees a take one cycle late and
-/// offers the next request two cycles after it, so `rq_ready` must be low
-/// on the cycle after a take. The data reaches the line buffer one cycle
-/// after `rd_valid`. Each pair of 16-bit words, low word first, makes one 32-bit line
+/// can be far from the fetcher. Any `rq_ready` pattern is correct. A take
+/// clears `rq_valid` on its edge, and the next request comes two cycles
+/// after the take, so a port can take at most every other cycle. The data reaches the
+/// line buffer one cycle after `rd_valid`. Each pair of 16-bit words, low word first, makes one 32-bit line
 /// buffer write. The fetcher ignores the low 2 bits of [fetchAddr], so a
 /// line always starts on a 4-byte word. Pulse [fetchStart]
 /// only while [busy] is low. The [words], [fillSel], [busy] and [done] ports
@@ -273,13 +273,18 @@ class HarborScanoutFetcher extends Module {
                 startAddr.getRange(1, 1 + burstBits).zeroExtend(lw))
             .named('to_group_end');
     final firstLen = minOf(total, toGroupEnd).named('first_len');
-    // Every later request starts on a group. The next length comes from a
-    // register: a take acts at least one cycle after req_left changes.
+    // Every later request starts on a group. next_len is a register that
+    // follows the next value of req_left, so it is correct for every take.
     final nextLen = Logic(name: 'next_len', width: lw);
     final take = Logic(name: 'take');
     final rdValidReg = Logic(name: 'rd_valid_reg');
     final rdDataReg = Logic(name: 'rd_data_reg', width: 16);
     final got = (reading & rdValidReg).named('got');
+    final reqLeftNext = mux(
+      fetchStart,
+      total - firstLen,
+      mux(take, reqLeft - nextLen, reqLeft),
+    ).named('req_left_next');
 
     rqValid <= valid;
     rqAddr <= addr;
@@ -300,8 +305,8 @@ class HarborScanoutFetcher extends Module {
       take < valid & rqReady,
       nextLen <
           mux(
-            reqLeft.getRange(burstBits).eq(0),
-            reqLeft,
+            reqLeftNext.getRange(burstBits).eq(0),
+            reqLeftNext,
             Const(maxBurst, width: lw),
           ),
       rdValidReg < rdValid,
@@ -327,6 +332,9 @@ class HarborScanoutFetcher extends Module {
               len < nextLen.getRange(0, rqWordsWidth),
               valid < reqLeft.neq(0),
               reqLeft < reqLeft - nextLen,
+            ],
+            orElse: [
+              If(rqReady, then: [valid < Const(0)]),
             ],
           ),
           If(

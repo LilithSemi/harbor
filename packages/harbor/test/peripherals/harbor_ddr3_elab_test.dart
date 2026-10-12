@@ -3,8 +3,20 @@ import 'package:harbor/src/peripherals/ddr3_burst_adapter.dart';
 import 'package:harbor/src/peripherals/ddr3_config.dart'
     show HarborDdrConfig, HarborDdrType;
 import 'package:harbor/src/peripherals/harbor_ddr3.dart';
+import 'package:harbor/src/soc/target.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
+
+/// Fails if any instance port in [sv] is left unconnected, e.g. `.cti()`.
+/// [instanceContains] narrows the check to the instantiation line that
+/// contains this text, such as a leaf module's instance name.
+void expectNoEmptyPort(String sv, String instanceContains) {
+  final line = sv
+      .split('\n')
+      .firstWhere((l) => l.contains(instanceContains));
+  final empty = RegExp(r'\.\w+\(\)').allMatches(line).map((m) => m.group(0));
+  expect(empty, isEmpty, reason: 'empty port(s) in: $line');
+}
 
 /// Elaboration smoke test: the [HarborDdr3] wrapper (bus -> CDC -> burst adapter
 /// -> Ddr3Controller -> Ddr3Phy -> pads) builds and generates SystemVerilog with
@@ -48,5 +60,31 @@ void main() {
       adapter.input('reset').srcConnection,
       same(cdc.output('m_reset_joined')),
     );
+  });
+
+  test('sim-mode HarborDdr3 drives every HarborSimDram port', () async {
+    const config = HarborDdrConfig(
+      type: HarborDdrType.ddr3,
+      size: 128 * 1024 * 1024,
+      dataWidth: 16,
+      frequency: 300000000,
+      banks: 8,
+      rowWidth: 14,
+      colWidth: 10,
+      casLatency: 5,
+    );
+    final ddr = HarborDdr3(
+      config: config,
+      baseAddress: 0x80000000,
+      clockHz: 75000000,
+      busAddressWidth: 25,
+      busDataWidth: 32,
+      ckPeriodPs: 3333,
+      target: const HarborSimTarget(),
+    );
+    await ddr.build();
+    final sv = ddr.generateSynth();
+    expect(sv, contains('harbor_sim_dram'));
+    expectNoEmptyPort(sv, 'sim_dram(');
   });
 }

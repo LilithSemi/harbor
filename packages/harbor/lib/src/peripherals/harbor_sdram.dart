@@ -255,6 +255,7 @@ class HarborSdram extends BridgeModule
       readLatency: simReadLatency,
       writeLatency: simWriteLatency,
       scanoutPorts: scanoutPorts,
+      scanoutMaxInFlight: scanoutMaxInFlight,
     );
     addSubModule(dram);
     dram.input('clk').srcConnection! <= clk;
@@ -264,6 +265,9 @@ class HarborSdram extends BridgeModule
     dram.input('adr').srcConnection! <= bus.addr;
     dram.input('dat_w').srcConnection! <= bus.dataIn;
     dram.input('sel').srcConnection! <= bus.sel;
+    // No classic/registered-feedback burst from the fabric yet, so this
+    // leaf always sees a classic cycle.
+    dram.input('cti').srcConnection! <= Const(0, width: 3);
     bus.ack <= dram.output('ack');
     bus.dataOut <= dram.output('dat_r');
     addOutput('bus_error') <= Const(0);

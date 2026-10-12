@@ -7,13 +7,20 @@ import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
 /// Lines through one [HarborScanoutFetcher] against a port model with a
-/// random `rq_ready`, low after each take, and a read latency. Each job is a start byte address
-/// and a count of 32-bit words. Returns the requests taken for each line.
+/// read latency. Each job is a start byte address and a count of 32-bit
+/// words. Returns the requests taken for each line.
+///
+/// [ready] gives `rq_ready` for the next cycle. [tookLastCycle] is true
+/// when a take occurred on the cycle before. The default is random and low
+/// after a take.
 Future<List<List<(int, int)>>> _lines(
   List<(int, int)> jobs, {
   required int seed,
   int latency = 6,
+  bool Function(Random rng, bool tookLastCycle)? ready,
 }) async {
+  final readyFn =
+      ready ?? (rng, tookLastCycle) => !tookLastCycle && rng.nextInt(3) != 0;
   final clk = SimpleClockGenerator(10).clk;
   final reset = Logic()..inject(1);
   final start = Logic()..inject(0);
@@ -54,10 +61,9 @@ Future<List<List<(int, int)>>> _lines(
       written[f.wrIdx.value.toInt()] = f.wrData.value.toInt();
     }
     if (f.done.value == LogicValue.one) doneSeen = true;
-    // A port holds rq_ready low on the cycle after a take.
-    final ready = !took && rng.nextInt(3) != 0;
-    rqReady.put(ready ? 1 : 0);
-    took = ready && f.rqValid.value == LogicValue.one;
+    final readyNow = readyFn(rng, took);
+    rqReady.put(readyNow ? 1 : 0);
+    took = readyNow && f.rqValid.value == LogicValue.one;
     if (took) {
       final a = f.rqAddr.value.toInt();
       final n = f.rqWords.value.toInt();
@@ -91,7 +97,14 @@ Future<List<List<(int, int)>>> _lines(
       start.put(1);
       await clk.nextNegedge;
       start.put(0);
-      while (!doneSeen) {
+      final limit = 1000 + 50 * n;
+      for (var c = 0; !doneSeen; c++) {
+        if (c > limit) {
+          fail(
+            'line at 0x${addr.toRadixString(16)}, $n words: not done '
+            'after $limit cycles, ${taken.length} requests taken',
+          );
+        }
         await clk.nextPosedge;
       }
       await clk.nextPosedge;
@@ -132,8 +145,13 @@ Future<List<(int, int)>> _line({
   required int words,
   required int seed,
   int latency = 6,
-}) async =>
-    (await _lines([(addr, words)], seed: seed, latency: latency)).single;
+  bool Function(Random rng, bool tookLastCycle)? ready,
+}) async => (await _lines(
+  [(addr, words)],
+  seed: seed,
+  latency: latency,
+  ready: ready,
+)).single;
 
 void main() {
   tearDown(() async => Simulator.reset());
@@ -176,6 +194,22 @@ void main() {
 
   test('back to back reads with latency 1', () async {
     await _line(addr: 0x400 - 16, words: 33, seed: 4, latency: 1);
+  });
+
+  test('rq_ready held high every cycle still gives correct requests', () async {
+    // _lines checks that no request repeats or skips one.
+    final jobs = [
+      for (final off in [0, 4, 8, 12])
+        for (var n = 1; n <= 40; n++) (0x8000 * (1 + n % 5) - 64 + off, n),
+    ];
+    await _lines(jobs, seed: 20, ready: (rng, took) => true);
+  });
+
+  test('a random rq_ready with no guaranteed gap after a take still gives '
+      'correct requests', () async {
+    // Ready is often high on the cycle after a take.
+    final jobs = [for (var n = 1; n <= 80; n++) (0x4000 + 16 * n, n)];
+    await _lines(jobs, seed: 21, ready: (rng, took) => rng.nextBool());
   });
 
   test('maxBurst must be a power of two from 2 to 8', () {
