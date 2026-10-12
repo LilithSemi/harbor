@@ -1365,11 +1365,13 @@ class HarborSoC extends BridgeModule {
           ).writeAsStringSync(t.generateConstraints(knownPorts: knownPorts));
           final rtlDir = Directory('$path/rtl');
           final svFiles = rtlDir.existsSync()
-              ? rtlDir
+              // The file system order is not stable, so sort the list.
+              ? (rtlDir
                     .listSync()
                     .where((f) => f.path.endsWith('.sv'))
                     .map((f) => 'rtl/${f.uri.pathSegments.last}')
                     .toList()
+                  ..sort())
               : <String>[];
           File(
             '$path/synth.tcl',

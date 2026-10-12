@@ -276,4 +276,14 @@ void main() {
       );
     });
   });
+
+  test('synth.tcl reads the RTL files in sorted order', () async {
+    final dir = await _generate(_soc(target: _ecp5));
+    final reads = File('${dir.path}/synth.tcl')
+        .readAsLinesSync()
+        .where((l) => l.trimLeft().startsWith('read_verilog'))
+        .toList();
+    expect(reads.length, greaterThan(1));
+    expect(reads, orderedEquals([...reads]..sort()));
+  });
 }
