@@ -110,6 +110,28 @@ class HarborDdrConfig with HarborPrettyString {
       density = DdrDensity.gb2,
       dmRemapping = null;
 
+  /// Alinx AX7203 DDR3 config: two Micron MT41J256M16HA-125 (4 Gb x16 each)
+  /// on a 32-bit bus, 1 GB, 400 MHz (800 MT/s, AX7203 manual p.6 and p.12).
+  /// Each part is 8 banks, 32K rows (A[14:0]) and 1K columns. The two parts
+  /// share address and command.
+  ///
+  /// The controller uses CL 6 and CWL 5, the DDR3-800 setting that the -125
+  /// part supports at tCK 2.5 ns. Its AC timings in [DdrTiming] are the
+  /// DDR3-1600 values, which are the -125 values. tRFC for 4 Gb is 260 ns in
+  /// the datasheet, [DdrDensity.gb4] uses 300 ns, which is safe.
+  const HarborDdrConfig.ax7203()
+    : type = HarborDdrType.ddr3,
+      size = 1024 * 1024 * 1024,
+      dataWidth = 32,
+      frequency = 400000000,
+      ranks = 1,
+      banks = 8,
+      rowWidth = 15,
+      colWidth = 10,
+      casLatency = 6,
+      density = DdrDensity.gb4,
+      dmRemapping = null;
+
   /// Frequency in MHz.
   double get frequencyMhz => frequency / 1e6;
 

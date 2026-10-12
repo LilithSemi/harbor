@@ -7,6 +7,7 @@ import '../peripherals/display.dart';
 import 'display_output.dart';
 import 'dual_clock_scanout.dart';
 import 'dvi_transmitter.dart';
+import 'parallel_rgb_output.dart';
 import 'tmds_encoder.dart';
 import 'video_timing.dart';
 
@@ -24,24 +25,35 @@ import 'video_timing.dart';
 /// line to the next, the line size by default. Use
 /// [HarborSdram.scanoutStride] to start each line on a new sdram row.
 ///
-/// Emits parallel RGB+sync (for a VGA-style backend or observation) and the
-/// four GPDI lanes. See [HarborFramebufferDisplay] for the single-clock
-/// variant used by the test-pattern path.
+/// Emits parallel RGB+sync (for a VGA-style backend or observation) and,
+/// depending on [outputType], either the four GPDI lanes (dvi/hdmi) or a
+/// packed [rgb] plus a forwarded pixel clock [pclk] (parallelRgb). See
+/// [HarborFramebufferDisplay] for the single-clock variant used by the
+/// test-pattern path.
 ///
 /// The parallel outputs ([de], [hsync], [vsync], [red], [green], [blue], [x],
-/// [y], [pixelWord]) are registered and aligned with each other. They come
-/// [pipelineDelay] pixel cycles after the timing generator. The TMDS lanes add
-/// the [TmdsEncoder.latency] of the encoders on top of that.
+/// [y], [pixelWord], and for parallelRgb [rgb]/[pclk]) are registered and
+/// aligned with each other. They come [pipelineDelay] pixel cycles after the
+/// timing generator. The TMDS lanes add the [TmdsEncoder.latency] of the
+/// encoders on top of that; parallelRgb adds none, since [rgb]/[pclk] are the
+/// same registers as [red]/[green]/[blue]/[hsync]/[vsync]/[de].
 class HarborDualClockDisplay extends Module {
   /// Pixel cycles from the timing generator to the parallel outputs: one for
   /// the line buffer read and one for the output register.
   static const pipelineDelay = 2;
 
+  /// Four serialized TMDS lanes, present only for dvi/hdmi.
   Logic get gpdi => output('gpdi');
 
   /// The four complement lanes, present only on a target that drives its own
   /// ([TmdsSerializer.needsComplement]).
   Logic get gpdiN => output('gpdi_n');
+
+  /// 24-bit 8:8:8 RGB (red in bits 23:16), present only for parallelRgb.
+  Logic get rgb => output('rgb');
+
+  /// The forwarded pixel clock, present only for parallelRgb.
+  Logic get pclk => output('pclk');
   Logic get de => output('de');
   Logic get hsync => output('hsync');
   Logic get vsync => output('vsync');
@@ -94,15 +106,21 @@ class HarborDualClockDisplay extends Module {
     int burstWords = 16,
     this.outputType = HarborDisplayInterface.hdmi,
     this.pixelFormat = HarborPixelFormat.xrgb8888,
+    HarborParallelRgbLatchEdge parallelRgbLatchEdge =
+        HarborParallelRgbLatchEdge.falling,
     required HarborDeviceTarget target,
     super.name = 'dual_clock_display',
   }) : lineStride = lineStride ?? _lineBytes(timing, pixelFormat),
        super(
-         definitionName: rqReady != null
-             ? 'HarborDualClockDisplayPort'
-                   '_s${lineStride ?? _lineBytes(timing, pixelFormat)}'
-                   '_w${_lineBytes(timing, pixelFormat) ~/ 4}'
-             : 'HarborDualClockDisplay',
+         definitionName:
+             (rqReady != null
+                 ? 'HarborDualClockDisplayPort'
+                       '_s${lineStride ?? _lineBytes(timing, pixelFormat)}'
+                       '_w${_lineBytes(timing, pixelFormat) ~/ 4}'
+                 : 'HarborDualClockDisplay') +
+             (outputType == HarborDisplayInterface.parallelRgb
+                 ? '_parallelRgb'
+                 : ''),
        ) {
     requireDisplayOutputSupported(outputType);
     final lineBytes = _lineBytes(timing, pixelFormat);
@@ -141,10 +159,17 @@ class HarborDualClockDisplay extends Module {
 
     final hbits = (timing.hTotal - 1).bitLength;
     final vbits = (timing.vTotal - 1).bitLength;
-    addOutput('gpdi', width: 4);
-    final tmdsComplement = TmdsSerializer.needsComplement(target);
-    if (tmdsComplement) {
-      addOutput('gpdi_n', width: 4);
+    final parallelRgb = outputType == HarborDisplayInterface.parallelRgb;
+    final tmdsComplement =
+        !parallelRgb && TmdsSerializer.needsComplement(target);
+    if (parallelRgb) {
+      addOutput('rgb', width: 24);
+      addOutput('pclk');
+    } else {
+      addOutput('gpdi', width: 4);
+      if (tmdsComplement) {
+        addOutput('gpdi_n', width: 4);
+      }
     }
     addOutput('de');
     addOutput('hsync');
@@ -249,8 +274,23 @@ class HarborDualClockDisplay extends Module {
 
     // Stage 2 registers every parallel output.
     final de2 = delay(de1, 'de_s2');
-    final hsync2 = delay(delay(timingGen.hsync, 'hsync_s1'), 'hsync_s2');
-    final vsync2 = delay(delay(timingGen.vsync, 'vsync_s1'), 'vsync_s2');
+    // On a parallelRgb pin the sync flops reset to the idle level of the
+    // mode's polarity. The TMDS path keeps its reset at 0.
+    Logic syncDelay(Logic v, String name, bool positive) =>
+        parallelRgb && !positive
+        ? flop(pixelClk, v, reset: pixelReset, resetValue: 1).named(name)
+        : delay(v, name);
+    final hp = timing.hSyncPositive, vp = timing.vSyncPositive;
+    final hsync2 = syncDelay(
+      syncDelay(timingGen.hsync, 'hsync_s1', hp),
+      'hsync_s2',
+      hp,
+    );
+    final vsync2 = syncDelay(
+      syncDelay(timingGen.vsync, 'vsync_s1', vp),
+      'vsync_s2',
+      vp,
+    );
     final r2 = delay(mux(de1, r, zero), 'red_s2');
     final g2 = delay(mux(de1, g, zero), 'green_s2');
     final b2 = delay(mux(de1, b, zero), 'blue_s2');
@@ -264,22 +304,35 @@ class HarborDualClockDisplay extends Module {
     y <= delay(delay(ty, 'y_s1'), 'y_s2');
     pixelWord <= delay(word, 'pixel_word_s2');
 
-    final transmitter = DviTransmitter(
-      target: target,
-      pixelClk: pixelClk,
-      shiftClk: shiftClk, // 5x pixel clock from the SoC's display PLL
-      pixelReset: pixelReset,
-      shiftReset: shiftReset,
-      de: de2,
-      hsync: hsync2,
-      vsync: vsync2,
-      red: r2,
-      green: g2,
-      blue: b2,
-    );
-    gpdi <= transmitter.gpdi;
-    if (tmdsComplement) {
-      gpdiN <= transmitter.gpdiN;
+    if (parallelRgb) {
+      // No TMDS encoder or serializer, and no shift clock: rgb/hsync/vsync/de
+      // are already the registered, pixel-aligned stage-2 values above, and
+      // pclk is the pixel clock forwarded through the same edge.
+      rgb <= [r2, g2, b2].swizzle();
+      pclk <=
+          HarborPixelClockForward(
+            clk: pixelClk,
+            target: target,
+            latchEdge: parallelRgbLatchEdge,
+          ).q;
+    } else {
+      final transmitter = DviTransmitter(
+        target: target,
+        pixelClk: pixelClk,
+        shiftClk: shiftClk, // 5x pixel clock from the SoC's display PLL
+        pixelReset: pixelReset,
+        shiftReset: shiftReset,
+        de: de2,
+        hsync: hsync2,
+        vsync: vsync2,
+        red: r2,
+        green: g2,
+        blue: b2,
+      );
+      gpdi <= transmitter.gpdi;
+      if (tmdsComplement) {
+        gpdiN <= transmitter.gpdiN;
+      }
     }
   }
 

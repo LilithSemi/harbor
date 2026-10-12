@@ -153,7 +153,7 @@ class HarborSoC extends BridgeModule {
     final domain = domainFor(clockDomainName);
     final (clk, reset) = domain != null
         ? (domain.clk, domain.reset)
-        : (input('clk'), input('reset'));
+        : (_boardClk, input('reset'));
     module.input('clk').srcConnection! <= clk;
     module.input('reset').srcConnection! <= reset;
   }
@@ -178,6 +178,10 @@ class HarborSoC extends BridgeModule {
   }
 
   late final HarborClockGenerator _clockGen;
+
+  /// The board clock after the input buffer. It is the `clk` port itself for
+  /// a single-ended clock.
+  late final Logic _boardClk;
   final Map<String, HarborClockDomain> _clockDomains = {};
 
   /// The Xilinx DDR3-fast clock tree, built in this SoC's clock generation when
@@ -260,6 +264,7 @@ class HarborSoC extends BridgeModule {
     XilinxDdr3TreeSpec? xilinxDdr3Tree,
   }) : super(name, name: name) {
     createPort('clk', PortDirection.input);
+    _boardClk = _buildBoardClock();
 
     final hasClockDomains = clocks.isNotEmpty;
 
@@ -287,7 +292,7 @@ class HarborSoC extends BridgeModule {
     final Logic resetSignal;
     if (usePowerOnReset) {
       final porCount = Logic(name: 'porCount', width: 8);
-      Sequential(input('clk'), [
+      Sequential(_boardClk, [
         If(~porCount[7], then: [porCount < porCount + 1]),
       ]);
       final por = (~porCount[7]).named('porReset');
@@ -300,7 +305,7 @@ class HarborSoC extends BridgeModule {
 
     _clockGen = HarborClockGenerator(
       parent: this,
-      inputClk: input('clk'),
+      inputClk: _boardClk,
       inputReset: resetSignal,
       target: target,
     );
@@ -317,7 +322,7 @@ class HarborSoC extends BridgeModule {
     ({Logic coreClk, Logic locked, double coreMhz})? corePll;
     if (ddrSpec != null) {
       final sharedIn = addSubModule(XilinxBufg(name: 'sysosc_bufg'));
-      sharedIn.input('I').srcConnection! <= input('clk');
+      sharedIn.input('I').srcConnection! <= _boardClk;
       final shared = sharedIn.output('O');
       // Decoupled core PLL off the shared input. The DDR tree no longer emits
       // its CLKOUT5 core clock.
@@ -408,7 +413,36 @@ class HarborSoC extends BridgeModule {
       final d = _clockDomains['sys'] ?? _clockDomains.values.first;
       return (d.clk, d.reset);
     }
-    return (input('clk'), input('reset'));
+    return (_boardClk, input('reset'));
+  }
+
+  /// Joins a differential board clock (`clk` and the target's
+  /// [HarborFpgaTarget.clockNPortName]) through an IBUFDS.
+  Logic _buildBoardClock() {
+    final t = target;
+    final nName = t is HarborFpgaTarget ? t.clockNPortName : null;
+    if (nName == null) return input('clk');
+    t as HarborFpgaTarget;
+    if (t.vendor != HarborFpgaVendor.vivado &&
+        t.vendor != HarborFpgaVendor.openXc7) {
+      throw UnsupportedError(
+        'A differential board clock is only built for Xilinx targets.',
+      );
+    }
+    if (t.clockPortName != 'clk') {
+      throw ArgumentError(
+        'The SoC clock input is `clk`, but the target names its P side '
+        '"${t.clockPortName}".',
+      );
+    }
+    createPort(nName, PortDirection.input);
+    final buf = addSubModule(XilinxIbufds(name: 'sysclk_ibufds'));
+    buf.input('I').srcConnection! <= input('clk');
+    buf.input('IB').srcConnection! <= input(nName);
+    // A fixed net name lets the XDC put the board clock constraint on it.
+    final net = Logic(name: HarborFpgaTarget.differentialClockNet);
+    net <= buf.o;
+    return net;
   }
 
   /// All registered peripherals.
@@ -1360,6 +1394,22 @@ class HarborSoC extends BridgeModule {
             ...outputs.keys,
             ...inOuts.keys,
           };
+          // nextpnr-xilinx rejects a design with an unconstrained IO, and
+          // Vivado stops at bitstream time. Fail here and name the ports.
+          if (t.vendor == HarborFpgaVendor.openXc7 ||
+              t.vendor == HarborFpgaVendor.vivado) {
+            final missing = t.missingPins({
+              for (final p in [...inputs.values, ...outputs.values])
+                p.name: p.width,
+              for (final p in inOuts.values) p.name: p.width,
+            });
+            if (missing.isNotEmpty) {
+              throw StateError(
+                'Top-level ports of $name have no pin in the ${t.name} '
+                'pin map: ${missing.join(', ')}.',
+              );
+            }
+          }
           File(
             '$path/$name.${t.constraintExtension}',
           ).writeAsStringSync(t.generateConstraints(knownPorts: knownPorts));

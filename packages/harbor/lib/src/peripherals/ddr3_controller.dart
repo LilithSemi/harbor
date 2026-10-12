@@ -1287,12 +1287,23 @@ class Ddr3Controller extends Module {
   /// unless [phySelfTrainsRead].
   Logic? get calFailed => phySelfTrainsRead ? output('o_cal_failed') : null;
 
-  /// Calibration write patterns: each 16-bit beat is a byte replicated across
-  /// the two lanes (ddr3_controller.v:1554/1563). x16 (LANES=2) only.
-  static BigInt get _calibDataW1 =>
-      BigInt.parse('9191777729298c8cd0d0adad5151c1c1', radix: 16);
-  static BigInt get _calibDataW2 =>
-      BigInt.parse('8080dbdbcfcfd2d27575f1f12c2c3d3d', radix: 16);
+  /// Calibration write patterns: each beat is one byte replicated across all
+  /// lanes (ddr3_controller.v:1554/1563).
+  BigInt get _calibDataW1 =>
+      _replicateLanes([0x91, 0x77, 0x29, 0x8c, 0xd0, 0xad, 0x51, 0xc1]);
+  BigInt get _calibDataW2 =>
+      _replicateLanes([0x80, 0xdb, 0xcf, 0xd2, 0x75, 0xf1, 0x2c, 0x3d]);
+
+  /// The beats in [bytes] go high to low, each byte repeated [lanes] times.
+  BigInt _replicateLanes(List<int> bytes) {
+    var v = BigInt.zero;
+    for (final b in bytes) {
+      for (var l = 0; l < lanes; l++) {
+        v = (v << 8) | BigInt.from(b);
+      }
+    }
+    return v;
+  }
 
   /// Read-verify reference (ddr3_controller.v:1584): the two per-lane byte
   /// sequences concatenated, {W2-lane-bytes, W1-lane-bytes}.
@@ -1335,7 +1346,8 @@ class Ddr3Controller extends Module {
     );
     final initialDqs = Logic(name: 'initial_dqs');
     final laneReg = Logic(name: 'lane', width: laneW);
-    final laneTimes8 = Logic(name: 'lane_times_8', width: 4);
+    final laneTimes8W = math.max(4, ((lanes - 1) * 8).bitLength);
+    final laneTimes8 = Logic(name: 'lane_times_8', width: laneTimes8W);
     final dqsBitslipArrangement = Logic(
       name: 'dqs_bitslip_arrangement',
       width: 16,
@@ -1490,7 +1502,7 @@ class Ddr3Controller extends Module {
           dqsTargetIndexOrig < Const(0, width: idxW),
           initialDqs < Const(1),
           laneReg < Const(0, width: laneW),
-          laneTimes8 < Const(0, width: 4),
+          laneTimes8 < Const(0, width: laneTimes8W),
           dqsBitslipArrangement < Const(0, width: 16),
           delayBeforeReadData < Const(0, width: 4),
           idelayDataCntPrev < Const(0, width: 5),
@@ -1541,7 +1553,7 @@ class Ddr3Controller extends Module {
                 Const(0, width: 4),
                 delayBeforeReadData - 1,
               ),
-          laneTimes8 < laneReg.zeroExtend(4) << 3,
+          laneTimes8 < laneReg.zeroExtend(laneTimes8W) << 3,
           if (selfTrain) ...[
             levelCheck! < Const(0),
             levelWait! <

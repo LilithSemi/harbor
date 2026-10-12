@@ -81,6 +81,7 @@ export 'src/video/dual_clock_display.dart';
 export 'src/video/dual_clock_scanout.dart';
 export 'src/video/dvi_output.dart';
 export 'src/video/line_fetcher.dart';
+export 'src/video/parallel_rgb_output.dart';
 export 'src/video/read_arbiter.dart';
 export 'src/video/video_capture.dart';
 export 'src/video/dvi_transmitter.dart';

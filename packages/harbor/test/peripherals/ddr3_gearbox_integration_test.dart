@@ -179,7 +179,7 @@ void main() {
     () {
       const config = HarborDdrConfig(
         type: HarborDdrType.ddr3,
-        size: 128 * 1024 * 1024,
+        size: 256 * 1024 * 1024,
         dataWidth: 16,
         frequency: 300000000,
         banks: 8,

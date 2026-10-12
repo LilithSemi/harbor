@@ -127,7 +127,25 @@ class HarborFpgaTarget extends HarborDeviceTarget {
 
   /// Name of the top-level clock input port, used for the timing constraint in
   /// the generated constraint file. Defaults to `'clk'`.
+  ///
+  /// For a differential board clock this is the P side.
   final String clockPortName;
+
+  /// Name of the N side port of a differential board clock, or null for a
+  /// single-ended clock. When set, the SoC adds this input port and joins the
+  /// pair through an input buffer (IBUFDS on Xilinx).
+  final String? clockNPortName;
+
+  /// Net name of the IBUFDS output for a differential board clock.
+  ///
+  /// nextpnr-xilinx does not carry a `create_clock` on the P port through the
+  /// IBUFDS, so the XDC also constrains this net.
+  static const differentialClockNet = 'sysclk_diff';
+
+  /// Xilinx speed grade (`'1'`, `'2'`, `'2L'`, `'3'`). It completes the part
+  /// name that the openXC7 flow gives to prjxray, for example
+  /// `xc7a200tfbg484-2`. Other vendors ignore it.
+  final String speedGrade;
 
   /// Optional bitstream programming command for a `prog` Makefile target
   /// (e.g. `'openFPGALoader -b ulx3s \$(TOP).bit'`). When null, no `prog`
@@ -193,6 +211,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.pinMap = const {},
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
+    this.clockNPortName,
+    this.speedGrade = '1',
     this.progCommand,
     this.ecp5Autoname = false,
   }) : _xilinxFamily = null;
@@ -209,6 +229,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   }) : name = 'ice40-$device',
        vendor = HarborFpgaVendor.ice40,
        _xilinxFamily = null,
+       clockNPortName = null,
+       speedGrade = '1',
        ecp5Autoname = false;
 
   /// Lattice ECP5 target using Yosys + nextpnr-ecp5.
@@ -223,6 +245,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.ecp5Autoname = false,
   }) : name = 'ecp5-$device',
        vendor = HarborFpgaVendor.ecp5,
+       clockNPortName = null,
+       speedGrade = '1',
        _xilinxFamily = null;
 
   /// Xilinx Spartan-7 target using Vivado or openXC7.
@@ -236,6 +260,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.pinMap = const {},
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
+    this.clockNPortName,
+    this.speedGrade = '1',
     this.progCommand,
     bool useOpenXc7 = false,
   }) : name = 'spartan7-$device',
@@ -254,6 +280,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.pinMap = const {},
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
+    this.clockNPortName,
+    this.speedGrade = '1',
     this.progCommand,
     bool useOpenXc7 = false,
   }) : name = 'artix7-$device',
@@ -272,6 +300,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.pinMap = const {},
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
+    this.clockNPortName,
+    this.speedGrade = '1',
     this.progCommand,
     bool useOpenXc7 = false,
   }) : name = 'kintex7-$device',
@@ -463,6 +493,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   int? get jtagIdcode => switch (device.toLowerCase()) {
     'xc7s50' => 0x0362F093,
     'xc7s25' => 0x0362D093,
+    'xc7a200t' => 0x13636093,
     'lfe5u-25f' => 0x41111043,
     'lfe5u-45f' => 0x41112043,
     'lfe5u-85f' => 0x41113043,
@@ -552,52 +583,59 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     return buf.toString();
   }
 
-  /// Per-device DDR train-SERDES pre-place geometry for the openXC7 flow.
+  /// Per-device DDR train-SERDES pre-place sites for the openXC7 flow.
   ///
-  /// The DDR PHY's bitslip-reference train SERDES must be pinned off the dead
-  /// `_SING` OLOGIC/ILOGIC tile (missing prjxray PIPs make its capture dead).
-  /// Lane 0 pins to `X<column>Y<baseY>`, lane `l` to
-  /// `X<column>Y<baseY + l*strideY>`; the dead `_SING` tile sits one stride
-  /// above lane 0 (`baseY - strideY`). Each lane's OSERDESE2/ISERDESE2 pair
-  /// shares the SAME tile (they loop back via OFB).
+  /// The DDR PHY's bitslip-reference train SERDES of lane `l` goes to the
+  /// OLOGIC/ILOGIC site `sites[l]`. Each lane's OSERDESE2/ISERDESE2 pair
+  /// shares the same site index (they loop back via OFB). A `_SING` tile has
+  /// missing prjxray PIPs, which makes its capture dead, so no site is on one.
   ///
   /// Keyed by the lower-case device part. Add an entry per verified part.
   static const Map<String, _DdrPreplaceGeom> _ddrPreplaceGeom = {
-    // Verified on the Arty S7 (xc7s50), 2 lanes: lane0 -> X0Y145,
-    // lane1 -> X0Y141, dead _SING -> X0Y149.
-    'xc7s50': _DdrPreplaceGeom(baseY: 145, strideY: -4, column: 0),
+    // Verified on the Arty S7 (xc7s50), 2 lanes. Dead _SING -> X0Y149.
+    'xc7s50': _DdrPreplaceGeom(sites: ['X0Y145', 'X0Y141'], deadSite: 'X0Y149'),
+    // AX7203 (xc7a200t fbg484), from the prjxray-db package_pins.csv and
+    // tilegrid.json. All DQ groups are in bank 35 (Y150-199, one clock
+    // region). Each site is the one IOB of its lane's byte group that the
+    // DDR3 pads do not use, on a plain RIOI3 tile: lane 1 G4 (Y175), lane 2
+    // K4 (Y174), lane 3 N3 (Y161, a VREF ball). The T0 group has no free
+    // plain tile, so lane 0 takes E3 (Y187, a VREF ball on a RIOI3_TBYTETERM
+    // tile). The pads stay unused, only the IO logic is taken. Not yet proven
+    // on hardware.
+    'xc7a200t': _DdrPreplaceGeom(
+      sites: ['X1Y187', 'X1Y175', 'X1Y174', 'X1Y161'],
+      deadSite: 'X1Y199',
+    ),
   };
 
   /// Generates the nextpnr-xilinx `--pre-place` Python script
   /// (`support/nextpnr/constraints.py`) for the openXC7 DDR3 flow.
   ///
-  /// It pins each of the [lanes] DDR train SERDES pairs off the dead `_SING`
-  /// tile using the [device]-keyed [_ddrPreplaceGeom]. When the device is not
-  /// in the map, the xc7s50 geometry is used as a fallback and a warning
-  /// header notes that the placement is unverified for the part.
+  /// It pins each of the [lanes] DDR train SERDES pairs to the
+  /// [device]-keyed [_ddrPreplaceGeom] sites. A device with no entry, or with
+  /// fewer sites than [lanes], throws an [ArgumentError].
   String generateDdrPreplacePy({required int lanes}) {
-    final geom = _ddrPreplaceGeom[device.toLowerCase()];
-    // Fallback geometry (xc7s50) when the part is unknown: still emit, but flag.
-    final g =
-        geom ?? const _DdrPreplaceGeom(baseY: 145, strideY: -4, column: 0);
-    final singY =
-        g.baseY - g.strideY; // dead _SING tile, one stride above lane 0
-
-    final buf = StringBuffer();
-    if (geom == null) {
-      buf.writeln(
-        '# WARNING: device "$device" has no verified DDR train-SERDES tile',
-      );
-      buf.writeln(
-        '# placement in Harbor. The geometry below is the xc7s50 default and is',
-      );
-      buf.writeln(
-        '# UNVERIFIED for this part - confirm the OLOGIC/ILOGIC tile Y range.',
+    final g = _ddrPreplaceGeom[device.toLowerCase()];
+    if (g == null) {
+      throw ArgumentError.value(
+        device,
+        'device',
+        'has no verified DDR train-SERDES sites. Known: '
+            '${_ddrPreplaceGeom.keys.join(', ')}',
       );
     }
+    if (lanes > g.sites.length) {
+      throw ArgumentError.value(
+        lanes,
+        'lanes',
+        '$device has train-SERDES sites for ${g.sites.length} lanes',
+      );
+    }
+
+    final buf = StringBuffer();
     buf.writeln(
       '# Pin the bitslip-reference train serdes off the _SING tile '
-      '(X${g.column}Y$singY, which has',
+      '(${g.deadSite}, which has',
     );
     buf.writeln(
       '# missing prjxray PIPs -> dead capture). Each lane\'s '
@@ -608,10 +646,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     );
     buf.writeln('def get_cells(part):');
     buf.writeln('    return [c.second for c in ctx.cells if part in c.first]');
-    final pairs = [
-      for (var l = 0; l < lanes; l++)
-        "('$l', 'X${g.column}Y${g.baseY + l * g.strideY}')",
-    ];
+    final pairs = [for (var l = 0; l < lanes; l++) "('$l', '${g.sites[l]}')"];
     buf.writeln('pairs = [${pairs.join(', ')}]');
     buf.writeln('for suf, y in pairs:');
     buf.writeln("    for c in get_cells('train_oserdes_' + suf):");
@@ -761,7 +796,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         'CHIPDB ?= \$(NEXTPNR_XILINX_CHIPDB)/\$(DEVICE)\$(PACKAGE).bin',
       );
       buf.writeln('XRAY_DB ?= \$(PRJXRAY_DB)');
-      buf.writeln('PART ?= \$(DEVICE)\$(PACKAGE)-1');
+      buf.writeln('PART ?= \$(DEVICE)\$(PACKAGE)-$speedGrade');
       buf.writeln('FAMILY = $_prjxrayFamily');
       buf.writeln('SEED ?= 1');
       buf.writeln(
@@ -823,6 +858,13 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         '\$(PREPACK) \$(PREPLACE) \$(PREROUTE) --placer \$(PLACER) '
         '--seed \$(SEED)',
       );
+      // nextpnr-xilinx always writes the 0.675 V internal VREF (SSTL135) for
+      // a bank with SSTL inputs and ignores INTERNAL_VREF. SSTL15 needs 0.75 V.
+      if (sstlVrefMv == 750) {
+        buf.writeln(
+          "\tsed -i 's/\\.VREF\\.V_675_MV\$\$/.VREF.V_750_MV/' \$(TOP).fasm",
+        );
+      }
       buf.writeln();
       buf.writeln('pack: \$(TOP).$bitstreamExtension');
       buf.writeln('\$(TOP).frames: \$(TOP).fasm');
@@ -876,6 +918,37 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       case HarborFpgaVendor.openXc7:
         return _generateXdc(knownPorts);
     }
+  }
+
+  /// The internal VREF in mV that the SSTL inputs in [pinMap] need: 675 for
+  /// SSTL135 (VCCO 1.35 V), 750 for SSTL15 (VCCO 1.5 V), null with neither.
+  /// Throws when one design has both, since the openXC7 flow sets one level.
+  int? get sstlVrefMv {
+    final levels = <int>{};
+    for (final v in pinMap.values) {
+      final io = _ioAttrs(v).where((a) => !a.contains('=')).firstOrNull ?? '';
+      if (RegExp(r'^(DIFF_)?SSTL135').hasMatch(io)) levels.add(675);
+      if (RegExp(r'^(DIFF_)?SSTL15').hasMatch(io)) levels.add(750);
+    }
+    if (levels.length > 1) {
+      throw StateError('$name mixes SSTL135 and SSTL15 pins.');
+    }
+    return levels.firstOrNull;
+  }
+
+  /// The pin keys that top-level ports need and [pinMap] does not have.
+  ///
+  /// [portWidths] maps each top-level port to its width. A 1-bit port needs
+  /// the key `name`, a wider port needs `name[i]` for every bit.
+  List<String> missingPins(Map<String, int> portWidths) {
+    final missing = <String>[];
+    for (final MapEntry(key: name, value: width) in portWidths.entries) {
+      final keys = width == 1
+          ? [name]
+          : [for (var i = 0; i < width; i++) '$name[$i]'];
+      missing.addAll(keys.where((k) => !pinMap.containsKey(k)));
+    }
+    return missing;
   }
 
   /// A pin key may carry a bus index (`sdram_dq[0]`); the port it belongs to is
@@ -1007,12 +1080,17 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       if (!_emitPin(entry.key, knownPorts)) continue;
       final attrs = _ioAttrs(entry.value);
       final ioStandard = attrs.where((a) => !a.contains('=')).firstOrNull;
+      // A KEY=VAL attribute (e.g. IN_TERM=UNTUNED_SPLIT_50) joins the dict.
+      final extras = [
+        for (final a in attrs.where((a) => a.contains('=')))
+          ' ${a.replaceFirst('=', ' ')}',
+      ].join();
       // No braces around the port name in get_ports: the open-source
       // nextpnr-xilinx XDC parser rejects `[get_ports {name}]` (asserts on the
       // brace token), unlike Vivado which accepts either form.
       buf.writeln(
         'set_property -dict {PACKAGE_PIN ${_site(entry.value)} '
-        'IOSTANDARD ${ioStandard ?? 'LVCMOS33'}} '
+        'IOSTANDARD ${ioStandard ?? 'LVCMOS33'}$extras} '
         '[get_ports ${entry.key}]',
       );
     }
@@ -1022,6 +1100,12 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         'create_clock -period ${periodNs.toStringAsFixed(3)} '
         '[get_ports $clockPortName]',
       );
+      if (clockNPortName != null && vendor == HarborFpgaVendor.openXc7) {
+        buf.writeln(
+          'create_clock -period ${periodNs.toStringAsFixed(3)} '
+          '[get_nets $differentialClockNet]',
+        );
+      }
     }
     // Extra raw XDC lines (values written verbatim). Used for openXC7 clock-BEL
     // placement constraints the auto placer gets wrong, e.g. pinning the DDR3
@@ -1034,25 +1118,17 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   }
 }
 
-/// DDR train-SERDES pre-place tile geometry for one FPGA part (openXC7 flow).
+/// DDR train-SERDES pre-place sites for one FPGA part (openXC7 flow).
 ///
-/// See [HarborFpgaTarget.generateDdrPreplacePy]. Lane `l`'s OSERDESE2/ISERDESE2
-/// pair pins to `X<column>Y<baseY + l*strideY>`.
+/// See [HarborFpgaTarget.generateDdrPreplacePy].
 class _DdrPreplaceGeom {
-  /// OLOGIC/ILOGIC tile Y for lane 0.
-  final int baseY;
+  /// OLOGIC/ILOGIC site suffix (`X<x>Y<y>`) for each lane, lane 0 first.
+  final List<String> sites;
 
-  /// Per-lane Y delta (negative descends the tile column).
-  final int strideY;
+  /// The dead `_SING` tile the sites keep clear of, for the script comment.
+  final String deadSite;
 
-  /// OLOGIC/ILOGIC tile X column.
-  final int column;
-
-  const _DdrPreplaceGeom({
-    required this.baseY,
-    required this.strideY,
-    required this.column,
-  });
+  const _DdrPreplaceGeom({required this.sites, required this.deadSite});
 }
 
 /// Describes a macro/tile module for hierarchical hardening.

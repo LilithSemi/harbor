@@ -640,6 +640,20 @@ class XilinxIbuf extends BridgeModule {
   }
 }
 
+/// Xilinx 7-series IBUFDS: differential input buffer. The pad pair `I` (P)
+/// and `IB` (N) gives the single-ended [o]. The DIFF IO standard is set by the
+/// XDC on the P/N pins.
+class XilinxIbufds extends BridgeModule {
+  Logic get o => output('O');
+
+  XilinxIbufds({super.name = 'ibufds'})
+    : super('IBUFDS', isSystemVerilogLeaf: true) {
+    createPort('I', PortDirection.input);
+    createPort('IB', PortDirection.input);
+    addOutput('O');
+  }
+}
+
 /// Xilinx 7-series OBUF: Output buffer. Drives the pad output [o] from the
 /// single-ended [i]. Leaving [i] unset keeps the bare open port for callers that
 /// wire `.input('I')` directly.

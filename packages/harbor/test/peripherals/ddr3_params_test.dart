@@ -77,7 +77,7 @@ void main() {
         () => DdrParams(
           controllerClkPeriodPs: 12000,
           ddr3ClkPeriodPs: 3000,
-          lanes: 4,
+          lanes: 3,
         ),
         throwsA(isA<AssertionError>()),
       );

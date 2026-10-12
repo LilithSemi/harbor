@@ -169,10 +169,27 @@ class HarborDdr3 extends BridgeModule
         'the ECP5 DDR3 PHY needs a CK/4 controller',
       );
     }
-    // The ECP5 board is the OrangeCrab r0.2 (MT41K64M16).
+    // The controller runs CL 6 and CWL 5. JEDEC allows CWL 5 only at
+    // tCK 2.5 ns or more, so a faster CK is out of spec.
+    if (ckPeriodPs < 2500) {
+      throw ArgumentError.value(
+        ckPeriodPs,
+        'ckPeriodPs',
+        'CWL 5 needs tCK of at least 2500 ps',
+      );
+    }
+    // The ECP5 board is the OrangeCrab r0.2 (MT41K64M16). On Xilinx the
+    // geometry comes from the config. The sim memory has no controller, so it
+    // keeps the Arty geometry and skips the config check.
     final p = isEcp5
         ? DdrParams.orangeCrab(ckPeriodPs: ckPeriodPs)
-        : DdrParams.artyS7(
+        : target is HarborSimTarget
+        ? DdrParams.artyS7(
+            ckPeriodPs: ckPeriodPs,
+            controllerGearRatio: controllerGearRatio,
+          )
+        : DdrParams.fromConfig(
+            config,
             ckPeriodPs: ckPeriodPs,
             controllerGearRatio: controllerGearRatio,
           );

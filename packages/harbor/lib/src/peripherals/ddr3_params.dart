@@ -12,6 +12,7 @@
 /// is nothing to hand-tune.
 library;
 
+import 'ddr3_config.dart';
 import 'ddr3_timing.dart';
 
 class DdrParams {
@@ -42,8 +43,8 @@ class DdrParams {
   /// DQ bits per byte lane. Always 8 for DDR3.
   final int dqBits;
 
-  /// Byte lanes: 1 = x8, 2 = x16. The Arty S7 populates a x16 device, so 2
-  /// (the full 256 MB).
+  /// Byte lanes: 1 = x8, 2 = x16, 4 = two x16 parts on a 32-bit bus. The Arty
+  /// S7 populates a x16 device, so 2 (the full 256 MB).
   final int lanes;
 
   /// Write path selection: HP-bank ODELAYE2 deskew (true) vs HR-bank CK@90
@@ -104,7 +105,10 @@ class DdrParams {
     this.dualRankDimm = false,
     this.density = DdrDensity.gb2,
   }) : assert(dqBits == 8, 'DDR3 DQ is 8 bits per lane'),
-       assert(lanes == 1 || lanes == 2, 'x8 (1) or x16 (2)'),
+       assert(
+         lanes == 1 || lanes == 2 || lanes == 4,
+         'x8 (1), x16 (2) or x32 (4)',
+       ),
        assert(serdesRatio >= 1, 'serdesRatio must be >= 1'),
        // The controller clock must be an integer multiple of the SERDES CLKDIV
        // rate (serdesRatio * CK), so the fabric gearbox is a clean integer ratio.
@@ -133,6 +137,65 @@ class DdrParams {
     lanes: 2,
     odelaySupported: false,
     speedBin: 1,
+  );
+
+  /// The Xilinx 7-series geometry of [config]: rows, columns, byte lanes and
+  /// density come from the config. [ckPeriodPs] and [controllerGearRatio] are
+  /// as for [DdrParams.artyS7].
+  ///
+  /// Throws an [ArgumentError] when the config does not describe a DDR3 part
+  /// this controller can drive.
+  factory DdrParams.fromConfig(
+    HarborDdrConfig config, {
+    required int ckPeriodPs,
+    int controllerGearRatio = 1,
+  }) {
+    const baBits = 3;
+    if (config.banks != 1 << baBits) {
+      throw ArgumentError.value(
+        config.banks,
+        'config.banks',
+        'DDR3 has ${1 << baBits} banks ($baBits bank address bits)',
+      );
+    }
+    if (config.dataWidth % 8 != 0 ||
+        !const [1, 2, 4].contains(config.dataWidth ~/ 8)) {
+      throw ArgumentError.value(
+        config.dataWidth,
+        'config.dataWidth',
+        'must be 8, 16 or 32 bits (1, 2 or 4 byte lanes)',
+      );
+    }
+    final geometry =
+        (1 << config.rowWidth) *
+        (1 << config.colWidth) *
+        config.banks *
+        (config.dataWidth ~/ 8);
+    if (config.size != geometry) {
+      throw ArgumentError.value(
+        config.size,
+        'config.size',
+        'must equal rows x cols x banks x data bytes = $geometry',
+      );
+    }
+    return DdrParams._fromConfig(config, ckPeriodPs, controllerGearRatio);
+  }
+
+  factory DdrParams._fromConfig(
+    HarborDdrConfig config,
+    int ckPeriodPs,
+    int controllerGearRatio,
+  ) => DdrParams(
+    ddr3ClkPeriodPs: ckPeriodPs,
+    controllerClkPeriodPs: ckPeriodPs * 4 * controllerGearRatio,
+    rowBits: config.rowWidth,
+    colBits: config.colWidth,
+    baBits: 3,
+    dqBits: 8,
+    lanes: config.dataWidth ~/ 8,
+    odelaySupported: false,
+    speedBin: 1,
+    density: config.density,
   );
 
   /// OrangeCrab r0.2: Micron MT41K64M16 (1 Gb, 128 MB, x16), the litex-boards

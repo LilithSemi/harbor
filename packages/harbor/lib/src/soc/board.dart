@@ -47,8 +47,16 @@ class HarborBoard {
   final String? progCommand;
 
   /// Name of the board's clock signal in [pins] and the SoC top port (default
-  /// `'clk'`).
+  /// `'clk'`). For a differential clock this is the P side.
   final String clockPortName;
+
+  /// Name of the N side of a differential board clock in [pins], or null for a
+  /// single-ended clock.
+  final String? clockNPortName;
+
+  /// Xilinx speed grade of the fitted part (`'1'`, `'2'`, ...). See
+  /// [HarborFpgaTarget.speedGrade].
+  final String speedGrade;
 
   /// Package balls that reach a global clock net with no clock buffer.
   ///
@@ -82,6 +90,8 @@ class HarborBoard {
     this.ddrDqsComplementPins = const {},
     this.progCommand,
     this.clockPortName = 'clk',
+    this.clockNPortName,
+    this.speedGrade = '1',
     this.clockCapableSites = const {},
   });
 
@@ -125,6 +135,7 @@ class HarborBoard {
     'ulx3s-85f': _ulx3s85f,
     'orangecrab-25f': _orangeCrab25f,
     'arty-s7-50': _artyS7_50,
+    'ax7203': _ax7203,
   };
 
   /// Resolves a board preset by name, throwing if it is unknown.
@@ -141,9 +152,15 @@ class HarborBoard {
   String get _vendorPrefix => switch (vendor) {
     HarborFpgaVendor.ice40 => 'ice40',
     HarborFpgaVendor.ecp5 => 'ecp5',
-    HarborFpgaVendor.vivado => 'spartan7',
-    HarborFpgaVendor.openXc7 => 'spartan7',
+    HarborFpgaVendor.vivado || HarborFpgaVendor.openXc7 => _xilinxFamilyName,
   };
+
+  String get _xilinxFamilyName {
+    final d = device.toLowerCase();
+    if (d.startsWith('xc7a')) return 'artix7';
+    if (d.startsWith('xc7k')) return 'kintex7';
+    return 'spartan7';
+  }
 
   /// Builds a [HarborFpgaTarget] for this board.
   ///
@@ -198,6 +215,8 @@ class HarborBoard {
       frequency: frequency ?? oscillatorHz,
       pinMap: pinMap,
       clockPortName: clockPortName,
+      clockNPortName: clockNPortName,
+      speedGrade: speedGrade,
       progCommand: progCommand,
     );
   }
@@ -644,4 +663,170 @@ const _artyS7_50 = HarborBoard(
       'sck': 'T18 LVCMOS33',
     },
   },
+);
+
+/// Alinx AX7203 with the Xilinx Artix-7 XC7A200T-2FBG484I, 200 MHz
+/// differential oscillator, via the openXC7 flow.
+///
+/// Sites come from the Alinx AX7203 user manual V1.0 (page numbers in the
+/// comments). Pins and IO standards that the manual does not give come from
+/// the litex-boards `alinx_ax7203` platform, and each one is marked "LiteX".
+/// Where the two disagree, the manual wins.
+///
+/// The DDR3 is two Micron MT41J256M16HA-125 parts on a 32-bit bus (p.12).
+/// Pair it with `HarborDdrConfig.ax7203()`. Banks 34 and 35 run at 1.5 V
+/// (p.10), so the DDR3 pins are SSTL15. CK is a DIFF_SSTL15 pair. DQS is
+/// SSTL15 on both balls, the same choice as the Arty S7 preset, which is
+/// hardware-proven with this PHY on openXC7. LiteX uses DIFF_SSTL15 for DQS.
+/// DQ and DQS take IN_TERM=UNTUNED_SPLIT_50 as in LiteX.
+///
+/// These are on the board and are left out of [pins] on purpose:
+/// - 125 MHz GTP reference clock MGT_CLK0 P/N = F6/E6 (p.11-12).
+/// - PCIe x4: 100 MHz host reference clock F10/E10, PERST J20, lanes RX0-3
+///   D11/C11 B8/A8 B10/A10 D9/C9 and TX0-3 D5/C5 B4/A4 B6/A6 D7/C7 (p.29-31).
+const _ax7203 = HarborBoard(
+  name: 'ax7203',
+  vendor: HarborFpgaVendor.openXc7,
+  device: 'xc7a200t',
+  package: 'fbg484',
+  speedGrade: '2',
+  oscillatorHz: 200000000,
+  clockNPortName: 'clk_n',
+  pins: {
+    // SYS_CLK_P/N on the bank 34 MRCC pair (p.10-11). The oscillator is AC
+    // coupled. DIFF_SSTL15 is from LiteX.
+    'clk': 'R4 DIFF_SSTL15',
+    'clk_n': 'T4 DIFF_SSTL15',
+    // SoM reset key, active low (p.17-18). LVCMOS15 is from LiteX. The name
+    // matches the HarborSoC `reset_n` port.
+    'reset_n': 'T6 LVCMOS15',
+    // CP2102 USB-UART (p.36).
+    'uart_tx': 'N15 LVCMOS33', // UART1_TXD, FPGA drives the CP2102 RXD
+    'uart_rx': 'P20 LVCMOS33', // UART1_RXD, FPGA reads the CP2102 TXD
+    // Carrier user LEDs LED1-4, active low (p.41-42).
+    'led_n[0]': 'B13 LVCMOS33',
+    'led_n[1]': 'C13 LVCMOS33',
+    'led_n[2]': 'D14 LVCMOS33',
+    'led_n[3]': 'D15 LVCMOS33',
+    // SoM user LED1, active high, on the 1.5 V bank 34 (p.16-17).
+    'som_led': 'W5 LVCMOS15',
+    // Carrier keys KEY1 and KEY2, active low (p.40-41).
+    'key_n[0]': 'J21 LVCMOS33',
+    'key_n[1]': 'E13 LVCMOS33',
+    // SiI9134 HDMI transmitter, parallel input (p.31-32). hdmi_d[23:16],
+    // [15:8] and [7:0] drive the top 8 bits of the SiI9134 D[35:24], D[23:12]
+    // and D[11:0] channels. The color of each channel is set by the SiI9134
+    // input setup over I2C. LiteX names hdmi_d[7:0] red and [23:16] blue.
+    // 9134_CLK to IDCK. Drive it from the display's forwarded pixel clock.
+    'hdmi_clk': 'M13 LVCMOS33',
+    'hdmi_de': 'V13 LVCMOS33',
+    'hdmi_hsync': 'T15 LVCMOS33',
+    'hdmi_vsync': 'T14 LVCMOS33',
+    'hdmi_reset_n': 'J19 LVCMOS33', // 9134_nRESET
+    'hdmi_d[0]': 'V14 LVCMOS33',
+    'hdmi_d[1]': 'H14 LVCMOS33',
+    'hdmi_d[2]': 'J14 LVCMOS33',
+    'hdmi_d[3]': 'K13 LVCMOS33',
+    'hdmi_d[4]': 'K14 LVCMOS33',
+    'hdmi_d[5]': 'L13 LVCMOS33',
+    'hdmi_d[6]': 'L19 LVCMOS33',
+    'hdmi_d[7]': 'L20 LVCMOS33',
+    'hdmi_d[8]': 'K17 LVCMOS33',
+    'hdmi_d[9]': 'J17 LVCMOS33',
+    'hdmi_d[10]': 'L16 LVCMOS33',
+    'hdmi_d[11]': 'K16 LVCMOS33',
+    'hdmi_d[12]': 'L14 LVCMOS33',
+    'hdmi_d[13]': 'L15 LVCMOS33',
+    'hdmi_d[14]': 'M15 LVCMOS33',
+    'hdmi_d[15]': 'M16 LVCMOS33',
+    'hdmi_d[16]': 'L18 LVCMOS33',
+    'hdmi_d[17]': 'M18 LVCMOS33',
+    'hdmi_d[18]': 'N18 LVCMOS33',
+    'hdmi_d[19]': 'N19 LVCMOS33',
+    'hdmi_d[20]': 'M20 LVCMOS33',
+    'hdmi_d[21]': 'N20 LVCMOS33',
+    'hdmi_d[22]': 'L21 LVCMOS33',
+    'hdmi_d[23]': 'M21 LVCMOS33',
+    // HDMI I2C, from LiteX (the manual draws the nets but gives no balls). On
+    // this board the pair is the SiI9134 and SiI9013 config bus, not the
+    // monitor DDC. It uses the ULX3S sideband names so a display DDC
+    // controller binds to it. The manual gives no I2C address.
+    'gpdi_scl': 'E16 LVCMOS33',
+    'gpdi_sda': 'F16 LVCMOS33',
+    // DDR3 (p.12-15). DQ[15:0] with DQS0-1/DM0-1 go to one chip and DQ[31:16]
+    // with DQS2-3/DM2-3 to the other. Address and command are shared.
+    'sdram_ck': 'R3 DIFF_SSTL15',
+    'sdram_ck_n': 'R2 DIFF_SSTL15',
+    'sdram_cke': 'T5 SSTL15',
+    'sdram_cs_n': 'AB3 SSTL15', // DDR3_S0
+    'sdram_ras_n': 'V4 SSTL15',
+    'sdram_cas_n': 'W4 SSTL15',
+    'sdram_we_n': 'AA1 SSTL15',
+    'sdram_odt': 'U5 SSTL15',
+    'sdram_reset_n': 'W6 LVCMOS15', // LVCMOS15 is from LiteX
+    'sdram_ba[0]': 'AA3 SSTL15',
+    'sdram_ba[1]': 'Y3 SSTL15',
+    'sdram_ba[2]': 'Y4 SSTL15',
+    'sdram_addr[0]': 'AA4 SSTL15',
+    'sdram_addr[1]': 'AB2 SSTL15',
+    'sdram_addr[2]': 'AA5 SSTL15',
+    'sdram_addr[3]': 'AB5 SSTL15',
+    'sdram_addr[4]': 'AB1 SSTL15',
+    'sdram_addr[5]': 'U3 SSTL15',
+    'sdram_addr[6]': 'W1 SSTL15',
+    'sdram_addr[7]': 'T1 SSTL15',
+    'sdram_addr[8]': 'V2 SSTL15',
+    'sdram_addr[9]': 'U2 SSTL15',
+    'sdram_addr[10]': 'Y1 SSTL15',
+    'sdram_addr[11]': 'W2 SSTL15',
+    'sdram_addr[12]': 'Y2 SSTL15',
+    'sdram_addr[13]': 'U1 SSTL15',
+    'sdram_addr[14]': 'V3 SSTL15',
+    'sdram_dm[0]': 'D2 SSTL15',
+    'sdram_dm[1]': 'G2 SSTL15',
+    'sdram_dm[2]': 'M2 SSTL15',
+    'sdram_dm[3]': 'M5 SSTL15',
+    'sdram_dqs[0]': 'E1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[1]': 'K2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[2]': 'M1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[3]': 'P5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[0]': 'D1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[1]': 'J2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[2]': 'L1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[3]': 'P4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[0]': 'C2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[1]': 'G1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[2]': 'A1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[3]': 'F3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[4]': 'B2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[5]': 'F1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[6]': 'B1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[7]': 'E2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[8]': 'H3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[9]': 'G3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[10]': 'H2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[11]': 'H5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[12]': 'J1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[13]': 'J5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[14]': 'K1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[15]': 'H4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[16]': 'L4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[17]': 'M3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[18]': 'L3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[19]': 'J6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[20]': 'K3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[21]': 'K6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[22]': 'J4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[23]': 'L5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[24]': 'P1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[25]': 'N4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[26]': 'R1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[27]': 'N2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[28]': 'M6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[29]': 'N5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[30]': 'P6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[31]': 'P2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+  },
+  // R4 is the P side of a bank 34 MRCC pair (p.10).
+  clockCapableSites: {'R4'},
 );
