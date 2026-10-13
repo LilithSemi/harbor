@@ -1351,13 +1351,22 @@ class HarborSoC extends BridgeModule {
           // TOP-LEVEL names its own pins were exposed under. Masters are
           // scanned too: what hangs off a pin does not depend on which side of
           // the fabric the module sits on (a display's TMDS lanes reach a
-          // monitor whether or not it also answers as a slave). A dual-role
-          // module is asked once.
+          // monitor whether or not it also answers as a slave). Plain
+          // submodules at any depth, such as a display on a memory read port,
+          // are asked too. A module is asked once.
+          Iterable<Module> descendants(Module m) sync* {
+            for (final c in m.subModules) {
+              yield c;
+              yield* descendants(c);
+            }
+          }
+
           final models = <HarborSimModel>[];
           final askedForModels = <BridgeModule>{};
           for (final p
               in peripherals
                   .followedBy(masters)
+                  .followedBy(descendants(this).whereType<BridgeModule>())
                   .whereType<HarborSimModelProvider>()) {
             final mod = p as BridgeModule;
             if (!askedForModels.add(mod)) continue;

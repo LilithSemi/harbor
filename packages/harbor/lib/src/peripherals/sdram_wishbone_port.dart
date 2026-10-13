@@ -16,9 +16,17 @@ import 'sdram_port.dart';
 /// `reset` clears everything. `abort` is the bus side reset: it drops a
 /// read or a request not yet taken, but a write the arbiter took still
 /// hands over both words, so no taken write is lost or torn.
+///
+/// A write is acked once both words are out and the arbiter took it. With
+/// a [SdramPortSlice] in front of the arbiter, give its `wr_taken` pulse as
+/// `writeTaken`. Without it, the take on `req_ready` counts.
 class SdramWishbonePort extends Module {
   Logic get ack => output('ack');
   Logic get datR => output('dat_r');
+
+  /// The ACK flop without the `cyc` gate, for a master that gates it with
+  /// its own `cyc`.
+  Logic get ackPulse => output('ack_pulse');
 
   SdramWishbonePort({
     required Logic clk,
@@ -30,6 +38,7 @@ class SdramWishbonePort extends Module {
     required Logic datW,
     required Logic sel,
     required SdramPortInterface port,
+    Logic? writeTaken,
     int portId = 0,
     super.name = 'sdram_wb_port',
   }) {
@@ -55,8 +64,10 @@ class SdramWishbonePort extends Module {
     adr = addInput('adr', adr, width: adr.width);
     datW = addInput('dat_w', datW, width: 32);
     sel = addInput('sel', sel, width: 4);
+    if (writeTaken != null) writeTaken = addInput('wr_taken', writeTaken);
 
     addOutput('ack');
+    addOutput('ack_pulse');
     addOutput('dat_r', width: 32);
 
     port = SdramPortInterface(
@@ -96,6 +107,9 @@ class SdramWishbonePort extends Module {
     final ackReg = Logic(name: 'ack_r');
     // The master dropped cyc after this request started.
     final aborted = Logic(name: 'aborted');
+    // The arbiter took this write, and both write words are out.
+    final taken = Logic(name: 'wr_taken_seen');
+    final wordsOut = Logic(name: 'wr_words_out');
 
     port.reqValid <= reqValidReg;
     port.reqWrite <= reqWriteReg;
@@ -109,6 +123,7 @@ class SdramWishbonePort extends Module {
     }
 
     output('ack') <= ackReg & cyc;
+    output('ack_pulse') <= ackReg;
     output('dat_r') <= datRReg;
 
     Const st(int p) => Const(p, width: 3);
@@ -118,6 +133,9 @@ class SdramWishbonePort extends Module {
         phase.eq(st(pWr1)) |
         (phase.eq(st(pReq)) & reqWriteReg & port.reqReady);
     final drop = (reset | (abort & ~committed)).named('drop');
+    final takenNow =
+        writeTaken ?? (phase.eq(st(pReq)) & reqWriteReg & port.reqReady);
+    final wrDone = (port.wrReady | wordsOut) & (taken | takenNow);
 
     // Only the control registers clear on drop. The data registers clear
     // on reset alone, so drop has a small fanout.
@@ -131,9 +149,12 @@ class SdramWishbonePort extends Module {
           wrValidReg < Const(0),
           ackReg < Const(0),
           aborted < Const(0),
+          taken < Const(0),
+          wordsOut < Const(0),
         ],
         orElse: [
           ackReg < Const(0),
+          taken < (taken | takenNow) & ~phase.eq(st(pAck)),
           aborted < (aborted | ~cyc | abort) & ~phase.eq(st(pIdle)),
           Case(
             phase,
@@ -167,9 +188,13 @@ class SdramWishbonePort extends Module {
               CaseItem(st(pWr1), [
                 If(
                   port.wrReady,
+                  then: [wrValidReg < Const(0), wordsOut < Const(1)],
+                ),
+                If(
+                  wrDone,
                   then: [
                     phase < st(pAck),
-                    wrValidReg < Const(0),
+                    wordsOut < Const(0),
                     ackReg < cyc & ~aborted & ~abort,
                   ],
                 ),

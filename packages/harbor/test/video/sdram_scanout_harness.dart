@@ -90,6 +90,9 @@ class SdramScanoutBench {
   final int pixelPeriodPs;
   final int fbBase;
   final int maxInFlight;
+
+  /// [HarborSdram.readPortStages] of the scanout port.
+  final int readPortStages;
   late final int stride;
 
   late final HarborSoC soc;
@@ -155,6 +158,7 @@ class SdramScanoutBench {
     this.pixelPeriodPs = 39722,
     this.fbBase = sdramBase + 0x10000,
     this.maxInFlight = 3,
+    this.readPortStages = 0,
     int? stride,
   }) {
     this.stride = stride ?? timing.hActive * 4;
@@ -206,6 +210,7 @@ class SdramScanoutBench {
         busAddressWidth: 32,
         scanoutPorts: 1,
         scanoutMaxInFlight: maxInFlight,
+        readPortStages: readPortStages,
         target: const HarborFpgaTarget.ecp5(
           device: 'LFE5U-85F',
           package: 'CABGA381',
@@ -484,12 +489,14 @@ Future<FullWidthResult> runFullWidthScanout({
   required int memPeriodPs,
   int lines = 3,
   int maxInFlight = 3,
+  int readPortStages = 0,
 }) async {
   final b = SdramScanoutBench(
     timing: vgaLines(lines),
     memPeriodPs: memPeriodPs,
     stride: 3072,
     maxInFlight: maxInFlight,
+    readPortStages: readPortStages,
   );
   await b.start();
   if (b.sdram.scanoutStride(640 * 4) != b.stride) {

@@ -165,9 +165,10 @@ class HarborBoard {
   /// Builds a [HarborFpgaTarget] for this board.
   ///
   /// [pins] selects which catalog signals to constrain (defaults to all of
-  /// them), requesting a signal not in the catalog throws. [extraPins] adds
-  /// board-specific pins not in the catalog. [frequency] overrides the target
-  /// clock (defaults to [oscillatorHz]).
+  /// them), requesting a signal not in the catalog throws. With a
+  /// differential clock, one leg in [pins] also selects the other.
+  /// [extraPins] adds board-specific pins not in the catalog. [frequency]
+  /// overrides the target clock (defaults to [oscillatorHz]).
   ///
   /// [ddrDllOn] picks the DDR3 DQS mapping (see [ddrPinsFor]) for a board
   /// with [ddrDqsComplementPins]. Pass the DLL mode the DDR3 controller
@@ -193,7 +194,17 @@ class HarborBoard {
     final catalog = ddrDqsComplementPins.isEmpty
         ? this.pins
         : ddrPinsFor(dllOn: ddrDllOn ?? true);
-    final selected = pins ?? catalog.keys;
+    // A differential clock always takes both legs.
+    final clkN = clockNPortName;
+    final selected = {
+      ...(pins ?? catalog.keys),
+      if (clkN != null &&
+          pins != null &&
+          (pins.contains(clockPortName) || pins.contains(clkN))) ...[
+        clockPortName,
+        clkN,
+      ],
+    };
     final pinMap = <String, String>{};
     for (final signal in selected) {
       final site = catalog[signal];

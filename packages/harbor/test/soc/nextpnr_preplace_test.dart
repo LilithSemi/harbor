@@ -130,6 +130,42 @@ void main() {
       expect(recipe, contains('\$(PREROUTE)'));
     });
 
+    test('every nextpnr recipe takes PNRFLAGS', () {
+      for (final (t, tool) in [
+        (_ice40, 'nextpnr-ice40'),
+        (_ecp5, 'nextpnr-ecp5'),
+        (_openXc7, 'nextpnr-xilinx'),
+      ]) {
+        final mk = t.generateMakefile('TopCell');
+        expect(mk.split('\n'), contains('PNRFLAGS ?='), reason: tool);
+        final recipe = mk
+            .split('\n')
+            .singleWhere((l) => l.startsWith('\t') && l.contains(tool));
+        expect(recipe, endsWith(' \$(PNRFLAGS)'), reason: tool);
+      }
+    });
+
+    test('ecp5 and ice40 recipes take SEED and THREADS only when set', () {
+      for (final (t, tool) in [
+        (_ice40, 'nextpnr-ice40'),
+        (_ecp5, 'nextpnr-ecp5'),
+      ]) {
+        final lines = t.generateMakefile('TopCell').split('\n');
+        expect(lines, containsAll(['SEED ?=', 'THREADS ?=']));
+        final recipe = lines.singleWhere(
+          (l) => l.startsWith('\t') && l.contains(tool),
+        );
+        expect(
+          recipe,
+          endsWith(
+            ' \$(PREPLACE) \$(PREROUTE)\$(if \$(SEED), --seed \$(SEED))'
+            '\$(if \$(THREADS), --threads \$(THREADS)) \$(PNRFLAGS)',
+          ),
+          reason: tool,
+        );
+      }
+    });
+
     test('show_bels.py guard is independent of constraints.py', () {
       for (final mk in [
         _ice40.generateMakefile('TopCell'),

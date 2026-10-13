@@ -40,6 +40,9 @@ import 'wishbone_cdc.dart' show stickyCdcError;
 ///
 /// With [useErr], the bridge also carries the ERR of the response on `m_err`
 /// to `s_err`, and a poison ACK has `s_err` set.
+///
+/// With [registerMaster], every master side output is a flop and the master
+/// side inputs go into flops before any other logic. See [registerMaster].
 class HarborWishboneCdcFifoBridge extends BridgeModule {
   /// Address bus width.
   final int addressWidth;
@@ -71,6 +74,14 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
   /// Carry the response error from `m_err` to `s_err`.
   final bool useErr;
 
+  /// Make the master side register to register. The request comes from
+  /// flops loaded with the FIFO head, and `m_ack`, `m_dat_r` and `m_err` go
+  /// into flops first. The FIFO pointers and the response FIFO write then
+  /// see only flops of this bridge, so a slave far away from the storage
+  /// has no logic in front of the long wire. `m_cyc` drops one cycle after
+  /// the ACK, as without the flag. The response is one cycle later.
+  final bool registerMaster;
+
   HarborWishboneCdcFifoBridge({
     required this.addressWidth,
     required this.dataWidth,
@@ -81,6 +92,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     this.blockRam = false,
     this.postedWrites = false,
     this.useErr = false,
+    this.registerMaster = false,
     super.name = 'wishbone_cdc_fifo',
   }) : selWidth = selWidth ?? (dataWidth ~/ 8),
        super(
@@ -93,6 +105,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
            blockRam: blockRam && target?.blockRam != null,
            posted: postedWrites,
            useErr: useErr,
+           registerMaster: registerMaster,
          ),
        ) {
     final sw = this.selWidth;
@@ -274,60 +287,75 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     final startServe = (~reqEmpty & ~serving & ~respWrFull).named(
       'start_serve',
     );
-    final complete = (serving & mCycReg & input('m_ack')).named('complete');
-    // The top bit of the head says if the transaction in flight is a write.
-    // The head stays in the FIFO until completion, so a copy taken at the
-    // start of service stays correct and cuts the path from the read port.
-    final headWe = Logic(name: 'head_we');
-    // A posted write was already ACKed on the slave side. Pushing a response
-    // for it would desynchronize the response FIFO from the pending read.
-    final respPush = postedWrites
-        ? (complete & ~headWe).named('resp_push')
-        : complete;
+    if (registerMaster) {
+      _registeredMaster(
+        reqFifo: reqFifo,
+        respFifo: respFifo,
+        mClk: mClk,
+        mReset: mReset,
+        startServe: startServe,
+        serving: serving,
+        mCycReg: mCycReg,
+        reqW: reqW,
+        respW: respW,
+      );
+    } else {
+      final complete = (serving & mCycReg & input('m_ack')).named('complete');
+      // The top bit of the head says if the transaction in flight is a write.
+      // The head stays in the FIFO until completion, so a copy taken at the
+      // start of service stays correct and cuts the path from the read port.
+      final headWe = Logic(name: 'head_we');
+      // A posted write was already ACKed on the slave side. Pushing a response
+      // for it would desynchronize the response FIFO from the pending read.
+      final respPush = postedWrites
+          ? (complete & ~headWe).named('resp_push')
+          : complete;
 
-    reqFifo.input('rd_clk').srcConnection! <= mClk;
-    reqFifo.input('rd_reset').srcConnection! <= mReset;
-    // Keep the head in the FIFO while serving (drives m_adr etc. directly).
-    // Pop it only on completion.
-    reqFifo.input('rd_en').srcConnection! <= complete;
+      reqFifo.input('rd_clk').srcConnection! <= mClk;
+      reqFifo.input('rd_reset').srcConnection! <= mReset;
+      // Keep the head in the FIFO while serving (drives m_adr etc. directly).
+      // Pop it only on completion.
+      reqFifo.input('rd_en').srcConnection! <= complete;
 
-    respFifo.input('wr_clk').srcConnection! <= mClk;
-    respFifo.input('wr_reset').srcConnection! <= mReset;
-    respFifo.input('wr_en').srcConnection! <= respPush;
-    respFifo.input('wr_data').srcConnection! <=
-        (useErr
-            ? [input('m_err'), input('m_dat_r')].swizzle()
-            : input('m_dat_r'));
+      respFifo.input('wr_clk').srcConnection! <= mClk;
+      respFifo.input('wr_reset').srcConnection! <= mReset;
+      respFifo.input('wr_en').srcConnection! <= respPush;
+      respFifo.input('wr_data').srcConnection! <=
+          (useErr
+              ? [input('m_err'), input('m_dat_r')].swizzle()
+              : input('m_dat_r'));
 
-    Sequential(mClk, [
-      If(
-        mReset,
-        then: [serving < Const(0), mCycReg < Const(0), headWe < Const(0)],
-        orElse: [
-          If(
-            startServe,
-            then: [
-              serving < Const(1),
-              mCycReg < Const(1),
-              headWe < reqFifo.output('rd_data').slice(reqW - 1, reqW - 1),
-            ],
-            orElse: [
-              If(complete, then: [serving < Const(0), mCycReg < Const(0)]),
-            ],
-          ),
-        ],
-      ),
-    ]);
+      Sequential(mClk, [
+        If(
+          mReset,
+          then: [serving < Const(0), mCycReg < Const(0), headWe < Const(0)],
+          orElse: [
+            If(
+              startServe,
+              then: [
+                serving < Const(1),
+                mCycReg < Const(1),
+                headWe < reqFifo.output('rd_data').slice(reqW - 1, reqW - 1),
+              ],
+              orElse: [
+                If(complete, then: [serving < Const(0), mCycReg < Const(0)]),
+              ],
+            ),
+          ],
+        ),
+      ]);
 
-    // Unpack the FIFO head { we, adr, dat_w, sel } onto the master bus. Stable
-    // while serving because the head is not popped until completion.
-    final head = reqFifo.output('rd_data');
-    output('m_cyc') <= mCycReg;
-    output('m_stb') <= mCycReg;
-    output('m_we') <= head.slice(reqW - 1, reqW - 1);
-    output('m_adr') <= head.slice(reqW - 2, reqW - 1 - aw);
-    output('m_dat_w') <= head.slice(sw + dw - 1, sw);
-    output('m_sel') <= head.slice(sw - 1, 0);
+      // Unpack the FIFO head { we, adr, dat_w, sel } onto the master bus.
+      // Stable while serving because the head is not popped until
+      // completion.
+      final head = reqFifo.output('rd_data');
+      output('m_cyc') <= mCycReg;
+      output('m_stb') <= mCycReg;
+      output('m_we') <= head.slice(reqW - 1, reqW - 1);
+      output('m_adr') <= head.slice(reqW - 2, reqW - 1 - aw);
+      output('m_dat_w') <= head.slice(sw + dw - 1, sw);
+      output('m_sel') <= head.slice(sw - 1, 0);
+    }
 
     // Observation tap, port-compatible with HarborWishboneCdcBridge.dbg so the
     // DDR controller's dbg_cdc routing is unchanged. swizzle: first = MSB (bit 7).
@@ -348,6 +376,90 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
           ackReg,
           pending,
         ].swizzle();
+  }
+
+  /// The master side of [registerMaster]. The bus outputs are flops loaded
+  /// with the FIFO head at the start of service. The ACK and the response
+  /// go into flops, and those flops pop the request and push the response.
+  void _registeredMaster({
+    required HarborCdcFifo reqFifo,
+    required HarborCdcFifo respFifo,
+    required Logic mClk,
+    required Logic mReset,
+    required Logic startServe,
+    required Logic serving,
+    required Logic mCycReg,
+    required int reqW,
+    required int respW,
+  }) {
+    final aw = addressWidth;
+    final dw = dataWidth;
+    final sw = selWidth;
+    final head = reqFifo.output('rd_data');
+    final mTerm = (mCycReg & input('m_ack')).named('m_term');
+    final doneReg = Logic(name: 'done_r');
+    final pushReg = Logic(name: 'resp_push_r');
+    final respReg = Logic(name: 'm_resp_r', width: respW);
+    final weReg = Logic(name: 'm_we_r');
+    final adrReg = Logic(name: 'm_adr_r', width: aw);
+    final datWReg = Logic(name: 'm_dat_w_r', width: dw);
+    final selReg = Logic(name: 'm_sel_r', width: sw);
+
+    reqFifo.input('rd_clk').srcConnection! <= mClk;
+    reqFifo.input('rd_reset').srcConnection! <= mReset;
+    reqFifo.input('rd_en').srcConnection! <= doneReg;
+    respFifo.input('wr_clk').srcConnection! <= mClk;
+    respFifo.input('wr_reset').srcConnection! <= mReset;
+    respFifo.input('wr_en').srcConnection! <= pushReg;
+    respFifo.input('wr_data').srcConnection! <= respReg;
+
+    Sequential(mClk, [
+      If(
+        mReset,
+        then: [
+          serving < Const(0),
+          mCycReg < Const(0),
+          doneReg < Const(0),
+          pushReg < Const(0),
+        ],
+        orElse: [
+          doneReg < mTerm,
+          // A posted write was already ACKed on the slave side.
+          pushReg < (postedWrites ? mTerm & ~weReg : mTerm),
+          If(
+            mTerm,
+            then: [
+              respReg <
+                  (useErr
+                      ? [input('m_err'), input('m_dat_r')].swizzle()
+                      : input('m_dat_r')),
+            ],
+          ),
+          If(
+            startServe,
+            then: [
+              serving < Const(1),
+              mCycReg < Const(1),
+              weReg < head.slice(reqW - 1, reqW - 1),
+              adrReg < head.slice(reqW - 2, reqW - 1 - aw),
+              datWReg < head.slice(sw + dw - 1, sw),
+              selReg < head.slice(sw - 1, 0),
+            ],
+            orElse: [
+              If(mTerm, then: [mCycReg < Const(0)]),
+              If(doneReg, then: [serving < Const(0)]),
+            ],
+          ),
+        ],
+      ),
+    ]);
+
+    output('m_cyc') <= mCycReg;
+    output('m_stb') <= mCycReg;
+    output('m_we') <= weReg;
+    output('m_adr') <= adrReg;
+    output('m_dat_w') <= datWReg;
+    output('m_sel') <= selReg;
   }
 
   static void _checkDepth(int value, String field) {
@@ -373,6 +485,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     required bool blockRam,
     required bool posted,
     required bool useErr,
+    required bool registerMaster,
   }) {
     _checkDepth(depth, 'depth');
     _checkDepth(respDepth, 'respDepth');
@@ -386,10 +499,11 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
         depth == 16 &&
         respDepth == 2 &&
         !blockRam &&
-        !useErr;
+        !useErr &&
+        !registerMaster;
     if (arty) return base;
     return '${base}_${addressWidth}a${dataWidth}d${selWidth}s'
         '${depth}q${respDepth}r${blockRam ? '_bram' : ''}'
-        '${useErr ? '_err' : ''}';
+        '${useErr ? '_err' : ''}${registerMaster ? '_mreg' : ''}';
   }
 }

@@ -155,8 +155,11 @@ int _arbiterIndexWidth(int n) => n <= 1 ? 1 : (n - 1).bitLength;
 /// register: the winning request is latched into a one-entry request
 /// register, and write words go through a 4-word buffer that is filled
 /// in the order the engine accepted the write requests. The engine's
-/// `req_ready`, `rd_valid`, `rd_data`, `rd_last` and `rd_port` outputs
-/// are only muxed and demuxed toward the clients.
+/// `req_ready` and `wr_ready` are only muxed toward the clients.
+///
+/// Each client gets its reads from its own `rd_valid`, `rd_last` and
+/// `rd_data` registers, one cycle after the engine. A client can then sit
+/// far from the engine and the path still has a whole cycle.
 ///
 /// `abort` is the bus side reset. It drops a held read request of an
 /// abortable port only ([HarborSdramPortConfig.abortable]). Taken writes
@@ -395,12 +398,23 @@ class SdramArbiter extends Module {
       mux(pushInto1, heldWords, wqLeft[1]),
     ];
 
-    // --- read and ready/accept fan-out, straight from engine outputs,
-    // never registered again on the way back out ---
+    // --- read return: each client has its own registers, so a client
+    // far from the engine gets a whole cycle for the distance ---
+    final rdRegs = <(Logic, Logic)>[];
+    final rdDataRegs = <(Logic, Logic)>[];
     for (var i = 0; i < n; i++) {
-      clients[i].rdValid <= eng.rdValid & eng.rdPort.eq(i);
-      clients[i].rdData <= eng.rdData;
-      clients[i].rdLast <= eng.rdLast;
+      final name = configs[i].name;
+      final valid = Logic(name: '${name}_rd_valid_r');
+      final last = Logic(name: '${name}_rd_last_r');
+      final data = Logic(name: '${name}_rd_data_r', width: 16);
+      final drop = configs[i].abortable ? abort : Const(0);
+      rdRegs.add((valid, eng.rdValid & eng.rdPort.eq(i) & ~drop));
+      rdDataRegs
+        ..add((last, eng.rdLast))
+        ..add((data, eng.rdData));
+      clients[i].rdValid <= valid;
+      clients[i].rdData <= data;
+      clients[i].rdLast <= last;
       // A client only ever sees its own traffic, so its own wr_port and
       // rd_port (when it has them) are always its own index.
       if (ports[i].portIdWidth > 0) {
@@ -463,6 +477,7 @@ class SdramArbiter extends Module {
         (wqPort[i], wqPortNext[i], 0),
         (wqLeft[i], wqLeftNext[i], 0),
       ],
+      for (final r in rdRegs) (r.$1, r.$2, 0),
     ];
 
     for (var i = 0; i < n; i++) {
@@ -480,6 +495,9 @@ class SdramArbiter extends Module {
         then: [for (final r in regs) r.$1 < Const(r.$3, width: r.$1.width)],
         orElse: [for (final r in regs) r.$1 < r.$2],
       ),
+      // Read data and last are used only with a valid, so they need no
+      // reset.
+      for (final r in rdDataRegs) r.$1 < r.$2,
     ]);
   }
 
@@ -535,5 +553,146 @@ class SdramArbiter extends Module {
         );
       }
     });
+  }
+}
+
+/// A register slice between a client and its [SdramArbiter] port, for a
+/// client far from the arbiter. Both ports have the same widths and no
+/// lookahead.
+///
+/// `req_ready` and `wr_ready` toward the client come from registers (and
+/// the client's own `wr_valid`), so no path goes from the client through
+/// the arbiter and back in one cycle. A
+/// request waits in a one-entry slot, and write words in a two-entry queue,
+/// so words still pass at one a cycle. Reads pass straight through, because
+/// [SdramArbiter] registers them for each client.
+///
+/// `abort` drops a read request in the slot, as the arbiter does for an
+/// abortable port. Taken writes and their words always drain.
+///
+/// A take into the slot is not a take by the arbiter. [writeTaken] pulses
+/// one cycle after the arbiter takes a write from the slot, in take order.
+/// A client must not report a write done before that pulse, else a read
+/// on another port can win the arbiter first and read old data.
+class SdramPortSlice extends Module {
+  /// One-cycle pulse, one cycle after the arbiter takes a write request.
+  Logic get writeTaken => output('wr_taken');
+
+  SdramPortSlice({
+    required Logic clk,
+    required Logic reset,
+    Logic? abort,
+    required SdramPortInterface client,
+    required SdramPortInterface arbiter,
+    super.name = 'sdram_port_slice',
+  }) {
+    if (client.wrLookahead || arbiter.wrLookahead) {
+      throw ArgumentError('a slice port has no lookahead');
+    }
+    if (client.addrWidth != arbiter.addrWidth ||
+        client.wordsWidth != arbiter.wordsWidth ||
+        client.portIdWidth != arbiter.portIdWidth) {
+      throw ArgumentError('both slice ports need the same widths');
+    }
+    clk = addInput('clk', clk);
+    reset = addInput('reset', reset);
+    abort = addInput('abort', abort ?? Const(0));
+    final c = client.clone()
+      ..pairConnectIO(this, client, PairRole.provider, uniquify: (n) => 'c_$n');
+    final a = arbiter.clone()
+      ..pairConnectIO(
+        this,
+        arbiter,
+        PairRole.consumer,
+        uniquify: (n) => 'a_$n',
+      );
+
+    c.rdValid <= a.rdValid;
+    c.rdData <= a.rdData;
+    c.rdLast <= a.rdLast;
+    final ids = c.portIdWidth > 0;
+    if (ids) {
+      c.rdPort <= a.rdPort;
+      c.wrPort <= a.wrPort;
+    }
+
+    // --- request slot ---
+    final reqReady = Logic(name: 'req_ready_r');
+    final slotValid = Logic(name: 'slot_valid');
+    final slotWrite = Logic(name: 'slot_write');
+    final slotAddr = Logic(name: 'slot_addr', width: c.addrWidth);
+    final slotWords = Logic(name: 'slot_words', width: c.wordsWidth);
+    c.reqReady <= reqReady;
+    a.reqValid <= slotValid;
+    a.reqWrite <= slotWrite;
+    a.reqAddr <= slotAddr;
+    a.reqWords <= slotWords;
+    final slotPort = ids
+        ? Logic(name: 'slot_port', width: c.portIdWidth)
+        : null;
+    if (slotPort != null) a.reqPort <= slotPort;
+    final take = c.reqValid & reqReady;
+    // [reqReady] is high only while the slot is empty, so the slot loads
+    // whenever it is empty and the client never drives a clock enable.
+    final writeNext = mux(slotValid, slotWrite, c.reqWrite);
+    final wrTaken = Logic(name: 'wr_taken_r');
+    addOutput('wr_taken') <= wrTaken;
+    final slotNext = (take | (slotValid & ~a.reqReady)) & ~(abort & ~writeNext);
+
+    // --- write queue, entry 0 drives the arbiter ---
+    final wrReady = Logic(name: 'wr_ready_r');
+    final qValid = [Logic(name: 'wq_valid_0'), Logic(name: 'wq_valid_1')];
+    final qWord = [
+      Logic(name: 'wq_word_0', width: 18),
+      Logic(name: 'wq_word_1', width: 18),
+    ];
+    // `wr_ready` is a take pulse, so it needs the client word.
+    c.wrReady <= wrReady & c.wrValid;
+    a.wrValid <= qValid[0];
+    a.wrData <= qWord[0].getRange(0, 16);
+    a.wrMask <= qWord[0].getRange(16, 18);
+    final push = c.wrValid & wrReady;
+    final pop = a.wrReady;
+    final word = [c.wrMask, c.wrData].swizzle();
+    final v0 = mux(pop, qValid[1], qValid[0]);
+    final v1 = mux(pop, Const(0), qValid[1]);
+    final w0 = mux(pop, qWord[1], qWord[0]);
+    final into0 = push & ~v0;
+    final into1 = push & v0;
+    final q0Next = v0 | into0;
+    final q1Next = v1 | into1;
+
+    Sequential(clk, [
+      If(
+        reset,
+        then: [
+          wrTaken < 0,
+          reqReady < 0,
+          slotValid < 0,
+          wrReady < 0,
+          qValid[0] < 0,
+          qValid[1] < 0,
+        ],
+        orElse: [
+          wrTaken < slotValid & slotWrite & a.reqReady,
+          reqReady < ~slotNext,
+          slotValid < slotNext,
+          wrReady < ~(q0Next & q1Next),
+          qValid[0] < q0Next,
+          qValid[1] < q1Next,
+        ],
+      ),
+      slotWrite < writeNext,
+      If(
+        ~slotValid,
+        then: [
+          slotAddr < c.reqAddr,
+          slotWords < c.reqWords,
+          if (slotPort != null) slotPort < c.reqPort,
+        ],
+      ),
+      qWord[0] < mux(into0, word, w0),
+      qWord[1] < mux(into1, word, qWord[1]),
+    ]);
   }
 }

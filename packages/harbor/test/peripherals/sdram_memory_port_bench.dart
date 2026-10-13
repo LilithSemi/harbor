@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:async';
 import 'dart:math';
 
@@ -39,8 +40,10 @@ class SdramPortTop extends BridgeModule {
     HarborFabricKind kind,
     HarborMemoryWaistConfig config, {
     required int memHz,
+    int scanoutPorts = 0,
   }) : super(
-         'SdramPortBench_${kind.name}_n${config.outstanding}_m$memHz',
+         'SdramPortBench_${kind.name}_n${config.outstanding}_m${memHz}'
+         '_s$scanoutPorts',
          name: 'top',
        ) {
     for (final p in ['clk', 'reset', 'mem_clk', 'mem_reset']) {
@@ -55,6 +58,7 @@ class SdramPortTop extends BridgeModule {
         protocol: kind,
         idWidth: config.idWidth,
         outstanding: config.outstanding,
+        scanoutPorts: scanoutPorts,
         target: const HarborFpgaTarget.ecp5(
           device: 'LFE5U-85F',
           package: 'CABGA381',
@@ -66,6 +70,18 @@ class SdramPortTop extends BridgeModule {
     }
     for (final p in _pads) {
       pullUpPort(sdram.port(p), newPortName: p);
+    }
+    for (var i = 0; i < scanoutPorts; i++) {
+      for (final p in [
+        'rq_valid',
+        'rq_addr',
+        'rq_words',
+        'rq_ready',
+        'rd_valid',
+        'rd_data',
+      ]) {
+        pullUpPort(sdram.port('scan${i}_$p'), newPortName: 'scan${i}_$p');
+      }
     }
     linkRequester(this, sdram, config, kind);
   }
@@ -90,10 +106,16 @@ class SdramPortBench {
     HarborMemoryWaistConfig config, {
     required int fabricPeriodPs,
     int memPeriodPs = 8000,
+    int scanoutPorts = 0,
     required void Function(Sim s) attach,
   }) async {
     final memHz = 1000000000000 ~/ memPeriodPs;
-    final top = SdramPortTop(kind, config, memHz: memHz);
+    final top = SdramPortTop(
+      kind,
+      config,
+      memHz: memHz,
+      scanoutPorts: scanoutPorts,
+    );
     final fabricClk = SimpleClockGenerator(fabricPeriodPs).clk;
     final memClk = SimpleClockGenerator(memPeriodPs).clk;
     for (final input in top.inputs.values) {
@@ -530,6 +552,131 @@ Future<List<String>> sdramWrespAfterTake(int outstanding) async {
   }
   await waitUntil(bench.s, () => req.done, limit: 400000);
   if (resps != need.length) errors.add('$resps WRESPs for ${need.length}');
+  await bench.stop();
+  return errors;
+}
+
+/// Keeps two scanout reads of other rows in flight, so the engine stays
+/// busy, and sends a short bus read and then a one-word write. In the
+/// mem_clk cycle after the WRESP it reads the word back on the scanout
+/// port. Returns an error for each read that does not see the write.
+Future<List<String>> sdramScanReadAfterWresp({int rounds = 24}) async {
+  const config = HarborMemoryWaistConfig(
+    addressWidth: 26,
+    dataWidth: 32,
+    idWidth: 2,
+    outstanding: 8,
+  );
+  late WaistRequester req;
+  final errors = <String>[];
+  final bench = await SdramPortBench.start(
+    HarborFabricKind.axi4,
+    config,
+    fabricPeriodPs: 20000,
+    scanoutPorts: 1,
+    attach: (s) {
+      req = WaistRequester(s, 'up', Random(9), errors: errors, idle: 0);
+    },
+  );
+  final top = bench.top;
+  final d = bench.sdram.bus!.waist;
+  final wresp = d.wrespValid & d.wrespReady;
+  final rqValid = top.input('scan0_rq_valid').srcConnection!;
+  final rqAddr = top.input('scan0_rq_addr').srcConnection!;
+  final rqWords = top.input('scan0_rq_words').srcConnection!;
+  final rng = Random(10);
+  int? probe;
+  // Scanout reads taken and not read back: (words, is the probe).
+  final sent = Queue<(int, bool)>();
+  final words = <int>[];
+  final got = <int>[];
+  var resps = 0;
+  var fill = true;
+  // The port outputs are registers, so the negedge sees this cycle's value.
+  bench.memClk.negedge.listen((_) {
+    if (top.output('scan0_rd_valid').value == LogicValue.one) {
+      words.add(top.output('scan0_rd_data').value.toInt());
+      final (n, isProbe) = sent.first;
+      if (words.length == n) {
+        if (isProbe) got.add(words[0] | words[1] << 16);
+        sent.removeFirst();
+        words.clear();
+      }
+    }
+    final p = probe;
+    final fills = sent.where((e) => !e.$2).length;
+    final int? addr;
+    if (p != null) {
+      addr = p;
+    } else if (fill && fills < 2) {
+      // Other rows of every bank, so the reads miss and run long.
+      addr = (300 + rng.nextInt(50)) << 12 | rng.nextInt(4) << 10;
+    } else {
+      addr = null;
+    }
+    rqValid.put(addr == null ? 0 : 1);
+    if (addr == null) return;
+    final n = p == null ? 8 : 2;
+    rqAddr.put(addr);
+    rqWords.put(n);
+    if (top.output('scan0_rq_ready').value == LogicValue.one) {
+      sent.add((n, p != null));
+      probe = null;
+    }
+  });
+  bench.memClk.posedge.listen((_) {
+    if (wresp.value == LogicValue.one) resps++;
+  });
+
+  final want = <int>[];
+  for (var i = 0; i < rounds; i++) {
+    req.send(
+      Burst(
+        id: 0,
+        write: false,
+        addr: (200 + rng.nextInt(50)) << 12 | rng.nextInt(4) << 10,
+        len: 3,
+        size: 2,
+        burst: 1,
+      ),
+    );
+    final addr = 0x1000 * i + 4 * rng.nextInt(64);
+    final value = rng.nextInt(1 << 32);
+    want.add(value);
+    req.send(
+      Burst(
+        id: 1,
+        write: true,
+        addr: addr,
+        len: 0,
+        size: 2,
+        burst: 1,
+        data: [value],
+        strb: [15],
+      ),
+    );
+    while (resps <= i) {
+      await bench.memClk.nextPosedge;
+    }
+    probe = addr;
+    while (got.length <= i) {
+      await bench.memClk.nextPosedge;
+    }
+    await waitUntil(bench.s, () => req.done, limit: 100000);
+    for (var k = rng.nextInt(16); k > 0; k--) {
+      await bench.memClk.nextPosedge;
+    }
+  }
+  fill = false;
+  for (var i = 0; i < rounds; i++) {
+    if (got[i] != want[i]) {
+      errors.add(
+        'round $i: read 0x${got[i].toRadixString(16)}, '
+        'wrote 0x${want[i].toRadixString(16)}',
+      );
+    }
+  }
+  errors.addAll(bench.model.errors.take(4));
   await bench.stop();
   return errors;
 }

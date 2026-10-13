@@ -235,6 +235,17 @@ void main() {
     );
   });
 
+  test('one leg of the differential clock binds both', () {
+    for (final leg in ['clk', 'clk_n']) {
+      final t = board.fpgaTarget(pins: [leg, 'led_n[0]']);
+      expect(t.pinMap.keys, containsAll(['clk', 'clk_n', 'led_n[0]']));
+      expect(t.pinMap, hasLength(3), reason: leg);
+    }
+    expect(board.fpgaTarget(pins: ['led_n[0]']).pinMap.keys, ['led_n[0]']);
+    final se = HarborBoard.get('ulx3s-85f').fpgaTarget(pins: ['clk']);
+    expect(se.pinMap.keys, ['clk']);
+  });
+
   test('every ball is used once', () {
     final byBall = <String, List<String>>{};
     for (final e in board.pins.entries) {

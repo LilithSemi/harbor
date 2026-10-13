@@ -11,16 +11,17 @@ import 'package:test/test.dart';
 /// words. Returns the requests taken for each line.
 ///
 /// [ready] gives `rq_ready` for the next cycle. [tookLastCycle] is true
-/// when a take occurred on the cycle before. The default is random and low
-/// after a take.
+/// when a take occurred on the cycle before. [firstOffer] is true while the
+/// first request of a line is on offer. The default is random and low after
+/// a take.
 Future<List<List<(int, int)>>> _lines(
   List<(int, int)> jobs, {
   required int seed,
   int latency = 6,
-  bool Function(Random rng, bool tookLastCycle)? ready,
+  bool Function(Random rng, bool tookLastCycle, bool firstOffer)? ready,
 }) async {
   final readyFn =
-      ready ?? (rng, tookLastCycle) => !tookLastCycle && rng.nextInt(3) != 0;
+      ready ?? (rng, tookLastCycle, _) => !tookLastCycle && rng.nextInt(3) != 0;
   final clk = SimpleClockGenerator(10).clk;
   final reset = Logic()..inject(1);
   final start = Logic()..inject(0);
@@ -61,7 +62,8 @@ Future<List<List<(int, int)>>> _lines(
       written[f.wrIdx.value.toInt()] = f.wrData.value.toInt();
     }
     if (f.done.value == LogicValue.one) doneSeen = true;
-    final readyNow = readyFn(rng, took);
+    final first = taken.isEmpty && f.rqValid.value == LogicValue.one;
+    final readyNow = readyFn(rng, took, first);
     rqReady.put(readyNow ? 1 : 0);
     took = readyNow && f.rqValid.value == LogicValue.one;
     if (took) {
@@ -145,7 +147,7 @@ Future<List<(int, int)>> _line({
   required int words,
   required int seed,
   int latency = 6,
-  bool Function(Random rng, bool tookLastCycle)? ready,
+  bool Function(Random rng, bool tookLastCycle, bool firstOffer)? ready,
 }) async => (await _lines(
   [(addr, words)],
   seed: seed,
@@ -202,14 +204,48 @@ void main() {
       for (final off in [0, 4, 8, 12])
         for (var n = 1; n <= 40; n++) (0x8000 * (1 + n % 5) - 64 + off, n),
     ];
-    await _lines(jobs, seed: 20, ready: (rng, took) => true);
+    await _lines(jobs, seed: 20, ready: (rng, took, _) => true);
   });
 
   test('a random rq_ready with no guaranteed gap after a take still gives '
       'correct requests', () async {
     // Ready is often high on the cycle after a take.
     final jobs = [for (var n = 1; n <= 80; n++) (0x4000 + 16 * n, n)];
-    await _lines(jobs, seed: 21, ready: (rng, took) => rng.nextBool());
+    await _lines(jobs, seed: 21, ready: (rng, took, _) => rng.nextBool());
+  });
+
+  test('rq_ready high from before the first offer to the end of a line of '
+      'one burst or of many bursts', () async {
+    // Each line runs in a new simulation, so ready is high before the
+    // first offer.
+    for (final (addr, n) in [
+      (0x1000, 4),
+      (0x1008, 2),
+      (0x100C, 1),
+      (0x2000, 20),
+      (0x2004, 37),
+      (0x200C, 64),
+    ]) {
+      await Simulator.reset();
+      await _line(
+        addr: addr,
+        words: n,
+        seed: 30,
+        ready: (rng, took, _) => true,
+      );
+    }
+  });
+
+  test('rq_ready high on the first offer, then random', () async {
+    for (var seed = 0; seed < 8; seed++) {
+      await Simulator.reset();
+      final jobs = [for (var n = 1; n <= 24; n++) (0x6000 + 12 * n, n)];
+      await _lines(
+        jobs,
+        seed: 40 + seed,
+        ready: (rng, took, first) => first || rng.nextBool(),
+      );
+    }
   });
 
   test('maxBurst must be a power of two from 2 to 8', () {

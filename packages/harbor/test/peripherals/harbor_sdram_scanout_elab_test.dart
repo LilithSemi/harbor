@@ -58,10 +58,10 @@ void main() {
     await s.build();
     expectScanPorts(s);
     final dram = s.subModules.whereType<HarborSimDram>().single;
-    expect(dram.readLatency, 10);
+    expect(dram.readLatency, 11);
     expect(dram.writeLatency, 7);
     expect(dram.scanoutPorts, 1);
-    expect(dram.definitionName, endsWith('_r10w7_s1'));
+    expect(dram.definitionName, endsWith('_r11w7_s1'));
     expect(dram.simRtl, contains('scan0_rq_ready'));
     expect(dram.simRtl, contains('scan0_rd_data'));
   });
@@ -77,6 +77,36 @@ void main() {
     final dram = s.subModules.whereType<HarborSimDram>().single;
     expect(dram.definitionName, 'harbor_sim_dram_26a32d8388608w');
   });
+
+  test(
+    'read port stages add registers and a queue on the scanout port',
+    () async {
+      HarborSdram make(int stages) => HarborSdram(
+        config: config,
+        baseAddress: 0x80000000,
+        clockHz: 125000000,
+        target: ecp5Target,
+        scanoutPorts: 1,
+        readPortStages: stages,
+      );
+      expect(() => make(-1), throwsArgumentError);
+      final s = make(2);
+      expect(s.definitionName, isNot(make(0).definitionName));
+      expect(s.definitionName, isNot(make(1).definitionName));
+      await s.build();
+      expectScanPorts(s);
+      expect(s.busWaitBound, HarborSdram.bestEffortWaitBound(s.cycles, 3) + 1);
+      final sv = s.generateSynth();
+      for (final n in [
+        'scan0_rq_valid_s1',
+        'scan0_rd_valid_s1',
+        'scan0_q_valid_2',
+      ]) {
+        expect(sv, contains(n));
+      }
+      expect(sv, isNot(contains('scan0_slot_valid')));
+    },
+  );
 
   test('scanout stride puts each line on a new row', () {
     final s = HarborSdram(

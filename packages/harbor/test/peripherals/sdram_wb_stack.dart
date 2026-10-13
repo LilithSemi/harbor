@@ -30,6 +30,12 @@ class SdramWbStack {
 
   late final Logic cyc, we, adr, datW, sel;
 
+  /// Scanout ports of [sdram], 0 or 1.
+  final int scanoutPorts;
+
+  /// Scanout port 0 request inputs, when [scanoutPorts] is 1.
+  late final Logic scanRqValid, scanRqAddr, scanRqWords;
+
   late final Future<void> simRun;
 
   /// Shadow memory, 32-bit word keyed by byte address, for the scoreboard.
@@ -42,6 +48,7 @@ class SdramWbStack {
     this.postedWrites = false,
     this.fastInit = true,
     this.fpgaToSdramNs = 4.6,
+    this.scanoutPorts = 0,
     HarborSdramAddressMap map = HarborSdramAddressMap.rowBankCol,
   }) : config = _config(map, fastInit),
        cycles = HarborSdramCycles(
@@ -123,6 +130,7 @@ class SdramWbStack {
       clockHz: memClockHz,
       busClockSync: busClockSync,
       postedWrites: postedWrites,
+      scanoutPorts: scanoutPorts,
       target: const HarborFpgaTarget.ecp5(
         device: 'LFE5U-85F',
         package: 'CABGA381',
@@ -143,6 +151,14 @@ class SdramWbStack {
     sdram.input('bus_SEL').srcConnection! <= sel;
     sdram.input('bus_CTI').srcConnection! <= Const(0, width: 3);
     sdram.input('bus_BTE').srcConnection! <= Const(0, width: 2);
+    if (scanoutPorts > 0) {
+      scanRqValid = Logic(name: 'scan_rq_valid')..inject(0);
+      scanRqAddr = Logic(name: 'scan_rq_addr', width: 32)..inject(0);
+      scanRqWords = Logic(name: 'scan_rq_words', width: 4)..inject(0);
+      sdram.input('scan0_rq_valid').srcConnection! <= scanRqValid;
+      sdram.input('scan0_rq_addr').srcConnection! <= scanRqAddr;
+      sdram.input('scan0_rq_words').srcConnection! <= scanRqWords;
+    }
 
     await sdram.build();
 

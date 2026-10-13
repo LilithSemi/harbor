@@ -98,6 +98,8 @@ const _golden = [
 ///    next word of a write. Nothing is picked in the cycle after a
 ///    finishing column, a precharge all or a refresh.
 /// 3. The init sequence does not use the select and does not move.
+/// 4. The arbiter registers the read data for each client, so a client
+///    gets each read beat one cycle after the engine.
 ///
 /// A drain ends on the last write word or read beat, so a change before a
 /// drain moves every entry after it.
@@ -144,25 +146,26 @@ const _expected = [
   // Turnaround of 9 from the read picked at 116.
   (126, 'write', 1, 0),
   (127, 'write', 1, 1),
-  // The drain ends 3 cycles later (last write word), picked at 132.
-  (133, 'read', 0, 0),
+  // The drain ends 4 cycles later on the last read beat (rule 4), picked
+  // at 133.
+  (134, 'read', 0, 0),
   // The entries empty 4 cycles later after the read above, so the idle
   // count and the refresh pull-in run 4 cycles later and the pick is at
-  // 153, then rp and rfc as before.
-  (154, 'precharge', 0, 1024),
-  (157, 'refresh', 0, 12),
-  (165, 'refresh', 0, 12),
-  (173, 'refresh', 0, 12),
-  (181, 'refresh', 0, 12),
-  (189, 'refresh', 0, 12),
-  (197, 'refresh', 0, 12),
-  (205, 'refresh', 0, 12),
-  // The drain before the idle ends on the read data of the read at 133, 4
-  // cycles later, and rule 1 adds one more.
-  (545, 'activate', 0, 12),
-  (547, 'activate', 1, 20),
-  (548, 'read', 0, 2),
-  (555, 'write', 1, 2),
+  // 154, then rp and rfc as before.
+  (155, 'precharge', 0, 1024),
+  (158, 'refresh', 0, 12),
+  (166, 'refresh', 0, 12),
+  (174, 'refresh', 0, 12),
+  (182, 'refresh', 0, 12),
+  (190, 'refresh', 0, 12),
+  (198, 'refresh', 0, 12),
+  (206, 'refresh', 0, 12),
+  // The drain before the idle ends on the read data of the read at 134, 4
+  // cycles later, and rules 1 and 4 add one each.
+  (547, 'activate', 0, 12),
+  (549, 'activate', 1, 20),
+  (550, 'read', 0, 2),
+  (557, 'write', 1, 2),
 ];
 
 /// How many trailing [_expected] entries come after the workload's final

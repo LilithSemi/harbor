@@ -131,13 +131,13 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
   /// [memHz] behind a clock crossing from a bus on [busHz]: [crossingCycles]
   /// bus cycles for the crossing and [memCycles] controller cycles.
   ///
-  /// The defaults match [HarborSdram] with its clock crossing, measured with
-  /// back to back 32-bit reads from a 25 MHz bus: 10 cycles at 100 MHz and 9
-  /// at 125 MHz.
+  /// The defaults match [HarborSdram] with its clock crossing and its bus
+  /// port slice, with back to back 32-bit reads from a 25 MHz bus: 11 cycles
+  /// at 100 MHz and 10 at 125 MHz.
   static int latencyFor({
     required int busHz,
     required int memHz,
-    int memCycles = 19,
+    int memCycles = 21,
     int crossingCycles = 5,
   }) => crossingCycles + (memCycles * busHz + memHz - 1) ~/ memHz;
 
@@ -233,9 +233,7 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     b.writeln(
       '  // Single-cycle ack outside a burst. The bus master must drop stb',
     );
-    b.writeln(
-      '  // on the ack, so ack is gated on its own previous value. A',
-    );
+    b.writeln('  // on the ack, so ack is gated on its own previous value. A');
     b.writeln(
       '  // registered-feedback burst (cti 010, ending on 111) acks one',
     );
@@ -251,9 +249,7 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
     b.writeln("        if (stb) burst_active <= (cti == 3'b010);");
     b.writeln('      end else begin');
     b.writeln('        ack <= stb & ~ack;');
-    b.writeln(
-      "        if (stb & ~ack) burst_active <= (cti == 3'b010);",
-    );
+    b.writeln("        if (stb & ~ack) burst_active <= (cti == 3'b010);");
     b.writeln('      end');
     b.writeln('      if (stb & ~ack & we) begin');
     for (var l = 0; l < lanes; l++) {
@@ -293,9 +289,7 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
       b.writeln('  logic [3:0] ${p}_left;');
       b.writeln('  logic ${p}_ready;');
       b.writeln('  assign ${p}_rq_ready = ${p}_ready;');
-      b.writeln(
-        '  wire ${p}_take = ${p}_rq_valid & ${p}_ready;',
-      );
+      b.writeln('  wire ${p}_take = ${p}_rq_valid & ${p}_ready;');
       b.writeln(
         "  wire [3:0] ${p}_next_left = ${p}_take ? ${p}_rq_words : "
         "(${p}_left != 4'd0 ? ${p}_left - 4'd1 : ${p}_left);",
@@ -317,9 +311,7 @@ class HarborSimDram extends BridgeModule with HarborSimLeaf {
       b.writeln('        ${p}_addr <= ${p}_rq_addr;');
       b.writeln('      end');
       b.writeln('      ${p}_left <= ${p}_next_left;');
-      b.writeln(
-        "      ${p}_ready <= (${p}_next_left <= 4'd1) & ~${p}_take;",
-      );
+      b.writeln("      ${p}_ready <= (${p}_next_left <= 4'd1) & ~${p}_take;");
       b.writeln('    end');
       b.writeln('  end');
     }

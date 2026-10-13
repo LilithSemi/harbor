@@ -43,11 +43,11 @@ void main() {
   test('latencyFor matches the sdram crossing at 25 MHz', () {
     expect(
       HarborSimDram.latencyFor(busHz: 25000000, memHz: 100000000),
-      equals(10),
+      equals(11),
     );
     expect(
       HarborSimDram.latencyFor(busHz: 25000000, memHz: 125000000),
-      equals(9),
+      equals(10),
     );
   });
 
@@ -83,26 +83,29 @@ void main() {
     expect(sv, isNot(contains('assign scan0_rq_ready = (scan0_left')));
   });
 
-  test('scanoutMaxInFlight is validated and only names a non-default value', () {
-    HarborSimDram make({int ports = 1, int inFlight = 3}) => HarborSimDram(
-      addrWidth: 12,
-      dataWidth: 32,
-      words: 1024,
-      byteSize: 4096,
-      scanoutPorts: ports,
-      scanoutMaxInFlight: inFlight,
-    );
-    expect(() => make(inFlight: 0), throwsArgumentError);
-    expect(() => make(inFlight: 4), throwsArgumentError);
-    expect(make().definitionName, endsWith('_s1'));
-    expect(make(inFlight: 1).definitionName, endsWith('_s1f1'));
-    expect(make(inFlight: 2).definitionName, endsWith('_s1f2'));
-    // With no scanout port, scanoutMaxInFlight never shows in the name.
-    expect(
-      make(ports: 0, inFlight: 1).definitionName,
-      equals(_dram().definitionName),
-    );
-  });
+  test(
+    'scanoutMaxInFlight is validated and only names a non-default value',
+    () {
+      HarborSimDram make({int ports = 1, int inFlight = 3}) => HarborSimDram(
+        addrWidth: 12,
+        dataWidth: 32,
+        words: 1024,
+        byteSize: 4096,
+        scanoutPorts: ports,
+        scanoutMaxInFlight: inFlight,
+      );
+      expect(() => make(inFlight: 0), throwsArgumentError);
+      expect(() => make(inFlight: 4), throwsArgumentError);
+      expect(make().definitionName, endsWith('_s1'));
+      expect(make(inFlight: 1).definitionName, endsWith('_s1f1'));
+      expect(make(inFlight: 2).definitionName, endsWith('_s1f2'));
+      // With no scanout port, scanoutMaxInFlight never shows in the name.
+      expect(
+        make(ports: 0, inFlight: 1).definitionName,
+        equals(_dram().definitionName),
+      );
+    },
+  );
 
   test('scanoutPorts outside 0..1 throws', () {
     HarborSimDram make(int ports) => HarborSimDram(

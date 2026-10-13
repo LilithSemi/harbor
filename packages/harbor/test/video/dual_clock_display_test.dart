@@ -53,6 +53,29 @@ void main() {
     );
   });
 
+  test('parallelRgb needs no shift clock, a TMDS output does', () async {
+    HarborDualClockDisplay make(HarborDisplayInterface out) =>
+        HarborDualClockDisplay(
+          target: const HarborSimTarget(),
+          timing: const HarborDisplayTiming.vga640x480(),
+          pixelClk: Logic(),
+          pixelReset: Logic(),
+          sysClk: Logic(),
+          sysReset: Logic(),
+          enable: Logic(),
+          fbBase: Logic(width: 32),
+          mDataIn: Logic(width: 32),
+          mAck: Logic(),
+          outputType: out,
+        );
+    final d = make(HarborDisplayInterface.parallelRgb);
+    await d.build();
+    expect(d.inputs.keys, isNot(contains('shift_clk')));
+    expect(d.inputs.keys, isNot(contains('shift_reset')));
+    expect(d.outputs.keys, contains('pclk'));
+    expect(() => make(HarborDisplayInterface.hdmi), throwsArgumentError);
+  });
+
   test('odd hActive with rgb565 throws', () {
     expect(
       () => _buildDisplay(

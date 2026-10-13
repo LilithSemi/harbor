@@ -21,9 +21,10 @@ import 'sdram_port.dart';
 ///
 /// A write request goes to the port only when all its beats are in the
 /// write buffer, so the arbiter never waits for write data. WRESP goes out
-/// when the arbiter takes the last request of the write. From then on any
-/// port that reads the sdram sees the write, and its words go out even
-/// after a bus reset. A read request
+/// when the arbiter takes the last request of the write. With a
+/// [SdramPortSlice] in front of the arbiter, give its `wr_taken` pulse as
+/// [writeTaken]. From then on any port that reads the sdram sees the write,
+/// and its words go out even after a bus reset. A read request
 /// goes to the port only when the read buffer has room for its beats,
 /// because the port has no back pressure on read data.
 ///
@@ -52,6 +53,7 @@ class SdramMemoryPort extends Module {
     Logic? clear,
     required HarborMemoryWaist waist,
     required SdramPortInterface port,
+    Logic? writeTaken,
     this.readBeats = 16,
     this.writeBeats = 8,
     super.name = 'sdram_mem_port',
@@ -89,6 +91,7 @@ class SdramMemoryPort extends Module {
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
     final clr = addInput('clear', clearSrc);
+    if (writeTaken != null) writeTaken = addInput('wr_taken', writeTaken);
 
     final w = waist.clone()
       ..pairConnectIO(
@@ -257,7 +260,18 @@ class SdramMemoryPort extends Module {
     load <= ~sValid & headValid & ~clr;
     final lastChunk = sLeft.getRange(3).eq(0) & sLeft.getRange(0, 3).lt(kReg);
     // The arbiter takes the last request of a write.
-    final wEvent = (qTake & qWrite & qLast & ~clr).named('write_done');
+    final wEvent =
+        (writeTaken == null
+                ? qTake & qWrite & qLast & ~clr
+                : _takenLast(
+                    clk,
+                    reset,
+                    clr,
+                    qTake & qWrite,
+                    qLast,
+                    writeTaken,
+                  ))
+            .named('write_done');
 
     // --- read data back ---
     final rHalf = Logic(name: 'rd_half');
@@ -516,6 +530,44 @@ class SdramMemoryPort extends Module {
   );
 
   /// Stops the simulation when [bad] is high on a [clk] edge out of reset.
+  /// The last flags of the writes the slice took and the arbiter did not
+  /// yet take, at most two. Each [taken] pulse pops one, and it is the
+  /// write done event when that write was the last of its burst. [clr]
+  /// keeps the entries, so the pulses still line up, but clears their
+  /// flags, so a write kept across a bus reset gives no WRESP.
+  static Logic _takenLast(
+    Logic clk,
+    Logic reset,
+    Logic clr,
+    Logic push,
+    Logic last,
+    Logic taken,
+  ) {
+    final v = [Logic(name: 'taken_q_valid_0'), Logic(name: 'taken_q_valid_1')];
+    final l = [Logic(name: 'taken_q_last_0'), Logic(name: 'taken_q_last_1')];
+    final v0 = mux(taken, v[1], v[0]);
+    final v1 = mux(taken, Const(0), v[1]);
+    final l0 = mux(taken, l[1], l[0]);
+    final in0 = push & ~v0;
+    final in1 = push & v0;
+    final pushLast = last & ~clr;
+    _check(clk, reset, taken & ~v[0], 'write taken with none in the slice');
+    _check(clk, reset, push & v1, 'more than two writes in the slice');
+    Sequential(clk, [
+      If(
+        reset,
+        then: [v[0] < 0, v[1] < 0, l[0] < 0, l[1] < 0],
+        orElse: [
+          v[0] < v0 | in0,
+          v[1] < v1 | in1,
+          l[0] < mux(in0, pushLast, l0 & ~clr),
+          l[1] < mux(in1, pushLast, l[1] & ~taken & ~clr),
+        ],
+      ),
+    ]);
+    return taken & l[0] & ~clr;
+  }
+
   static void _check(Logic clk, Logic rst, Logic bad, String what) {
     clk.glitch.listen((args) {
       if (LogicValue.isPosedge(

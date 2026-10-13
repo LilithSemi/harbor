@@ -29,7 +29,8 @@ import 'video_timing.dart';
 /// depending on [outputType], either the four GPDI lanes (dvi/hdmi) or a
 /// packed [rgb] plus a forwarded pixel clock [pclk] (parallelRgb). See
 /// [HarborFramebufferDisplay] for the single-clock variant used by the
-/// test-pattern path.
+/// test-pattern path. A parallelRgb build has no serializer, so it needs no
+/// `shiftClk` or `shiftReset` and has no `shift_*` ports without them.
 ///
 /// The parallel outputs ([de], [hsync], [vsync], [red], [green], [blue], [x],
 /// [y], [pixelWord], and for parallelRgb [rgb]/[pclk]) are registered and
@@ -91,8 +92,8 @@ class HarborDualClockDisplay extends Module {
     required this.timing,
     required Logic pixelClk,
     required Logic pixelReset,
-    required Logic shiftClk,
-    required Logic shiftReset,
+    Logic? shiftClk,
+    Logic? shiftReset,
     required Logic sysClk,
     required Logic sysReset,
     required Logic enable,
@@ -123,6 +124,10 @@ class HarborDualClockDisplay extends Module {
                  : ''),
        ) {
     requireDisplayOutputSupported(outputType);
+    if (outputType != HarborDisplayInterface.parallelRgb &&
+        (shiftClk == null || shiftReset == null)) {
+      throw ArgumentError('a TMDS output needs shiftClk and shiftReset');
+    }
     final lineBytes = _lineBytes(timing, pixelFormat);
     if (this.lineStride < lineBytes || this.lineStride % 4 != 0) {
       throw ArgumentError.value(
@@ -145,8 +150,8 @@ class HarborDualClockDisplay extends Module {
 
     pixelClk = addInput('pixel_clk', pixelClk);
     pixelReset = addInput('pixel_reset', pixelReset);
-    shiftClk = addInput('shift_clk', shiftClk);
-    shiftReset = addInput('shift_reset', shiftReset);
+    if (shiftClk != null) shiftClk = addInput('shift_clk', shiftClk);
+    if (shiftReset != null) shiftReset = addInput('shift_reset', shiftReset);
     sysClk = addInput('sys_clk', sysClk);
     sysReset = addInput('sys_reset', sysReset);
     enable = addInput('enable', enable);
@@ -319,9 +324,9 @@ class HarborDualClockDisplay extends Module {
       final transmitter = DviTransmitter(
         target: target,
         pixelClk: pixelClk,
-        shiftClk: shiftClk, // 5x pixel clock from the SoC's display PLL
+        shiftClk: shiftClk!, // 5x pixel clock from the SoC's display PLL
         pixelReset: pixelReset,
-        shiftReset: shiftReset,
+        shiftReset: shiftReset!,
         de: de2,
         hsync: hsync2,
         vsync: vsync2,

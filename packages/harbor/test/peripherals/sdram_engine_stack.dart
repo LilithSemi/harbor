@@ -35,6 +35,7 @@ class SdramEngineStackTop extends Module {
     required int maxGrantWords,
     List<int>? portMaxGrantWords,
     List<bool>? portRealtime,
+    List<bool>? portSlice,
     bool rowAgeGuard = true,
     Logic? abort,
     Logic? abortNext,
@@ -114,11 +115,18 @@ class SdramEngineStackTop extends Module {
             maxGrantWords: maxGrantWords,
             abort: abortIn,
           );
+    final arbiterPorts = [
+      for (var i = 0; i < outer.length; i++)
+        if (portSlice?[i] ?? false)
+          _slice(clk, reset, abortIn, outer[i], i)
+        else
+          outer[i],
+    ];
     arbiter = SdramArbiter(
       clk: clk,
       reset: reset,
       abort: abortIn,
-      ports: outer,
+      ports: arbiterPorts,
       configs: [
         for (var i = 0; i < outer.length; i++)
           HarborSdramPortConfig(
@@ -141,6 +149,30 @@ class SdramEngineStackTop extends Module {
     dqOut <= engine.phyDqOut;
     dqOe <= engine.phyDqOe;
   }
+}
+
+/// [port] behind a [SdramPortSlice], as [HarborSdram] has its bus port.
+SdramPortInterface _slice(
+  Logic clk,
+  Logic reset,
+  Logic? abort,
+  SdramPortInterface port,
+  int i,
+) {
+  final inner = SdramPortInterface(
+    addrWidth: port.addrWidth,
+    wordsWidth: port.wordsWidth,
+    portIdWidth: port.portIdWidth,
+  );
+  SdramPortSlice(
+    clk: clk,
+    reset: reset,
+    abort: abort,
+    client: port,
+    arbiter: inner,
+    name: 'slice_$i',
+  );
+  return inner;
 }
 
 /// Command kinds in cs#/ras#/cas#/we# encoding order, cmd3 = (ras << 2) |
@@ -186,6 +218,13 @@ class SdramEngineStack {
 
   /// Realtime ports, see [HarborSdramPortConfig.realtime]. Null for none.
   final List<bool>? portRealtime;
+
+  /// Ports behind a [SdramPortSlice]. Null for none. The read order and
+  /// grant checks watch the arbiter side of a slice, where the arbiter
+  /// takes the request.
+  final List<bool>? portSlice;
+
+  bool _sliced(int p) => portSlice?[p] ?? false;
 
   /// The longest wait of each port, from `req_valid` up to the cycle the
   /// arbiter takes the request, in cycles.
@@ -274,6 +313,7 @@ class SdramEngineStack {
     this.ports = 1,
     this.portMaxGrantWords,
     this.portRealtime,
+    this.portSlice,
     this.rowAgeGuard = true,
     HarborSdramAddressMap map = HarborSdramAddressMap.rowBankCol,
     this.tRasMaxNs,
@@ -358,6 +398,7 @@ class SdramEngineStack {
       maxGrantWords: maxGrantWords,
       portMaxGrantWords: portMaxGrantWords,
       portRealtime: portRealtime,
+      portSlice: portSlice,
       rowAgeGuard: rowAgeGuard,
     );
     await top.build();
@@ -465,6 +506,27 @@ class SdramEngineStack {
       _drivePort(p);
     }
     final waiting = [for (var p = 0; p < ports; p++) _pendingReq[p] != null];
+    // The take by the arbiter. Behind a slice it comes after the take on
+    // the client port.
+    final arbiterTook = <bool>[];
+    for (var p = 0; p < ports; p++) {
+      if (_sliced(p)) {
+        final arb = top.arbiter;
+        final took =
+            arb.input('p${p}_req_valid').value == LogicValue.one &&
+            arb.output('p${p}_req_ready').value == LogicValue.one;
+        arbiterTook.add(took);
+        if (took && arb.input('p${p}_req_write').value == LogicValue.zero) {
+          _readOrder.add(p);
+        }
+      } else {
+        arbiterTook.add(
+          waiting[p] &&
+              _pendingReq[p] != null &&
+              portIfaces[p].reqReady.value == LogicValue.one,
+        );
+      }
+    }
     for (var p = 0; p < ports; p++) {
       _samplePort(p);
     }
@@ -485,7 +547,7 @@ class SdramEngineStack {
           if (rt[p] && waiting[p] && _pendingReq[p] != null) p,
       ];
       for (var q = 0; q < ports; q++) {
-        if (!rt[q] && waiting[q] && _pendingReq[q] == null) {
+        if (!rt[q] && arbiterTook[q]) {
           for (final p in rtLost) {
             _errors.add('cycle $_cycle: best effort port $q won over $p');
           }
@@ -567,7 +629,7 @@ class SdramEngineStack {
     if (offered != null && iface.reqReady.value == LogicValue.one) {
       if (!offered.write) {
         _reads[p].add(offered);
-        _readOrder.add(p);
+        if (!_sliced(p)) _readOrder.add(p);
       }
       _pendingReq[p] = null;
     }

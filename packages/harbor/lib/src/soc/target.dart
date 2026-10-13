@@ -734,6 +734,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     buf.writeln();
     buf.writeln('SV_FILES = \$(wildcard rtl/*.sv)');
     buf.writeln();
+    if (vendor != HarborFpgaVendor.vivado) {
+      buf.writeln('# Extra nextpnr flags, such as --seed 3.');
+      buf.writeln('PNRFLAGS ?=');
+      buf.writeln();
+    }
 
     // Synthesis
     buf.writeln('.PHONY: all synth pnr pack clean');
@@ -769,10 +774,17 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         'PREROUTE := \$(if \$(wildcard support/nextpnr/show_bels.py),'
         '--pre-route support/nextpnr/show_bels.py,)',
       );
+      buf.writeln('# nextpnr seed and thread count, unset by default.');
+      buf.writeln('SEED ?=');
+      buf.writeln('THREADS ?=');
       buf.writeln();
       buf.writeln('pnr: $intermediate');
       buf.writeln('$intermediate: \$(TOP).json \$(TOP).$constraintExtension');
-      buf.writeln('\t$pnrCmd \$(PREPLACE) \$(PREROUTE)');
+      buf.writeln(
+        '\t$pnrCmd \$(PREPLACE) \$(PREROUTE)'
+        '\$(if \$(SEED), --seed \$(SEED))'
+        '\$(if \$(THREADS), --threads \$(THREADS)) \$(PNRFLAGS)',
+      );
       buf.writeln();
       buf.writeln('pack: \$(TOP).$bitstreamExtension');
       buf.writeln('\$(TOP).$bitstreamExtension: $intermediate');
@@ -856,7 +868,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         '--xdc \$(TOP).$constraintExtension '
         '--json \$(TOP).json --write \$(TOP)_routed.json --fasm \$(TOP).fasm '
         '\$(PREPACK) \$(PREPLACE) \$(PREROUTE) --placer \$(PLACER) '
-        '--seed \$(SEED)',
+        '--seed \$(SEED) \$(PNRFLAGS)',
       );
       // nextpnr-xilinx always writes the 0.675 V internal VREF (SSTL135) for
       // a bank with SSTL inputs and ignores INTERNAL_VREF. SSTL15 needs 0.75 V.

@@ -9,6 +9,19 @@ import 'sdram_wb_stack.dart';
 /// One bus access for [streamHeld].
 typedef WbOp = ({int addr, bool write, int data});
 
+/// Waits for [count] edges of [clk] that land strictly after [notBefore].
+///
+/// A posedge already pending at the moment [notBefore] was sampled resolves
+/// `nextPosedge` at that same timestamp, so counting it would hold a reset
+/// pulse that starts there for less than [count] full cycles.
+Future<void> _edgesStrictlyAfter(Logic clk, int notBefore, int count) async {
+  var got = 0;
+  while (got < count) {
+    await clk.nextPosedge;
+    if (Simulator.time > notBefore) got++;
+  }
+}
+
 /// Runs [ops] with cyc held high across every ack and returns the data of
 /// each ack, or -1 where the data is not valid.
 Future<List<int>> streamHeld(
@@ -235,10 +248,12 @@ Future<void> committedWriteCase(SdramWbStack s, {int maxN = 20}) async {
           }
           s.release();
         }
+        // Inject right at this instant: a pending sysClk posedge can resolve
+        // `nextPosedge` at the same timestamp, so only edges strictly after
+        // the inject time count toward the hold.
+        final injectAt = Simulator.time;
         s.sysReset.inject(1);
-        for (var i = 0; i <= k % 3; i++) {
-          await s.sysClk.nextPosedge;
-        }
+        await _edgesStrictlyAfter(s.sysClk, injectAt, k % 3 + 1);
         s.sysReset.inject(0);
         await s.idle(4);
         allowed[a] = acked ? {data} : {old, data};

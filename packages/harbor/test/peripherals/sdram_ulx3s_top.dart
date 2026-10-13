@@ -188,8 +188,8 @@ class SdramBistMaster extends Module {
 
 /// Ulx3s top for the sdram place and route check and the board test.
 ///
-/// One ehxplll makes the 125 MHz sdram clock (clkop) and the 62.5 MHz sys
-/// clock (clkos). A [SdramBistMaster] on sys drives [HarborSdram] through
+/// One ehxplll makes the sdram clock (clkop, [memHz] Hz, 125 MHz by default)
+/// and the sys clock at half that rate (clkos). A [SdramBistMaster] on sys drives [HarborSdram] through
 /// the cdc. Leds: 0 init done, 1 pass, 2 fail, 7..3 loop count.
 ///
 /// With [scanout], a [HarborScanoutFetcher] also reads 640-word lines
@@ -205,6 +205,7 @@ class SdramUlx3sTop extends BridgeModule {
     int bistWords = 65536,
     bool bistAddressLineWalk = false,
     bool scanout = false,
+    int memHz = 125000000,
   }) : super('SdramUlx3sTop', name: 'top') {
     createPort('clk', PortDirection.input);
     createPort('rst_n', PortDirection.input);
@@ -219,10 +220,10 @@ class SdramUlx3sTop extends BridgeModule {
     final pair = gen.createDomainWithSecondary(
       HarborClockConfig.fixed(
         name: 'sdram',
-        frequency: 125000000,
+        frequency: memHz,
         sourceFrequency: 25000000,
       ),
-      secondaryFrequency: 62500000,
+      secondaryFrequency: memHz ~/ 2,
       secondaryName: 'sys',
     );
     memDomain = pair.primary;
@@ -231,7 +232,7 @@ class SdramUlx3sTop extends BridgeModule {
     sdram = HarborSdram(
       config: const HarborSdramConfig.as4c16m16sb6(),
       baseAddress: 0,
-      clockHz: 125000000,
+      clockHz: memHz,
       target: target,
       scanoutPorts: scanout ? 1 : 0,
     );
@@ -283,13 +284,16 @@ class SdramUlx3sTop extends BridgeModule {
     final rst = sdram.output('scan_reset');
     final start = Logic(name: 'scan_start');
     final lineAddr = Logic(name: 'scan_line_addr', width: 32);
+    // Registers, as in a display, so the start path is a real path.
+    final words = Logic(name: 'scan_words', width: 16);
+    final fill = Logic(name: 'scan_fill');
     final f = HarborScanoutFetcher(
       clk: clk,
       reset: rst,
       fetchStart: start,
       fetchAddr: lineAddr,
-      words: Const(640, width: 16),
-      fillSel: Const(0),
+      words: words,
+      fillSel: fill,
       rqReady: sdram.output('scan0_rq_ready'),
       rdValid: sdram.output('scan0_rd_valid'),
       rdData: sdram.output('scan0_rd_data'),
@@ -301,7 +305,8 @@ class SdramUlx3sTop extends BridgeModule {
     final fold = Logic(name: 'scan_fold', width: 32);
     Sequential(clk, reset: rst, [
       start < ~f.busy & ~start & sdram.output('init_done'),
-      If(f.done, then: [lineAddr < lineAddr + 3072]),
+      words < Const(640, width: 16),
+      If(f.done, then: [lineAddr < lineAddr + 3072, fill < ~fill]),
       If(f.wrEn, then: [fold < fold ^ f.wrData]),
     ]);
     return fold.xor();

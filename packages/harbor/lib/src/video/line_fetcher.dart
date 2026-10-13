@@ -5,8 +5,10 @@ import 'package:rohd/rohd.dart';
 ///
 /// On a [fetchStart] pulse it reads [words] sequential 32-bit words from
 /// [fetchAddr] (advancing on each `ack`), driving [wrEn]/[wrIdx]/[wrData] to
-/// write each word into the buffer selected by [fillSel]. [busy] is high during
-/// the line, [done] pulses for one cycle when the line is complete.
+/// write each word into the buffer selected by [fillSel]. The inputs go
+/// through one register, so the line starts one cycle after [fetchStart].
+/// [busy] is high from the cycle after [fetchStart] until the line is
+/// complete, [done] pulses for one cycle when the line is complete.
 ///
 /// After every [burstWords] words the fetcher drops `cyc` for one cycle, so a
 /// shared bus arbiter that locks its grant on `cyc` can serve other masters
@@ -87,6 +89,11 @@ class HarborLineFetcher extends Module {
     final beat = Logic(name: 'beat', width: burstW);
     final yieldBus = Logic(name: 'yield_bus');
     final active = (reading & ~yieldBus).named('active');
+    // The start inputs can come from far away, so they get a register here.
+    final start1 = Logic(name: 'start_s1');
+    final addr1 = Logic(name: 'addr_s1', width: 32);
+    final words1 = Logic(name: 'words_s1', width: 16);
+    final fill1 = Logic(name: 'fill_s1');
 
     final capture = active & mAck;
 
@@ -104,22 +111,24 @@ class HarborLineFetcher extends Module {
     wrIdx <= idx;
     wrData <= mDataIn;
 
-    busy <= reading;
+    busy <= reading | start1;
     done <= doneReg;
 
+    Sequential(clk, [addr1 < fetchAddr, words1 < words, fill1 < fillSel]);
     Sequential(clk, reset: reset, [
+      start1 < fetchStart,
       doneReg < Const(0),
       yieldBus < Const(0),
       If(
         ~reading,
         then: [
           If(
-            fetchStart,
+            start1,
             then: [
-              addr < fetchAddr,
-              cnt < words,
+              addr < addr1,
+              cnt < words1,
               idx < Const(0, width: idxW),
-              fillReg < fillSel,
+              fillReg < fill1,
               beat < Const(0, width: burstW),
               reading < Const(1),
             ],
@@ -167,9 +176,10 @@ class HarborLineFetcher extends Module {
 /// after the take, so a port can take at most every other cycle. The data reaches the
 /// line buffer one cycle after `rd_valid`. Each pair of 16-bit words, low word first, makes one 32-bit line
 /// buffer write. The fetcher ignores the low 2 bits of [fetchAddr], so a
-/// line always starts on a 4-byte word. Pulse [fetchStart]
-/// only while [busy] is low. The [words], [fillSel], [busy] and [done] ports
-/// work as in [HarborLineFetcher].
+/// line always starts on a 4-byte word. The start inputs go through two
+/// registers, so the first request comes two cycles after [fetchStart].
+/// Pulse [fetchStart] only while [busy] is low. The [words], [fillSel],
+/// [busy] and [done] ports work as in [HarborLineFetcher].
 class HarborScanoutFetcher extends Module {
   Logic get rqValid => output('rq_valid');
   Logic get rqAddr => output('rq_addr');
@@ -262,29 +272,42 @@ class HarborScanoutFetcher extends Module {
 
     Logic minOf(Logic a, Logic b) => mux(a.lt(b), a, b);
 
-    final startAddr = [
-      fetchAddr.getRange(2),
-      Const(0, width: 2),
-    ].swizzle().named('start_addr');
+    // Stage 1 takes the start inputs from a far source. Stage 2 holds the
+    // first request.
+    final start1 = Logic(name: 'start_s1');
+    final addr1 = Logic(name: 'addr_s1', width: 30);
+    final words1 = Logic(name: 'words_s1', width: 16);
+    final fill1 = Logic(name: 'fill_s1');
+    final start2 = Logic(name: 'start_s2');
+    final addr2 = Logic(name: 'addr_s2', width: 32);
+    final len2 = Logic(name: 'len_s2', width: rqWordsWidth);
+    final left2 = Logic(name: 'left_s2', width: lw);
+    final total2 = Logic(name: 'total_s2', width: lw);
+    final any2 = Logic(name: 'any_s2');
+    final fill2 = Logic(name: 'fill_s2');
+
+    final startAddr = [addr1, Const(0, width: 2)].swizzle().named('start_addr');
     // The first request runs to the end of its group.
-    final total = [words, Const(0)].swizzle().named('total');
+    final total = [words1, Const(0)].swizzle().named('total');
     final toGroupEnd =
         (Const(maxBurst, width: lw) -
                 startAddr.getRange(1, 1 + burstBits).zeroExtend(lw))
             .named('to_group_end');
     final firstLen = minOf(total, toGroupEnd).named('first_len');
-    // Every later request starts on a group. next_len is a register that
-    // follows the next value of req_left, so it is correct for every take.
-    final nextLen = Logic(name: 'next_len', width: lw);
+
+    // Every later request starts on a group, so it asks for
+    // min(req_left, maxBurst). The left_* registers hold this for req_left.
+    // A start loads them with req_left, so they are correct at the first
+    // offer. A take makes them one cycle late, and a take never comes in the
+    // cycle after a take.
+    final leftSub = Logic(name: 'left_sub', width: lw);
+    final leftBig = Logic(name: 'left_big');
+    final leftLow = Logic(name: 'left_low');
     final take = Logic(name: 'take');
     final rdValidReg = Logic(name: 'rd_valid_reg');
     final rdDataReg = Logic(name: 'rd_data_reg', width: 16);
     final got = (reading & rdValidReg).named('got');
-    final reqLeftNext = mux(
-      fetchStart,
-      total - firstLen,
-      mux(take, reqLeft - nextLen, reqLeft),
-    ).named('req_left_next');
+    final leftSrc = mux(start2, left2, reqLeft).named('left_src');
 
     rqValid <= valid;
     rqAddr <= addr;
@@ -293,45 +316,58 @@ class HarborScanoutFetcher extends Module {
     wrSel <= fillReg;
     wrIdx <= wrIdxReg;
     wrData <= wrDataReg;
-    busy <= reading;
+    busy <= reading | start1 | start2;
     done <= doneReg;
 
     // Only the control flops reset, so the reset net stays small. A start
-    // loads the data flops straight from fetch_start, so a synthesis tool
+    // loads the data flops straight from start_s2, so a synthesis tool
     // that turns a constant load into a set or reset uses that flop.
     Sequential(clk, [
       doneReg < Const(0),
       wrEnReg < Const(0),
       take < valid & rqReady,
-      nextLen <
-          mux(
-            reqLeftNext.getRange(burstBits).eq(0),
-            reqLeftNext,
-            Const(maxBurst, width: lw),
-          ),
+      start1 < fetchStart,
+      addr1 < fetchAddr.getRange(2),
+      words1 < words,
+      fill1 < fillSel,
+      start2 < start1,
+      addr2 < startAddr,
+      len2 < firstLen.getRange(0, rqWordsWidth),
+      left2 < total - firstLen,
+      total2 < total,
+      any2 < words1.neq(0),
+      fill2 < fill1,
+      leftSub < leftSrc - maxBurst,
+      leftBig < leftSrc.getRange(burstBits).or(),
+      leftLow < leftSrc.getRange(0, burstBits).or(),
       rdValidReg < rdValid,
       rdDataReg < rdData,
       If(
-        fetchStart,
+        start2,
         then: [
-          addr < startAddr,
-          len < firstLen.getRange(0, rqWordsWidth),
-          valid < words.neq(0),
-          reqLeft < total - firstLen,
-          rdLeft < total,
+          addr < addr2,
+          len < len2,
+          valid < any2,
+          reqLeft < left2,
+          rdLeft < total2,
           idx < Const(0, width: idxW),
           odd < Const(0),
-          fillReg < fillSel,
-          reading < words.neq(0),
+          fillReg < fill2,
+          reading < any2,
         ],
         orElse: [
           If(
             take,
             then: [
               addr < addr + [len, Const(0)].swizzle().zeroExtend(32),
-              len < nextLen.getRange(0, rqWordsWidth),
-              valid < reqLeft.neq(0),
-              reqLeft < reqLeft - nextLen,
+              len <
+                  mux(
+                    leftBig,
+                    Const(maxBurst, width: rqWordsWidth),
+                    reqLeft.getRange(0, burstBits).zeroExtend(rqWordsWidth),
+                  ),
+              valid < leftBig | leftLow,
+              reqLeft < mux(leftBig, leftSub, Const(0, width: lw)),
             ],
             orElse: [
               If(rqReady, then: [valid < Const(0)]),
@@ -363,6 +399,8 @@ class HarborScanoutFetcher extends Module {
           reading < Const(0),
           valid < Const(0),
           take < Const(0),
+          start1 < Const(0),
+          start2 < Const(0),
           rdValidReg < Const(0),
         ],
       ),
