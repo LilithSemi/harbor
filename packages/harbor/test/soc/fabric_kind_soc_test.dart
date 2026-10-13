@@ -439,7 +439,7 @@ void main() {
           isA<StateError>().having(
             (e) => e.message,
             'message',
-            contains('Task 8'),
+            contains('native master port for axi4 is not implemented'),
           ),
         ),
       );

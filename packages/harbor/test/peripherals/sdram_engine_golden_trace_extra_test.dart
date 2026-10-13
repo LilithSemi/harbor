@@ -36,8 +36,7 @@ const _initPrefix = [
 ];
 
 /// Expected trace for [_runColumn7Case], reasoned from the command rules
-/// in sdram_engine_golden_trace_test.dart and the round 4 report, not
-/// copied from a run.
+/// in sdram_engine_golden_trace_test.dart, not copied from a run.
 const _expectedColumn7 = [
   ..._initPrefix,
   // rfc from the last init refresh's pick (80): picked 88, issued 89.

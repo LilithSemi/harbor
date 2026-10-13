@@ -162,8 +162,8 @@ class Ddr3PhyWordModel {
   }
 }
 
-/// Task 8's line fetcher on a memory master waist, copied here because
-/// this tree has the Wishbone fetcher only. Reads [words] 32-bit words
+/// A line fetcher on a memory master waist, copied here because the
+/// library has the Wishbone fetcher only. Reads [words] 32-bit words
 /// from [fetchAddr] with INCR requests of up to [burstWords] beats that
 /// never cross 4 KB, as many in flight as the waist takes.
 class WaistLineFetcher extends Module {

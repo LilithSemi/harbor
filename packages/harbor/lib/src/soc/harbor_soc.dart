@@ -1193,8 +1193,8 @@ class HarborSoC extends BridgeModule {
     final kind = fabricKind.name;
     final later = switch (module) {
       _ when role == 'master' && intf is WishboneInterface =>
-        ' Masters get native ports in fabric Task 8, so use a Wishbone '
-            'fabric for now.',
+        ' A native master port for $kind is not implemented yet, only slave '
+            'ports are. Build this SoC on a wishbone fabric until it is.',
       _ => '',
     };
     throw StateError(
