@@ -8,6 +8,7 @@ import '../fabric.dart';
 import '../fabric_util.dart';
 import '../port/fabric_kind.dart';
 import '../port/reg_fifo.dart';
+import 'axi4_exclusive.dart';
 import 'axi4_interface.dart';
 import 'axi4_lite_interface.dart';
 
@@ -268,6 +269,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
       addressWidth: addrW,
       dataWidth: dataW,
     );
+    _checkExclusive(masters, slaves);
 
     final c = addInput('clk', clk);
     final r = addInput('reset', reset);
@@ -292,7 +294,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
     final maxId = masters.map((m) => _shape(m.interface).$3 ?? 1).reduce(max);
     final pW = nm > 1 ? indexWidth(nm) : 0;
-    fullIdWidth = maxId + pW;
+    fullIdWidth = fullIdWidthOf(masters);
     final tW = indexWidth(nt);
     final mW = indexWidth(nm);
 
@@ -1145,6 +1147,87 @@ class HarborAxi4Fabric extends HarborFabricModule {
       wDone < wDone + (w.valid & w.last).zeroExtend(cw) - b.fire.zeroExtend(cw),
       If(rd.fire, then: [beat < mux(rd.last, Const(0, width: lenW), beat + 1)]),
     ]);
+  }
+
+  /// ID bits a slave needs to see full master IDs with no remap: the widest
+  /// master ID plus the master index.
+  static int fullIdWidthOf(List<HarborFabricMaster> masters) {
+    final maxId = masters.map((m) => _shape(m.interface).$3 ?? 1).reduce(max);
+    return maxId + (masters.length > 1 ? indexWidth(masters.length) : 0);
+  }
+
+  /// The exclusive monitor for the slave side of a fabric of [masters], or
+  /// null when no master has exclusive access. A memory slave with a
+  /// monitor on this fabric needs these slots and an ID width of at least
+  /// [fullIdWidthOf]. The fabric check uses the default [slotBudget] for
+  /// automatic masters.
+  static HarborAxi4Exclusive? exclusiveOf(
+    List<HarborFabricMaster> masters, {
+    int slotBudget = HarborExclusive.defaultSlotBudget,
+    int granuleBytes = HarborExclusive.defaultGranuleBytes,
+  }) => HarborAxi4Exclusive.forMasters(
+    [for (final m in masters) _shape(m.interface).$3 ?? 1],
+    [for (final m in masters) m.exclusiveIds],
+    slotBudget: slotBudget,
+    granuleBytes: granuleBytes,
+  );
+
+  // Throws when an exclusive master or a monitored slave cannot work.
+  static void _checkExclusive(
+    List<HarborFabricMaster> masters,
+    List<HarborFabricSlave> slaves,
+  ) {
+    for (final m in masters) {
+      if (m.exclusive && m.interface is! Axi4Interface) {
+        throw ArgumentError(
+          '${m.name}: exclusive access needs a full AXI4 port',
+        );
+      }
+      if (!m.exclusive) continue;
+      for (final s in slaves) {
+        if (s.exclusive == null &&
+            s.memory &&
+            s.interface is Axi4Interface &&
+            m.reaches(s.name)) {
+          throw ArgumentError(
+            '${m.name}: an exclusive master reaches the memory slave '
+            '${s.name}, which has no exclusive monitor. Give it a monitor or '
+            'take it out of the master reach.',
+          );
+        }
+      }
+    }
+    final want = exclusiveOf(masters);
+    final fullW = fullIdWidthOf(masters);
+    for (final s in slaves) {
+      final have = s.exclusive;
+      if (have == null) continue;
+      final w = _shape(s.interface).$3;
+      if (w == null || w < fullW) {
+        throw ArgumentError(
+          '${s.name}: an exclusive monitor needs full master IDs, so the '
+          'slave needs ID width $fullW, but it has ${w ?? 'no ID'}',
+        );
+      }
+      if (want == null || !have.sameIds(want)) {
+        final need = want == null
+            ? 'the fabric has no exclusive master'
+            : 'the exclusive masters need ${want.runs}';
+        throw ArgumentError(
+          '${s.name}: the exclusive monitor has slots for ${have.runs}, but '
+          '$need',
+        );
+      }
+      final chans = HarborFabric.readChannelsOf(s, masters);
+      for (var i = 0; i < masters.length; i++) {
+        if (masters[i].exclusive && chans[i] > 0) {
+          throw ArgumentError(
+            '${masters[i].name}: an exclusive master must read ${s.name} on '
+            'read channel 0, the only channel with the monitor',
+          );
+        }
+      }
+    }
   }
 
   // Address width, data width, and ID width or null for AXI4-Lite.

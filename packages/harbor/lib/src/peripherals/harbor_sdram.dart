@@ -136,6 +136,10 @@ class HarborSdram extends BridgeModule
   /// Request ID width of the bus port.
   final int idWidth;
 
+  /// The IDs of the AXI4 exclusive monitor on [bus], or null for no
+  /// monitor. See [HarborMemorySlavePort.create].
+  final HarborAxi4Exclusive? exclusive;
+
   /// Requests the bus port keeps in flight. A Wishbone port has only one in
   /// flight, so it must be 1. The others default to 8.
   final int outstanding;
@@ -206,6 +210,7 @@ class HarborSdram extends BridgeModule
     this.busDataWidth = 32,
     this.protocol = HarborFabricKind.wishbone,
     this.idWidth = 1,
+    this.exclusive,
     int? outstanding,
     this.wishboneBurstBeats = 8,
     int? cdcDepth,
@@ -259,6 +264,7 @@ class HarborSdram extends BridgeModule
            readPortStages: readPortStages,
            simReadLatency: simReadLatency,
            simWriteLatency: simWriteLatency,
+           exclusive: exclusive,
          ),
        ) {
     if (busDataWidth != 32) {
@@ -279,6 +285,13 @@ class HarborSdram extends BridgeModule
         protocol,
         'protocol',
         'busClockSync needs a Wishbone port',
+      );
+    }
+    if (exclusive != null && protocol != HarborFabricKind.axi4) {
+      throw ArgumentError.value(
+        protocol,
+        'protocol',
+        'an exclusive monitor needs an AXI4 port',
       );
     }
     if (postedWrites && protocol != HarborFabricKind.wishbone) {
@@ -410,6 +423,8 @@ class HarborSdram extends BridgeModule
     clk: clk,
     reset: reset,
     wishboneBurstBeats: wishboneBurstBeats,
+    exclusive: exclusive,
+    deviceAddressWidth: (config.sizeBytes - 1).bitLength,
     fabricClock: fabric,
     cdcDepth: fabric == null ? null : cdcDepth,
     deviceResetCopy: fabric == null
@@ -497,6 +512,7 @@ class HarborSdram extends BridgeModule
     required int readPortStages,
     required int simReadLatency,
     required int simWriteLatency,
+    required HarborAxi4Exclusive? exclusive,
   }) {
     final sim = target is HarborSimTarget;
     final c = cycles;
@@ -525,6 +541,7 @@ class HarborSdram extends BridgeModule
         's${scanoutPorts}f$scanoutMaxInFlight',
         if (readPortStages > 0 && !sim) 'rs$readPortStages',
         if (sim) 'rl${simReadLatency}wl$simWriteLatency',
+        ?exclusive?.tag,
       ],
     );
   }

@@ -1,5 +1,6 @@
 import 'package:rohd/rohd.dart';
 
+import 'axi4/axi4_exclusive.dart';
 import 'axi4/axi4_fabric.dart';
 import 'bus.dart';
 import 'bus_error_source.dart';
@@ -53,6 +54,18 @@ class HarborFabricMaster {
   /// channel 0.
   final int? readChannel;
 
+  /// AXI4 exclusive access: null or 0 for none, N to give the low IDs 0 to
+  /// N-1 a reservation slot in each monitored memory slave, or
+  /// [HarborExclusive.auto] to let the builder pick N from a slot budget
+  /// (see [HarborExclusive.slotCounts]). An exclusive access on an ID with
+  /// no slot gets OKAY. Only a full AXI4 master on an AXI4 fabric can set
+  /// it. Slots cost timing: in one ECP5 check, 4 masters with 16 slots each
+  /// reached about 80 MHz, against about 111 MHz with 2 slots each.
+  final int? exclusiveIds;
+
+  /// True when this master uses exclusive access.
+  bool get exclusive => (exclusiveIds ?? 0) != 0;
+
   const HarborFabricMaster({
     required this.name,
     required this.interface,
@@ -60,6 +73,7 @@ class HarborFabricMaster {
     this.memory = true,
     this.reach,
     this.readChannel,
+    this.exclusiveIds,
   });
 
   /// The outstanding limit of this master on a fabric of [kind].
@@ -117,6 +131,12 @@ class HarborFabricSlave {
   /// Wishbone builders throw when this is not empty.
   final List<PairInterface> readInterfaces;
 
+  /// The AXI4 exclusive monitor of this slave, or null when it has none.
+  /// The fabric checks that its slots are those of its exclusive masters
+  /// (see [HarborAxi4Fabric.exclusiveOf]) and that the slave sees full
+  /// master IDs.
+  final HarborAxi4Exclusive? exclusive;
+
   const HarborFabricSlave({
     required this.name,
     required this.range,
@@ -126,6 +146,7 @@ class HarborFabricSlave {
     this.memory = true,
     this.offset = false,
     this.readInterfaces = const [],
+    this.exclusive,
   });
 
   /// The value the fabric subtracts from each address to this slave.
@@ -311,6 +332,14 @@ abstract final class HarborFabric {
       }
       if (kind != HarborFabricKind.axi4 && s.readInterfaces.isNotEmpty) {
         throw ArgumentError('${s.name}: readChannels > 1 needs an AXI4 fabric');
+      }
+      if (kind != HarborFabricKind.axi4 && s.exclusive != null) {
+        throw ArgumentError('${s.name}: an exclusive monitor needs AXI4');
+      }
+    }
+    for (final m in masters) {
+      if (kind != HarborFabricKind.axi4 && m.exclusive) {
+        throw ArgumentError('${m.name}: exclusive access needs AXI4');
       }
     }
     for (final m in masters) {

@@ -4,6 +4,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../blackbox/ecp5/ecp5.dart';
 import '../blackbox/ice40/ice40.dart';
 import '../blackbox/xilinx/xilinx.dart';
+import '../bus/axi4/axi4_exclusive.dart';
 import '../bus/bus.dart';
 import '../bus/port/fabric_kind.dart';
 import '../bus/port/memory_port.dart';
@@ -48,6 +49,10 @@ class HarborSram extends BridgeModule
   /// The aligned block a Wishbone burst request covers.
   final int wishboneBurstBeats;
 
+  /// The IDs of the AXI4 exclusive monitor, or null for no monitor. See
+  /// [HarborMemorySlavePort.create].
+  final HarborAxi4Exclusive? exclusive;
+
   /// The memory slave port. It takes one request at a time.
   late final HarborMemorySlavePort bus;
 
@@ -66,6 +71,7 @@ class HarborSram extends BridgeModule
     this.protocol = HarborFabricKind.wishbone,
     this.idWidth = 1,
     this.wishboneBurstBeats = 8,
+    this.exclusive,
     HarborDeviceTarget? target,
     String? name,
   }) : super(
@@ -76,6 +82,7 @@ class HarborSram extends BridgeModule
            protocol: protocol,
            idWidth: idWidth,
            wishboneBurstBeats: wishboneBurstBeats,
+           exclusive: exclusive,
            target: target,
          ),
          name: name ?? 'sram',
@@ -109,6 +116,8 @@ class HarborSram extends BridgeModule
       clk: clk,
       reset: input('reset'),
       wishboneBurstBeats: wishboneBurstBeats,
+      exclusive: exclusive,
+      deviceAddressWidth: (size - 1).bitLength,
     );
 
     final ack = Logic(name: 'mem_ack');
@@ -179,6 +188,7 @@ class HarborSram extends BridgeModule
     required HarborFabricKind protocol,
     required int idWidth,
     required int wishboneBurstBeats,
+    required HarborAxi4Exclusive? exclusive,
     required HarborDeviceTarget? target,
   }) {
     final store = switch (target) {
@@ -190,7 +200,8 @@ class HarborSram extends BridgeModule
         ? '_b$wishboneBurstBeats'
         : '';
     return 'HarborSram_${size}_d${dataWidth}_a$addressWidth'
-        '_${protocol.name}_i${idWidth}_n${outstanding}_q0${burst}_$store';
+        '_${protocol.name}_i${idWidth}_n${outstanding}_q0${burst}_$store'
+        '${exclusive == null ? '' : '_${exclusive.tag}'}';
   }
 
   void _buildWithBram(

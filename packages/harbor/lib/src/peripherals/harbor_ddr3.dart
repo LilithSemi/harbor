@@ -2,6 +2,7 @@ import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
+import '../bus/axi4/axi4_exclusive.dart';
 import '../bus/bus.dart';
 import '../bus/bus_error_source.dart';
 import '../bus/bus_slave_port.dart';
@@ -98,6 +99,10 @@ class HarborDdr3 extends BridgeModule
   /// The aligned block a Wishbone burst request on [bus] covers.
   final int wishboneBurstBeats;
 
+  /// The IDs of the AXI4 exclusive monitor on [bus], or null for no
+  /// monitor. See [HarborMemorySlavePort.create].
+  final HarborAxi4Exclusive? exclusive;
+
   /// Read channels on AXI4. Channel 0 is [bus]. Channel k is the read-only
   /// port `bus_r<k>` in [readBuses]. Wishbone and TileLink have 1.
   final int readChannels;
@@ -178,6 +183,7 @@ class HarborDdr3 extends BridgeModule
     this.protocol = HarborFabricKind.wishbone,
     this.idWidth = 1,
     this.wishboneBurstBeats = 8,
+    this.exclusive,
     this.readChannels = 1,
     int? outstanding,
     int? readWords,
@@ -211,6 +217,7 @@ class HarborDdr3 extends BridgeModule
            fastSim: fastSim,
            writeCombine: writeCombine,
            readGap: readGap ?? defaultReadGap(protocol),
+           exclusive: exclusive,
          ),
        ) {
     final wishbone = protocol == HarborFabricKind.wishbone;
@@ -328,6 +335,8 @@ class HarborDdr3 extends BridgeModule
       reset: devReset,
       wishboneBurstBeats: wishboneBurstBeats,
       fabricClock: fabric,
+      exclusive: exclusive,
+      deviceAddressWidth: (config.size - 1).bitLength,
     );
     readBuses = [
       for (var k = 1; k < readChannels; k++)
@@ -514,6 +523,7 @@ class HarborDdr3 extends BridgeModule
     required bool fastSim,
     required bool writeCombine,
     required int readGap,
+    required HarborAxi4Exclusive? exclusive,
   }) {
     final sim = target is HarborSimTarget;
     final ecp5 = switch (target) {
@@ -558,6 +568,7 @@ class HarborDdr3 extends BridgeModule
         'rw$readWords',
         'rg$readGap',
         if (fastSim) 'fast',
+        ?exclusive?.tag,
       ],
     );
   }

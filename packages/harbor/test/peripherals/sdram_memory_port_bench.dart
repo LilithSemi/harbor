@@ -33,6 +33,9 @@ HarborSdramConfig sdramBenchConfig() {
 
 /// A requester on the fabric clock `clk` linked to an ECP5 [HarborSdram]
 /// on `mem_clk`, with the sdram pads on the top.
+///
+/// [link] replaces the requester: it gets the top and the sdram and wires
+/// the sdram port `bus` itself. [exclusive] goes to the sdram.
 class SdramPortTop extends BridgeModule {
   late final HarborSdram sdram;
 
@@ -41,9 +44,12 @@ class SdramPortTop extends BridgeModule {
     HarborMemoryWaistConfig config, {
     required int memHz,
     int scanoutPorts = 0,
+    HarborAxi4Exclusive? exclusive,
+    void Function(BridgeModule top, HarborSdram sdram)? link,
   }) : super(
          'SdramPortBench_${kind.name}_n${config.outstanding}_m${memHz}'
-         '_s$scanoutPorts',
+         '_s$scanoutPorts${link == null ? '' : '_link'}'
+         '${exclusive == null ? '' : '_${exclusive.tag}'}',
          name: 'top',
        ) {
     for (final p in ['clk', 'reset', 'mem_clk', 'mem_reset']) {
@@ -57,6 +63,7 @@ class SdramPortTop extends BridgeModule {
         busAddressWidth: config.addressWidth,
         protocol: kind,
         idWidth: config.idWidth,
+        exclusive: exclusive,
         outstanding: config.outstanding,
         scanoutPorts: scanoutPorts,
         target: const HarborFpgaTarget.ecp5(
@@ -83,7 +90,11 @@ class SdramPortTop extends BridgeModule {
         pullUpPort(sdram.port('scan${i}_$p'), newPortName: 'scan${i}_$p');
       }
     }
-    linkRequester(this, sdram, config, kind);
+    if (link != null) {
+      link(this, sdram);
+    } else {
+      linkRequester(this, sdram, config, kind);
+    }
   }
 }
 
@@ -107,6 +118,8 @@ class SdramPortBench {
     required int fabricPeriodPs,
     int memPeriodPs = 8000,
     int scanoutPorts = 0,
+    HarborAxi4Exclusive? exclusive,
+    void Function(BridgeModule top, HarborSdram sdram)? link,
     required void Function(Sim s) attach,
   }) async {
     final memHz = 1000000000000 ~/ memPeriodPs;
@@ -115,6 +128,8 @@ class SdramPortBench {
       config,
       memHz: memHz,
       scanoutPorts: scanoutPorts,
+      exclusive: exclusive,
+      link: link,
     );
     final fabricClk = SimpleClockGenerator(fabricPeriodPs).clk;
     final memClk = SimpleClockGenerator(memPeriodPs).clk;

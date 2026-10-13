@@ -47,7 +47,7 @@ String _cfgName(HarborMemoryWaistConfig c) =>
 /// [readOnly], the native port is read-only (AXI4 only; see
 /// [HarborMemorySlavePort.create]). With [fabricClock], the native port
 /// runs on the fabric clock `fclk`/`freset` and the waist crosses to the
-/// device clock `clk`/`reset`.
+/// device clock `clk`/`reset`. [exclusive] adds an exclusive monitor.
 class MemSlaveShell extends BridgeModule {
   late final HarborMemorySlavePort mem;
 
@@ -57,9 +57,11 @@ class MemSlaveShell extends BridgeModule {
     int burstBeats = 8,
     bool readOnly = false,
     bool fabricClock = false,
+    HarborAxi4Exclusive? exclusive,
   }) : super(
          'MemTestSlaveShell_${kind.name}_${_cfgName(config)}_b$burstBeats'
-         '${readOnly ? '_ro' : ''}${fabricClock ? '_x' : ''}',
+         '${readOnly ? '_ro' : ''}${fabricClock ? '_x' : ''}'
+         '${exclusive == null ? '' : '_${exclusive.tag}'}',
          name: 'shell',
        ) {
     createPort('clk', PortDirection.input);
@@ -77,6 +79,7 @@ class MemSlaveShell extends BridgeModule {
       reset: input('reset'),
       wishboneBurstBeats: burstBeats,
       readOnly: readOnly,
+      exclusive: exclusive,
       fabricClock: fabricClock
           ? HarborFabricClock(clk: input('fclk'), reset: input('freset'))
           : null,
@@ -893,6 +896,10 @@ class AxiManager {
   /// not be called.
   final bool readOnly;
 
+  /// Drives AWLOCK and ARLOCK on every request, from the `lock` argument of
+  /// [write] and [read].
+  final bool lockPorts;
+
   AxiManager(
     this.s,
     this.p,
@@ -903,6 +910,7 @@ class AxiManager {
     double stall = 0.3,
     this.lite = false,
     this.readOnly = false,
+    this.lockPorts = false,
   }) {
     if (!readOnly) {
       aw = Source(s, '${p}_AWVALID', '${p}_AWREADY', rng, idle: awIdle)
@@ -943,20 +951,25 @@ class AxiManager {
     );
   }
 
-  Map<String, int> _addr(String ch, Burst x) => lite
-      ? {'${p}_${ch}ADDR': x.addr}
-      : {
-          '${p}_${ch}ID': x.id,
-          '${p}_${ch}ADDR': x.addr,
-          '${p}_${ch}LEN': x.len,
-          '${p}_${ch}SIZE': x.size,
-          '${p}_${ch}BURST': x.burst,
-        };
+  Map<String, int> _addr(String ch, Burst x, bool lock) {
+    if (lock && !lockPorts) throw StateError('$p: lockPorts is off');
+    return lite
+        ? {'${p}_${ch}ADDR': x.addr}
+        : {
+            '${p}_${ch}ID': x.id,
+            '${p}_${ch}ADDR': x.addr,
+            '${p}_${ch}LEN': x.len,
+            '${p}_${ch}SIZE': x.size,
+            '${p}_${ch}BURST': x.burst,
+            if (lockPorts) '${p}_${ch}LOCK': lock ? 1 : 0,
+          };
+  }
 
-  /// Queues AW, and the W beats unless [data] is false.
-  void write(Burst x, {bool data = true}) {
+  /// Queues AW, and the W beats unless [data] is false. [lock] makes it an
+  /// exclusive write.
+  void write(Burst x, {bool data = true, bool lock = false}) {
     _aw.add(x);
-    aw.queue.add(_addr('AW', x));
+    aw.queue.add(_addr('AW', x, lock));
     if (!data) return;
     for (var i = 0; i < x.beats; i++) {
       w.queue.add({
@@ -967,9 +980,10 @@ class AxiManager {
     }
   }
 
-  void read(Burst x) {
+  /// Queues AR. [lock] makes it an exclusive read.
+  void read(Burst x, {bool lock = false}) {
     _ar.add(x);
-    ar.queue.add(_addr('AR', x));
+    ar.queue.add(_addr('AR', x, lock));
   }
 
   int get readBeatsExpected =>

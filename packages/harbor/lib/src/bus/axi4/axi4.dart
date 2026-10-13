@@ -7,6 +7,7 @@ library;
 export 'package:rohd_hcl/src/interfaces/axi4.dart';
 
 export 'axi4_config.dart';
+export 'axi4_exclusive.dart';
 export 'axi4_interface.dart';
 export 'axi4_lite_interface.dart';
 export 'axi4_memory_port.dart';

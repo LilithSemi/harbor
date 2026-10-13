@@ -3,6 +3,7 @@ import 'package:rohd_hcl/rohd_hcl.dart' show Axi4RespField;
 
 import '../port/memory_waist.dart';
 import '../port/reg_fifo.dart';
+import 'axi4_exclusive.dart';
 import 'axi4_interface.dart';
 
 void _checkMatch(Axi4Interface axi, HarborMemoryWaistConfig config) {
@@ -37,9 +38,16 @@ Logic _counter(String name, int max) => Logic(name: name, width: max.bitLength);
 /// bus, BURST 3, FIXED longer than 16 beats, WRAP not 2, 4, 8 or 16 beats or
 /// not aligned to SIZE, and INCR across a 4 KB boundary. Such a request still
 /// goes to the memory, as a FIXED burst of the same length at full bus size,
-/// with all write strobes low and read data replaced by zero. LOCK, CACHE,
-/// PROT and QOS are ignored. An exclusive access gets OKAY, which means
-/// exclusive access is not supported.
+/// with all write strobes low and read data replaced by zero. CACHE, PROT
+/// and QOS are ignored.
+///
+/// With no [exclusive] monitor, LOCK is ignored too, and an exclusive
+/// access gets OKAY, which means exclusive access is not supported. With
+/// one, a [HarborAxi4ExclusiveMonitor] watches the waist requests: an
+/// exclusive access that it accepts gets EXOKAY, and a failed exclusive
+/// write reaches the memory with all strobes low and gets OKAY.
+/// [deviceAddressWidth] is the number of low address bits the memory
+/// decodes. The monitor keys on them, so it sees aliases as one address.
 class HarborAxi4MemorySlave extends Module {
   /// Depth of the W FIFO, which is the most W beats taken before their AW.
   static const int wBuffer = 2;
@@ -49,15 +57,20 @@ class HarborAxi4MemorySlave extends Module {
     required Logic reset,
     required Axi4Interface axi,
     required HarborMemoryWaist waist,
+    HarborAxi4Exclusive? exclusive,
+    int? deviceAddressWidth,
     super.name = 'axi4_memory_slave',
   }) : super(
          definitionName:
              'HarborAxi4MemorySlave_a${waist.config.addressWidth}'
              '_d${waist.config.dataWidth}_i${waist.config.idWidth}'
-             '_n${waist.config.outstanding}',
+             '_n${waist.config.outstanding}'
+             '${exclusive == null ? '' : '_${exclusive.tag}'
+                       '_k${deviceAddressWidth ?? waist.config.addressWidth}'}',
        ) {
     final config = waist.config;
     _checkMatch(axi, config);
+    final ex = exclusive != null;
     final c = addInput('clk', clk);
     final r = addInput('reset', reset);
     final a = axi.clone()
@@ -74,7 +87,35 @@ class HarborAxi4MemorySlave extends Module {
     const lenW = Axi4Interface.lenWidth;
     const sizeW = Axi4Interface.sizeWidth;
     const burstW = Axi4Interface.burstWidth;
-    final reqWidths = [idW, addrW, lenW, sizeW, burstW, 1];
+    final devBits = deviceAddressWidth ?? addrW;
+    final preW = ex
+        ? HarborAxi4ExclusiveMonitor.preWidth(
+            config: exclusive,
+            addrWidth: addrW,
+            busSize: busSize,
+            deviceBits: devBits,
+          )
+        : 0;
+    Logic pre(Logic addr, Logic len, Logic size, Logic burst, bool write) =>
+        HarborAxi4ExclusiveMonitor.pre(
+          config: exclusive!,
+          addr: addr,
+          len: len,
+          size: size,
+          burst: burst,
+          busSize: busSize,
+          deviceBits: devBits,
+          write: write,
+        );
+    final reqWidths = [
+      idW,
+      addrW,
+      lenW,
+      sizeW,
+      burstW,
+      1,
+      if (ex) ...[1, preW],
+    ];
 
     // Request FIFOs and the arbiter. The illegal-burst check runs once per
     // AW or AR, at the push, and rides along as one extra bit. The REQ
@@ -94,6 +135,10 @@ class HarborAxi4MemorySlave extends Module {
         a.awSize,
         a.awBurst,
         _illegal(a.awAddr, a.awLen, a.awSize, a.awBurst, busSize),
+        if (ex) ...[
+          a.awLock,
+          pre(a.awAddr, a.awLen, a.awSize, a.awBurst, true),
+        ],
       ]),
       popReady: reqFire & pickWrite,
     );
@@ -110,6 +155,10 @@ class HarborAxi4MemorySlave extends Module {
         a.arSize,
         a.arBurst,
         _illegal(a.arAddr, a.arLen, a.arSize, a.arBurst, busSize),
+        if (ex) ...[
+          a.arLock,
+          pre(a.arAddr, a.arLen, a.arSize, a.arBurst, false),
+        ],
       ]),
       popReady: reqFire & ~pickWrite,
     );
@@ -120,13 +169,20 @@ class HarborAxi4MemorySlave extends Module {
     final held = Logic(name: 'held');
     final heldWrite = Logic(name: 'held_write');
     final lastWrite = Logic(name: 'last_write');
-    pickWrite <=
-        mux(held, heldWrite, awF.popValid & (~arF.popValid | ~lastWrite));
+    // With a monitor, an exclusive AW or AR head waits one cycle after its
+    // push for its slot lookup. Only a LOCK push marks its entry, so other
+    // heads do not wait.
+    final awHead = ex ? Logic(name: 'aw_head_valid') : awF.popValid;
+    final arHead = ex ? Logic(name: 'ar_head_valid') : arF.popValid;
+    pickWrite <= mux(held, heldWrite, awHead & (~arHead | ~lastWrite));
     final canIssue = inflight.lt(Const(n, width: inflight.width));
     final head = mux(pickWrite, awF.popData, arF.popData);
-    final [id, addr, len, size, burst, illegal] = harborUnpack(head, reqWidths);
+    final [id, addr, len, size, burst, illegal, ...] = harborUnpack(
+      head,
+      reqWidths,
+    );
 
-    m.reqValid <= canIssue & mux(pickWrite, awF.popValid, arF.popValid);
+    m.reqValid <= canIssue & mux(pickWrite, awHead, arHead);
     m.reqId <= id;
     m.reqWrite <= pickWrite;
     m.reqAddr <= addr;
@@ -139,6 +195,60 @@ class HarborAxi4MemorySlave extends Module {
           burst,
         );
     reqFire <= m.reqValid & m.reqReady;
+
+    HarborAxi4ExclusiveMonitor? mon;
+    if (exclusive != null) {
+      // The monitor reads each FIFO head on its own, so its slot lookup does
+      // not wait for the arbiter.
+      final [wId, wAddr, _, _, _, wIllegal, wLock, wPre] = harborUnpack(
+        awF.popData,
+        reqWidths,
+      );
+      final [rId, rAddr, _, _, _, rIllegal, rLock, rPre] = harborUnpack(
+        arF.popData,
+        reqWidths,
+      );
+      mon = HarborAxi4ExclusiveMonitor(
+        clk: c,
+        reset: r,
+        config: exclusive,
+        write: pickWrite,
+        wId: wId,
+        wAddr: wAddr,
+        wLock: wLock,
+        wIllegal: wIllegal,
+        wPre: wPre,
+        rId: rId,
+        rAddr: rAddr,
+        rLock: rLock,
+        rIllegal: rIllegal,
+        rPre: rPre,
+        wEntryIds: [for (final e in awF.entries) harborUnpack(e, reqWidths)[0]],
+        wEntryAddrs: [
+          for (final e in awF.entries) harborUnpack(e, reqWidths)[1],
+        ],
+        wPush: [
+          for (var e = 0; e < awF.entries.length; e++)
+            awF.pushFire & a.awLock & awF.writeIndex.eq(e),
+        ],
+        wRead: awF.readIndex,
+        rEntryAddrs: [
+          for (final e in arF.entries) harborUnpack(e, reqWidths)[1],
+        ],
+        rPush: [
+          for (var e = 0; e < arF.entries.length; e++)
+            arF.pushFire & a.arLock & arF.writeIndex.eq(e),
+        ],
+        rRead: arF.readIndex,
+        take: reqFire,
+        done: m.wrespValid & m.wrespReady,
+        busSize: busSize,
+        deviceBits: devBits,
+        depth: n,
+      );
+      awHead <= awF.popValid & ~mon.wStall;
+      arHead <= arF.popValid & ~mon.rStall;
+    }
 
     // Write data. A beat goes out only while a taken write still has beats
     // to send.
@@ -165,7 +275,7 @@ class HarborAxi4MemorySlave extends Module {
       reset: r,
       depth: n,
       pushValid: reqFire & pickWrite,
-      pushData: illegal,
+      pushData: mon == null ? illegal : illegal | mon.drop,
       popReady: wLastFire,
     );
     m.wdataValid <= wF.popValid & wPend.neq(0);
@@ -182,7 +292,7 @@ class HarborAxi4MemorySlave extends Module {
       reset: r,
       depth: n,
       pushValid: reqFire & pickWrite,
-      pushData: illegal,
+      pushData: mon == null ? illegal : harborPack([illegal, mon.wExOkay]),
       popReady: m.wrespValid & m.wrespReady,
       bypassWhenEmpty: true,
     );
@@ -192,15 +302,19 @@ class HarborAxi4MemorySlave extends Module {
       reset: r,
       depth: 2,
       pushValid: m.wrespValid,
-      pushData: harborPack([m.wrespId, m.wrespErr | bFlag.popData]),
+      pushData: harborPack([
+        m.wrespId,
+        m.wrespErr | (ex ? bFlag.popData[0] : bFlag.popData),
+        if (ex) bFlag.popData[1],
+      ]),
       popReady: a.bReady,
       resetEntries: true,
     );
     m.wrespReady <= bF.pushReady;
-    final [bId, bErr] = harborUnpack(bF.popData, [idW, 1]);
+    final [bId, bErr, ...bEx] = harborUnpack(bF.popData, [idW, 1, if (ex) 1]);
     a.bValid <= bF.popValid;
     a.bId <= bId;
-    a.bResp <= _resp(bErr);
+    a.bResp <= (ex ? _resp(bErr, bEx.single) : _resp(bErr));
 
     // Read data. bypassWhenEmpty covers a device that answers RDATA in the
     // same cycle as the read's REQ (a comb memory with no outstanding read
@@ -212,10 +326,11 @@ class HarborAxi4MemorySlave extends Module {
       reset: r,
       depth: n,
       pushValid: reqFire & ~pickWrite,
-      pushData: illegal,
+      pushData: mon == null ? illegal : harborPack([illegal, mon.rExOkay]),
       popReady: m.rdataValid & m.rdataReady & m.rdataLast,
       bypassWhenEmpty: true,
     );
+    final rIllegal = ex ? rFlag.popData[0] : rFlag.popData;
     final rF = HarborRegFifo(
       name: 'r',
       clk: c,
@@ -224,24 +339,26 @@ class HarborAxi4MemorySlave extends Module {
       pushValid: m.rdataValid,
       pushData: harborPack([
         m.rdataId,
-        mux(rFlag.popData, Const(0, width: dataW), m.rdataData),
-        m.rdataErr | rFlag.popData,
+        mux(rIllegal, Const(0, width: dataW), m.rdataData),
+        m.rdataErr | rIllegal,
         m.rdataLast,
+        if (ex) rFlag.popData[1],
       ]),
       popReady: a.rReady,
       resetEntries: true,
     );
     m.rdataReady <= rF.pushReady;
-    final [rId, rData, rErr, rLast] = harborUnpack(rF.popData, [
+    final [rId, rData, rErr, rLast, ...rEx] = harborUnpack(rF.popData, [
       idW,
       dataW,
       1,
       1,
+      if (ex) 1,
     ]);
     a.rValid <= rF.popValid;
     a.rId <= rId;
     a.rData <= rData;
-    a.rResp <= _resp(rErr);
+    a.rResp <= (ex ? _resp(rErr, rEx.single) : _resp(rErr));
     a.rLast <= rLast;
 
     final done = [
@@ -264,10 +381,17 @@ class HarborAxi4MemorySlave extends Module {
     ]);
   }
 
-  static Logic _resp(Logic err) => mux(
+  // SLVERR on [err], else EXOKAY on [exOkay], else OKAY.
+  static Logic _resp(Logic err, [Logic? exOkay]) => mux(
     err,
     Const(Axi4RespField.slvErr.value, width: Axi4Interface.respWidth),
-    Const(Axi4RespField.okay.value, width: Axi4Interface.respWidth),
+    exOkay == null
+        ? Const(Axi4RespField.okay.value, width: Axi4Interface.respWidth)
+        : mux(
+            exOkay,
+            Const(Axi4RespField.exOkay.value, width: Axi4Interface.respWidth),
+            Const(Axi4RespField.okay.value, width: Axi4Interface.respWidth),
+          ),
   );
 
   // High when the request breaks the AXI4 burst rules.

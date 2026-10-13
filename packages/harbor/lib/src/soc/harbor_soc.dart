@@ -4,6 +4,8 @@ import 'dart:math' show max;
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../bus/axi4/axi4_exclusive.dart';
+import '../bus/axi4/axi4_fabric.dart';
 import '../bus/axi4/axi4_interface.dart';
 import '../bus/axi4/axi4_lite_interface.dart';
 import '../bus/bus.dart';
@@ -250,6 +252,14 @@ class HarborSoC extends BridgeModule {
   /// path already takes a real external `reset` pin.
   final bool externalReset;
 
+  /// Reservation slots per monitored memory slave that masters added with
+  /// `exclusiveIds: HarborExclusive.auto` share (see
+  /// [HarborExclusive.slotCounts]).
+  final int exclusiveSlotBudget;
+
+  /// The reservation granule of the memory exclusive monitors, in bytes.
+  final int exclusiveGranuleBytes;
+
   /// Creates a new SoC.
   ///
   /// Accepts an optional list of [clocks] to generate PLL-derived
@@ -269,9 +279,26 @@ class HarborSoC extends BridgeModule {
     this.externalReset = false,
     this.cpus = const [],
     this.target,
+    this.exclusiveSlotBudget = HarborExclusive.defaultSlotBudget,
+    this.exclusiveGranuleBytes = HarborExclusive.defaultGranuleBytes,
     List<HarborClockConfig> clocks = const [],
     XilinxDdr3TreeSpec? xilinxDdr3Tree,
   }) : super(name, name: name) {
+    if (exclusiveSlotBudget < 1) {
+      throw ArgumentError.value(
+        exclusiveSlotBudget,
+        'exclusiveSlotBudget',
+        'must be at least 1',
+      );
+    }
+    final g = exclusiveGranuleBytes;
+    if (g < 1 || g & (g - 1) != 0 || g > 128) {
+      throw ArgumentError.value(
+        g,
+        'exclusiveGranuleBytes',
+        'must be a power of two of at most 128',
+      );
+    }
     createPort('clk', PortDirection.input);
     _boardClk = _buildBoardClock();
 
@@ -563,7 +590,9 @@ class HarborSoC extends BridgeModule {
   /// TileLink-UH master must set it. [outstanding] is the most requests in
   /// flight (see [HarborFabricMaster.outstanding]). [readChannel] picks the
   /// read channel at a slave with more than one (see
-  /// [HarborFabricMaster.readChannel]).
+  /// [HarborFabricMaster.readChannel]). [exclusiveIds] turns on AXI4
+  /// exclusive access for this master (see [HarborFabricMaster.exclusiveIds]
+  /// and [memoryBusShape]).
   ///
   /// Clock and reset are auto-wired.
   T addMaster<T extends BridgeModule>(
@@ -575,6 +604,7 @@ class HarborSoC extends BridgeModule {
     bool? memory,
     int? outstanding,
     int? readChannel,
+    int? exclusiveIds,
   }) {
     _masters.add(
       _MasterEntry(
@@ -585,6 +615,7 @@ class HarborSoC extends BridgeModule {
         memory: memory,
         outstanding: outstanding,
         readChannel: readChannel,
+        exclusiveIds: exclusiveIds,
       ),
     );
     _wireOnce(master, clockDomainName);
@@ -876,11 +907,30 @@ class HarborSoC extends BridgeModule {
       _ => const [],
     };
 
+    // The exclusive monitor IDs of a memory slave port.
+    HarborAxi4Exclusive? exclusiveOf(int i) => switch (slaves[i].module) {
+      HarborSram(:final exclusive) ||
+      HarborDdr3(:final exclusive) ||
+      HarborSdram(:final exclusive) when slaves[i].iface == 'bus' => exclusive,
+      _ => null,
+    };
+    for (var i = 0; i < slaves.length; i++) {
+      final g = exclusiveOf(i)?.granuleBytes;
+      if (g != null && g != exclusiveGranuleBytes) {
+        throw ArgumentError(
+          '${slaveName(i)}: the exclusive monitor granule is $g bytes, but '
+          'exclusiveGranuleBytes is $exclusiveGranuleBytes. Build the memory '
+          'with memoryBusShape().',
+        );
+      }
+    }
+
     HarborFabricSlave realSlave(int i) => HarborFabricSlave(
       name: slaveName(i),
       range: slaves[i].range,
       interface: slaveIntf(i),
       readInterfaces: readIntfs(i),
+      exclusive: exclusiveOf(i),
       outstanding: shapeOf(i).outstanding,
       timeout: timeoutOf(i),
       memory: shapeOf(i).memory,
@@ -901,6 +951,7 @@ class HarborSoC extends BridgeModule {
       return name;
     }
 
+    final slotsOf = _exclusiveSlotsOf();
     final masters = <String, List<HarborFabricMaster>>{};
     for (final m in _masters) {
       var port = m.module.interface(m.busInterfaceName);
@@ -917,6 +968,7 @@ class HarborSoC extends BridgeModule {
           memory: m.memory ?? intf is Axi4Interface,
           reach: reach[m.channel],
           readChannel: m.readChannel,
+          exclusiveIds: slotsOf[m],
         ),
       );
     }
@@ -1007,6 +1059,7 @@ class HarborSoC extends BridgeModule {
             interface: m.interface,
             outstanding: m.outstanding,
             memory: m.memory,
+            exclusiveIds: m.exclusiveIds,
           ),
       ], ss);
     }
@@ -1026,6 +1079,77 @@ class HarborSoC extends BridgeModule {
         [realSlave(i)],
       );
     }
+  }
+
+  // The masters in the order of the one fabric that [buildFabric] builds.
+  List<_MasterEntry> get _fabricOrder {
+    final channels = {for (final m in _masters) m.channel};
+    return [
+      for (final c in channels)
+        for (final m in _masters)
+          if (m.channel == c) m,
+    ];
+  }
+
+  // The resolved exclusive slot count of each master, in fabric order. It
+  // throws when exclusive masters cannot share one fabric.
+  Map<_MasterEntry, int> _exclusiveSlotsOf() {
+    final order = _fabricOrder;
+    if (!order.any((m) => (m.exclusiveIds ?? 0) != 0)) {
+      return {for (final m in order) m: 0};
+    }
+    final channels = {for (final m in order) m.channel};
+    if (channels.length > 1 && fabricTopology == null) {
+      throw StateError(
+        'exclusive access needs one fabric, so a SoC with more than one '
+        'channel needs a fabricTopology',
+      );
+    }
+    final counts = HarborExclusive.slotCounts(
+      [
+        for (final m in order)
+          switch (m.module.interface(m.busInterfaceName).interface) {
+            final Axi4Interface a => a.idWidth,
+            _ => 1,
+          },
+      ],
+      [for (final m in order) m.exclusiveIds],
+      budget: exclusiveSlotBudget,
+    );
+    return {for (final (i, m) in order.indexed) m: counts[i]};
+  }
+
+  /// The reservation slots of each exclusive master by module name, after
+  /// [HarborExclusive.auto] is resolved. Empty when no master is exclusive.
+  Map<String, int> get exclusiveSlots => {
+    for (final e in _exclusiveSlotsOf().entries)
+      if (e.value > 0) e.key.module.name: e.value,
+  };
+
+  /// The memory bus shape to build an AXI4 memory slave with (`idWidth` and
+  /// `exclusive` of [HarborSram], [HarborSdram] and [HarborDdr3]): the ID
+  /// width that carries full master IDs, and the exclusive monitor, or null
+  /// when no master is exclusive. Call it after every [addMaster].
+  ({int idWidth, HarborAxi4Exclusive? exclusive}) memoryBusShape() {
+    if (fabricKind != HarborFabricKind.axi4 || _masters.isEmpty) {
+      return (idWidth: 1, exclusive: null);
+    }
+    final slots = _exclusiveSlotsOf();
+    final ms = [
+      for (final (i, m) in _fabricOrder.indexed)
+        HarborFabricMaster(
+          name: 'm$i',
+          interface: m.module.interface(m.busInterfaceName).interface,
+          exclusiveIds: slots[m],
+        ),
+    ];
+    return (
+      idWidth: HarborAxi4Fabric.fullIdWidthOf(ms),
+      exclusive: HarborAxi4Fabric.exclusiveOf(
+        ms,
+        granuleBytes: exclusiveGranuleBytes,
+      ),
+    );
   }
 
   // A slave that holds memory, which a SoC-wide timeout leaves out.
@@ -1314,6 +1438,14 @@ class HarborSoC extends BridgeModule {
     File(
       '$path/$name.mermaid.md',
     ).writeAsStringSync('```mermaid\n${generateMermaid()}\n```\n');
+    final slots = exclusiveSlots;
+    if (slots.isNotEmpty) {
+      File('$path/$name.exclusive.txt').writeAsStringSync(
+        'AXI4 exclusive reservation slots per monitored memory slave '
+        '(budget $exclusiveSlotBudget, granule $exclusiveGranuleBytes '
+        'bytes):\n${[for (final e in slots.entries) '${e.key}: ${e.value}\n'].join()}',
+      );
+    }
 
     // Target-specific outputs
     final t = target;
@@ -1725,6 +1857,9 @@ class _MasterEntry {
   /// Read channel at a slave with more than one, or null for the default.
   final int? readChannel;
 
+  /// AXI4 exclusive slots, as in [HarborFabricMaster.exclusiveIds].
+  final int? exclusiveIds;
+
   const _MasterEntry({
     required this.module,
     required this.busInterfaceName,
@@ -1733,5 +1868,6 @@ class _MasterEntry {
     this.memory,
     this.outstanding,
     this.readChannel,
+    this.exclusiveIds,
   });
 }

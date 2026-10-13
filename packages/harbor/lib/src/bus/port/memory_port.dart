@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../axi4/axi4_exclusive.dart';
 import '../axi4/axi4_interface.dart';
 import '../axi4/axi4_memory_port.dart';
 import '../tilelink/tilelink_interface.dart';
@@ -84,6 +85,11 @@ class HarborMemorySlavePort {
   /// The waist stays a full [HarborMemoryWaist]; the adapter never raises a
   /// write request or write data, and keeps WRESP_READY high. Read-only
   /// ports exist only on AXI4: on Wishbone or TileLink this throws.
+  ///
+  /// [exclusive] adds an AXI4 exclusive access monitor (see
+  /// [HarborAxi4ExclusiveMonitor]) keyed on the low [deviceAddressWidth]
+  /// address bits, all of them when null. It needs a full AXI4 port, so with
+  /// another kind or [readOnly] this throws.
   static HarborMemorySlavePort create({
     required BridgeModule module,
     required String name,
@@ -96,9 +102,14 @@ class HarborMemorySlavePort {
     int? cdcDepth,
     HarborResetCopy? deviceResetCopy,
     bool readOnly = false,
+    HarborAxi4Exclusive? exclusive,
+    int? deviceAddressWidth,
   }) {
     if (readOnly && kind != HarborFabricKind.axi4) {
       throw ArgumentError('read-only memory ports exist only on AXI4');
+    }
+    if (exclusive != null && (readOnly || kind != HarborFabricKind.axi4)) {
+      throw ArgumentError('an exclusive monitor needs a full AXI4 port');
     }
     final waist = HarborMemoryWaist(config);
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
@@ -111,6 +122,8 @@ class HarborMemorySlavePort {
         reset: fabricClock.reset,
         wishboneBurstBeats: wishboneBurstBeats,
         readOnly: readOnly,
+        exclusive: exclusive,
+        deviceAddressWidth: deviceAddressWidth,
       );
       final cdc = HarborMemoryWaistCdc(
         fabricClk: fabricClock.clk,
@@ -164,6 +177,8 @@ class HarborMemorySlavePort {
           reset: reset,
           axi: ref.internalInterface!,
           waist: waist,
+          exclusive: exclusive,
+          deviceAddressWidth: deviceAddressWidth,
           name: '${name}_axi4',
         );
         return HarborMemorySlavePort._(waist, kind, ref, reset, 0);

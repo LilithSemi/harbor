@@ -38,6 +38,15 @@ class HarborRegFifo {
   /// Entries in the FIFO, `depth.bitLength` bits wide.
   final Logic count;
 
+  /// The entry registers, for logic that reads them in place.
+  final List<Logic> entries;
+
+  /// Index of the entry at the head.
+  final Logic readIndex;
+
+  /// Index of the entry the next push writes.
+  final Logic writeIndex;
+
   HarborRegFifo._(
     this.pushReady,
     this.popValid,
@@ -45,6 +54,9 @@ class HarborRegFifo {
     this.pushFire,
     this.popFire,
     this.count,
+    this.entries,
+    this.readIndex,
+    this.writeIndex,
   );
 
   /// Builds a FIFO of [depth] entries of [pushData]'s width. An entry goes
@@ -140,6 +152,9 @@ class HarborRegFifo {
       pushFire,
       popFire,
       count,
+      entries,
+      rd,
+      wr,
     );
   }
 }

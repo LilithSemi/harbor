@@ -319,7 +319,17 @@ class CoreCfg {
   final int idWidth;
   final int outstanding;
   final int? readChannel;
-  const CoreCfg(this.name, this.idWidth, this.outstanding, {this.readChannel});
+
+  /// AXI4 exclusive slots, as in [HarborFabricMaster.exclusiveIds]. With
+  /// any core exclusive, the DDR3 gets a monitor.
+  final int? exclusiveIds;
+  const CoreCfg(
+    this.name,
+    this.idWidth,
+    this.outstanding, {
+    this.readChannel,
+    this.exclusiveIds,
+  });
 }
 
 /// AXI4 masters, an AXI4 crossbar and a fast sim AX7203 [HarborDdr3] with
@@ -340,7 +350,8 @@ class Ddr3FabricBench extends BridgeModule {
     HarborFabricTopology topology = HarborFabricTopology.crossbar,
   }) : super(
          'Ddr3FabricBench_c${readChannels}_n${outstanding}_'
-         '${cores.length}${display ? 'd' : ''}',
+         '${cores.length}${display ? 'd' : ''}'
+         '${cores.any((c) => (c.exclusiveIds ?? 0) != 0) ? 'x' : ''}',
          name: 'top',
        ) {
     for (final p in ['clk', 'reset', 'ddr_clk', 'ddr_reset']) {
@@ -360,6 +371,7 @@ class Ddr3FabricBench extends BridgeModule {
           interface: intf,
           outstanding: c.outstanding,
           readChannel: c.readChannel,
+          exclusiveIds: c.exclusiveIds,
         ),
       );
     }
@@ -385,11 +397,8 @@ class Ddr3FabricBench extends BridgeModule {
         ),
       );
     }
-    final maxId = masters
-        .map((m) => (m.interface as Axi4Interface).idWidth)
-        .reduce(max);
-    final idW =
-        maxId + (masters.length > 1 ? (masters.length - 1).bitLength : 0);
+    final idW = HarborAxi4Fabric.fullIdWidthOf(masters);
+    final exclusive = HarborAxi4Fabric.exclusiveOf(masters);
     ddr = addSubModule(
       HarborDdr3(
         config: ax7203,
@@ -400,6 +409,7 @@ class Ddr3FabricBench extends BridgeModule {
         ckPeriodPs: ax7203CkPs,
         protocol: HarborFabricKind.axi4,
         idWidth: idW,
+        exclusive: exclusive,
         readChannels: readChannels,
         outstanding: outstanding,
         fastSim: true,
@@ -447,6 +457,7 @@ class Ddr3FabricBench extends BridgeModule {
               ddr.interface('bus_r$k').interface,
           ],
           outstanding: outstanding,
+          exclusive: exclusive,
         ),
       ],
     );
