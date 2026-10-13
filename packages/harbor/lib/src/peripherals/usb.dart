@@ -61,8 +61,8 @@ const _uFlushSt = 8;
 
 /// Memory-mapped USB full-speed device controller.
 ///
-/// Exposes [HarborUsbFsPe] to a CPU over a Wishbone slave for a Linux UDC
-/// driver. The protocol engine runs on `usb_clk`. The register file runs on
+/// Exposes [HarborUsbFsPe] to a CPU over a native slave port of the fabric
+/// kind for a Linux UDC driver. The protocol engine runs on `usb_clk`. The register file runs on
 /// `clk`. Crossings use [HarborCdcFifo] for bytes, [HarborCdcSync] for a
 /// held level, or a toggle plus edge detect for a one-shot event.
 ///

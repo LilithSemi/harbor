@@ -498,11 +498,11 @@ void main() {
       );
     });
 
-    test('a pipelined master needs a Wishbone fabric', () {
+    test('pipeline has no effect on an AXI4 fabric', () {
       final soc = _soc(HarborFabricKind.axi4);
       soc.addMaster(_Cpu(HarborFabricKind.axi4), pipeline: true);
       soc.addPeripheral(_gpio(HarborFabricKind.axi4, 0x10001000, 'gpio_a'));
-      expect(soc.buildFabric, throwsStateError);
+      expect(soc.buildFabric, returnsNormally);
     });
   });
 }

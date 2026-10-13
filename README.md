@@ -91,12 +91,13 @@ Future<void> main() async {
   final soc = HarborSoC(
     name: 'MySoC',
     compatible: 'myproject,mysoc-v1',
-    busConfig: WishboneConfig(addressWidth: 32, dataWidth: 32),
+    // Wishbone is the default. HarborFabricKind.axi4 and .tilelink also work.
+    fabricKind: HarborFabricKind.wishbone,
     cpus: [HarborDeviceTreeCpu(name: 'rv64', isa: 'rv64imafdc_zicsr_zifencei')],
     target: target,
   );
 
-  // CPU core (River or any BridgeModule with a Wishbone master interface)
+  // CPU core (River or any BridgeModule with a master port of the fabric kind)
   final core = RiverCore(isa: RiscVIsaConfig(
     mxlen: RiscVMxlen.rv64,
     extensions: rva23Extensions,

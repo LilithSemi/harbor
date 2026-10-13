@@ -550,7 +550,7 @@ class HarborSoC extends BridgeModule {
   int inputClockHzFor(String? clockDomainName) =>
       domainFor(clockDomainName)?.config.frequency ?? 0;
 
-  /// Maps a SECOND wishbone slave interface of an already-added peripheral into
+  /// Maps a second slave interface of an already-added peripheral into
   /// the fabric at [range]. Unlike [addPeripheral] it does NOT register the
   /// module again (its dtNode / clock / interrupts are already wired) - it only
   /// adds a decoder slot bound to [busInterfaceName]. For peripherals that
@@ -819,12 +819,6 @@ class HarborSoC extends BridgeModule {
         m.module.interface(m.busInterfaceName).interface,
         'master',
       );
-      if (m.pipeline && fabricKind != HarborFabricKind.wishbone) {
-        throw StateError(
-          'master ${m.module.name}: a pipelined leg is a Wishbone register '
-          'stage, so it needs a Wishbone fabric',
-        );
-      }
     }
     _checkClockDomains();
 
@@ -955,7 +949,9 @@ class HarborSoC extends BridgeModule {
     final masters = <String, List<HarborFabricMaster>>{};
     for (final m in _masters) {
       var port = m.module.interface(m.busInterfaceName);
-      if (m.pipeline) port = _registerStage(port);
+      if (m.pipeline && fabricKind == HarborFabricKind.wishbone) {
+        port = _registerStage(port);
+      }
       if (pipeline && fabricKind == HarborFabricKind.wishbone) {
         port = _registerStage(port);
       }
