@@ -240,7 +240,11 @@ void main() {
       );
 
       expect(accesses, equals(lines * hActive));
-      expect(afterFillBad, isEmpty, reason: 'frame 1 after fill: $afterFillBad');
+      expect(
+        afterFillBad,
+        isEmpty,
+        reason: 'frame 1 after fill: $afterFillBad',
+      );
       expect(laterBad, isEmpty, reason: 'frame 2 after fill: $laterBad');
       expect(underrunFrames, equals(0));
       expect(frames, greaterThanOrEqualTo(3));

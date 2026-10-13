@@ -125,3 +125,87 @@ class Axi4Interface extends PairInterface {
     idWidth: idWidth,
   );
 }
+
+/// The AR and R half of [Axi4Interface], for a read-only AXI4 port.
+///
+/// Provider role is the manager, same as [Axi4Interface]. Use it for a
+/// memory slave's extra read channels, where the fabric only ever sends AR
+/// and never AW or W.
+class Axi4ReadOnlyInterface extends PairInterface {
+  /// Address width in bits.
+  final int addressWidth;
+
+  /// Data width in bits.
+  final int dataWidth;
+
+  /// Width of ARID and RID.
+  final int idWidth;
+
+  Logic get arId => port('ARID');
+  Logic get arAddr => port('ARADDR');
+  Logic get arLen => port('ARLEN');
+  Logic get arSize => port('ARSIZE');
+  Logic get arBurst => port('ARBURST');
+  Logic get arLock => port('ARLOCK');
+  Logic get arCache => port('ARCACHE');
+  Logic get arProt => port('ARPROT');
+  Logic get arQos => port('ARQOS');
+  Logic get arValid => port('ARVALID');
+  Logic get arReady => port('ARREADY');
+
+  Logic get rId => port('RID');
+  Logic get rData => port('RDATA');
+  Logic get rResp => port('RRESP');
+  Logic get rLast => port('RLAST');
+  Logic get rValid => port('RVALID');
+  Logic get rReady => port('RREADY');
+
+  Axi4ReadOnlyInterface({
+    required this.addressWidth,
+    required this.dataWidth,
+    required this.idWidth,
+  }) : super(
+         portsFromProvider: [
+           Logic.port('ARID', idWidth),
+           Logic.port('ARADDR', addressWidth),
+           Logic.port('ARLEN', Axi4Interface.lenWidth),
+           Logic.port('ARSIZE', Axi4Interface.sizeWidth),
+           Logic.port('ARBURST', Axi4Interface.burstWidth),
+           Logic.port('ARLOCK'),
+           Logic.port('ARCACHE', Axi4Interface.cacheWidth),
+           Logic.port('ARPROT', Axi4Interface.protWidth),
+           Logic.port('ARQOS', Axi4Interface.qosWidth),
+           Logic.port('ARVALID'),
+           Logic.port('RREADY'),
+         ],
+         portsFromConsumer: [
+           Logic.port('ARREADY'),
+           Logic.port('RID', idWidth),
+           Logic.port('RDATA', dataWidth),
+           Logic.port('RRESP', Axi4Interface.respWidth),
+           Logic.port('RLAST'),
+           Logic.port('RVALID'),
+         ],
+       ) {
+    if (addressWidth < 1 || addressWidth > 64) {
+      throw ArgumentError.value(addressWidth, 'addressWidth', 'must be 1..64');
+    }
+    if (dataWidth < 8 || dataWidth > 1024 || dataWidth & (dataWidth - 1) != 0) {
+      throw ArgumentError.value(
+        dataWidth,
+        'dataWidth',
+        'must be a power of two from 8 to 1024',
+      );
+    }
+    if (idWidth < 1) {
+      throw ArgumentError.value(idWidth, 'idWidth', 'must be >= 1');
+    }
+  }
+
+  @override
+  Axi4ReadOnlyInterface clone() => Axi4ReadOnlyInterface(
+    addressWidth: addressWidth,
+    dataWidth: dataWidth,
+    idWidth: idWidth,
+  );
+}

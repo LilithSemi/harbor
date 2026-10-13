@@ -336,6 +336,7 @@ export 'src/peripherals/crypto.dart';
 export 'src/peripherals/ddr3_config.dart';
 export 'src/peripherals/ddr3_burst_adapter.dart';
 export 'src/peripherals/ddr3_gearbox.dart';
+export 'src/peripherals/ddr3_memory_port.dart';
 export 'src/peripherals/ddr3_phy_base.dart';
 export 'src/peripherals/ddr3_phy_ecp5.dart';
 export 'src/peripherals/harbor_ddr3.dart';

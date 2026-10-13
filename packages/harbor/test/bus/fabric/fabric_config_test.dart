@@ -19,6 +19,7 @@ HarborFabricSlave _slave(
   int timeout = 0,
   PairInterface? intf,
   bool? memory,
+  int readChannels = 1,
 }) => HarborFabricSlave(
   name: name,
   range: BusAddressRange(start, size),
@@ -26,6 +27,10 @@ HarborFabricSlave _slave(
   outstanding: outstanding,
   timeout: timeout,
   memory: memory ?? intf is! Axi4LiteInterface,
+  readInterfaces: [
+    for (var k = 1; k < readChannels; k++)
+      Axi4ReadOnlyInterface(addressWidth: 20, dataWidth: 32, idWidth: id),
+  ],
 );
 
 List<String> _check(
@@ -366,6 +371,8 @@ void main() {
         int size = 0x10000,
         bool mLite = false,
         bool sLite = false,
+        int readChannels = 1,
+        int? readChannel,
       }) => _build(
         topology: topology,
         masters: [
@@ -374,6 +381,7 @@ void main() {
             interface: mLite ? _lite() : _axi(id: mId),
             outstanding: mOut,
             memory: !mLite,
+            readChannel: readChannel,
           ),
         ],
         slaves: [
@@ -385,6 +393,7 @@ void main() {
             outstanding: sOut,
             timeout: timeout,
             intf: sLite ? _lite() : null,
+            readChannels: readChannels,
           ),
         ],
       ).definitionName;
@@ -401,9 +410,111 @@ void main() {
         name(size: 0x20000),
         name(mLite: true),
         name(sLite: true),
+        name(readChannels: 2),
+        name(readChannel: 0),
       ];
       expect({base, ...others}, hasLength(others.length + 1));
     });
+  });
+
+  test('TileLink and Wishbone reject readInterfaces', () {
+    for (final k in [HarborFabricKind.tilelink, HarborFabricKind.wishbone]) {
+      expect(
+        () => HarborFabric.build(
+          kind: k,
+          topology: HarborFabricTopology.shared,
+          clk: Logic(),
+          reset: Logic(),
+          masters: [
+            HarborFabricMaster(
+              name: 'm0',
+              interface: portIntf(k, const PortCfg('m0')),
+            ),
+          ],
+          slaves: [
+            HarborFabricSlave(
+              name: 's0',
+              range: const BusAddressRange(0, 0x1000),
+              interface: portIntf(k, const PortCfg('s0', size: 0x1000)),
+              readInterfaces: [
+                Axi4ReadOnlyInterface(
+                  addressWidth: 20,
+                  dataWidth: 32,
+                  idWidth: 2,
+                ),
+              ],
+            ),
+          ],
+        ),
+        throwsArgumentError,
+        reason: k.name,
+      );
+    }
+  });
+
+  test('a bad readChannel throws', () {
+    expect(
+      () => _build(
+        masters: [
+          HarborFabricMaster(name: 'm0', interface: _axi(), readChannel: -1),
+        ],
+        slaves: [_slave('s0', 0, 0x10000, readChannels: 2)],
+      ),
+      throwsArgumentError,
+      reason: 'negative',
+    );
+    expect(
+      () => _build(
+        masters: [
+          HarborFabricMaster(name: 'm0', interface: _axi(), readChannel: 2),
+        ],
+        slaves: [_slave('s0', 0, 0x10000, readChannels: 2)],
+      ),
+      throwsArgumentError,
+      reason: 'out of range',
+    );
+    expect(
+      () => _build(
+        masters: [
+          HarborFabricMaster(name: 'm0', interface: _axi(), readChannel: 1),
+        ],
+        slaves: [_slave('s0', 0, 0x10000, readChannels: 2)],
+      ),
+      returnsNormally,
+      reason: 'in range',
+    );
+    // A single-channel slave never checks readChannel.
+    expect(
+      () => _build(
+        masters: [
+          HarborFabricMaster(name: 'm0', interface: _axi(), readChannel: 5),
+        ],
+        slaves: [_slave('s0', 0, 0x10000)],
+      ),
+      returnsNormally,
+      reason: 'single channel slaves are not checked',
+    );
+  });
+
+  test('an override keeps the other masters off its channel', () {
+    HarborFabricMaster m(String n, [int? rc]) =>
+        HarborFabricMaster(name: n, interface: _axi(), readChannel: rc);
+    final two = _slave('s0', 0, 0x10000, readChannels: 2);
+    final three = _slave('s0', 0, 0x10000, readChannels: 3);
+    expect(
+      HarborFabric.readChannelsOf(two, [m('a'), m('b'), m('c'), m('d', 1)]),
+      [0, 0, 0, 1],
+    );
+    expect(HarborFabric.readChannelsOf(two, [m('a'), m('b')]), [0, 1]);
+    expect(
+      HarborFabric.readChannelsOf(three, [m('a'), m('d', 2), m('b'), m('c')]),
+      [0, 2, 1, 0],
+    );
+    // Every channel claimed: the rest spread over all of them.
+    expect(
+      HarborFabric.readChannelsOf(two, [m('x', 0), m('y', 1), m('a'), m('b')]),
+      [0, 1, 0, 1],
+    );
   });
 
   group('TileLink', () {
@@ -605,6 +716,30 @@ void main() {
         await shell.build();
         final sv = shell.generateSynth();
         must(sv, contains('module HarborAxi4Fabric'));
+      }),
+    );
+  }
+
+  for (final t in HarborFabricTopology.values) {
+    test(
+      '${t.name} fabric with a 2-channel slave emits SystemVerilog',
+      () => isolated(() async {
+        final shell = FabricShell(
+          t,
+          slaves: const [
+            SlaveCfg('s0', 5, 8, 0x00000, 0x10000, readChannels: 2),
+            SlaveCfg('s1', 1, 2, 0x10000, 0x10000),
+          ],
+          masters: const [
+            MasterCfg('m0', 2, 4),
+            MasterCfg('m1', 3, 8, readChannel: 1),
+          ],
+        );
+        await shell.build();
+        final sv = shell.generateSynth();
+        must(sv, contains('module HarborAxi4Fabric'));
+        must(sv, contains('s0_r1_ARVALID'));
+        must(sv, contains('s0_r1_RREADY'));
       }),
     );
   }

@@ -24,11 +24,16 @@ class MasterCfg {
 
   /// The port is AXI4-Lite and [idWidth] is not used.
   final bool lite;
+
+  /// This master's explicit read channel at every multi-channel slave it
+  /// reaches. Null spreads it round robin.
+  final int? readChannel;
   const MasterCfg(
     this.name,
     this.idWidth,
     this.outstanding, {
     this.lite = false,
+    this.readChannel,
   });
 }
 
@@ -42,6 +47,10 @@ class SlaveCfg {
 
   /// The port is AXI4-Lite and [idWidth] is not used.
   final bool lite;
+
+  /// Read channels on this slave: 1 is the full port alone, 2 or more adds
+  /// read-only ports.
+  final int readChannels;
   const SlaveCfg(
     this.name,
     this.idWidth,
@@ -50,6 +59,7 @@ class SlaveCfg {
     this.size, {
     this.timeout = 0,
     this.lite = false,
+    this.readChannels = 1,
   });
 }
 
@@ -117,6 +127,7 @@ class FabricShell extends BridgeModule {
           interface: intf,
           outstanding: m.outstanding,
           memory: !m.lite,
+          readChannel: m.readChannel,
         ),
       );
     }
@@ -124,6 +135,16 @@ class FabricShell extends BridgeModule {
     for (final s in slaves) {
       final intf = _intf(s.idWidth, s.lite);
       exposeInterface(this, intf, s.name, PairDirection.fromConsumer);
+      final readIntfs = <PairInterface>[];
+      for (var k = 1; k < s.readChannels; k++) {
+        final ri = Axi4ReadOnlyInterface(
+          addressWidth: addrW,
+          dataWidth: dataW,
+          idWidth: s.idWidth,
+        );
+        exposeInterface(this, ri, '${s.name}_r$k', PairDirection.fromConsumer);
+        readIntfs.add(ri);
+      }
       ss.add(
         HarborFabricSlave(
           name: s.name,
@@ -132,6 +153,7 @@ class FabricShell extends BridgeModule {
           outstanding: s.outstanding,
           timeout: s.timeout,
           memory: !s.lite,
+          readInterfaces: readIntfs,
         ),
       );
     }
@@ -155,6 +177,10 @@ class Bench {
   final List<SlaveCfg> slaveCfgs;
   final Map<String, AxiManager> managers = {};
   final Map<String, AxiMemory> memories = {};
+
+  /// Extra read-only ports of a slave with [SlaveCfg.readChannels] over 1,
+  /// by slave name, sharing the full port's memory.
+  final Map<String, List<AxiReadMemory>> readMemories = {};
   final List<String> errors = [];
   final Random rng;
 
@@ -210,6 +236,27 @@ class Bench {
         '${s.name}_WSTRB',
         if (!s.lite) '${s.name}_WLAST',
       ], b.errors);
+      final extras = <AxiReadMemory>[];
+      for (var k = 1; k < s.readChannels; k++) {
+        final p = '${s.name}_r$k';
+        extras.add(
+          AxiReadMemory(
+            sim,
+            p,
+            rng,
+            busBytes: busBytes,
+            outstanding: s.outstanding,
+            errors: b.errors,
+            mem: b.memories[s.name]!.mem,
+            errBase: 1 << 40,
+            stall: stall,
+          ),
+        );
+        StableCheck(sim, '${p}_ARVALID', '${p}_ARREADY', [
+          for (final f in fields) '${p}_AR$f',
+        ], b.errors);
+      }
+      b.readMemories[s.name] = extras;
     }
     for (final m in masters) {
       StableCheck(sim, '${m.name}_BVALID', '${m.name}_BREADY', [

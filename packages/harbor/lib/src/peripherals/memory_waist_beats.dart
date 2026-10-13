@@ -199,6 +199,7 @@ Logic harborPortErrorBeat(PairInterface intf) => switch (intf) {
   Axi4Interface() =>
     (intf.bValid & intf.bReady & intf.bResp[1]) |
         (intf.rValid & intf.rReady & intf.rResp[1]),
+  Axi4ReadOnlyInterface() => intf.rValid & intf.rReady & intf.rResp[1],
   Axi4LiteInterface() =>
     (intf.bValid & intf.bReady & intf.bResp[1]) |
         (intf.rValid & intf.rReady & intf.rResp[1]),

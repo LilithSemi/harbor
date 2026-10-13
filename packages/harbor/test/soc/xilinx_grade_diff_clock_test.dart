@@ -52,11 +52,8 @@ void main() {
   });
 
   group('differential board clock', () {
-    HarborSoC soc(HarborDeviceTarget target) => HarborSoC(
-      name: 'DiffClk',
-      compatible: 'test,diff-clk',
-      target: target,
-    );
+    HarborSoC soc(HarborDeviceTarget target) =>
+        HarborSoC(name: 'DiffClk', compatible: 'test,diff-clk', target: target);
 
     test('a Xilinx target adds clk_n and an IBUFDS', () async {
       final s = soc(

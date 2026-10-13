@@ -186,6 +186,14 @@ class _Tracker {
 /// Decode uses the start address of a burst only. A full AXI4 slave must
 /// accept any burst that starts in its region, so a full slave region under
 /// 4 KB must handle addresses past its end.
+///
+/// A slave with [HarborFabricSlave.readChannels] over 1 gets one target per
+/// channel: channel 0 is its full port, and each extra channel is a
+/// read-only port ([Axi4ReadOnlyInterface]) presented internally as a full
+/// [Axi4Interface] with its AW/W/B side tied off. Writes always go to
+/// channel 0. A master's reads go to the channel [HarborFabricMaster]
+/// names, or round robin by master order when it names none. Each channel
+/// has its own outstanding counter and timeout guard.
 class HarborAxi4Fabric extends HarborFabricModule {
   /// Topology of the fabric.
   final HarborFabricTopology topology;
@@ -235,6 +243,17 @@ class HarborAxi4Fabric extends HarborFabricModule {
       }
     }
     for (final s in slaves) {
+      for (var k = 0; k < s.readInterfaces.length; k++) {
+        final (a, d, _) = _shape(s.readInterfaces[k]);
+        if (a != addrW || d != dataW) {
+          throw ArgumentError(
+            '${s.name} read channel ${k + 1}: AXI4 widths (addr $a, data '
+            '$d) differ from addr $addrW, data $dataW',
+          );
+        }
+      }
+    }
+    for (final s in slaves) {
       if (s.interface is Axi4LiteInterface && s.outstanding != 1) {
         throw ArgumentError(
           '${s.name}: an AXI4-Lite slave has outstanding 1, got '
@@ -256,18 +275,49 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
     final nm = masters.length;
     final ns = slaves.length;
-    final nt = ns + 1;
+
+    // One target per (slave, read channel), plus the error target. Channel
+    // 0 of a slave is its full port; channel k >= 1 is a read-only port.
+    final chCount = [for (final s in slaves) s.readChannels];
+    final tSlave = <int>[];
+    final tChan = <int>[];
+    for (var s = 0; s < ns; s++) {
+      for (var k = 0; k < chCount[s]; k++) {
+        tSlave.add(s);
+        tChan.add(k);
+      }
+    }
+    final nst = tSlave.length;
+    final nt = nst + 1;
+
     final maxId = masters.map((m) => _shape(m.interface).$3 ?? 1).reduce(max);
     final pW = nm > 1 ? indexWidth(nm) : 0;
     fullIdWidth = maxId + pW;
     final tW = indexWidth(nt);
     final mW = indexWidth(nm);
 
+    // The read channel each master uses at each slave, by master index.
+    final chanOf = [
+      for (final s in slaves) HarborFabric.readChannelsOf(s, masters),
+    ];
+
     final ma = [for (final m in masters) _masterPort(m)];
-    final sa = [for (final s in slaves) _slavePort(c, r, s)];
-    final tName = [for (final s in slaves) s.name, 'err'];
+    final sa = <Axi4Interface>[];
+    for (final s in slaves) {
+      sa.add(_slavePort(c, r, s));
+      for (var k = 1; k < s.readChannels; k++) {
+        sa.add(_slaveReadPort(s, k));
+      }
+    }
+    final tName = [
+      for (var t = 0; t < nst; t++)
+        tChan[t] == 0
+            ? slaves[tSlave[t]].name
+            : '${slaves[tSlave[t]].name}_r${tChan[t]}',
+      'err',
+    ];
     final tIdW = [for (final a in sa) a.idWidth, fullIdWidth];
-    final tN = [for (final s in slaves) s.outstanding, errorOutstanding];
+    final tN = [for (final s in tSlave) slaves[s].outstanding, errorOutstanding];
     final tRemap = [for (var t = 0; t < nt; t++) tIdW[t] < fullIdWidth];
 
     const restFields = [
@@ -363,7 +413,16 @@ class HarborAxi4Fabric extends HarborFabricModule {
           for (final s in slaves)
             masters[m].reaches(s.name) ? inRange(addr, s.range) : Const(0),
         ];
-        final tgt = [...hits, ~anyOf(hits)];
+        // AW always targets channel 0. AR targets this master's assigned
+        // channel at the slave it hits.
+        final tgt = <Logic>[];
+        for (var s = 0; s < ns; s++) {
+          final chan = dir == 0 ? 0 : max(0, chanOf[s][m]);
+          for (var k = 0; k < chCount[s]; k++) {
+            tgt.add(k == chan ? hits[s] : Const(0));
+          }
+        }
+        tgt.add(~anyOf(hits));
         final tgtIdx = indexOf(tgt, tW);
         final full = pW > 0
             ? [Const(m, width: pW), hid.zeroExtend(maxId)].swizzle()
@@ -601,14 +660,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
     // Slave paths and the error slave.
     final dead = <Logic>[];
-    for (var t = 0; t < ns; t++) {
+    for (var t = 0; t < nst; t++) {
       final x = _slavePath(
         c,
         r,
         p: tName[t],
         s: sa[t],
         outstanding: tN[t],
-        timeout: slaves[t].timeout,
+        timeout: slaves[tSlave[t]].timeout,
         aw: tReq[t][0],
         awSid: tSid[t][0],
         ar: tReq[t][1],
@@ -620,23 +679,23 @@ class HarborAxi4Fabric extends HarborFabricModule {
         b: bResp[t],
         rd: rResp[t],
         addrW: addrW,
-        base: slaves[t].base,
+        base: slaves[tSlave[t]].base,
       );
       if (x != null) dead.add(x);
     }
     _errorSlave(
       c,
       r,
-      aw: tReq[ns][0],
-      awSid: tSid[ns][0],
-      ar: tReq[ns][1],
-      arSid: tSid[ns][1],
-      w: tBeat[ns],
-      awReady: inReady[ns][0],
-      arReady: inReady[ns][1],
-      wReady: wReady[ns],
-      b: bResp[ns],
-      rd: rResp[ns],
+      aw: tReq[nst][0],
+      awSid: tSid[nst][0],
+      ar: tReq[nst][1],
+      arSid: tSid[nst][1],
+      w: tBeat[nst],
+      awReady: inReady[nst][0],
+      arReady: inReady[nst][1],
+      wReady: wReady[nst],
+      b: bResp[nst],
+      rd: rResp[nst],
       addrW: addrW,
       dataW: dataW,
     );
@@ -1092,6 +1151,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
   static (int, int, int?) _shape(PairInterface p) => switch (p) {
     final Axi4Interface a => (a.addressWidth, a.dataWidth, a.idWidth),
     final Axi4LiteInterface l => (l.addressWidth, l.dataWidth, null),
+    final Axi4ReadOnlyInterface x => (x.addressWidth, x.dataWidth, x.idWidth),
     _ => throw ArgumentError(
       'an AXI4 fabric takes Axi4Interface or Axi4LiteInterface ports, got $p',
     ),
@@ -1156,6 +1216,50 @@ class HarborAxi4Fabric extends HarborFabricModule {
       idWidth: fullIdWidth,
     );
     _liteSlave(c, r, p: s.name, a: a, l: l);
+    return a;
+  }
+
+  // A read-only target for channel [k] (k >= 1) of slave [s]. Presented
+  // internally as a full Axi4Interface so the rest of the fabric treats it
+  // like any other target: AWREADY, WREADY, BVALID, BID and BRESP are tied
+  // to 0, and AR/R are wired straight to the slave's extra read-only port.
+  Axi4Interface _slaveReadPort(HarborFabricSlave s, int k) {
+    final ri = s.readInterfaces[k - 1] as Axi4ReadOnlyInterface;
+    final uniq = (String n) => '${s.name}_r${k}_$n';
+    final ro = ri.clone()
+      ..pairConnectIO(this, ri, PairRole.provider, uniquify: uniq);
+    final a = Axi4Interface(
+      addressWidth: ro.addressWidth,
+      dataWidth: ro.dataWidth,
+      idWidth: ro.idWidth,
+    );
+    a.awReady <= Const(0);
+    a.wReady <= Const(0);
+    a.bValid <= Const(0);
+    a.bId <= Const(0, width: a.idWidth);
+    a.bResp <= Const(0, width: Axi4Interface.respWidth);
+
+    for (final f in [
+      'ID',
+      'ADDR',
+      'LEN',
+      'SIZE',
+      'BURST',
+      'LOCK',
+      'CACHE',
+      'PROT',
+      'QOS',
+    ]) {
+      ro.port('AR$f') <= a.port('AR$f');
+    }
+    ro.arValid <= a.arValid;
+    a.arReady <= ro.arReady;
+    a.rValid <= ro.rValid;
+    a.rId <= ro.rId;
+    a.rData <= ro.rData;
+    a.rResp <= ro.rResp;
+    a.rLast <= ro.rLast;
+    ro.rReady <= a.rReady;
     return a;
   }
 
@@ -1265,12 +1369,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
       'd$dataW',
       for (final m in masters)
         'M${m.name}${id(m.interface)}'
-            'o${m.outstandingOn(HarborFabricKind.axi4)}${m.reachTag(slaves)}',
+            'o${m.outstandingOn(HarborFabricKind.axi4)}${m.reachTag(slaves)}'
+            '${m.readChannel != null ? 'rc${m.readChannel}' : ''}',
       for (final s in slaves)
         'S${s.name}${id(s.interface)}n${s.outstanding}'
             '${s.offset ? 'O' : ''}'
             't${s.timeout}r${s.range.start.toRadixString(16)}'
-            'x${s.range.size.toRadixString(16)}',
+            'x${s.range.size.toRadixString(16)}'
+            '${s.readChannels > 1 ? 'c${s.readChannels}' : ''}',
     ]);
   }
 }

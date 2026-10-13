@@ -43,7 +43,11 @@ void exposeWaist(
 String _cfgName(HarborMemoryWaistConfig c) =>
     'a${c.addressWidth}_d${c.dataWidth}_i${c.idWidth}_n${c.outstanding}';
 
-/// A memory slave port of [kind] with its waist on ports `mem_*`.
+/// A memory slave port of [kind] with its waist on ports `mem_*`. With
+/// [readOnly], the native port is read-only (AXI4 only; see
+/// [HarborMemorySlavePort.create]). With [fabricClock], the native port
+/// runs on the fabric clock `fclk`/`freset` and the waist crosses to the
+/// device clock `clk`/`reset`.
 class MemSlaveShell extends BridgeModule {
   late final HarborMemorySlavePort mem;
 
@@ -51,12 +55,19 @@ class MemSlaveShell extends BridgeModule {
     HarborMemoryWaistConfig config, {
     HarborFabricKind kind = HarborFabricKind.axi4,
     int burstBeats = 8,
+    bool readOnly = false,
+    bool fabricClock = false,
   }) : super(
-         'MemTestSlaveShell_${kind.name}_${_cfgName(config)}_b$burstBeats',
+         'MemTestSlaveShell_${kind.name}_${_cfgName(config)}_b$burstBeats'
+         '${readOnly ? '_ro' : ''}${fabricClock ? '_x' : ''}',
          name: 'shell',
        ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
+    if (fabricClock) {
+      createPort('fclk', PortDirection.input);
+      createPort('freset', PortDirection.input);
+    }
     mem = HarborMemorySlavePort.create(
       module: this,
       name: 'bus',
@@ -65,6 +76,10 @@ class MemSlaveShell extends BridgeModule {
       clk: input('clk'),
       reset: input('reset'),
       wishboneBurstBeats: burstBeats,
+      readOnly: readOnly,
+      fabricClock: fabricClock
+          ? HarborFabricClock(clk: input('fclk'), reset: input('freset'))
+          : null,
     );
     exposeWaist(this, mem.waist, 'mem', PairRole.provider);
   }
@@ -874,6 +889,10 @@ class AxiManager {
   /// The port is AXI4-Lite: ID reads as 0 and RLAST as 1.
   final bool lite;
 
+  /// The port has no AW, W or B channel: only AR and R exist. [write] must
+  /// not be called.
+  final bool readOnly;
+
   AxiManager(
     this.s,
     this.p,
@@ -883,21 +902,26 @@ class AxiManager {
     double arIdle = 0.3,
     double stall = 0.3,
     this.lite = false,
+    this.readOnly = false,
   }) {
-    aw = Source(s, '${p}_AWVALID', '${p}_AWREADY', rng, idle: awIdle)
-      ..onFire = (_) => awOrder.add(_aw.removeFirst());
-    w = Source(s, '${p}_WVALID', '${p}_WREADY', rng, idle: wIdle);
+    if (!readOnly) {
+      aw = Source(s, '${p}_AWVALID', '${p}_AWREADY', rng, idle: awIdle)
+        ..onFire = (_) => awOrder.add(_aw.removeFirst());
+      w = Source(s, '${p}_WVALID', '${p}_WREADY', rng, idle: wIdle);
+    }
     ar = Source(s, '${p}_ARVALID', '${p}_ARREADY', rng, idle: arIdle)
       ..onFire = (_) => arOrder.add(_ar.removeFirst());
-    b = Sink(
-      s,
-      '${p}_BVALID',
-      '${p}_BREADY',
-      [if (!lite) '${p}_BID', '${p}_BRESP'],
-      rng,
-      (f) => bResp.add((f['${p}_BID'] ?? 0, f['${p}_BRESP']!)),
-      stall: stall,
-    );
+    if (!readOnly) {
+      b = Sink(
+        s,
+        '${p}_BVALID',
+        '${p}_BREADY',
+        [if (!lite) '${p}_BID', '${p}_BRESP'],
+        rng,
+        (f) => bResp.add((f['${p}_BID'] ?? 0, f['${p}_BRESP']!)),
+        stall: stall,
+      );
+    }
     r = Sink(
       s,
       '${p}_RVALID',
@@ -1004,7 +1028,8 @@ class AxiMemory {
     this.errBase = 0xf000,
     double stall = 0.3,
     this.lite = false,
-  }) : mem = WordMemory(busBytes) {
+    WordMemory? sharedMemory,
+  }) : mem = sharedMemory ?? WordMemory(busBytes) {
     List<String> addr(String ch) => [
       for (final f in lite ? ['ADDR'] : ['ID', 'ADDR', 'LEN', 'SIZE', 'BURST'])
         '${p}_$ch$f',
@@ -1129,6 +1154,103 @@ class AxiMemory {
       });
       e.beat++;
       if (last) _pendR.removeAt(i);
+    }
+  }
+}
+
+/// A read-only AXI4 subordinate (AR and R only) on the ports `<p>_*` of a
+/// manager, reading [mem]. Answers reads strictly in acceptance order, so
+/// it can share [mem] with an [AxiMemory] on another port of the same
+/// device and still show each port making its own progress.
+class AxiReadMemory {
+  final Sim s;
+  final String p;
+  final Random rng;
+  final int busBytes;
+  final int outstanding;
+  final int errBase;
+  final List<String> errors;
+  final WordMemory mem;
+  late final Sink ar;
+  late final Source r;
+  final List<Burst> arOrder = [];
+  final List<_PendRead> _pendR = [];
+  int inflight = 0;
+  int maxInflight = 0;
+
+  /// Stops R responses from going out at all, so a test can pile up
+  /// requests to exactly [outstanding] before releasing any of them.
+  bool holdResponses = false;
+
+  AxiReadMemory(
+    this.s,
+    this.p,
+    this.rng, {
+    required this.busBytes,
+    required this.outstanding,
+    required this.errors,
+    required this.mem,
+    this.errBase = 0xf000,
+    double stall = 0.3,
+  }) {
+    ar = Sink(
+      s,
+      '${p}_ARVALID',
+      '${p}_ARREADY',
+      ['${p}_ARID', '${p}_ARADDR', '${p}_ARLEN', '${p}_ARSIZE', '${p}_ARBURST'],
+      rng,
+      (f) {
+        final x = Burst(
+          id: f['${p}_ARID']!,
+          write: false,
+          addr: f['${p}_ARADDR']!,
+          len: f['${p}_ARLEN']!,
+          size: f['${p}_ARSIZE']!,
+          burst: f['${p}_ARBURST']!,
+        );
+        arOrder.add(x);
+        inflight++;
+        maxInflight = max(maxInflight, inflight);
+        if (inflight > outstanding) {
+          errors.add('more than $outstanding requests in flight on $p');
+        }
+        final resp = _resp(x.addr);
+        final data = [
+          for (final a in beatAddrs(x.addr, x.len, x.size, x.burst))
+            resp == 0 ? mem.read(a) : 0,
+        ];
+        _pendR.add(_PendRead(x, data, resp));
+      },
+      stall: stall,
+    );
+    r = Source(s, '${p}_RVALID', '${p}_RREADY', rng, idle: stall)
+      ..onFire = (f) {
+        if ((f['${p}_RLAST'] ?? 1) == 1) inflight--;
+      };
+    s.onFall(_feed);
+  }
+
+  int _resp(int addr) => addr < errBase
+      ? 0
+      : addr < errBase + 0x800
+      ? 2
+      : 3;
+
+  // Strict FIFO: each port answers the oldest read it still owes, so it
+  // keeps acceptance order on its own.
+  void _feed() {
+    if (holdResponses) return;
+    if (r.queue.isEmpty && _pendR.isNotEmpty) {
+      final e = _pendR.first;
+      final last = e.beat == e.burst.len;
+      r.queue.add({
+        '${p}_RID': e.burst.id,
+        '${p}_RDATA': e.data[e.beat],
+        '${p}_RRESP': e.resp,
+        '${p}_RLAST': last ? 1 : 0,
+      });
+      e.beat++;
+      if (last) _pendR.removeAt(0);
     }
   }
 }

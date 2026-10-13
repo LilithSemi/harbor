@@ -255,11 +255,15 @@ class Ddr3PinDramModel {
         : (_mem[_key(ba, a)] ??
               [for (var k = 0; k < 8; k++) (_idle * (k + 3)) & 0xFFFF]);
     final end = r0 + 4 * period;
+    // A read right behind another one has no preamble, DQS keeps toggling.
+    final seamless = r0 - period < _readUntil;
     if (end > _readUntil) _readUntil = end;
-    Simulator.registerAction(r0 - period, () {
-      _dqsDrv.put(0);
-      _dqsEn.put(1);
-    });
+    if (!seamless) {
+      Simulator.registerAction(r0 - period, () {
+        _dqsDrv.put(0);
+        _dqsEn.put(1);
+      });
+    }
     for (var k = 0; k < 8; k++) {
       Simulator.registerAction(r0 + k * half, () {
         _dqDrv.put(data[k]);

@@ -561,7 +561,9 @@ class HarborSoC extends BridgeModule {
   /// [memory] marks a memory port (see [HarborFabricMaster.memory]). Null
   /// picks true for an `Axi4Interface` and false for every other port, so a
   /// TileLink-UH master must set it. [outstanding] is the most requests in
-  /// flight (see [HarborFabricMaster.outstanding]).
+  /// flight (see [HarborFabricMaster.outstanding]). [readChannel] picks the
+  /// read channel at a slave with more than one (see
+  /// [HarborFabricMaster.readChannel]).
   ///
   /// Clock and reset are auto-wired.
   T addMaster<T extends BridgeModule>(
@@ -572,6 +574,7 @@ class HarborSoC extends BridgeModule {
     String channel = 'primary',
     bool? memory,
     int? outstanding,
+    int? readChannel,
   }) {
     _masters.add(
       _MasterEntry(
@@ -581,6 +584,7 @@ class HarborSoC extends BridgeModule {
         channel: channel,
         memory: memory,
         outstanding: outstanding,
+        readChannel: readChannel,
       ),
     );
     _wireOnce(master, clockDomainName);
@@ -863,10 +867,20 @@ class HarborSoC extends BridgeModule {
         )
         .fold(8, max);
 
+    // The read-only ports of a slave with more than one read channel.
+    List<PairInterface> readIntfs(int i) => switch (slaves[i].module) {
+      final HarborDdr3 d when slaves[i].iface == 'bus' => [
+        for (var k = 1; k < d.readChannels; k++)
+          d.interface('bus_r$k').interface,
+      ],
+      _ => const [],
+    };
+
     HarborFabricSlave realSlave(int i) => HarborFabricSlave(
       name: slaveName(i),
       range: slaves[i].range,
       interface: slaveIntf(i),
+      readInterfaces: readIntfs(i),
       outstanding: shapeOf(i).outstanding,
       timeout: timeoutOf(i),
       memory: shapeOf(i).memory,
@@ -902,6 +916,7 @@ class HarborSoC extends BridgeModule {
           outstanding: m.outstanding,
           memory: m.memory ?? intf is Axi4Interface,
           reach: reach[m.channel],
+          readChannel: m.readChannel,
         ),
       );
     }
@@ -959,6 +974,12 @@ class HarborSoC extends BridgeModule {
         if (users(i).length == 1) {
           ss.add(realSlave(i));
           continue;
+        }
+        if (readIntfs(i).isNotEmpty) {
+          throw StateError(
+            '${slaveName(i)}: a slave with more than one read channel cannot '
+            'sit behind a converge fabric, use one fabric with a topology',
+          );
         }
         // A leg to the converge fabric. It passes the full address on, and
         // on Wishbone it has ERR so a cut off reaches the master as ERR.
@@ -1025,9 +1046,9 @@ class HarborSoC extends BridgeModule {
     PairInterface intf,
   ) => switch (m) {
     HarborSram() => (memory: true, outstanding: HarborSram.outstanding),
-    HarborDdr3() when iface == 'bus' => (
+    HarborDdr3(:final outstanding) when iface == 'bus' => (
       memory: true,
-      outstanding: HarborDdr3.outstanding,
+      outstanding: outstanding,
     ),
     HarborSdram(:final outstanding) when iface == 'bus' => (
       memory: true,
@@ -1701,6 +1722,9 @@ class _MasterEntry {
   /// Most requests in flight, or null for the fabric default.
   final int? outstanding;
 
+  /// Read channel at a slave with more than one, or null for the default.
+  final int? readChannel;
+
   const _MasterEntry({
     required this.module,
     required this.busInterfaceName,
@@ -1708,5 +1732,6 @@ class _MasterEntry {
     this.channel = 'primary',
     this.memory,
     this.outstanding,
+    this.readChannel,
   });
 }

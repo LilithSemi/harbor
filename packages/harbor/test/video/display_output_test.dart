@@ -89,36 +89,30 @@ void main() {
     },
   );
 
-  test(
-    'a parallelRgb build gets its own definitionName and rgb/pclk ports, '
-    'no gpdi',
-    () async {
-      Logic l([int w = 1]) => Logic(width: w);
-      final prgb = HarborFramebufferDisplay(
-        target: const HarborSimTarget(),
-        timing: const HarborDisplayTiming.vga640x480(),
-        pixelClk: l(),
-        pixelReset: l(),
-        shiftClk: l(),
-        shiftReset: l(),
-        enable: l(),
-        fbBase: l(32),
-        mDataIn: l(32),
-        mAck: l(),
-        outputType: HarborDisplayInterface.parallelRgb,
-      );
-      await prgb.build();
-      expect(
-        prgb.definitionName,
-        equals('HarborFramebufferDisplay_parallelRgb'),
-      );
-      final sv = prgb.generateSynth();
-      expect(sv, contains('rgb'));
-      expect(sv, contains('pclk'));
-      expect(sv, isNot(contains('gpdi')));
-      expect(sv, isNot(contains('DviTransmitter')));
-      expect(sv, isNot(contains('TmdsEncoder')));
-      expect(sv, isNot(contains('TmdsSerializer')));
-    },
-  );
+  test('a parallelRgb build gets its own definitionName and rgb/pclk ports, '
+      'no gpdi', () async {
+    Logic l([int w = 1]) => Logic(width: w);
+    final prgb = HarborFramebufferDisplay(
+      target: const HarborSimTarget(),
+      timing: const HarborDisplayTiming.vga640x480(),
+      pixelClk: l(),
+      pixelReset: l(),
+      shiftClk: l(),
+      shiftReset: l(),
+      enable: l(),
+      fbBase: l(32),
+      mDataIn: l(32),
+      mAck: l(),
+      outputType: HarborDisplayInterface.parallelRgb,
+    );
+    await prgb.build();
+    expect(prgb.definitionName, equals('HarborFramebufferDisplay_parallelRgb'));
+    final sv = prgb.generateSynth();
+    expect(sv, contains('rgb'));
+    expect(sv, contains('pclk'));
+    expect(sv, isNot(contains('gpdi')));
+    expect(sv, isNot(contains('DviTransmitter')));
+    expect(sv, isNot(contains('TmdsEncoder')));
+    expect(sv, isNot(contains('TmdsSerializer')));
+  });
 }

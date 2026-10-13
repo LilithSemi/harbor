@@ -46,6 +46,15 @@ class Ddr3Controller extends Module {
   /// [calFailed]. 1 to 8. Used only with [phySelfTrainsRead].
   final int maxCalAttempts;
 
+  /// Empty controller cycles between two read commands, on any bank. 0
+  /// lets reads go out back to back.
+  final int minReadGap;
+
+  /// Simulation only. The power-up waits are short, and calibration goes
+  /// straight to DONE_CALIBRATE with no read pipe delay. A PHY model at the
+  /// controller clock must then return read data at the default latency.
+  final bool skipCalibration;
+
   // --- runtime-trainable knob registers (built only when runtimeTrainable) ---
   List<Logic>? _rtOdelay; // per-lane 5-bit write odelay tap
   List<Logic>? _rtIdelay; // per-lane 5-bit read idelay tap
@@ -73,6 +82,28 @@ class Ddr3Controller extends Module {
   static const int wb2AddrBits = 7;
   static const int wb2DataBits = 32;
   static const int wb2SelBits = wb2DataBits ~/ 8;
+
+  /// Read answers may sit in the ack reorder queue this many controller
+  /// cycles before they drain.
+  static const int maxAckDelay = 16;
+
+  /// Controller cycles from an accepted command to its ack, worst case: the
+  /// command register, the read capture pipe, and the ack reorder queue.
+  /// A front end sizes its in-flight counter from this plus its own queue
+  /// depth, so back to back acceptance can never wrap it.
+  static int ackPipeDepth(DdrParams params) {
+    final timing = DdrTiming.fromPs(
+      ddr3ClkPeriodPs: params.ddr3ClkPeriodPs,
+      serdesRatio: params.serdesRatio,
+      controllerClkRatio: params.controllerClkRatio,
+      density: params.density,
+    );
+    final readDelay =
+        (DdrTiming.clNck - (params.serdesRatio - 1 - timing.readSlot + 1)) ~/
+        params.controllerClkRatio;
+    final readAckPipeWidth = readDelay + 1 + 2 + 1 + 1;
+    return 2 + readAckPipeWidth + maxAckDelay;
+  }
 
   int get lanes => params.lanes;
   int get dq => params.dqBits * lanes;
@@ -118,6 +149,8 @@ class Ddr3Controller extends Module {
     this.phySelfTrainsRead = false,
     this.phyReadPipeTicks = 0,
     this.maxCalAttempts = defaultMaxCalAttempts,
+    this.skipCalibration = false,
+    this.minReadGap = 0,
     super.name = 'ddr3_controller',
   }) : timing = DdrTiming.fromPs(
          ddr3ClkPeriodPs: params.ddr3ClkPeriodPs,
@@ -132,6 +165,7 @@ class Ddr3Controller extends Module {
            controllerClkRatio: params.controllerClkRatio,
            density: params.density,
          ),
+         micronSim: skipCalibration,
        ) {
     // --- clocks/reset ---
     controllerClk = addInput('i_controller_clk', controllerClk);
@@ -383,7 +417,6 @@ class Ddr3Controller extends Module {
     final wbDataBits = params.wbDataBits, wbSelBits = params.wbSelBits;
     final depth = _stage2DataDepth; // 2
     final readAckPipeWidth = _readDelay + 1 + 2 + 1 + 1; // 6
-    const maxAckDelay = 16;
     // A failed self-trained calibration also opens the bus, so a CPU access
     // does not stall forever and firmware can read the failure flag.
     final done = phySelfTrainsRead
@@ -630,7 +663,14 @@ class Ddr3Controller extends Module {
                           dPreQ[b].lte(dc(t.readToPrechargeDelay)),
                           then: [dPreD[b] < dc(t.readToPrechargeDelay)],
                         ),
-                        dRdD[b] < dc(t.readToReadDelay),
+                        dRdD[b] < dc(math.max(t.readToReadDelay, minReadGap)),
+                        // Any next read waits [minReadGap] cycles.
+                        for (var k = 0; k < nBanks; k++)
+                          if (k != b && minReadGap > 0)
+                            If(
+                              dRdQ[k].lte(dc(minReadGap)),
+                              then: [dRdD[k] < dc(minReadGap)],
+                            ),
                         for (var k = 0; k < nBanks; k++)
                           dWrD[k] < dc(t.writeToReadDelay + 1),
                         shiftRegD[readAckPipeWidth - 1] <
@@ -1640,24 +1680,29 @@ class Ddr3Controller extends Module {
             CaseItem(Const(_stIdle, width: 6), [
               If(
                 idelayctrlRdy & _instructionAddress.eq(13),
-                then: [
-                  // A self-training PHY needs no sampled-DQS calibration: go
-                  // to the write phase, which writes its test pattern.
-                  state <
-                      Const(
-                        selfTrain ? _stStartWriteLevel : _stBitslipTrain1,
-                        width: 6,
-                      ),
-                  laneReg < Const(0, width: laneW),
-                  for (var l = 0; l < lanes; l++) ...[
-                    oOdelayDataLd[l] < Const(1),
-                    oOdelayDqsLd[l] < Const(1),
-                    oIdelayDataLd[l] < Const(1),
-                    oIdelayDqsLd[l] < Const(1),
-                  ],
-                  pauseCounterReg < Const(1),
-                  oWlCalib < Const(0),
-                ],
+                then: skipCalibration
+                    ? [
+                        state < Const(_stDoneCalibrate, width: 6),
+                        pauseCounterReg < Const(0),
+                      ]
+                    : [
+                        // A self-training PHY needs no sampled-DQS calibration: go
+                        // to the write phase, which writes its test pattern.
+                        state <
+                            Const(
+                              selfTrain ? _stStartWriteLevel : _stBitslipTrain1,
+                              width: 6,
+                            ),
+                        laneReg < Const(0, width: laneW),
+                        for (var l = 0; l < lanes; l++) ...[
+                          oOdelayDataLd[l] < Const(1),
+                          oOdelayDqsLd[l] < Const(1),
+                          oIdelayDataLd[l] < Const(1),
+                          oIdelayDqsLd[l] < Const(1),
+                        ],
+                        pauseCounterReg < Const(1),
+                        oWlCalib < Const(0),
+                      ],
                 orElse: [
                   If(
                     _instructionAddress.eq(13),

@@ -44,12 +44,22 @@ class HarborFabricMaster {
   /// for a register port (AXI4-Lite, TileLink-UL, Wishbone classic).
   final bool memory;
 
+  /// The read channel this master uses at every slave with more than one
+  /// read channel (see [HarborFabricSlave.readChannels]). Null spreads
+  /// masters round robin over the channels that no override claims at that
+  /// slave, in master list order. So giving only the display channel 1 keeps
+  /// every other master on the rest. When the overrides claim every
+  /// channel, the others spread over all of them. Writes always use
+  /// channel 0.
+  final int? readChannel;
+
   const HarborFabricMaster({
     required this.name,
     required this.interface,
     this.outstanding,
     this.memory = true,
     this.reach,
+    this.readChannel,
   });
 
   /// The outstanding limit of this master on a fabric of [kind].
@@ -101,6 +111,12 @@ class HarborFabricSlave {
   /// the device does not depend on where it sits in the map.
   final bool offset;
 
+  /// Extra read-only native ports on this slave, one per extra read
+  /// channel. On AXI4 each entry is an [Axi4ReadOnlyInterface] with this
+  /// slave's widths. Only an AXI4 fabric supports this; TileLink and
+  /// Wishbone builders throw when this is not empty.
+  final List<PairInterface> readInterfaces;
+
   const HarborFabricSlave({
     required this.name,
     required this.range,
@@ -109,10 +125,17 @@ class HarborFabricSlave {
     this.timeout = 0,
     this.memory = true,
     this.offset = false,
+    this.readInterfaces = const [],
   });
 
   /// The value the fabric subtracts from each address to this slave.
   int get base => offset ? range.start : 0;
+
+  /// Most read channels at this slave: 1 plus [readInterfaces.length].
+  /// Channel 0 is the full port and counts reads and writes together, as
+  /// [outstanding] always has. Each extra channel is read-only and holds
+  /// up to [outstanding] reads in flight on its own.
+  int get readChannels => 1 + readInterfaces.length;
 }
 
 /// A fabric module built by [HarborFabric.build].
@@ -286,6 +309,25 @@ abstract final class HarborFabric {
           '${s.name}: outstanding must be >= 1 and timeout >= 0',
         );
       }
+      if (kind != HarborFabricKind.axi4 && s.readInterfaces.isNotEmpty) {
+        throw ArgumentError('${s.name}: readChannels > 1 needs an AXI4 fabric');
+      }
+    }
+    for (final m in masters) {
+      final rc = m.readChannel;
+      if (rc == null) continue;
+      if (rc < 0) {
+        throw ArgumentError('${m.name}: readChannel must be >= 0');
+      }
+      for (final s in slaves) {
+        if (s.readChannels <= 1 || !m.reaches(s.name)) continue;
+        if (rc >= s.readChannels) {
+          throw ArgumentError(
+            '${m.name}: readChannel $rc is out of range for ${s.name} '
+            'with ${s.readChannels} read channels',
+          );
+        }
+      }
     }
     final errors = validateAddressMap(
       kind: kind,
@@ -297,5 +339,44 @@ abstract final class HarborFabric {
     if (errors.isNotEmpty) {
       throw ArgumentError('bad address map:\n${errors.join('\n')}');
     }
+  }
+
+  /// The read channel at [slave] for each master in [masters], in list
+  /// order: -1 for a master that does not reach [slave], else the master's
+  /// explicit [HarborFabricMaster.readChannel], else the next channel in
+  /// round robin order over the channels no override claims (all channels
+  /// when the overrides claim every one). Always 0 when
+  /// [slave] has only one read channel, even for a master with an
+  /// explicit [HarborFabricMaster.readChannel] set for some other slave.
+  static List<int> readChannelsOf(
+    HarborFabricSlave slave,
+    List<HarborFabricMaster> masters,
+  ) {
+    final out = <int>[];
+    if (slave.readChannels <= 1) {
+      return [for (final m in masters) m.reaches(slave.name) ? 0 : -1];
+    }
+    // Masters with no override share the channels no override claims, or
+    // every channel when the overrides claim them all.
+    final claimed = {
+      for (final m in masters)
+        if (m.reaches(slave.name) && m.readChannel != null) m.readChannel!,
+    };
+    var free = [
+      for (var c = 0; c < slave.readChannels; c++)
+        if (!claimed.contains(c)) c,
+    ];
+    if (free.isEmpty) free = [for (var c = 0; c < slave.readChannels; c++) c];
+    var rank = 0;
+    for (final m in masters) {
+      if (!m.reaches(slave.name)) {
+        out.add(-1);
+      } else if (m.readChannel != null) {
+        out.add(m.readChannel!);
+      } else {
+        out.add(free[rank++ % free.length]);
+      }
+    }
+    return out;
   }
 }

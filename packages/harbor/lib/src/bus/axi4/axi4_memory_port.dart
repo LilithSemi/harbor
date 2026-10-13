@@ -298,6 +298,154 @@ class HarborAxi4MemorySlave extends Module {
   }
 }
 
+/// A read-only AXI4 subordinate in front of a memory slave waist.
+///
+/// Built like the read side of [HarborAxi4MemorySlave]: AR goes into a 2
+/// entry FIFO, R comes back through a 2 entry FIFO, and up to `outstanding`
+/// reads are in flight. The waist's write side is never used: REQ_WRITE is
+/// always 0, WDATA_VALID is always 0, and WRESP_READY stays high.
+class HarborAxi4MemorySlaveReadOnly extends Module {
+  HarborAxi4MemorySlaveReadOnly({
+    required Logic clk,
+    required Logic reset,
+    required Axi4ReadOnlyInterface axi,
+    required HarborMemoryWaist waist,
+    super.name = 'axi4_memory_slave_ro',
+  }) : super(
+         definitionName:
+             'HarborAxi4MemorySlave_ro_a${waist.config.addressWidth}'
+             '_d${waist.config.dataWidth}_i${waist.config.idWidth}'
+             '_n${waist.config.outstanding}',
+       ) {
+    final config = waist.config;
+    if (axi.addressWidth != config.addressWidth ||
+        axi.dataWidth != config.dataWidth ||
+        axi.idWidth != config.idWidth) {
+      throw ArgumentError(
+        'AXI4 widths (addr ${axi.addressWidth}, data ${axi.dataWidth}, '
+        'id ${axi.idWidth}) do not match $config',
+      );
+    }
+    final c = addInput('clk', clk);
+    final r = addInput('reset', reset);
+    final a = axi.clone()
+      ..pairConnectIO(this, axi, PairRole.consumer, uniquify: (n) => 'axi_$n');
+    final m = waist.clone()
+      ..pairConnectIO(this, waist, PairRole.provider, uniquify: (n) => 'm_$n');
+
+    final n = config.outstanding;
+    final idW = config.idWidth;
+    final addrW = config.addressWidth;
+    final dataW = config.dataWidth;
+    final strbW = config.strbWidth;
+    final busSize = _log2(strbW);
+    const lenW = Axi4Interface.lenWidth;
+    const sizeW = Axi4Interface.sizeWidth;
+    const burstW = Axi4Interface.burstWidth;
+    final reqWidths = [idW, addrW, lenW, sizeW, burstW, 1];
+
+    final reqFire = Logic(name: 'req_fire');
+    final arF = HarborRegFifo(
+      name: 'ar',
+      clk: c,
+      reset: r,
+      depth: 2,
+      pushValid: a.arValid,
+      pushData: harborPack([
+        a.arId,
+        a.arAddr,
+        a.arLen,
+        a.arSize,
+        a.arBurst,
+        HarborAxi4MemorySlave._illegal(
+          a.arAddr,
+          a.arLen,
+          a.arSize,
+          a.arBurst,
+          busSize,
+        ),
+      ]),
+      popReady: reqFire,
+    );
+    a.arReady <= arF.pushReady;
+
+    final inflight = _counter('inflight', n);
+    final canIssue = inflight.lt(Const(n, width: inflight.width));
+    final [id, addr, len, size, burst, illegal] = harborUnpack(
+      arF.popData,
+      reqWidths,
+    );
+
+    m.reqValid <= canIssue & arF.popValid;
+    m.reqId <= id;
+    m.reqWrite <= Const(0);
+    m.reqAddr <= addr;
+    m.reqLen <= len;
+    m.reqSize <= mux(illegal, Const(busSize, width: sizeW), size);
+    m.reqBurst <=
+        mux(
+          illegal,
+          Const(HarborMemoryBurst.fixed.value, width: burstW),
+          burst,
+        );
+    reqFire <= m.reqValid & m.reqReady;
+
+    // Never raise a write request or write data. Keep WRESP_READY high so a
+    // device that happens to echo something on this waist never stalls.
+    m.wdataValid <= Const(0);
+    m.wdataData <= Const(0, width: dataW);
+    m.wdataStrb <= Const(0, width: strbW);
+    m.wdataLast <= Const(0);
+    m.wrespReady <= Const(1);
+
+    final rFlag = HarborRegFifo(
+      name: 'r_flag',
+      clk: c,
+      reset: r,
+      depth: n,
+      pushValid: reqFire,
+      pushData: illegal,
+      popReady: m.rdataValid & m.rdataReady & m.rdataLast,
+      bypassWhenEmpty: true,
+    );
+    final rF = HarborRegFifo(
+      name: 'r',
+      clk: c,
+      reset: r,
+      depth: 2,
+      pushValid: m.rdataValid,
+      pushData: harborPack([
+        m.rdataId,
+        mux(rFlag.popData, Const(0, width: dataW), m.rdataData),
+        m.rdataErr | rFlag.popData,
+        m.rdataLast,
+      ]),
+      popReady: a.rReady,
+      resetEntries: true,
+    );
+    m.rdataReady <= rF.pushReady;
+    final [rId, rData, rErr, rLast] = harborUnpack(rF.popData, [
+      idW,
+      dataW,
+      1,
+      1,
+    ]);
+    a.rValid <= rF.popValid;
+    a.rId <= rId;
+    a.rData <= rData;
+    a.rResp <= HarborAxi4MemorySlave._resp(rErr);
+    a.rLast <= rLast;
+
+    final done = m.rdataValid & m.rdataReady & m.rdataLast;
+    Sequential(c, reset: r, [
+      inflight <
+          inflight +
+              reqFire.zeroExtend(inflight.width) -
+              done.zeroExtend(inflight.width),
+    ]);
+  }
+}
+
 /// An AXI4 manager behind a memory master waist.
 ///
 /// - The waist request goes into a 2 entry AW or AR FIFO. REQ_READY is low

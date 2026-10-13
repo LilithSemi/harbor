@@ -161,7 +161,6 @@ Future<void> ddr3RandomBursts(
   final bad = await check.run(count, extra: longBursts(Random(seed), 4));
   final busError = top.ddr.busError.value.toInt();
   await Simulator.endSimulation();
-  expect(bad, isEmpty);
-  expect(dram.errors, isEmpty);
+  expect([for (final e in dram.errors) 'dram: $e', ...bad], isEmpty);
   expect(busError, 0);
 }

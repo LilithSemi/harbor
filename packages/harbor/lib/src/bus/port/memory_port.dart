@@ -78,6 +78,12 @@ class HarborMemorySlavePort {
   /// [HarborMemoryWaistCdc] of [cdcDepth] entries (default
   /// [harborCdcDepth]) crosses the waist to the device, with
   /// [deviceResetCopy] as in [HarborMemoryWaistCdc].
+  ///
+  /// [readOnly] adds a read-only native port instead: an [Axi4ReadOnlyInterface]
+  /// on AXI4, with [HarborAxi4MemorySlaveReadOnly] in front of the waist.
+  /// The waist stays a full [HarborMemoryWaist]; the adapter never raises a
+  /// write request or write data, and keeps WRESP_READY high. Read-only
+  /// ports exist only on AXI4: on Wishbone or TileLink this throws.
   static HarborMemorySlavePort create({
     required BridgeModule module,
     required String name,
@@ -89,7 +95,11 @@ class HarborMemorySlavePort {
     HarborFabricClock? fabricClock,
     int? cdcDepth,
     HarborResetCopy? deviceResetCopy,
+    bool readOnly = false,
   }) {
+    if (readOnly && kind != HarborFabricKind.axi4) {
+      throw ArgumentError('read-only memory ports exist only on AXI4');
+    }
     final waist = HarborMemoryWaist(config);
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
       final inner = create(
@@ -100,6 +110,7 @@ class HarborMemorySlavePort {
         clk: fabricClock.clk,
         reset: fabricClock.reset,
         wishboneBurstBeats: wishboneBurstBeats,
+        readOnly: readOnly,
       );
       final cdc = HarborMemoryWaistCdc(
         fabricClk: fabricClock.clk,
@@ -124,6 +135,25 @@ class HarborMemorySlavePort {
     }
     switch (kind) {
       case HarborFabricKind.axi4:
+        if (readOnly) {
+          final ref = module.addInterface(
+            Axi4ReadOnlyInterface(
+              addressWidth: config.addressWidth,
+              dataWidth: config.dataWidth,
+              idWidth: config.idWidth,
+            ),
+            name: name,
+            role: PairRole.consumer,
+          );
+          HarborAxi4MemorySlaveReadOnly(
+            clk: clk,
+            reset: reset,
+            axi: ref.internalInterface!,
+            waist: waist,
+            name: '${name}_axi4',
+          );
+          return HarborMemorySlavePort._(waist, kind, ref, reset, 0);
+        }
         final ref = module.addInterface(
           _axi4(config),
           name: name,

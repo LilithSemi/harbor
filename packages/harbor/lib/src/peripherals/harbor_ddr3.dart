@@ -1,9 +1,11 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_error_source.dart';
 import '../bus/bus_slave_port.dart';
+import '../bus/fabric_util.dart';
 import '../bus/port/memory_port.dart';
 import '../bus/port/memory_waist.dart';
 import '../bus/port/port_cdc.dart';
@@ -15,6 +17,7 @@ import 'ddr3_config.dart' show HarborDdrConfig, HarborDdrType;
 import 'ddr3_burst_adapter.dart';
 import 'ddr3_controller.dart';
 import 'ddr3_gearbox.dart';
+import 'ddr3_memory_port.dart';
 import 'ddr3_params.dart';
 import 'ddr3_phy.dart';
 import 'ddr3_phy_base.dart';
@@ -27,15 +30,18 @@ import 'sim_dram.dart';
 /// bank management verified on the Arty S7).
 ///
 /// It presents one fixed external contract so genip wires it the same way on
-/// every target: a memory slave port `'bus'` of [protocol], the DDR3 clock
+/// every target: a memory slave port `'bus'` of [protocol], the read-only
+/// ports `bus_r1` and up when [readChannels] is more than 1, the DDR3 clock
 /// inputs (`clk`, `reset`, `ddr_clk`, `ddr_reset`, `ddr_ck_fast`,
 /// `ddr_ck90_fast`, `ddr_ck_dqs_fast`, `ddr_idelay_ref`), and the `sdram_*`
 /// pads. Internally:
 ///
-///   bus (clk, outstanding 1) -> port layer crossing to ddr_clk
-///     -> HarborMemoryBeats (one beat at a time)
-///     -> Ddr3BurstAdapter (32<->128, B4<->pipelined) -> Ddr3Controller (128b)
-///     -> Ddr3Phy -> sdram_* pads          (all on ddr_clk = CK/4)
+///   bus, bus_r1.. (clk, [outstanding] each) -> port layer crossing to ddr_clk
+///     -> Ddr3MemoryPort (one command per controller word, round robin)
+///     -> Ddr3Controller -> Ddr3Phy -> sdram_* pads (all on ddr_clk = CK/4)
+///
+/// A Wishbone port keeps one request in flight and the older front end:
+/// HarborMemoryBeats (one beat at a time) and Ddr3BurstAdapter.
 ///
 /// Writes are not posted. WRESP goes out when the controller accepts the
 /// last write command, so a later read from any port is ordered after it.
@@ -92,12 +98,33 @@ class HarborDdr3 extends BridgeModule
   /// The aligned block a Wishbone burst request on [bus] covers.
   final int wishboneBurstBeats;
 
-  /// Requests [bus] holds in flight.
-  static const int outstanding = 1;
+  /// Read channels on AXI4. Channel 0 is [bus]. Channel k is the read-only
+  /// port `bus_r<k>` in [readBuses]. Wishbone and TileLink have 1.
+  final int readChannels;
 
-  /// Merge sequential narrow writes into one BL8 burst in the burst adapter.
-  /// Set false to A/B the write path on hardware.
+  /// Requests each memory port holds in flight. The default is 1 on
+  /// Wishbone and 8 on AXI4 and TileLink. Wishbone takes only 1.
+  final int outstanding;
+
+  /// Merge sequential narrow writes into one BL8 burst in the Wishbone burst
+  /// adapter. Wishbone only.
   final bool writeCombine;
+
+  /// Empty controller cycles between two read commands on AXI4 and
+  /// TileLink. The default is 1 until seamless reads are proven on silicon.
+  /// Try 0 on Xilinx for full read bandwidth. The ECP5 PHY needs 1. Wishbone
+  /// ignores this (its default is 0, and any value is accepted) since its
+  /// adapter keeps one read in flight.
+  final int readGap;
+
+  /// Controller words in the read buffer of each read channel. The default
+  /// is 2 with one request in flight, else 4.
+  final int readWords;
+
+  /// Simulation only, on a Xilinx target. The controller skips calibration
+  /// and there is no PHY: the controller side of the PHY goes to the `phy_*`
+  /// ports, for a model on `ddr_clk`.
+  final bool fastSim;
 
   /// Under Verilator, present the DRAM as a host-side C++ mmap model instead of
   /// a Verilated behavioral RAM. The memory bus is routed to top-level ports and
@@ -118,6 +145,9 @@ class HarborDdr3 extends BridgeModule
   /// The memory slave port. On a hardware target it crosses from `clk` to
   /// `ddr_clk` in the port layer.
   late final HarborMemorySlavePort bus;
+
+  /// The read-only ports of read channels 1 and up.
+  late final List<HarborMemorySlavePort> readBuses;
 
   /// The knob-ABI register slave, present only when [runtimeTrainable]. It
   /// crosses to `ddr_clk` the same way.
@@ -144,13 +174,23 @@ class HarborDdr3 extends BridgeModule
     this.ckPeriodPs = 3333,
     this.controllerGearRatio = 1,
     this.runtimeTrainable = false,
-    this.writeCombine = false,
     this.simExternalMem = false,
     this.protocol = HarborFabricKind.wishbone,
     this.idWidth = 1,
     this.wishboneBurstBeats = 8,
+    this.readChannels = 1,
+    int? outstanding,
+    int? readWords,
+    this.fastSim = false,
+    this.writeCombine = false,
+    int? readGap,
     super.name = 'ddr3',
-  }) : super(
+  }) : outstanding = outstanding ?? defaultOutstanding(protocol),
+       readWords =
+           readWords ??
+           defaultReadWords(outstanding ?? defaultOutstanding(protocol)),
+       readGap = readGap ?? defaultReadGap(protocol),
+       super(
          _definitionName(
            config: config,
            target: target,
@@ -159,13 +199,95 @@ class HarborDdr3 extends BridgeModule
            ckPeriodPs: ckPeriodPs,
            controllerGearRatio: controllerGearRatio,
            runtimeTrainable: runtimeTrainable,
-           writeCombine: writeCombine,
            simExternalMem: simExternalMem,
            protocol: protocol,
            idWidth: idWidth,
            wishboneBurstBeats: wishboneBurstBeats,
+           readChannels: readChannels,
+           outstanding: outstanding ?? defaultOutstanding(protocol),
+           readWords:
+               readWords ??
+               defaultReadWords(outstanding ?? defaultOutstanding(protocol)),
+           fastSim: fastSim,
+           writeCombine: writeCombine,
+           readGap: readGap ?? defaultReadGap(protocol),
          ),
        ) {
+    final wishbone = protocol == HarborFabricKind.wishbone;
+    if (wishbone && this.outstanding != 1) {
+      throw ArgumentError.value(
+        this.outstanding,
+        'outstanding',
+        'a Wishbone port holds 1 request',
+      );
+    }
+    if (writeCombine && !wishbone) {
+      throw ArgumentError.value(
+        writeCombine,
+        'writeCombine',
+        'is for the Wishbone burst adapter only',
+      );
+    }
+    // Wishbone ignores readGap (the controller always runs its gap at 0
+    // there), so the ECP5 seamless-read guard is for AXI4 and TileLink only.
+    if (this.readGap < 0 ||
+        this.readGap > 7 ||
+        (!wishbone && isEcp5 && this.readGap < 1)) {
+      throw ArgumentError.value(
+        this.readGap,
+        'readGap',
+        'must be 0 to 7, and at least 1 on ECP5',
+      );
+    }
+    if (readChannels < 1 || readChannels > Ddr3MemoryPort.maxReadChannels) {
+      throw ArgumentError.value(
+        readChannels,
+        'readChannels',
+        'must be 1 to ${Ddr3MemoryPort.maxReadChannels}',
+      );
+    }
+    if (readChannels > 1 && protocol != HarborFabricKind.axi4) {
+      throw ArgumentError.value(
+        readChannels,
+        'readChannels',
+        'more than 1 read channel needs an AXI4 port',
+      );
+    }
+    if (this.outstanding < 1) {
+      throw ArgumentError.value(
+        this.outstanding,
+        'outstanding',
+        'must be >= 1',
+      );
+    }
+    final xilinx = switch (target) {
+      HarborFpgaTarget(
+        vendor: HarborFpgaVendor.ecp5 || HarborFpgaVendor.ice40,
+      ) ||
+      HarborSimTarget() ||
+      null => false,
+      _ => true,
+    };
+    if (fastSim && (!xilinx || controllerGearRatio != 1)) {
+      throw ArgumentError.value(
+        fastSim,
+        'fastSim',
+        'needs a Xilinx target and controllerGearRatio 1',
+      );
+    }
+    // fastSim builds no PHY, so a target wired to real sdram_* pads is a
+    // bitstream build, not a test. Board presets carry those pins only when
+    // asked to, so this cannot fire on the bare targets a sim build uses.
+    final fpgaTarget = target;
+    if (fastSim &&
+        fpgaTarget is HarborFpgaTarget &&
+        fpgaTarget.pinMap.keys.any((k) => k.startsWith('sdram_'))) {
+      throw ArgumentError.value(
+        fastSim,
+        'fastSim',
+        'the target wires sdram_* pads for a bitstream; fastSim has no PHY',
+      );
+    }
     final clk = addInput('clk', Logic());
     final reset = addInput('reset', Logic());
     final ddrClk = addInput('ddr_clk', Logic());
@@ -191,21 +313,35 @@ class HarborDdr3 extends BridgeModule
     final devClk = sim ? clk : ddrClk;
     final devReset = sim ? reset : ddrReset;
     final fabric = HarborFabricClock(clk: clk, reset: reset);
+    final waistConfig = HarborMemoryWaistConfig(
+      addressWidth: busAW,
+      dataWidth: busDW,
+      idWidth: idWidth,
+      outstanding: this.outstanding,
+    );
     bus = HarborMemorySlavePort.create(
       module: this,
       name: 'bus',
       kind: protocol,
-      config: HarborMemoryWaistConfig(
-        addressWidth: busAW,
-        dataWidth: busDW,
-        idWidth: idWidth,
-        outstanding: outstanding,
-      ),
+      config: waistConfig,
       clk: devClk,
       reset: devReset,
       wishboneBurstBeats: wishboneBurstBeats,
       fabricClock: fabric,
     );
+    readBuses = [
+      for (var k = 1; k < readChannels; k++)
+        HarborMemorySlavePort.create(
+          module: this,
+          name: 'bus_r$k',
+          kind: protocol,
+          config: waistConfig,
+          clk: devClk,
+          reset: devReset,
+          fabricClock: fabric,
+          readOnly: true,
+        ),
+    ];
 
     if (isEcp5 && controllerGearRatio != 1) {
       throw ArgumentError.value(
@@ -265,7 +401,8 @@ class HarborDdr3 extends BridgeModule
     // gives no error itself, so this is a crossing that poisoned an access
     // during a DDR clock reset, or a request the port layer refused.
     final errBeat = [
-      harborPortErrorBeat(bus.interfaceRef.internalInterface!),
+      for (final b in [bus, ...readBuses])
+        harborPortErrorBeat(b.interfaceRef.internalInterface!),
       if (trainBus != null)
         harborPortErrorBeat(trainBus!.interfaceRef.internalInterface!),
     ].reduce((a, b) => a | b);
@@ -291,6 +428,23 @@ class HarborDdr3 extends BridgeModule
       } else {
         _buildSim(clk, busDW);
       }
+      return;
+    }
+
+    if (fastSim) {
+      _build(
+        clk,
+        reset,
+        ddrClk,
+        serdesClk,
+        ddrReset,
+        ddrCk,
+        ddrCk90,
+        idelayRef,
+        p,
+        busDW,
+        busAW,
+      );
       return;
     }
 
@@ -329,6 +483,19 @@ class HarborDdr3 extends BridgeModule
     );
   }
 
+  /// The default [readWords]: 2 with one request in flight, else 4.
+  static int defaultReadWords(int outstanding) => outstanding == 1 ? 2 : 4;
+
+  /// The default [outstanding] for a port of [protocol].
+  static int defaultOutstanding(HarborFabricKind protocol) =>
+      protocol == HarborFabricKind.wishbone ? 1 : 8;
+
+  /// The default [readGap] for a port of [protocol]. Wishbone ignores
+  /// [readGap] (it always runs the controller gap at 0), so its default is
+  /// 0 and not the AXI4/TileLink seamless-read guard value of 1.
+  static int defaultReadGap(HarborFabricKind protocol) =>
+      protocol == HarborFabricKind.wishbone ? 0 : 1;
+
   static String _definitionName({
     required HarborDdrConfig config,
     required HarborDeviceTarget? target,
@@ -337,11 +504,16 @@ class HarborDdr3 extends BridgeModule
     required int ckPeriodPs,
     required int controllerGearRatio,
     required bool runtimeTrainable,
-    required bool writeCombine,
     required bool simExternalMem,
     required HarborFabricKind protocol,
     required int idWidth,
     required int wishboneBurstBeats,
+    required int readChannels,
+    required int outstanding,
+    required int readWords,
+    required bool fastSim,
+    required bool writeCombine,
+    required int readGap,
   }) {
     final sim = target is HarborSimTarget;
     final ecp5 = switch (target) {
@@ -354,17 +526,104 @@ class HarborDdr3 extends BridgeModule
       HarborFpgaTarget(:final vendor) => vendor.name,
       _ => target.name.replaceAll(RegExp('[^A-Za-z0-9]'), '_'),
     };
-    final dm = ecp5 && config.dmRemapping != null
-        ? '_dm${config.dmRemapping!.join()}'
-        : '';
     final burst = protocol == HarborFabricKind.wishbone
         ? '_b$wishboneBurstBeats'
         : '';
     final cdc = sim ? 0 : harborCdcDepth(outstanding);
-    return 'HarborDdr3_${phy}_s${config.size}_a${busAddressWidth}'
-        '_d${busDataWidth}_ck${ckPeriodPs}_g$controllerGearRatio'
-        '${runtimeTrainable ? '_rt' : ''}${writeCombine ? '_wc' : ''}$dm'
-        '_${protocol.name}_i${idWidth}_n${outstanding}_q$cdc$burst';
+    if (protocol == HarborFabricKind.wishbone) {
+      final dm = ecp5 && config.dmRemapping != null
+          ? '_dm${config.dmRemapping!.join()}'
+          : '';
+      return 'HarborDdr3_${phy}_s${config.size}_a${busAddressWidth}'
+          '_d${busDataWidth}_ck${ckPeriodPs}_g$controllerGearRatio'
+          '${runtimeTrainable ? '_rt' : ''}${writeCombine ? '_wc' : ''}$dm'
+          '_${protocol.name}_i${idWidth}_n${outstanding}_q$cdc$burst'
+          '${fastSim ? '_fast' : ''}';
+    }
+    final c = config;
+    return harborStableDefinitionName(
+      'HarborDdr3_${phy}_${protocol.name}_i${idWidth}_n${outstanding}'
+      '_c${readChannels}_q$cdc$burst',
+      [
+        's${c.size}',
+        'a$busAddressWidth',
+        'd$busDataWidth',
+        'ck$ckPeriodPs',
+        'g$controllerGearRatio',
+        if (runtimeTrainable) 'rt',
+        '${c.type.name}w${c.dataWidth}f${c.frequency}k${c.ranks}'
+            'b${c.banks}r${c.rowWidth}c${c.colWidth}l${c.casLatency}'
+            '${c.density.name}',
+        if (ecp5 && c.dmRemapping != null) 'dm${c.dmRemapping!.join()}',
+        'rw$readWords',
+        'rg$readGap',
+        if (fastSim) 'fast',
+      ],
+    );
+  }
+
+  /// The device side reset of every memory port together.
+  Logic get _clear => [
+    for (final b in [bus, ...readBuses]) b.reset,
+  ].reduce((a, b) => a | b);
+
+  /// One waist for the one-beat sim memory. With more read channels it
+  /// takes one request at a time from the ports, round robin, and sends the
+  /// answer back to the port it came from.
+  HarborMemoryWaist _simWaist(Logic clk) {
+    if (readBuses.isEmpty) return bus.waist;
+    final ws = [bus.waist, for (final b in readBuses) b.waist];
+    final m = HarborMemoryWaist(bus.waist.config);
+    final n = ws.length;
+    final busy = Logic(name: 'sim_merge_busy');
+    final own = [for (var c = 0; c < n; c++) Logic(name: 'sim_merge_own$c')];
+    final g = roundRobin('sim_merge', clk, _clear, [
+      for (final w in ws) w.reqValid & ~busy & m.reqReady,
+    ]);
+    m.reqValid <= ~busy & anyOf([for (final w in ws) w.reqValid]);
+    m.reqId <= pick(g, [for (final w in ws) w.reqId]);
+    m.reqWrite <= pick(g, [for (final w in ws) w.reqWrite]);
+    m.reqAddr <= pick(g, [for (final w in ws) w.reqAddr]);
+    m.reqLen <= pick(g, [for (final w in ws) w.reqLen]);
+    m.reqSize <= pick(g, [for (final w in ws) w.reqSize]);
+    m.reqBurst <= pick(g, [for (final w in ws) w.reqBurst]);
+    m.wdataValid <= ws[0].wdataValid & own[0];
+    m.wdataData <= ws[0].wdataData;
+    m.wdataStrb <= ws[0].wdataStrb;
+    m.wdataLast <= ws[0].wdataLast;
+    m.rdataReady <= pick(own, [for (final w in ws) w.rdataReady]);
+    m.wrespReady <= ws[0].wrespReady & own[0];
+    for (var c = 0; c < n; c++) {
+      final w = ws[c];
+      w.reqReady <= g[c];
+      w.rdataValid <= m.rdataValid & own[c];
+      w.rdataId <= m.rdataId;
+      w.rdataData <= m.rdataData;
+      w.rdataErr <= m.rdataErr;
+      w.rdataLast <= m.rdataLast;
+      if (c == 0) {
+        w.wdataReady <= m.wdataReady & own[0];
+        w.wrespValid <= m.wrespValid & own[0];
+        w.wrespId <= m.wrespId;
+        w.wrespErr <= m.wrespErr;
+      } else {
+        w.wdataReady <= Const(0);
+        w.wrespValid <= Const(0);
+        w.wrespId <= Const(0, width: w.config.idWidth);
+        w.wrespErr <= Const(0);
+      }
+    }
+    final done =
+        (m.rdataValid & m.rdataReady & m.rdataLast) |
+        (m.wrespValid & m.wrespReady);
+    final take = m.reqValid & m.reqReady;
+    Sequential(clk, reset: _clear, [
+      If.block([
+        Iff(take, [busy < 1, for (var c = 0; c < n; c++) own[c] < g[c]]),
+        ElseIf(done, [busy < 0]),
+      ]),
+    ]);
+    return m;
   }
 
   /// Verilator build: a behavioral memory on the same bus port, at the same
@@ -378,8 +637,8 @@ class HarborDdr3 extends BridgeModule
     final datOut = Logic(name: 'mem_dat_r', width: busDW);
     final beats = HarborMemoryBeats(
       clk: clk,
-      reset: bus.reset,
-      waist: bus.waist,
+      reset: _clear,
+      waist: _simWaist(clk),
       ack: ack,
       dataOut: datOut,
     );
@@ -391,7 +650,7 @@ class HarborDdr3 extends BridgeModule
     );
     addSubModule(dram);
     dram.input('clk').srcConnection! <= clk;
-    dram.input('reset').srcConnection! <= bus.reset;
+    dram.input('reset').srcConnection! <= _clear;
     dram.input('stb').srcConnection! <= beats.stb;
     dram.input('we').srcConnection! <= beats.we;
     dram.input('adr').srcConnection! <= beats.addr;
@@ -418,8 +677,8 @@ class HarborDdr3 extends BridgeModule
     final datOut = Logic(name: 'mem_dat_r_in', width: busDW);
     final beats = HarborMemoryBeats(
       clk: input('clk'),
-      reset: bus.reset,
-      waist: bus.waist,
+      reset: _clear,
+      waist: _simWaist(input('clk')),
       ack: ack,
       dataOut: datOut,
     );
@@ -590,7 +849,7 @@ struct DramStore {
         then: [porCnt < Const(0, width: 12), rstN < Const(0)],
         orElse: [
           If(
-            porCnt.lt(4095),
+            porCnt.lt(fastSim ? 15 : 4095),
             then: [porCnt < porCnt + 1, rstN < Const(0)],
             orElse: [rstN < Const(1)],
           ),
@@ -598,19 +857,26 @@ struct DramStore {
       ),
     ]);
 
-    // --- one beat at a time from the memory port, on ddr clk ---
-    final beatAck = Logic(name: 'beat_ack');
-    final beatData = Logic(name: 'beat_data', width: busDW);
-    final beats = HarborMemoryBeats(
-      clk: ddrClk,
-      reset: bus.reset,
-      waist: bus.waist,
-      ack: beatAck,
-      dataOut: beatData,
-    );
+    final wishbone = protocol == HarborFabricKind.wishbone;
+    // --- Wishbone: one beat at a time from the memory port, on ddr clk ---
+    Logic? beatAck;
+    Logic? beatData;
+    HarborMemoryBeats? beats;
+    if (wishbone) {
+      beatAck = Logic(name: 'beat_ack');
+      beatData = Logic(name: 'beat_data', width: busDW);
+      beats = HarborMemoryBeats(
+        clk: ddrClk,
+        reset: bus.reset,
+        waist: bus.waist,
+        ack: beatAck,
+        dataOut: beatData,
+      );
+    }
 
-    // --- burst adapter (32<->128) + controller <-> phy, all on ddr clk ---
-    // Placeholder nets break the controller<->adapter<->phy construction cycles.
+    // --- front end + controller <-> phy, all on ddr clk ---
+    // Placeholder nets break the controller<->front end<->phy construction
+    // cycles.
     final ctrlStall = Logic(name: 'ctrl_stall');
     final ctrlAck = Logic(name: 'ctrl_ack');
     final ctrlAckAux = Logic(
@@ -626,32 +892,53 @@ struct DramStore {
     final phyBsRef = Logic(name: 'phy_iserdes_bsref', width: p.lanes * 8);
     final phyRdy = Logic(name: 'phy_idelayctrl_rdy');
 
-    final adapter = Ddr3BurstAdapter(
-      busAddrWidth: busAW,
-      ddrAddrWidth: p.wbAddrBits,
-      busDataWidth: busDW,
-      ddrDataWidth: p.wbDataBits,
-      auxWidth: Ddr3Controller.auxWidth,
-      writeCombine: writeCombine,
-      clk: ddrClk,
-      // The crossing device side and the adapter reset together, so a stale
-      // response cannot complete the first request after a reset.
-      reset: bus.reset,
-      ctrlReset: ddrReset,
-      sCyc: beats.stb,
-      sStb: Const(1),
-      sWe: beats.we,
-      sAddr: beats.addr,
-      sData: beats.dataIn,
-      sSel: beats.sel,
-      sLast: beats.last,
-      mStall: ctrlStall,
-      mAck: ctrlAck,
-      mAckAux: ctrlAckAux,
-      mData: ctrlData,
-    );
-    beatAck <= adapter.output('s_ack');
-    beatData <= adapter.output('s_data_out');
+    final Module front;
+    if (wishbone) {
+      front = Ddr3BurstAdapter(
+        busAddrWidth: busAW,
+        ddrAddrWidth: p.wbAddrBits,
+        busDataWidth: busDW,
+        ddrDataWidth: p.wbDataBits,
+        auxWidth: Ddr3Controller.auxWidth,
+        writeCombine: writeCombine,
+        clk: ddrClk,
+        // The crossing device side and the adapter reset together, so a stale
+        // response cannot complete the first request after a reset.
+        reset: bus.reset,
+        ctrlReset: ddrReset,
+        sCyc: beats!.stb,
+        sStb: Const(1),
+        sWe: beats.we,
+        sAddr: beats.addr,
+        sData: beats.dataIn,
+        sSel: beats.sel,
+        sLast: beats.last,
+        mStall: ctrlStall,
+        mAck: ctrlAck,
+        mAckAux: ctrlAckAux,
+        mData: ctrlData,
+      );
+      beatAck! <= front.output('s_ack');
+      beatData! <= front.output('s_data_out');
+    } else {
+      front = Ddr3MemoryPort(
+        clk: ddrClk,
+        reset: ddrReset,
+        // The crossings and the front end reset together, so a stale answer
+        // cannot complete a request after a reset.
+        clear: _clear,
+        waists: [bus.waist, for (final b in readBuses) b.waist],
+        ctrlAddrWidth: p.wbAddrBits,
+        ctrlDataWidth: p.wbDataBits,
+        ctrlStall: ctrlStall,
+        ctrlAck: ctrlAck,
+        ctrlAckAux: ctrlAckAux,
+        ctrlData: ctrlData,
+        ctrlAckPipeDepth: Ddr3Controller.ackPipeDepth(p),
+        readWords: readWords,
+      );
+    }
+    String m(String adapter, String port) => wishbone ? adapter : port;
 
     // --- wb2 knob-ABI window: train port (crossed to ddr clk) -> wb2 ---
     Logic wb2Cyc = Const(0);
@@ -699,13 +986,13 @@ struct DramStore {
       // ECP5: the controller starts once the PHY can drive the pins (DLL lock
       // and init done), so a late lock cannot use up a calibration try.
       rstN: isEcp5 ? rstN & phyRdy : rstN,
-      wbCyc: adapter.output('m_cyc'),
-      wbStb: adapter.output('m_stb'),
-      wbWe: adapter.output('m_we'),
-      wbAddr: adapter.output('m_addr'),
-      wbData: adapter.output('m_data_out'),
-      wbSel: adapter.output('m_sel'),
-      aux: adapter.output('m_aux'),
+      wbCyc: front.output('m_cyc'),
+      wbStb: front.output('m_stb'),
+      wbWe: front.output('m_we'),
+      wbAddr: front.output('m_addr'),
+      wbData: front.output(m('m_data_out', 'm_data')),
+      wbSel: front.output('m_sel'),
+      aux: front.output('m_aux'),
       wb2Cyc: wb2Cyc,
       wb2Stb: wb2Stb,
       wb2We: wb2We,
@@ -720,6 +1007,9 @@ struct DramStore {
       phyReadLevelDone: phyLevelDone,
       phySelfTrainsRead: isEcp5,
       phyReadPipeTicks: isEcp5 ? Ddr3PhyEcp5.readPipeTicks : 0,
+      skipCalibration: fastSim,
+      // The Wishbone adapter has one read in flight, so it needs no gap.
+      minReadGap: wishbone ? 0 : readGap,
     );
     controller = ctrl;
     if (isEcp5) output('cal_failed') <= ctrl.calFailed!;
@@ -730,6 +1020,24 @@ struct DramStore {
     if (runtimeTrainable) {
       wb2Ack! <= ctrl.output('o_wb2_ack');
       wb2DataOut! <= ctrl.output('o_wb2_data');
+    }
+
+    if (fastSim) {
+      // The controller side of the PHY goes to ports for a model.
+      addOutput('phy_cmd', width: ctrl.phyCmd.width) <= ctrl.phyCmd;
+      addOutput('phy_data', width: p.wbDataBits) <= ctrl.output('o_phy_data');
+      addOutput('phy_dm', width: p.wbSelBits) <= ctrl.output('o_phy_dm');
+      addOutput('phy_reset') <= ctrl.phyReset;
+      phyData <=
+          addInput(
+            'phy_iserdes_data',
+            Logic(width: phyData.width),
+            width: phyData.width,
+          );
+      phyDqs <= Const(0, width: phyDqs.width);
+      phyBsRef <= Const(0, width: phyBsRef.width);
+      phyRdy <= Const(1);
+      return;
     }
 
     // --- inout pads to the PHY (harbor idiom: net through createPort/inOut) ---
