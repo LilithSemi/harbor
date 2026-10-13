@@ -35,7 +35,6 @@ void main() {
       final soc = HarborSoC(
         name: 'DdrSimSoc',
         compatible: 'test,ddr-sim',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
         target: target,
       );
       soc.addMaster(

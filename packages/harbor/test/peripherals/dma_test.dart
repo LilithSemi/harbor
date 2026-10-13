@@ -4,6 +4,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 // Register BYTE offsets. Each register is its own 8-byte slot and a block is 8
 // slots (0x40): block 0 is global, block ch+1 is channel ch.
 const _ctrl = 0x00;
@@ -52,9 +54,9 @@ void main() {
     test('supports TileLink', () {
       final dma = HarborDmaController(
         baseAddress: 0x30000000,
-        protocol: BusProtocol.tilelink,
+        fabricKind: HarborFabricKind.tilelink,
       );
-      expect(dma.bus.protocol, equals(BusProtocol.tilelink));
+      expect(dma.bus.kind, equals(HarborFabricKind.tilelink));
     });
 
     test('defaults the master data bus to 32 bits', () {
@@ -103,47 +105,46 @@ void main() {
         throwsArgumentError,
       );
     });
+
+    test('two parameter sets give different definitionNames', () {
+      final a = HarborDmaController(baseAddress: 0x30000000, channels: 2);
+      final b = HarborDmaController(baseAddress: 0x30000000, channels: 4);
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
   });
 
-  group('HarborDmaController transfer engine', () {
+  for (final kind in HarborFabricKind.values) {
+    _transferEngineTests(kind);
+    _dataWidth64Tests(kind);
+    _peripheralStreamTests(kind);
+    _targetSdramTests(kind);
+  }
+}
+
+void _transferEngineTests(HarborFabricKind kind) {
+  group('HarborDmaController transfer engine (${kind.name})', () {
     late HarborDmaController dma;
-    late Logic clk, reset, stb, we, adr, mosi, irq;
+    late Logic clk, reset, irq;
+    late RegBus bus;
     late List<Logic> mem;
 
-    Future<void> bw(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (dma.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
+    Future<void> bw(int addr, int data) => bus.write(addr, data);
+    Future<int> br(int addr) => bus.read(addr);
 
     // Build the DUT with a 16-word memory model on the master port, preloaded
     // with [dmaMem].
     Future<void> setUpDut(List<int> dmaMem) async {
-      dma = HarborDmaController(baseAddress: 0x30000000, channels: 2);
+      dma = HarborDmaController(
+        baseAddress: 0x30000000,
+        channels: 2,
+        fabricKind: kind,
+      );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: 32);
+      bus = RegBus.attach(dma, clk);
 
       dma.input('clk').srcConnection! <= clk;
       dma.input('reset').srcConnection! <= reset;
-      dma.input('bus_CYC').srcConnection! <= stb;
-      dma.input('bus_STB').srcConnection! <= stb;
-      dma.input('bus_WE').srcConnection! <= we;
-      dma.input('bus_ADR').srcConnection! <= adr;
-      dma.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      dma.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: dma.input('bus_SEL').width);
 
       final initVals = [
         for (var i = 0; i < 16; i++) i < dmaMem.length ? dmaMem[i] : 0,
@@ -178,13 +179,10 @@ void main() {
       dma.input('dma_ack').srcConnection! <= mStb;
 
       await dma.build();
+      bus.idle();
       irq = dma.output('interrupt');
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
       Simulator.setMaxSimTime(2000000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
@@ -237,159 +235,150 @@ void main() {
       expect(mem[9].value.toInt(), equals(0xC0FFEE00));
       await Simulator.endSimulation();
     });
-  });
 
-  group('HarborDmaController transfer engine at dataWidth 64', () {
-    late HarborDmaController dma;
-    late Logic clk, reset, stb, we, adr, mosi, irq;
-    late List<Logic> mem;
-    late Logic beatCount;
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut([0xAAAA1111, 0xBBBB2222]);
+      // intEnable is channels wide (2 bits here); the other registers are
+      // full 32-bit words.
+      await bw(_intEnable, 0x3);
+      await bw(_chSrc(0), 0x11223344);
 
-    Future<void> bw(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (dma.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
+      // sel=0: none of these may take effect, including the channel start.
+      await bus.write(_intEnable, 0x0, sel: 0x0);
+      await bus.write(_chSrc(0), 0xffffffff, sel: 0x0);
+      await bus.write(_chCtrl(0), 0x1, sel: 0x0);
 
-    // Build the DUT with a 64-bit master data bus and an 8-beat memory model
-    // (one beat = 8 bytes), preloaded with [dmaMem]. Also counts write beats
-    // on the master port so the test can tell 8-byte beats apart from the
-    // 4-byte beats the default dataWidth:32 uses.
-    Future<void> setUpDut(List<int> dmaMem) async {
-      dma = HarborDmaController(
-        baseAddress: 0x30000000,
-        channels: 2,
-        dataWidth: 64,
-      );
-      clk = SimpleClockGenerator(10).clk;
-      reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: 32);
-
-      dma.input('clk').srcConnection! <= clk;
-      dma.input('reset').srcConnection! <= reset;
-      dma.input('bus_CYC').srcConnection! <= stb;
-      dma.input('bus_STB').srcConnection! <= stb;
-      dma.input('bus_WE').srcConnection! <= we;
-      dma.input('bus_ADR').srcConnection! <= adr;
-      dma.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      dma.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: dma.input('bus_SEL').width);
-
-      final initVals = [
-        for (var i = 0; i < 8; i++) i < dmaMem.length ? dmaMem[i] : 0,
-      ];
-      mem = [for (var i = 0; i < 8; i++) Logic(name: 'mem64_$i', width: 64)];
-      final beats = Logic(name: 'beat_count', width: 8);
-      final mStb = dma.output('dma_stb');
-      final mWe = dma.output('dma_we');
-      final mAddr = dma.output('dma_addr');
-      final mWdata = dma.output('dma_wdata');
-      // 8-byte beats: the beat index is the byte address divided by 8.
-      final mIdx = mAddr.getRange(3, 6);
-      Sequential(
-        clk,
-        reset: reset,
-        resetValues: {
-          for (var i = 0; i < 8; i++) mem[i]: Const(initVals[i], width: 64),
-          beats: Const(0, width: 8),
-        },
-        [
-          If(
-            mStb & mWe,
-            then: [
-              for (var i = 0; i < 8; i++)
-                If(mIdx.eq(Const(i, width: 3)), then: [mem[i] < mWdata]),
-              beats < (beats + Const(1, width: 8)),
-            ],
-          ),
-        ],
-      );
-      Logic mRd = mem[7];
-      for (var i = 6; i >= 0; i--) {
-        mRd = mux(mIdx.eq(Const(i, width: 3)), mem[i], mRd);
-      }
-      dma.input('dma_rdata').srcConnection! <= mRd;
-      dma.input('dma_ack').srcConnection! <= mStb;
-      beatCount = beats;
-
-      await dma.build();
-      irq = dma.output('interrupt');
-
-      reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
-      Simulator.setMaxSimTime(2000000);
-      unawaited(Simulator.run());
-      await clk.nextPosedge;
-      await clk.nextPosedge;
-      reset.inject(0);
-      await clk.nextPosedge;
-    }
-
-    Future<bool> runUntilIrq() async {
-      for (var i = 0; i < 4000; i++) {
-        await clk.nextPosedge;
-        if (irq.value.toInt() == 1) return true;
-      }
-      return false;
-    }
-
-    tearDown(() async {
-      await Simulator.reset();
-    });
-
-    test('mem-to-mem moves 8 bytes per beat, not 4', () async {
-      // Source beat 0 (byte 0x00), destination beat 4 (byte 0x20). CH_LEN is
-      // 16 bytes: at dataWidth:64 that is 2 beats of 8 bytes, versus 4 beats
-      // of 4 bytes at the default dataWidth:32.
-      await setUpDut([0x1111111122222222, 0x3333333344444444]);
-      await bw(_ctrl, 1); // global enable
-      await bw(_intEnable, 0x1); // channel 0 IRQ
-      await bw(_chSrc(0), 0x00);
-      await bw(_chDst(0), 0x20);
-      await bw(_chLen(0), 16); // 2 beats of 8 bytes
-      await bw(_chCtrl(0), 0x1); // enable, type memToMem -> start
-
-      expect(await runUntilIrq(), isTrue);
-      expect(beatCount.value.toInt(), equals(2));
-      expect(mem[4].value.toInt(), equals(0x1111111122222222));
-      expect(mem[5].value.toInt(), equals(0x3333333344444444));
+      expect(await br(_intEnable), equals(0x3));
+      expect(await br(_chSrc(0)), equals(0x11223344));
+      expect(await br(_chStatus(0)) & 0x1, equals(0)); // not busy: no start
       await Simulator.endSimulation();
     });
   });
+}
 
-  group('HarborDmaController peripheral stream source', () {
+void _dataWidth64Tests(HarborFabricKind kind) {
+  group(
+    'HarborDmaController transfer engine at dataWidth 64 (${kind.name})',
+    () {
+      late HarborDmaController dma;
+      late Logic clk, reset, irq;
+      late RegBus bus;
+      late List<Logic> mem;
+      late Logic beatCount;
+
+      Future<void> bw(int addr, int data) => bus.write(addr, data);
+
+      // Build the DUT with a 64-bit master data bus and an 8-beat memory model
+      // (one beat = 8 bytes), preloaded with [dmaMem]. Also counts write beats
+      // on the master port so the test can tell 8-byte beats apart from the
+      // 4-byte beats the default dataWidth:32 uses.
+      Future<void> setUpDut(List<int> dmaMem) async {
+        dma = HarborDmaController(
+          baseAddress: 0x30000000,
+          channels: 2,
+          dataWidth: 64,
+          fabricKind: kind,
+        );
+        clk = SimpleClockGenerator(10).clk;
+        reset = Logic(name: 'reset');
+        bus = RegBus.attach(dma, clk);
+
+        dma.input('clk').srcConnection! <= clk;
+        dma.input('reset').srcConnection! <= reset;
+
+        final initVals = [
+          for (var i = 0; i < 8; i++) i < dmaMem.length ? dmaMem[i] : 0,
+        ];
+        mem = [for (var i = 0; i < 8; i++) Logic(name: 'mem64_$i', width: 64)];
+        final beats = Logic(name: 'beat_count', width: 8);
+        final mStb = dma.output('dma_stb');
+        final mWe = dma.output('dma_we');
+        final mAddr = dma.output('dma_addr');
+        final mWdata = dma.output('dma_wdata');
+        // 8-byte beats: the beat index is the byte address divided by 8.
+        final mIdx = mAddr.getRange(3, 6);
+        Sequential(
+          clk,
+          reset: reset,
+          resetValues: {
+            for (var i = 0; i < 8; i++) mem[i]: Const(initVals[i], width: 64),
+            beats: Const(0, width: 8),
+          },
+          [
+            If(
+              mStb & mWe,
+              then: [
+                for (var i = 0; i < 8; i++)
+                  If(mIdx.eq(Const(i, width: 3)), then: [mem[i] < mWdata]),
+                beats < (beats + Const(1, width: 8)),
+              ],
+            ),
+          ],
+        );
+        Logic mRd = mem[7];
+        for (var i = 6; i >= 0; i--) {
+          mRd = mux(mIdx.eq(Const(i, width: 3)), mem[i], mRd);
+        }
+        dma.input('dma_rdata').srcConnection! <= mRd;
+        dma.input('dma_ack').srcConnection! <= mStb;
+        beatCount = beats;
+
+        await dma.build();
+        bus.idle();
+        irq = dma.output('interrupt');
+
+        reset.inject(1);
+        Simulator.setMaxSimTime(2000000);
+        unawaited(Simulator.run());
+        await clk.nextPosedge;
+        await clk.nextPosedge;
+        reset.inject(0);
+        await clk.nextPosedge;
+      }
+
+      Future<bool> runUntilIrq() async {
+        for (var i = 0; i < 4000; i++) {
+          await clk.nextPosedge;
+          if (irq.value.toInt() == 1) return true;
+        }
+        return false;
+      }
+
+      tearDown(() async {
+        await Simulator.reset();
+      });
+
+      test('mem-to-mem moves 8 bytes per beat, not 4', () async {
+        // Source beat 0 (byte 0x00), destination beat 4 (byte 0x20). CH_LEN is
+        // 16 bytes: at dataWidth:64 that is 2 beats of 8 bytes, versus 4 beats
+        // of 4 bytes at the default dataWidth:32.
+        await setUpDut([0x1111111122222222, 0x3333333344444444]);
+        await bw(_ctrl, 1); // global enable
+        await bw(_intEnable, 0x1); // channel 0 IRQ
+        await bw(_chSrc(0), 0x00);
+        await bw(_chDst(0), 0x20);
+        await bw(_chLen(0), 16); // 2 beats of 8 bytes
+        await bw(_chCtrl(0), 0x1); // enable, type memToMem -> start
+
+        expect(await runUntilIrq(), isTrue);
+        expect(beatCount.value.toInt(), equals(2));
+        expect(mem[4].value.toInt(), equals(0x1111111122222222));
+        expect(mem[5].value.toInt(), equals(0x3333333344444444));
+        await Simulator.endSimulation();
+      });
+    },
+  );
+}
+
+void _peripheralStreamTests(HarborFabricKind kind) {
+  group('HarborDmaController peripheral stream source (${kind.name})', () {
     late HarborDmaController dma;
-    late Logic clk, reset, stb, we, adr, mosi;
+    late Logic clk, reset;
+    late RegBus bus;
     late Logic sData, sValid, sLast, irq;
     late List<Logic> mem;
 
-    Future<void> bw(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (dma.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
+    Future<void> bw(int addr, int data) => bus.write(addr, data);
 
     // Build the DUT in peripheralStream mode with a 16-word memory model on
     // the master (write) side. The stream is fed by the test via s_data /
@@ -399,26 +388,17 @@ void main() {
         baseAddress: 0x30000000,
         channels: 2,
         source: HarborDmaSource.peripheralStream,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: 32);
+      bus = RegBus.attach(dma, clk);
       sData = Logic(name: 's_data', width: dma.input('s_data').width);
       sValid = Logic(name: 's_valid');
       sLast = Logic(name: 's_last');
 
       dma.input('clk').srcConnection! <= clk;
       dma.input('reset').srcConnection! <= reset;
-      dma.input('bus_CYC').srcConnection! <= stb;
-      dma.input('bus_STB').srcConnection! <= stb;
-      dma.input('bus_WE').srcConnection! <= we;
-      dma.input('bus_ADR').srcConnection! <= adr;
-      dma.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      dma.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: dma.input('bus_SEL').width);
       dma.input('s_data').srcConnection! <= sData;
       dma.input('s_valid').srcConnection! <= sValid;
       dma.input('s_last').srcConnection! <= sLast;
@@ -450,13 +430,10 @@ void main() {
       dma.input('dma_ack').srcConnection! <= mStb;
 
       await dma.build();
+      bus.idle();
       irq = dma.output('interrupt');
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
       sData.inject(0);
       sValid.inject(0);
       sLast.inject(0);
@@ -518,10 +495,13 @@ void main() {
       },
     );
   });
+}
 
-  group('HarborDmaController target=sdram address clamp', () {
+void _targetSdramTests(HarborFabricKind kind) {
+  group('HarborDmaController target=sdram address clamp (${kind.name})', () {
     late HarborDmaController dma;
-    late Logic clk, reset, stb, we, adr, mosi, irq;
+    late Logic clk, reset, irq;
+    late RegBus bus;
     late List<Logic> mem;
     late Logic writeBeats;
 
@@ -529,33 +509,8 @@ void main() {
     // 256 MiB).
     const memRange = BusAddressRange(0x80000000, 0x10000000);
 
-    Future<void> bw(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (dma.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
-
-    Future<int> br(int addr) async {
-      adr.inject(addr);
-      we.inject(0);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (dma.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final v = dma.output('bus_DAT_MISO').value.toInt();
-      stb.inject(0);
-      await clk.nextPosedge;
-      return v;
-    }
+    Future<void> bw(int addr, int data) => bus.write(addr, data);
+    Future<int> br(int addr) => bus.read(addr);
 
     // Build the DUT with target: sdram and the memRange above, and a 16-word
     // memory model on the master port preloaded with [dmaMem]. The model
@@ -569,23 +524,14 @@ void main() {
         channels: 2,
         target: HarborDmaTarget.sdram,
         memRange: memRange,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: 32);
+      bus = RegBus.attach(dma, clk);
 
       dma.input('clk').srcConnection! <= clk;
       dma.input('reset').srcConnection! <= reset;
-      dma.input('bus_CYC').srcConnection! <= stb;
-      dma.input('bus_STB').srcConnection! <= stb;
-      dma.input('bus_WE').srcConnection! <= we;
-      dma.input('bus_ADR').srcConnection! <= adr;
-      dma.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      dma.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: dma.input('bus_SEL').width);
 
       final initVals = [
         for (var i = 0; i < 16; i++) i < dmaMem.length ? dmaMem[i] : 0,
@@ -624,13 +570,10 @@ void main() {
       writeBeats = beats;
 
       await dma.build();
+      bus.idle();
       irq = dma.output('interrupt');
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
       Simulator.setMaxSimTime(2000000);
       unawaited(Simulator.run());
       await clk.nextPosedge;

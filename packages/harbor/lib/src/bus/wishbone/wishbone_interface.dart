@@ -48,6 +48,20 @@ class WishboneConfig with HarborPrettyString {
   /// Default select width: one bit per byte lane.
   int get effectiveSelWidth => selWidth > 0 ? selWidth : dataWidth ~/ 8;
 
+  /// Parts for a module definition name, one per field that changes the
+  /// ports. Each part starts with [tag].
+  List<String> definitionNameParts([String tag = '']) => [
+    '${tag}A$addressWidth',
+    '${tag}D$dataWidth',
+    '${tag}S$effectiveSelWidth',
+    if (useErr) '${tag}Err',
+    if (useRty) '${tag}Rty',
+    if (useCti) '${tag}Cti',
+    if (useBte) '${tag}Bte',
+    if (tgaWidth > 0) '${tag}Tga$tgaWidth',
+    if (tgdWidth > 0) '${tag}Tgd$tgdWidth',
+  ];
+
   /// Returns a copy with the given fields replaced.
   WishboneConfig copyWith({
     int? addressWidth,

@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -67,9 +68,21 @@ class HarborTraceEncoder extends BridgeModule
     required this.baseAddress,
     this.bufferSize = 4096,
     this.syncInterval = 256,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     super.name = 'trace',
-  }) : super('HarborTraceEncoder') {
+  }) : super(
+         harborStableDefinitionName('HarborTraceEncoder', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'buf$bufferSize',
+           'sync$syncInterval',
+         ]),
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -95,15 +108,19 @@ class HarborTraceEncoder extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Trace state
     final enabled = Logic(name: 'trace_enabled');

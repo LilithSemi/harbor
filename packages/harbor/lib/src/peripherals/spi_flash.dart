@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../blackbox/ecp5/ecp5.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../bus/bus.dart';
@@ -212,9 +213,30 @@ class HarborSpiFlashController extends BridgeModule
     // write engine gives up and raises wr_err). The default (~1M) is many
     // orders beyond any real sector-erase time, lower it for fast simulation.
     int writePollLimit = (1 << 20) - 1,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborSpiFlashController', name: name ?? 'spi_flash') {
+  }) : super(
+         harborStableDefinitionName('HarborSpiFlashController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth ?? config.size.bitLength,
+             dataWidth: busDataWidth ?? 32,
+             cross: crossFabricClock,
+           ),
+           config.mode.name,
+           'ab${config.addressBytes}',
+           'dc${config.dummyCycles}',
+           'rc0x${config.readCommand.toRadixString(16)}',
+           'ra${config.readAheadWords}',
+           'sz${config.size}',
+           'wp$writePollLimit',
+           if (useUsrmclk) 'usrmclk',
+           if (useStartupe2) 'startupe2',
+           if (ownPads) 'ownpads',
+         ]),
+         name: name ?? 'spi_flash',
+       ) {
     if (writePollLimit < 1) {
       throw ArgumentError.value(
         writePollLimit,
@@ -254,11 +276,15 @@ class HarborSpiFlashController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: addrWidth,
       dataWidth: busDataWidth ?? 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     // Write and erase command interface for the DFU flash sink, separate
@@ -291,7 +317,7 @@ class HarborSpiFlashController extends BridgeModule
     addOutput('wr_err');
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     // A memory-class slave on the system bus must return the FULL bus word. The
     // RV64 core issues bus-word-aligned reads (the low address bits are 0) and
     // selects the addressed sub-word out of the returned bus.dataOut, exactly

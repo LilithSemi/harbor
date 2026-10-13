@@ -38,8 +38,8 @@ class _BenchMaster extends BridgeModule {
 }
 
 /// [HarborDualClockDisplay] on a [HarborSdram] scanout port.
-class _BenchDisplay extends BridgeModule {
-  _BenchDisplay({required HarborDisplayTiming timing, required int stride})
+class BenchScanDisplay extends BridgeModule {
+  BenchScanDisplay({required HarborDisplayTiming timing, required int stride})
     : super('BenchScanDisplay', name: 'display') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -96,7 +96,7 @@ class SdramScanoutBench {
   late final HarborSdram sdram;
   late final SdramPinModel model;
   late final _BenchMaster bench;
-  late final _BenchDisplay display;
+  late final BenchScanDisplay display;
   late final Logic sysClk;
   late final Logic memClk;
   late final Logic pixelClk;
@@ -194,13 +194,9 @@ class SdramScanoutBench {
       phyMaxClockHz: SdramPhyEcp5.maxClockHzLvcmos33,
     );
 
-    soc = HarborSoC(
-      name: 'ScanPortSoC',
-      compatible: 'test,scanport',
-      busConfig: cfg,
-    );
+    soc = HarborSoC(name: 'ScanPortSoC', compatible: 'test,scanport');
     bench = soc.addMaster(_BenchMaster(cfg), busInterfaceName: 'bus');
-    display = _BenchDisplay(timing: timing, stride: stride);
+    display = BenchScanDisplay(timing: timing, stride: stride);
     soc.addSubModule(display);
     sdram = soc.addPeripheral(
       HarborSdram(

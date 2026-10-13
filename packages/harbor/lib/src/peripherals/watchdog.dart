@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -50,9 +51,21 @@ class HarborWatchdog extends BridgeModule
   HarborWatchdog({
     required this.baseAddress,
     this.counterWidth = 32,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborWatchdog', name: name ?? 'watchdog') {
+  }) : super(
+         harborStableDefinitionName('HarborWatchdog', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'w$counterWidth',
+         ]),
+         name: name ?? 'watchdog',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     addOutput('wdt_reset');
@@ -61,15 +74,19 @@ class HarborWatchdog extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     final enable = Logic(name: 'enable');
     final resetEn = Logic(name: 'reset_en');

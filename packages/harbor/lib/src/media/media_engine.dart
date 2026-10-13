@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -150,10 +151,27 @@ class HarborMediaEngine extends BridgeModule
     this.interpTaps = 2,
     this.tileMaxCols = 8,
     this.useOdEc = false,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
   }) : assert(interpTaps == 2 || interpTaps == 8, 'only 2-tap or 8-tap'),
-       super('HarborMediaEngine', name: name ?? 'media_engine') {
+       super(
+         harborStableDefinitionName('HarborMediaEngine', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'sess$maxSessions',
+           'da$dmaAddrWidth',
+           'tap$interpTaps',
+           'tc$tileMaxCols',
+           if (useOdEc) 'odec',
+           codecs.map((c) => '${c.format.name}${c.capability.name}').join('_'),
+         ]),
+         name: name ?? 'media_engine',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -177,15 +195,19 @@ class HarborMediaEngine extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Engine-level registers
     final engineCtrl = Logic(name: 'engine_ctrl', width: 32);
@@ -708,7 +730,7 @@ class HarborMediaEngine extends BridgeModule
       scanLookup(scan4S8, posLin),
     );
     coeffDec.input('clk').srcConnection! <= input('clk');
-    coeffDec.input('reset').srcConnection! <= input('reset');
+    coeffDec.input('reset').srcConnection! <= reset;
     coeffDec.input('start').srcConnection! <=
         (inBitLoad & input('dma_read_valid') & beatCnt[0]);
     // In tiled decode mode, continue the bitstream into the next block (reusing
@@ -756,7 +778,7 @@ class HarborMediaEngine extends BridgeModule
       [for (var r = 7; r >= 0; r--) blk[r * 8 + 3].getRange(0, 8)].swizzle(),
     );
     lineBuf.input('clk').srcConnection! <= input('clk');
-    lineBuf.input('reset').srcConnection! <= input('reset');
+    lineBuf.input('reset').srcConnection! <= reset;
     lineBuf.input('size').srcConnection! <= sizeReg;
     lineBuf.input('bw_col').srcConnection! <= bcReg;
     lineBuf.input('store').srcConnection! <=

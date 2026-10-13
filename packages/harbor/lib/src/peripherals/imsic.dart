@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -62,9 +63,22 @@ class HarborImsic extends BridgeModule
     this.numIds = 256,
     this.numGuests = 0,
     this.hartIndex = 0,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborImsic', name: name ?? 'imsic_hart$hartIndex') {
+  }) : super(
+         harborStableDefinitionName('HarborImsic', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'i$numIds',
+           'g$numGuests',
+         ]),
+         name: name ?? 'imsic_hart$hartIndex',
+       ) {
     assert(numIds > 0 && numIds <= 2048, 'numIds must be 1-2048');
     assert(numIds & (numIds - 1) == 0, 'numIds must be power of 2');
 
@@ -80,11 +94,15 @@ class HarborImsic extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     // CSR interface (miselect/mireg, siselect/sireg)
@@ -95,7 +113,7 @@ class HarborImsic extends BridgeModule
     createPort('csr_priv', PortDirection.input, width: 2); // M=3, S=1, VS=0
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Number of 64-bit EIP/EIE registers needed
     final numRegs = (numIds + 63) ~/ 64;

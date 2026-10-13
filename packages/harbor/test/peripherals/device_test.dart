@@ -87,6 +87,12 @@ void main() {
       expect(dt.compatible.first, equals('harbor,flash'));
       expect(dt.reg.size, equals(256 * 1024));
     });
+
+    test('two parameter sets give different definitionNames', () {
+      final a = HarborFlash(baseAddress: 0x00000000, size: 256 * 1024);
+      final b = HarborFlash(baseAddress: 0x00000000, size: 512 * 1024);
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
   });
 
   group('HarborMaskRom', () {
@@ -109,6 +115,18 @@ void main() {
         initialData: [0xDEADBEEF],
       );
       expect(rom.size, equals(4));
+    });
+
+    test('two parameter sets give different definitionNames', () {
+      final a = HarborMaskRom(
+        baseAddress: 0x00000000,
+        initialData: [0x00000297, 0x02028593],
+      );
+      final b = HarborMaskRom(
+        baseAddress: 0x00000000,
+        initialData: [0x00000297, 0x11111111],
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
     });
   });
 

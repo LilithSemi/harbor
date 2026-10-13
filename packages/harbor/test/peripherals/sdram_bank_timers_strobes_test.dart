@@ -165,7 +165,13 @@ void main() {
   test('rasMin, then rp after a precharge, through act/pre strobes', () async {
     final h = await start();
     final c = h.cycles;
-    await expectSpacing(h, h.dut.canPre[0], c.rasMin, 'canPre after act', act: 0x1);
+    await expectSpacing(
+      h,
+      h.dut.canPre[0],
+      c.rasMin,
+      'canPre after act',
+      act: 0x1,
+    );
     await expectSpacing(h, h.dut.canAct[0], c.rp, 'canAct after pre', pre: 0x1);
     await Simulator.endSimulation();
   });
@@ -173,7 +179,13 @@ void main() {
   test('rcd for read and write, through the act strobe', () async {
     final h = await start();
     final c = h.cycles;
-    await expectSpacing(h, h.dut.canRead[0], c.rcd, 'canRead after act', act: 0x1);
+    await expectSpacing(
+      h,
+      h.dut.canRead[0],
+      c.rcd,
+      'canRead after act',
+      act: 0x1,
+    );
     expect(h.dut.canWrite[0].value.toInt(), 1);
     await Simulator.endSimulation();
   });
@@ -183,13 +195,25 @@ void main() {
     final c = h.cycles;
     await h.drive(act: 0x1);
     await h.nops(c.rasMin + 2);
-    await expectSpacing(h, h.dut.canPre[0], c.wr, 'canPre after write', write: 0x1);
+    await expectSpacing(
+      h,
+      h.dut.canPre[0],
+      c.wr,
+      'canPre after write',
+      write: 0x1,
+    );
     await Simulator.endSimulation();
   });
 
   test('rrd on a different bank through act[1]', () async {
     final h = await start();
-    await expectSpacing(h, h.dut.canAct[1], h.cycles.rrd, 'canAct[1] after act', act: 0x1);
+    await expectSpacing(
+      h,
+      h.dut.canAct[1],
+      h.cycles.rrd,
+      'canAct[1] after act',
+      act: 0x1,
+    );
     await Simulator.endSimulation();
   });
 
@@ -201,7 +225,13 @@ void main() {
     await expectSpacing(h, h.dut.canRef, c.rp, 'canRef after pre', pre: 0x1);
     await h.drive(act: 0x2);
     await h.nops(c.rasMin);
-    await expectSpacing(h, h.dut.canRef, c.rp, 'canRef after pre all', preAll: 1);
+    await expectSpacing(
+      h,
+      h.dut.canRef,
+      c.rp,
+      'canRef after pre all',
+      preAll: 1,
+    );
     await Simulator.endSimulation();
   });
 
@@ -388,22 +418,26 @@ void main() {
           expect(
             plain.canAct[b].value.toInt(),
             predictedAct[b],
-            reason: 'actBankNext/actCommonNext[$b] one edge early, cycle $cycle',
+            reason:
+                'actBankNext/actCommonNext[$b] one edge early, cycle $cycle',
           );
           expect(
             plain.canRead[b].value.toInt(),
             predictedRead[b],
-            reason: 'colBankNext/readCommonNext[$b] one edge early, cycle $cycle',
+            reason:
+                'colBankNext/readCommonNext[$b] one edge early, cycle $cycle',
           );
           expect(
             plain.canWrite[b].value.toInt(),
             predictedWrite[b],
-            reason: 'colBankNext/writeCommonNext[$b] one edge early, cycle $cycle',
+            reason:
+                'colBankNext/writeCommonNext[$b] one edge early, cycle $cycle',
           );
           expect(
             plain.canPre[b].value.toInt(),
             predictedPre[b],
-            reason: 'preBankNext/preCommonNext[$b] one edge early, cycle $cycle',
+            reason:
+                'preBankNext/preCommonNext[$b] one edge early, cycle $cycle',
           );
         }
         expect(

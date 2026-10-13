@@ -181,11 +181,7 @@ Future<int> _runStarvation({
   required int burst,
 }) async {
   const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
-  final soc = HarborSoC(
-    name: 'StarveSoC',
-    compatible: 'test,starve',
-    busConfig: cfg,
-  );
+  final soc = HarborSoC(name: 'StarveSoC', compatible: 'test,starve');
   final hog = _BurstHog(cfg, burst: burst, addr: 0x100, name: 'hog');
   final poller = _Poller(cfg, addr: 0x200, name: 'poller');
   // The ADMA leg is register-staged in the real SoC (genip pipeline: true); the

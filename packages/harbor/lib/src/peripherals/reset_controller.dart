@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -67,9 +68,21 @@ class HarborResetController extends BridgeModule
   HarborResetController({
     required this.baseAddress,
     this.domainCount = 4,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborResetController', name: name ?? 'reset_ctrl') {
+  }) : super(
+         harborStableDefinitionName('HarborResetController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'd$domainCount',
+         ]),
+         name: name ?? 'reset_ctrl',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('por', PortDirection.input); // power-on reset
     createPort('ext_reset', PortDirection.input); // external reset pin
@@ -83,15 +96,22 @@ class HarborResetController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       addressWidth: 12,
       dataWidth: 32,
       clk: input('clk'),
       reset: input('por'),
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final por = input('por');
+    // This device's own reset is the power-on reset, not a plain 'reset'
+    // port. [bus.reset] is that same signal, joined with the fabric reset
+    // when the port crosses clocks.
+    final por = bus.reset;
 
     final holdTime = Logic(name: 'hold_time', width: 16);
     final holdCounter = Logic(name: 'hold_counter', width: 16);

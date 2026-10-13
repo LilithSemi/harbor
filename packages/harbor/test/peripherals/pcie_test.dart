@@ -4,6 +4,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 // Register word indices (bus presents a word index).
 const _ctrl = 0x00;
 const _status = 0x08;
@@ -49,94 +51,59 @@ void main() {
       expect(dt.properties['max-link-speed'], equals(3));
       expect(dt.properties['num-lanes'], equals(4));
     });
+
+    test('two parameter sets give different definitionNames', () {
+      final a = HarborPcieController(
+        config: const HarborPcieConfig(),
+        baseAddress: 0xE000,
+        ecamBase: 0x10000000,
+      );
+      final b = HarborPcieController(
+        config: const HarborPcieConfig(maxLanes: HarborPcieLanes.x8),
+        baseAddress: 0xE000,
+        ecamBase: 0x10000000,
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
   });
 
-  group('HarborPcieController LTSSM', () {
+  for (final kind in HarborFabricKind.values) {
+    _registerTests(kind);
+  }
+}
+
+void _registerTests(HarborFabricKind kind) {
+  group('HarborPcieController LTSSM (${kind.name})', () {
     late HarborPcieController pcie;
-    late Logic clk, reset, stb, we, adr, mosi, rxn0;
-    late Logic estb, ewe, eadr, emosi;
+    late Logic clk, reset, rxn0;
+    late RegBus bus, ecam;
     late List<Logic> mem; // downstream memory model (endpoint), 16 words
 
     // Builds an ECAM dword address from bus/dev/fn and a register byte offset.
-    int ecamAddr(int bus, int dev, int fn, int regByte) =>
-        (bus << 18) | (dev << 13) | (fn << 10) | (regByte >> 2);
+    int ecamAddr(int b, int dev, int fn, int regByte) =>
+        (b << 18) | (dev << 13) | (fn << 10) | regByte;
 
-    Future<void> ew(int addr, int data) async {
-      eadr.inject(addr);
-      emosi.inject(data);
-      ewe.inject(1);
-      estb.inject(1);
-      await clk.nextPosedge;
-      while (pcie.output('ecam_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      estb.inject(0);
-      ewe.inject(0);
-      await clk.nextPosedge;
-    }
-
-    Future<int> er(int addr) async {
-      eadr.inject(addr);
-      ewe.inject(0);
-      estb.inject(1);
-      await clk.nextPosedge;
-      while (pcie.output('ecam_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final v = pcie.output('ecam_DAT_MISO').value.toInt();
-      estb.inject(0);
-      await clk.nextPosedge;
-      return v;
-    }
-
-    Future<void> bw(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (pcie.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
-
-    Future<int> br(int addr) async {
-      adr.inject(addr);
-      we.inject(0);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (pcie.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final v = pcie.output('bus_DAT_MISO').value.toInt();
-      stb.inject(0);
-      await clk.nextPosedge;
-      return v;
-    }
+    Future<void> ew(int addr, int data) => ecam.write(addr, data);
+    Future<int> er(int addr) => ecam.read(addr);
+    Future<void> bw(int addr, int data) => bus.write(addr, data);
+    Future<int> br(int addr) => bus.read(addr);
 
     Future<void> setUpDut() async {
       pcie = HarborPcieController(
-        config: const HarborPcieConfig(
+        config: HarborPcieConfig(
           maxGen: HarborPcieGen.gen3,
           maxLanes: HarborPcieLanes.x4,
         ),
         baseAddress: 0xE000,
         ecamBase: 0x10000000,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: 32);
       rxn0 = Logic(name: 'rxn0');
-      estb = Logic(name: 'estb');
-      ewe = Logic(name: 'ewe');
-      eadr = Logic(name: 'eadr', width: 26);
-      emosi = Logic(name: 'emosi', width: 32);
+
+      bus = RegBus.attach(pcie, clk, name: 'bus');
+      ecam = RegBus.attach(pcie, clk, name: 'ecam');
 
       pcie.input('clk').srcConnection! <= clk;
       pcie.input('reset').srcConnection! <= reset;
@@ -147,20 +114,6 @@ void main() {
         pcie.input('rxp_$i').srcConnection! <= Const(0);
         pcie.input('rxn_$i').srcConnection! <= Const(1);
       }
-      pcie.input('bus_CYC').srcConnection! <= stb;
-      pcie.input('bus_STB').srcConnection! <= stb;
-      pcie.input('bus_WE').srcConnection! <= we;
-      pcie.input('bus_ADR').srcConnection! <= adr;
-      pcie.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      pcie.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: pcie.input('bus_SEL').width);
-      pcie.input('ecam_CYC').srcConnection! <= estb;
-      pcie.input('ecam_STB').srcConnection! <= estb;
-      pcie.input('ecam_WE').srcConnection! <= ewe;
-      pcie.input('ecam_ADR').srcConnection! <= eadr;
-      pcie.input('ecam_DAT_MOSI').srcConnection! <= emosi;
-      pcie.input('ecam_SEL').srcConnection! <=
-          Const(0xF, width: pcie.input('ecam_SEL').width);
 
       // Downstream memory model backing the master port (the endpoint). Single
       // cycle ack=stb, combinational read mux, clocked write, preset on reset.
@@ -195,16 +148,10 @@ void main() {
       ]);
 
       await pcie.build();
+      bus.idle();
+      ecam.idle();
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
       rxn0.inject(1); // partner attached
-      estb.inject(0);
-      ewe.inject(0);
-      eadr.inject(0);
-      emosi.inject(0);
       Simulator.setMaxSimTime(10000000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
@@ -220,6 +167,12 @@ void main() {
         if (s & 0x1 == 0x1) return s;
       }
       return 0;
+    }
+
+    Future<void> waitTlpDone() async {
+      for (var i = 0; i < 60; i++) {
+        if ((await br(_tlpStatus)) & 0x2 == 0x2) return;
+      }
     }
 
     test('trains from Detect to L0 and reports link up', () async {
@@ -374,12 +327,6 @@ void main() {
       },
     );
 
-    Future<void> waitTlpDone() async {
-      for (var i = 0; i < 60; i++) {
-        if ((await br(_tlpStatus)) & 0x2 == 0x2) return;
-      }
-    }
-
     test('TLP memory write moves the buffer into endpoint memory', () async {
       await setUpDut();
       await bw(_tlpAddrLo, 0x10); // word 4
@@ -414,6 +361,28 @@ void main() {
       await Simulator.endSimulation();
     });
 
+    // TLP_DATA's read drains the buffer and advances the read pointer (see
+    // HarborPcieController), so a read with no byte selected must not do
+    // either: the first real read afterward still returns the first word.
+    // AXI4-Lite has no RSTRB on a read, so on a 32-bit bus it cannot express
+    // "no bytes": every AXI4 read of this register selects the whole word.
+    test(
+      'a read with no byte selected does not drain TLP_DATA',
+      skip: kind == HarborFabricKind.axi4,
+      () async {
+        await setUpDut();
+        await bw(_tlpAddrLo, 0x08); // word 2 (preset 0xAA02..)
+        await bw(_tlpLen, 2);
+        await bw(_tlpCtrl, 0x1); // start | read
+        await waitTlpDone();
+
+        await bus.read(_tlpData, sel: 0x0);
+        expect(await br(_tlpData), equals(0xAA02));
+        expect(await br(_tlpData), equals(0xAA03));
+        await Simulator.endSimulation();
+      },
+    );
+
     test('MSI trigger writes msi data to the msi address', () async {
       await setUpDut();
       await bw(_msiAddr, 0x20); // word 8
@@ -435,31 +404,41 @@ void main() {
       expect(pcie.interrupt.value.toInt(), equals(1));
       await Simulator.endSimulation();
     });
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      // TLP_DATA: a sel=0 write must not push into the data buffer or
+      // advance the write pointer, so the next real write still lands in
+      // the first buffer slot.
+      await bw(_tlpAddrLo, 0x10);
+      await bw(_tlpAddrHi, 0x0);
+      await bw(_tlpLen, 1);
+      await bus.write(_tlpData, 0xdeadbeef, sel: 0x0);
+      await bw(_tlpData, 0x99999999);
+      await bw(_tlpCtrl, 0x3); // start | write
+      await waitTlpDone();
+      expect(mem[4].value.toInt(), equals(0x99999999));
+
+      // A plain register also ignores a sel=0 write.
+      await bw(0x40, 0x11223344); // BAR0_BASE
+      await bus.write(0x40, 0xffffffff, sel: 0x0);
+      expect(await br(0x40), equals(0x11223344));
+      await Simulator.endSimulation();
+    });
   });
 
-  group('HarborPcieController endpoint', () {
+  group('HarborPcieController endpoint (${kind.name})', () {
     late HarborPcieController pcie;
     late Logic clk, reset;
-    late Logic estb, ewe, eadr, emosi;
+    late RegBus ecam;
     late Logic epValid, epWrite, epAddr, epWdata;
     late List<Logic> emem; // endpoint local memory model
 
-    int ecamAddr(int bus, int dev, int fn, int regByte) =>
-        (bus << 18) | (dev << 13) | (fn << 10) | (regByte >> 2);
+    int ecamAddr(int b, int dev, int fn, int regByte) =>
+        (b << 18) | (dev << 13) | (fn << 10) | regByte;
 
-    Future<int> er(int addr) async {
-      eadr.inject(addr);
-      ewe.inject(0);
-      estb.inject(1);
-      await clk.nextPosedge;
-      while (pcie.output('ecam_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final v = pcie.output('ecam_DAT_MISO').value.toInt();
-      estb.inject(0);
-      await clk.nextPosedge;
-      return v;
-    }
+    Future<int> er(int addr) => ecam.read(addr);
 
     // Presents one inbound MWr/MRd request and returns the completion data.
     Future<int> epReq(int addr, {bool write = false, int wdata = 0}) async {
@@ -483,17 +462,18 @@ void main() {
         config: const HarborPcieConfig(role: HarborPcieRole.endpoint),
         baseAddress: 0xE000,
         ecamBase: 0x10000000,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      estb = Logic(name: 'estb');
-      ewe = Logic(name: 'ewe');
-      eadr = Logic(name: 'eadr', width: 26);
-      emosi = Logic(name: 'emosi', width: 32);
       epValid = Logic(name: 'ep_valid');
       epWrite = Logic(name: 'ep_write');
       epAddr = Logic(name: 'ep_addr', width: 32);
       epWdata = Logic(name: 'ep_wdata', width: 32);
+
+      // Controller register bus is unused here; it still needs a driver.
+      RegBus.attach(pcie, clk, name: 'bus');
+      ecam = RegBus.attach(pcie, clk, name: 'ecam');
 
       pcie.input('clk').srcConnection! <= clk;
       pcie.input('reset').srcConnection! <= reset;
@@ -502,24 +482,6 @@ void main() {
         pcie.input('rxp_$i').srcConnection! <= Const(0);
         pcie.input('rxn_$i').srcConnection! <= Const(1);
       }
-      // Controller register bus and outbound master port are unused here.
-      pcie.input('bus_CYC').srcConnection! <= Const(0);
-      pcie.input('bus_STB').srcConnection! <= Const(0);
-      pcie.input('bus_WE').srcConnection! <= Const(0);
-      pcie.input('bus_ADR').srcConnection! <= Const(0, width: 12);
-      pcie.input('bus_DAT_MOSI').srcConnection! <= Const(0, width: 32);
-      pcie.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: pcie.input('bus_SEL').width);
-      pcie.input('pcie_m_rdata').srcConnection! <= Const(0, width: 32);
-      pcie.input('pcie_m_ack').srcConnection! <= Const(0);
-      // ECAM config-space port (host reads the EP's Type 0 header).
-      pcie.input('ecam_CYC').srcConnection! <= estb;
-      pcie.input('ecam_STB').srcConnection! <= estb;
-      pcie.input('ecam_WE').srcConnection! <= ewe;
-      pcie.input('ecam_ADR').srcConnection! <= eadr;
-      pcie.input('ecam_DAT_MOSI').srcConnection! <= emosi;
-      pcie.input('ecam_SEL').srcConnection! <=
-          Const(0xF, width: pcie.input('ecam_SEL').width);
       // Inbound target request port.
       pcie.input('ep_req_valid').srcConnection! <= epValid;
       pcie.input('ep_req_write').srcConnection! <= epWrite;
@@ -558,11 +520,8 @@ void main() {
       ]);
 
       await pcie.build();
+      ecam.idle();
       reset.inject(1);
-      estb.inject(0);
-      ewe.inject(0);
-      eadr.inject(0);
-      emosi.inject(0);
       epValid.inject(0);
       epWrite.inject(0);
       epAddr.inject(0);

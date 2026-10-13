@@ -1,5 +1,16 @@
+import 'dart:async';
+
 import 'package:harbor/harbor.dart';
+import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
+
+import '../util/reg_bus.dart';
+
+// Register byte offsets: each register in its own 8-byte slot.
+const _ctrl = 0x00;
+const _addr = 0x10;
+const _wdata = 0x20;
+const _timing = 0x30;
 
 void main() {
   group('HarborEfuseConfig', () {
@@ -120,6 +131,81 @@ void main() {
       );
       expect(device.programUnlockKey, equals(0xDEADBEEF));
       expect(device.dtNode.properties['harbor,unlock-key'], equals(0xDEADBEEF));
+    });
+
+    test('two different parameter sets get different definition names', () {
+      final a = HarborEfuseDevice(baseAddress: 0x20000000);
+      final b = HarborEfuseDevice(
+        baseAddress: 0x20000000,
+        config: const HarborEfuseConfig(totalBits: 512),
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+
+      final c = HarborEfuseDevice(
+        baseAddress: 0x20000000,
+        programUnlockKey: 0xDEADBEEF,
+      );
+      expect(a.definitionName, isNot(equals(c.definitionName)));
+    });
+  });
+
+  for (final kind in HarborFabricKind.values) {
+    _registerTests(kind);
+  }
+}
+
+void _registerTests(HarborFabricKind kind) {
+  group('HarborEfuseDevice register access (${kind.name})', () {
+    late HarborEfuseDevice device;
+    late Logic clk, reset;
+    late RegBus bus;
+
+    Future<void> setUpDut() async {
+      device = HarborEfuseDevice(baseAddress: 0x20000000, fabricKind: kind);
+      clk = SimpleClockGenerator(10).clk;
+      reset = Logic(name: 'reset');
+
+      device.input('clk').srcConnection! <= clk;
+      device.input('reset').srcConnection! <= reset;
+      device.input('fuse_rdata').srcConnection! <=
+          Const(0, width: device.config.bitsPerWord);
+      device.input('fuse_done').srcConnection! <= Const(0);
+      bus = RegBus.attach(device, clk);
+
+      await device.build();
+
+      reset.inject(1);
+      bus.idle();
+      Simulator.setMaxSimTime(200000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+    }
+
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      // ADDR is only config.words.bitLength wide (4 bits for the default
+      // config), so its readback is the low nibble of the written word.
+      await bus.write(_addr, 0x5);
+      await bus.write(_wdata, 0x55667788);
+      await bus.write(_timing, 0x0099);
+
+      await bus.write(_addr, 0xffffffff, sel: 0x0);
+      await bus.write(_wdata, 0xffffffff, sel: 0x0);
+      await bus.write(_timing, 0xffffffff, sel: 0x0);
+      await bus.write(_ctrl, 0x3, sel: 0x0);
+
+      expect(await bus.read(_addr), equals(0x5));
+      expect(await bus.read(_wdata), equals(0x55667788));
+      expect(await bus.read(_timing), equals(0x0099));
+      await Simulator.endSimulation();
     });
   });
 }

@@ -1,3 +1,4 @@
+import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
@@ -126,44 +127,6 @@ void main() {
     await Simulator.endSimulation();
   });
 
-  test('a host SETUP lands on EP0', () async {
-    final (dut, host, clk, _, _) = await buildUsbControllerHarness();
-    await dut.write(clk, ctrlAddr, 0x3);
-    for (var i = 0; i < 4; i++) {
-      await clk.nextPosedge;
-    }
-
-    final setupDone = host.sendToken(13, 0, 0);
-    await setupDone;
-    await host.sendData(3, [0x80, 6, 0, 1, 0, 0, 18, 0]);
-    await host.idle(100);
-
-    var status = await dut.read(clk, epAddr(0, outStatOff));
-    var guard = 0;
-    while ((status & 0x1) == 0 && guard < 500) {
-      await clk.nextPosedge;
-      status = await dut.read(clk, epAddr(0, outStatOff));
-      guard++;
-    }
-
-    expect(status & 0x1, equals(1), reason: 'packet ready');
-    expect((status >> 1) & 0x1, equals(1), reason: 'is SETUP');
-    expect((status >> 8) & 0xFF, equals(8), reason: 'SETUP is always 8 bytes');
-
-    final intStatus = await dut.read(clk, intStatusAddr);
-    expect((intStatus >> 8) & 0x1, equals(1), reason: 'EP0 OUT ready');
-
-    final bytes = <int>[];
-    for (var i = 0; i < 8; i++) {
-      bytes.add(await dut.read(clk, epAddr(0, outDataOff)));
-    }
-    expect(bytes, equals([0x80, 6, 0, 1, 0, 0, 18, 0]));
-
-    await dut.write(clk, epAddr(0, outAckOff), status);
-
-    await Simulator.endSimulation();
-  });
-
   test('ADDR write changes the address the PE answers to', () async {
     final (dut, host, clk, _, _) = await buildUsbControllerHarness();
     await dut.write(clk, ctrlAddr, 0x3);
@@ -257,4 +220,53 @@ void main() {
 
     await Simulator.endSimulation();
   });
+
+  // One basic transfer test, run on every fabric kind so the register port
+  // migration is checked end to end. The rest of this file stays on the
+  // default kind (Wishbone) so the suite does not triple in run time.
+  for (final kind in HarborFabricKind.values) {
+    test('a host SETUP lands on EP0 (${kind.name})', () async {
+      final (dut, host, clk, _, _) = await buildUsbControllerHarness(
+        kind: kind,
+      );
+      await dut.write(clk, ctrlAddr, 0x3);
+      for (var i = 0; i < 4; i++) {
+        await clk.nextPosedge;
+      }
+
+      final setupDone = host.sendToken(13, 0, 0);
+      await setupDone;
+      await host.sendData(3, [0x80, 6, 0, 1, 0, 0, 18, 0]);
+      await host.idle(100);
+
+      var status = await dut.read(clk, epAddr(0, outStatOff));
+      var guard = 0;
+      while ((status & 0x1) == 0 && guard < 500) {
+        await clk.nextPosedge;
+        status = await dut.read(clk, epAddr(0, outStatOff));
+        guard++;
+      }
+
+      expect(status & 0x1, equals(1), reason: 'packet ready');
+      expect((status >> 1) & 0x1, equals(1), reason: 'is SETUP');
+      expect(
+        (status >> 8) & 0xFF,
+        equals(8),
+        reason: 'SETUP is always 8 bytes',
+      );
+
+      final intStatus = await dut.read(clk, intStatusAddr);
+      expect((intStatus >> 8) & 0x1, equals(1), reason: 'EP0 OUT ready');
+
+      final bytes = <int>[];
+      for (var i = 0; i < 8; i++) {
+        bytes.add(await dut.read(clk, epAddr(0, outDataOff)));
+      }
+      expect(bytes, equals([0x80, 6, 0, 1, 0, 0, 18, 0]));
+
+      await dut.write(clk, epAddr(0, outAckOff), status);
+
+      await Simulator.endSimulation();
+    });
+  }
 }

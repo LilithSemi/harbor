@@ -914,14 +914,14 @@ class _Result {
 // rebuild corrupts the next build; see the ROHD gotchas).
 final _sweep = <_Result>[];
 
-// The DMA-bound sweep uses a 128-byte block (32 words, 8 bursts) on the 32-bit
-// path (the 32-bit sim is several times faster than the 128-bit-adapter 64-bit
-// one) and spans a low-to-high controller latency. The point after the
-// streaming fix is that the number of WIDE DRAM writes stays at one per 16-byte
-// burst no matter how slow the controller is: the burst adapter combines the
-// streamed narrow beats before the controller ever sees them.
+// The DMA-bound sweep uses a 128-byte block (32 words) on the 32-bit path
+// (the 32-bit sim is several times faster than the 128-bit-adapter 64-bit
+// one) and spans a low-to-high controller latency. Single-beat writes never
+// combine, so wideWrites stays at one DRAM write per narrow word at every
+// latency: a slow controller does not multiply the DRAM command count
+// further, it only slows each of those commands down.
 const _sweepBlock = 128;
-const _sweepBursts = _sweepBlock ~/ 16;
+const _sweepWords = _sweepBlock ~/ 4;
 const _sweepWidth = 32;
 // A high controller latency makes the behavioural sim churn (mStall/adapter FSM
 // toggle every ddr edge), so the wall time grows with latency, not cycle count.
@@ -1197,43 +1197,43 @@ void main() {
   });
 
   group('SDIO ADMA -> posted CDC -> burst adapter -> DDR write throughput', () {
-    // The streaming fix: the ADMA holds STB asserted and buffers a full wide
-    // burst's worth of words before draining, so the burst adapter combines
-    // four narrow words (or two packed 64-bit beats) into ONE 128-bit DRAM
-    // burst. A 512-byte block is 32 such bursts, so wideWrites collapses from
-    // 128 (one DRAM command per narrow word, the pre-fix behaviour) to about
-    // 32, and every word still lands. 512B / 16B-per-burst = 32; the ceiling
-    // leaves headroom for the one tail idle-flush.
-    const wideWriteCeiling = 40;
+    // The DDR3 non-posted write fix: the adapter only ACKs the last write of
+    // a request once the controller accepts it. The SDIO ADMA issues classic
+    // single-beat Wishbone writes, so every write IS the last beat of its own
+    // request; write combining never merges across separate requests (that
+    // would ACK a write before it reaches the controller, a posted write).
+    // So each narrow word costs its own wide DRAM write; see the
+    // registered-feedback burst test below for combining within one request.
     for (final width in [32, 64]) {
-      test('a 512-byte block combines to ~32 wide bursts on the ${width}b path '
-          '(low latency)', () async {
+      final wordsPerBeat = width == 32 ? 1 : 2; // 64b packs two 32b words
+      final expectedWideWrites = 128 ~/ wordsPerBeat;
+      test('a 512-byte block lands one wide write per narrow word on the '
+          '${width}b path (low latency)', () async {
         final r = await _runBlock(writeAcceptLatency: 2, busWidth: width);
         print(
           '[512B block, ${width}b, latency=${r.latency}] '
           'cyclesToLand=${r.cyclesToLand} '
           'cyclesPerBeat=${r.cyclesPerBeat.toStringAsFixed(1)} '
-          'wideWrites=${r.wideWrites} (was 128 before the fix)',
+          'wideWrites=${r.wideWrites}',
         );
         expect(r.dataOk, isTrue, reason: 'all 128 words must land correctly');
         expect(r.dataDone, isTrue, reason: 'data-done interrupt must fire');
-        // Locked-in improvement: narrow words are combined into wide bursts.
         expect(
           r.wideWrites,
-          lessThanOrEqualTo(wideWriteCeiling),
+          expectedWideWrites,
           reason:
-              'the burst adapter must combine narrow words into wide '
-              'bursts (128 means no combining at all)',
+              'single-beat writes never combine, so each beat is its own '
+              'DRAM write',
         );
       });
     }
 
-    test('a 512-byte block still combines to ~32 wide bursts when the '
-        'controller is slow (32b path)', () async {
-      // Combining is latency-independent: the adapter merges the streamed
-      // same-burst beats regardless of how slowly the controller then drains
-      // them, so a slow controller costs 32 wide writes, not 128. Run on the
-      // faster 32-bit sim so a high latency stays test-tractable.
+    test('a 512-byte block still lands one wide write per narrow word when '
+        'the controller is slow (32b path)', () async {
+      // A slow controller does not change the combining rule: each
+      // single-beat write is still its own last beat, so it still costs its
+      // own DRAM write. Run on the faster 32-bit sim so a high latency stays
+      // test-tractable.
       final r = await _runBlock(writeAcceptLatency: 200, busWidth: 32);
       print(
         '[512B block, 32b, latency=${r.latency}] '
@@ -1248,18 +1248,124 @@ void main() {
       );
       expect(
         r.wideWrites,
-        lessThanOrEqualTo(wideWriteCeiling),
-        reason: 'combining must hold up when the controller is slow',
+        128,
+        reason: 'controller latency does not change the single-beat count',
       );
     });
 
-    // One simulation per latency. After the streaming fix the number of wide
-    // DRAM writes is one per 16-byte burst at EVERY latency: the adapter
-    // combines the streamed beats before the slow controller sees them, so the
-    // controller latency no longer multiplies the DRAM command count.
+    test(
+      'the same payload still combines to one write per 4-word burst sent '
+      'as registered-feedback bursts, not single-beat writes',
+      () async {
+        // writeCombine merges beats inside ONE multi-beat request: s_last
+        // stays low on the first three beats of each 4-word burst and high
+        // on the fourth, exactly what a WB B4 registered-feedback burst
+        // drives. This is the traffic the single-beat tests above cannot
+        // combine; it proves combining itself still works.
+        const aw = 24;
+        final clk = SimpleClockGenerator(10).clk;
+        final reset = Logic(name: 'reset')..inject(1);
+        final sCyc = Logic()..inject(0);
+        final sWe = Logic()..inject(0);
+        final sAddr = Logic(width: aw)..inject(0);
+        final sData = Logic(width: 32)..inject(0);
+        final sLast = Logic()..inject(0);
+        final mAck = Logic()..inject(0);
+        final mAckAux = Logic(width: 4)..inject(0);
+        final mData = Logic(width: 128)..inject(0);
+
+        final dut = Ddr3BurstAdapter(
+          busAddrWidth: aw,
+          ddrAddrWidth: aw,
+          clk: clk,
+          reset: reset,
+          sCyc: sCyc,
+          sStb: Const(1),
+          sWe: sWe,
+          sAddr: sAddr,
+          sData: sData,
+          sSel: Const(0xf, width: 4),
+          sLast: sLast,
+          mStall: Const(0),
+          mAck: mAck,
+          mAckAux: mAckAux,
+          mData: mData,
+        );
+        await dut.build();
+
+        final mem = <int, BigInt>{};
+        var wideWrites = 0;
+        Simulator.setMaxSimTime(2000000);
+        unawaited(Simulator.run());
+        final sub = clk.posedge.listen((_) {
+          mAck.inject(0);
+          final cyc = dut.output('m_cyc').value;
+          if (cyc.isValid &&
+              cyc == LogicValue.one &&
+              dut.output('m_stb').value == LogicValue.one) {
+            final addr = dut.output('m_addr').value.toInt();
+            if (dut.output('m_we').value == LogicValue.one) {
+              wideWrites++;
+              final data = dut.output('m_data_out').value.toBigInt();
+              final sel = dut.output('m_sel').value.toInt();
+              var mask = BigInt.zero;
+              for (var b = 0; b < 16; b++) {
+                if ((sel >> b) & 1 == 1) mask |= BigInt.from(0xff) << (b * 8);
+              }
+              mem[addr] = ((mem[addr] ?? BigInt.zero) & ~mask) | (data & mask);
+            }
+            mAckAux.inject(1);
+            mAck.inject(1);
+          }
+        });
+
+        await clk.nextPosedge;
+        await clk.nextPosedge;
+        reset.inject(0);
+        await clk.nextPosedge;
+
+        final words = [for (var i = 0; i < 128; i++) 0xC0DE0000 | i];
+        for (var i = 0; i < words.length; i++) {
+          sCyc.inject(1);
+          sWe.inject(1);
+          sAddr.inject(i * 4);
+          sData.inject(words[i]);
+          sLast.inject(i % 4 == 3 ? 1 : 0); // last beat of each 4-word burst
+          var guard = 0;
+          do {
+            await clk.nextPosedge;
+            if (++guard > 200) fail('burst write $i hung');
+          } while (dut.output('s_ack').value != LogicValue.one);
+          sCyc.inject(0);
+          sWe.inject(0);
+          await clk.nextPosedge;
+        }
+
+        await sub.cancel();
+        await Simulator.endSimulation();
+
+        expect(
+          wideWrites,
+          32,
+          reason: 'four merged beats per burst = 32 DRAM writes',
+        );
+        for (var i = 0; i < words.length; i++) {
+          final burst = (i * 4) >> 4;
+          final lane = ((i * 4) >> 2) & 3;
+          final w = mem[burst] ?? BigInt.zero;
+          final got = ((w >> (lane * 32)) & BigInt.from(0xffffffff)).toInt();
+          expect(got, words[i], reason: 'word $i must land via the merged burst');
+        }
+      },
+    );
+
+    // One simulation per latency. Single-beat writes never combine, so the
+    // number of wide DRAM writes is one per narrow word at EVERY latency: a
+    // slower controller does not add MORE DRAM commands, it just slows the
+    // same _sweepWords commands down.
     for (final lat in _sweepLatencies) {
       test(
-        'write latency $lat: the 128-byte block combines and lands',
+        'write latency $lat: the 128-byte block lands correctly',
         () async {
           final r = await _runBlock(
             writeAcceptLatency: lat,
@@ -1270,7 +1376,7 @@ void main() {
             '[128B block, ${_sweepWidth}b, latency=${r.latency}] '
             'cyclesToLand=${r.cyclesToLand} '
             'cyclesPerBeat=${r.cyclesPerBeat.toStringAsFixed(1)} '
-            'wideWrites=${r.wideWrites} (${_sweepBursts} bursts)',
+            'wideWrites=${r.wideWrites} (${_sweepWords} words)',
           );
           expect(
             r.dataOk,
@@ -1282,23 +1388,22 @@ void main() {
       );
     }
 
-    test('combining holds across the controller-latency sweep', () {
+    test('the DRAM write count stays one-per-word across the '
+        'controller-latency sweep', () {
       expect(
         _sweep.length,
         _sweepLatencies.length,
         reason: 'every latency run must have recorded a result',
       );
-      // The 128-byte block is _sweepBursts 16-byte bursts. Allow the one tail
-      // idle-flush plus a small margin. Crucially this ceiling does NOT grow
-      // with latency, which is the whole point of the streaming + combining
-      // fix: the DRAM command count is decoupled from the controller latency.
-      final ceiling = _sweepBursts + 4;
+      // Each of the _sweepWords single-beat writes is its own last beat, so
+      // it costs its own DRAM write at every latency: the count does not
+      // grow with latency, only the time each command takes does.
       for (final r in _sweep) {
         expect(
           r.wideWrites,
-          lessThanOrEqualTo(ceiling),
+          _sweepWords,
           reason:
-              'wideWrites must stay near one-per-burst at latency='
+              'wideWrites must stay at one per word at latency='
               '${r.latency}, not scale with it (got ${r.wideWrites})',
         );
       }
@@ -1331,7 +1436,11 @@ void main() {
   group(
     'read-back barrier makes data-done mean durable (DMA-read coherency)',
     () {
-      const lat = 200; // a slow controller: posted writes lag the SD receive
+      // Single-beat writes no longer combine, so each of the 128 words pays
+      // its own controller-accept latency. 100 still backs up the posted CDC
+      // FIFO enough to show the bug, but stays inside the barrier's fixed
+      // 256-cycle wait; 200 (the old value) does not.
+      const lat = 100;
       test(
         'WITHOUT the barrier, data-done fires before the block lands (the bug)',
         () async {

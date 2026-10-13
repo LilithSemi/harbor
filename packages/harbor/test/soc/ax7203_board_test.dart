@@ -161,7 +161,6 @@ HarborSoC _soc(HarborFpgaTarget target, {bool withDdr = true}) {
   final soc = HarborSoC(
     name: 'Ax7203Soc',
     compatible: 'test,ax7203-soc',
-    busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
     target: target,
     externalReset: true,
     clocks: [
@@ -196,7 +195,6 @@ HarborSoC _soc(HarborFpgaTarget target, {bool withDdr = true}) {
         busDataWidth: 32,
         target: target,
         ckPeriodPs: (1000000 / tree.ddrCkMhz).round(),
-        postedWrites: false,
       ),
     );
     ddr.input('ddr_clk').srcConnection! <= tree.controllerClk;

@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -73,9 +74,20 @@ class HarborI2cController extends BridgeModule
     this.clockFrequency = 0,
     this.busAddressWidth = 12,
     this.busDataWidth = 32,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborI2cController', name: name ?? 'i2c') {
+  }) : super(
+         harborStableDefinitionName('HarborI2cController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth,
+             dataWidth: busDataWidth,
+             cross: crossFabricClock,
+           ),
+         ]),
+         name: name ?? 'i2c',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -95,15 +107,19 @@ class HarborI2cController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     final sclOut = output('scl_out');
     final sclOe = output('scl_oe');
     final sdaOut = output('sda_out');
@@ -503,14 +519,15 @@ class HarborI2cController extends BridgeModule
                     then: [cmdDone < Const(0), cmdRejected < Const(0)],
                   ),
                 ]),
-                // 0x10: DATA
+                // 0x10: DATA. A read pops the RX byte, so it only does that
+                // when its own lane is selected.
                 CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
                     then: [txData < bus.selMerge(txData, 0x10)],
                     orElse: [
                       bus.dataOut < rxData.zeroExtend(dw),
-                      rxReady < Const(0),
+                      If(bus.selAny(0x10, 1), then: [rxReady < Const(0)]),
                     ],
                   ),
                 ]),

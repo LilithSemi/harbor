@@ -4,6 +4,7 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../util/reg_bus.dart';
 import 'usb_test_host.dart';
 
 // Shared fixtures for the usb_controller_*_test.dart files. Kept out of a
@@ -43,15 +44,25 @@ class _UsbWbMaster extends BridgeModule {
   }
 }
 
-/// Wraps [HarborUsbController] with a Wishbone test master on the bus
+/// Wraps [HarborUsbController] with a register-bus test master on the bus
 /// clock and exposes the line pins for a [UsbTestHost].
+///
+/// [kind] picks the register port's fabric. Wishbone (the default) pulls the
+/// raw port signals up to the harness (`cyc`, `adr`, `sel`, `ack`, `dat_in`,
+/// ...) for tests that drive them directly. Any other kind is driven through
+/// [RegBus], attached once [build] is called.
 class UsbControllerHarness extends BridgeModule {
   final int numEndpoints;
-  late final _UsbWbMaster _master;
+  final HarborFabricKind kind;
+  late final HarborUsbController usb;
+  _UsbWbMaster? _master;
+  RegBus? _regBus;
 
   UsbControllerHarness({
     this.numEndpoints = 4,
     int localResetDetachUs = 10000,
+    this.kind = HarborFabricKind.wishbone,
+    int busDataWidth = 32,
     String? name,
   }) : super('UsbControllerHarness', name: name ?? 'ctrl_h') {
     createPort('clk', PortDirection.input);
@@ -66,10 +77,12 @@ class UsbControllerHarness extends BridgeModule {
     addOutput('interrupt');
     addOutput('usb_pullup');
 
-    final usb = HarborUsbController(
+    usb = HarborUsbController(
       baseAddress: 0,
       numEndpoints: numEndpoints,
       localResetDetachUs: localResetDetachUs,
+      fabricKind: kind,
+      busDataWidth: busDataWidth,
       name: 'usb',
     );
     addSubModule(usb);
@@ -80,20 +93,23 @@ class UsbControllerHarness extends BridgeModule {
     usb.input('dp').srcConnection! <= input('dp');
     usb.input('dm').srcConnection! <= input('dm');
 
-    final wb = usb.interface('bus').internalInterface! as WishboneInterface;
-    _master = _UsbWbMaster(config: wb.config);
-    addSubModule(_master);
-    _master.input('clk').srcConnection! <= input('clk');
-    connectInterfaces(_master.interface('bus'), usb.interface('bus'));
+    if (kind == HarborFabricKind.wishbone) {
+      final wb = usb.interface('bus').internalInterface! as WishboneInterface;
+      final master = _UsbWbMaster(config: wb.config);
+      _master = master;
+      addSubModule(master);
+      master.input('clk').srcConnection! <= input('clk');
+      connectInterfaces(master.interface('bus'), usb.interface('bus'));
 
-    pullUpPort(_master.port('m_cyc'), newPortName: 'cyc');
-    pullUpPort(_master.port('m_stb'), newPortName: 'stb');
-    pullUpPort(_master.port('m_we'), newPortName: 'we');
-    pullUpPort(_master.port('m_adr'), newPortName: 'adr');
-    pullUpPort(_master.port('m_dat_out'), newPortName: 'dat_out');
-    pullUpPort(_master.port('m_sel'), newPortName: 'sel');
-    pullUpPort(_master.port('m_dat_in'), newPortName: 'dat_in');
-    pullUpPort(_master.port('m_ack'), newPortName: 'ack');
+      pullUpPort(master.port('m_cyc'), newPortName: 'cyc');
+      pullUpPort(master.port('m_stb'), newPortName: 'stb');
+      pullUpPort(master.port('m_we'), newPortName: 'we');
+      pullUpPort(master.port('m_adr'), newPortName: 'adr');
+      pullUpPort(master.port('m_dat_out'), newPortName: 'dat_out');
+      pullUpPort(master.port('m_sel'), newPortName: 'sel');
+      pullUpPort(master.port('m_dat_in'), newPortName: 'dat_in');
+      pullUpPort(master.port('m_ack'), newPortName: 'ack');
+    }
 
     output('dp_out') <= usb.output('dp_out');
     output('dm_out') <= usb.output('dm_out');
@@ -102,8 +118,28 @@ class UsbControllerHarness extends BridgeModule {
     output('usb_pullup') <= usb.output('usb_pullup');
   }
 
+  /// Attaches the [RegBus] driving [usb]'s register port. Call before
+  /// [build], and only when [kind] is not [HarborFabricKind.wishbone].
+  void attachRegBus(Logic clk) {
+    _regBus = RegBus.attach(usb, clk);
+  }
+
+  /// Puts the register port in its idle state. Call after [build].
+  void idleBus() {
+    if (kind == HarborFabricKind.wishbone) {
+      input('cyc').inject(0);
+      input('stb').inject(0);
+      input('we').inject(0);
+      input('adr').inject(0);
+      input('dat_out').inject(0);
+      input('sel').inject(0xf);
+    } else {
+      _regBus!.idle();
+    }
+  }
+
   int get _selWidth =>
-      (_master.interface('bus').internalInterface! as WishboneInterface)
+      (_master!.interface('bus').internalInterface! as WishboneInterface)
           .config
           .effectiveSelWidth;
   int get _fullSel => (1 << _selWidth) - 1;
@@ -116,6 +152,11 @@ class UsbControllerHarness extends BridgeModule {
   /// Always settles the bus clock for one cycle first. The extra cycle is
   /// harmless either way. [sel] selects the byte lanes, all lanes if null.
   Future<void> write(Logic clk, int address, int data, {int? sel}) async {
+    if (kind != HarborFabricKind.wishbone) {
+      await clk.nextPosedge;
+      await _regBus!.write(address, data, sel: sel);
+      return;
+    }
     await clk.nextPosedge;
     input('cyc').put(1);
     input('stb').put(1);
@@ -142,14 +183,19 @@ class UsbControllerHarness extends BridgeModule {
 
   /// Performs a bus read and returns the data.
   ///
-  /// See [write]: it also settles the bus clock for one cycle first.
-  Future<int> read(Logic clk, int address) async {
+  /// See [write]: it also settles the bus clock for one cycle first. [sel]
+  /// selects the byte lanes carried with the read, all lanes if null.
+  Future<int> read(Logic clk, int address, {int? sel}) async {
+    if (kind != HarborFabricKind.wishbone) {
+      await clk.nextPosedge;
+      return _regBus!.read(address, sel: sel);
+    }
     await clk.nextPosedge;
     input('cyc').put(1);
     input('stb').put(1);
     input('we').put(0);
     input('adr').put(address);
-    input('sel').put(_fullSel);
+    input('sel').put(sel ?? _fullSel);
 
     var guard = 0;
     while (!(ack.value.isValid && ack.value.toInt() == 1)) {
@@ -217,10 +263,14 @@ buildUsbControllerHarness({
   int busPeriod = 20,
   int usbPeriod = 10,
   int localResetDetachUs = 10000,
+  HarborFabricKind kind = HarborFabricKind.wishbone,
+  int busDataWidth = 32,
 }) async {
   final dut = UsbControllerHarness(
     numEndpoints: numEndpoints,
     localResetDetachUs: localResetDetachUs,
+    kind: kind,
+    busDataWidth: busDataWidth,
   );
 
   final clk = SimpleClockGenerator(busPeriod).clk;
@@ -236,6 +286,10 @@ buildUsbControllerHarness({
   dut.input('usb_reset').srcConnection! <= usbReset;
   dut.input('dp').srcConnection! <= dp;
   dut.input('dm').srcConnection! <= dm;
+
+  if (kind != HarborFabricKind.wishbone) {
+    dut.attachRegBus(clk);
+  }
 
   final host = UsbTestHost(
     clk: usbClk,
@@ -254,12 +308,7 @@ buildUsbControllerHarness({
   usbReset.inject(1);
   dp.inject(1);
   dm.inject(0);
-  dut.input('cyc').inject(0);
-  dut.input('stb').inject(0);
-  dut.input('we').inject(0);
-  dut.input('adr').inject(0);
-  dut.input('dat_out').inject(0);
-  dut.input('sel').inject(0xf);
+  dut.idleBus();
 
   Simulator.setMaxSimTime(maxSimTime);
   unawaited(Simulator.run());

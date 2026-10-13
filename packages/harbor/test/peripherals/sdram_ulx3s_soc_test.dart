@@ -26,7 +26,6 @@ void main() {
     final soc = HarborSoC(
       name: 'SdramUlx3sSoC',
       compatible: 'test,sdram-ulx3s',
-      busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
       target: target,
       clocks: [
         const HarborClockConfig(

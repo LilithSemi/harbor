@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../bus/wishbone/wishbone_interface.dart';
@@ -38,11 +39,12 @@ class HarborSpiController extends BridgeModule
   /// Data width in bits (typically 8).
   final int spiDataWidth;
 
-  /// Wishbone slave address width. Defaults to 12 (the 0x1000 window).
+  /// Register slave address width. Defaults to 12 (the 0x1000 window).
   final int busAddressWidth;
 
-  /// Wishbone slave data width. Must match the SoC fabric (e.g. 64 on an RV64
-  /// SoC). The register file itself is 32-bit; wider buses zero-extend reads.
+  /// Register slave data width. Must match the SoC fabric (e.g. 64 on an
+  /// RV64 SoC). The register file itself is 32-bit; wider buses zero-extend
+  /// reads.
   final int busDataWidth;
 
   /// When true, an SD/MMC card is wired to chip select 0 in SPI mode. The
@@ -95,9 +97,24 @@ class HarborSpiController extends BridgeModule
     this.dma = false,
     this.dmaAddressWidth = 32,
     this.clockFrequency = 0,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborSpiController', name: name ?? 'spi') {
+  }) : super(
+         harborStableDefinitionName('HarborSpiController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth,
+             dataWidth: busDataWidth,
+             cross: crossFabricClock,
+           ),
+           'cs$csCount',
+           'sd$spiDataWidth',
+           if (dma) 'dma',
+           if (dma) 'da$dmaAddressWidth',
+         ]),
+         name: name ?? 'spi',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -133,15 +150,19 @@ class HarborSpiController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     final miso = input('spi_miso');
 
     // Control register fields
@@ -392,20 +413,28 @@ class HarborSpiController extends BridgeModule
                   else
                     bus.dataOut < status,
                 ]),
-                // 0x10: DATA
+                // 0x10: DATA. A write starts a transfer, so a write with no
+                // byte selected (SEL 0) must not touch the shift register or
+                // kick off a transfer. A read pops the RX byte, so it only
+                // does that when its own lane is selected.
                 CaseItem(Const(0x10, width: 12), [
                   If(
                     bus.we,
                     then: [
-                      shiftReg < bus.selMerge(shiftReg, 0x10),
-                      busy < Const(1),
-                      txEmpty < Const(0),
-                      bitCount < Const(0, width: 4),
-                      divCount < divider,
+                      If(
+                        bus.selAny(0x10, 1),
+                        then: [
+                          shiftReg < bus.selMerge(shiftReg, 0x10),
+                          busy < Const(1),
+                          txEmpty < Const(0),
+                          bitCount < Const(0, width: 4),
+                          divCount < divider,
+                        ],
+                      ),
                     ],
                     orElse: [
                       bus.dataOut < rxData.zeroExtend(dw),
-                      rxReady < Const(0),
+                      If(bus.selAny(0x10, 1), then: [rxReady < Const(0)]),
                     ],
                   ),
                 ]),

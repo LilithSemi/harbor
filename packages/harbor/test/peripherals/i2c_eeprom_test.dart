@@ -4,6 +4,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 // Register byte offsets, same map as i2c_test.dart.
 const _ctrl = 0x00;
 const _status = 0x08;
@@ -287,42 +289,36 @@ class I2cEepromModel extends Module {
 class _I2cHarness {
   late final Logic clk;
   late final Logic reset;
-  late final Logic stb;
-  late final Logic we;
-  late final Logic adr;
-  late final Logic mosi;
   late final Logic sclLine;
   late final Logic sdaLine;
   late final HarborI2cController i2c;
   late final I2cEepromModel slave;
+  late final RegBus bus;
 
   Future<void> init({
     required List<int> pattern,
     bool stretch = false,
     int prescale = 4,
+    HarborFabricKind kind = HarborFabricKind.wishbone,
+    int busDataWidth = 32,
   }) async {
-    i2c = HarborI2cController(baseAddress: 0x6000);
+    await Simulator.reset();
+    i2c = HarborI2cController(
+      baseAddress: 0x6000,
+      fabricKind: kind,
+      busDataWidth: busDataWidth,
+    );
 
     clk = SimpleClockGenerator(10).clk;
     reset = Logic(name: 'reset');
-    stb = Logic(name: 'stb');
-    we = Logic(name: 'we');
-    adr = Logic(name: 'adr', width: 12);
-    mosi = Logic(name: 'mosi', width: 32);
     sclLine = Logic(name: 'scl_line');
     sdaLine = Logic(name: 'sda_line');
 
     i2c.input('clk').srcConnection! <= clk;
     i2c.input('reset').srcConnection! <= reset;
-    i2c.input('bus_CYC').srcConnection! <= stb;
-    i2c.input('bus_STB').srcConnection! <= stb;
-    i2c.input('bus_WE').srcConnection! <= we;
-    i2c.input('bus_ADR').srcConnection! <= adr;
-    i2c.input('bus_DAT_MOSI').srcConnection! <= mosi;
-    i2c.input('bus_SEL').srcConnection! <=
-        Const(-1, width: i2c.input('bus_SEL').width);
     i2c.input('scl_in').srcConnection! <= sclLine;
     i2c.input('sda_in').srcConnection! <= sdaLine;
+    bus = RegBus.attach(i2c, clk);
 
     await i2c.build();
 
@@ -342,10 +338,7 @@ class _I2cHarness {
     sdaLine <= ~(i2c.output('sda_oe') | slave.sdaOe);
 
     reset.inject(1);
-    stb.inject(0);
-    we.inject(0);
-    adr.inject(0);
-    mosi.inject(0);
+    bus.idle();
     Simulator.setMaxSimTime(2000000);
     unawaited(Simulator.run());
     await clk.nextPosedge;
@@ -357,33 +350,9 @@ class _I2cHarness {
     await busWrite(_ctrl, 0x1); // enable
   }
 
-  Future<void> busWrite(int addr, int data) async {
-    adr.inject(addr);
-    mosi.inject(data);
-    we.inject(1);
-    stb.inject(1);
-    await clk.nextPosedge;
-    while (i2c.output('bus_ACK').value.toInt() != 1) {
-      await clk.nextPosedge;
-    }
-    stb.inject(0);
-    we.inject(0);
-    await clk.nextPosedge;
-  }
+  Future<void> busWrite(int addr, int data) => bus.write(addr, data);
 
-  Future<int> busRead(int addr) async {
-    adr.inject(addr);
-    we.inject(0);
-    stb.inject(1);
-    await clk.nextPosedge;
-    while (i2c.output('bus_ACK').value.toInt() != 1) {
-      await clk.nextPosedge;
-    }
-    final v = i2c.output('bus_DAT_MISO').value.toInt();
-    stb.inject(0);
-    await clk.nextPosedge;
-    return v;
-  }
+  Future<int> busRead(int addr, {int? sel}) => bus.read(addr, sel: sel);
 
   /// Issues a CMD and waits for cmd_done, returning the STATUS value seen
   /// (cmd_done still set) and the simulated time (in Simulator.time units)
@@ -407,17 +376,26 @@ class _I2cHarness {
 }
 
 void main() {
+  for (final kind in HarborFabricKind.values) {
+    _eepromTests(kind);
+  }
+}
+
+void _eepromTests(HarborFabricKind kind) {
   tearDown(() async {
     await Simulator.reset();
   });
 
-  group('I2C EDID read against a behavioral EEPROM slave', () {
+  group('I2C EDID read against a behavioral EEPROM slave (${kind.name})', () {
+    // The full 128 byte read is long. It runs on Wishbone only, because it
+    // checks the I2C engine and not the bus port.
     test(
       'reads all 128 bytes in one transaction, NACKs the last, then STOPs',
+      skip: kind != HarborFabricKind.wishbone,
       () async {
         final pattern = List<int>.generate(128, (i) => (i * 7 + 3) & 0xFF);
         final h = _I2cHarness();
-        await h.init(pattern: pattern);
+        await h.init(pattern: pattern, kind: kind);
 
         // Address phase: 0x50 << 1 | 1 (read).
         await h.busWrite(_data, 0xA1);
@@ -454,10 +432,39 @@ void main() {
       },
     );
 
+    // DATA's read side effect (the RX pop) must only act on its own lane.
+    // A read of the padding upper half of its 8-byte slot (64-bit bus)
+    // must leave the received byte in place.
+    test('a read of the padding lane of DATA does not pop the RX byte '
+        '(64-bit bus)', () async {
+      final h = _I2cHarness();
+      await h.init(pattern: [0x5a], kind: kind, busDataWidth: 64);
+
+      await h.busWrite(_data, 0xA1);
+      await h.issueCmd(_cmdStart | _cmdWrite);
+      await h.issueCmd(_cmdRead | _cmdNack);
+      expect(
+        await h.busRead(_status) & 0x10,
+        equals(0x10),
+        reason: 'rx_ready should be set',
+      );
+
+      // A read of the upper lane does not pop it.
+      await h.busRead(_data, sel: 0xf0);
+      expect(await h.busRead(_status) & 0x10, equals(0x10));
+
+      // Reading DATA's own lane pops it and returns the byte.
+      expect(await h.busRead(_data, sel: 0x0f) & 0xff, equals(0x5a));
+      expect(await h.busRead(_status) & 0x10, equals(0));
+
+      await h.issueCmd(_cmdStop);
+      await Simulator.endSimulation();
+    });
+
     test('ack_received reflects a real address NACK', () async {
       final pattern = List<int>.generate(128, (i) => i & 0xFF);
       final h = _I2cHarness();
-      await h.init(pattern: pattern);
+      await h.init(pattern: pattern, kind: kind);
 
       // Address 0x55 (not the EEPROM's 0x50): no slave answers.
       await h.busWrite(_data, 0xAB);
@@ -477,13 +484,19 @@ void main() {
       final pattern = List<int>.generate(128, (i) => i & 0xFF);
 
       final baseline = _I2cHarness();
-      await baseline.init(pattern: pattern, stretch: false);
+      await baseline.init(pattern: pattern, stretch: false, kind: kind);
       await baseline.busWrite(_data, 0xA1);
       final baseResult = await baseline.issueCmd(_cmdStart | _cmdWrite);
       expect(baseResult.status & _stAck, equals(_stAck));
+      await Simulator.endSimulation();
+
+      // A fresh simulator for the second harness: ROHD's Simulator is a
+      // single global instance, so one test driving two DUTs in turn must
+      // reset it between them.
+      await Simulator.reset();
 
       final stretched = _I2cHarness();
-      await stretched.init(pattern: pattern, stretch: true);
+      await stretched.init(pattern: pattern, stretch: true, kind: kind);
       await stretched.busWrite(_data, 0xA1);
       final stretchResult = await stretched.issueCmd(_cmdStart | _cmdWrite);
 

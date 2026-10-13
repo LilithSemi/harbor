@@ -1,19 +1,28 @@
 import 'dart:io';
+import 'dart:math' show max;
 
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../bus/axi4/axi4_interface.dart';
+import '../bus/axi4/axi4_lite_interface.dart';
 import '../bus/bus.dart';
 import '../bus/bus_error_source.dart';
+import '../bus/bus_slave_port.dart';
+import '../bus/fabric.dart';
+import '../bus/tilelink/tilelink_interface.dart';
 import '../bus/wishbone/wishbone_arbiter.dart';
-import '../bus/wishbone/wishbone_connect.dart';
-import '../bus/wishbone/wishbone_decoder.dart';
-import '../bus/wishbone/wishbone_register_stage.dart';
 import '../bus/wishbone/wishbone_interface.dart';
+import '../bus/wishbone/wishbone_register_stage.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../clock/clock_domain.dart';
 import '../pdk/klayout.dart';
+import '../peripherals/flash.dart';
 import '../peripherals/harbor_ddr3.dart';
+import '../peripherals/harbor_sdram.dart';
+import '../peripherals/maskrom.dart';
+import '../peripherals/spi_flash.dart';
+import '../peripherals/sram.dart';
 import 'acpi.dart';
 import 'cpu.dart';
 import 'device_tree.dart';
@@ -23,14 +32,13 @@ import 'target.dart';
 
 /// Selects how a slave that more than one fabric channel reaches is shared.
 ///
-/// A channel is one arbiter plus decoder over its own slave subset. When two
-/// channels both reach one slave (for example a DMA channel and the CPU channel
-/// that meet only at memory), that slave has more than one channel decoder that
-/// wants to drive it. The convergence mode says how to merge those drivers.
+/// A channel is a group of masters that reach the same slave subset. When
+/// two channels both reach one slave (for example a DMA channel and the CPU
+/// channel that meet only at memory), the convergence mode says how that
+/// slave takes both.
 enum HarborMemConverge {
-  /// Merge the channels with a [WishboneArbiter] at the shared slave. The
-  /// arbiter grants one channel at a time, so the slave sees one master. This
-  /// is the only mode that is built today.
+  /// The fabric arbitrates the channels at the shared slave, so the slave
+  /// sees one master at a time. This is the only mode that is built today.
   arbiter,
 
   /// Give the shared slave two independent ports (for a true dual-port memory).
@@ -46,15 +54,15 @@ enum HarborMemConverge {
 ///
 /// Provides a declarative API for assembling a RISC-V SoC: add
 /// peripherals and bus masters, and [HarborSoC] auto-wires them
-/// through a bus decoder. For custom topology, drop down to
-/// rohd_bridge's [addSubModule], [connectInterfaces], and
+/// through a [HarborFabric] of [fabricKind]. For custom topology, drop down
+/// to rohd_bridge's [addSubModule], [connectInterfaces], and
 /// [connectPorts] directly.
 ///
 /// ```dart
 /// final soc = HarborSoC(
 ///   name: 'MySoC',
 ///   compatible: 'lilithsemi,creek-v1',
-///   busConfig: WishboneConfig(addressWidth: 32, dataWidth: 32),
+///   fabricKind: HarborFabricKind.wishbone,
 /// );
 ///
 /// // Declarative - auto-wired by address
@@ -69,7 +77,7 @@ enum HarborMemConverge {
 /// // Add a bus master (CPU)
 /// soc.addMaster(myRiverCore);
 ///
-/// // Build the bus fabric (decoder + wiring)
+/// // Build the bus fabric
 /// soc.buildFabric();
 ///
 /// // Generate outputs
@@ -81,8 +89,13 @@ class HarborSoC extends BridgeModule {
   /// Root `compatible` string for the device tree.
   final String compatible;
 
-  /// Bus configuration for the fabric.
-  final Object busConfig;
+  /// The kind of the bus fabric. Every peripheral and master port must be
+  /// native to it.
+  final HarborFabricKind fabricKind;
+
+  /// The topology of the bus fabric. Null picks crossbar when [buildFabric]
+  /// gets more than one channel, else shared.
+  final HarborFabricTopology? fabricTopology;
 
   /// CPU information for the device tree.
   final List<HarborCpu> cpus;
@@ -94,46 +107,41 @@ class HarborSoC extends BridgeModule {
   final List<_SecondarySlave> _secondarySlaves = [];
   final List<_MasterEntry> _masters = [];
 
-  /// The fabric arbiter, exposed after [buildFabric] when there is more than one
-  /// master (null with a single master, which connects to the decoder directly).
-  /// Its `grant` output identifies the master that owns the bus while the
-  /// slave-side CYC is high, which a security peripheral can use as the
-  /// unforgeable source identity. While CYC is low it shows the last owner.
-  WishboneArbiter? fabricArbiter;
+  /// Every bus fabric [buildFabric] built: one, or with channels one per
+  /// channel and one per shared slave.
+  final List<HarborFabricModule> fabrics = [];
 
-  /// Every fabric decoder, filled by [buildFabric].
-  final List<WishboneDecoder> fabricDecoders = [];
+  /// The first fabric, the one of the primary channel. On a shared Wishbone
+  /// fabric its `grant` output shows the master that owns the bus.
+  HarborFabricModule? get fabric => fabrics.firstOrNull;
 
-  /// Sticky error flags of fabric register stages.
+  /// Sticky error flags of the master register stages.
   final List<Logic> _fabricErrorFlags = [];
 
-  /// Fabric links where a slave ERR or RTY folds into ACK with poison data.
-  final List<Logic> _fabricFolds = [];
-
-  /// Adds a `bus_error` output (or [portName]) to the SoC. It goes high after
-  /// an unmapped access, a bus timeout, a slave ERR or RTY that a master sees
-  /// as ACK with poison data, or an error in a peripheral that is a
-  /// [HarborBusErrorSource]. It stays high until reset. Call it after
-  /// [buildFabric].
+  /// Adds a `bus_error` output (or [portName]) to the SoC. It stays high
+  /// until reset once one of these happens:
+  ///
+  /// - a bus timeout cuts a slave off,
+  /// - an error goes to a master that has no error signal, so the master
+  ///   sees a normal response (an unmapped access or a slave error),
+  /// - a master register stage gives such a response,
+  /// - a peripheral that is a [HarborBusErrorSource] flags an error.
+  ///
+  /// An unmapped access from a master that has an error signal gets the
+  /// native decode error and does not set it. Call it after [buildFabric].
   Logic exposeBusError({String portName = 'bus_error'}) {
-    if (fabricDecoders.isEmpty) {
+    if (fabrics.isEmpty) {
       throw StateError('exposeBusError needs buildFabric first');
     }
     final sources = <Logic>[
-      for (final d in fabricDecoders) d.busError,
+      for (final f in fabrics) ...[
+        f.busError,
+        if (f.foldError case final fold?) fold,
+      ],
       ..._fabricErrorFlags,
       for (final e in _peripherals)
         if (e.module case final HarborBusErrorSource m) m.busError,
     ];
-    if (_fabricFolds.isNotEmpty) {
-      final (clk, reset) = defaultClock;
-      final folded = Logic(name: 'bus_fold_error');
-      final fold = _fabricFolds.reduce((a, b) => a | b);
-      Sequential(clk, [
-        If(reset, then: [folded < 0], orElse: [folded < (folded | fold)]),
-      ]);
-      sources.add(folded);
-    }
     final port = addOutput(portName);
     port <= sources.reduce((a, b) => a | b);
     return port;
@@ -249,7 +257,8 @@ class HarborSoC extends BridgeModule {
   HarborSoC({
     required String name,
     required this.compatible,
-    required this.busConfig,
+    this.fabricKind = HarborFabricKind.wishbone,
+    this.fabricTopology,
     this.acpiOemId = 'LILSEM',
     this.acpiOemTableId = 'HARBOR',
     this.svdVendor = 'Lilith Semiconductor',
@@ -459,9 +468,13 @@ class HarborSoC extends BridgeModule {
   ///
   /// Clock and reset are auto-wired. The bus interface is connected
   /// when [buildFabric] is called.
+  ///
+  /// [busTimeoutCycles] sets the timeout of this peripheral on the fabric
+  /// and overrides the one of [buildFabric]. 0 turns it off.
   T addPeripheral<T extends BridgeModule>(
     T peripheral, {
     String? clockDomainName,
+    int? busTimeoutCycles,
   }) {
     if (peripheral is! HarborDeviceTreeNodeProvider) {
       throw ArgumentError(
@@ -476,9 +489,15 @@ class HarborSoC extends BridgeModule {
         module: peripheral,
         addressRange: dt.reg,
         clockDomainName: clockDomainName,
+        busTimeoutCycles: busTimeoutCycles,
       ),
     );
     _wireOnce(peripheral, clockDomainName);
+    if (peripheral.tryInput(BusSlavePort.fabricClkPort) != null) {
+      final (clk, reset) = defaultClock;
+      peripheral.input(BusSlavePort.fabricClkPort).srcConnection! <= clk;
+      peripheral.input(BusSlavePort.fabricResetPort).srcConnection! <= reset;
+    }
 
     // A driver that divides its input clock cannot work without knowing the
     // rate. The peripheral does not know which domain it landed on, the SoC
@@ -526,20 +545,23 @@ class HarborSoC extends BridgeModule {
 
   /// Adds a bus master (e.g., CPU core) to the SoC.
   ///
-  /// [busInterfaceName] is the name of the master's Wishbone provider
-  /// interface (default `'dataBus'`).
+  /// [busInterfaceName] is the name of the master's provider interface
+  /// (default `'dataBus'`). It must be native to [fabricKind].
   ///
   /// When [pipeline] is set, a [WishboneRegisterStage] is interposed on this
-  /// master's leg to the arbiter, so a physically distant master (for example a
-  /// DMA engine at an I/O pad) drives a registered bus instead of a
-  /// die-crossing combinational one. That relieves routing congestion near the
-  /// arbiter at the cost of two extra bus-latency cycles on this master alone.
+  /// master's leg to the fabric, so a physically distant master (for example
+  /// a DMA engine at an I/O pad) drives a registered bus instead of a
+  /// die-crossing combinational one. That costs two extra bus-latency cycles
+  /// on this master alone. It needs a Wishbone fabric.
   ///
-  /// [channel] names the fabric channel this master joins. Masters that share a
-  /// channel share one arbiter plus decoder. A master on its own channel gets
-  /// its own arbiter plus decoder, and meets the other channels only at a slave
-  /// that both channels reach (see [buildFabric]'s `channelSlaves`). The default
-  /// `'primary'` keeps the classic single-fabric SoC.
+  /// [channel] names the fabric channel this master joins. The masters of a
+  /// channel reach the slaves [buildFabric] gives that channel in
+  /// `channelSlaves`. The default `'primary'` keeps the classic SoC.
+  ///
+  /// [memory] marks a memory port (see [HarborFabricMaster.memory]). Null
+  /// picks true for an `Axi4Interface` and false for every other port, so a
+  /// TileLink-UH master must set it. [outstanding] is the most requests in
+  /// flight (see [HarborFabricMaster.outstanding]).
   ///
   /// Clock and reset are auto-wired.
   T addMaster<T extends BridgeModule>(
@@ -548,6 +570,8 @@ class HarborSoC extends BridgeModule {
     String? clockDomainName,
     bool pipeline = false,
     String channel = 'primary',
+    bool? memory,
+    int? outstanding,
   }) {
     _masters.add(
       _MasterEntry(
@@ -555,6 +579,8 @@ class HarborSoC extends BridgeModule {
         busInterfaceName: busInterfaceName,
         pipeline: pipeline,
         channel: channel,
+        memory: memory,
+        outstanding: outstanding,
       ),
     );
     _wireOnce(master, clockDomainName);
@@ -678,41 +704,45 @@ class HarborSoC extends BridgeModule {
     return errors;
   }
 
-  /// Builds the bus fabric connecting masters to peripherals.
+  /// Builds the bus fabric that connects the masters to the peripherals.
   ///
-  /// For each master, creates address-decode logic that routes
-  /// transactions to the correct peripheral based on
-  /// [HarborDeviceTreeNode.reg] address ranges.
+  /// It runs [validate] first and throws a [StateError] for any problem.
+  /// Call it after every [addPeripheral] and [addMaster], before [build].
   ///
-  /// Validates the SoC via [validate] first and throws a [StateError] if any
-  /// problem is found.
+  /// The fabric is a [HarborFabric] of [fabricKind] on the [defaultClock].
+  /// Every master and peripheral port must be native to [fabricKind]. A slave
+  /// sees the offset of the access in its own region, and an access that
+  /// hits no slave ends with the native decode error (see [exposeBusError]
+  /// for masters with no error signal). [HarborSram], [HarborSdram] and the
+  /// [HarborDdr3] data port are memory slaves with their outstanding depth.
   ///
-  /// Must be called after all [addPeripheral] and [addMaster]
-  /// calls, before [build].
-  /// Builds the bus fabric connecting masters to peripherals.
+  /// When [pipeline] is set on a Wishbone fabric, a [WishboneRegisterStage]
+  /// goes in front of every master, so no path from a master through the
+  /// fabric is fully combinational. That costs two cycles per transfer. The
+  /// AXI4 and TileLink fabrics register their edges already, so [pipeline]
+  /// has no effect on them.
   ///
-  /// When [pipeline] is set, a [WishboneRegisterStage] is interposed at the
-  /// decoder's master port, so the master -> arbiter -> decoder -> slave -> back
-  /// path is registered instead of fully combinational. That raises the fabric
-  /// clock ceiling at the cost of two extra cycles of bus latency per transfer.
-  ///
-  /// [channelSlaves] turns the one fabric into N named channels. It maps a
-  /// channel name to the SET of slave module names that channel can reach. Each
-  /// channel gets its own arbiter plus decoder over just those slaves. A slave
-  /// that more than one channel reaches is shared through a convergence arbiter
-  /// (see [converge]). When [channelSlaves] is null there is one `'primary'`
-  /// channel that reaches every slave, which is byte identical to the historic
-  /// fabric. A channel that has masters must appear in [channelSlaves].
+  /// [channelSlaves] maps a channel name to the set of slave module names
+  /// the masters of that channel can reach. A master reaches no other slave.
+  /// When it is null every master reaches every slave. A channel that has
+  /// masters must appear in it, and every slave must be in reach of some
+  /// channel. With more than one channel and no [fabricTopology], each
+  /// channel gets its own shared fabric over its reach set, and each slave
+  /// that more than one channel reaches gets a converge fabric in front of
+  /// it, so the channels move at the same time and meet only there. With a
+  /// [fabricTopology] it is one fabric of that topology with a reach set per
+  /// master.
   ///
   /// [converge] selects how a shared slave merges its channels. Only
   /// [HarborMemConverge.arbiter] is built. The other modes throw
   /// [UnimplementedError].
   ///
-  /// The fabric gets ERR when [busConfig] asks for it or when every master has
-  /// ERR. [busTimeoutCycles] sets the decoder timeout (see
-  /// [WishboneDecoder.timeoutCycles]) and [maxGrantCycles] sets the arbiter
-  /// grant-hold cap (see [WishboneArbiter.maxGrantCycles]). Both are off by
-  /// default.
+  /// [busTimeoutCycles] is the timeout of every slave that does not hold
+  /// memory (see [HarborFabricSlave.timeout]). A slave that times out is cut
+  /// off until reset. Memory (system RAM, SRAM, flash, mask ROM) gets none,
+  /// and [addPeripheral] can set the timeout of one peripheral.
+  /// [maxGrantCycles] sets the Wishbone grant hold cap (see
+  /// [WishboneArbiter.maxGrantCycles]). Both are off by default.
   void buildFabric({
     bool pipeline = false,
     Map<String, Set<String>>? channelSlaves,
@@ -726,65 +756,10 @@ class HarborSoC extends BridgeModule {
     }
 
     if (_peripherals.isEmpty || _masters.isEmpty) return;
-
-    switch (busConfig) {
-      case WishboneConfig wbConfig:
-        _busTimeoutCycles = busTimeoutCycles;
-        _maxGrantCycles = maxGrantCycles;
-        _buildWishboneFabric(
-          _fabricConfig(wbConfig),
-          pipeline: pipeline,
-          channelSlaves: channelSlaves,
-          converge: converge,
-        );
-      default:
-        throw UnsupportedError(
-          'Bus protocol ${busConfig.runtimeType} not yet supported in buildFabric',
-        );
+    if (fabrics.isNotEmpty) {
+      throw StateError('buildFabric was already called');
     }
-  }
 
-  int? _busTimeoutCycles;
-  int? _maxGrantCycles;
-
-  WishboneConfig _masterConfig(_MasterEntry m) =>
-      (m.module.interface(m.busInterfaceName).interface as WishboneInterface)
-          .config;
-
-  // Turn ERR on when every master can take it.
-  WishboneConfig _fabricConfig(WishboneConfig cfg) {
-    if (cfg.useErr) return cfg;
-    final allErr = _masters.every((m) => _masterConfig(m).useErr);
-    return allErr ? cfg.copyWith(useErr: true) : cfg;
-  }
-
-  WishboneDecoder _newDecoder(
-    WishboneConfig wbConfig,
-    List<HarborAddressMapping> mappings, {
-    String name = 'wishbone_decoder',
-  }) {
-    final decoder = WishboneDecoder(
-      wbConfig,
-      mappings,
-      timeoutCycles: _busTimeoutCycles,
-      name: name,
-    );
-    addSubModule(decoder);
-    final (clk, reset) = defaultClock;
-    decoder.input('clk').srcConnection! <= clk;
-    decoder.input('reset').srcConnection! <= reset;
-    fabricDecoders.add(decoder);
-    return decoder;
-  }
-
-  void _buildWishboneFabric(
-    WishboneConfig wbConfig, {
-    bool pipeline = false,
-    Map<String, Set<String>>? channelSlaves,
-    HarborMemConverge converge = HarborMemConverge.arbiter,
-  }) {
-    // Primary peripheral buses first, then any secondary slaves (each a distinct
-    // decoder slot). Both feed the same address-decode + connect loop below.
     final slaves =
         <({BridgeModule module, String iface, BusAddressRange range})>[
           for (final e in _peripherals)
@@ -796,271 +771,315 @@ class HarborSoC extends BridgeModule {
               range: s.addressRange,
             ),
         ];
+    String slaveName(int i) => i < _peripherals.length
+        ? slaves[i].module.name
+        : '${slaves[i].module.name}_${slaves[i].iface}';
 
-    // Group masters by channel, keeping the add order inside each channel.
-    final byChannel = <String, List<_MasterEntry>>{};
-    for (final m in _masters) {
-      byChannel.putIfAbsent(m.channel, () => []).add(m);
+    for (final s in slaves) {
+      _checkNative(s.module, s.module.interface(s.iface).interface, 'slave');
     }
-
-    // The set of slave list indices a channel can reach. A null map is the
-    // classic SoC: the one channel reaches every slave.
-    Set<int> reachableFor(String channel) {
-      if (channelSlaves == null) {
-        return {for (var i = 0; i < slaves.length; i++) i};
+    for (final m in _masters) {
+      _checkNative(
+        m.module,
+        m.module.interface(m.busInterfaceName).interface,
+        'master',
+      );
+      if (m.pipeline && fabricKind != HarborFabricKind.wishbone) {
+        throw StateError(
+          'master ${m.module.name}: a pipelined leg is a Wishbone register '
+          'stage, so it needs a Wishbone fabric',
+        );
       }
+    }
+    _checkClockDomains();
+
+    // The slaves each channel reaches. Null when every master reaches all.
+    final channels = {for (final m in _masters) m.channel};
+    Set<String>? reachOf(String channel) {
+      if (channelSlaves == null) return null;
       final names = channelSlaves[channel];
       if (names == null) {
         throw StateError(
           'channel "$channel" has masters but is absent from channelSlaves',
         );
       }
-      return {
+      final reach = {
         for (var i = 0; i < slaves.length; i++)
-          if (names.contains(slaves[i].module.name)) i,
+          if (names.contains(slaves[i].module.name)) slaveName(i),
       };
+      if (reach.isEmpty) {
+        throw StateError('channel "$channel" reaches no slave');
+      }
+      return reach;
     }
 
-    // One channel that reaches every slave is byte identical to the historic
-    // fabric, so take the exact old path. This keeps creek and delta unchanged.
-    final onlyOneChannel = byChannel.length == 1;
-    final singleChannel = byChannel.keys.first;
-    if (onlyOneChannel && reachableFor(singleChannel).length == slaves.length) {
-      _buildSingleChannelWishboneFabric(wbConfig, slaves, pipeline: pipeline);
+    final reach = {for (final c in channels) c: reachOf(c)};
+    if (channelSlaves != null) {
+      final orphans = [
+        for (var i = 0; i < slaves.length; i++)
+          if (!reach.values.any((r) => r!.contains(slaveName(i))))
+            slaves[i].module.name,
+      ];
+      if (orphans.isNotEmpty) {
+        throw StateError(
+          'slaves unreachable from every channel: ${orphans.join(", ")}',
+        );
+      }
+      final shared = [
+        for (var i = 0; i < slaves.length; i++)
+          if (reach.values.where((r) => r!.contains(slaveName(i))).length > 1)
+            i,
+      ];
+      if (shared.isNotEmpty &&
+          channels.length > 1 &&
+          converge != HarborMemConverge.arbiter) {
+        throw UnimplementedError(
+          'converge ${converge.name} not yet implemented',
+        );
+      }
+    }
+
+    final (clk, reset) = defaultClock;
+    PairInterface slaveIntf(int i) =>
+        slaves[i].module.interface(slaves[i].iface).interface;
+    int timeoutOf(int i) {
+      final own = i < _peripherals.length
+          ? _peripherals[i].busTimeoutCycles
+          : null;
+      return own ?? (_isMemory(slaves[i].module) ? 0 : busTimeoutCycles ?? 0);
+    }
+
+    ({bool memory, int outstanding}) shapeOf(int i) =>
+        _slaveShape(slaves[i].module, slaves[i].iface, slaveIntf(i));
+    // The map check takes the largest Wishbone burst block of any slave.
+    final burstBeats = slaves
+        .map(
+          (s) => switch (s.module) {
+            HarborSram(:final wishboneBurstBeats) ||
+            HarborDdr3(:final wishboneBurstBeats) ||
+            HarborSdram(:final wishboneBurstBeats) => wishboneBurstBeats,
+            _ => 8,
+          },
+        )
+        .fold(8, max);
+
+    HarborFabricSlave realSlave(int i) => HarborFabricSlave(
+      name: slaveName(i),
+      range: slaves[i].range,
+      interface: slaveIntf(i),
+      outstanding: shapeOf(i).outstanding,
+      timeout: timeoutOf(i),
+      memory: shapeOf(i).memory,
+      offset: true,
+    );
+
+    // A master takes its module name, or the module name plus its bus
+    // interface name when a slave or another master has that name.
+    final taken = {for (var i = 0; i < slaves.length; i++) slaveName(i)};
+    String masterName(_MasterEntry m) {
+      final base = m.module.name;
+      final name = taken.contains(base)
+          ? '${base}_${m.busInterfaceName}'
+          : base;
+      if (!taken.add(name)) {
+        throw ArgumentError('two fabric masters are named $name');
+      }
+      return name;
+    }
+
+    final masters = <String, List<HarborFabricMaster>>{};
+    for (final m in _masters) {
+      var port = m.module.interface(m.busInterfaceName);
+      if (m.pipeline) port = _registerStage(port);
+      if (pipeline && fabricKind == HarborFabricKind.wishbone) {
+        port = _registerStage(port);
+      }
+      final intf = port.interface;
+      (masters[m.channel] ??= []).add(
+        HarborFabricMaster(
+          name: masterName(m),
+          interface: intf,
+          outstanding: m.outstanding,
+          memory: m.memory ?? intf is Axi4Interface,
+          reach: reach[m.channel],
+        ),
+      );
+    }
+
+    HarborFabricModule build(
+      String name,
+      HarborFabricTopology topology,
+      List<HarborFabricMaster> ms,
+      List<HarborFabricSlave> ss,
+    ) {
+      final f = HarborFabric.build(
+        kind: fabricKind,
+        topology: topology,
+        clk: clk,
+        reset: reset,
+        masters: ms,
+        slaves: ss,
+        wishboneBurstBeats: burstBeats,
+        maxGrantCycles: maxGrantCycles,
+        name: name,
+      );
+      fabrics.add(f);
+      return f;
+    }
+
+    // One fabric, unless channels keep the channel shape: a shared bus per
+    // channel over its reach set, and a converge fabric in front of each
+    // slave that more than one channel reaches.
+    if (channels.length == 1 || fabricTopology != null) {
+      build(
+        'fabric',
+        fabricTopology ?? HarborFabricTopology.shared,
+        [for (final c in channels) ...masters[c]!],
+        [for (var i = 0; i < slaves.length; i++) realSlave(i)],
+      );
       return;
     }
 
-    _buildMultiChannelWishboneFabric(
-      wbConfig,
-      slaves,
-      byChannel,
-      reachableFor,
-      pipeline: pipeline,
-      converge: converge,
-    );
-  }
-
-  /// The historic one-fabric path: all masters -> one arbiter -> one decoder ->
-  /// all slaves. Kept verbatim so its emitted netlist stays byte identical.
-  void _buildSingleChannelWishboneFabric(
-    WishboneConfig wbConfig,
-    List<({BridgeModule module, String iface, BusAddressRange range})> slaves, {
-    bool pipeline = false,
-  }) {
-    final mappings = slaves.indexed
-        .map((e) => HarborAddressMapping(range: e.$2.range, slaveIndex: e.$1))
-        .toList();
-
-    final decoder = _newDecoder(wbConfig, mappings);
-
-    // Whatever drives the decoder's master port: the decoder directly, or a
-    // register slice interposed in front of it when [pipeline] is set.
-    var decoderUpstream = decoder.interface('master');
-    if (pipeline) {
-      final reg = WishboneRegisterStage(config: wbConfig);
-      addSubModule(reg);
-      _fabricErrorFlags.add(reg.output('bus_error'));
-      final (clk, reset) = defaultClock;
-      reg.input('clk').srcConnection! <= clk;
-      reg.input('reset').srcConnection! <= reset;
-      connectInterfaces(reg.interface('down'), decoder.interface('master'));
-      decoderUpstream = reg.interface('up');
-    }
-
-    // One master -> straight to the decoder. Multiple masters -> merge them
-    // through a WishboneArbiter first (round-robin, grant-locked) so they share
-    // the single decoder/peripheral fabric without multi-driving it.
-    if (_masters.length == 1) {
-      _connectFabric(_masterFabricPort(_masters[0], wbConfig), decoderUpstream);
-    } else {
-      final arbiter = WishboneArbiter(
-        numMasters: _masters.length,
-        config: wbConfig,
-        maxGrantCycles: _maxGrantCycles,
-      );
-      fabricArbiter = arbiter;
-      addSubModule(arbiter);
-      final (clk, reset) = defaultClock;
-      arbiter.input('clk').srcConnection! <= clk;
-      arbiter.input('reset').srcConnection! <= reset;
-      for (var i = 0; i < _masters.length; i++) {
-        _connectFabric(
-          _masterFabricPort(_masters[i], wbConfig),
-          arbiter.interface('master_$i'),
-        );
-      }
-      connectInterfaces(arbiter.interface('slave'), decoderUpstream);
-    }
-
-    // Connect decoder's slave interfaces to the primary + secondary slaves.
-    for (var i = 0; i < slaves.length; i++) {
-      _connectFabric(
-        decoder.interface('slave_$i'),
-        slaves[i].module.interface(slaves[i].iface),
-      );
-    }
-  }
-
-  /// The N-channel path. Each channel gets its own arbiter plus decoder over its
-  /// own reachable slave subset. A slave that more than one channel reaches is
-  /// merged by a convergence arbiter at that slave.
-  void _buildMultiChannelWishboneFabric(
-    WishboneConfig wbConfig,
-    List<({BridgeModule module, String iface, BusAddressRange range})> slaves,
-    Map<String, List<_MasterEntry>> byChannel,
-    Set<int> Function(String channel) reachableFor, {
-    bool pipeline = false,
-    HarborMemConverge converge = HarborMemConverge.arbiter,
-  }) {
-    // A channel with masters that is absent from channelSlaves is an error.
-    // reachableFor throws for such a channel, so the loop below surfaces it.
-
-    // Deterministic channel order: 'primary' first when present, then the rest
-    // sorted by name. This fixes the submodule order so regens stay stable.
-    final channelNames = byChannel.keys.toList()
+    final order = channels.toList()
       ..sort((a, b) {
         if (a == b) return 0;
         if (a == 'primary') return -1;
         if (b == 'primary') return 1;
         return a.compareTo(b);
       });
-
-    final (clk, reset) = defaultClock;
-
-    // Each channel decoder's slave port, keyed by global slave index. A slave
-    // with more than one entry is shared and needs a convergence arbiter.
-    final drivers = <int, List<InterfaceReference>>{};
-
-    for (final channel in channelNames) {
-      final masters = byChannel[channel]!;
-      final reachable = reachableFor(channel).toList()..sort();
-      if (reachable.isEmpty) {
-        throw StateError('channel "$channel" reaches no slave');
-      }
-
-      final mappings = [
-        for (final gi in reachable)
-          HarborAddressMapping(range: slaves[gi].range, slaveIndex: gi),
-      ];
-      final decoder = _newDecoder(
-        wbConfig,
-        mappings,
-        name: 'wishbone_decoder_$channel',
-      );
-
-      // Optional per-channel register slice at the decoder master port, same as
-      // the single-channel `pipeline` behaviour.
-      var decoderUpstream = decoder.interface('master');
-      if (pipeline) {
-        final reg = WishboneRegisterStage(config: wbConfig);
-        addSubModule(reg);
-        _fabricErrorFlags.add(reg.output('bus_error'));
-        reg.input('clk').srcConnection! <= clk;
-        reg.input('reset').srcConnection! <= reset;
-        connectInterfaces(reg.interface('down'), decoder.interface('master'));
-        decoderUpstream = reg.interface('up');
-      }
-
-      // One master on the channel -> straight to its decoder. More than one ->
-      // merge them through the channel arbiter first.
-      if (masters.length == 1) {
-        _connectFabric(
-          _masterFabricPort(masters[0], wbConfig),
-          decoderUpstream,
-        );
-      } else {
-        final arbiter = WishboneArbiter(
-          numMasters: masters.length,
-          config: wbConfig,
-          maxGrantCycles: _maxGrantCycles,
-          name: 'wishbone_arbiter_$channel',
-        );
-        addSubModule(arbiter);
-        arbiter.input('clk').srcConnection! <= clk;
-        arbiter.input('reset').srcConnection! <= reset;
-        for (var i = 0; i < masters.length; i++) {
-          _connectFabric(
-            _masterFabricPort(masters[i], wbConfig),
-            arbiter.interface('master_$i'),
-          );
-        }
-        connectInterfaces(arbiter.interface('slave'), decoderUpstream);
-        // Keep fabricArbiter pointing at the primary channel for back-compat.
-        if (channel == 'primary') fabricArbiter = arbiter;
-      }
-
-      for (var k = 0; k < reachable.length; k++) {
-        drivers
-            .putIfAbsent(reachable[k], () => [])
-            .add(decoder.interface('slave_$k'));
-      }
-    }
-
-    // Every slave must be reachable from at least one channel. An orphan slave
-    // would have undriven bus inputs, so fail loudly instead.
-    final orphans = [
-      for (var gi = 0; gi < slaves.length; gi++)
-        if (!drivers.containsKey(gi)) slaves[gi].module.name,
+    List<String> users(int i) => [
+      for (final c in order)
+        if (reach[c]!.contains(slaveName(i))) c,
     ];
-    if (orphans.isNotEmpty) {
-      throw StateError(
-        'slaves unreachable from every channel: ${orphans.join(", ")}',
-      );
-    }
-
-    // Hook each slave up. One driver connects straight. More than one driver
-    // means channels share the slave, so a convergence arbiter merges them.
-    for (var gi = 0; gi < slaves.length; gi++) {
-      final ds = drivers[gi]!;
-      final slaveIface = slaves[gi].module.interface(slaves[gi].iface);
-      if (ds.length == 1) {
-        _connectFabric(ds[0], slaveIface);
-        continue;
-      }
-      if (converge != HarborMemConverge.arbiter) {
-        throw UnimplementedError(
-          'converge ${converge.name} not yet implemented',
+    final legs = <int, List<(String, PairInterface)>>{};
+    for (final c in order) {
+      final ss = <HarborFabricSlave>[];
+      for (var i = 0; i < slaves.length; i++) {
+        if (!reach[c]!.contains(slaveName(i))) continue;
+        if (users(i).length == 1) {
+          ss.add(realSlave(i));
+          continue;
+        }
+        // A leg to the converge fabric. It passes the full address on, and
+        // on Wishbone it has ERR so a cut off reaches the master as ERR.
+        final leg = switch (slaveIntf(i)) {
+          final WishboneInterface w => WishboneInterface(
+            w.config.copyWith(useErr: true),
+          ),
+          final other => other.clone(),
+        };
+        (legs[i] ??= []).add((c, leg));
+        ss.add(
+          HarborFabricSlave(
+            name: slaveName(i),
+            range: slaves[i].range,
+            interface: leg,
+            outstanding: shapeOf(i).outstanding,
+            memory: shapeOf(i).memory,
+          ),
         );
       }
-      final conv = WishboneArbiter(
-        numMasters: ds.length,
-        config: wbConfig,
-        maxGrantCycles: _maxGrantCycles,
-        name: 'wishbone_converge_${slaves[gi].module.name}',
+      build('fabric_$c', HarborFabricTopology.shared, [
+        for (final m in masters[c]!)
+          HarborFabricMaster(
+            name: m.name,
+            interface: m.interface,
+            outstanding: m.outstanding,
+            memory: m.memory,
+          ),
+      ], ss);
+    }
+    for (final MapEntry(key: i, value: ls) in legs.entries) {
+      build(
+        'converge_${slaveName(i)}',
+        HarborFabricTopology.shared,
+        [
+          for (final (c, leg) in ls)
+            HarborFabricMaster(
+              name: c,
+              interface: leg,
+              outstanding: shapeOf(i).outstanding,
+              memory: shapeOf(i).memory,
+            ),
+        ],
+        [realSlave(i)],
       );
-      addSubModule(conv);
-      conv.input('clk').srcConnection! <= clk;
-      conv.input('reset').srcConnection! <= reset;
-      for (var i = 0; i < ds.length; i++) {
-        connectInterfaces(ds[i], conv.interface('master_$i'));
-      }
-      _connectFabric(conv.interface('slave'), slaveIface);
     }
   }
 
-  void _connectFabric(
-    InterfaceReference provider,
-    InterfaceReference consumer,
-  ) {
-    final fold = connectWishbone(provider, consumer);
-    if (fold != null) _fabricFolds.add(fold);
+  // A slave that holds memory, which a SoC-wide timeout leaves out.
+  static bool _isMemory(BridgeModule m) =>
+      m is HarborSystemMemoryProvider ||
+      m is HarborSram ||
+      m is HarborSdram ||
+      m is HarborDdr3 ||
+      m is HarborFlash ||
+      m is HarborSpiFlashController ||
+      m is HarborMaskRom;
+
+  // The memory flag and outstanding depth of a slave port. Other ports are
+  // register ports, except a full AXI4 port.
+  static ({bool memory, int outstanding}) _slaveShape(
+    BridgeModule m,
+    String iface,
+    PairInterface intf,
+  ) => switch (m) {
+    HarborSram() => (memory: true, outstanding: HarborSram.outstanding),
+    HarborDdr3() when iface == 'bus' => (
+      memory: true,
+      outstanding: HarborDdr3.outstanding,
+    ),
+    HarborSdram(:final outstanding) when iface == 'bus' => (
+      memory: true,
+      outstanding: outstanding,
+    ),
+    _ => (memory: intf is Axi4Interface, outstanding: 1),
+  };
+
+  /// Throws when [intf] of [module] is not a port of [fabricKind].
+  void _checkNative(BridgeModule module, PairInterface intf, String role) {
+    final native = switch (fabricKind) {
+      HarborFabricKind.wishbone => intf is WishboneInterface,
+      HarborFabricKind.axi4 =>
+        intf is Axi4Interface || intf is Axi4LiteInterface,
+      HarborFabricKind.tilelink => intf is TileLinkInterface,
+    };
+    if (native) return;
+    final kind = fabricKind.name;
+    final later = switch (module) {
+      _ when role == 'master' && intf is WishboneInterface =>
+        ' Masters get native ports in fabric Task 8, so use a Wishbone '
+            'fabric for now.',
+      _ => '',
+    };
+    throw StateError(
+      '$role ${module.name} has a ${intf.runtimeType} port, but the fabric '
+      'of $name is $kind.$later',
+    );
   }
 
-  /// The interface the fabric (arbiter or lone decoder) connects to for master
-  /// [m]. When the master requested a pipelined leg, a [WishboneRegisterStage]
-  /// is interposed here so its bus to the arbiter is registered rather than a
-  /// long combinational route (see [addMaster]'s `pipeline`). Otherwise the
-  /// master's own bus interface is returned directly.
-  InterfaceReference _masterFabricPort(
-    _MasterEntry m,
-    WishboneConfig wbConfig,
-  ) {
-    final port = m.module.interface(m.busInterfaceName);
-    if (!m.pipeline) return port;
-    final reg = WishboneRegisterStage(
-      config: wbConfig,
-      upConfig: _masterConfig(m),
-    );
+  /// Throws when a peripheral runs on a clock other than the fabric clock
+  /// and has no crossing to it.
+  void _checkClockDomains() {
+    final (fabricClk, _) = defaultClock;
+    for (final e in _peripherals) {
+      final domain = domainFor(e.clockDomainName);
+      if (domain == null || identical(domain.clk, fabricClk)) continue;
+      if (e.module.tryInput(BusSlavePort.fabricClkPort) == null) {
+        throw StateError(
+          'peripheral ${e.module.name} runs on clock domain '
+          '"${e.clockDomainName}", not on the fabric clock. Build it with '
+          'crossFabricClock so its port crosses to the fabric clock.',
+        );
+      }
+    }
+  }
+
+  // Puts a register stage in front of a master port and returns the stage's
+  // fabric side.
+  InterfaceReference _registerStage(InterfaceReference port) {
+    final cfg = (port.interface as WishboneInterface).config;
+    final reg = WishboneRegisterStage(config: cfg);
     addSubModule(reg);
     _fabricErrorFlags.add(reg.output('bus_error'));
     final (clk, reset) = defaultClock;
@@ -1634,7 +1653,11 @@ class _PeripheralEntry {
   /// on rather than assuming the primary.
   final String? clockDomainName;
 
+  /// Fabric timeout of this peripheral, or null for the SoC default.
+  final int? busTimeoutCycles;
+
   const _PeripheralEntry({
+    this.busTimeoutCycles,
     required this.module,
     required this.addressRange,
     this.clockDomainName,
@@ -1660,15 +1683,21 @@ class _MasterEntry {
   final String busInterfaceName;
   final bool pipeline;
 
-  /// The fabric channel this master lives on. Masters on the same channel share
-  /// one arbiter plus decoder. The default `'primary'` keeps every master on
-  /// one channel, which is the classic single-fabric SoC.
+  /// The fabric channel this master lives on.
   final String channel;
+
+  /// Memory port flag, or null to pick from the interface class.
+  final bool? memory;
+
+  /// Most requests in flight, or null for the fabric default.
+  final int? outstanding;
 
   const _MasterEntry({
     required this.module,
     required this.busInterfaceName,
     this.pipeline = false,
     this.channel = 'primary',
+    this.memory,
+    this.outstanding,
   });
 }

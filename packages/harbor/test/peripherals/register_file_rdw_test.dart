@@ -379,22 +379,19 @@ void main() {
     });
   }
 
-  test(
-    'EBR multi-write rejection wins over a bad forceReadLatency',
-    () {
-      // numWritePorts=2 is both an unsupported EBR shape and a latency
-      // mismatch (ECP5 EBR latency is 1). The unsupported-shape error is the
-      // more useful one, so it must be the one thrown.
-      expect(
-        () => HarborRegisterFile(
-          target: _ecp5,
-          numWritePorts: 2,
-          forceReadLatency: 0,
-        ),
-        throwsA(isA<UnimplementedError>()),
-      );
-    },
-  );
+  test('EBR multi-write rejection wins over a bad forceReadLatency', () {
+    // numWritePorts=2 is both an unsupported EBR shape and a latency
+    // mismatch (ECP5 EBR latency is 1). The unsupported-shape error is the
+    // more useful one, so it must be the one thrown.
+    expect(
+      () => HarborRegisterFile(
+        target: _ecp5,
+        numWritePorts: 2,
+        forceReadLatency: 0,
+      ),
+      throwsA(isA<UnimplementedError>()),
+    );
+  });
 
   test('a Xilinx flop shape accepts any forceReadLatency', () {
     final rf = HarborRegisterFile(
@@ -408,10 +405,7 @@ void main() {
   test('every block RAM path has the read-during-write bypass', () async {
     // ECP5 is checked by the traces above, since its sim body gives X on the
     // port collision.
-    const targets = <HarborDeviceTarget>[
-      _ice40,
-      _spartan7,
-    ];
+    const targets = <HarborDeviceTarget>[_ice40, _spartan7];
     for (final t in targets) {
       final rf = HarborRegisterFile(target: t);
       await rf.build();

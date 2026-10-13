@@ -247,7 +247,7 @@ class SdramUlx3sTop extends BridgeModule {
       ready: sdram.output('init_done'),
       ack: sdram.output('bus_ACK'),
       datR: sdram.output('bus_DAT_MISO'),
-      adrWidth: sdram.bus.addr.width,
+      adrWidth: sdram.busAddressWidth,
       words: bistWords,
       addressLineWalk: bistAddressLineWalk,
     );
@@ -257,6 +257,8 @@ class SdramUlx3sTop extends BridgeModule {
     sdram.input('bus_ADR').srcConnection! <= bist.adr;
     sdram.input('bus_DAT_MOSI').srcConnection! <= bist.datW;
     sdram.input('bus_SEL').srcConnection! <= Const(0xf, width: 4);
+    sdram.input('bus_CTI').srcConnection! <= Const(0, width: 3);
+    sdram.input('bus_BTE').srcConnection! <= Const(0, width: 2);
 
     var top = bist.loops[4];
     if (scanout) top = top ^ _scanParity();

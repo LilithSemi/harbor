@@ -1,3 +1,5 @@
+import 'package:rohd/rohd.dart';
+
 import '../util/pretty_string.dart';
 
 /// Describes an analog block's symbol and pin mapping for a specific PDK.
@@ -17,11 +19,25 @@ class AnalogBlock with HarborPrettyString {
   /// Additional instance properties (key=value pairs).
   final Map<String, String> properties;
 
+  /// Harbor pin names whose PDK pin is active low. A driver inverts these,
+  /// so each PDK states its own convention.
+  final Set<String> activeLow;
+
+  /// Integer parameters of the block. An SRAM with a `writeMask` pin gives
+  /// `writeMaskBits`, the data bits that each mask bit covers.
+  final Map<String, int> params;
+
   const AnalogBlock({
     required this.symbolPath,
     required this.pinMapping,
     this.properties = const {},
+    this.activeLow = const {},
+    this.params = const {},
   });
+
+  /// Drives [active] on Harbor pin [name] at the level the PDK pin wants.
+  Logic level(String name, Logic active) =>
+      activeLow.contains(name) ? ~active : active;
 
   @override
   String toString() => 'AnalogBlock($symbolPath)';
@@ -36,8 +52,9 @@ class AnalogBlock with HarborPrettyString {
     buf.writeln('${c}symbol: $symbolPath,');
     buf.writeln('${c}pins: {');
     for (final entry in pinMapping.entries) {
+      final low = activeLow.contains(entry.key) ? ' (active low)' : '';
       buf.writeln(
-        '${options.nested().childPrefix}${entry.key} -> ${entry.value},',
+        '${options.nested().childPrefix}${entry.key} -> ${entry.value}$low,',
       );
     }
     buf.writeln('$c},');

@@ -4,7 +4,9 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-// Register word indices (the bus presents a word index).
+import '../util/reg_bus.dart';
+
+// Register byte offsets: each register in its own 8-byte slot.
 const _intStatus = 0x20;
 const _intEnable = 0x28;
 const _txCtrl = 0x40;
@@ -95,42 +97,39 @@ void main() {
       expect(dt.properties['phy-mode'], equals('rmii'));
       expect(dt.properties['max-speed'], equals(100));
     });
+
+    test('two different parameter sets get different definition names', () {
+      final a = HarborEthernetMac(
+        config: const HarborEthernetConfig(),
+        baseAddress: 0x40000000,
+      );
+      final b = HarborEthernetMac(
+        config: const HarborEthernetConfig(
+          maxSpeed: HarborEthernetSpeed.speed100,
+        ),
+        baseAddress: 0x40000000,
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
   });
 
-  group('HarborEthernetMac MDIO engine', () {
+  for (final kind in HarborFabricKind.values) {
+    _registerTests(kind);
+  }
+}
+
+void _registerTests(HarborFabricKind kind) {
+  group('HarborEthernetMac MDIO engine (${kind.name})', () {
     late HarborEthernetMac eth;
-    late Logic clk, reset, stb, we, adr, mosi, mdioIn;
+    late Logic clk, reset, mdioIn;
     late Logic mdc, mdioOut, mdioOe, irq;
     late Logic txd, txEn, rxdSig, rxDvSig;
     late List<Logic> mem; // 16-word DMA memory model
+    late RegBus bus;
 
-    Future<void> bw(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (eth.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
+    Future<void> bw(int addr, int data) => bus.write(addr, data);
 
-    Future<int> br(int addr) async {
-      adr.inject(addr);
-      we.inject(0);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (eth.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final v = eth.output('bus_DAT_MISO').value.toInt();
-      stb.inject(0);
-      await clk.nextPosedge;
-      return v;
-    }
+    Future<int> br(int addr) => bus.read(addr);
 
     Future<void> setUpDut({List<int> dmaMem = const []}) async {
       eth = HarborEthernetMac(
@@ -138,24 +137,15 @@ void main() {
           maxSpeed: HarborEthernetSpeed.speed100,
         ),
         baseAddress: 0x40000000,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: 32);
       mdioIn = Logic(name: 'mdio_in');
 
       eth.input('clk').srcConnection! <= clk;
       eth.input('reset').srcConnection! <= reset;
-      eth.input('bus_CYC').srcConnection! <= stb;
-      eth.input('bus_STB').srcConnection! <= stb;
-      eth.input('bus_WE').srcConnection! <= we;
-      eth.input('bus_ADR').srcConnection! <= adr;
-      eth.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      eth.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: eth.input('bus_SEL').width);
+      bus = RegBus.attach(eth, clk);
       eth.input('mdio_in').srcConnection! <= mdioIn;
       rxdSig = Logic(name: 'rxd_sig', width: eth.input('rxd').width);
       rxDvSig = Logic(name: 'rx_dv_sig');
@@ -204,10 +194,7 @@ void main() {
       txEn = eth.output('tx_en');
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
+      bus.idle();
       mdioIn.inject(0);
       rxdSig.inject(0);
       rxDvSig.inject(0);
@@ -292,18 +279,10 @@ void main() {
       await bw(_txData, word);
       await bw(_txLen, payload.length);
 
-      // Start the frame inline (no trailing cycle) so capture begins on the
-      // first emitted nibble.
-      adr.inject(_txCtrl);
-      mosi.inject(0x1 | 0x2); // enable + start
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (eth.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
+      // Start the frame and capture concurrently: tx_en does not rise until
+      // the write is acknowledged and the engine has moved on a cycle, so
+      // polling from before the write completes still catches every nibble.
+      unawaited(bw(_txCtrl, 0x1 | 0x2)); // enable + start
 
       // One nibble per cycle on the 4-bit MII bus while tx_en is asserted.
       final nibbles = <int>[];
@@ -469,6 +448,22 @@ void main() {
         equals(payload.length),
       ); // length written back
       expect(await br(_intStatus) & 0x08, equals(0x08)); // RX-done
+      await Simulator.endSimulation();
+    });
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      await bw(_txLen, 0x1234);
+      await bw(_mdioData, 0x5678);
+      await bus.write(_txLen, 0xffff, sel: 0x0);
+      await bus.write(_mdioData, 0xffff, sel: 0x0);
+      await bus.write(_txCtrl, 0x3, sel: 0x0);
+
+      expect(await br(_txLen), equals(0x1234));
+      expect(await br(_mdioData), equals(0x5678));
+      // A write with no byte selected to TX_CTRL must not start a frame.
+      expect(txEn.value.toInt(), equals(0));
       await Simulator.endSimulation();
     });
   });

@@ -17,9 +17,7 @@ void main() {
 
   test('a down-side useErr difference changes the definitionName', () {
     final plain = WishboneRegisterStage(config: base);
-    final withErr = WishboneRegisterStage(
-      config: base.copyWith(useErr: true),
-    );
+    final withErr = WishboneRegisterStage(config: base.copyWith(useErr: true));
     expect(plain.definitionName, isNot(equals(withErr.definitionName)));
   });
 
@@ -34,18 +32,12 @@ void main() {
 
   test('useRty, useCti+useBte and tag widths each change the name', () {
     final plain = WishboneRegisterStage(config: base);
-    final withRty = WishboneRegisterStage(
-      config: base.copyWith(useRty: true),
-    );
+    final withRty = WishboneRegisterStage(config: base.copyWith(useRty: true));
     final withCtiBte = WishboneRegisterStage(
       config: base.copyWith(useCti: true, useBte: true),
     );
-    final withTga = WishboneRegisterStage(
-      config: base.copyWith(tgaWidth: 4),
-    );
-    final withTgd = WishboneRegisterStage(
-      config: base.copyWith(tgdWidth: 8),
-    );
+    final withTga = WishboneRegisterStage(config: base.copyWith(tgaWidth: 4));
+    final withTgd = WishboneRegisterStage(config: base.copyWith(tgdWidth: 8));
     final names = {
       plain.definitionName,
       withRty.definitionName,

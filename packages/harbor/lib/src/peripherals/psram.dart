@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -93,11 +94,23 @@ class HarborPsramController extends BridgeModule
   HarborPsramController({
     required this.config,
     required this.baseAddress,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     int? busAddressWidth,
     int? busDataWidth,
     String? name,
-  }) : super('HarborPsramController', name: name ?? 'psram') {
+  }) : super(
+         harborStableDefinitionName('HarborPsramController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth ?? 32,
+             dataWidth: busDataWidth ?? 32,
+             cross: crossFabricClock,
+           ),
+           config.mode.name,
+         ]),
+         name: name ?? 'psram',
+       ) {
     final quad = config.mode == HarborPsramMode.quad;
 
     createPort('clk', PortDirection.input);
@@ -118,15 +131,19 @@ class HarborPsramController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: addrWidth,
       dataWidth: busDataWidth ?? 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Standard SPI command/opcode bytes.
     const cmdWrite = 0x02;
@@ -327,14 +344,22 @@ class HarborPsramController extends BridgeModule
                     If(
                       valid & ~busAckReg,
                       then: [
-                        state < Const(sSelect, width: 3),
-                        xferCycles < Const(0, width: 6),
-                        orphan < Const(0),
-                        weR < write,
-                        wordAddrR < wordAddr,
-                        byteOffsetR < byteOffset,
-                        wrBufferR < wrBuffer,
-                        wrCyclesR < wrCycles,
+                        If(
+                          write & ~sel.or(),
+                          // No byte selected: ack right away and touch
+                          // nothing in the PSRAM.
+                          then: [busAckReg < Const(1)],
+                          orElse: [
+                            state < Const(sSelect, width: 3),
+                            xferCycles < Const(0, width: 6),
+                            orphan < Const(0),
+                            weR < write,
+                            wordAddrR < wordAddr,
+                            byteOffsetR < byteOffset,
+                            wrBufferR < wrBuffer,
+                            wrCyclesR < wrCycles,
+                          ],
+                        ),
                       ],
                     ),
                   ]),

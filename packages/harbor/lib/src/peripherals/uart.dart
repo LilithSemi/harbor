@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -54,9 +55,20 @@ class HarborUart extends BridgeModule
     this.clockFrequency = 0,
     int? busAddressWidth,
     this.busDataWidth,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborUart', name: name ?? 'uart') {
+  }) : super(
+         harborStableDefinitionName('HarborUart', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth ?? 12,
+             dataWidth: busDataWidth ?? 8,
+             cross: crossFabricClock,
+           ),
+         ]),
+         name: name ?? 'uart',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('rx', PortDirection.input);
@@ -66,16 +78,20 @@ class HarborUart extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       // The full 0x1000 window, so no address in it aliases a register.
       addressWidth: busAddressWidth ?? 12,
       dataWidth: busDataWidth ?? 8,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     // The bus carries word-aligned addresses with the byte position encoded
     // in the SEL lanes (ns16550a registers are byte-mapped). Writes decode
     // the active lane back into a register index and take their data from
@@ -115,6 +131,10 @@ class HarborUart extends BridgeModule
     // window read 0 and ignore writes. Address bits above the window are
     // ignored, so absolute and window-relative addresses both work.
     final inWindow = bus.inSpan(8, 0x1000).named('uart_in_window');
+    // Every UART register is one byte. A write that selects no byte at all
+    // (AXI4 WSTRB 0) must change nothing, instead of falling through to lane
+    // 0 of a wide bus by default.
+    final anySel = bus.sel.or().named('uart_any_sel');
     final datOutW = Logic(name: 'uart_dat_out', width: bus.dataOut.width);
     bus.dataOut <= datOutW;
     final ack = bus.ack;
@@ -191,7 +211,8 @@ class HarborUart extends BridgeModule
     // Read mux. On a multi-byte bus every byte register of the addressed word
     // is returned in its lane and the master extracts the byte it wants. On a
     // byte-wide bus each register is returned individually. Only a read that
-    // selects byte lane 0 (the RBR) pops the receive buffer.
+    // selects the RBR lane pops the receive buffer, so a read of IER, IIR or
+    // LCR in the same word does not.
     final List<Conditional> readItems;
     if (lanes == 1) {
       readItems = [
@@ -379,7 +400,7 @@ class HarborUart extends BridgeModule
               ack < Const(1),
 
               If(
-                inWindow & we,
+                inWindow & we & anySel,
                 then: [
                   Case(addr, [
                     // 0x0: THR/DLL
@@ -405,7 +426,7 @@ class HarborUart extends BridgeModule
                     CaseItem(Const(7, width: 3), [scr < datIn]),
                   ]),
                 ],
-                orElse: [If(inWindow, then: readItems)],
+                orElse: [If(inWindow & ~we, then: readItems)],
               ),
             ],
           ),

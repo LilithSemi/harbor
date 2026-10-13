@@ -40,6 +40,8 @@ void main() {
       sAddr: sAddr,
       sData: sData,
       sSel: sSel,
+      // Not last, so the writes combine. The mock holds one write at a time.
+      sLast: Const(0),
       mStall: mStall,
       mAck: mAck,
       mAckAux: mAckAux,
@@ -553,6 +555,45 @@ void main() {
       });
     }
   });
+
+  group('write order point', () {
+    // The write is held in the controller for longer than the drain, the way
+    // a refresh holds it. The adapter must keep cyc up until the write lands.
+    test(
+      'pass-through: a second port reads the write right after its ack',
+      () async {
+        final b = _OrderBench(writeCombine: false, commitCycles: 40);
+        await b.start();
+        await b.busWrite(0x40, 0x600DF00D, last: true);
+        expect(await b.portRead(0x40), 0x600DF00D);
+        await b.stop();
+      },
+    );
+
+    test('combining: the last write is flushed before its ack', () async {
+      final b = _OrderBench(writeCombine: true, commitCycles: 4);
+      await b.start();
+      await b.busWrite(0x40, 0x600DF00D, last: true);
+      expect(await b.portRead(0x40), 0x600DF00D);
+      await b.stop();
+    });
+
+    test(
+      'combining: a 4 beat request is one command and lands before its ack',
+      () async {
+        final b = _OrderBench(writeCombine: true, commitCycles: 4);
+        await b.start();
+        for (var i = 0; i < 4; i++) {
+          await b.busWrite(0x80 + i * 4, 0xA0000000 | i, last: i == 3);
+        }
+        for (var i = 0; i < 4; i++) {
+          expect(await b.portRead(0x80 + i * 4), 0xA0000000 | i);
+        }
+        expect(b.wideWrites, 1);
+        await b.stop();
+      },
+    );
+  });
 }
 
 /// Drives the adapter against a procedural mock of the wide controller side.
@@ -579,6 +620,9 @@ class _Harness {
   final Logic sAddr = Logic(width: busAddrW)..inject(0);
   final Logic sData = Logic(width: 32)..inject(0);
   final Logic sSel = Logic(width: 4)..inject(0);
+
+  /// Low, so a combined write stays held as it does mid burst.
+  final Logic sLast = Logic()..inject(0);
   final Logic mStall = Logic()..inject(0);
   final Logic mAck = Logic()..inject(0);
   final Logic mAckAux = Logic(width: 4)..inject(0);
@@ -618,6 +662,7 @@ class _Harness {
       sAddr: sAddr,
       sData: sData,
       sSel: sSel,
+      sLast: sLast,
       mStall: mStall,
       mAck: mAck,
       mAckAux: mAckAux,
@@ -803,5 +848,152 @@ class _AckPipe {
       aux.inject(e.$2);
       ack.inject(1);
     }
+  }
+}
+
+/// The adapter on one port of a controller model, with a second port that
+/// models another arbiter port such as scanout.
+///
+/// The model keeps one command order. A command lands [commitCycles] cycles
+/// after it reaches the head, and only while `cyc` is high. When `cyc` drops,
+/// the model aborts every command it holds, as [Ddr3Controller] does. The
+/// arbiter gives the second port the controller only when the adapter drops
+/// `cyc`, so the hand over aborts a write that has not landed.
+class _OrderBench {
+  static const aw = 24;
+
+  final bool writeCombine;
+  final int commitCycles;
+
+  final Logic clk = SimpleClockGenerator(10).clk;
+  final Logic reset = Logic(name: 'reset')..inject(1);
+  final Logic sCyc = Logic()..inject(0);
+  final Logic sWe = Logic()..inject(0);
+  final Logic sAddr = Logic(width: aw)..inject(0);
+  final Logic sData = Logic(width: 32)..inject(0);
+  final Logic sLast = Logic()..inject(0);
+  final Logic mAck = Logic()..inject(0);
+  final Logic mAckAux = Logic(width: 4)..inject(0);
+  final Logic mData = Logic(width: 128)..inject(0);
+  late final Ddr3BurstAdapter dut;
+
+  final mem = <int, BigInt>{};
+  final _queue = <Map<String, dynamic>>[];
+  int wideWrites = 0;
+  int? _portAddr;
+  Completer<int>? _portDone;
+  StreamSubscription<void>? _mock;
+
+  _OrderBench({required this.writeCombine, required this.commitCycles}) {
+    dut = Ddr3BurstAdapter(
+      busAddrWidth: aw,
+      ddrAddrWidth: aw,
+      writeCombine: writeCombine,
+      clk: clk,
+      reset: reset,
+      sCyc: sCyc,
+      sStb: Const(1),
+      sWe: sWe,
+      sAddr: sAddr,
+      sData: sData,
+      sSel: Const(0xf, width: 4),
+      sLast: sLast,
+      mStall: Const(0),
+      mAck: mAck,
+      mAckAux: mAckAux,
+      mData: mData,
+    );
+  }
+
+  Future<void> start() async {
+    await dut.build();
+    Simulator.setMaxSimTime(20000000);
+    unawaited(Simulator.run());
+    _mock = clk.posedge.listen((_) => _tick());
+    await clk.nextPosedge;
+    await clk.nextPosedge;
+    reset.inject(0);
+    await clk.nextPosedge;
+  }
+
+  void _tick() {
+    mAck.inject(0);
+    final cycVal = dut.output('m_cyc').value;
+    if (!cycVal.isValid) return;
+    final cyc = cycVal == LogicValue.one;
+    if (cyc && dut.output('m_stb').value == LogicValue.one) {
+      final we = dut.output('m_we').value == LogicValue.one;
+      if (we) wideWrites++;
+      _queue.add({
+        'we': we,
+        'addr': dut.output('m_addr').value.toInt(),
+        'data': dut.output('m_data_out').value.toBigInt(),
+        'sel': dut.output('m_sel').value.toInt(),
+        'aux': dut.output('m_aux').value.toInt(),
+        'left': commitCycles,
+      });
+    }
+    if (!cyc) {
+      _queue.clear();
+      final a = _portAddr;
+      if (a != null) {
+        final wide = mem[a >> 4] ?? BigInt.zero;
+        final word = (wide >> (32 * ((a >> 2) & 3))) & BigInt.from(0xffffffff);
+        _portAddr = null;
+        _portDone!.complete(word.toInt());
+      }
+      return;
+    }
+    if (_queue.isEmpty) return;
+    final head = _queue.first;
+    head['left'] = (head['left'] as int) - 1;
+    if ((head['left'] as int) > 0) return;
+    _queue.removeAt(0);
+    final addr = head['addr'] as int;
+    if (head['we'] as bool) {
+      var mask = BigInt.zero;
+      final sel = head['sel'] as int;
+      for (var i = 0; i < 16; i++) {
+        if ((sel >> i) & 1 == 1) mask |= BigInt.from(0xff) << (i * 8);
+      }
+      mem[addr] =
+          ((mem[addr] ?? BigInt.zero) & ~mask) |
+          ((head['data'] as BigInt) & mask);
+    } else {
+      mData.inject(mem[addr] ?? BigInt.zero);
+    }
+    mAckAux.inject(head['aux'] as int);
+    mAck.inject(1);
+  }
+
+  Future<void> busWrite(int addr, int data, {required bool last}) async {
+    sCyc.inject(1);
+    sWe.inject(1);
+    sAddr.inject(addr);
+    sData.inject(data);
+    sLast.inject(last ? 1 : 0);
+    var guard = 0;
+    do {
+      await clk.nextPosedge;
+      if (++guard > 500) fail('write to 0x${addr.toRadixString(16)} hung');
+    } while (dut.output('s_ack').value != LogicValue.one);
+    sCyc.inject(0);
+    sWe.inject(0);
+    await clk.nextPosedge;
+  }
+
+  /// A read on the second port, asked for in the cycle after the write ack.
+  Future<int> portRead(int addr) {
+    _portAddr = addr;
+    _portDone = Completer<int>();
+    return _portDone!.future.timeout(
+      const Duration(seconds: 30),
+      onTimeout: () => fail('the second port never got the controller'),
+    );
+  }
+
+  Future<void> stop() async {
+    await _mock?.cancel();
+    await Simulator.endSimulation();
   }
 }

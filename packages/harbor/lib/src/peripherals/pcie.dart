@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -182,9 +183,30 @@ class HarborPcieController extends BridgeModule
     required this.baseAddress,
     required this.ecamBase,
     this.ecamSize = 256 * 1024 * 1024,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborPcieController', name: name ?? 'pcie') {
+  }) : super(
+         harborStableDefinitionName('HarborPcieController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'ecam',
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 26,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'g${config.maxGen.gen}',
+           'l${config.maxLanes.count}',
+           config.role.name,
+         ]),
+         name: name ?? 'pcie',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     addOutput('interrupt');
@@ -230,32 +252,40 @@ class HarborPcieController extends BridgeModule
       createPort('ep_m_ack', PortDirection.input);
     }
 
+    final fabricClock = BusSlavePort.fabricClockInputs(
+      this,
+      cross: crossFabricClock,
+    );
+
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: fabricClock,
     );
 
-    // ECAM configuration-space port. The fabric strips the byte offset, so the
-    // address is a dword index laid out as {bus[7:0], dev[4:0], fn[2:0],
-    // reg[9:0]} = 26 bits. The root complex answers config accesses to its own
-    // host-bridge function (00:00.0) and master-aborts everything else.
+    // ECAM configuration-space port. The address is a byte address laid out
+    // as {bus[7:0], dev[4:0], fn[2:0], reg[9:0]} = 26 bits, reg being the
+    // byte offset into the function's (up to 1 KiB) config space. The root
+    // complex answers config accesses to its own host-bridge function
+    // (00:00.0) and master-aborts everything else.
     ecam = BusSlavePort.create(
       module: this,
       name: 'ecam',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 26,
       dataWidth: 32,
+      fabricClock: fabricClock,
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Registers
     final enable = Logic(name: 'enable');
@@ -826,16 +856,24 @@ class HarborPcieController extends BridgeModule
                   If(
                     bus.we,
                     then: [
-                      for (var i = 0; i < tlpDepth; i++)
-                        If(
-                          tlpWrPtr.eq(Const(i, width: 4)),
-                          then: [dbuf[i] < bus.selMerge(dbuf[i], 0xC0)],
-                        ),
-                      tlpWrPtr < (tlpWrPtr + Const(1, width: 4)),
+                      If(
+                        bus.selAny(0xC0, 4),
+                        then: [
+                          for (var i = 0; i < tlpDepth; i++)
+                            If(
+                              tlpWrPtr.eq(Const(i, width: 4)),
+                              then: [dbuf[i] < bus.selMerge(dbuf[i], 0xC0)],
+                            ),
+                          tlpWrPtr < (tlpWrPtr + Const(1, width: 4)),
+                        ],
+                      ),
                     ],
                     orElse: [
                       bus.dataOut < dbufAt(tlpRdPtr),
-                      tlpRdPtr < (tlpRdPtr + Const(1, width: 4)),
+                      If(
+                        bus.selAny(0xC0, 4),
+                        then: [tlpRdPtr < (tlpRdPtr + Const(1, width: 4))],
+                      ),
                     ],
                   ),
                 ]),
@@ -891,72 +929,72 @@ class HarborPcieController extends BridgeModule
                 // Only 00:00.0 (bus/dev/fn fields all zero) is the host bridge.
                 ecam.addr.getRange(10, 26).eq(Const(0, width: 16)),
                 then: [
-                  // Match the full dword index, not just its low bits, so a
-                  // reg field outside the map does not alias a defined
-                  // register.
+                  // ecam.addr is a byte address (the fabric masks it down to a
+                  // word boundary), so match real PCI config-space byte
+                  // offsets, not a dword index.
                   Case(ecam.addr, [
                     // 0x00: vendor / device ID
                     CaseItem(Const(0x00, width: 26), [
                       ecam.dataOut < Const(cfgVendorDevice, width: 32),
                     ]),
-                    // 0x08: command / status
-                    CaseItem(Const(0x01, width: 26), [
+                    // 0x04: command / status
+                    CaseItem(Const(0x04, width: 26), [
                       If(
                         ecam.we,
                         then: [cfgCommand < ecam.selMerge(cfgCommand, 0)],
                         orElse: [ecam.dataOut < cfgCommand.zeroExtend(32)],
                       ),
                     ]),
-                    // 0x10: class code / revision
-                    CaseItem(Const(0x02, width: 26), [
+                    // 0x08: class code / revision
+                    CaseItem(Const(0x08, width: 26), [
                       ecam.dataOut < Const(cfgClassRev, width: 32),
                     ]),
-                    // 0x18: header type (0x01 = bridge)
-                    CaseItem(Const(0x03, width: 26), [
+                    // 0x0C: header type (0x01 = bridge)
+                    CaseItem(Const(0x0C, width: 26), [
                       ecam.dataOut < Const(cfgHeaderType, width: 32),
                     ]),
-                    // 0x20: BAR0 (shared with the controller BAR0 register)
-                    CaseItem(Const(0x04, width: 26), [
+                    // 0x10: BAR0 (shared with the controller BAR0 register)
+                    CaseItem(Const(0x10, width: 26), [
                       If(
                         ecam.we,
                         then: [bar0Base < ecam.selMerge(bar0Base, 0)],
                         orElse: [ecam.dataOut < bar0Base],
                       ),
                     ]),
-                    // 0x28: BAR1
-                    CaseItem(Const(0x05, width: 26), [
+                    // 0x14: BAR1
+                    CaseItem(Const(0x14, width: 26), [
                       If(
                         ecam.we,
                         then: [bar1Base < ecam.selMerge(bar1Base, 0)],
                         orElse: [ecam.dataOut < bar1Base],
                       ),
                     ]),
-                    // 0x30: primary/secondary/subordinate bus numbers
-                    CaseItem(Const(0x06, width: 26), [
+                    // 0x18: primary/secondary/subordinate bus numbers
+                    CaseItem(Const(0x18, width: 26), [
                       If(
                         ecam.we,
                         then: [cfgBusNumbers < ecam.selMerge(cfgBusNumbers, 0)],
                         orElse: [ecam.dataOut < cfgBusNumbers],
                       ),
                     ]),
-                    // 0x68: capabilities pointer
-                    CaseItem(Const(0x0D, width: 26), [
+                    // 0x34: capabilities pointer
+                    CaseItem(Const(0x34, width: 26), [
                       ecam.dataOut < Const(cfgCapPtr, width: 32),
                     ]),
-                    // 0x80: MSI capability header
-                    CaseItem(Const(0x10, width: 26), [
+                    // 0x40: MSI capability header
+                    CaseItem(Const(0x40, width: 26), [
                       ecam.dataOut < Const(cfgMsiCap, width: 32),
                     ]),
-                    // 0x88: MSI address (shared with MSI_ADDR register)
-                    CaseItem(Const(0x11, width: 26), [
+                    // 0x44: MSI address (shared with MSI_ADDR register)
+                    CaseItem(Const(0x44, width: 26), [
                       If(
                         ecam.we,
                         then: [msiAddr < ecam.selMerge(msiAddr, 0)],
                         orElse: [ecam.dataOut < msiAddr],
                       ),
                     ]),
-                    // 0x98: MSI data (shared with MSI_DATA register)
-                    CaseItem(Const(0x13, width: 26), [
+                    // 0x4C: MSI data (shared with MSI_DATA register)
+                    CaseItem(Const(0x4C, width: 26), [
                       If(
                         ecam.we,
                         then: [msiData < ecam.selMerge(msiData, 0)],

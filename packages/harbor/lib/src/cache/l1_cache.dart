@@ -359,9 +359,8 @@ class HarborL1ICache extends BridgeModule {
     memEn <= memEnR;
     memAddr <= memAddrR;
 
-    Logic ramRead(int r) => ramLatency == 1
-        ? dataRam.readData(r)
-        : flop(clk, dataRam.readData(r));
+    Logic ramRead(int r) =>
+        ramLatency == 1 ? dataRam.readData(r) : flop(clk, dataRam.readData(r));
     respData <= ramRead(0);
     respValid <= hit;
     // A faulting fetch presents as done (in core.dart: done = respValid |

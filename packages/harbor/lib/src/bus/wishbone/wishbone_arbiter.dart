@@ -2,6 +2,7 @@ import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:rohd_hcl/rohd_hcl.dart' show PriorityArbiter, RoundRobinArbiter;
 
+import '../../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus.dart';
 import 'wishbone_interface.dart';
 
@@ -34,7 +35,15 @@ class WishboneArbiter extends BridgeModule {
     BusArbitration arbitration = BusArbitration.roundRobin,
     this.maxGrantCycles,
     String? name,
-  }) : super('WishboneArbiter_M$numMasters', name: name ?? 'wishbone_arbiter') {
+  }) : super(
+         harborStableDefinitionName('WishboneArbiter', [
+           'M$numMasters',
+           ...config.definitionNameParts(),
+           arbitration.name,
+           if (maxGrantCycles != null) 'G$maxGrantCycles',
+         ]),
+         name: name ?? 'wishbone_arbiter',
+       ) {
     if (numMasters < 1) {
       throw ArgumentError('At least one master is required, got $numMasters');
     }
@@ -66,103 +75,19 @@ class WishboneArbiter extends BridgeModule {
             ).internalInterface
             as WishboneInterface;
 
-    final requestsVec = [
-      for (final m in masters) m.cyc,
-    ].rswizzle().named('requests');
-
-    // A master that lost the grant to the cap stays out of arbitration until
-    // another master takes the grant.
-    final blocked = cap != null
-        ? Logic(name: 'blocked', width: numMasters)
-        : null;
-    final arbReqVec = blocked == null
-        ? requestsVec
-        : (requestsVec & ~blocked).named('arb_requests');
-    final arbRequests = [for (var i = 0; i < numMasters; i++) arbReqVec[i]];
-
-    final grantSignals = <Logic>[];
-    switch (arbitration) {
-      case BusArbitration.roundRobin:
-        final arb = RoundRobinArbiter(arbRequests, clk: clk, reset: reset);
-        grantSignals.addAll(arb.grants);
-      case BusArbitration.fixed:
-      case BusArbitration.priority:
-        final arb = PriorityArbiter(arbRequests);
-        grantSignals.addAll(arb.grants);
-    }
-
-    // The grant is a register. It stays on one master while that master
-    // holds CYC, and a fresh grant shows one cycle after the request. A
-    // combinational grant would put arbitration, address decode and the slave
-    // ACK in one long path.
-    final grantVec = grantSignals.rswizzle();
-    final heldReg = Logic(name: 'held_grant', width: numMasters);
-    final heldReqVec = (heldReg & requestsVec).named('held_req');
-    final heldValid = heldReqVec.or().named('held_valid');
-    // With no request the grant parks on the last owner, so a master that
-    // asks again pays no extra cycle.
-    final nextGrant = mux(
-      requestsVec.or(),
-      mux(heldValid, heldReqVec, grantVec),
-      heldReg,
-    ).named('next_grant');
-    final effGrant = [for (var i = 0; i < numMasters; i++) heldReg[i]];
-
     final slaveTerm =
         (slave.ack | (slave.err ?? Const(0)) | (slave.rty ?? Const(0))).named(
           'slave_term',
         );
-
-    if (cap == null) {
-      Sequential(clk, [
-        If(
-          reset,
-          then: [heldReg < Const(0, width: numMasters)],
-          orElse: [heldReg < nextGrant],
-        ),
-      ]);
-    } else {
-      final count = Logic(name: 'hold_count', width: cap.bitLength);
-      final othersWait = (requestsVec & ~heldReg).or().named('others_wait');
-      final preempt = (heldValid & count.eq(cap) & slaveTerm & othersWait)
-          .named('preempt');
-      final freeVec = (requestsVec & ~blocked!).named('free_requests');
-      Sequential(clk, [
-        If(
-          reset,
-          then: [
-            heldReg < Const(0, width: numMasters),
-            blocked < Const(0, width: numMasters),
-            count < 0,
-          ],
-          orElse: [
-            If(
-              preempt,
-              // An empty grant for one cycle drops CYC between the owners.
-              then: [
-                heldReg < Const(0, width: numMasters),
-                blocked < heldReqVec,
-                count < 0,
-              ],
-              orElse: [
-                heldReg < nextGrant,
-                If(
-                  (heldReg & ~blocked).or() | ~freeVec.or(),
-                  then: [blocked < Const(0, width: numMasters)],
-                ),
-                If(
-                  heldValid,
-                  then: [
-                    If(count.lt(cap), then: [count < count + 1]),
-                  ],
-                  orElse: [count < 0],
-                ),
-              ],
-            ),
-          ],
-        ),
-      ]);
-    }
+    final heldReg = harborWishboneGrant(
+      clk: clk,
+      reset: reset,
+      requests: [for (final m in masters) m.cyc],
+      terminate: slaveTerm,
+      arbitration: arbitration,
+      maxGrantCycles: cap,
+    );
+    final effGrant = [for (var i = 0; i < numMasters; i++) heldReg[i]];
 
     addOutput('grant', width: numMasters);
     grant <= heldReg;
@@ -207,4 +132,114 @@ class WishboneArbiter extends BridgeModule {
       if (m.tgdMiso != null) m.tgdMiso! <= slave.tgdMiso!;
     }
   }
+}
+
+/// The registered grant of a Wishbone arbiter over [requests], one-hot.
+///
+/// A master keeps the grant while its request stays high, and a new grant
+/// shows one cycle after the request. With no request the grant stays on
+/// the last owner. [terminate] is high when the owner's transfer ends. With
+/// [maxGrantCycles], an owner that held the grant that long loses it at the
+/// end of a transfer when another master waits (see [WishboneArbiter]).
+/// [prefix] goes in front of every signal name.
+Logic harborWishboneGrant({
+  required Logic clk,
+  required Logic reset,
+  required List<Logic> requests,
+  required Logic terminate,
+  BusArbitration arbitration = BusArbitration.roundRobin,
+  int? maxGrantCycles,
+  String prefix = '',
+}) {
+  final numMasters = requests.length;
+  final cap = maxGrantCycles;
+  final requestsVec = requests.rswizzle().named('${prefix}requests');
+
+  // A master that lost the grant to the cap stays out of arbitration until
+  // another master takes the grant.
+  final blocked = cap != null
+      ? Logic(name: '${prefix}blocked', width: numMasters)
+      : null;
+  final arbReqVec = blocked == null
+      ? requestsVec
+      : (requestsVec & ~blocked).named('${prefix}arb_requests');
+  final arbRequests = [for (var i = 0; i < numMasters; i++) arbReqVec[i]];
+
+  final grantSignals = <Logic>[];
+  switch (arbitration) {
+    case BusArbitration.roundRobin:
+      final arb = RoundRobinArbiter(arbRequests, clk: clk, reset: reset);
+      grantSignals.addAll(arb.grants);
+    case BusArbitration.fixed:
+    case BusArbitration.priority:
+      final arb = PriorityArbiter(arbRequests);
+      grantSignals.addAll(arb.grants);
+  }
+
+  // The grant is a register. A combinational grant would put arbitration,
+  // address decode and the slave ACK in one long path.
+  final grantVec = grantSignals.rswizzle();
+  final heldReg = Logic(name: '${prefix}held_grant', width: numMasters);
+  final heldReqVec = (heldReg & requestsVec).named('${prefix}held_req');
+  final heldValid = heldReqVec.or().named('${prefix}held_valid');
+  final nextGrant = mux(
+    requestsVec.or(),
+    mux(heldValid, heldReqVec, grantVec),
+    heldReg,
+  ).named('${prefix}next_grant');
+
+  if (cap == null) {
+    Sequential(clk, [
+      If(
+        reset,
+        then: [heldReg < Const(0, width: numMasters)],
+        orElse: [heldReg < nextGrant],
+      ),
+    ]);
+  } else {
+    final count = Logic(name: '${prefix}hold_count', width: cap.bitLength);
+    final othersWait = (requestsVec & ~heldReg).or().named(
+      '${prefix}others_wait',
+    );
+    final preempt = (heldValid & count.eq(cap) & terminate & othersWait).named(
+      '${prefix}preempt',
+    );
+    final freeVec = (requestsVec & ~blocked!).named('${prefix}free_requests');
+    Sequential(clk, [
+      If(
+        reset,
+        then: [
+          heldReg < Const(0, width: numMasters),
+          blocked < Const(0, width: numMasters),
+          count < 0,
+        ],
+        orElse: [
+          If(
+            preempt,
+            // An empty grant for one cycle drops CYC between the owners.
+            then: [
+              heldReg < Const(0, width: numMasters),
+              blocked < heldReqVec,
+              count < 0,
+            ],
+            orElse: [
+              heldReg < nextGrant,
+              If(
+                (heldReg & ~blocked).or() | ~freeVec.or(),
+                then: [blocked < Const(0, width: numMasters)],
+              ),
+              If(
+                heldValid,
+                then: [
+                  If(count.lt(cap), then: [count < count + 1]),
+                ],
+                orElse: [count < 0],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ]);
+  }
+  return heldReg;
 }

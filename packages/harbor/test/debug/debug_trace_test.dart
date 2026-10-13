@@ -4,6 +4,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 void main() {
   group('HarborDebugModule', () {
     test('creates with defaults (numHarts=1)', () {
@@ -59,104 +61,15 @@ void main() {
       },
     );
 
-    group('register access', () {
-      late HarborTraceEncoder trace;
-      late Logic clk, reset, cyc, stb, we, adr, mosi;
-
-      Future<void> busWrite(int addr, int data) async {
-        adr.inject(addr);
-        mosi.inject(data);
-        we.inject(1);
-        cyc.inject(1);
-        stb.inject(1);
-        await clk.nextPosedge;
-        while (trace.output('bus_ACK').value.toInt() != 1) {
-          await clk.nextPosedge;
-        }
-        cyc.inject(0);
-        stb.inject(0);
-        we.inject(0);
-        await clk.nextPosedge;
-      }
-
-      Future<int> busRead(int addr) async {
-        adr.inject(addr);
-        we.inject(0);
-        cyc.inject(1);
-        stb.inject(1);
-        await clk.nextPosedge;
-        while (trace.output('bus_ACK').value.toInt() != 1) {
-          await clk.nextPosedge;
-        }
-        final v = trace.output('bus_DAT_MISO').value.toInt();
-        cyc.inject(0);
-        stb.inject(0);
-        await clk.nextPosedge;
-        return v;
-      }
-
-      setUp(() async {
-        trace = HarborTraceEncoder(baseAddress: 0x30000000);
-        clk = SimpleClockGenerator(10).clk;
-        reset = Logic(name: 'reset');
-        cyc = Logic(name: 'cyc');
-        stb = Logic(name: 'stb');
-        we = Logic(name: 'we');
-        adr = Logic(name: 'adr', width: trace.input('bus_ADR').width);
-        mosi = Logic(name: 'mosi', width: 32);
-
-        trace.input('clk').srcConnection! <= clk;
-        trace.input('reset').srcConnection! <= reset;
-        trace.input('valid').srcConnection! <= Const(0);
-        trace.input('pc').srcConnection! <= Const(0, width: 64);
-        trace.input('is_branch').srcConnection! <= Const(0);
-        trace.input('branch_taken').srcConnection! <= Const(0);
-        trace.input('is_exception').srcConnection! <= Const(0);
-        trace.input('is_eret').srcConnection! <= Const(0);
-        trace.input('exception_cause').srcConnection! <= Const(0, width: 5);
-        trace.input('priv_mode').srcConnection! <= Const(0, width: 2);
-        trace.input('priv_change').srcConnection! <= Const(0);
-        trace.input('bus_CYC').srcConnection! <= cyc;
-        trace.input('bus_STB').srcConnection! <= stb;
-        trace.input('bus_WE').srcConnection! <= we;
-        trace.input('bus_ADR').srcConnection! <= adr;
-        trace.input('bus_DAT_MOSI').srcConnection! <= mosi;
-        trace.input('bus_SEL').srcConnection! <=
-            Const(-1, width: trace.input('bus_SEL').width);
-
-        await trace.build();
-        reset.inject(1);
-        cyc.inject(0);
-        stb.inject(0);
-        we.inject(0);
-        adr.inject(0);
-        mosi.inject(0);
-        Simulator.setMaxSimTime(200000);
-        unawaited(Simulator.run());
-        await clk.nextPosedge;
-        await clk.nextPosedge;
-        reset.inject(0);
-        await clk.nextPosedge;
-      });
-
-      tearDown(() async => Simulator.reset());
-
-      // Regression: the decode used to match a word index (addr >> 2)
-      // against the byte address on ADR, so only CTRL at 0x00 ever
-      // answered and every other register was dead.
-      test('BUF_BASE, BUF_SIZE and SYNC_CNT decode at their own byte '
-          'offsets, not at CTRL', () async {
-        await busWrite(0x10, 0x1000); // BUF_BASE
-        expect(await busRead(0x10), equals(0x1000));
-
-        await busWrite(0x14, 0x2000); // BUF_SIZE
-        expect(await busRead(0x14), equals(0x2000));
-
-        // The registers are distinct, not aliases of one another.
-        expect(await busRead(0x10), equals(0x1000));
-        await Simulator.endSimulation();
-      });
+    test('different sync intervals get different definition names', () {
+      final a = HarborTraceEncoder(baseAddress: 0x0, syncInterval: 256);
+      final b = HarborTraceEncoder(baseAddress: 0x0, syncInterval: 512);
+      expect(a.definitionName, isNot(equals(b.definitionName)));
     });
+
+    for (final kind in HarborFabricKind.values) {
+      registerTests(kind);
+    }
   });
 
   group('JtagTapController', () {
@@ -186,6 +99,73 @@ void main() {
       expect(dtm.dmiReqData.width, equals(32));
       expect(dtm.dmiReqOp.width, equals(2));
       expect(dtm.dmiRspReady.width, equals(1));
+    });
+  });
+}
+
+void registerTests(HarborFabricKind kind) {
+  group('HarborTraceEncoder register access (${kind.name})', () {
+    late HarborTraceEncoder trace;
+    late Logic clk, reset;
+    late RegBus bus;
+
+    setUp(() async {
+      trace = HarborTraceEncoder(baseAddress: 0x30000000, fabricKind: kind);
+      clk = SimpleClockGenerator(10).clk;
+      reset = Logic(name: 'reset');
+
+      trace.input('clk').srcConnection! <= clk;
+      trace.input('reset').srcConnection! <= reset;
+      trace.input('valid').srcConnection! <= Const(0);
+      trace.input('pc').srcConnection! <= Const(0, width: 64);
+      trace.input('is_branch').srcConnection! <= Const(0);
+      trace.input('branch_taken').srcConnection! <= Const(0);
+      trace.input('is_exception').srcConnection! <= Const(0);
+      trace.input('is_eret').srcConnection! <= Const(0);
+      trace.input('exception_cause').srcConnection! <= Const(0, width: 5);
+      trace.input('priv_mode').srcConnection! <= Const(0, width: 2);
+      trace.input('priv_change').srcConnection! <= Const(0);
+      bus = RegBus.attach(trace, clk);
+
+      await trace.build();
+      reset.inject(1);
+      bus.idle();
+      Simulator.setMaxSimTime(200000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+    });
+
+    tearDown(() async => Simulator.reset());
+
+    // Regression: the decode used to match a word index (addr >> 2)
+    // against the byte address on ADR, so only CTRL at 0x00 ever
+    // answered and every other register was dead.
+    test('BUF_BASE, BUF_SIZE and SYNC_CNT decode at their own byte '
+        'offsets, not at CTRL', () async {
+      await bus.write(0x10, 0x1000); // BUF_BASE
+      expect(await bus.read(0x10), equals(0x1000));
+
+      await bus.write(0x14, 0x2000); // BUF_SIZE
+      expect(await bus.read(0x14), equals(0x2000));
+
+      // The registers are distinct, not aliases of one another.
+      expect(await bus.read(0x10), equals(0x1000));
+      await Simulator.endSimulation();
+    });
+
+    // A write with no byte selected must not change BUF_BASE or BUF_SIZE.
+    test('a write with no byte selected changes nothing', () async {
+      await bus.write(0x10, 0x1000);
+      await bus.write(0x14, 0x2000);
+      await bus.write(0x10, 0xffffffff, sel: 0x0);
+      await bus.write(0x14, 0xffffffff, sel: 0x0);
+
+      expect(await bus.read(0x10), equals(0x1000));
+      expect(await bus.read(0x14), equals(0x2000));
+      await Simulator.endSimulation();
     });
   });
 }

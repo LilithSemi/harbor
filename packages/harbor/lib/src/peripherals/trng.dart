@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/device_tree.dart';
@@ -63,10 +64,22 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
 
   HarborTrng(
     this.config, {
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     int? busDataWidth,
     String? name,
-  }) : super('HarborTrng', name: name ?? 'trng') {
+  }) : super(
+         harborStableDefinitionName('HarborTrng', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: (busDataWidth ?? 32) >= 64 ? 32 : 12,
+             dataWidth: busDataWidth ?? 32,
+             cross: crossFabricClock,
+           ),
+           if (config.seed != 0) 'sd${config.seed.toRadixString(16)}',
+         ]),
+         name: name ?? 'trng',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -83,15 +96,19 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: wide ? 32 : 12,
       dataWidth: busDataWidth ?? 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     final noiseBit = input('noise');
 
     // 32-bit register view on the LOW data lanes (the bus may be 32 or 64 wide).
@@ -225,8 +242,11 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
                 // RAND: present the current DRBG word and advance.
                 CaseItem(randOff, [
                   datOut32 < state,
+                  // A read advances the generator, so it only acts when the
+                  // low 4 bytes (the register's own lane) are selected: on a
+                  // wide bus the other lanes are padding, not RAND.
                   If(
-                    ~bus.we,
+                    ~bus.we & bus.selAny(0, 4),
                     then: [
                       // Advance. In non-deterministic mode fold in entropy.
                       // xorshift(0)==0, so a noise-mode state can self-lock at

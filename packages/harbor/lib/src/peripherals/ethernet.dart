@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -134,9 +135,21 @@ class HarborEthernetMac extends BridgeModule
   HarborEthernetMac({
     required this.config,
     required this.baseAddress,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborEthernetMac', name: name ?? 'ethernet') {
+  }) : super(
+         harborStableDefinitionName('HarborEthernetMac', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           config.maxSpeed.name,
+         ]),
+         name: name ?? 'ethernet',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     addOutput('interrupt');
@@ -173,15 +186,19 @@ class HarborEthernetMac extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Registers
     final macEnable = Logic(name: 'mac_enable');
@@ -950,7 +967,7 @@ class HarborEthernetMac extends BridgeModule
                 // 0x090: TX_DATA (PIO payload, one word at a time).
                 CaseItem(Const(0x90, width: 12), [
                   If(
-                    bus.we,
+                    bus.we & bus.selAny(0x90, 4),
                     then: [
                       txWord < bus.selMerge(txWord, 0x90),
                       txWordValid < Const(1),

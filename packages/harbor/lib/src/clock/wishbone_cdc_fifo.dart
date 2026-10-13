@@ -37,6 +37,9 @@ import 'wishbone_cdc.dart' show stickyCdcError;
 /// cycle that waits during a master domain reset gets ACK with all-ones data.
 /// When the slave aborts a cycle, the bridge drops its response.
 /// Each such poison ACK sets the sticky `s_bus_error` output.
+///
+/// With [useErr], the bridge also carries the ERR of the response on `m_err`
+/// to `s_err`, and a poison ACK has `s_err` set.
 class HarborWishboneCdcFifoBridge extends BridgeModule {
   /// Address bus width.
   final int addressWidth;
@@ -65,6 +68,9 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
   /// round trip per word.
   final bool postedWrites;
 
+  /// Carry the response error from `m_err` to `s_err`.
+  final bool useErr;
+
   HarborWishboneCdcFifoBridge({
     required this.addressWidth,
     required this.dataWidth,
@@ -74,6 +80,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     this.target,
     this.blockRam = false,
     this.postedWrites = false,
+    this.useErr = false,
     super.name = 'wishbone_cdc_fifo',
   }) : selWidth = selWidth ?? (dataWidth ~/ 8),
        super(
@@ -85,6 +92,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
            respDepth: respDepth,
            blockRam: blockRam && target?.blockRam != null,
            posted: postedWrites,
+           useErr: useErr,
          ),
        ) {
     final sw = this.selWidth;
@@ -101,11 +109,13 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     createPort('s_sel', PortDirection.input, width: sw);
     addOutput('s_ack');
     addOutput('s_dat_r', width: dw);
+    if (useErr) addOutput('s_err');
 
     createPort('m_clk', PortDirection.input);
     createPort('m_reset', PortDirection.input);
     createPort('m_ack', PortDirection.input);
     createPort('m_dat_r', PortDirection.input, width: dw);
+    if (useErr) createPort('m_err', PortDirection.input);
     addOutput('m_cyc');
     addOutput('m_stb');
     addOutput('m_we');
@@ -129,8 +139,16 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     );
     // Logic on the master clock behind this bridge must reset with it.
     addOutput('m_reset_joined') <= mReset;
+    // The slave domain registers reset on a copy of sReset that changes only
+    // on edges of sClk, so they never see the master reset mid cycle.
+    final sState = harborCdcSyncReset(
+      sClk,
+      input('s_reset'),
+      sReset,
+      name: 's_join_sync',
+    );
     // Reset only from the master domain while a slave cycle waits.
-    final sPeerReset = (sReset & ~input('s_reset')).named('s_peer_reset');
+    final sPeerReset = (sState & ~input('s_reset')).named('s_peer_reset');
 
     // Request payload packed { we, adr, dat_w, sel } (MSB..LSB).
     final reqW = 1 + aw + dw + sw;
@@ -142,9 +160,11 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
       blockRam: blockRam,
       name: 'req_fifo',
     );
-    // The response FIFO is small, so it always uses flops.
+    // The response FIFO is small, so it always uses flops. With useErr the
+    // error rides above the data.
+    final respW = useErr ? dw + 1 : dw;
     final respFifo = HarborCdcFifo(
-      dataWidth: dw,
+      dataWidth: respW,
       depth: respDepth,
       name: 'resp_fifo',
     );
@@ -156,13 +176,17 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     final orphan = Logic(name: 'orphan');
     final ackReg = Logic(name: 's_ack_reg');
     final sDatRReg = Logic(name: 's_dat_r_reg', width: dw);
+    final sErrReg = Logic(name: 's_err_reg');
+    final respHead = respFifo.output('rd_data');
 
     final sReq = (input('s_cyc') & input('s_stb')).named('s_req');
     final reqFull = reqFifo.output('wr_full');
     // A posted write never sets `pending`, so `~ackReg` alone spaces it: ACK is
     // a one-cycle pulse, and a master that holds its request through the ACK
     // gets exactly one push per ACK, the same as a read.
-    final reqPush = (sReq & ~pending & ~ackReg & ~reqFull).named('req_push');
+    final reqPush = (sReq & ~pending & ~ackReg & ~reqFull & ~sState).named(
+      'req_push',
+    );
     // A posted write completes entirely on the slave side.
     final postedPush = postedWrites
         ? (reqPush & input('s_we')).named('posted_push')
@@ -191,7 +215,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
 
     Sequential(sClk, [
       If(
-        sReset,
+        sState,
         then: [
           pending < Const(0),
           orphan < Const(0),
@@ -201,6 +225,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
             then: [
               ackReg < Const(1),
               sDatRReg < Const(1, width: dw, fill: true),
+              if (useErr) sErrReg < Const(1),
             ],
             orElse: [ackReg < Const(0)],
           ),
@@ -223,7 +248,8 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
             respPop,
             then: [
               // The response of an aborted cycle is dropped.
-              sDatRReg < respFifo.output('rd_data'),
+              sDatRReg < (useErr ? respHead.getRange(0, dw) : respHead),
+              if (useErr) sErrReg < respHead[dw],
               ackReg < sReq & ~orphan,
               pending < Const(0),
               orphan < Const(0),
@@ -238,6 +264,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
 
     output('s_ack') <= ackReg & sReq;
     output('s_dat_r') <= sDatRReg;
+    if (useErr) output('s_err') <= sErrReg & ackReg & sReq;
 
     final serving = Logic(name: 'serving');
     final mCycReg = Logic(name: 'm_cyc_reg');
@@ -267,7 +294,10 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     respFifo.input('wr_clk').srcConnection! <= mClk;
     respFifo.input('wr_reset').srcConnection! <= mReset;
     respFifo.input('wr_en').srcConnection! <= respPush;
-    respFifo.input('wr_data').srcConnection! <= input('m_dat_r');
+    respFifo.input('wr_data').srcConnection! <=
+        (useErr
+            ? [input('m_err'), input('m_dat_r')].swizzle()
+            : input('m_dat_r'));
 
     Sequential(mClk, [
       If(
@@ -342,6 +372,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     required int respDepth,
     required bool blockRam,
     required bool posted,
+    required bool useErr,
   }) {
     _checkDepth(depth, 'depth');
     _checkDepth(respDepth, 'respDepth');
@@ -354,9 +385,11 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
         selWidth == 8 &&
         depth == 16 &&
         respDepth == 2 &&
-        !blockRam;
+        !blockRam &&
+        !useErr;
     if (arty) return base;
     return '${base}_${addressWidth}a${dataWidth}d${selWidth}s'
-        '${depth}q${respDepth}r${blockRam ? '_bram' : ''}';
+        '${depth}q${respDepth}r${blockRam ? '_bram' : ''}'
+        '${useErr ? '_err' : ''}';
   }
 }

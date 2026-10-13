@@ -33,11 +33,7 @@ class _RegMockPeripheral extends BridgeModule
 void main() {
   group('HarborSoC', () {
     test('creates with peripherals', () {
-      final soc = HarborSoC(
-        name: 'TestSoC',
-        compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-      );
+      final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
 
       final clint = soc.addPeripheral(HarborClint(baseAddress: 0x02000000));
       final uart = soc.addPeripheral(HarborUart(baseAddress: 0x10000000));
@@ -48,11 +44,7 @@ void main() {
     });
 
     test('rejects non-HarborDeviceTreeNodeProvider peripheral', () {
-      final soc = HarborSoC(
-        name: 'TestSoC',
-        compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-      );
+      final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
 
       // A plain BridgeModule without HarborDeviceTreeNodeProvider
       final badModule = BridgeModule('BadModule', name: 'bad');
@@ -66,7 +58,6 @@ void main() {
       final soc = HarborSoC(
         name: 'TestSoC',
         compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
         cpus: [HarborCpu(hartId: 0, isa: 'rv64imac')],
       );
 
@@ -84,7 +75,6 @@ void main() {
       final soc = HarborSoC(
         name: 'BoolSoC',
         compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
         cpus: [HarborCpu(hartId: 0, isa: 'rv64imac')],
       );
       // The DMA-enabled SPI controller emits a `harbor,dma` boolean property.
@@ -103,7 +93,6 @@ void main() {
       final soc = HarborSoC(
         name: 'TestSoC',
         compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
         svdVendor: 'Lilith Semiconductor',
         svdVersion: '3.0',
         cpus: [HarborCpu(hartId: 0, isa: 'rv64imac')],
@@ -128,11 +117,7 @@ void main() {
     });
 
     test('allocates interrupt numbers once for all generators', () {
-      final soc = HarborSoC(
-        name: 'TestSoC',
-        compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-      );
+      final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
 
       // PLIC is an interrupt controller, so it is not assigned a source.
       soc.addPeripheral(HarborPlic(baseAddress: 0x0C000000));
@@ -160,11 +145,7 @@ void main() {
     });
 
     test('the ACPI GSI base reaches _GSB and the device GSIs', () {
-      final soc = HarborSoC(
-        name: 'TestSoC',
-        compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-      );
+      final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
 
       soc.addPeripheral(HarborPlic(baseAddress: 0x0C000000));
       final uart = soc.addPeripheral(HarborUart(baseAddress: 0x10000000));
@@ -185,7 +166,6 @@ void main() {
       final soc = HarborSoC(
         name: 'TestSoC',
         compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
         interruptGsiBase: 0x40,
       );
 
@@ -203,7 +183,6 @@ void main() {
       final soc = HarborSoC(
         name: 'TestSoC',
         compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
         interruptBase: 32,
       );
 
@@ -212,11 +191,7 @@ void main() {
     });
 
     test('generates Mermaid', () {
-      final soc = HarborSoC(
-        name: 'TestSoC',
-        compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-      );
+      final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
 
       soc.addPeripheral(HarborUart(baseAddress: 0x10000000));
 
@@ -226,11 +201,7 @@ void main() {
     });
 
     test('generates DOT', () {
-      final soc = HarborSoC(
-        name: 'TestSoC',
-        compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-      );
+      final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
 
       soc.addPeripheral(HarborPlic(baseAddress: 0x0C000000));
 
@@ -240,11 +211,7 @@ void main() {
     });
 
     test('validates address overlaps', () {
-      final soc = HarborSoC(
-        name: 'TestSoC',
-        compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-      );
+      final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
 
       // Two CLINTs at the same base overlap.
       soc.addPeripheral(HarborClint(baseAddress: 0x02000000));
@@ -256,11 +223,7 @@ void main() {
 
     group('validate', () {
       test('a consistent SoC reports no problems', () {
-        final soc = HarborSoC(
-          name: 'TestSoC',
-          compatible: 'test,soc-v1',
-          busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-        );
+        final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
         soc.addPeripheral(HarborClint(baseAddress: 0x02000000));
         soc.addPeripheral(HarborUart(baseAddress: 0x10000000));
 
@@ -268,11 +231,7 @@ void main() {
       });
 
       test('flags a register that overflows its address block', () {
-        final soc = HarborSoC(
-          name: 'TestSoC',
-          compatible: 'test,soc-v1',
-          busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-        );
+        final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
         // Block is 0x1000, but the register ends at 0x1002.
         soc.addPeripheral(
           _RegMockPeripheral(
@@ -291,11 +250,7 @@ void main() {
       });
 
       test('flags overlapping register fields', () {
-        final soc = HarborSoC(
-          name: 'TestSoC',
-          compatible: 'test,soc-v1',
-          busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
-        );
+        final soc = HarborSoC(name: 'TestSoC', compatible: 'test,soc-v1');
         soc.addPeripheral(
           _RegMockPeripheral(
             const HarborDeviceRegisterMap(
@@ -320,7 +275,6 @@ void main() {
       final soc = HarborSoC(
         name: 'TestSoC',
         compatible: 'test,soc-v1',
-        busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
         target: const HarborFpgaTarget.ice40(
           device: 'up5k',
           package: 'sg48',

@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -263,9 +264,25 @@ class HarborDisplayController extends BridgeModule
   HarborDisplayController({
     required this.config,
     required this.baseAddress,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborDisplayController', name: name ?? 'display') {
+  }) : super(
+         harborStableDefinitionName('HarborDisplayController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'pf${config.pixelFormat.name}',
+           'h${config.timing.hActive}_${config.timing.hFrontPorch}_'
+               '${config.timing.hSyncWidth}_${config.timing.hBackPorch}',
+           'v${config.timing.vActive}_${config.timing.vFrontPorch}_'
+               '${config.timing.vSyncWidth}_${config.timing.vBackPorch}',
+         ]),
+         name: name ?? 'display',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('pixel_clk', PortDirection.input);
@@ -288,15 +305,19 @@ class HarborDisplayController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     final pixClk = input('pixel_clk');
 
     // Registers

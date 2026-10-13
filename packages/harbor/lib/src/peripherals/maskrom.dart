@@ -4,12 +4,36 @@ import 'dart:typed_data';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../util/elf_loader.dart';
+
+/// Short FNV-1a hash of [data], used to fold ROM contents into a
+/// `definitionName` without the name growing with the ROM size.
+int _hashWords(List<int> data) {
+  var hash = 0x811c9dc5;
+  for (final w in data) {
+    for (var shift = 0; shift < 64; shift += 8) {
+      hash = (hash ^ ((w >> shift) & 0xff)) & 0xffffffff;
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+  }
+  return hash;
+}
+
+/// Resolved register-bus address width for a ROM holding [depth] words of
+/// [dataWidth] bits, matching the width [HarborMaskRom] derives when
+/// [override] is not given.
+int _resolvedAddressWidth(int depth, int dataWidth, int? override) {
+  final rows = depth == 0 ? 1 : depth;
+  final addrWidth = rows.bitLength.clamp(1, 64);
+  final byteShift = (dataWidth ~/ 8 - 1).bitLength;
+  return override ?? (addrWidth + byteShift);
+}
 
 /// Mask ROM: read-only memory with contents fixed at synthesis time.
 ///
@@ -61,9 +85,26 @@ class HarborMaskRom extends BridgeModule
     this.dataWidth = 32,
     int? busAddressWidth,
     this.busDataWidth,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborMaskRom', name: name ?? 'maskrom') {
+  }) : super(
+         harborStableDefinitionName('HarborMaskRom', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: _resolvedAddressWidth(
+               initialData.length,
+               dataWidth,
+               busAddressWidth,
+             ),
+             dataWidth: busDataWidth ?? dataWidth,
+             cross: crossFabricClock,
+           ),
+           'n${initialData.length}',
+           'H${_hashWords(initialData).toRadixString(16)}',
+         ]),
+         name: name ?? 'maskrom',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -79,11 +120,15 @@ class HarborMaskRom extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth ?? (addrWidth + byteShift),
       dataWidth: busDataWidth ?? dataWidth,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');

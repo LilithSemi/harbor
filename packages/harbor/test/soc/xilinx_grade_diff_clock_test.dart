@@ -55,7 +55,6 @@ void main() {
     HarborSoC soc(HarborDeviceTarget target) => HarborSoC(
       name: 'DiffClk',
       compatible: 'test,diff-clk',
-      busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
       target: target,
     );
 

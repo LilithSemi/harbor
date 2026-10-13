@@ -9,25 +9,31 @@ import 'package:rohd/rohd.dart';
 ///
 /// ## Writes
 ///
-/// Writes are posted: the adapter ACKs the bus as soon as the command is safe,
-/// and it does not wait for DRAM. Two mechanisms keep the command rate up.
+/// The last write of a request (`s_last`) is ACKed only when the controller
+/// accepts its command. The controller keeps one command order, so a later
+/// read from any port sees the write.
 ///
 ///  - The adapter accepts a new bus request immediately after it releases the
 ///    previous write to the controller. The controller ABORTS an in-flight
-///    request when `cyc` drops, so `cyc` stays asserted for
-///    [writeDrainCycles] more cycles after the last write. A following write
-///    arrives well inside that window, so a stream of writes holds `cyc`
-///    continuously and pays the drain only once, at the end.
+///    request when `cyc` drops, so `cyc` stays asserted until the controller
+///    ACKs every accepted write, and for at least [writeDrainCycles] cycles
+///    after the last write.
 ///  - With [writeCombine], the adapter holds ONE dirty burst. A write whose
 ///    burst address matches the held burst is merged into it and ACKed with no
 ///    DRAM command at all, so four sequential narrow words become one BL8
 ///    burst. A write to a different burst flushes the held burst first. The
 ///    byte-enables accumulate, so DDR3 DM still masks the untouched bytes and
-///    no read-modify-write is needed.
+///    no read-modify-write is needed. A write with `s_last` set is merged, and
+///    then the held burst is flushed before the ACK.
 ///
-/// The held burst is flushed when: a write addresses a different burst, a read
-/// addresses the SAME burst (the read hazard), or the bus is idle for
-/// [flushIdleCycles]. The idle flush is what lands the tail of a transfer.
+/// Combining only ever merges beats inside ONE multi-beat burst request. A
+/// classic single-beat write carries `s_last` high on every write, so it
+/// flushes (and is ACKed) on its own; writes never merge across separate
+/// requests, since that would ACK one before it reaches the controller.
+///
+/// The held burst is flushed when: a write addresses a different burst, a
+/// write has `s_last` set, a read addresses the SAME burst (the read hazard),
+/// or the bus is idle for [flushIdleCycles].
 ///
 /// ## Reads
 ///
@@ -53,8 +59,8 @@ class Ddr3BurstAdapter extends Module {
   /// Merge sequential narrow writes into one wide burst before issuing them.
   final bool writeCombine;
 
-  /// Cycles to hold `cyc` after a write is accepted, so the controller does not
-  /// abort it. A following write re-arms this, so a stream pays it only once.
+  /// Minimum cycles to hold `cyc` after a write is accepted. `cyc` also stays
+  /// up until the controller ACKs the write.
   final int writeDrainCycles;
 
   /// Idle cycles before a held dirty burst is flushed to DRAM.
@@ -85,6 +91,7 @@ class Ddr3BurstAdapter extends Module {
     required Logic sAddr,
     required Logic sData,
     required Logic sSel,
+    Logic? sLast,
     // --- wide controller read-return / status side ---
     required Logic mStall,
     required Logic mAck, // controller o_wb_ack (reads and writes)
@@ -108,6 +115,8 @@ class Ddr3BurstAdapter extends Module {
     sAddr = addInput('s_addr', sAddr, width: busAddrWidth);
     sData = addInput('s_data', sData, width: busDataWidth);
     sSel = addInput('s_sel', sSel, width: busSelWidth);
+    // Without a last flag, every write is the last of its request.
+    sLast = addInput('s_last', sLast ?? Const(1));
     mStall = addInput('m_stall', mStall);
     mAck = addInput('m_ack', mAck);
     mAckAux = addInput('m_ack_aux', mAckAux, width: auxWidth);
@@ -131,6 +140,7 @@ class Ddr3BurstAdapter extends Module {
     const stReadWait = 2; // await the controller read ack
     const stFlush = 3; // flush the held burst to service a pending request
     const stFlushIdle = 4; // flush the held burst after an idle timeout
+    const stFlushLast = 5; // flush the held burst, then ack the last write
 
     final drainW = writeDrainCycles.bitLength;
     final idleW = flushIdleCycles.bitLength;
@@ -146,6 +156,9 @@ class Ddr3BurstAdapter extends Module {
     final served = Logic(name: 'served');
     final drainCnt = Logic(name: 'wr_drain', width: drainW);
     final idleCnt = Logic(name: 'idle_cnt', width: idleW);
+    // Writes the controller accepted and has not ACKed yet.
+    const wrOutW = 6;
+    final wrOut = Logic(name: 'wr_out', width: wrOutW);
     final seqW = auxWidth - 1;
     final rdSeq = seqW > 0 ? Logic(name: 'rd_seq', width: seqW) : null;
     final rdTag = (rdSeq == null ? Const(0) : [rdSeq, Const(0)].swizzle())
@@ -250,7 +263,7 @@ class Ddr3BurstAdapter extends Module {
         // Flush the held burst. The pending request is still on the slave port,
         // so the command must come from the held registers, not from sAddr.
         If(
-          st.eq(stFlush) | st.eq(stFlushIdle),
+          st.eq(stFlush) | st.eq(stFlushIdle) | st.eq(stFlushLast),
           then: [
             mCyc < Const(1),
             mStb < Const(1),
@@ -260,15 +273,21 @@ class Ddr3BurstAdapter extends Module {
             mSel < wbSel,
           ],
         ),
-      // Hold cyc through the post-write drain so the controller does not abort
-      // the last accepted write.
+      // Hold cyc until the controller ACKs the accepted writes, so it cannot
+      // abort them.
       If(
-        st.eq(stIdle) & drainCnt.neq(Const(0, width: drainW)),
+        st.eq(stIdle) &
+            (drainCnt.neq(Const(0, width: drainW)) |
+                wrOut.neq(Const(0, width: wrOutW))),
         then: [mCyc < Const(1)],
       ),
     ]);
     sAck <= ackReg;
     sDataOut <= rdData;
+
+    final wrTaken = (mStb & mWe & ~mStall).named('wr_taken');
+    final wrAcked = (mAck & mAckAux[0] & wrOut.neq(Const(0, width: wrOutW)))
+        .named('wr_acked');
 
     Sequential(clk, [
       If(
@@ -282,6 +301,7 @@ class Ddr3BurstAdapter extends Module {
           served < Const(0),
           drainCnt < Const(0, width: drainW),
           idleCnt < Const(0, width: idleW),
+          wrOut < Const(0, width: wrOutW),
           wbValid < Const(0),
           wbAddr < Const(0, width: ddrAddrWidth),
           wbData < Const(0, width: ddrDataWidth),
@@ -302,6 +322,8 @@ class Ddr3BurstAdapter extends Module {
         ],
         orElse: [
           ackReg < Const(0), // single-cycle ack pulse by default
+          wrOut <
+              wrOut + wrTaken.zeroExtend(wrOutW) - wrAcked.zeroExtend(wrOutW),
           // Re-arm for the next request as soon as this one leaves the port.
           If(~(sCyc & sStb), then: [served < Const(0)]),
           Case(
@@ -333,14 +355,18 @@ class Ddr3BurstAdapter extends Module {
                               st < Const(stFlush, width: 3),
                             ],
                             // Merge into the held burst, or start a new one.
-                            // Either way no DRAM command is needed.
+                            // The last write of a request flushes it first.
                             orElse: [
                               wbAddr < burstAddr,
                               wbData <
                                   mux(wbValid, mergedData, placedData(curWord)),
                               wbSel < mux(wbValid, wbSel | newSel, newSel),
                               wbValid < Const(1),
-                              ackReg < Const(1),
+                              If(
+                                sLast,
+                                then: [st < Const(stFlushLast, width: 3)],
+                                orElse: [ackReg < Const(1)],
+                              ),
                             ],
                           ),
                         ],
@@ -385,8 +411,8 @@ class Ddr3BurstAdapter extends Module {
                     If(
                       isWrite,
                       then: [
-                        // Posted write: ack on accept and take the next request
-                        // straight away. drainCnt keeps cyc up meanwhile.
+                        // The command is in the controller order: ack and take
+                        // the next request. wrOut keeps cyc up meanwhile.
                         ackReg < Const(1),
                         drainCnt < Const(writeDrainCycles, width: drainW),
                         st < Const(stIdle, width: 3),
@@ -428,8 +454,14 @@ class Ddr3BurstAdapter extends Module {
                           wbData < placedData(curWord),
                           wbSel < newSel,
                           wbValid < Const(1),
-                          ackReg < Const(1),
-                          st < Const(stIdle, width: 3),
+                          If(
+                            sLast,
+                            then: [st < Const(stFlushLast, width: 3)],
+                            orElse: [
+                              ackReg < Const(1),
+                              st < Const(stIdle, width: 3),
+                            ],
+                          ),
                         ],
                         // The pending read can go now that DRAM is current.
                         orElse: [
@@ -442,18 +474,20 @@ class Ddr3BurstAdapter extends Module {
                     ],
                   ),
                 ]),
-                CaseItem(Const(stFlushIdle, width: 3), [
-                  If(
-                    ~mStall,
-                    then: [
-                      wbValid < Const(0),
-                      wbSel < Const(0, width: ddrSelWidth),
-                      drainCnt < Const(writeDrainCycles, width: drainW),
-                      idleCnt < Const(0, width: idleW),
-                      st < Const(stIdle, width: 3),
-                    ],
-                  ),
-                ]),
+                for (final last in [false, true])
+                  CaseItem(Const(last ? stFlushLast : stFlushIdle, width: 3), [
+                    If(
+                      ~mStall,
+                      then: [
+                        wbValid < Const(0),
+                        wbSel < Const(0, width: ddrSelWidth),
+                        drainCnt < Const(writeDrainCycles, width: drainW),
+                        idleCnt < Const(0, width: idleW),
+                        if (last) ackReg < Const(1),
+                        st < Const(stIdle, width: 3),
+                      ],
+                    ),
+                  ]),
               ],
             ],
             conditionalType: ConditionalType.unique,

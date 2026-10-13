@@ -16,6 +16,10 @@ import 'package:test/test.dart';
 /// Standard SPI is used so MISO is a plain INPUT (drivable from the testbench
 /// without an inout co-sim), the write engine drives standard single-bit DQ0
 /// regardless of read mode, so this is representative.
+///
+/// These are long flash-protocol tests (erase/program/poll sequences, a
+/// watchdog timeout), driven mostly through the wr_req sideband, so they stay
+/// on Wishbone only rather than looping three times over.
 
 /// Configurable-address behavioral SPI NOR model (3- or 4-byte addressing).
 class _SpiNorModel {

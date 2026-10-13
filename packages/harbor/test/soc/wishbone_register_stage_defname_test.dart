@@ -1,11 +1,8 @@
 // Regression for a HarborSoC fabric that mixes two WishboneRegisterStage
-// shapes: buildFabric(pipeline: true) puts a plain config==wbConfig stage
-// in front of the decoder, and a pipelined master whose own bus config
-// differs from wbConfig (e.g. a DMA master with ERR) gets a second stage
-// built with upConfig != config. Before both stages carried the same fixed
-// definitionName, ROHD's uniquifier refused the second as a reserved-name
-// clash. This must pass only once WishboneRegisterStage.definitionName
-// encodes the up/down config.
+// shapes: buildFabric(pipeline: true) puts a stage in front of every master,
+// and the stage of a master with ERR differs from the stage of a master
+// without it. Both must get their own definitionName, or ROHD refuses the
+// second as a reserved-name clash.
 
 import 'dart:io';
 
@@ -42,54 +39,50 @@ class _IdleMaster extends BridgeModule {
 }
 
 void main() {
-  test(
-    'a plain-config fabric stage and a DMA upConfig stage coexist in one '
-    'generateAll (no reserved-name clash)',
-    () async {
-      const wbConfig = WishboneConfig(addressWidth: 32, dataWidth: 32);
-      // Stands in for an SDIO dma=true master: same address/data/sel width
-      // as the fabric (required), but its own bus adds ERR, which the fabric
-      // config above does not have.
-      const dmaMasterConfig = WishboneConfig(
-        addressWidth: 32,
-        dataWidth: 32,
-        useErr: true,
-      );
+  test('a plain-config fabric stage and a DMA upConfig stage coexist in one '
+      'generateAll (no reserved-name clash)', () async {
+    const wbConfig = WishboneConfig(addressWidth: 32, dataWidth: 32);
+    // Stands in for an SDIO dma=true master: same address/data/sel width
+    // as the fabric (required), but its own bus adds ERR, which the fabric
+    // config above does not have.
+    const dmaMasterConfig = WishboneConfig(
+      addressWidth: 32,
+      dataWidth: 32,
+      useErr: true,
+    );
 
-      final soc = HarborSoC(
-        name: 'DefnameRepro',
-        compatible: 'test,defname-repro',
-        busConfig: wbConfig,
-      );
+    final soc = HarborSoC(
+      name: 'DefnameRepro',
+      compatible: 'test,defname-repro',
+    );
 
-      soc.addMaster(_IdleMaster(wbConfig, name: 'cpu'), busInterfaceName: 'bus');
-      soc.addMaster(
-        _IdleMaster(dmaMasterConfig, name: 'dma'),
-        busInterfaceName: 'bus',
-        pipeline: true,
-      );
-      soc.addPeripheral(
-        HarborSram(baseAddress: 0, size: 4096, busAddressWidth: 32),
-      );
+    soc.addMaster(_IdleMaster(wbConfig, name: 'cpu'), busInterfaceName: 'bus');
+    soc.addMaster(
+      _IdleMaster(dmaMasterConfig, name: 'dma'),
+      busInterfaceName: 'bus',
+      pipeline: true,
+    );
+    soc.addPeripheral(
+      HarborSram(baseAddress: 0, size: 4096, busAddressWidth: 32),
+    );
 
-      // Decoder-side pipeline stage: plain config == wbConfig, structurally
-      // different from the DMA master's upConfig stage above.
-      soc.buildFabric(pipeline: true);
+    // A stage per master: the plain one of the cpu differs from the ERR
+    // one of the dma master.
+    soc.buildFabric(pipeline: true);
 
-      final dir = Directory.systemTemp.createTempSync('harbor_defname_');
-      addTearDown(() => dir.deleteSync(recursive: true));
-      await soc.generateAll(dir);
+    final dir = Directory.systemTemp.createTempSync('harbor_defname_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await soc.generateAll(dir);
 
-      final rtlDir = Directory('${dir.path}/rtl');
-      expect(rtlDir.existsSync(), isTrue);
-      final names = rtlDir
-          .listSync()
-          .whereType<File>()
-          .map((f) => f.uri.pathSegments.last)
-          .where((n) => n.startsWith('WishboneRegisterStage'))
-          .toList();
-      // Two structurally-different stages must land in two distinct files.
-      expect(names.toSet(), hasLength(2));
-    },
-  );
+    final rtlDir = Directory('${dir.path}/rtl');
+    expect(rtlDir.existsSync(), isTrue);
+    final names = rtlDir
+        .listSync()
+        .whereType<File>()
+        .map((f) => f.uri.pathSegments.last)
+        .where((n) => n.startsWith('WishboneRegisterStage'))
+        .toList();
+    // Two structurally-different stages must land in two distinct files.
+    expect(names.toSet(), hasLength(2));
+  });
 }

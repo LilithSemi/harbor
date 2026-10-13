@@ -34,6 +34,9 @@ class WishboneMasterTestDriver extends BridgeModule {
     bus.adr <= input('m_adr');
     bus.datMosi <= input('m_dat_out');
     bus.sel <= input('m_sel');
+    // Classic cycles only, for a slave that also takes bursts.
+    bus.cti?.gets(Const(0, width: 3));
+    bus.bte?.gets(Const(0, width: 2));
 
     addOutput('m_dat_in', width: config.dataWidth);
     addOutput('m_ack');

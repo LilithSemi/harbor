@@ -10,31 +10,27 @@ import 'package:harbor/harbor.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test(
-    'a default HarborIntraReconWalk generates SV (3 leaf sizes, no '
-    'reserved-name clash)',
-    () async {
-      final walk = HarborIntraReconWalk();
-      await walk.build();
-      final sv = walk.generateSynth();
+  test('a default HarborIntraReconWalk generates SV (3 leaf sizes, no '
+      'reserved-name clash)', () async {
+    final walk = HarborIntraReconWalk();
+    await walk.build();
+    final sv = walk.generateSynth();
 
-      for (final prefix in [
-        'HarborIntraPredAvail',
-        'HarborInvTxfm',
-        'HarborReconAdd',
-      ]) {
-        final names = RegExp('module ($prefix\\w*)')
-            .allMatches(sv)
-            .map((m) => m.group(1))
-            .toSet();
-        expect(
-          names.length,
-          greaterThanOrEqualTo(3),
-          reason: '$prefix should emit one distinct module per leaf size',
-        );
-      }
-    },
-  );
+    for (final prefix in [
+      'HarborIntraPredAvail',
+      'HarborInvTxfm',
+      'HarborReconAdd',
+    ]) {
+      final names = RegExp(
+        'module ($prefix\\w*)',
+      ).allMatches(sv).map((m) => m.group(1)).toSet();
+      expect(
+        names.length,
+        greaterThanOrEqualTo(3),
+        reason: '$prefix should emit one distinct module per leaf size',
+      );
+    }
+  });
 
   test('HarborIntraPredAvail definitionName varies with bs and bitDepth', () {
     final a = HarborIntraPredAvail(bs: 4);

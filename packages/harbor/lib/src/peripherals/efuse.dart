@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -221,9 +222,25 @@ class HarborEfuseDevice extends BridgeModule
     required this.baseAddress,
     this.config = const HarborEfuseConfig(),
     this.programUnlockKey = 0x4F545021, // "OTP!" default
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborEfuseDevice', name: name ?? 'efuse') {
+  }) : super(
+         harborStableDefinitionName('HarborEfuseDevice', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'b${config.totalBits}',
+           'w${config.bitsPerWord}',
+           'r${config.regions}',
+           if (config.hasEcc) 'ecc',
+           'k${programUnlockKey.toRadixString(16)}',
+         ]),
+         name: name ?? 'efuse',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -241,15 +258,19 @@ class HarborEfuseDevice extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Internal state
     final addr = Logic(name: 'addr', width: config.words.bitLength);

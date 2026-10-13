@@ -4,7 +4,9 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-// Register word indices (the bus presents a word index).
+import '../util/reg_bus.dart';
+
+// Register byte offsets: each register in its own 8-byte slot.
 const _ctrl = 0x00;
 const _fbBase = 0x10;
 const _fbStride = 0x18;
@@ -127,6 +129,24 @@ void main() {
       expect(dt.properties['output-interface'], equals('hdmi'));
       expect(dt.properties['max-width'], equals(3840));
     });
+
+    test('two different parameter sets get different definition names', () {
+      final a = HarborDisplayController(
+        config: const HarborDisplayConfig(
+          interface_: HarborDisplayInterface.vga,
+          timing: HarborDisplayTiming.vga640x480(),
+        ),
+        baseAddress: 0x70000000,
+      );
+      final b = HarborDisplayController(
+        config: const HarborDisplayConfig(
+          interface_: HarborDisplayInterface.hdmi,
+          timing: HarborDisplayTiming.hd720(),
+        ),
+        baseAddress: 0x70000000,
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
   });
 
   group('HarborPixelFormat', () {
@@ -138,88 +158,83 @@ void main() {
     });
   });
 
-  group('HarborDisplayController scanout', () {
-    test('streams framebuffer pixels during active video', () async {
-      final disp = HarborDisplayController(
+  for (final kind in HarborFabricKind.values) {
+    _registerTests(kind);
+  }
+}
+
+void _registerTests(HarborFabricKind kind) {
+  group('HarborDisplayController register access (${kind.name})', () {
+    late HarborDisplayController disp;
+    late RegBus bus;
+    late Logic clk;
+
+    Future<void> setUpDut({Logic Function(Logic fbAddr)? fbDataOf}) async {
+      disp = HarborDisplayController(
         config: const HarborDisplayConfig(
           interface_: HarborDisplayInterface.parallelRgb,
           timing: HarborDisplayTiming.vga640x480(),
         ),
         baseAddress: 0x70000000,
+        fabricKind: kind,
       );
-      final clk = SimpleClockGenerator(10).clk;
+      clk = SimpleClockGenerator(10).clk;
       final reset = Logic(name: 'reset');
-      final stb = Logic(name: 'stb');
-      final we = Logic(name: 'we');
-      final adr = Logic(name: 'adr', width: 12);
-      final mosi = Logic(name: 'mosi', width: 32);
 
       disp.input('clk').srcConnection! <= clk;
       disp.input('reset').srcConnection! <= reset;
       disp.input('pixel_clk').srcConnection! <= clk; // single domain for sim
-      disp.input('bus_CYC').srcConnection! <= stb;
-      disp.input('bus_STB').srcConnection! <= stb;
-      disp.input('bus_WE').srcConnection! <= we;
-      disp.input('bus_ADR').srcConnection! <= adr;
-      disp.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      disp.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: disp.input('bus_SEL').width);
-
-      // Framebuffer model: a 2x2 image at base 0, stride 8 bytes.
-      const fb = {0: 0x00112233, 4: 0x00445566, 8: 0x00778899, 12: 0x00AABBCC};
-      final fbAddr = disp.output('fb_addr');
-      Logic fbData = Const(0, width: 32);
-      fb.forEach((a, v) {
-        fbData = mux(
-          fbAddr.eq(Const(a, width: 32)),
-          Const(v, width: 32),
-          fbData,
-        );
-      });
-      disp.input('fb_data').srcConnection! <= fbData;
+      disp.input('fb_data').srcConnection! <=
+          (fbDataOf?.call(disp.output('fb_addr')) ?? Const(0, width: 32));
       disp.input('fb_ack').srcConnection! <= disp.output('fb_stb');
+      bus = RegBus.attach(disp, clk);
 
       await disp.build();
-      final de = disp.output('de');
-      final vsync = disp.output('vsync');
-      final pr = disp.output('pixel_r');
-      final pg = disp.output('pixel_g');
-      final pb = disp.output('pixel_b');
-
-      Future<void> bw(int addr, int data) async {
-        adr.inject(addr);
-        mosi.inject(data);
-        we.inject(1);
-        stb.inject(1);
-        await clk.nextPosedge;
-        while (disp.output('bus_ACK').value.toInt() != 1) {
-          await clk.nextPosedge;
-        }
-        stb.inject(0);
-        we.inject(0);
-        await clk.nextPosedge;
-      }
-
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
+      bus.idle();
       Simulator.setMaxSimTime(2000000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
       await clk.nextPosedge;
       reset.inject(0);
       await clk.nextPosedge;
+    }
+
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test('streams framebuffer pixels during active video', () async {
+      // Framebuffer model: a 2x2 image at base 0, stride 8 bytes.
+      const fb = {0: 0x00112233, 4: 0x00445566, 8: 0x00778899, 12: 0x00AABBCC};
+      await setUpDut(
+        fbDataOf: (fbAddr) {
+          Logic fbData = Const(0, width: 32);
+          fb.forEach((a, v) {
+            fbData = mux(
+              fbAddr.eq(Const(a, width: 32)),
+              Const(v, width: 32),
+              fbData,
+            );
+          });
+          return fbData;
+        },
+      );
+
+      final de = disp.output('de');
+      final vsync = disp.output('vsync');
+      final pr = disp.output('pixel_r');
+      final pg = disp.output('pixel_g');
+      final pb = disp.output('pixel_b');
 
       // Shrink to a 2x2 frame with 1-pixel porches.
-      await bw(_hActive, 2);
-      await bw(_hTiming, 1 | (1 << 8) | (1 << 16));
-      await bw(_vActive, 2);
-      await bw(_vTiming, 1 | (1 << 8) | (1 << 16));
-      await bw(_fbBase, 0);
-      await bw(_fbStride, 8);
-      await bw(_ctrl, 0x1); // enable
+      await bus.write(_hActive, 2);
+      await bus.write(_hTiming, 1 | (1 << 8) | (1 << 16));
+      await bus.write(_vActive, 2);
+      await bus.write(_vTiming, 1 | (1 << 8) | (1 << 16));
+      await bus.write(_fbBase, 0);
+      await bus.write(_fbStride, 8);
+      await bus.write(_ctrl, 0x1); // enable
 
       // Align to a frame boundary: wait through one vsync pulse so the next
       // active region starts at pixel (0,0).
@@ -245,6 +260,18 @@ void main() {
       }
 
       expect(pixels, equals([0x112233, 0x445566, 0x778899, 0xAABBCC]));
+      await Simulator.endSimulation();
+    });
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      await bus.write(_fbBase, 0x11223344);
+      await bus.write(_fbStride, 0x0000ffff);
+      await bus.write(_fbBase, 0xffffffff, sel: 0x0);
+      await bus.write(_fbStride, 0xffffffff, sel: 0x0);
+      expect(await bus.read(_fbBase), equals(0x11223344));
+      expect(await bus.read(_fbStride), equals(0x0000ffff));
       await Simulator.endSimulation();
     });
   });

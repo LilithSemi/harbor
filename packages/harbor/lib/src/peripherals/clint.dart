@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -46,24 +47,40 @@ class HarborClint extends BridgeModule
     this.hartCount = 1,
     int? busAddressWidth,
     this.busDataWidth,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborClint', name: name ?? 'clint') {
+  }) : super(
+         harborStableDefinitionName('HarborClint', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth ?? 16,
+             dataWidth: busDataWidth ?? 32,
+             cross: crossFabricClock,
+           ),
+           'h$hartCount',
+         ]),
+         name: name ?? 'clint',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth ?? 16,
       dataWidth: busDataWidth ?? 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     final addr = bus.addr.getRange(0, 16);
     final ack = bus.ack;
     final stb = bus.stb;

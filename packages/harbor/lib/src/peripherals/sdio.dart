@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../blackbox/ecp5/ecp5.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../bus/bus.dart';
@@ -311,7 +312,8 @@ class HarborSdioController extends BridgeModule
   HarborSdioController({
     required this.baseAddress,
     this.config = const HarborSdioConfig.sd(),
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     this.target,
     this.ownPads = false,
     this.fabricDma = false,
@@ -335,7 +337,27 @@ class HarborSdioController extends BridgeModule
        ),
        assert(dmaBurstBeats >= 1, 'dmaBurstBeats must be at least 1'),
        assert(dmaWriteBatch >= 1, 'dmaWriteBatch must be at least 1'),
-       super('HarborSdioController', name: name ?? 'sdio') {
+       super(
+         harborStableDefinitionName('HarborSdioController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth,
+             dataWidth: busDataWidth,
+             cross: crossFabricClock,
+           ),
+           'bw${config.maxBusWidth.width}',
+           'sp${config.maxSpeed.name}',
+           'sf${config.sampleReadOnFall}',
+           if (target is HarborFpgaTarget) 'tg${target.vendor.name}',
+           if (ownPads) 'pads',
+           if (fabricDma) 'fdma_a${dmaAddressWidth}_d$dmaDataWidth',
+           'rx$rxFifoDepth',
+           'db$dmaBurstBeats',
+           'wb$dmaWriteBatch',
+           if (readBackBarrier) 'rbb',
+         ]),
+         name: name ?? 'sdio',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -399,15 +421,19 @@ class HarborSdioController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     final cardDetect = input('sd_cd');
     // Raw CMD-in source: the inout pad's captured value (ownPads) or the split
     // input port. CMD stays SDR even in HS400, so it only gets input-delay tune.
@@ -733,8 +759,15 @@ class HarborSdioController extends BridgeModule
     // master that keeps STB asserted after seeing it would re-enter the handler
     // and run the access a second time - which on a DATA read pops the RX FIFO
     // twice and skips a word. `busServed` holds until STB drops.
+    // Only a direct Wishbone port needs this. The AXI4 and TileLink ports and
+    // the crossing present each access once, and can keep STB high across two
+    // accesses, which this hold would stall forever.
     final busServed = Logic(name: 'bus_served');
-    final busAccess = (bus.stb & ~bus.ack & ~busServed).named('bus_access');
+    final holdServed =
+        bus.kind == HarborFabricKind.wishbone && bus.cdcDepth == 0;
+    final busAccess =
+        (holdServed ? bus.stb & ~bus.ack & ~busServed : bus.stb & ~bus.ack)
+            .named('bus_access');
 
     // Pop strobes. The ADMA retires a word when the fabric acks the beat that
     // carried it; the CPU retires one by reading DATA during a card read.
@@ -753,7 +786,8 @@ class HarborSdioController extends BridgeModule
                 ~bus.we &
                 cmdDataDir &
                 ~rxEmpty &
-                bus.windowAddr(0x1000).getRange(3).eq(Const(0x09, width: 9)))
+                bus.windowAddr(0x1000).getRange(3).eq(Const(0x09, width: 9)) &
+                bus.selAny(0x48, 4))
             .named('rx_pop_cpu');
     final rxPop = (rxPopAdma | rxPopCpu).named('rx_pop');
     // A word is only really taken when the FIFO had one to give.
@@ -1851,16 +1885,28 @@ class HarborSdioController extends BridgeModule
                 // [8] read-data sample edge 0:rising 1:falling).
                 CaseItem(Const(0x00, width: 9), [
                   If(
-                    bus.we & bus.selAny(0x00, 2),
+                    bus.we,
                     then: [
-                      ctrlEnable < bus.dataIn[0],
-                      // [5:4] selects the active bus width (0:1-bit, 1:4-bit,
-                      // 2:8-bit), clamped to the configured maximum.
-                      busWidthSel < bus.dataIn.getRange(4, 6),
+                      // [0] enable and [5:4] bus width live in byte 0; [8] the
+                      // sample edge lives in byte 1. A store that selects only
+                      // one of the two bytes must leave the other alone.
+                      If(
+                        bus.selAny(0x00, 1),
+                        then: [
+                          ctrlEnable < bus.dataIn[0],
+                          // [5:4] selects the active bus width (0:1-bit,
+                          // 1:4-bit, 2:8-bit), clamped to the configured
+                          // maximum.
+                          busWidthSel < bus.dataIn.getRange(4, 6),
+                        ],
+                      ),
                       // [8] picks the read-data sample edge. Firmware raises it
                       // to sample the read DAT on the falling edge for
                       // round-trip margin at speed.
-                      sampleFall < bus.dataIn[8],
+                      If(
+                        bus.selAny(0x01, 1),
+                        then: [sampleFall < bus.dataIn[8]],
+                      ),
                     ],
                     orElse: [
                       bus.dataOut <
@@ -2118,7 +2164,7 @@ class HarborSdioController extends BridgeModule
       case HarborFpgaVendor.ecp5:
         return Ecp5Iddrx1f(
           sclk: input('clk'),
-          rst: input('reset'),
+          rst: bus.reset,
           d: delayed,
           name: 'sd_iddr_$tag',
         ).q0;

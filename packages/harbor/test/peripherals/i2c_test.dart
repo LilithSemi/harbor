@@ -4,6 +4,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 // Register byte offsets: each register in its own 8-byte slot.
 const _ctrl = 0x00;
 const _status = 0x08;
@@ -30,95 +32,59 @@ void main() {
     test('supports TileLink', () {
       final i2c = HarborI2cController(
         baseAddress: 0x10003000,
-        protocol: BusProtocol.tilelink,
+        fabricKind: HarborFabricKind.tilelink,
       );
-      expect(i2c.bus.protocol, equals(BusProtocol.tilelink));
+      expect(i2c.bus.kind, equals(HarborFabricKind.tilelink));
+    });
+
+    test('two different parameter sets give different definition names', () {
+      final a = HarborI2cController(baseAddress: 0x10003000);
+      final b = HarborI2cController(baseAddress: 0x10003000, busDataWidth: 64);
+      expect(a.definitionName, isNot(equals(b.definitionName)));
     });
   });
 
-  group('HarborI2cController register access', () {
+  for (final kind in HarborFabricKind.values) {
+    _registerTests(kind);
+  }
+}
+
+void _registerTests(HarborFabricKind kind) {
+  group('HarborI2cController register access (${kind.name})', () {
     late HarborI2cController i2c;
-    late Logic clk, reset, stb, we, adr, mosi, sel;
+    late Logic clk, reset, sclIn, sdaIn;
+    late RegBus bus;
 
-    int allSel() => (1 << sel.width) - 1;
+    Future<void> busWrite(int addr, int data) => bus.write(addr, data);
 
-    Future<void> busWrite(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      sel.inject(allSel());
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (i2c.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
+    Future<int> busRead(int addr) => bus.read(addr);
 
-    Future<void> busWriteSel(int addr, int selMask, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      sel.inject(selMask);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (i2c.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      sel.inject(allSel());
-      await clk.nextPosedge;
-    }
-
-    Future<int> busRead(int addr) async {
-      adr.inject(addr);
-      we.inject(0);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (i2c.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final v = i2c.output('bus_DAT_MISO').value.toInt();
-      stb.inject(0);
-      await clk.nextPosedge;
-      return v;
-    }
+    Future<void> busWriteSel(int addr, int selMask, int data) =>
+        bus.write(addr, data, sel: selMask);
 
     Future<void> setUpDut({int dataWidth = 32}) async {
       i2c = HarborI2cController(
         baseAddress: 0x10003000,
         busDataWidth: dataWidth,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: dataWidth);
-      sel = Logic(name: 'sel', width: dataWidth ~/ 8);
+      sclIn = Logic(name: 'scl_in');
+      sdaIn = Logic(name: 'sda_in');
 
       i2c.input('clk').srcConnection! <= clk;
       i2c.input('reset').srcConnection! <= reset;
-      i2c.input('bus_CYC').srcConnection! <= stb;
-      i2c.input('bus_STB').srcConnection! <= stb;
-      i2c.input('bus_WE').srcConnection! <= we;
-      i2c.input('bus_ADR').srcConnection! <= adr;
-      i2c.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      i2c.input('bus_SEL').srcConnection! <= sel;
-      i2c.input('scl_in').srcConnection! <= Const(1);
-      i2c.input('sda_in').srcConnection! <= Const(1);
+      i2c.input('scl_in').srcConnection! <= sclIn;
+      i2c.input('sda_in').srcConnection! <= sdaIn;
+      bus = RegBus.attach(i2c, clk);
 
       await i2c.build();
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
-      sel.inject(allSel());
+      bus.idle();
+      sclIn.inject(1);
+      sdaIn.inject(1);
       Simulator.setMaxSimTime(200000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
@@ -292,35 +258,25 @@ void main() {
     // the low and high time, in clk cycles, of a steady data bit, well
     // after the one-off START condition.
     Future<({int low, int high})> measureSclTiming(int prescale) async {
-      final dut = HarborI2cController(baseAddress: 0x10003000);
+      final dut = HarborI2cController(
+        baseAddress: 0x10003000,
+        fabricKind: kind,
+      );
       final lclk = SimpleClockGenerator(10).clk;
       final lreset = Logic(name: 'reset');
-      final lstb = Logic(name: 'stb');
-      final lwe = Logic(name: 'we');
-      final ladr = Logic(name: 'adr', width: 12);
-      final lmosi = Logic(name: 'mosi', width: 32);
 
       dut.input('clk').srcConnection! <= lclk;
       dut.input('reset').srcConnection! <= lreset;
-      dut.input('bus_CYC').srcConnection! <= lstb;
-      dut.input('bus_STB').srcConnection! <= lstb;
-      dut.input('bus_WE').srcConnection! <= lwe;
-      dut.input('bus_ADR').srcConnection! <= ladr;
-      dut.input('bus_DAT_MOSI').srcConnection! <= lmosi;
-      dut.input('bus_SEL').srcConnection! <=
-          Const(-1, width: dut.input('bus_SEL').width);
       // Self loopback: nothing else is on this bus, so the line reads
       // exactly the controller's own drive (released reads high).
       dut.input('scl_in').srcConnection! <= ~dut.output('scl_oe');
       dut.input('sda_in').srcConnection! <= ~dut.output('sda_oe');
+      final lbus = RegBus.attach(dut, lclk);
 
       await dut.build();
 
       lreset.inject(1);
-      lstb.inject(0);
-      lwe.inject(0);
-      ladr.inject(0);
-      lmosi.inject(0);
+      lbus.idle();
       Simulator.setMaxSimTime(200000);
       unawaited(Simulator.run());
       await lclk.nextPosedge;
@@ -328,24 +284,10 @@ void main() {
       lreset.inject(0);
       await lclk.nextPosedge;
 
-      Future<void> lwrite(int addr, int data) async {
-        ladr.inject(addr);
-        lmosi.inject(data);
-        lwe.inject(1);
-        lstb.inject(1);
-        await lclk.nextPosedge;
-        while (dut.output('bus_ACK').value.toInt() != 1) {
-          await lclk.nextPosedge;
-        }
-        lstb.inject(0);
-        lwe.inject(0);
-        await lclk.nextPosedge;
-      }
-
-      await lwrite(_ctrl, 0x1);
-      await lwrite(_prescale, prescale);
-      await lwrite(_data, 0xAA);
-      await lwrite(_cmd, 0x1 | 0x4); // START|WRITE
+      await lbus.write(_ctrl, 0x1);
+      await lbus.write(_prescale, prescale);
+      await lbus.write(_data, 0xAA);
+      await lbus.write(_cmd, 0x1 | 0x4); // START|WRITE
 
       final sclOe = dut.output('scl_oe');
       final levels = <int>[];
@@ -457,6 +399,18 @@ void main() {
       await busWrite(_addr, 0x2a);
       expect(await busRead(_addr), equals(0x2a));
       expect(await busRead(_prescale), equals(0x4321));
+      await Simulator.endSimulation();
+    });
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      await busWrite(_prescale, 0x1234);
+      await busWrite(_ctrl, 0x3);
+      await busWriteSel(_prescale, 0x0, 0xffff);
+      await busWriteSel(_ctrl, 0x0, 0x0);
+      expect(await busRead(_prescale), equals(0x1234));
+      expect(await busRead(_ctrl), equals(0x3));
       await Simulator.endSimulation();
     });
 

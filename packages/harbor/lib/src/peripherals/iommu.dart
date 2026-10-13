@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -91,9 +92,24 @@ class HarborIommu extends BridgeModule
     this.faultQueueDepth = 64,
     this.msiTranslation = true,
     this.atsSupport = false,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborIommu', name: name ?? 'iommu') {
+  }) : super(
+         harborStableDefinitionName('HarborIommu', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 64,
+             cross: crossFabricClock,
+           ),
+           // numDevices, cmdQueueDepth, faultQueueDepth and atsSupport are
+           // not wired into any logic or port yet, so they are left out.
+           't$iotlbEntries',
+           if (msiTranslation) 'msi',
+         ]),
+         name: name ?? 'iommu',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -103,11 +119,15 @@ class HarborIommu extends BridgeModule
     regBus = BusSlavePort.create(
       module: this,
       name: 'reg',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 64,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     // DMA request input (from device)
@@ -136,7 +156,7 @@ class HarborIommu extends BridgeModule
     }
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = regBus.reset;
     final dmaAddr = input('dma_addr');
     final dmaValid = input('dma_valid');
     final dmaWrite = input('dma_write');

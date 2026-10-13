@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../clock/cdc.dart';
@@ -186,8 +187,23 @@ class HarborUsbController extends BridgeModule
     this.localResetDetachUs = 10000,
     int busAddressWidth = 32,
     int busDataWidth = 32,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborUsbController', name: name ?? 'usb') {
+  }) : super(
+         harborStableDefinitionName('HarborUsbController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth,
+             dataWidth: busDataWidth,
+             cross: crossFabricClock,
+           ),
+           'ep$numEndpoints',
+           'hz$usbClkHz',
+           'det$localResetDetachUs',
+         ]),
+         name: name ?? 'usb',
+       ) {
     if (usbClkHz <= 0 || localResetDetachUs <= 0) {
       throw ArgumentError('usbClkHz and localResetDetachUs must be > 0');
     }
@@ -224,34 +240,41 @@ class HarborUsbController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: BusProtocol.wishbone,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: busDataWidth,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
     final usbClk = input('usb_clk');
     // Either reset resets every crossing on both sides together. The
-    // registers software owns reset on `reset` only. Its chain has the same
-    // length as the joined one, so a reset of both releases on one edge.
+    // registers software owns reset on `bus.reset` only. Its chain has the
+    // same length as the joined one, so a reset of both releases on one
+    // edge. `bus.reset` is `input('reset')` unless the register port itself
+    // crosses a fabric clock, in which case it is that crossing's joined
+    // reset.
     final busOwnReset = harborCdcJoinReset(
       clk,
-      input('reset'),
-      input('reset'),
+      bus.reset,
+      bus.reset,
       name: 'bus_own_reset',
     );
     final reset = harborCdcJoinReset(
       clk,
-      input('reset'),
+      bus.reset,
       input('usb_reset'),
       name: 'bus_join_reset',
     );
     final usbReset = harborCdcJoinReset(
       usbClk,
       input('usb_reset'),
-      input('reset'),
+      bus.reset,
       name: 'usb_join_reset',
     );
     final dw = busDataWidth;
@@ -1187,24 +1210,33 @@ class HarborUsbController extends BridgeModule
                           If(
                             bus.we,
                             then: [
-                              epEnableBus[i] < cfgKeep[i][0],
-                              epTypeBus[i] < cfgKeep[i].getRange(1, 3),
-                              opBusy < Const(1),
-                              opRegBus < Const(_opCfg, width: 3),
-                              opEpBus < Const(i, width: epIdxWidth),
-                              opPayloadBus <
-                                  [
-                                    cfgAct[i][8],
-                                    cfgAct[i][7],
-                                    cfgKeep[i]
-                                        .getRange(1, 3)
-                                        .eq(Const(0, width: 2)),
-                                    cfgAct[i][4],
-                                    cfgAct[i][3],
-                                    cfgAct[i][6],
-                                    cfgAct[i][5],
-                                  ].swizzle(),
-                              opReqToggleBus < ~opReqToggleBus,
+                              If(
+                                bus.selAny(
+                                  _epBase + i * _epStride + _cfgOff,
+                                  2,
+                                ),
+                                then: [
+                                  epEnableBus[i] < cfgKeep[i][0],
+                                  epTypeBus[i] < cfgKeep[i].getRange(1, 3),
+                                  opBusy < Const(1),
+                                  opRegBus < Const(_opCfg, width: 3),
+                                  opEpBus < Const(i, width: epIdxWidth),
+                                  opPayloadBus <
+                                      [
+                                        cfgAct[i][8],
+                                        cfgAct[i][7],
+                                        cfgKeep[i]
+                                            .getRange(1, 3)
+                                            .eq(Const(0, width: 2)),
+                                        cfgAct[i][4],
+                                        cfgAct[i][3],
+                                        cfgAct[i][6],
+                                        cfgAct[i][5],
+                                      ].swizzle(),
+                                  opReqToggleBus < ~opReqToggleBus,
+                                ],
+                                orElse: [bus.ack < Const(1)],
+                              ),
                             ],
                             orElse: [
                               opBusy < Const(1),
@@ -1231,8 +1263,15 @@ class HarborUsbController extends BridgeModule
                         CaseItem(
                           regAddr(_epBase + i * _epStride + _outDataOff),
                           [
+                            // A read pops one byte, so it only starts the pop
+                            // when its own lane is selected; a write, or a
+                            // read of another lane, just acks.
                             If(
-                              ~bus.we,
+                              ~bus.we &
+                                  bus.selAny(
+                                    _epBase + i * _epStride + _outDataOff,
+                                    1,
+                                  ),
                               then: [
                                 opBusy < Const(1),
                                 opRegBus < Const(_opPopOut, width: 3),

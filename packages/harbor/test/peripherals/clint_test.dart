@@ -4,6 +4,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 void main() {
   group('HarborClint', () {
     test('creates with default hart count', () {
@@ -30,9 +32,17 @@ void main() {
       expect(dt.reg.start, equals(0x02000000));
       expect(dt.reg.size, equals(0x10000));
     });
+
+    test('different hart counts get different definition names', () {
+      final one = HarborClint(baseAddress: 0x02000000);
+      final four = HarborClint(baseAddress: 0x02000000, hartCount: 4);
+      expect(one.definitionName, isNot(equals(four.definitionName)));
+    });
   });
 
-  laneTests();
+  for (final kind in HarborFabricKind.values) {
+    laneTests(kind);
+  }
 }
 
 // Bus-lane decode, driven the way the core drives it. The River MMU and the
@@ -40,10 +50,11 @@ void main() {
 // data and SEL into the byte lane of the access (mmu.dart wbAdr/wbDatMosi/
 // wbSel, sba_wishbone.dart alignedAddr/wbSel). On a 64-bit bus that means the
 // mtimecmp high half arrives in lane 1, never in lane 0.
-void laneTests() {
-  group('HarborClint bus lane decode', () {
+void laneTests(HarborFabricKind kind) {
+  group('HarborClint bus lane decode (${kind.name})', () {
     late HarborClint clint;
-    late Logic clk, reset, stb, we, adr, mosi, sel;
+    late Logic clk, reset;
+    late RegBus bus;
     late int busBytes;
 
     Future<void> setUpDut({required int dataWidth, int hartCount = 1}) async {
@@ -53,32 +64,19 @@ void laneTests() {
         hartCount: hartCount,
         busAddressWidth: 32,
         busDataWidth: dataWidth,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 32);
-      mosi = Logic(name: 'mosi', width: dataWidth);
-      sel = Logic(name: 'sel', width: busBytes);
 
       clint.input('clk').srcConnection! <= clk;
       clint.input('reset').srcConnection! <= reset;
-      clint.input('bus_CYC').srcConnection! <= stb;
-      clint.input('bus_STB').srcConnection! <= stb;
-      clint.input('bus_WE').srcConnection! <= we;
-      clint.input('bus_ADR').srcConnection! <= adr;
-      clint.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      clint.input('bus_SEL').srcConnection! <= sel;
+      bus = RegBus.attach(clint, clk);
 
       await clint.build();
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
-      sel.inject(0);
+      bus.idle();
       Simulator.setMaxSimTime(200000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
@@ -91,38 +89,16 @@ void laneTests() {
 
     Future<void> coreWrite(int byteAddr, int bytes, BigInt value) async {
       final lane = byteAddr % busBytes;
-      adr.inject(byteAddr - lane);
-      mosi.inject(
-        LogicValue.ofBigInt(
-          (value << (lane * 8)) & maskOf(busBytes * 8),
-          busBytes * 8,
-        ),
-      );
-      sel.inject(((1 << bytes) - 1) << lane);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (clint.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
+      final addr = byteAddr - lane;
+      final shifted = (value << (lane * 8)) & maskOf(busBytes * 8);
+      final sel = ((1 << bytes) - 1) << lane;
+      await bus.write(addr, shifted.toInt(), sel: sel);
     }
 
     Future<BigInt> coreRead(int byteAddr, int bytes) async {
       final lane = byteAddr % busBytes;
-      adr.inject(byteAddr - lane);
-      sel.inject(((1 << bytes) - 1) << lane);
-      we.inject(0);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (clint.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final raw = clint.output('bus_DAT_MISO').value.toBigInt();
-      stb.inject(0);
-      await clk.nextPosedge;
+      final addr = byteAddr - lane;
+      final raw = BigInt.from(await bus.read(addr));
       return (raw >> (lane * 8)) & maskOf(bytes * 8);
     }
 
@@ -230,6 +206,23 @@ void laneTests() {
       await clk.nextPosedge;
       expect(clint.output('sw_irq_0').value.toInt(), equals(1));
 
+      await Simulator.endSimulation();
+    });
+
+    // A write with no byte selected must not change anything: not msip, not
+    // mtimecmp.
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut(dataWidth: 32);
+
+      await coreWrite(0x4000, 4, BigInt.from(0x1234));
+      await coreWrite(0x0000, 4, BigInt.one);
+      await clk.nextPosedge;
+
+      await bus.write(0x4000, 0xffffffff, sel: 0x0);
+      await bus.write(0x0000, 0, sel: 0x0);
+
+      expect(await coreRead(0x4000, 4), equals(BigInt.from(0x1234)));
+      expect(clint.output('sw_irq_0').value.toInt(), equals(1));
       await Simulator.endSimulation();
     });
   });

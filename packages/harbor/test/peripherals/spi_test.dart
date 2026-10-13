@@ -4,6 +4,15 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
+// Byte-address register map (see HarborSpiController): each register is in
+// its own 64-bit-aligned slot.
+const _ctrl = 0x00;
+const _status = 0x08;
+const _data = 0x10;
+const _divider = 0x18;
+
 void main() {
   group('HarborSpiController', () {
     test('creates with defaults', () {
@@ -28,214 +37,52 @@ void main() {
     test('supports both bus protocols', () {
       final wb = HarborSpiController(
         baseAddress: 0x1000,
-        protocol: BusProtocol.wishbone,
+        fabricKind: HarborFabricKind.wishbone,
       );
       final tl = HarborSpiController(
         baseAddress: 0x1000,
-        protocol: BusProtocol.tilelink,
+        fabricKind: HarborFabricKind.tilelink,
       );
-      expect(wb.bus.protocol, equals(BusProtocol.wishbone));
-      expect(tl.bus.protocol, equals(BusProtocol.tilelink));
+      expect(wb.bus.kind, equals(HarborFabricKind.wishbone));
+      expect(tl.bus.kind, equals(HarborFabricKind.tilelink));
+    });
+
+    test('two different parameter sets get different definition names', () {
+      final a = HarborSpiController(baseAddress: 0x1000, csCount: 1);
+      final b = HarborSpiController(baseAddress: 0x1000, csCount: 2);
+      expect(a.definitionName, isNot(equals(b.definitionName)));
     });
   });
 
-  // Byte-address register map (see HarborSpiController): each register is in
-  // its own 64-bit-aligned slot.
-  const ctrl = 0x00;
-  const status = 0x08;
-  const data = 0x10;
-  const divider = 0x18;
+  for (final kind in HarborFabricKind.values) {
+    _registerTests(kind);
+  }
+}
 
-  group('HarborSpiController loopback (functional)', () {
+void _registerTests(HarborFabricKind kind) {
+  group('HarborSpiController register access (${kind.name})', () {
     late HarborSpiController spi;
-    late Logic clk, reset, cyc, stb, we, adr, mosi, miso;
-
-    Future<void> busWrite(int addr, int value) async {
-      adr.inject(addr);
-      mosi.inject(value);
-      we.inject(1);
-      cyc.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (spi.bus.ack.value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      cyc.inject(0);
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
-
-    Future<int> busRead(int addr) async {
-      adr.inject(addr);
-      we.inject(0);
-      cyc.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (spi.bus.ack.value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final d = spi.bus.dataOut.value.toInt();
-      cyc.inject(0);
-      stb.inject(0);
-      await clk.nextPosedge;
-      return d;
-    }
-
-    tearDown(() async => Simulator.reset());
-
-    test(
-      'a byte written in loopback returns intact (no bit rotation)',
-      () async {
-        spi = HarborSpiController(baseAddress: 0x1000);
-        clk = SimpleClockGenerator(10).clk;
-        reset = Logic(name: 'reset');
-        cyc = Logic(name: 'cyc');
-        stb = Logic(name: 'stb');
-        we = Logic(name: 'we');
-        adr = Logic(name: 'adr', width: spi.input('bus_ADR').width);
-        mosi = Logic(name: 'mosi', width: 32);
-        miso = Logic(name: 'miso');
-
-        spi.input('clk').srcConnection! <= clk;
-        spi.input('reset').srcConnection! <= reset;
-        spi.input('bus_CYC').srcConnection! <= cyc;
-        spi.input('bus_STB').srcConnection! <= stb;
-        spi.input('bus_WE').srcConnection! <= we;
-        spi.input('bus_ADR').srcConnection! <= adr;
-        spi.input('bus_DAT_MOSI').srcConnection! <= mosi;
-        spi.input('bus_SEL').srcConnection! <=
-            Const(0xF, width: spi.input('bus_SEL').width);
-        spi.input('spi_miso').srcConnection! <= miso;
-
-        await spi.build();
-        reset.inject(1);
-        cyc.inject(0);
-        stb.inject(0);
-        we.inject(0);
-        adr.inject(0);
-        mosi.inject(0);
-        miso.inject(0);
-        Simulator.setMaxSimTime(1000000);
-        unawaited(Simulator.run());
-        await clk.nextPosedge;
-        await clk.nextPosedge;
-        reset.inject(0);
-        await clk.nextPosedge;
-
-        // At reset STATUS must show tx_empty (bit1) set: proves the byte-address
-        // decode reaches the right register (the old word-index decode read 0).
-        expect(await busRead(status), equals(0x2));
-
-        await busWrite(divider, 1);
-        await busWrite(ctrl, 0x9); // enable | loopback
-        await busWrite(data, 0xA5); // start a transfer
-
-        var st = await busRead(status);
-        var guard = 0;
-        while (st & 0x1 != 0 && guard < 200) {
-          st = await busRead(status);
-          guard++;
-        }
-        expect(st & 0x1, equals(0), reason: 'transfer should finish');
-
-        // Loopback feeds MOSI back to MISO: an 8-bit exchange must return the
-        // exact byte. A one-bit rotation here is the "capture before the 8th
-        // shift" bug.
-        expect(await busRead(data) & 0xFF, equals(0xA5));
-
-        await Simulator.endSimulation();
-      },
-    );
-  });
-
-  group('HarborSpiController byte-lane writes', () {
-    late HarborSpiController spi;
-    late Logic clk, reset, cyc, stb, we, adr, mosi, sel, miso;
-
-    int allSel() => (1 << sel.width) - 1;
-
-    Future<void> busWrite(int addr, int value) async {
-      adr.inject(addr);
-      mosi.inject(value);
-      sel.inject(allSel());
-      we.inject(1);
-      cyc.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (spi.bus.ack.value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      cyc.inject(0);
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
-
-    Future<void> busWriteSel(int addr, int selMask, int value) async {
-      adr.inject(addr);
-      mosi.inject(value);
-      sel.inject(selMask);
-      we.inject(1);
-      cyc.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (spi.bus.ack.value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      cyc.inject(0);
-      stb.inject(0);
-      we.inject(0);
-      sel.inject(allSel());
-      await clk.nextPosedge;
-    }
-
-    Future<int> busRead(int addr) async {
-      adr.inject(addr);
-      we.inject(0);
-      cyc.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (spi.bus.ack.value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final d = spi.bus.dataOut.value.toInt();
-      cyc.inject(0);
-      stb.inject(0);
-      await clk.nextPosedge;
-      return d;
-    }
+    late Logic clk, reset, miso;
+    late RegBus bus;
 
     Future<void> setUpDut({int dataWidth = 32}) async {
-      spi = HarborSpiController(baseAddress: 0x1000, busDataWidth: dataWidth);
+      spi = HarborSpiController(
+        baseAddress: 0x1000,
+        busDataWidth: dataWidth,
+        fabricKind: kind,
+      );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      cyc = Logic(name: 'cyc');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: spi.input('bus_ADR').width);
-      mosi = Logic(name: 'mosi', width: dataWidth);
-      sel = Logic(name: 'sel', width: dataWidth ~/ 8);
       miso = Logic(name: 'miso');
 
       spi.input('clk').srcConnection! <= clk;
       spi.input('reset').srcConnection! <= reset;
-      spi.input('bus_CYC').srcConnection! <= cyc;
-      spi.input('bus_STB').srcConnection! <= stb;
-      spi.input('bus_WE').srcConnection! <= we;
-      spi.input('bus_ADR').srcConnection! <= adr;
-      spi.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      spi.input('bus_SEL').srcConnection! <= sel;
       spi.input('spi_miso').srcConnection! <= miso;
+      bus = RegBus.attach(spi, clk);
 
       await spi.build();
       reset.inject(1);
-      cyc.inject(0);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
-      sel.inject(allSel());
+      bus.idle();
       miso.inject(0);
       Simulator.setMaxSimTime(1000000);
       unawaited(Simulator.run());
@@ -247,13 +94,43 @@ void main() {
 
     tearDown(() async => Simulator.reset());
 
+    test(
+      'a byte written in loopback returns intact (no bit rotation)',
+      () async {
+        await setUpDut();
+
+        // At reset STATUS must show tx_empty (bit1) set: proves the byte-address
+        // decode reaches the right register (the old word-index decode read 0).
+        expect(await bus.read(_status), equals(0x2));
+
+        await bus.write(_divider, 1);
+        await bus.write(_ctrl, 0x9); // enable | loopback
+        await bus.write(_data, 0xA5); // start a transfer
+
+        var st = await bus.read(_status);
+        var guard = 0;
+        while (st & 0x1 != 0 && guard < 200) {
+          st = await bus.read(_status);
+          guard++;
+        }
+        expect(st & 0x1, equals(0), reason: 'transfer should finish');
+
+        // Loopback feeds MOSI back to MISO: an 8-bit exchange must return the
+        // exact byte. A one-bit rotation here is the "capture before the 8th
+        // shift" bug.
+        expect(await bus.read(_data) & 0xFF, equals(0xA5));
+
+        await Simulator.endSimulation();
+      },
+    );
+
     test('a byte store changes only the selected byte (32-bit bus)', () async {
       await setUpDut();
 
-      await busWrite(divider, 0x1234);
+      await bus.write(_divider, 0x1234);
       // SEL=0b0001: only byte 0 of the write data is live.
-      await busWriteSel(divider, 0x1, 0x00000099);
-      expect(await busRead(divider), equals(0x1299));
+      await bus.write(_divider, 0x00000099, sel: 0x1);
+      expect(await bus.read(_divider), equals(0x1299));
       await Simulator.endSimulation();
     });
 
@@ -262,9 +139,9 @@ void main() {
       () async {
         await setUpDut();
 
-        await busWrite(divider, 0x1234);
-        await busWriteSel(divider, 0x3, 0x0000beef);
-        expect(await busRead(divider), equals(0xbeef));
+        await bus.write(_divider, 0x1234);
+        await bus.write(_divider, 0x0000beef, sel: 0x3);
+        expect(await bus.read(_divider), equals(0xbeef));
         await Simulator.endSimulation();
       },
     );
@@ -278,14 +155,74 @@ void main() {
         'below it (64-bit bus)', () async {
       await setUpDut(dataWidth: 64);
 
-      await busWriteSel(divider, 0x0f, 0x1234);
-      final before = await busRead(divider);
+      await bus.write(_divider, 0x1234, sel: 0x0f);
+      final before = await bus.read(_divider);
 
-      await busWriteSel(divider, 0xf0, 0x5678 << 32);
-      final after = await busRead(divider);
+      await bus.write(_divider, 0x5678 << 32, sel: 0xf0);
+      final after = await bus.read(_divider);
 
       expect(before, equals(0x1234));
       expect(after, equals(before));
+      await Simulator.endSimulation();
+    });
+
+    // DATA's read side effect (the RX pop) must only act on DATA's own
+    // lane. A read of the padding upper half of its 8-byte slot (64-bit
+    // bus) must leave the received byte in place.
+    test('a read of the upper lane of DATA does not pop the RX byte '
+        '(64-bit bus)', () async {
+      await setUpDut(dataWidth: 64);
+
+      await bus.write(_divider, 1);
+      await bus.write(_ctrl, 0x9); // enable | loopback
+      await bus.write(_data, 0x5a);
+
+      var st = await bus.read(_status);
+      var guard = 0;
+      while (st & 0x1 != 0 && guard < 200) {
+        st = await bus.read(_status);
+        guard++;
+      }
+      expect(st & 0x4, equals(0x4), reason: 'rx_ready should be set');
+
+      // A read of the upper lane does not pop it.
+      await bus.read(_data, sel: 0xf0);
+      expect(await bus.read(_status) & 0x4, equals(0x4));
+
+      // Reading DATA's own lane pops it and returns the byte.
+      expect(await bus.read(_data, sel: 0x0f) & 0xff, equals(0x5a));
+      expect(await bus.read(_status) & 0x4, equals(0));
+
+      await Simulator.endSimulation();
+    });
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      await bus.write(_divider, 1);
+      await bus.write(_ctrl, 0x9); // enable | loopback
+      await bus.write(_data, 0xaa); // start and finish a transfer
+
+      var st = await bus.read(_status);
+      var guard = 0;
+      while (st & 0x1 != 0 && guard < 200) {
+        st = await bus.read(_status);
+        guard++;
+      }
+      expect(st & 0x1, equals(0));
+      expect(await bus.read(_data) & 0xff, equals(0xaa));
+
+      // A write with SEL 0 to DATA must not touch the shift register or
+      // start a new transfer: busy stays clear and DATA still reads the
+      // byte from the finished transfer above.
+      await bus.write(_data, 0x55, sel: 0x0);
+      expect(await bus.read(_status) & 0x1, equals(0));
+      expect(await bus.read(_data) & 0xff, equals(0xaa));
+
+      // DIVIDER (a plain merge register) must also ignore a SEL-0 write.
+      await bus.write(_divider, 0xffffffff, sel: 0x0);
+      expect(await bus.read(_divider), equals(1));
+
       await Simulator.endSimulation();
     });
   });

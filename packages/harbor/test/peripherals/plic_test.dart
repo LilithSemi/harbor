@@ -4,6 +4,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 void main() {
   group('HarborPlic', () {
     test('creates with defaults', () {
@@ -35,9 +37,17 @@ void main() {
       expect(dt.interruptController, isTrue);
       expect(dt.properties['riscv,ndev'], equals(32));
     });
+
+    test('different params get different definition names', () {
+      final a = HarborPlic(baseAddress: 0x0C000000, sources: 32);
+      final b = HarborPlic(baseAddress: 0x0C000000, sources: 64);
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
   });
 
-  laneTests();
+  for (final kind in HarborFabricKind.values) {
+    laneTests(kind);
+  }
 }
 
 // Bus-lane decode, driven the way the core drives it. The master puts a
@@ -45,11 +55,12 @@ void main() {
 // byte lane of the access. On a 64-bit bus the claim/complete register
 // (offset 0x200004) is in lane 1 of the bus word at 0x200000, the same word as
 // the threshold register.
-void laneTests() {
-  group('HarborPlic bus lane decode', () {
+void laneTests(HarborFabricKind kind) {
+  group('HarborPlic bus lane decode (${kind.name})', () {
     late HarborPlic plic;
-    late Logic clk, reset, stb, we, adr, mosi, sel;
+    late Logic clk, reset;
     late List<Logic> srcs;
+    late RegBus bus;
     late int busBytes;
 
     const nSources = 4;
@@ -62,36 +73,23 @@ void laneTests() {
         contexts: 1,
         busAddressWidth: 32,
         busDataWidth: dataWidth,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 32);
-      mosi = Logic(name: 'mosi', width: dataWidth);
-      sel = Logic(name: 'sel', width: busBytes);
       srcs = [for (var i = 0; i < nSources; i++) Logic(name: 'src_$i')];
 
       plic.input('clk').srcConnection! <= clk;
       plic.input('reset').srcConnection! <= reset;
-      plic.input('bus_CYC').srcConnection! <= stb;
-      plic.input('bus_STB').srcConnection! <= stb;
-      plic.input('bus_WE').srcConnection! <= we;
-      plic.input('bus_ADR').srcConnection! <= adr;
-      plic.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      plic.input('bus_SEL').srcConnection! <= sel;
       for (var i = 0; i < nSources; i++) {
         plic.input('src_irq_$i').srcConnection! <= srcs[i];
       }
+      bus = RegBus.attach(plic, clk);
 
       await plic.build();
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
-      sel.inject(0);
+      bus.idle();
       for (final s in srcs) {
         s.inject(0);
       }
@@ -107,38 +105,21 @@ void laneTests() {
 
     Future<void> coreWrite(int byteAddr, int bytes, BigInt value) async {
       final lane = byteAddr % busBytes;
-      adr.inject(byteAddr - lane);
-      mosi.inject(
-        LogicValue.ofBigInt(
-          (value << (lane * 8)) & maskOf(busBytes * 8),
-          busBytes * 8,
-        ),
-      );
-      sel.inject(((1 << bytes) - 1) << lane);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (plic.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
+      final addr = byteAddr - lane;
+      final shifted = (value << (lane * 8)) & maskOf(busBytes * 8);
+      final sel = ((1 << bytes) - 1) << lane;
+      await bus.write(addr, shifted.toInt(), sel: sel);
     }
 
+    // The claim register's read has a side effect gated by SEL (see
+    // HarborPlic), so a read must restrict SEL to its own lane just like a
+    // write does, instead of RegBus.read's default of every byte.
     Future<BigInt> coreRead(int byteAddr, int bytes) async {
       final lane = byteAddr % busBytes;
-      adr.inject(byteAddr - lane);
-      sel.inject(((1 << bytes) - 1) << lane);
-      we.inject(0);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (plic.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final raw = plic.output('bus_DAT_MISO').value.toBigInt();
-      stb.inject(0);
-      await clk.nextPosedge;
+      final addr = byteAddr - lane;
+      final sel = ((1 << bytes) - 1) << lane;
+      final result = await bus.access(addr, sel: sel, write: false);
+      final raw = BigInt.from(result.data);
       return (raw >> (lane * 8)) & maskOf(bytes * 8);
     }
 
@@ -164,8 +145,12 @@ void laneTests() {
       expect(plic.output('ext_irq_0').value.toInt(), equals(1));
 
       // Threshold and claim share a bus word on a 64-bit bus. Reading the
-      // threshold must return the threshold, not the claim id.
+      // threshold must return the threshold, not the claim id, and must not
+      // claim the pending source either: the external interrupt must stay
+      // asserted until the claim register itself is read.
       expect(await coreRead(0x200000, 4), equals(BigInt.zero));
+      await clk.nextPosedge;
+      expect(plic.output('ext_irq_0').value.toInt(), equals(1));
 
       // Claim returns the source id and masks it.
       expect(await coreRead(0x200004, 4), equals(BigInt.one));
@@ -194,6 +179,25 @@ void laneTests() {
     test('32-bit bus keeps the plain word behaviour', () async {
       await setUpDut(dataWidth: 32);
       await claimCompleteFlow();
+      await Simulator.endSimulation();
+    });
+
+    // A write with no byte selected must not change the priority register,
+    // the enable bitmap, the threshold register, or complete a source.
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut(dataWidth: 32);
+
+      await coreWrite(0x4, 4, BigInt.one);
+      await coreWrite(0x2000, 4, BigInt.two);
+      await coreWrite(0x200000, 4, BigInt.from(3));
+
+      await bus.write(0x4, 0xff, sel: 0x0);
+      await bus.write(0x2000, 0xffffffff, sel: 0x0);
+      await bus.write(0x200000, 0xff, sel: 0x0);
+
+      expect(await coreRead(0x4, 4), equals(BigInt.one));
+      expect(await coreRead(0x2000, 4), equals(BigInt.two));
+      expect(await coreRead(0x200000, 4), equals(BigInt.from(3)));
       await Simulator.endSimulation();
     });
   });

@@ -78,6 +78,7 @@ class Sky130Provider extends PdkProvider {
       'fabricOut': 'OUT',
     },
     properties: {'name': 'io_$index'},
+    activeLow: const {'padOutputEnable'},
   );
 
   @override
@@ -118,6 +119,8 @@ class Sky130Provider extends PdkProvider {
   }) {
     // OpenRAM-generated Sky130 SRAM macros
     // Common sizes: 256x32, 512x32, 1024x32, 2048x32
+    // Every macro has the read port 1. csb0, web0 and csb1 are active low,
+    // and wmask0 has one active high bit per byte.
     final macroName = 'sky130_sram_${numPorts}rw1r_${words}_${width}_8';
     return AnalogBlock(
       symbolPath: '$pdkRoot/libs.ref/sky130_sram_macros/lef/$macroName.lef',
@@ -128,12 +131,14 @@ class Sky130Provider extends PdkProvider {
         'dataOut': 'dout0',
         'writeEnable': 'web0',
         'chipSelect': 'csb0',
-        if (numPorts > 1) ...{
-          'addr1': 'addr1',
-          'dataOut1': 'dout1',
-          'chipSelect1': 'csb1',
-        },
+        'writeMask': 'wmask0',
+        'clk1': 'clk1',
+        'addr1': 'addr1',
+        'dataOut1': 'dout1',
+        'chipSelect1': 'csb1',
       },
+      activeLow: const {'writeEnable', 'chipSelect', 'chipSelect1'},
+      params: const {'writeMaskBits': 8},
       properties: {
         'name': macroName,
         'words': '$words',

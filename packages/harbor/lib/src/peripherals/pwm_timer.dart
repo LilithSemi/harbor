@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -53,9 +54,22 @@ class HarborPwmTimer extends BridgeModule
     required this.baseAddress,
     this.channels = 4,
     this.counterWidth = 32,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborPwmTimer', name: name ?? 'pwm_timer') {
+  }) : super(
+         harborStableDefinitionName('HarborPwmTimer', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'ch$channels',
+           'w$counterWidth',
+         ]),
+         name: name ?? 'pwm_timer',
+       ) {
     // Channel ch decodes at 0x20 + ch*0x20 inside the 4 KiB register window, so
     // channel 127 would wrap past the window and alias the global block.
     if (channels > 127) {
@@ -73,15 +87,19 @@ class HarborPwmTimer extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Per-channel state
     final chEnable = List.generate(channels, (i) => Logic(name: 'ch${i}_en'));

@@ -167,11 +167,7 @@ class ScanoutContentionBench {
       phyMaxClockHz: SdramPhyEcp5.maxClockHzLvcmos33,
     );
 
-    soc = HarborSoC(
-      name: 'ScanoutSoC',
-      compatible: 'test,scanout',
-      busConfig: cfg,
-    );
+    soc = HarborSoC(name: 'ScanoutSoC', compatible: 'test,scanout');
     bench = soc.addMaster(_BenchMaster(cfg), busInterfaceName: 'bus');
     display = soc.addMaster(
       _BenchDisplay(cfg, timing: timing, burstWords: burstWords),
@@ -291,7 +287,7 @@ class ScanoutContentionBench {
   }
 
   void _watch() {
-    final grant = soc.fabricArbiter?.grant;
+    final grant = (soc.fabric! as HarborWishboneFabric).grant;
     final busy = _fetcherBusy();
     final iface = display.interface('bus').interface as WishboneInterface;
     var dispAccess = 0;

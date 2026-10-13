@@ -1,13 +1,11 @@
 import 'dart:async';
 
-import 'package:harbor/src/clock/wishbone_cdc_fifo.dart';
 import 'package:harbor/src/peripherals/ddr3_config.dart'
     show HarborDdrConfig, HarborDdrType;
 import 'package:harbor/src/peripherals/ddr3_controller.dart';
 import 'package:harbor/src/peripherals/ddr3_params.dart';
 import 'package:harbor/src/peripherals/harbor_ddr3.dart';
 import 'package:rohd/rohd.dart';
-import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:test/test.dart';
 
 /// wb2 register indices (the controller decodes a bus-width-independent
@@ -73,121 +71,36 @@ Future<void> _wb2Write(_Wb2 wb2, Logic clk, int addr, int data) async {
   wb2.we.inject(0);
 }
 
-/// Fabric harness: a 64-bit SoC-side wishbone -> train_cdc (CDC FIFO) -> the
-/// wb2 boundary adaptation (mirror of HarborDdr3._build) -> Ddr3Controller wb2.
-/// Proves the width + address-granularity conversion end to end at 64-bit.
-class _Wb2FabricTop extends BridgeModule {
-  late final Ddr3Controller controller;
+/// Drives the real `train` Wishbone port of [ddr] with byte addresses, the
+/// way the FSBL writes `train_base + index * 8`.
+class _TrainPort {
+  final HarborDdr3 ddr;
+  final Logic clk;
+  _TrainPort(this.ddr, this.clk);
 
-  _Wb2FabricTop(DdrParams p) : super('_Wb2FabricTop', name: 'wb2_fabric_top') {
-    const busDW = 64;
-    createPort('sys_clk', PortDirection.input);
-    createPort('ddr_clk', PortDirection.input);
-    createPort('rst_n', PortDirection.input);
-    createPort('t_cyc', PortDirection.input);
-    createPort('t_stb', PortDirection.input);
-    createPort('t_we', PortDirection.input);
-    createPort('t_adr', PortDirection.input, width: busDW);
-    createPort('t_dat', PortDirection.input, width: busDW);
-    createPort('t_sel', PortDirection.input, width: busDW ~/ 8);
+  void _set(String p, int v) => ddr.input('train_$p').srcConnection!.inject(v);
 
-    final sysClk = input('sys_clk');
-    final ddrClk = input('ddr_clk');
-    final rstN = input('rst_n');
-    final rst = ~rstN;
-
-    final cdc = HarborWishboneCdcFifoBridge(
-      addressWidth: busDW,
-      dataWidth: busDW,
-      selWidth: busDW ~/ 8,
-      depth: 16,
-      name: 'train_cdc',
-    );
-    addSubModule(cdc);
-    cdc.input('s_clk').srcConnection! <= sysClk;
-    cdc.input('s_reset').srcConnection! <= rst;
-    cdc.input('s_cyc').srcConnection! <= input('t_cyc');
-    cdc.input('s_stb').srcConnection! <= input('t_stb');
-    cdc.input('s_we').srcConnection! <= input('t_we');
-    cdc.input('s_adr').srcConnection! <= input('t_adr');
-    cdc.input('s_dat_w').srcConnection! <= input('t_dat');
-    cdc.input('s_sel').srcConnection! <= input('t_sel');
-    cdc.input('m_clk').srcConnection! <= ddrClk;
-    cdc.input('m_reset').srcConnection! <= rst;
-
-    // wb2 boundary adaptation (mirror of HarborDdr3._build).
-    final wordShift = (busDW ~/ 8).bitLength - 1; // log2(bytesPerWord) = 3
-    final mAdr = cdc.output('m_adr');
-    final byteAddr = [mAdr, Const(0, width: wordShift)].swizzle();
-    final wb2Addr = byteAddr.getRange(3, 3 + Ddr3Controller.wb2AddrBits);
-    final wb2Data = cdc
-        .output('m_dat_w')
-        .getRange(0, Ddr3Controller.wb2DataBits);
-    final wb2Sel = cdc.output('m_sel').getRange(0, Ddr3Controller.wb2SelBits);
-    final wb2Cyc = cdc.output('m_cyc') & cdc.output('m_stb');
-
-    final wb2Ack = Logic(name: 'wb2_ack');
-    final wb2DataOut = Logic(
-      name: 'wb2_data',
-      width: Ddr3Controller.wb2DataBits,
-    );
-
-    controller = Ddr3Controller(
-      p,
-      controllerClk: ddrClk,
-      rstN: rstN,
-      wbCyc: Const(0),
-      wbStb: Const(0),
-      wbWe: Const(0),
-      wbAddr: Const(0, width: p.wbAddrBits),
-      wbData: Const(0, width: p.wbDataBits),
-      wbSel: Const(0, width: p.wbSelBits),
-      aux: Const(0, width: Ddr3Controller.auxWidth),
-      wb2Cyc: wb2Cyc,
-      wb2Stb: Const(1),
-      wb2We: cdc.output('m_we'),
-      wb2Addr: wb2Addr,
-      wb2Sel: wb2Sel,
-      wb2Data: wb2Data,
-      phyIserdesData: Const(0, width: p.dqBits * p.lanes * 8),
-      phyIserdesDqs: Const(0, width: p.lanes * 8),
-      phyIserdesBitslipReference: Const(0, width: p.lanes * 8),
-      phyIdelayctrlRdy: Const(0),
-      runtimeTrainable: true,
-    );
-    wb2Ack <= controller.output('o_wb2_ack');
-    wb2DataOut <= controller.output('o_wb2_data');
-    cdc.input('m_ack').srcConnection! <= wb2Ack;
-    cdc.input('m_dat_r').srcConnection! <= wb2DataOut.zeroExtend(busDW);
-
-    addOutput('t_ack') <= cdc.output('s_ack');
-    addOutput('t_dat_r', width: busDW) <= cdc.output('s_dat_r');
-  }
-}
-
-/// One 64-bit fabric write through the CDC; holds the request until ack.
-Future<void> _fabricWrite(
-  _Wb2FabricTop top,
-  Logic clk,
-  int adr,
-  int data,
-) async {
-  top.input('t_cyc').inject(1);
-  top.input('t_stb').inject(1);
-  top.input('t_we').inject(1);
-  top.input('t_adr').inject(adr);
-  top.input('t_dat').inject(data);
-  top.input('t_sel').inject(0xF);
-  var guard = 0;
-  while (top.output('t_ack').value.toInt() != 1) {
+  Future<int> access(int byteAddr, {int? write}) async {
+    _set('CYC', 1);
+    _set('STB', 1);
+    _set('WE', write == null ? 0 : 1);
+    _set('ADR', byteAddr);
+    _set('DAT_MOSI', write ?? 0);
+    _set('SEL', (1 << (ddr.trainBus!.sel.width)) - 1);
+    var guard = 0;
+    while (ddr.output('train_ACK').value.toInt() != 1) {
+      await clk.nextPosedge;
+      if (++guard > 400)
+        throw StateError('no ACK at 0x${byteAddr.toRadixString(16)}');
+    }
+    final data = ddr.output('train_DAT_MISO').value.getRange(0, 32).toInt();
+    await clk.nextNegedge;
+    _set('CYC', 0);
+    _set('STB', 0);
+    _set('WE', 0);
     await clk.nextPosedge;
-    if (++guard > 400) break;
+    return data;
   }
-  await clk.nextPosedge;
-  top.input('t_cyc').inject(0);
-  top.input('t_stb').inject(0);
-  top.input('t_we').inject(0);
-  await clk.nextPosedge;
 }
 
 void main() {
@@ -434,65 +347,66 @@ void main() {
     expect(ddr.trainBus!.dataIn.width, 64);
   });
 
-  test('FABRIC 64-bit: byte 0x08 write lands on the ODELAY register and drives '
-      'o_phy (address-granularity + data-narrow)', () async {
-    final clk = SimpleClockGenerator(10).clk;
-    final p = DdrParams.artyS7(ckPeriodPs: 3000);
-    final top = _Wb2FabricTop(p);
-    top.port('sys_clk').getsLogic(clk);
-    top
-        .port('ddr_clk')
-        .getsLogic(clk); // synchronous CDC for a deterministic sim
-    await top.build();
+  for (final busDW in [32, 64]) {
+    test('HarborDdr3 $busDW-bit train port: FSBL byte offsets reach the knob '
+        'registers', () async {
+      final ddr = HarborDdr3(
+        config: HarborDdrConfig(
+          type: HarborDdrType.ddr3,
+          size: 0x10000000,
+          dataWidth: 16,
+          frequency: 300000000,
+          rowWidth: 14,
+        ),
+        baseAddress: 0x80000000,
+        clockHz: 100000000,
+        busDataWidth: busDW,
+        busAddressWidth: 28,
+        runtimeTrainable: true,
+        ckPeriodPs: 3000,
+      );
+      final clk = SimpleClockGenerator(10).clk;
+      for (final i in ddr.inputs.values) {
+        i.srcConnection!.put(0);
+      }
+      // One clock for both sides keeps the sim deterministic. The port
+      // layer still builds the crossing.
+      ddr.input('clk').srcConnection! <= clk;
+      ddr.input('ddr_clk').srcConnection! <= clk;
+      await ddr.build();
+      ddr.input('reset').srcConnection!.inject(1);
+      ddr.input('ddr_reset').srcConnection!.inject(1);
+      Simulator.setMaxSimTime(20000000);
+      unawaited(Simulator.run());
+      for (var i = 0; i < 4; i++) {
+        await clk.nextPosedge;
+      }
+      ddr.input('reset').srcConnection!.inject(0);
+      ddr.input('ddr_reset').srcConnection!.inject(0);
+      // The controller leaves reset after the 4096 cycle power-on hold.
+      for (var i = 0; i < 4200; i++) {
+        await clk.nextPosedge;
+      }
 
-    top.input('rst_n').inject(0);
-    top.input('t_cyc').inject(0);
-    top.input('t_stb').inject(0);
-    top.input('t_we').inject(0);
-    top.input('t_adr').inject(0);
-    top.input('t_dat').inject(0);
-    top.input('t_sel').inject(0);
-    Simulator.setMaxSimTime(2000000);
-    unawaited(Simulator.run());
-    await clk.nextPosedge;
-    await clk.nextPosedge;
-    top.input('rst_n').inject(1);
-    await clk.nextPosedge;
-
-    // 64-bit ADR is byte>>3: ODELAY (byte 0x08) = adr 1, CTL (byte 0x20) = adr 4.
-    await _fabricWrite(top, clk, 1, 0x7); // ODELAY = 7
-    await _fabricWrite(top, clk, 4, 0x1); // CTL SET, lane 0
-    await _fabricWrite(top, clk, 4, 0x2); // CTL LOAD/APPLY
-    await clk.nextPosedge;
-
-    // The byte offset routed to the ODELAY register (index 1), value from the
-    // low 32 bits of the 64-bit word.
-    expect(
-      top.controller.rtOdelayRegs![0].value.toInt(),
-      7,
-      reason: 'byte 0x08 must hit ODELAY lane 0 through the 64-bit fabric',
-    );
-    expect(
-      top.controller.output('o_phy_odelay_data_cntvaluein').value.toInt(),
-      7,
-      reason: 'o_phy must follow the runtime knob after APPLY',
-    );
-
-    // Read back ODELAY (byte 0x08) over the same fabric: low 32 bits = 7.
-    top.input('t_cyc').inject(1);
-    top.input('t_stb').inject(1);
-    top.input('t_we').inject(0);
-    top.input('t_adr').inject(1);
-    var guard = 0;
-    while (top.output('t_ack').value.toInt() != 1) {
+      final t = _TrainPort(ddr, clk);
+      final base = ddr.trainBase - ddr.baseAddress;
+      await t.access(base + 0x08, write: 0x7); // ODELAY = 7
+      await t.access(base + 0x20, write: 0x1); // CTL SET, lane 0
+      await t.access(base + 0x20, write: 0x2); // CTL LOAD/APPLY
       await clk.nextPosedge;
-      if (++guard > 400) break;
-    }
-    final rd = top.output('t_dat_r').value.getRange(0, 32).toInt();
-    top.input('t_cyc').inject(0);
-    top.input('t_stb').inject(0);
-    expect(rd, 7, reason: 'fabric read-back of ODELAY returns the applied tap');
-
-    await Simulator.endSimulation();
-  });
+      final ctrl = ddr.controller!;
+      expect(
+        ctrl.rtOdelayRegs![0].value.toInt(),
+        7,
+        reason: 'byte 0x08 must hit ODELAY lane 0',
+      );
+      expect(
+        ctrl.output('o_phy_odelay_data_cntvaluein').value.toInt(),
+        7,
+        reason: 'o_phy must follow the runtime knob after APPLY',
+      );
+      expect(await t.access(base + 0x08), 7, reason: 'ODELAY read-back');
+      await Simulator.endSimulation();
+    });
+  }
 }

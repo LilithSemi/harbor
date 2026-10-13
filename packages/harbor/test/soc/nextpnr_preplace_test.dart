@@ -72,7 +72,6 @@ HarborSoC _soc({
   final soc = HarborSoC(
     name: 'PreplaceSoC',
     compatible: 'test,preplace-soc',
-    busConfig: const WishboneConfig(addressWidth: 32, dataWidth: 32),
     target: target,
   );
   soc.addPeripheral(HarborUart(baseAddress: 0x10000000));

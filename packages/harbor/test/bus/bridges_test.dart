@@ -54,30 +54,4 @@ void main() {
       expect(arbiter.grant.width, equals(1));
     });
   });
-
-  group('TileLinkDecoder', () {
-    test('creates with config and mappings, hit output width is 1', () {
-      final config = TileLinkConfig(addressWidth: 32, dataWidth: 32);
-      final master = TileLinkInterface(config);
-      final slave0 = TileLinkInterface(config);
-      final mapping0 = HarborAddressMapping(
-        range: BusAddressRange(0x0000, 0x1000),
-        slaveIndex: 0,
-      );
-      final decoder = TileLinkDecoder(master, [(slave0, mapping0)]);
-      expect(decoder.hit.width, equals(1));
-    });
-  });
-
-  group('TileLinkArbiter', () {
-    test('creates with single master, grant output exists', () {
-      final config = TileLinkConfig(addressWidth: 32, dataWidth: 32);
-      final master0 = TileLinkInterface(config);
-      final slave = TileLinkInterface(config);
-      final clk = Logic(name: 'clk');
-      final reset = Logic(name: 'reset');
-      final arbiter = TileLinkArbiter([master0], slave, clk: clk, reset: reset);
-      expect(arbiter.grant.width, equals(1));
-    });
-  });
 }

@@ -155,11 +155,7 @@ void main() {
             dataWidth: 32,
             useErr: true,
           );
-          final soc = HarborSoC(
-            name: 'ErrorSoC',
-            compatible: 'test,error',
-            busConfig: cfg,
-          );
+          final soc = HarborSoC(name: 'ErrorSoC', compatible: 'test,error');
           final a = _RwMaster(cfg, 0x20, 0x12345678, name: 'cpu');
           final b = _RwMaster(
             cfg,
@@ -180,8 +176,7 @@ void main() {
             ),
           );
           if (topology == 'private') {
-            // Give the private decoders different slave counts so this fixture
-            // does not collide on ROHD's reserved WishboneDecoder_S1 name.
+            // A slave only the primary channel reaches.
             soc.addPeripheral(
               HarborSram(
                 baseAddress: 8192,
@@ -245,14 +240,7 @@ void main() {
               }
             }
             expect(completed, isTrue);
-            expect(
-              rtl,
-              contains(
-                topology == 'shared'
-                    ? ".slave_ERR(1'h0)"
-                    : ".slave_0_ERR(1'h0)",
-              ),
-            );
+            expect(rtl, contains('HarborWishboneFabric'));
             expect(a.output('rdata').value.toInt(), 0x12345678);
             if (topology != 'single') {
               expect(b.output('rdata').value.toInt(), 0x76543210);
@@ -266,12 +254,11 @@ void main() {
     }
   }
 
-  test('buildFabric inserts a WishboneArbiter for >1 master', () async {
+  test('buildFabric builds one Wishbone fabric for >1 master', () async {
     const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
     final soc = HarborSoC(
       name: 'MultiMasterSoC',
       compatible: 'test,multimaster',
-      busConfig: cfg,
     );
 
     soc.addMaster(_IdleMaster(cfg, name: 'm_a'), busInterfaceName: 'bus');
@@ -284,16 +271,18 @@ void main() {
     await soc.build();
 
     final sv = soc.generateSynth();
-    expect(sv, contains('WishboneArbiter_M2'));
-    expect(sv, contains('WishboneDecoder'));
+    expect(sv, contains('HarborWishboneFabric'));
+    expect((soc.fabric! as HarborWishboneFabric).masters.map((m) => m.name), [
+      'm_a',
+      'm_b',
+    ]);
   });
 
-  test('single master uses the decoder directly (no arbiter)', () async {
+  test('a single master gets a fabric with a one bit grant', () async {
     const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
     final soc = HarborSoC(
       name: 'SingleMasterSoC',
       compatible: 'test,singlemaster',
-      busConfig: cfg,
     );
     soc.addMaster(_IdleMaster(cfg, name: 'm_only'), busInterfaceName: 'bus');
     soc.addPeripheral(
@@ -303,17 +292,13 @@ void main() {
     await soc.build();
 
     final sv = soc.generateSynth();
-    expect(sv, contains('WishboneDecoder'));
-    expect(sv, isNot(contains('WishboneArbiter')));
+    expect(sv, contains('HarborWishboneFabric'));
+    expect((soc.fabric! as HarborWishboneFabric).grant!.width, 1);
   });
 
   test('two masters contend on a shared SRAM and both complete', () async {
     const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
-    final soc = HarborSoC(
-      name: 'ContendSoC',
-      compatible: 'test,contend',
-      busConfig: cfg,
-    );
+    final soc = HarborSoC(name: 'ContendSoC', compatible: 'test,contend');
     // Distinct words in the SRAM (word stride 4): 0x20 and 0x40.
     final mA = _RwMaster(cfg, 0x20, 0xAAAA1111, name: 'm_a');
     final mB = _RwMaster(cfg, 0x40, 0xBBBB2222, name: 'm_b');
@@ -373,11 +358,7 @@ void main() {
 
   test('pipelined single-master fabric round-trips a write+read', () async {
     const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
-    final soc = HarborSoC(
-      name: 'PipeSingleSoC',
-      compatible: 'test,pipe1',
-      busConfig: cfg,
-    );
+    final soc = HarborSoC(name: 'PipeSingleSoC', compatible: 'test,pipe1');
     final m = _RwMaster(cfg, 0x30, 0xC0DECAFE, name: 'm');
     soc.addMaster(m, busInterfaceName: 'bus');
     soc.addPeripheral(
@@ -422,11 +403,7 @@ void main() {
 
   test('pipelined two-master fabric: both contend and complete', () async {
     const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
-    final soc = HarborSoC(
-      name: 'PipeContendSoC',
-      compatible: 'test,pipe2',
-      busConfig: cfg,
-    );
+    final soc = HarborSoC(name: 'PipeContendSoC', compatible: 'test,pipe2');
     final mA = _RwMaster(cfg, 0x20, 0xAAAA1111, name: 'm_a');
     final mB = _RwMaster(cfg, 0x40, 0xBBBB2222, name: 'm_b');
     soc.addMaster(mA, busInterfaceName: 'bus');

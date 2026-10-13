@@ -4,29 +4,32 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 // ddtp at byte 0x10 (register index addr[6:3] == 2).
 const _ddtp = 0x10;
 
 void main() {
-  group('HarborIommu translation', () {
+  test('different iotlbEntries counts get different definition names', () {
+    final a = HarborIommu(baseAddress: 0x10000000, iotlbEntries: 4);
+    final b = HarborIommu(baseAddress: 0x10000000, iotlbEntries: 8);
+    expect(a.definitionName, isNot(equals(b.definitionName)));
+  });
+
+  for (final kind in HarborFabricKind.values) {
+    translationTests(kind);
+  }
+}
+
+void translationTests(HarborFabricKind kind) {
+  group('HarborIommu translation (${kind.name})', () {
     late HarborIommu io;
-    late Logic clk, reset, stb, we, adr, mosi;
+    late Logic clk, reset;
     late Logic dmaAddr, dmaValid, dmaWrite;
     late Logic transValid, fault;
+    late RegBus regBus;
 
-    Future<void> regWrite(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (io.output('reg_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
+    Future<void> regWrite(int addr, int data) => regBus.write(addr, data);
 
     // Build with a combinational page-table model on the PTW port: each address
     // in [ptes] returns its PTE, ptw_valid follows ptw_read (single cycle).
@@ -35,30 +38,21 @@ void main() {
         baseAddress: 0x10000000,
         iotlbEntries: 4,
         msiTranslation: false,
+        fabricKind: kind,
       );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: 64);
       dmaAddr = Logic(name: 'dma_addr_t', width: 64);
       dmaValid = Logic(name: 'dma_valid_t');
       dmaWrite = Logic(name: 'dma_write_t');
 
       io.input('clk').srcConnection! <= clk;
       io.input('reset').srcConnection! <= reset;
-      io.input('reg_CYC').srcConnection! <= stb;
-      io.input('reg_STB').srcConnection! <= stb;
-      io.input('reg_WE').srcConnection! <= we;
-      io.input('reg_ADR').srcConnection! <= adr;
-      io.input('reg_DAT_MOSI').srcConnection! <= mosi;
-      io.input('reg_SEL').srcConnection! <=
-          Const(0xFF, width: io.input('reg_SEL').width);
       io.input('dma_addr').srcConnection! <= dmaAddr;
       io.input('dma_valid').srcConnection! <= dmaValid;
       io.input('dma_write').srcConnection! <= dmaWrite;
       io.input('dma_device_id').srcConnection! <= Const(0, width: 24);
+      regBus = RegBus.attach(io, clk, name: 'reg');
 
       // Page-table model on the PTW port.
       final ptwAddr = io.output('ptw_addr');
@@ -74,10 +68,7 @@ void main() {
       fault = io.output('dma_fault');
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
+      regBus.idle();
       dmaAddr.inject(0);
       dmaValid.inject(0);
       dmaWrite.inject(0);
@@ -160,6 +151,25 @@ void main() {
       final (_, faulted, __) = await translate(0x2000, write: true);
       expect(faulted, isTrue);
       expect(io.output('dma_fault_cause').value.toInt(), equals(2)); // perm
+      await Simulator.endSimulation();
+    });
+
+    // A write with no byte selected must not change ddtp.
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut({
+        0x10000: (0x11 << 10) | 1,
+        0x11000: (0x12 << 10) | 1,
+        0x12010: (0x55 << 10) | 0x7,
+      });
+      await regWrite(_ddtp, 0x10000 | 1);
+      await regBus.write(_ddtp, -1, sel: 0x0);
+
+      // If the sel-0 write had clobbered ddtp, translation would either
+      // disable (bare passthrough, no walk) or walk a different root.
+      final (addr, faulted, ptwUsed) = await translate(0x2000);
+      expect(faulted, isFalse);
+      expect(addr, equals(0x55000));
+      expect(ptwUsed, isTrue);
       await Simulator.endSimulation();
     });
   });

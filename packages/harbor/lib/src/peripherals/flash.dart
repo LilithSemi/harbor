@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -34,9 +35,21 @@ class HarborFlash extends BridgeModule
     required this.baseAddress,
     required this.size,
     this.dataWidth = 32,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborFlash', name: name ?? 'flash') {
+  }) : super(
+         harborStableDefinitionName('HarborFlash', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: (size ~/ (dataWidth ~/ 8)).bitLength,
+             dataWidth: dataWidth,
+             cross: crossFabricClock,
+           ),
+           's$size',
+         ]),
+         name: name ?? 'flash',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -45,11 +58,15 @@ class HarborFlash extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: addrWidth,
       dataWidth: dataWidth,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');

@@ -8,47 +8,39 @@ import 'package:harbor/harbor.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test(
-    'a default HarborKeyframeDecodeHorzVert generates SV (no reserved-name '
-    'clash between its tx84/tx48 and pred84/pred48 siblings)',
-    () async {
-      final dut = HarborKeyframeDecodeHorzVert();
-      await dut.build();
-      final sv = dut.generateSynth();
+  test('a default HarborKeyframeDecodeHorzVert generates SV (no reserved-name '
+      'clash between its tx84/tx48 and pred84/pred48 siblings)', () async {
+    final dut = HarborKeyframeDecodeHorzVert();
+    await dut.build();
+    final sv = dut.generateSynth();
 
-      for (final prefix in ['HarborInvTxfm', 'HarborIntraPredRect']) {
-        final names = RegExp('module ($prefix\\w*)')
-            .allMatches(sv)
-            .map((m) => m.group(1))
-            .toSet();
-        expect(
-          names.length,
-          greaterThanOrEqualTo(2),
-          reason: '$prefix should emit a distinct module per sibling shape',
-        );
-      }
-    },
-  );
+    for (final prefix in ['HarborInvTxfm', 'HarborIntraPredRect']) {
+      final names = RegExp(
+        'module ($prefix\\w*)',
+      ).allMatches(sv).map((m) => m.group(1)).toSet();
+      expect(
+        names.length,
+        greaterThanOrEqualTo(2),
+        reason: '$prefix should emit a distinct module per sibling shape',
+      );
+    }
+  });
 
-  test(
-    'a default HarborKeyframeDecodeHorzVertYuv generates SV (same sibling '
-    'shapes, luma + chroma)',
-    () async {
-      final dut = HarborKeyframeDecodeHorzVertYuv();
-      await dut.build();
-      final sv = dut.generateSynth();
+  test('a default HarborKeyframeDecodeHorzVertYuv generates SV (same sibling '
+      'shapes, luma + chroma)', () async {
+    final dut = HarborKeyframeDecodeHorzVertYuv();
+    await dut.build();
+    final sv = dut.generateSynth();
 
-      for (final prefix in ['HarborInvTxfm', 'HarborIntraPredRect']) {
-        final names = RegExp('module ($prefix\\w*)')
-            .allMatches(sv)
-            .map((m) => m.group(1))
-            .toSet();
-        expect(
-          names.length,
-          greaterThanOrEqualTo(2),
-          reason: '$prefix should emit a distinct module per sibling shape',
-        );
-      }
-    },
-  );
+    for (final prefix in ['HarborInvTxfm', 'HarborIntraPredRect']) {
+      final names = RegExp(
+        'module ($prefix\\w*)',
+      ).allMatches(sv).map((m) => m.group(1)).toSet();
+      expect(
+        names.length,
+        greaterThanOrEqualTo(2),
+        reason: '$prefix should emit a distinct module per sibling shape',
+      );
+    }
+  });
 }

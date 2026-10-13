@@ -4,11 +4,7 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-// Register byte offsets within the 8-byte window.
-const _rbr = 0x00;
-const _iir = 0x02;
-const _lcr = 0x03;
-const _lsr = 0x05;
+import '../util/reg_bus.dart';
 
 void main() {
   group('HarborUart', () {
@@ -43,101 +39,104 @@ void main() {
       expect(dt.reg.start, equals(0x10000000));
       expect(dt.reg.size, equals(0x1000));
     });
+
+    test('different data widths get different definition names', () {
+      final a = HarborUart(baseAddress: 0x10000000, busDataWidth: 8);
+      final b = HarborUart(baseAddress: 0x10000000, busDataWidth: 32);
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
   });
 
-  group('HarborUart RBR pop only on its byte lane', () {
+  for (final kind in HarborFabricKind.values) {
+    registerTests(kind);
+  }
+}
+
+void registerTests(HarborFabricKind kind) {
+  group('HarborUart register access (${kind.name})', () {
     late HarborUart uart;
-    late Logic clk, stb, we, adr, mosi, sel, rxPin;
-    late int lanes;
+    late Logic clk, reset, rx;
+    late RegBus bus;
 
-    // Baud divisor used for every test. Slow enough to clear the 2-cycle RX
-    // input synchronizer with margin.
-    const cyclesPerBit = 4;
-
-    Future<void> busWrite(int addr, int data, int selMask) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      sel.inject(selMask);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (uart.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
-
-    // Reads the bus word at [addr] with [selMask] and returns the byte in
-    // [lane].
-    Future<int> busReadByte(int addr, int selMask, int lane) async {
-      adr.inject(addr);
-      sel.inject(selMask);
-      we.inject(0);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (uart.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final word = uart.output('bus_DAT_MISO').value.toInt();
-      stb.inject(0);
-      await clk.nextPosedge;
-      return (word >> (8 * lane)) & 0xff;
-    }
-
-    // Sends one byte on the RX pin, 8N1, LSB first, at [cyclesPerBit] cycles
-    // per bit.
-    Future<void> sendByte(int value) async {
-      Future<void> hold(int level) async {
-        rxPin.inject(level);
-        for (var i = 0; i < cyclesPerBit; i++) {
-          await clk.nextPosedge;
-        }
-      }
-
-      await hold(0); // start bit
-      for (var i = 0; i < 8; i++) {
-        await hold((value >> i) & 1);
-      }
-      await hold(1); // stop bit
-      // Margin for the receiver to land the byte and raise data-ready.
-      for (var i = 0; i < cyclesPerBit * 3; i++) {
-        await clk.nextPosedge;
-      }
-    }
-
-    Future<void> setUpDut(int dataWidth) async {
-      lanes = dataWidth ~/ 8;
-      uart = HarborUart(baseAddress: 0x10000000, busDataWidth: dataWidth);
+    Future<void> setUpDut() async {
+      // The ns16550a default: a byte-wide bus, every register at its own
+      // byte address with no lane sharing to account for.
+      uart = HarborUart(baseAddress: 0x10000000, fabricKind: kind);
       clk = SimpleClockGenerator(10).clk;
-      final reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: dataWidth);
-      sel = Logic(name: 'sel', width: lanes);
-      rxPin = Logic(name: 'rx_pin');
+      reset = Logic(name: 'reset');
+      rx = Logic(name: 'rx');
 
       uart.input('clk').srcConnection! <= clk;
       uart.input('reset').srcConnection! <= reset;
-      uart.input('bus_CYC').srcConnection! <= stb;
-      uart.input('bus_STB').srcConnection! <= stb;
-      uart.input('bus_WE').srcConnection! <= we;
-      uart.input('bus_ADR').srcConnection! <= adr;
-      uart.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      uart.input('bus_SEL').srcConnection! <= sel;
-      uart.input('rx').srcConnection! <= rxPin;
+      uart.input('rx').srcConnection! <= rx;
+      bus = RegBus.attach(uart, clk);
 
       await uart.build();
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
-      sel.inject((1 << lanes) - 1);
-      rxPin.inject(1);
+      bus.idle();
+      rx.inject(1);
+      Simulator.setMaxSimTime(200000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+    }
+
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test('LCR and SCR read back what was written', () async {
+      await setUpDut();
+
+      await bus.write(0x3, 0x03);
+      expect(await bus.read(0x3), equals(0x03));
+
+      await bus.write(0x7, 0xaa);
+      expect(await bus.read(0x7), equals(0xaa));
+      await Simulator.endSimulation();
+    });
+
+    // A write with no byte selected (AXI4 WSTRB 0) must not change any
+    // register, including defaulting to lane 0 of a wide bus.
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      await bus.write(0x3, 0x03);
+      await bus.write(0x4, 0x55);
+      await bus.write(0x3, 0xff, sel: 0x0);
+      await bus.write(0x4, 0xff, sel: 0x0);
+
+      expect(await bus.read(0x3), equals(0x03));
+      expect(await bus.read(0x4), equals(0x55));
+      await Simulator.endSimulation();
+    });
+
+    // On a wide bus every UART register lands in one access and the RBR
+    // pop is gated by SEL bit 0 (see HarborUart), so a read of any other
+    // register in that word must leave a pending byte untouched.
+    test('RBR pop is gated by its own lane on a 64-bit bus', () async {
+      uart = HarborUart(
+        baseAddress: 0x10000000,
+        fabricKind: kind,
+        busDataWidth: 64,
+      );
+      clk = SimpleClockGenerator(10).clk;
+      reset = Logic(name: 'reset');
+      rx = Logic(name: 'rx');
+
+      uart.input('clk').srcConnection! <= clk;
+      uart.input('reset').srcConnection! <= reset;
+      uart.input('rx').srcConnection! <= rx;
+      bus = RegBus.attach(uart, clk);
+
+      await uart.build();
+
+      reset.inject(1);
+      bus.idle();
+      rx.inject(1);
       Simulator.setMaxSimTime(200000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
@@ -145,67 +144,44 @@ void main() {
       reset.inject(0);
       await clk.nextPosedge;
 
-      // Program the baud divisor and drop out of DLAB mode. Write data goes
-      // in the byte lane that matches sel, same as a real bus master.
-      Future<void> writeReg(int offset, int value) async {
-        final lane = offset % lanes;
-        await busWrite(offset - lane, value << (8 * lane), 1 << lane);
+      // Send one byte on RX at the default (divisor = 1) bit rate: two
+      // cycles low for the start bit, then each data bit for one cycle,
+      // LSB first, then the stop bit.
+      const sent = 0xA5;
+      rx.inject(0);
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      for (var i = 0; i < 8; i++) {
+        rx.inject((sent >> i) & 1);
+        await clk.nextPosedge;
       }
+      rx.inject(1);
+      await clk.nextPosedge;
+      await clk.nextPosedge;
 
-      await writeReg(_lcr, 0x83); // DLAB=1
-      await writeReg(_rbr, cyclesPerBit); // DLL
-      await writeReg(_lcr, 0x03); // DLAB=0, 8N1
-    }
+      // Poll LSR (byte 5, bit 40 of the word) until data-ready, reading
+      // only its own lane so this does not touch RBR.
+      var ready = false;
+      for (var i = 0; i < 50 && !ready; i++) {
+        final word = await bus.read(0, sel: 0x20);
+        ready = (word >> 40) & 1 == 1;
+        if (!ready) await clk.nextPosedge;
+      }
+      expect(ready, isTrue, reason: 'LSR data-ready should assert');
 
-    tearDown(() async {
-      await Simulator.reset();
+      // Reading LSR again must not have popped RBR.
+      final still = await bus.read(0, sel: 0x20);
+      expect((still >> 40) & 1, equals(1));
+
+      // Reading RBR (lane 0) pops it and returns the byte.
+      final rbr = await bus.read(0, sel: 0x01);
+      expect(rbr & 0xff, equals(sent));
+
+      // LSR now shows no data ready.
+      final after = await bus.read(0, sel: 0x20);
+      expect((after >> 40) & 1, equals(0));
+
+      await Simulator.endSimulation();
     });
-
-    for (final dataWidth in [32, 64]) {
-      test(
-        'reading IIR and LSR alone does not pop RBR ($dataWidth-bit bus)',
-        () async {
-          await setUpDut(dataWidth);
-          await sendByte(0x42);
-
-          final iirLane = _iir % lanes;
-          final iirWord = _iir - iirLane;
-          await busReadByte(iirWord, 1 << iirLane, iirLane);
-
-          final lsrLane = _lsr % lanes;
-          final lsrWord = _lsr - lsrLane;
-          final lsr = await busReadByte(lsrWord, 1 << lsrLane, lsrLane);
-          expect(lsr & 0x01, equals(1), reason: 'data ready after IIR read');
-
-          final rbrLane = _rbr % lanes;
-          final rbrWord = _rbr - rbrLane;
-          final rbr = await busReadByte(rbrWord, 1 << rbrLane, rbrLane);
-          expect(rbr, equals(0x42));
-
-          final lsrAfter = await busReadByte(lsrWord, 1 << lsrLane, lsrLane);
-          expect(lsrAfter & 0x01, equals(0), reason: 'data ready after RBR');
-
-          await Simulator.endSimulation();
-        },
-      );
-
-      test('a full-word read of RBR still pops it ($dataWidth-bit bus)', () async {
-        await setUpDut(dataWidth);
-        await sendByte(0x5a);
-
-        final rbrLane = _rbr % lanes;
-        final rbrWord = _rbr - rbrLane;
-        final fullSel = (1 << lanes) - 1;
-        final rbr = await busReadByte(rbrWord, fullSel, rbrLane);
-        expect(rbr, equals(0x5a));
-
-        final lsrLane = _lsr % lanes;
-        final lsrWord = _lsr - lsrLane;
-        final lsrAfter = await busReadByte(lsrWord, fullSel, lsrLane);
-        expect(lsrAfter & 0x01, equals(0), reason: 'data ready after RBR');
-
-        await Simulator.endSimulation();
-      });
-    }
   });
 }

@@ -73,13 +73,10 @@ Future<void> sdramTwoPortRun({
 void main() {
   tearDown(() async => Simulator.reset());
 
-  test(
-    '125 MHz: a one-port arbiter passes the random run unchanged',
-    () async {
-      final s = await sdramRandomRun(125000000, seed: 1, requests: 300);
-      expect(s.errors, isEmpty);
-    },
-  );
+  test('125 MHz: a one-port arbiter passes the random run unchanged', () async {
+    final s = await sdramRandomRun(125000000, seed: 1, requests: 300);
+    expect(s.errors, isEmpty);
+  });
 
   test(
     '125 MHz: 2 ports on separate banks, each waits one grant at most',

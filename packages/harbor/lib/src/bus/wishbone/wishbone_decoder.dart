@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus.dart';
 import 'wishbone_interface.dart';
 
@@ -33,7 +34,17 @@ class WishboneDecoder extends BridgeModule {
     List<HarborAddressMapping> mappings, {
     this.timeoutCycles,
     String name = 'wishbone_decoder',
-  }) : super('WishboneDecoder_S${mappings.length}', name: name) {
+  }) : super(
+         harborStableDefinitionName('WishboneDecoder', [
+           'S${mappings.length}',
+           ...config.definitionNameParts(),
+           if (timeoutCycles != null) 'T$timeoutCycles',
+           for (final m in mappings)
+             'r${m.range.start.toRadixString(16)}'
+                 'x${m.range.size.toRadixString(16)}',
+         ]),
+         name: name,
+       ) {
     if (mappings.isEmpty) {
       throw ArgumentError('At least one slave is required.');
     }

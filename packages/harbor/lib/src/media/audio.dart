@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -69,6 +70,15 @@ enum HarborAudioCodecFormat {
   final String displayName;
 
   const HarborAudioCodecFormat(this.displayName);
+}
+
+/// Bitmask of [hwCodecs], one bit per [HarborAudioCodecFormat] index.
+int _codecCapsOf(List<HarborAudioCodecFormat> hwCodecs) {
+  var caps = 0;
+  for (final c in hwCodecs) {
+    caps |= 1 << c.index;
+  }
+  return caps;
 }
 
 /// Harbor Audio Controller.
@@ -191,9 +201,22 @@ class HarborAudioController extends BridgeModule
     this.hasSrc = false,
     this.txFifoDepth = 256,
     this.rxFifoDepth = 256,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborAudioController', name: name ?? 'audio') {
+  }) : super(
+         harborStableDefinitionName('HarborAudioController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           audioInterfaces.map((i) => i.name).join('_'),
+           'cc${_codecCapsOf(hwCodecs)}',
+         ]),
+         name: name ?? 'audio',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -230,15 +253,19 @@ class HarborAudioController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Registers
     final ctrl = Logic(name: 'ctrl', width: 32);
@@ -261,10 +288,7 @@ class HarborAudioController extends BridgeModule
     final muteReg = Logic(name: 'mute', width: 2);
 
     // Codec capabilities bitmask
-    var codecCaps = 0;
-    for (final c in hwCodecs) {
-      codecCaps |= 1 << c.index;
-    }
+    final codecCaps = _codecCapsOf(hwCodecs);
 
     interrupt <= (intStatus & intEnable).or();
 

@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -110,9 +111,22 @@ class HarborPowerManagementUnit extends BridgeModule
   HarborPowerManagementUnit({
     required this.config,
     required this.baseAddress,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('PMU', name: name ?? 'pmu') {
+  }) : super(
+         harborStableDefinitionName('PMU', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'd${config.domains.length}',
+           config.domains.map((d) => d.name).join('_'),
+         ]),
+         name: name ?? 'pmu',
+       ) {
     // Domain d decodes at 0x40 + d*0x20 inside the 4 KiB register window, so
     // domain 126 would wrap past the window and alias domain 0. Refuse to build
     // rather than silently overlap two domains' registers.
@@ -134,15 +148,19 @@ class HarborPowerManagementUnit extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     final domainCount = config.domains.length;
 
     final globalEnable = Logic(name: 'global_enable');

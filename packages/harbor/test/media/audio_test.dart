@@ -132,6 +132,16 @@ void main() {
       expect(audio.txFifoDepth, equals(512));
       expect(audio.rxFifoDepth, equals(512));
     });
+
+    test('two parameter sets give different definitionNames', () {
+      final a = HarborAudioController(baseAddress: 0x10010000);
+      final b = HarborAudioController(
+        baseAddress: 0x10010000,
+        audioInterfaces: const [HarborAudioInterface.i2s],
+        hwCodecs: const [HarborAudioCodecFormat.aac],
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
   });
 
   group('HarborAudioCodecFormat', () {

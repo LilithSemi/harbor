@@ -5,11 +5,15 @@ import '../blackbox/ecp5/ecp5.dart';
 import '../blackbox/ice40/ice40.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../bus/bus.dart';
-import '../bus/bus_slave_port.dart';
+import '../bus/port/fabric_kind.dart';
+import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
+import '../pdk/analog_block.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../soc/target.dart';
+import 'memory_waist_beats.dart';
 
 /// On-chip SRAM memory module.
 ///
@@ -20,7 +24,11 @@ import '../soc/target.dart';
 /// through MASKWREN, the ECP5 path through one x9 DP16KD per byte lane, the
 /// Xilinx path through the RAMB36E1 per-byte WEA lanes, and the generic
 /// sim/inferred-BRAM model through an explicit per-lane read-merge. The ASIC
-/// macro path still writes whole words (a known follow-up).
+/// macro path reads the word, then writes it back with only the selected
+/// lanes changed.
+///
+/// [bus] is a memory slave port of [protocol] with an outstanding depth of 1.
+/// [HarborMemoryBeats] runs each burst one beat at a time on the storage.
 class HarborSram extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -31,7 +39,23 @@ class HarborSram extends BridgeModule
   final int baseAddress;
   final int dataWidth;
 
-  late final BusSlavePort bus;
+  /// The fabric kind of the native memory port.
+  final HarborFabricKind protocol;
+
+  /// Request ID width of the memory port.
+  final int idWidth;
+
+  /// The aligned block a Wishbone burst request covers.
+  final int wishboneBurstBeats;
+
+  /// The memory slave port. It takes one request at a time.
+  late final HarborMemorySlavePort bus;
+
+  /// Requests the memory holds in flight.
+  static const int outstanding = 1;
+
+  // The reset of the storage handshake, the port reset.
+  late final Logic _reset;
 
   HarborSram({
     required this.baseAddress,
@@ -39,37 +63,69 @@ class HarborSram extends BridgeModule
     this.dataWidth = 32,
     int? busAddressWidth,
     this.busDataWidth,
-    BusProtocol protocol = BusProtocol.wishbone,
+    this.protocol = HarborFabricKind.wishbone,
+    this.idWidth = 1,
+    this.wishboneBurstBeats = 8,
     HarborDeviceTarget? target,
     String? name,
-  }) : super('HarborSram_${size}', name: name ?? 'sram') {
+  }) : super(
+         _definitionName(
+           size: size,
+           dataWidth: dataWidth,
+           addressWidth: busAddressWidth ?? _addressWidth(size, dataWidth),
+           protocol: protocol,
+           idWidth: idWidth,
+           wishboneBurstBeats: wishboneBurstBeats,
+           target: target,
+         ),
+         name: name ?? 'sram',
+       ) {
+    if (busDataWidth != null && busDataWidth != dataWidth) {
+      throw ArgumentError.value(
+        busDataWidth,
+        'busDataWidth',
+        'must match dataWidth $dataWidth',
+      );
+    }
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
+    final clk = input('clk');
 
     final bytesPerWord = dataWidth ~/ 8;
     final numWords = size ~/ bytesPerWord;
     final addrWidth = numWords > 1 ? (numWords - 1).bitLength : 1;
     final byteOffsetBits = bytesPerWord > 1 ? (bytesPerWord - 1).bitLength : 0;
-    final totalAddrWidth = addrWidth + byteOffsetBits;
-    final effectiveAddrWidth = busAddressWidth ?? totalAddrWidth;
 
-    bus = BusSlavePort.create(
+    bus = HarborMemorySlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
-      clk: input('clk'),
+      kind: protocol,
+      config: HarborMemoryWaistConfig(
+        addressWidth: busAddressWidth ?? _addressWidth(size, dataWidth),
+        dataWidth: dataWidth,
+        idWidth: idWidth,
+        outstanding: outstanding,
+      ),
+      clk: clk,
       reset: input('reset'),
-      addressWidth: effectiveAddrWidth,
-      dataWidth: busDataWidth ?? dataWidth,
+      wishboneBurstBeats: wishboneBurstBeats,
     );
 
-    final clk = input('clk');
-    final stb = bus.stb;
-    final we = bus.we;
-    final addr = bus.addr;
-    final datIn = bus.dataIn;
-    final datOut = bus.dataOut;
-    final ack = bus.ack;
+    final ack = Logic(name: 'mem_ack');
+    final datOut = Logic(name: 'mem_dat_out', width: dataWidth);
+    final beats = HarborMemoryBeats(
+      clk: clk,
+      reset: bus.reset,
+      waist: bus.waist,
+      ack: ack,
+      dataOut: datOut,
+    );
+    _reset = bus.reset;
+    final stb = beats.stb;
+    final we = beats.we;
+    final addr = beats.addr;
+    final datIn = beats.dataIn;
+    final sel = beats.sel;
 
     final wordAddr = byteOffsetBits > 0
         ? addr.getRange(byteOffsetBits, byteOffsetBits + addrWidth)
@@ -85,10 +141,10 @@ class HarborSram extends BridgeModule
         stb,
         we,
         ack,
-        bus.sel,
+        sel,
       );
     } else if (target case HarborSimTarget()) {
-      _buildSimArray(clk, wordAddr, datIn, datOut, stb, we, ack, bus.sel);
+      _buildSimArray(clk, wordAddr, datIn, datOut, stb, we, ack, sel);
     } else if (target case HarborAsicTarget asicTarget) {
       _buildWithAsicSram(
         asicTarget,
@@ -100,21 +156,41 @@ class HarborSram extends BridgeModule
         we,
         ack,
         numWords,
-        bus.sel,
+        sel,
       );
     } else {
-      _buildSimModel(
-        clk,
-        wordAddr,
-        datIn,
-        datOut,
-        stb,
-        we,
-        ack,
-        numWords,
-        bus.sel,
-      );
+      _buildSimModel(clk, wordAddr, datIn, datOut, stb, we, ack, numWords, sel);
     }
+  }
+
+  // Byte address bits that cover [size].
+  static int _addressWidth(int size, int dataWidth) {
+    final bytesPerWord = dataWidth ~/ 8;
+    final numWords = size ~/ bytesPerWord;
+    final addrWidth = numWords > 1 ? (numWords - 1).bitLength : 1;
+    final byteOffsetBits = bytesPerWord > 1 ? (bytesPerWord - 1).bitLength : 0;
+    return addrWidth + byteOffsetBits;
+  }
+
+  static String _definitionName({
+    required int size,
+    required int dataWidth,
+    required int addressWidth,
+    required HarborFabricKind protocol,
+    required int idWidth,
+    required int wishboneBurstBeats,
+    required HarborDeviceTarget? target,
+  }) {
+    final store = switch (target) {
+      null => 'generic',
+      HarborFpgaTarget(:final vendor) => vendor.name,
+      _ => target.name.replaceAll(RegExp('[^A-Za-z0-9]'), '_'),
+    };
+    final burst = protocol == HarborFabricKind.wishbone
+        ? '_b$wishboneBurstBeats'
+        : '';
+    return 'HarborSram_${size}_d${dataWidth}_a$addressWidth'
+        '_${protocol.name}_i${idWidth}_n${outstanding}_q0${burst}_$store';
   }
 
   void _buildWithBram(
@@ -510,29 +586,69 @@ class HarborSram extends BridgeModule
 
     // Instantiate the PDK SRAM macro as a blackbox
     final sramBlock = _PdkSramMacro(
-      macroName: macro.properties['name'] ?? 'sram_macro',
+      macro: macro,
       addrWidth: wordAddr.width,
-      dataWidth: busDataWidth ?? dataWidth,
-      pinMapping: macro.pinMapping,
+      dataWidth: dataWidth,
     );
     addSubModule(sramBlock);
+    String pin(String name) => macro.pinMapping[name] ?? name;
 
-    final clkPin = macro.pinMapping['clk'] ?? 'clk';
-    final addrPin = macro.pinMapping['addr'] ?? 'addr';
-    final dataInPin = macro.pinMapping['dataIn'] ?? 'dataIn';
-    final dataOutPin = macro.pinMapping['dataOut'] ?? 'dataOut';
-    final wePin = macro.pinMapping['writeEnable'] ?? 'writeEnable';
-    final csPin = macro.pinMapping['chipSelect'] ?? 'chipSelect';
+    // A write is a read-modify-write, so it works with or without a write
+    // mask: the first cycle reads the word, the second writes it back merged
+    // with the selected lanes. A write with no lane selected writes nothing.
+    final rmw = Logic(name: 'rmw_read_done');
+    final ackReg = Logic(name: 'rmw_ack');
+    final access = (stb & ~ackReg).named('rmw_access');
+    final lanes = dataWidth ~/ 8;
+    final merged = [
+      for (var b = 0; b < lanes; b++)
+        mux(
+          sel[b],
+          datIn.getRange(b * 8, b * 8 + 8),
+          datOut.getRange(b * 8, b * 8 + 8),
+        ),
+    ].rswizzle().named('rmw_merged');
+    Sequential(clk, [
+      If(
+        _reset,
+        then: [rmw < 0, ackReg < 0],
+        orElse: [
+          ackReg < 0,
+          If(
+            access,
+            then: [
+              If(we & ~rmw, then: [rmw < 1], orElse: [rmw < 0, ackReg < 1]),
+            ],
+          ),
+        ],
+      ),
+    ]);
+    ack <= ackReg;
 
-    sramBlock.input(clkPin).srcConnection! <= clk;
-    sramBlock.input(addrPin).srcConnection! <= wordAddr;
-    sramBlock.input(dataInPin).srcConnection! <= datIn;
-    sramBlock.input(wePin).srcConnection! <= stb & we;
-    sramBlock.input(csPin).srcConnection! <= stb;
-
-    datOut <= sramBlock.output(dataOutPin);
-
-    _ackOnce(clk, stb, ack);
+    void drive(String name, Logic value) =>
+        sramBlock.input(pin(name)).srcConnection! <= value;
+    drive('clk', clk);
+    drive('addr', wordAddr);
+    drive('dataIn', merged);
+    drive('chipSelect', macro.level('chipSelect', access));
+    drive(
+      'writeEnable',
+      macro.level('writeEnable', access & we & rmw & sel.or()),
+    );
+    if (macro.pinMapping.containsKey('writeMask')) {
+      final bits = dataWidth ~/ macro.params['writeMaskBits']!;
+      drive(
+        'writeMask',
+        macro.level('writeMask', Const(1, width: bits, fill: true)),
+      );
+    }
+    // The second port only reads, so it stays deselected.
+    if (macro.pinMapping.containsKey('chipSelect1')) {
+      drive('chipSelect1', macro.level('chipSelect1', Const(0)));
+      drive('clk1', clk);
+      drive('addr1', Const(0, width: wordAddr.width));
+    }
+    datOut <= sramBlock.output(pin('dataOut'));
   }
 
   /// A behavioral memory array for a Verilator build.
@@ -660,10 +776,10 @@ class HarborSram extends BridgeModule
   /// The bus handshake every storage path shares: ACK goes high the cycle
   /// after STB and drops for one cycle, so a held STB gets one ACK per
   /// access. [HarborSramArray] has the same logic in its SystemVerilog.
-  static void _ackOnce(Logic clk, Logic stb, Logic ack) {
+  void _ackOnce(Logic clk, Logic stb, Logic ack) {
     Sequential(clk, [
       ack < Const(0),
-      If(stb & ~ack, then: [ack < Const(1)]),
+      If(stb & ~ack & ~_reset, then: [ack < Const(1)]),
     ]);
   }
 
@@ -695,27 +811,85 @@ class HarborSram extends BridgeModule
   );
 }
 
-/// PDK SRAM macro instantiated as a blackbox leaf.
+/// PDK SRAM macro instantiated as a blackbox leaf, with the pins and their
+/// polarity from the [AnalogBlock] of the PDK.
 class _PdkSramMacro extends BridgeModule {
   _PdkSramMacro({
-    required String macroName,
+    required AnalogBlock macro,
     required int addrWidth,
     required int dataWidth,
-    required Map<String, String> pinMapping,
-  }) : super(macroName, isSystemVerilogLeaf: true) {
-    final clkPin = pinMapping['clk'] ?? 'clk';
-    final addrPin = pinMapping['addr'] ?? 'addr';
-    final dataInPin = pinMapping['dataIn'] ?? 'dataIn';
-    final dataOutPin = pinMapping['dataOut'] ?? 'dataOut';
-    final wePin = pinMapping['writeEnable'] ?? 'writeEnable';
-    final csPin = pinMapping['chipSelect'] ?? 'chipSelect';
+  }) : super(
+         macro.properties['name'] ?? 'sram_macro',
+         isSystemVerilogLeaf: true,
+       ) {
+    final map = macro.pinMapping;
+    String pin(String name) => map[name] ?? name;
+    final maskBits = macro.params['writeMaskBits'] ?? dataWidth;
+    for (final (name, width) in [
+      ('clk', 1),
+      ('addr', addrWidth),
+      ('dataIn', dataWidth),
+      ('writeEnable', 1),
+      ('chipSelect', 1),
+      if (map.containsKey('writeMask')) ('writeMask', dataWidth ~/ maskBits),
+      if (map.containsKey('chipSelect1')) ...[
+        ('clk1', 1),
+        ('addr1', addrWidth),
+        ('chipSelect1', 1),
+      ],
+    ]) {
+      createPort(pin(name), PortDirection.input, width: width);
+    }
+    createPort(pin('dataOut'), PortDirection.output, width: dataWidth);
+    if (map.containsKey('dataOut1')) {
+      createPort(pin('dataOut1'), PortDirection.output, width: dataWidth);
+      output(pin('dataOut1')) <= Const(0, width: dataWidth);
+    }
 
-    createPort(clkPin, PortDirection.input);
-    createPort(addrPin, PortDirection.input, width: addrWidth);
-    createPort(dataInPin, PortDirection.input, width: dataWidth);
-    createPort(dataOutPin, PortDirection.output, width: dataWidth);
-    createPort(wePin, PortDirection.input);
-    createPort(csPin, PortDirection.input);
+    // A behavioral body for simulation only. Synthesis keeps the leaf. Port 0
+    // reads into a register and writes the masked bits, with the pin
+    // polarity of the PDK.
+    final words = 1 << addrWidth;
+    if (words > 4096) return;
+    final clk = input(pin('clk'));
+    final addr = input(pin('addr'));
+    final din = input(pin('dataIn'));
+    final dout = output(pin('dataOut'));
+    final cs = macro.level('chipSelect', input(pin('chipSelect')));
+    final we = macro.level('writeEnable', input(pin('writeEnable')));
+    final mask = map.containsKey('writeMask')
+        ? [
+            for (var b = dataWidth - 1; b >= 0; b--)
+              macro.level('writeMask', input(pin('writeMask')))[b ~/ maskBits],
+          ].swizzle()
+        : Const(1, width: dataWidth, fill: true);
+    final mem = [
+      for (var i = 0; i < words; i++) Logic(name: 'm$i', width: dataWidth),
+    ];
+    Sequential(clk, [
+      If(
+        cs,
+        then: [
+          If(
+            we,
+            then: [
+              Case(addr, [
+                for (var i = 0; i < words; i++)
+                  CaseItem(Const(i, width: addrWidth), [
+                    mem[i] < ((mem[i] & ~mask) | (din & mask)),
+                  ]),
+              ]),
+            ],
+            orElse: [
+              Case(addr, [
+                for (var i = 0; i < words; i++)
+                  CaseItem(Const(i, width: addrWidth), [dout < mem[i]]),
+              ]),
+            ],
+          ),
+        ],
+      ),
+    ]);
   }
 }
 

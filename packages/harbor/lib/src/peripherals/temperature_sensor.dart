@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../blackbox/ecp5/ecp5.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../bus/bus.dart';
@@ -85,7 +86,8 @@ class HarborTemperatureSensor extends BridgeModule
   factory HarborTemperatureSensor.fromTarget({
     required int baseAddress,
     required HarborDeviceTarget target,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
   }) {
     final source = switch (target) {
@@ -114,7 +116,8 @@ class HarborTemperatureSensor extends BridgeModule
       baseAddress: baseAddress,
       source: source,
       pdk: pdk,
-      protocol: protocol,
+      fabricKind: fabricKind,
+      crossFabricClock: crossFabricClock,
       name: name,
     );
   }
@@ -123,9 +126,21 @@ class HarborTemperatureSensor extends BridgeModule
     required this.baseAddress,
     this.source = HarborTemperatureSource.external_,
     this.pdk,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborTemperatureSensor', name: name ?? 'temp_sensor') {
+  }) : super(
+         harborStableDefinitionName('HarborTemperatureSensor', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           source.name,
+         ]),
+         name: name ?? 'temp_sensor',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -134,15 +149,19 @@ class HarborTemperatureSensor extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Backend instantiation
     Logic tempRawIn;

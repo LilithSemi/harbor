@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -178,9 +179,27 @@ class HarborDmaController extends BridgeModule
     this.source = HarborDmaSource.mem,
     this.target = HarborDmaTarget.fabric,
     this.memRange,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborDmaController', name: name ?? 'dma') {
+  }) : super(
+         harborStableDefinitionName('HarborDmaController', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 12,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           'ch$channels',
+           'ma$addressWidth',
+           'md$dataWidth',
+           source.name,
+           target.name,
+           if (target == HarborDmaTarget.sdram && memRange != null)
+             'mr${memRange.start}_${memRange.end}',
+         ]),
+         name: name ?? 'dma',
+       ) {
     if (target == HarborDmaTarget.sdram && memRange == null) {
       throw ArgumentError(
         'HarborDmaController: target sdram requires a memRange.',
@@ -218,15 +237,19 @@ class HarborDmaController extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: 12,
       dataWidth: 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     // Global registers
     final globalEnable = Logic(name: 'global_enable');

@@ -10,6 +10,10 @@ import 'package:test/test.dart';
 /// always drives standard single-bit DQ0 regardless of read mode, so this is
 /// representative.
 ///
+/// This is a long flash-protocol test (erase, program, WREN, then one XIP
+/// read) driven through the wr_req sideband, not the register port, so it
+/// stays on Wishbone only rather than looping three times over.
+///
 /// The model is a clocked-by-the-testbench SPI slave that:
 ///  - tracks CS (resets its byte/bit accumulator on CS rising edge),
 ///  - samples MOSI on each spi_clk RISING edge (MSB-first into bytes),

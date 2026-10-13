@@ -140,6 +140,284 @@ void main() {
     expect(sdram.busError.width, equals(1));
   });
 
+  Iterable<Module> tree(Module m) sync* {
+    yield m;
+    for (final c in m.subModules) {
+      yield* tree(c);
+    }
+  }
+
+  for (final kind in [HarborFabricKind.axi4, HarborFabricKind.tilelink]) {
+    test(
+      '${kind.name}: a memory slave port crossed by the port layer',
+      () async {
+        final sdram = HarborSdram(
+          config: config,
+          baseAddress: 0,
+          clockHz: 125000000,
+          target: ecp5Target,
+          protocol: kind,
+          idWidth: 3,
+        );
+        await sdram.build();
+        final q = harborCdcDepth(8);
+        expect(sdram.outstanding, 8);
+        expect(sdram.cdcDepth, q);
+        expect(sdram.bus!.cdcDepth, q);
+        final mods = tree(sdram).toList();
+        final defs = mods.map((m) => m.definitionName).toList();
+        final cdc = mods.singleWhere(
+          (m) => m.definitionName.startsWith('HarborMemoryWaistCdcSlave'),
+        );
+        expect(cdc.definitionName, endsWith('_r'));
+        // One device reset copy per channel.
+        expect(cdc.subModules.whereType<Ecp5Fd1s3bx>(), hasLength(4));
+        expect(defs.where((d) => d.contains('CdcFifoBridge')), isEmpty);
+        expect(
+          defs.where((d) => d.startsWith('SdramMemoryPort')),
+          hasLength(1),
+        );
+        expect(
+          sdram.definitionName,
+          startsWith('HarborSdram_ecp5_${kind.name}_i3_n8_q$q'),
+        );
+      },
+    );
+  }
+
+  test('wishbone: the cdc bridge and SdramWishbonePort, no waist', () async {
+    for (final posted in [false, true]) {
+      final sdram = HarborSdram(
+        config: config,
+        baseAddress: 0,
+        clockHz: 125000000,
+        target: ecp5Target,
+        postedWrites: posted,
+      );
+      await sdram.build();
+      final q = posted ? 8 : 2;
+      expect(sdram.outstanding, 1);
+      expect(sdram.cdcDepth, q);
+      expect(sdram.bus, isNull);
+      final defs = tree(sdram).map((m) => m.definitionName).toList();
+      expect(defs.where((d) => d.contains('Waist')), isEmpty);
+      expect(defs.where((d) => d.contains('MemorySlave')), isEmpty);
+      expect(defs.where((d) => d.startsWith('SdramMemoryPort')), isEmpty);
+      expect(defs.where((d) => d == 'SdramWishbonePort'), hasLength(1));
+      expect(
+        defs.where((d) => d.startsWith('HarborWishboneCdcFifoBridge')),
+        hasLength(1),
+      );
+      expect(
+        sdram.definitionName,
+        startsWith('HarborSdram_ecp5_wishbone_i1_n1_q$q'),
+      );
+      // The port a Wishbone fabric expects of a memory slave.
+      for (final p in ['bus_CTI', 'bus_BTE']) {
+        expect(sdram.inputs.keys, contains(p));
+      }
+      expect(sdram.outputs.keys, contains('bus_ERR'));
+      await Simulator.reset();
+    }
+  });
+
+  test('wishbone sim build: harbor_sim_dram on the bus', () async {
+    final sdram = HarborSdram(
+      config: config,
+      baseAddress: 0,
+      clockHz: 125000000,
+      target: const HarborSimTarget(topCell: 'top', frequency: 50000000),
+    );
+    await sdram.build();
+    final defs = tree(sdram).map((m) => m.definitionName).toList();
+    expect(defs.where((d) => d.contains('Beats')), isEmpty);
+    expect(defs.where((d) => d.contains('MemorySlave')), isEmpty);
+  });
+
+  test('sim and busClockSync builds do not cross', () async {
+    for (final sdram in [
+      HarborSdram(
+        config: config,
+        baseAddress: 0,
+        clockHz: 125000000,
+        target: const HarborSimTarget(topCell: 'top', frequency: 50000000),
+        protocol: HarborFabricKind.axi4,
+      ),
+      HarborSdram(
+        config: config,
+        baseAddress: 0,
+        clockHz: 125000000,
+        target: ecp5Target,
+        busClockSync: true,
+      ),
+    ]) {
+      await sdram.build();
+      expect(sdram.cdcDepth, 0);
+      expect(
+        tree(
+          sdram,
+        ).where((m) => m.definitionName.startsWith('HarborMemoryWaistCdc')),
+        isEmpty,
+      );
+      expect(sdram.definitionName, contains('_q0'));
+      await Simulator.reset();
+    }
+  });
+
+  test('every body parameter changes the definition name', () {
+    HarborSdram make({
+      HarborFabricKind protocol = HarborFabricKind.axi4,
+      bool posted = false,
+      int id = 1,
+      int? n,
+      int? q,
+      int beats = 8,
+      int aw = 26,
+      int hz = 125000000,
+      bool sync = false,
+      int scan = 0,
+      int inFlight = 3,
+      int post = 8,
+      int pull = 8,
+      HarborSdramPhyConfig phy = const HarborSdramPhyConfig(),
+      HarborSdramConfig cfg = config,
+    }) => HarborSdram(
+      config: cfg,
+      baseAddress: 0,
+      clockHz: hz,
+      target: ecp5Target,
+      protocol: protocol,
+      idWidth: id,
+      outstanding: n,
+      cdcDepth: q,
+      wishboneBurstBeats: beats,
+      busAddressWidth: aw,
+      busClockSync: sync,
+      postedWrites: posted,
+      scanoutPorts: scan,
+      scanoutMaxInFlight: inFlight,
+      maxPostponedRefresh: post,
+      maxPulledInRefresh: pull,
+      phy: phy,
+    );
+    final names = [
+      make(),
+      make(protocol: HarborFabricKind.tilelink),
+      make(protocol: HarborFabricKind.wishbone),
+      make(protocol: HarborFabricKind.wishbone, beats: 4),
+      make(protocol: HarborFabricKind.wishbone, posted: true),
+      make(id: 2),
+      make(n: 4),
+      make(q: 32),
+      make(aw: 32),
+      make(hz: 100000000),
+      make(protocol: HarborFabricKind.wishbone, sync: true),
+      make(scan: 1),
+      make(scan: 1, inFlight: 1),
+      make(post: 9),
+      make(pull: 9),
+      make(phy: const HarborSdramPhyConfig(captureCycles: 3)),
+      make(cfg: config.copyWith(addressMap: HarborSdramAddressMap.bankRowCol)),
+      make(
+        cfg: config.copyWith(timing: config.timing.copyWith(powerUpNs: 2000)),
+      ),
+    ].map((s) => s.definitionName).toList();
+    expect(names.toSet(), hasLength(names.length), reason: '$names');
+  });
+
+  test('busClockSync and postedWrites need a Wishbone port', () {
+    for (final kind in [HarborFabricKind.axi4, HarborFabricKind.tilelink]) {
+      expect(
+        () => HarborSdram(
+          config: config,
+          baseAddress: 0,
+          clockHz: 125000000,
+          target: ecp5Target,
+          busClockSync: true,
+          protocol: kind,
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => HarborSdram(
+          config: config,
+          baseAddress: 0,
+          clockHz: 125000000,
+          target: ecp5Target,
+          postedWrites: true,
+          protocol: kind,
+        ),
+        throwsArgumentError,
+      );
+    }
+  });
+
+  test('a Wishbone port takes no outstanding or cdc depth', () {
+    expect(
+      () => HarborSdram(
+        config: config,
+        baseAddress: 0,
+        clockHz: 125000000,
+        target: ecp5Target,
+        outstanding: 2,
+      ),
+      throwsArgumentError,
+    );
+    expect(
+      () => HarborSdram(
+        config: config,
+        baseAddress: 0,
+        clockHz: 125000000,
+        target: ecp5Target,
+        cdcDepth: 4,
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('sdram requests per burst', () {
+    const fixed = HarborMemoryBurst.fixed;
+    const wrap = HarborMemoryBurst.wrap;
+    expect(HarborSdram.busRequestsFor(16, burst: fixed), 16);
+    expect(HarborSdram.busRequestsFor(16, size: 1), 16);
+    expect(HarborSdram.busRequestsFor(16), 5);
+    expect(HarborSdram.busRequestsFor(16, burst: wrap), 5);
+    expect(HarborSdram.busRequestsFor(256), 65);
+    expect(() => HarborSdram.busRequestsFor(257), throwsArgumentError);
+    final s = HarborSdram(
+      config: config,
+      baseAddress: 0,
+      clockHz: 125000000,
+      target: ecp5Target,
+      scanoutPorts: 1,
+    );
+    expect(s.busBurstWaitBound(16, burst: fixed), 16 * s.busWaitBound);
+    expect(s.busBurstWaitBound(16), 5 * s.busWaitBound);
+  });
+
+  test('a wrong bus width or depth throws', () {
+    expect(
+      () => HarborSdram(
+        config: config,
+        baseAddress: 0,
+        clockHz: 125000000,
+        target: ecp5Target,
+        busDataWidth: 64,
+      ),
+      throwsArgumentError,
+    );
+    expect(
+      () => HarborSdram(
+        config: config,
+        baseAddress: 0,
+        clockHz: 125000000,
+        target: ecp5Target,
+        outstanding: 0,
+      ),
+      throwsArgumentError,
+    );
+  });
+
   test('a null target throws', () {
     expect(
       () => HarborSdram(config: config, baseAddress: 0, clockHz: 125000000),

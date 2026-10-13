@@ -27,23 +27,11 @@ class WishboneRegisterStage extends BridgeModule {
   /// that alters the generated body so structurally-distinct stages (for
   /// example a plain stage and a DMA-master stage with extra tags) never
   /// collide onto one reserved module name.
-  static String _definitionName(WishboneConfig config, WishboneConfig upCfg) {
-    List<String> side(String tag, WishboneConfig c) => [
-      '${tag}A${c.addressWidth}',
-      '${tag}D${c.dataWidth}',
-      '${tag}S${c.effectiveSelWidth}',
-      if (c.useErr) '${tag}Err',
-      if (c.useRty) '${tag}Rty',
-      if (c.useCti) '${tag}Cti',
-      if (c.useBte) '${tag}Bte',
-      if (c.tgaWidth > 0) '${tag}Tga${c.tgaWidth}',
-      if (c.tgdWidth > 0) '${tag}Tgd${c.tgdWidth}',
-    ];
-    return harborStableDefinitionName('WishboneRegisterStage', [
-      ...side('Up', upCfg),
-      ...side('Dn', config),
-    ]);
-  }
+  static String _definitionName(WishboneConfig config, WishboneConfig upCfg) =>
+      harborStableDefinitionName('WishboneRegisterStage', [
+        ...upCfg.definitionNameParts('Up'),
+        ...config.definitionNameParts('Dn'),
+      ]);
 
   WishboneRegisterStage({
     required WishboneConfig config,

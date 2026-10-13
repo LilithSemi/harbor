@@ -4,6 +4,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 // Register byte offsets: each register in its own 8-byte slot.
 const _input = 0x00;
 const _output = 0x08;
@@ -40,92 +42,49 @@ void main() {
     test('supports TileLink protocol', () {
       final gpio = HarborGpio(
         baseAddress: 0x10001000,
-        protocol: BusProtocol.tilelink,
+        fabricKind: HarborFabricKind.tilelink,
       );
-      expect(gpio.bus.protocol, equals(BusProtocol.tilelink));
+      expect(gpio.bus.kind, equals(HarborFabricKind.tilelink));
     });
   });
 
-  group('HarborGpio register access', () {
+  for (final kind in HarborFabricKind.values) {
+    _registerTests(kind);
+  }
+}
+
+void _registerTests(HarborFabricKind kind) {
+  group('HarborGpio register access (${kind.name})', () {
     late HarborGpio gpio;
-    late Logic clk, reset, stb, we, adr, mosi, sel, pins;
+    late Logic clk, reset, pins;
+    late RegBus bus;
 
-    int allSel() => (1 << sel.width) - 1;
+    Future<void> busWrite(int addr, int data) => bus.write(addr, data);
 
-    Future<void> busWrite(int addr, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      sel.inject(allSel());
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (gpio.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      await clk.nextPosedge;
-    }
+    Future<int> busRead(int addr) => bus.read(addr);
 
-    Future<int> busRead(int addr) async {
-      adr.inject(addr);
-      we.inject(0);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (gpio.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      final v = gpio.output('bus_DAT_MISO').value.toInt();
-      stb.inject(0);
-      await clk.nextPosedge;
-      return v;
-    }
-
-    Future<void> busWriteSel(int addr, int selMask, int data) async {
-      adr.inject(addr);
-      mosi.inject(data);
-      sel.inject(selMask);
-      we.inject(1);
-      stb.inject(1);
-      await clk.nextPosedge;
-      while (gpio.output('bus_ACK').value.toInt() != 1) {
-        await clk.nextPosedge;
-      }
-      stb.inject(0);
-      we.inject(0);
-      sel.inject(allSel());
-      await clk.nextPosedge;
-    }
+    Future<void> busWriteSel(int addr, int selMask, int data) =>
+        bus.write(addr, data, sel: selMask);
 
     Future<void> setUpDut({int dataWidth = 32}) async {
-      gpio = HarborGpio(baseAddress: 0x10001000, busDataWidth: dataWidth);
+      gpio = HarborGpio(
+        baseAddress: 0x10001000,
+        busDataWidth: dataWidth,
+        fabricKind: kind,
+      );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
-      stb = Logic(name: 'stb');
-      we = Logic(name: 'we');
-      adr = Logic(name: 'adr', width: 12);
-      mosi = Logic(name: 'mosi', width: dataWidth);
-      sel = Logic(name: 'sel', width: dataWidth ~/ 8);
       pins = Logic(name: 'gpio_in', width: 32);
 
       gpio.input('clk').srcConnection! <= clk;
       gpio.input('reset').srcConnection! <= reset;
-      gpio.input('bus_CYC').srcConnection! <= stb;
-      gpio.input('bus_STB').srcConnection! <= stb;
-      gpio.input('bus_WE').srcConnection! <= we;
-      gpio.input('bus_ADR').srcConnection! <= adr;
-      gpio.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      gpio.input('bus_SEL').srcConnection! <= sel;
       gpio.input('gpio_in').srcConnection! <= pins;
+      bus = RegBus.attach(gpio, clk);
 
       await gpio.build();
 
       reset.inject(1);
-      stb.inject(0);
-      we.inject(0);
-      adr.inject(0);
-      mosi.inject(0);
-      sel.inject(allSel());
+      bus.idle();
       pins.inject(0);
       Simulator.setMaxSimTime(200000);
       unawaited(Simulator.run());
@@ -190,6 +149,18 @@ void main() {
       await busWrite(_dir, 0x11223344);
       expect(await busRead(_dir), equals(0x11223344));
       expect(await busRead(_output), equals(0xcafef00d));
+      await Simulator.endSimulation();
+    });
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      await busWrite(_output, 0x11223344);
+      await busWrite(_irqEn, 0x0000ffff);
+      await busWriteSel(_output, 0x0, 0xffffffff);
+      await busWriteSel(_irqEn, 0x0, 0xffffffff);
+      expect(await busRead(_output), equals(0x11223344));
+      expect(await busRead(_irqEn), equals(0x0000ffff));
       await Simulator.endSimulation();
     });
 

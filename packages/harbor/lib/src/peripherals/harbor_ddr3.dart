@@ -4,7 +4,9 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../bus/bus.dart';
 import '../bus/bus_error_source.dart';
 import '../bus/bus_slave_port.dart';
-import '../clock/wishbone_cdc_fifo.dart';
+import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
+import '../bus/port/port_cdc.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -17,6 +19,7 @@ import 'ddr3_params.dart';
 import 'ddr3_phy.dart';
 import 'ddr3_phy_base.dart';
 import 'ddr3_phy_ecp5.dart';
+import 'memory_waist_beats.dart';
 import 'sim_dram.dart';
 
 /// Clean SoC wrapper for the production [Ddr3Controller] + [Ddr3Phy] (the
@@ -24,14 +27,18 @@ import 'sim_dram.dart';
 /// bank management verified on the Arty S7).
 ///
 /// It presents one fixed external contract so genip wires it the same way on
-/// every target: a Wishbone-B4 slave `'bus'`, the DDR3 clock
+/// every target: a memory slave port `'bus'` of [protocol], the DDR3 clock
 /// inputs (`clk`, `reset`, `ddr_clk`, `ddr_reset`, `ddr_ck_fast`,
 /// `ddr_ck90_fast`, `ddr_ck_dqs_fast`, `ddr_idelay_ref`), and the `sdram_*`
 /// pads. Internally:
 ///
-///   bus (sys clk, 32b B4) -> HarborWishboneCdcFifoBridge('ddr_cdc', 32b)
+///   bus (clk, outstanding 1) -> port layer crossing to ddr_clk
+///     -> HarborMemoryBeats (one beat at a time)
 ///     -> Ddr3BurstAdapter (32<->128, B4<->pipelined) -> Ddr3Controller (128b)
 ///     -> Ddr3Phy -> sdram_* pads          (all on ddr_clk = CK/4)
+///
+/// Writes are not posted. WRESP goes out when the controller accepts the
+/// last write command, so a later read from any port is ordered after it.
 ///
 /// No writeVerify / readLevel / trainableRead workarounds: the controller
 /// self-calibrates and keeps the bus stalled (o_wb_stall high) until
@@ -76,10 +83,17 @@ class HarborDdr3 extends BridgeModule
   /// false (default), wb2 stays tied off and dtNode is unchanged from train=hw.
   final bool runtimeTrainable;
 
-  /// ACK a DRAM write on the SoC side as soon as the CDC captures it, instead
-  /// of after a full crossing round trip. Set false to A/B the write path on
-  /// hardware against the strictly ordered behaviour.
-  final bool postedWrites;
+  /// The fabric kind of [bus] and [trainBus].
+  final HarborFabricKind protocol;
+
+  /// Request ID width of [bus].
+  final int idWidth;
+
+  /// The aligned block a Wishbone burst request on [bus] covers.
+  final int wishboneBurstBeats;
+
+  /// Requests [bus] holds in flight.
+  static const int outstanding = 1;
 
   /// Merge sequential narrow writes into one BL8 burst in the burst adapter.
   /// Set false to A/B the write path on hardware.
@@ -101,9 +115,12 @@ class HarborDdr3 extends BridgeModule
   static const int trainStride = 8;
   static const int trainStrideLog2 = 3;
 
-  late final BusSlavePort bus;
+  /// The memory slave port. On a hardware target it crosses from `clk` to
+  /// `ddr_clk` in the port layer.
+  late final HarborMemorySlavePort bus;
 
-  /// The knob-ABI wishbone slave, present only when [runtimeTrainable].
+  /// The knob-ABI register slave, present only when [runtimeTrainable]. It
+  /// crosses to `ddr_clk` the same way.
   BusSlavePort? trainBus;
 
   /// The wrapped controller, exposed for simulation tests.
@@ -127,11 +144,28 @@ class HarborDdr3 extends BridgeModule
     this.ckPeriodPs = 3333,
     this.controllerGearRatio = 1,
     this.runtimeTrainable = false,
-    this.postedWrites = true,
     this.writeCombine = false,
     this.simExternalMem = false,
+    this.protocol = HarborFabricKind.wishbone,
+    this.idWidth = 1,
+    this.wishboneBurstBeats = 8,
     super.name = 'ddr3',
-  }) : super('HarborDdr3') {
+  }) : super(
+         _definitionName(
+           config: config,
+           target: target,
+           busAddressWidth: busAddressWidth ?? config.size.bitLength,
+           busDataWidth: busDataWidth ?? 32,
+           ckPeriodPs: ckPeriodPs,
+           controllerGearRatio: controllerGearRatio,
+           runtimeTrainable: runtimeTrainable,
+           writeCombine: writeCombine,
+           simExternalMem: simExternalMem,
+           protocol: protocol,
+           idWidth: idWidth,
+           wishboneBurstBeats: wishboneBurstBeats,
+         ),
+       ) {
     final clk = addInput('clk', Logic());
     final reset = addInput('reset', Logic());
     final ddrClk = addInput('ddr_clk', Logic());
@@ -152,14 +186,25 @@ class HarborDdr3 extends BridgeModule
 
     final busDW = busDataWidth ?? 32;
     final busAW = busAddressWidth ?? config.size.bitLength;
-    bus = BusSlavePort.create(
+    // The sim memory runs on `clk`, so only a hardware build crosses.
+    final sim = target is HarborSimTarget;
+    final devClk = sim ? clk : ddrClk;
+    final devReset = sim ? reset : ddrReset;
+    final fabric = HarborFabricClock(clk: clk, reset: reset);
+    bus = HarborMemorySlavePort.create(
       module: this,
       name: 'bus',
-      protocol: BusProtocol.wishbone,
-      addressWidth: busAW,
-      dataWidth: busDW,
-      clk: clk,
-      reset: reset,
+      kind: protocol,
+      config: HarborMemoryWaistConfig(
+        addressWidth: busAW,
+        dataWidth: busDW,
+        idWidth: idWidth,
+        outstanding: outstanding,
+      ),
+      clk: devClk,
+      reset: devReset,
+      wishboneBurstBeats: wishboneBurstBeats,
+      fabricClock: fabric,
     );
 
     if (isEcp5 && controllerGearRatio != 1) {
@@ -195,23 +240,46 @@ class HarborDdr3 extends BridgeModule
           );
     _p = p;
 
-    // Knob-ABI wishbone slave (train=runtime only). SoC (sys clk) facing; a
-    // second CDC FIFO crosses it into the DDR clock domain in _build.
+    // Knob-ABI register slave (train=runtime only). The port layer crosses
+    // it into the DDR clock domain.
     if (runtimeTrainable) {
       trainBus = BusSlavePort.create(
         module: this,
         name: 'train',
-        protocol: BusProtocol.wishbone,
+        kind: protocol,
         // FULL bus width: the fabric decoder drives every slave the
         // range-relative address AND data at bus width. The wb2 boundary in
         // _build narrows data/sel and converts the word address to the
         // controller's fixed 32-bit / register-index port.
         addressWidth: busAW,
         dataWidth: busDW,
-        clk: clk,
-        reset: reset,
+        clk: devClk,
+        reset: devReset,
+        useErr: true,
+        fabricClock: fabric,
       );
+      trainBus!.err! <= Const(0);
     }
+
+    // Sticky: a bus cycle on either port ended with an error. The device
+    // gives no error itself, so this is a crossing that poisoned an access
+    // during a DDR clock reset, or a request the port layer refused.
+    final errBeat = [
+      harborPortErrorBeat(bus.interfaceRef.internalInterface!),
+      if (trainBus != null)
+        harborPortErrorBeat(trainBus!.interfaceRef.internalInterface!),
+    ].reduce((a, b) => a | b);
+    final busErr = Logic(name: 'bus_error_sticky');
+    Sequential(clk, [
+      If(
+        reset,
+        then: [busErr < 0],
+        orElse: [
+          If(errBeat, then: [busErr < 1]),
+        ],
+      ),
+    ]);
+    addOutput('bus_error') <= busErr;
 
     // Under Verilator there is no PHY, so there are no pads to expose and
     // nothing to drive them. Creating them anyway would leave the bidirectional
@@ -221,10 +289,8 @@ class HarborDdr3 extends BridgeModule
       if (simExternalMem) {
         _buildSimExternal(busDW, busAW);
       } else {
-        _buildSim(clk, reset, busDW);
+        _buildSim(clk, busDW);
       }
-      // The sim memory has no CDC, so it has no bus error to report.
-      addOutput('bus_error') <= Const(0);
       return;
     }
 
@@ -263,44 +329,100 @@ class HarborDdr3 extends BridgeModule
     );
   }
 
+  static String _definitionName({
+    required HarborDdrConfig config,
+    required HarborDeviceTarget? target,
+    required int busAddressWidth,
+    required int busDataWidth,
+    required int ckPeriodPs,
+    required int controllerGearRatio,
+    required bool runtimeTrainable,
+    required bool writeCombine,
+    required bool simExternalMem,
+    required HarborFabricKind protocol,
+    required int idWidth,
+    required int wishboneBurstBeats,
+  }) {
+    final sim = target is HarborSimTarget;
+    final ecp5 = switch (target) {
+      HarborFpgaTarget(vendor: HarborFpgaVendor.ecp5) => true,
+      _ => false,
+    };
+    final phy = switch (target) {
+      null => 'generic',
+      HarborSimTarget() => simExternalMem ? 'simext' : 'sim',
+      HarborFpgaTarget(:final vendor) => vendor.name,
+      _ => target.name.replaceAll(RegExp('[^A-Za-z0-9]'), '_'),
+    };
+    final dm = ecp5 && config.dmRemapping != null
+        ? '_dm${config.dmRemapping!.join()}'
+        : '';
+    final burst = protocol == HarborFabricKind.wishbone
+        ? '_b$wishboneBurstBeats'
+        : '';
+    final cdc = sim ? 0 : harborCdcDepth(outstanding);
+    return 'HarborDdr3_${phy}_s${config.size}_a${busAddressWidth}'
+        '_d${busDataWidth}_ck${ckPeriodPs}_g$controllerGearRatio'
+        '${runtimeTrainable ? '_rt' : ''}${writeCombine ? '_wc' : ''}$dm'
+        '_${protocol.name}_i${idWidth}_n${outstanding}_q$cdc$burst';
+  }
+
   /// Verilator build: a behavioral memory on the same bus port, at the same
   /// base address, with the same device tree. No CDC, no burst adapter, no
   /// controller, no PHY, so no calibration to sit through before the first
   /// access. The timing this drops is exactly the timing Verilator could not
   /// have reproduced anyway.
-  void _buildSim(Logic clk, Logic reset, int busDW) {
+  void _buildSim(Logic clk, int busDW) {
     final words = usableSize ~/ (busDW ~/ 8);
+    final ack = Logic(name: 'mem_ack');
+    final datOut = Logic(name: 'mem_dat_r', width: busDW);
+    final beats = HarborMemoryBeats(
+      clk: clk,
+      reset: bus.reset,
+      waist: bus.waist,
+      ack: ack,
+      dataOut: datOut,
+    );
     final dram = HarborSimDram(
-      addrWidth: bus.addr.width,
+      addrWidth: beats.addr.width,
       dataWidth: busDW,
       words: words,
       byteSize: usableSize,
     );
     addSubModule(dram);
     dram.input('clk').srcConnection! <= clk;
-    dram.input('reset').srcConnection! <= reset;
-    dram.input('stb').srcConnection! <= bus.stb;
-    dram.input('we').srcConnection! <= bus.we;
-    dram.input('adr').srcConnection! <= bus.addr;
-    dram.input('dat_w').srcConnection! <= bus.dataIn;
-    dram.input('sel').srcConnection! <= bus.sel;
+    dram.input('reset').srcConnection! <= bus.reset;
+    dram.input('stb').srcConnection! <= beats.stb;
+    dram.input('we').srcConnection! <= beats.we;
+    dram.input('adr').srcConnection! <= beats.addr;
+    dram.input('dat_w').srcConnection! <= beats.dataIn;
+    dram.input('sel').srcConnection! <= beats.sel;
     // No classic/registered-feedback burst from the fabric yet, so this
     // leaf always sees a classic cycle.
     dram.input('cti').srcConnection! <= Const(0, width: 3);
-    bus.ack <= dram.output('ack');
-    bus.dataOut <= dram.output('dat_r');
+    ack <= dram.output('ack');
+    datOut <= dram.output('dat_r');
   }
 
   // Set by [_buildSimExternal] for [simModels] to size the host store.
   int? _simBusDW;
   int? _simByteSize;
 
-  /// Verilator with a host-side model: route the wishbone memory bus to
+  /// Verilator with a host-side model: route the beats of the memory port to
   /// top-level ports so a C++ [DramStore] can be the slave, the same split-port
   /// move the SDIO controller uses under sim. The store mmaps the whole address
   /// space, so only the pages the firmware touches cost host memory. Behaviour
   /// mirrors [_buildSim]: a single-cycle wishbone-B4 slave on the bus clock.
   void _buildSimExternal(int busDW, int busAW) {
+    final ack = Logic(name: 'mem_ack_in');
+    final datOut = Logic(name: 'mem_dat_r_in', width: busDW);
+    final beats = HarborMemoryBeats(
+      clk: input('clk'),
+      reset: bus.reset,
+      waist: bus.waist,
+      ack: ack,
+      dataOut: datOut,
+    );
     createPort('mem_stb', PortDirection.output);
     createPort('mem_we', PortDirection.output);
     createPort('mem_adr', PortDirection.output, width: busAW);
@@ -308,13 +430,13 @@ class HarborDdr3 extends BridgeModule
     createPort('mem_sel', PortDirection.output, width: busDW ~/ 8);
     createPort('mem_ack', PortDirection.input);
     createPort('mem_dat_r', PortDirection.input, width: busDW);
-    output('mem_stb') <= bus.stb;
-    output('mem_we') <= bus.we;
-    output('mem_adr') <= bus.addr;
-    output('mem_dat_w') <= bus.dataIn;
-    output('mem_sel') <= bus.sel;
-    bus.ack <= input('mem_ack');
-    bus.dataOut <= input('mem_dat_r');
+    output('mem_stb') <= beats.stb;
+    output('mem_we') <= beats.we;
+    output('mem_adr') <= beats.addr;
+    output('mem_dat_w') <= beats.dataIn;
+    output('mem_sel') <= beats.sel;
+    ack <= input('mem_ack');
+    datOut <= input('mem_dat_r');
     _simBusDW = busDW;
     _simByteSize = usableSize;
   }
@@ -476,29 +598,16 @@ struct DramStore {
       ),
     ]);
 
-    // --- CDC: bus-native B4, sys clk -> ddr clk (async gray-pointer FIFO) ---
-    final cdc = HarborWishboneCdcFifoBridge(
-      addressWidth: busAW,
-      dataWidth: busDW,
-      selWidth: busDW ~/ 8,
-      depth: 16,
-      target: target,
-      postedWrites: postedWrites,
-      name: 'ddr_cdc',
+    // --- one beat at a time from the memory port, on ddr clk ---
+    final beatAck = Logic(name: 'beat_ack');
+    final beatData = Logic(name: 'beat_data', width: busDW);
+    final beats = HarborMemoryBeats(
+      clk: ddrClk,
+      reset: bus.reset,
+      waist: bus.waist,
+      ack: beatAck,
+      dataOut: beatData,
     );
-    addSubModule(cdc);
-    cdc.input('s_clk').srcConnection! <= clk;
-    cdc.input('s_reset').srcConnection! <= reset;
-    cdc.input('s_cyc').srcConnection! <= bus.stb;
-    cdc.input('s_stb').srcConnection! <= Const(1);
-    cdc.input('s_we').srcConnection! <= bus.we;
-    cdc.input('s_adr').srcConnection! <= bus.addr;
-    cdc.input('s_dat_w').srcConnection! <= bus.dataIn;
-    cdc.input('s_sel').srcConnection! <= bus.sel;
-    bus.ack <= cdc.output('s_ack');
-    bus.dataOut <= cdc.output('s_dat_r');
-    cdc.input('m_clk').srcConnection! <= ddrClk;
-    cdc.input('m_reset').srcConnection! <= ddrReset;
 
     // --- burst adapter (32<->128) + controller <-> phy, all on ddr clk ---
     // Placeholder nets break the controller<->adapter<->phy construction cycles.
@@ -525,26 +634,26 @@ struct DramStore {
       auxWidth: Ddr3Controller.auxWidth,
       writeCombine: writeCombine,
       clk: ddrClk,
-      // The CDC master side and the adapter reset together, so a stale
+      // The crossing device side and the adapter reset together, so a stale
       // response cannot complete the first request after a reset.
-      reset: cdc.output('m_reset_joined'),
+      reset: bus.reset,
       ctrlReset: ddrReset,
-      sCyc: cdc.output('m_cyc') & cdc.output('m_stb'),
+      sCyc: beats.stb,
       sStb: Const(1),
-      sWe: cdc.output('m_we'),
-      sAddr: cdc.output('m_adr'),
-      sData: cdc.output('m_dat_w'),
-      sSel: cdc.output('m_sel'),
+      sWe: beats.we,
+      sAddr: beats.addr,
+      sData: beats.dataIn,
+      sSel: beats.sel,
+      sLast: beats.last,
       mStall: ctrlStall,
       mAck: ctrlAck,
       mAckAux: ctrlAckAux,
       mData: ctrlData,
     );
-    cdc.input('m_ack').srcConnection! <= adapter.output('s_ack');
-    cdc.input('m_dat_r').srcConnection! <= adapter.output('s_data_out');
+    beatAck <= adapter.output('s_ack');
+    beatData <= adapter.output('s_data_out');
 
-    // --- wb2 knob-ABI window: sys-clk slave -> CDC FIFO -> ddr-clk wb2 ---
-    // Placeholder nets break the wb2<->CDC construction cycle (train=runtime).
+    // --- wb2 knob-ABI window: train port (crossed to ddr clk) -> wb2 ---
     Logic wb2Cyc = Const(0);
     Logic wb2Stb = Const(0);
     Logic wb2We = Const(0);
@@ -553,72 +662,34 @@ struct DramStore {
     Logic wb2Data = Const(0, width: Ddr3Controller.wb2DataBits);
     Logic? wb2Ack;
     Logic? wb2DataOut;
-    HarborWishboneCdcFifoBridge? trainCdc;
-    if (runtimeTrainable) {
+    final train = trainBus;
+    if (train != null) {
       wb2Ack = Logic(name: 'ctrl_wb2_ack');
       wb2DataOut = Logic(
         name: 'ctrl_wb2_data',
         width: Ddr3Controller.wb2DataBits,
       );
-      // The CDC carries the FULL bus width so it matches the fabric decoder.
-      // The same width and depth as the main ddr_cdc lets both share one
-      // definition. Knob writes stay strictly ordered, so this one does not
-      // post writes.
-      trainCdc = HarborWishboneCdcFifoBridge(
-        addressWidth: busAW,
-        dataWidth: busDW,
-        selWidth: busDW ~/ 8,
-        depth: 16,
-        target: target,
-        name: 'train_cdc',
-      );
-      addSubModule(trainCdc);
-      trainCdc.input('s_clk').srcConnection! <= clk;
-      trainCdc.input('s_reset').srcConnection! <= reset;
-      trainCdc.input('s_cyc').srcConnection! <= trainBus!.stb;
-      trainCdc.input('s_stb').srcConnection! <= Const(1);
-      trainCdc.input('s_we').srcConnection! <= trainBus!.we;
-      trainCdc.input('s_adr').srcConnection! <= trainBus!.addr;
-      trainCdc.input('s_dat_w').srcConnection! <= trainBus!.dataIn;
-      trainCdc.input('s_sel').srcConnection! <= trainBus!.sel;
-      trainBus!.ack <= trainCdc.output('s_ack');
-      // Read data: the controller returns 32 bits; zero-extend to the bus.
-      trainBus!.dataOut <= trainCdc.output('s_dat_r').getRange(0, busDW);
-      trainCdc.input('m_clk').srcConnection! <= ddrClk;
-      trainCdc.input('m_reset').srcConnection! <= ddrReset;
 
       // --- wb2 boundary adaptation (fabric bus width -> fixed 32b / reg-index) ---
-      // ADR: harbor wishbone adr is word-granular (byteOffset >> wordShift).
-      // The controller decodes a REGISTER INDEX = byteOffset >> trainStrideLog2.
-      // Reconstruct the byte offset from m_adr then divide by the 8-byte stride.
-      final wordShift = (busDW ~/ 8).bitLength - 1; // log2(bytesPerWord)
-      final mAdr = trainCdc.output('m_adr');
-      final byteAddr = wordShift == 0
-          ? mAdr
-          : [mAdr, Const(0, width: wordShift)].swizzle();
-      wb2Addr = byteAddr.getRange(
-        trainStrideLog2,
-        trainStrideLog2 + Ddr3Controller.wb2AddrBits,
-      );
+      // The port address is a byte offset. The controller decodes a register
+      // index, the byte offset divided by the 8-byte stride.
+      final idxEnd = trainStrideLog2 + Ddr3Controller.wb2AddrBits;
+      wb2Addr = train.addr.width >= idxEnd
+          ? train.addr.getRange(trainStrideLog2, idxEnd)
+          : train.addr
+                .getRange(trainStrideLog2)
+                .zeroExtend(Ddr3Controller.wb2AddrBits);
 
-      wb2Cyc = trainCdc.output('m_cyc') & trainCdc.output('m_stb');
+      wb2Cyc = train.stb;
       wb2Stb = Const(1);
-      wb2We = trainCdc.output('m_we');
+      wb2We = train.we;
       // DATA/SEL: the 32-bit register lives in the low word of the bus word.
-      wb2Sel = trainCdc.output('m_sel').getRange(0, Ddr3Controller.wb2SelBits);
-      wb2Data = trainCdc
-          .output('m_dat_w')
-          .getRange(0, Ddr3Controller.wb2DataBits);
-      trainCdc.input('m_ack').srcConnection! <= wb2Ack;
-      // Zero-extend the 32-bit read response back to the CDC (bus) width.
-      trainCdc.input('m_dat_r').srcConnection! <= wb2DataOut.zeroExtend(busDW);
+      wb2Sel = train.sel.getRange(0, Ddr3Controller.wb2SelBits);
+      wb2Data = train.dataIn.getRange(0, Ddr3Controller.wb2DataBits);
+      train.ack <= wb2Ack;
+      // Zero-extend the 32-bit read response back to the bus width.
+      train.dataOut <= wb2DataOut.zeroExtend(busDW);
     }
-
-    // Sticky: a bus cycle ended with poison data during a DDR clock reset.
-    addOutput('bus_error') <=
-        (trainCdc == null
-            ? cdc.output('s_bus_error')
-            : cdc.output('s_bus_error') | trainCdc.output('s_bus_error'));
 
     // A self-training PHY (ECP5) reports its read leveling back.
     final phyLevelDone = isEcp5 ? Logic(name: 'phy_read_level_done') : null;

@@ -489,7 +489,7 @@ void main() {
   });
 
   group('soc', () {
-    test('fabric turns on ERR when every master has it and exposes '
+    test('unmapped gives ERR without bus_error, a timeout sets '
         'bus_error', () async {
       const masterCfg = WishboneConfig(
         addressWidth: 32,
@@ -497,20 +497,18 @@ void main() {
         useErr: true,
         useCti: true,
       );
-      const busCfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
-      final soc = HarborSoC(
-        name: 'ErrSoc',
-        compatible: 'test,err',
-        busConfig: busCfg,
-      );
+      final soc = HarborSoC(name: 'ErrSoc', compatible: 'test,err');
       final m = _Probe(masterCfg);
       soc.addMaster(m, busInterfaceName: 'bus');
       soc.addPeripheral(
         HarborSram(baseAddress: 0, size: 4096, busAddressWidth: 32),
       );
+      final mute = _MuteSlave();
+      soc.addSubModule(mute);
+      soc.addPeripheralSlave(mute, 'bus', const BusAddressRange(0x8000, 4096));
       soc.buildFabric(busTimeoutCycles: 16);
       soc.exposeBusError();
-      expect(soc.fabricDecoders.single.timeoutCycles, 16);
+      expect(soc.fabric!.busError, isNotNull);
       final (clk, _) = await _start(soc);
       void driveM(String n, int v) => m.input(n).srcConnection!.inject(v);
       driveM('cyc', 1);
@@ -520,6 +518,22 @@ void main() {
       expect(_out(m, 'err'), 1);
       expect(_out(m, 'ack'), 0);
       await clk.nextNegedge;
+      driveM('cyc', 0);
+      driveM('stb', 0);
+      await clk.nextNegedge;
+      expect(_out(soc, 'bus_error'), 0);
+
+      // A slave that never answers is cut off after 16 cycles.
+      driveM('cyc', 1);
+      driveM('stb', 1);
+      driveM('adr', 0x8000);
+      var cycles = 0;
+      while (_out(m, 'err') == 0) {
+        await clk.nextNegedge;
+        cycles++;
+        expect(cycles, lessThan(40));
+      }
+      expect(cycles, greaterThanOrEqualTo(16));
       driveM('cyc', 0);
       driveM('stb', 0);
       await clk.nextNegedge;
@@ -533,12 +547,7 @@ void main() {
         dataWidth: 32,
         useCti: true,
       );
-      const busCfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
-      final soc = HarborSoC(
-        name: 'FoldSoc',
-        compatible: 'test,fold',
-        busConfig: busCfg,
-      );
+      final soc = HarborSoC(name: 'FoldSoc', compatible: 'test,fold');
       final m = _Probe(masterCfg);
       soc.addMaster(m, busInterfaceName: 'bus');
       soc.addPeripheral(
@@ -565,13 +574,41 @@ void main() {
       await Simulator.endSimulation();
     });
 
-    test('bus_error takes marked peripherals only', () async {
-      const busCfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
-      final soc = HarborSoC(
-        name: 'MarkSoc',
-        compatible: 'test,mark',
-        busConfig: busCfg,
+    test('an unmapped access to a master without ERR acks 0 and sets '
+        'bus_error', () async {
+      final soc = HarborSoC(name: 'UnmappedSoc', compatible: 'test,unmapped');
+      final m = _Probe(
+        const WishboneConfig(addressWidth: 32, dataWidth: 32, useCti: true),
       );
+      soc.addMaster(m, busInterfaceName: 'bus');
+      soc.addPeripheral(
+        HarborSram(baseAddress: 0, size: 4096, busAddressWidth: 32),
+      );
+      soc.buildFabric();
+      soc.exposeBusError();
+      for (final n in ['cyc', 'stb', 'adr']) {
+        m.input(n).srcConnection!.put(0);
+      }
+      final (clk, _) = await _start(soc);
+      void driveM(String n, int v) => m.input(n).srcConnection!.inject(v);
+      await clk.nextNegedge;
+      expect(_out(soc, 'bus_error'), 0);
+      driveM('cyc', 1);
+      driveM('stb', 1);
+      driveM('adr', 0x40000000);
+      await clk.nextNegedge;
+      expect(_out(m, 'ack'), 1);
+      expect(_out(m, 'dat'), 0);
+      await clk.nextPosedge;
+      driveM('cyc', 0);
+      driveM('stb', 0);
+      await clk.nextNegedge;
+      expect(_out(soc, 'bus_error'), 1);
+      await Simulator.endSimulation();
+    });
+
+    test('bus_error takes marked peripherals only', () async {
+      final soc = HarborSoC(name: 'MarkSoc', compatible: 'test,mark');
       final m = _Probe(
         const WishboneConfig(addressWidth: 32, dataWidth: 32, useCti: true),
       );
@@ -621,6 +658,23 @@ class _PlainSram extends HarborSram {
     : super(size: 4096, busAddressWidth: 32, name: 'plain') {
     createPort('flag', PortDirection.input);
     addOutput('bus_error') <= input('flag');
+  }
+}
+
+/// A slave that never answers.
+class _MuteSlave extends BridgeModule {
+  _MuteSlave() : super('MuteSlave', name: 'mute_slave') {
+    final bus =
+        addInterface(
+              WishboneInterface(
+                const WishboneConfig(addressWidth: 32, dataWidth: 32),
+              ),
+              name: 'bus',
+              role: PairRole.consumer,
+            ).internalInterface
+            as WishboneInterface;
+    bus.ack <= Const(0);
+    bus.datMiso <= Const(0, width: 32);
   }
 }
 

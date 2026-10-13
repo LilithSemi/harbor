@@ -4,9 +4,12 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 // Register byte offsets: each register in its own 8-byte slot (the byte-addressed
 // fabric decodes byte-offset >> 3).
 const _ctrl = 0x00;
+const _status = 0x08;
 const _clkDiv = 0x10;
 const _cmd = 0x18;
 const _cmdArg = 0x20;
@@ -91,6 +94,94 @@ List<int> _fourBitStream(int word) {
   return [0, ...data, ...crc];
 }
 
+/// Wires a 16-word memory model to [sdio]'s raw ADMA master port. [ackDelay]
+/// holds every beat off that many cycles before acking, the way a real DDR
+/// controller does.
+List<Logic> _wireAdmaMemory(
+  HarborSdioController sdio,
+  Logic clk,
+  Logic reset, {
+  List<int> dmaMem = const [],
+  int ackDelay = 0,
+  int dmaDataWidth = 32,
+}) {
+  final initVals = [
+    for (var i = 0; i < 16; i++) i < dmaMem.length ? dmaMem[i] : 0,
+  ];
+  final mem = [for (var i = 0; i < 16; i++) Logic(name: 'mem$i', width: 32)];
+  final mStb = sdio.output('dma_stb');
+  final mWe = sdio.output('dma_we');
+  final mAddr = sdio.output('dma_addr');
+  final mWdata = sdio.output('dma_wdata');
+  final mSel = sdio.output('dma_sel');
+  final mIdx = mAddr.getRange(2, 6); // 32-bit word index 0..15
+  final mPair = mAddr.getRange(3, 6); // 64-bit beat index 0..7
+  final ackCnt = Logic(name: 'ack_cnt', width: 8);
+  final ackNow = (mStb & ackCnt.eq(Const(ackDelay, width: 8))).named('ack_now');
+  // Byte-enables decide which half of a 64-bit beat commits, so a packed
+  // beat (SEL=0xFF) lands both words and a half beat lands only its own.
+  final selLo = mSel.getRange(0, 4).or().named('sel_lo');
+  final selHi = dmaDataWidth == 64
+      ? mSel.getRange(4, 8).or().named('sel_hi')
+      : Const(0);
+  Sequential(
+    clk,
+    reset: reset,
+    resetValues: {
+      for (var i = 0; i < 16; i++) mem[i]: Const(initVals[i], width: 32),
+      ackCnt: Const(0, width: 8),
+    },
+    [
+      If(
+        mStb,
+        then: [
+          If(
+            ackCnt.lt(Const(ackDelay, width: 8)),
+            then: [ackCnt < (ackCnt + Const(1, width: 8))],
+          ),
+        ],
+        orElse: [ackCnt < Const(0, width: 8)],
+      ),
+      If(
+        ackNow & mWe,
+        then: [
+          if (dmaDataWidth == 32)
+            for (var i = 0; i < 16; i++)
+              If(mIdx.eq(Const(i, width: 4)), then: [mem[i] < mWdata])
+          else
+            for (var p = 0; p < 8; p++)
+              If(
+                mPair.eq(Const(p, width: 3)),
+                then: [
+                  If(selLo, then: [mem[2 * p] < mWdata.getRange(0, 32)]),
+                  If(selHi, then: [mem[2 * p + 1] < mWdata.getRange(32, 64)]),
+                ],
+              ),
+        ],
+      ),
+    ],
+  );
+  Logic mRd;
+  if (dmaDataWidth == 32) {
+    mRd = mem[15];
+    for (var i = 14; i >= 0; i--) {
+      mRd = mux(mIdx.eq(Const(i, width: 4)), mem[i], mRd);
+    }
+  } else {
+    mRd = [mem[15], mem[14]].swizzle();
+    for (var p = 6; p >= 0; p--) {
+      mRd = mux(
+        mPair.eq(Const(p, width: 3)),
+        [mem[2 * p + 1], mem[2 * p]].swizzle(),
+        mRd,
+      );
+    }
+  }
+  sdio.input('dma_rdata').srcConnection! <= mRd;
+  sdio.input('dma_ack').srcConnection! <= ackNow;
+  return mem;
+}
+
 void main() {
   group('HarborSdioConfig', () {
     test('SD preset', () {
@@ -153,6 +244,15 @@ void main() {
         config: const HarborSdioConfig(maxBusWidth: HarborSdioBusWidth.eight),
       );
       expect(sd.dtNode.properties['bus-width'], equals(8));
+    });
+
+    test('two different parameter sets get different definition names', () {
+      final a = HarborSdioController(baseAddress: 0x60000000);
+      final b = HarborSdioController(
+        baseAddress: 0x60000000,
+        config: const HarborSdioConfig.emmc(),
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
     });
   });
 
@@ -247,85 +347,14 @@ void main() {
       // A 16-word memory model on the ADMA master port. [ackDelay] holds every
       // beat off for that many cycles before acking, which is what a real DDR
       // controller does and what the 1-cycle model hid.
-      final initVals = [
-        for (var i = 0; i < 16; i++) i < dmaMem.length ? dmaMem[i] : 0,
-      ];
-      mem = [for (var i = 0; i < 16; i++) Logic(name: 'mem$i', width: 32)];
-      final mStb = sdio.output('dma_stb');
-      final mWe = sdio.output('dma_we');
-      final mAddr = sdio.output('dma_addr');
-      final mWdata = sdio.output('dma_wdata');
-      final mSel = sdio.output('dma_sel');
-      final mIdx = mAddr.getRange(2, 6); // 32-bit word index 0..15
-      final mPair = mAddr.getRange(3, 6); // 64-bit beat index 0..7
-      final ackCnt = Logic(name: 'ack_cnt', width: 8);
-      final ackNow = (mStb & ackCnt.eq(Const(ackDelay, width: 8))).named(
-        'ack_now',
-      );
-      // Byte-enables decide which half of a 64-bit beat commits, so a packed
-      // beat (SEL=0xFF) lands both words and a half beat lands only its own.
-      final selLo = mSel.getRange(0, 4).or().named('sel_lo');
-      final selHi = dmaDataWidth == 64
-          ? mSel.getRange(4, 8).or().named('sel_hi')
-          : Const(0);
-      Sequential(
+      mem = _wireAdmaMemory(
+        sdio,
         clk,
-        reset: reset,
-        resetValues: {
-          for (var i = 0; i < 16; i++) mem[i]: Const(initVals[i], width: 32),
-          ackCnt: Const(0, width: 8),
-        },
-        [
-          If(
-            mStb,
-            then: [
-              If(
-                ackCnt.lt(Const(ackDelay, width: 8)),
-                then: [ackCnt < (ackCnt + Const(1, width: 8))],
-              ),
-            ],
-            orElse: [ackCnt < Const(0, width: 8)],
-          ),
-          If(
-            ackNow & mWe,
-            then: [
-              if (dmaDataWidth == 32)
-                for (var i = 0; i < 16; i++)
-                  If(mIdx.eq(Const(i, width: 4)), then: [mem[i] < mWdata])
-              else
-                for (var p = 0; p < 8; p++)
-                  If(
-                    mPair.eq(Const(p, width: 3)),
-                    then: [
-                      If(selLo, then: [mem[2 * p] < mWdata.getRange(0, 32)]),
-                      If(
-                        selHi,
-                        then: [mem[2 * p + 1] < mWdata.getRange(32, 64)],
-                      ),
-                    ],
-                  ),
-            ],
-          ),
-        ],
+        reset,
+        dmaMem: dmaMem,
+        ackDelay: ackDelay,
+        dmaDataWidth: dmaDataWidth,
       );
-      Logic mRd;
-      if (dmaDataWidth == 32) {
-        mRd = mem[15];
-        for (var i = 14; i >= 0; i--) {
-          mRd = mux(mIdx.eq(Const(i, width: 4)), mem[i], mRd);
-        }
-      } else {
-        mRd = [mem[15], mem[14]].swizzle();
-        for (var p = 6; p >= 0; p--) {
-          mRd = mux(
-            mPair.eq(Const(p, width: 3)),
-            [mem[2 * p + 1], mem[2 * p]].swizzle(),
-            mRd,
-          );
-        }
-      }
-      sdio.input('dma_rdata').srcConnection! <= mRd;
-      sdio.input('dma_ack').srcConnection! <= ackNow;
 
       await sdio.build();
 
@@ -1477,6 +1506,10 @@ void main() {
   });
 
   group('HarborSdioController fabric integration', () {
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
     test(
       'ownPads collapses CMD/DAT to bidirectional pads + a WB dma master',
       () async {
@@ -1518,5 +1551,258 @@ void main() {
         expect(sdio.tryInOut('sd_cmd'), isNull);
       },
     );
+  });
+
+  // The RX FIFO pop on a DATA read is gated by SEL (see rxPopCpu in
+  // HarborSdioController). On a 64-bit bus DATA's own lane is the low 4
+  // bytes of its 8-byte slot; the upper 4 bytes are padding. Wishbone only,
+  // for the same reason as the CMD engine group above: the gate lives in
+  // the register decode, not the SD protocol, so one run is enough.
+  group('HarborSdioController DATA read SEL gating (64-bit bus)', () {
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test('a read of the padding lane does not pop the RX FIFO', () async {
+      final sdio = HarborSdioController(
+        baseAddress: 0x60000000,
+        busDataWidth: 64,
+      );
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset');
+      final stb = Logic(name: 'stb');
+      final we = Logic(name: 'we');
+      final sel = Logic(name: 'sel', width: 8);
+      final adr = Logic(name: 'adr', width: 12);
+      final mosi = Logic(name: 'mosi', width: 64);
+      final cmdIn = Logic(name: 'cmd_in');
+      final datIn = Logic(name: 'dat_in', width: 4);
+
+      sdio.input('clk').srcConnection! <= clk;
+      sdio.input('reset').srcConnection! <= reset;
+      sdio.input('bus_CYC').srcConnection! <= stb;
+      sdio.input('bus_STB').srcConnection! <= stb;
+      sdio.input('bus_WE').srcConnection! <= we;
+      sdio.input('bus_ADR').srcConnection! <= adr;
+      sdio.input('bus_DAT_MOSI').srcConnection! <= mosi;
+      sdio.input('bus_SEL').srcConnection! <= sel;
+      sdio.input('sd_cmd_in').srcConnection! <= cmdIn;
+      sdio.input('sd_cd').srcConnection! <= Const(0);
+      sdio.input('sd_dat_in').srcConnection! <= datIn;
+      sdio.input('dma_rdata').srcConnection! <=
+          Const(0, width: sdio.input('dma_rdata').width);
+      sdio.input('dma_ack').srcConnection! <= Const(0);
+
+      await sdio.build();
+
+      final cmdOe = sdio.output('sd_cmd_oe');
+      final sdClk = sdio.output('sd_clk');
+      final irq = sdio.output('interrupt');
+
+      Future<void> busWrite(int addr, int data, {int selMask = 0xff}) async {
+        adr.inject(addr);
+        mosi.inject(data);
+        sel.inject(selMask);
+        we.inject(1);
+        stb.inject(1);
+        await clk.nextPosedge;
+        while (sdio.output('bus_ACK').value.toInt() != 1) {
+          await clk.nextPosedge;
+        }
+        stb.inject(0);
+        we.inject(0);
+        await clk.nextPosedge;
+      }
+
+      Future<int> busRead(int addr, {int selMask = 0xff}) async {
+        adr.inject(addr);
+        sel.inject(selMask);
+        we.inject(0);
+        stb.inject(1);
+        await clk.nextPosedge;
+        while (sdio.output('bus_ACK').value.toInt() != 1) {
+          await clk.nextPosedge;
+        }
+        final v = sdio.output('bus_DAT_MISO').value.toInt();
+        stb.inject(0);
+        await clk.nextPosedge;
+        return v;
+      }
+
+      reset.inject(1);
+      stb.inject(0);
+      we.inject(0);
+      adr.inject(0);
+      mosi.inject(0);
+      sel.inject(0xff);
+      cmdIn.inject(1);
+      datIn.inject(0);
+      Simulator.setMaxSimTime(400000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+
+      const wordA = 0x11111111;
+      const wordB = 0x22222222;
+      // Enable, fastest clock, unmask data-done + timeout. A new CMD with
+      // data present resets the RX FIFO, so both words must land from one
+      // CMD17 block read (blkSize 8 = two words), not two separate reads.
+      await busWrite(_clkDiv, 0);
+      await busWrite(_ctrl, 0x1);
+      await busWrite(_blkSize, 8);
+      await busWrite(_intEnable, 0x12);
+      await busWrite(_cmdArg, 0);
+      // index 17, short response, data present, read direction.
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+
+      final resp = _resp48(0);
+      final dataBits = [..._wordBitsMsb(wordA), ..._wordBitsMsb(wordB)];
+      final datStream = [0, ...dataBits, ..._crc16(dataBits)];
+      final total = resp.length + datStream.length;
+
+      var sawDrive = false;
+      var prevSdLow = sdClk.value.toInt() == 0;
+      var idx = 0;
+      for (var i = 0; i < 10000; i++) {
+        await clk.nextPosedge;
+        final sending = cmdOe.value.toInt() == 1;
+        if (sending) sawDrive = true;
+        final sdLow = sdClk.value.toInt() == 0;
+        if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
+          if (idx < resp.length) {
+            cmdIn.inject(resp[idx]);
+          } else {
+            datIn.inject(datStream[idx - resp.length]);
+          }
+          idx++;
+        }
+        prevSdLow = sdLow;
+        if (irq.value.toInt() == 1) break; // data-done
+      }
+
+      expect(
+        await busRead(_intStatus) & 0x02,
+        equals(0x02),
+        reason: 'data-done should assert',
+      );
+
+      // The padding lane (bytes 4-7 of DATA's 8-byte slot) must not pop
+      // the FIFO: both words must still come out, in order, afterward.
+      await busRead(_data, selMask: 0xf0);
+      expect(await busRead(_data, selMask: 0x0f), equals(wordA));
+      expect(await busRead(_data, selMask: 0x0f), equals(wordB));
+
+      await Simulator.endSimulation();
+    });
+  });
+
+  for (final kind in HarborFabricKind.values) {
+    _registerTests(kind);
+  }
+}
+
+// The CMD-engine group above drives the register bus through raw Wishbone
+// wires on purpose: those tests exercise the SD command/data FSM and DMA
+// engine over the SD pins, not the register port, and bit-banging an SD
+// protocol co-simulation three times (once per fabric kind) would multiply
+// an already long run for no new coverage. The register port itself, byte
+// selects included, is covered here instead, once per fabric kind.
+void _registerTests(HarborFabricKind kind) {
+  group('HarborSdioController register access (${kind.name})', () {
+    late HarborSdioController sdio;
+    late Logic clk, reset;
+    late RegBus bus;
+
+    // A direct Wishbone port serves a new access only after STB drops, so
+    // give it one idle cycle after each access.
+    Future<void> settle() async {
+      if (kind == HarborFabricKind.wishbone) await clk.nextPosedge;
+    }
+
+    Future<void> wr(int addr, int data, {int? sel}) async {
+      await bus.write(addr, data, sel: sel);
+      await settle();
+    }
+
+    Future<int> rd(int addr) async {
+      final v = await bus.read(addr);
+      await settle();
+      return v;
+    }
+
+    Future<void> setUpDut() async {
+      sdio = HarborSdioController(baseAddress: 0x60000000, fabricKind: kind);
+      clk = SimpleClockGenerator(10).clk;
+      reset = Logic(name: 'reset');
+
+      sdio.input('clk').srcConnection! <= clk;
+      sdio.input('reset').srcConnection! <= reset;
+      sdio.input('sd_cmd_in').srcConnection! <= Const(1);
+      sdio.input('sd_cd').srcConnection! <= Const(0);
+      sdio.input('sd_dat_in').srcConnection! <=
+          Const(0, width: sdio.input('sd_dat_in').width);
+      sdio.input('dma_rdata').srcConnection! <=
+          Const(0, width: sdio.input('dma_rdata').width);
+      sdio.input('dma_ack').srcConnection! <= Const(0);
+      bus = RegBus.attach(sdio, clk);
+
+      await sdio.build();
+
+      reset.inject(1);
+      bus.idle();
+      Simulator.setMaxSimTime(200000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+    }
+
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test(
+      'CLK_DIV, CMD_ARG, BLK_SIZE, INT_ENABLE, and ADMA_ADDR are read/write',
+      () async {
+        await setUpDut();
+
+        await wr(_clkDiv, 0x1234);
+        expect(await rd(_clkDiv), equals(0x1234));
+
+        await wr(_cmdArg, 0xdeadbeef);
+        expect(await rd(_cmdArg), equals(0xdeadbeef));
+
+        await wr(_blkSize, 0x0abc);
+        expect(await rd(_blkSize), equals(0x0abc));
+
+        await wr(_intEnable, 0xa5);
+        expect(await rd(_intEnable), equals(0xa5));
+
+        await wr(_admaAddr, 0x11223344);
+        expect(await rd(_admaAddr), equals(0x11223344));
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      await wr(_clkDiv, 0x1234);
+      await wr(_cmdArg, 0x55667788);
+
+      await wr(_clkDiv, 0xffff, sel: 0x0);
+      await wr(_cmdArg, 0xffffffff, sel: 0x0);
+      // A CMD write with no byte selected must not start a command: busy
+      // (STATUS bit 8) must never assert.
+      await wr(_cmd, 17 | (1 << 6), sel: 0x0);
+
+      expect(await rd(_clkDiv), equals(0x1234));
+      expect(await rd(_cmdArg), equals(0x55667788));
+      expect((await rd(_status) >> 8) & 1, equals(0));
+      await Simulator.endSimulation();
+    });
   });
 }

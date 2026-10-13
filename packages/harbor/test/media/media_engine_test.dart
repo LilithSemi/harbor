@@ -5,6 +5,8 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/reg_bus.dart';
+
 // Reference transform, mirroring the integer arithmetic in media_engine.dart.
 // Transform types: 0 = DCT, 1 = ADST, 2 = FLIPADST, 3 = IDTX.
 List<List<int>> _dctM(int n) => [
@@ -320,6 +322,14 @@ BigInt _pack(List<int> s) {
 }
 
 void main() {
+  // The rest of this file drives the register bus directly over Wishbone and
+  // runs full codec-pipeline simulations, so it stays on the default kind to
+  // keep the suite's run time in check. This group alone runs register
+  // access over every fabric kind, including the required sel-0 check.
+  for (final kind in HarborFabricKind.values) {
+    _registerBusTests(kind);
+  }
+
   group('HarborCodecFormat', () {
     test('video codecs are video', () {
       expect(HarborCodecFormat.h264.isVideo, isTrue);
@@ -509,6 +519,26 @@ void main() {
       expect(engine.dmaWriteAddr.width, equals(40));
       expect(engine.dmaReadData.width, equals(128));
       expect(engine.dmaWriteData.width, equals(128));
+    });
+
+    test('two parameter sets give different definitionNames', () {
+      const codec = [
+        HarborCodecInstance(
+          format: HarborCodecFormat.h264,
+          capability: HarborCodecCapability.both,
+        ),
+      ];
+      final a = HarborMediaEngine(
+        baseAddress: 0x20000000,
+        codecs: codec,
+        maxSessions: 4,
+      );
+      final b = HarborMediaEngine(
+        baseAddress: 0x20000000,
+        codecs: codec,
+        maxSessions: 8,
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
     });
   });
 
@@ -3403,6 +3433,83 @@ void main() {
         }
         expect(row, equals(frame[y]), reason: 'frame row $y');
       }
+      await Simulator.endSimulation();
+    });
+  });
+}
+
+void _registerBusTests(HarborFabricKind kind) {
+  group('HarborMediaEngine register bus (${kind.name})', () {
+    late HarborMediaEngine eng;
+    late Logic clk, reset;
+    late RegBus bus;
+
+    Future<void> setUpDut() async {
+      eng = HarborMediaEngine(
+        baseAddress: 0x20000000,
+        codecs: const [
+          HarborCodecInstance(
+            format: HarborCodecFormat.av1,
+            capability: HarborCodecCapability.both,
+          ),
+        ],
+        fabricKind: kind,
+      );
+      clk = SimpleClockGenerator(10).clk;
+      reset = Logic(name: 'reset');
+      bus = RegBus.attach(eng, clk);
+
+      eng.input('clk').srcConnection! <= clk;
+      eng.input('reset').srcConnection! <= reset;
+      eng.input('dma_read_data').srcConnection! <= Const(0, width: 128);
+      eng.input('dma_read_valid').srcConnection! <= Const(0);
+      eng.input('dma_write_ack').srcConnection! <= Const(0);
+
+      await eng.build();
+      bus.idle();
+      reset.inject(1);
+      Simulator.setMaxSimTime(200000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+    }
+
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test(
+      'global and per-session registers read back what was written',
+      () async {
+        await setUpDut();
+
+        await bus.write(0x28, 0x3); // INT_ENABLE
+        expect(await bus.read(0x28), equals(0x3));
+
+        await bus.write(0x118, 0x11223344); // session 0 SESS_SRC_SIZE
+        expect(await bus.read(0x118), equals(0x11223344));
+
+        await bus.write(0x130, 0x1234); // session 0 SESS_WIDTH
+        expect(await bus.read(0x130), equals(0x1234));
+
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('a write with no byte selected changes nothing', () async {
+      await setUpDut();
+
+      await bus.write(0x118, 0x11223344);
+      await bus.write(0x28, 0x3);
+
+      await bus.write(0x118, 0xffffffff, sel: 0x0);
+      await bus.write(0x28, 0x0, sel: 0x0);
+
+      expect(await bus.read(0x118), equals(0x11223344));
+      expect(await bus.read(0x28), equals(0x3));
+
       await Simulator.endSimulation();
     });
   });

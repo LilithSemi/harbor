@@ -252,16 +252,19 @@ void main() {
     expect(out[1].$1, 0x66);
   });
 
-  test('a write and a read of different words on one edge stay valid', () async {
-    final out = await _dual([
-      (true, 4, 0x55, false, 0, 0),
-      // Words 4 and 5 share one x18 word but not their bits.
-      (true, 5, 0x66, false, 4, 0),
-      (true, 6, 0x77, false, 5, 0),
-    ]);
-    expect(out[1].$2, 0x55);
-    expect(out[2].$2, 0x66);
-  });
+  test(
+    'a write and a read of different words on one edge stay valid',
+    () async {
+      final out = await _dual([
+        (true, 4, 0x55, false, 0, 0),
+        // Words 4 and 5 share one x18 word but not their bits.
+        (true, 5, 0x66, false, 4, 0),
+        (true, 6, 0x77, false, 5, 0),
+      ]);
+      expect(out[1].$2, 0x55);
+      expect(out[2].$2, 0x66);
+    },
+  );
 
   test('two writes of one word on one edge make it X', () async {
     final out = await _dual([
@@ -282,14 +285,11 @@ void main() {
   ]) {
     test('WRITEMODE $mode on one port is unchanged by a read of another '
         'word on the other port', () async {
-      final out = await _dual(
-        [
-          (true, 2, 0x11, false, 0, 0),
-          (false, 2, 0, false, 0, 0),
-          (true, 2, 0x22, false, 3, 0),
-        ],
-        writeModeA: mode,
-      );
+      final out = await _dual([
+        (true, 2, 0x11, false, 0, 0),
+        (false, 2, 0, false, 0, 0),
+        (true, 2, 0x22, false, 3, 0),
+      ], writeModeA: mode);
       expect(out[2].$1, want);
       expect(out[2].$2, 0);
     });

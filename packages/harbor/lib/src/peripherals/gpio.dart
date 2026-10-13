@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -55,9 +56,21 @@ class HarborGpio extends BridgeModule
     this.pinCount = 32,
     this.busAddressWidth = 12,
     this.busDataWidth = 32,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborGpio', name: name ?? 'gpio') {
+  }) : super(
+         harborStableDefinitionName('HarborGpio', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth,
+             dataWidth: busDataWidth,
+             cross: crossFabricClock,
+           ),
+           'p$pinCount',
+         ]),
+         name: name ?? 'gpio',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -73,15 +86,19 @@ class HarborGpio extends BridgeModule
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
 
     final outputReg = Logic(name: 'output_reg', width: pinCount);
     final dirReg = Logic(name: 'dir_reg', width: pinCount);

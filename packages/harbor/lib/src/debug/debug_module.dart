@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -53,9 +54,24 @@ class HarborDebugModule extends BridgeModule
     this.progBufSize = 8,
     this.abstractDataCount = 2,
     this.hasSystemBusAccess = true,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborDebugModule', name: name ?? 'debug_module') {
+  }) : super(
+         harborStableDefinitionName('HarborDebugModule', [
+           if (hasSystemBusAccess)
+             ...BusSlavePort.definitionNameParts(
+               kind: fabricKind,
+               addressWidth: 32,
+               dataWidth: 32,
+               cross: crossFabricClock,
+             ),
+           'h$numHarts',
+           'pb$progBufSize',
+           'ad$abstractDataCount',
+         ]),
+         name: name ?? 'debug_module',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -97,18 +113,22 @@ class HarborDebugModule extends BridgeModule
       sysBus = BusSlavePort.create(
         module: this,
         name: 'sysbus',
-        protocol: protocol,
+        kind: fabricKind,
         clk: input('clk'),
         reset: input('reset'),
         addressWidth: 32,
         dataWidth: 32,
+        fabricClock: BusSlavePort.fabricClockInputs(
+          this,
+          cross: crossFabricClock,
+        ),
       );
     } else {
       sysBus = null;
     }
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = sysBus?.reset ?? input('reset');
 
     // DM registers
     final dmcontrol = Logic(name: 'dmcontrol', width: 32);

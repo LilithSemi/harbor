@@ -128,9 +128,13 @@ class Gf180mcuProvider extends PdkProvider {
         'addr': 'A',
         'dataIn': 'D',
         'dataOut': 'Q',
-        'writeEnable': 'WEN',
+        'writeEnable': 'GWEN',
         'chipSelect': 'CEN',
+        'writeMask': 'WEN',
       },
+      // CEN, GWEN and the per bit WEN are all active low.
+      activeLow: const {'writeEnable', 'chipSelect', 'writeMask'},
+      params: const {'writeMaskBits': 1},
       properties: {
         'name': macroName,
         'words': '$words',

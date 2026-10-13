@@ -141,6 +141,8 @@ class SdramWbStack {
     sdram.input('bus_ADR').srcConnection! <= adr;
     sdram.input('bus_DAT_MOSI').srcConnection! <= datW;
     sdram.input('bus_SEL').srcConnection! <= sel;
+    sdram.input('bus_CTI').srcConnection! <= Const(0, width: 3);
+    sdram.input('bus_BTE').srcConnection! <= Const(0, width: 2);
 
     await sdram.build();
 

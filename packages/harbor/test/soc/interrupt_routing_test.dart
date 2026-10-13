@@ -132,11 +132,7 @@ void main() {
 
   group('HarborInterruptRouting SoC wiring', () {
     HarborSoC buildSoC() {
-      final soc = HarborSoC(
-        name: 'irq_soc',
-        compatible: 'lilith,irq-soc',
-        busConfig: WishboneConfig(addressWidth: 64, dataWidth: 64, selWidth: 8),
-      );
+      final soc = HarborSoC(name: 'irq_soc', compatible: 'lilith,irq-soc');
       soc.addPeripheral(
         HarborUart(
           baseAddress: 0x10000000,
@@ -205,7 +201,6 @@ void main() {
       final soc = HarborSoC(
         name: 'small_irq_soc',
         compatible: 'lilith,small-irq-soc',
-        busConfig: WishboneConfig(addressWidth: 64, dataWidth: 64, selWidth: 8),
       );
       soc.addPeripheral(
         HarborUart(
@@ -245,7 +240,6 @@ void main() {
       final soc = HarborSoC(
         name: 'dt_soc',
         compatible: 'lilith,dt-soc',
-        busConfig: WishboneConfig(addressWidth: 64, dataWidth: 64, selWidth: 8),
         interruptContexts: contexts,
         cpus: [
           for (var h = 0; h < harts; h++) HarborCpu(hartId: h, isa: 'rv64imac'),

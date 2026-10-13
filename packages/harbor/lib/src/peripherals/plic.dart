@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
@@ -41,24 +42,42 @@ class HarborPlic extends BridgeModule
     this.priorityBits = 3,
     int? busAddressWidth,
     this.busDataWidth,
-    BusProtocol protocol = BusProtocol.wishbone,
+    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
+    bool crossFabricClock = false,
     String? name,
-  }) : super('HarborPlic', name: name ?? 'plic') {
+  }) : super(
+         harborStableDefinitionName('HarborPlic', [
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: busAddressWidth ?? 26,
+             dataWidth: busDataWidth ?? 32,
+             cross: crossFabricClock,
+           ),
+           's$sources',
+           'c$contexts',
+           'p$priorityBits',
+         ]),
+         name: name ?? 'plic',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
-      protocol: protocol,
+      kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth ?? 26,
       dataWidth: busDataWidth ?? 32,
+      fabricClock: BusSlavePort.fabricClockInputs(
+        this,
+        cross: crossFabricClock,
+      ),
     );
 
     final clk = input('clk');
-    final reset = input('reset');
+    final reset = bus.reset;
     final addr = bus.addr.getRange(0, 26);
     final ack = bus.ack;
     final stb = bus.stb;
@@ -153,20 +172,19 @@ class HarborPlic extends BridgeModule
             then: [
               ack < Const(1),
 
+              // A byte store keeps the bytes SEL does not select, so a
+              // partial store to this slot cannot pull in unselected (stale
+              // MOSI) bits from the rest of the word.
               for (var src = 0; src < sources; src++)
                 If(
                   addrHit(src * 4),
                   then: [
                     If(
-                      we & laneSel(src * 4),
+                      we,
                       then: [
-                        priority[src] <
-                            wrData(src * 4).getRange(0, priorityBits),
+                        priority[src] < bus.selMerge(priority[src], src * 4),
                       ],
-                    ),
-                    If(
-                      ~we,
-                      then: [
+                      orElse: [
                         datOut[laneOf(src * 4)] < priority[src].zeroExtend(32),
                       ],
                     ),
@@ -193,10 +211,19 @@ class HarborPlic extends BridgeModule
                   addrHit(0x2000 + ctx * 0x80),
                   then: [
                     If(
-                      we & laneSel(0x2000 + ctx * 0x80),
+                      we,
                       then: [
+                        // A bit whose byte SEL does not select keeps its
+                        // old value: a byte store only reaches the sources
+                        // in the bytes it selects.
                         for (var src = 0; src < sources && src < 32; src++)
-                          enable[ctx][src] < wrData(0x2000 + ctx * 0x80)[src],
+                          If(
+                            bus.sel[laneOf(0x2000 + ctx * 0x80) * 4 + src ~/ 8],
+                            then: [
+                              enable[ctx][src] <
+                                  wrData(0x2000 + ctx * 0x80)[src],
+                            ],
+                          ),
                       ],
                     ),
                     If(
@@ -221,17 +248,15 @@ class HarborPlic extends BridgeModule
                   addrHit(0x200000 + ctx * 0x1000),
                   then: [
                     If(
-                      we & laneSel(0x200000 + ctx * 0x1000),
+                      we,
                       then: [
                         threshold[ctx] <
-                            wrData(
+                            bus.selMerge(
+                              threshold[ctx],
                               0x200000 + ctx * 0x1000,
-                            ).getRange(0, priorityBits),
+                            ),
                       ],
-                    ),
-                    If(
-                      ~we,
-                      then: [
+                      orElse: [
                         datOut[laneOf(0x200000 + ctx * 0x1000)] <
                             threshold[ctx].zeroExtend(32),
                       ],
@@ -243,34 +268,49 @@ class HarborPlic extends BridgeModule
                 // A claim READ has a side effect: it masks the source. So the
                 // read arm is gated by SEL too, or a master that reads only the
                 // threshold half of the same bus word would eat an interrupt.
+                // A claim WRITE (complete) is gated by SEL over only the bytes
+                // the source id occupies, so a store that misses those bytes
+                // cannot complete a source from stale, unselected MOSI bits.
                 If(
-                  addrHit(0x200004 + ctx * 0x1000) &
-                      laneSel(0x200004 + ctx * 0x1000),
+                  addrHit(0x200004 + ctx * 0x1000),
                   then: [
                     If(
                       we,
                       then: [
-                        for (var src = 0; src < sources; src++)
-                          If(
-                            wrData(0x200004 + ctx * 0x1000)
-                                .getRange(0, sources.bitLength)
-                                .eq(Const(src, width: sources.bitLength)),
-                            then: [
-                              claimed[src] < Const(0),
-                              pending[src] < Const(0),
-                            ],
+                        If(
+                          bus.selAny(
+                            0x200004 + ctx * 0x1000,
+                            (sources.bitLength + 7) ~/ 8,
                           ),
+                          then: [
+                            for (var src = 0; src < sources; src++)
+                              If(
+                                wrData(0x200004 + ctx * 0x1000)
+                                    .getRange(0, sources.bitLength)
+                                    .eq(Const(src, width: sources.bitLength)),
+                                then: [
+                                  claimed[src] < Const(0),
+                                  pending[src] < Const(0),
+                                ],
+                              ),
+                          ],
+                        ),
                       ],
                       orElse: [
-                        for (var src = 0; src < sources; src++)
-                          If(
-                            pending[src] & enable[ctx][src] & ~claimed[src],
-                            then: [
-                              datOut[laneOf(0x200004 + ctx * 0x1000)] <
-                                  Const(src, width: 32),
-                              claimed[src] < Const(1),
-                            ],
-                          ),
+                        If(
+                          laneSel(0x200004 + ctx * 0x1000),
+                          then: [
+                            for (var src = 0; src < sources; src++)
+                              If(
+                                pending[src] & enable[ctx][src] & ~claimed[src],
+                                then: [
+                                  datOut[laneOf(0x200004 + ctx * 0x1000)] <
+                                      Const(src, width: 32),
+                                  claimed[src] < Const(1),
+                                ],
+                              ),
+                          ],
+                        ),
                       ],
                     ),
                   ],
