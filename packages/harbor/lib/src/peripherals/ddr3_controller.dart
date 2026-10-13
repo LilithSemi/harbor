@@ -231,6 +231,9 @@ class Ddr3Controller extends Module {
     _calibAddr = Logic(name: 'calib_addr_o', width: params.wbAddrBits);
     _calibData = Logic(name: 'calib_data_o', width: params.wbDataBits);
     _oWbStallCalib = Logic(name: 'o_wb_stall_calib_o');
+    _oWbStall = Logic(name: 'o_wb_stall_o');
+    _stage1Pending = Logic(name: 'stage1_pending_o');
+    _stage2Pending = Logic(name: 'stage2_pending_o');
     _stateCalibrate = Logic(name: 'state_calibrate_o', width: 6);
     _writeDqsSched = Logic(name: 'write_dqs_sched_o');
     _oWbAckRead = Logic(name: 'o_wb_ack_read_o', width: auxWidth + 1);
@@ -1024,6 +1027,9 @@ class Ddr3Controller extends Module {
     output('o_aux') <= ackReadQ[0].getRange(1, auxWidth + 1);
     output('o_wb_data') <= mux(indexWbData, oWbDataQ[1], oWbDataQ[0]);
     _oWbStallCalib <= oWbStallCalib;
+    _oWbStall <= oWbStall;
+    _stage1Pending <= s1Pending;
+    _stage2Pending <= s2Pending;
     _writeDqsSched <= writeDqsSched;
     _oWbAckRead <= ackReadQ[0];
     _oWbData <= mux(indexWbData, oWbDataQ[1], oWbDataQ[0]);
@@ -1140,6 +1146,9 @@ class Ddr3Controller extends Module {
   late final Logic _calibAddr; // [wbAddrBits]
   late final Logic _calibData; // [wbDataBits]
   late final Logic _oWbStallCalib; // scheduler stall seen by the cal FSM
+  late final Logic _oWbStall; // bus stall
+  late final Logic _stage1Pending;
+  late final Logic _stage2Pending;
   late final Logic _stateCalibrate; // calibration FSM state (6-bit)
   late final Logic _writeDqsSched; // scheduler stage2-write DQS strobe request
   late final Logic _oWbAckRead; // ackReadQ[0] (read-ack head, [auxWidth:0])
@@ -2011,6 +2020,26 @@ class Ddr3Controller extends Module {
             ],
             // ISSUE_WRITE_1..DONE: remaining BIST sweep states stubbed (hold).
           ], conditionalType: ConditionalType.unique),
+          // Before the precharge-all of a refresh, hold the ROM until every
+          // accepted request has left the pipeline (ddr3_controller.v:3396).
+          If(
+            _instructionAddress.eq(19),
+            then: [
+              pauseCounterReg < Const(1),
+              If(
+                ~_stage1Pending &
+                    ~_stage2Pending &
+                    mux(
+                      selfTrain
+                          ? state.eq(_stDoneCalibrate) | state.eq(_stCalFailed)
+                          : done,
+                      _oWbStall,
+                      _oWbStallCalib,
+                    ),
+                then: [pauseCounterReg < Const(0)],
+              ),
+            ],
+          ),
         ],
       ),
     ]);
