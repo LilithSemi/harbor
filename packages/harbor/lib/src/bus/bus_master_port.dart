@@ -2,6 +2,7 @@ import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../clock/wishbone_cdc_fifo.dart';
+import 'axi4/axi4_interface.dart';
 import 'axi4/axi4_lite_interface.dart';
 import 'port/fabric_kind.dart';
 import 'port/port_cdc.dart';
@@ -17,6 +18,16 @@ import 'wishbone/wishbone_interface.dart';
 /// that cycle. If [stb] stays high after [ack], that is the next access.
 /// [addr] is a byte address aligned to the data word, and [sel] marks the
 /// bytes a write changes.
+///
+/// Writes are not posted. The [ack] of a write comes only after the slave
+/// takes the write: ACK on Wishbone, B on AXI4 and D on TileLink. So
+/// `ack & we` is a write commit pulse.
+///
+/// A port created with `exclusive: true` on AXI4 can do exclusive accesses.
+/// The device holds [lock] high with [stb] for an exclusive access, and
+/// [exokay] is valid with [ack]. After an exclusive read, [exokay] high means
+/// the reservation is set. After an exclusive write, [exokay] high means the
+/// write went through, and low means it failed and changed nothing.
 class BusMasterPort {
   /// Byte address of the access, driven by the device.
   final Logic addr;
@@ -43,6 +54,17 @@ class BusMasterPort {
   /// created without `useErr`.
   final Logic err;
 
+  /// Driven by the device with [stb]. High for an exclusive access. Only a
+  /// port created with `exclusive: true` uses it.
+  final Logic lock;
+
+  /// High with [ack] when the slave gave EXOKAY. Always low on a port
+  /// created without `exclusive: true`.
+  final Logic exokay;
+
+  /// True when the port can do exclusive accesses.
+  final bool exclusive;
+
   /// The fabric kind of the native port.
   final HarborFabricKind kind;
 
@@ -61,6 +83,9 @@ class BusMasterPort {
     required this.sel,
     required this.ack,
     required this.err,
+    required this.lock,
+    required this.exokay,
+    required this.exclusive,
     required this.kind,
     required this.interfaceRef,
     this.cdcDepth = 0,
@@ -71,6 +96,12 @@ class BusMasterPort {
   ///
   /// Wishbone gives a classic master, AXI4 an AXI4-Lite manager and TileLink
   /// a TL-UL master. [useErr] adds ERR to a Wishbone port.
+  ///
+  /// With [exclusive], AXI4 gives a full AXI4 manager instead, with ID 0,
+  /// LEN 0, INCR bursts and SIZE equal to the data width, so the device can
+  /// do exclusive accesses with [lock]. Add it to a SoC with `exclusiveIds`.
+  /// A Wishbone or TileLink port, or a port with a clock crossing, cannot
+  /// have it.
   ///
   /// [clk] and [reset] are the device clock. When [fabricClock] is a
   /// different clock, the native port runs on it and a
@@ -87,9 +118,20 @@ class BusMasterPort {
     required Logic clk,
     required Logic reset,
     bool useErr = false,
+    bool exclusive = false,
     HarborFabricClock? fabricClock,
   }) {
     final crossed = fabricClock != null && fabricClock.crossesFrom(clk);
+    if (exclusive && kind != HarborFabricKind.axi4) {
+      throw ArgumentError('$name: a ${kind.name} port has no exclusive access');
+    }
+    if (exclusive && crossed) {
+      throw ArgumentError(
+        '$name: an exclusive port cannot cross clocks, so give it the fabric '
+        'clock',
+      );
+    }
+    final fullAxi4 = exclusive && kind == HarborFabricKind.axi4;
     BusMasterPort waist(String tag, InterfaceReference<PairInterface> ref) =>
         BusMasterPort._(
           addr: Logic(name: '$name${tag}_adr_in', width: addressWidth),
@@ -100,6 +142,9 @@ class BusMasterPort {
           sel: Logic(name: '$name${tag}_sel_in', width: dataWidth ~/ 8),
           ack: Logic(name: '$name${tag}_ack_out'),
           err: Logic(name: '$name${tag}_err_out'),
+          lock: Logic(name: '$name${tag}_lock_in'),
+          exokay: Logic(name: '$name${tag}_exokay_out'),
+          exclusive: fullAxi4,
           kind: kind,
           interfaceRef: ref,
           cdcDepth: crossed ? 2 : 0,
@@ -112,6 +157,15 @@ class BusMasterPort {
             dataWidth: dataWidth,
             useErr: useErr,
           ),
+        ),
+        name: name,
+        role: PairRole.provider,
+      ),
+      HarborFabricKind.axi4 when fullAxi4 => module.addInterface(
+        Axi4Interface(
+          addressWidth: addressWidth,
+          dataWidth: dataWidth,
+          idWidth: 1,
         ),
         name: name,
         role: PairRole.provider,
@@ -136,12 +190,16 @@ class BusMasterPort {
     switch (port.interfaceRef.internalInterface) {
       case final WishboneInterface wb:
         native._wishbone(wb);
+      case final Axi4Interface axi:
+        native._axi4(axi, name, nClk, nReset);
       case final Axi4LiteInterface axi:
         native._axi4Lite(axi, name, nClk, nReset);
       case final TileLinkInterface tl:
         native._tileLink(tl, name, nClk, nReset);
     }
+    if (!fullAxi4) native.exokay <= Const(0);
     if (crossed) {
+      port.exokay <= Const(0);
       _cross(module, name, port, native, clk, reset, fabricClock);
     }
     return port;
@@ -275,6 +333,68 @@ class BusMasterPort {
         // An access ends normally, or the device drops stb before the
         // response arrives. Either way the done flags clear, so a dropped
         // access never leaves a stale done flag blocking the next one.
+        Iff(done, [awDone < Const(0), wDone < Const(0), arDone < Const(0)]),
+        ElseIf(~stb, [awDone < Const(0), wDone < Const(0), arDone < Const(0)]),
+        Else([
+          If(axi.awValid & axi.awReady, then: [awDone < Const(1)]),
+          If(axi.wValid & axi.wReady, then: [wDone < Const(1)]),
+          If(axi.arValid & axi.arReady, then: [arDone < Const(1)]),
+        ]),
+      ]),
+    ]);
+  }
+
+  // A full AXI4 manager with one access in flight, the same handshake as
+  // [_axi4Lite]. Each access is one beat of the full data width on ID 0.
+  void _axi4(Axi4Interface axi, String name, Logic clk, Logic reset) {
+    final awDone = Logic(name: '${name}_aw_done');
+    final wDone = Logic(name: '${name}_w_done');
+    final arDone = Logic(name: '${name}_ar_done');
+    final write = stb & we;
+    final read = stb & ~we;
+    final size = Const(
+      (dataOut.width ~/ 8).bitLength - 1,
+      width: Axi4Interface.sizeWidth,
+    );
+    final incr = Const(1, width: Axi4Interface.burstWidth);
+
+    axi.awValid <= write & ~awDone;
+    axi.awId <= Const(0, width: axi.idWidth);
+    axi.awAddr <= addr;
+    axi.awLen <= Const(0, width: Axi4Interface.lenWidth);
+    axi.awSize <= size;
+    axi.awBurst <= incr;
+    axi.awLock <= lock;
+    axi.awCache <= Const(0, width: Axi4Interface.cacheWidth);
+    axi.awProt <= Const(0, width: Axi4Interface.protWidth);
+    axi.awQos <= Const(0, width: Axi4Interface.qosWidth);
+    axi.wValid <= write & ~wDone;
+    axi.wData <= dataOut;
+    axi.wStrb <= sel;
+    axi.wLast <= Const(1);
+    axi.bReady <= Const(1);
+    axi.arValid <= read & ~arDone;
+    axi.arId <= Const(0, width: axi.idWidth);
+    axi.arAddr <= addr;
+    axi.arLen <= Const(0, width: Axi4Interface.lenWidth);
+    axi.arSize <= size;
+    axi.arBurst <= incr;
+    axi.arLock <= lock;
+    axi.arCache <= Const(0, width: Axi4Interface.cacheWidth);
+    axi.arProt <= Const(0, width: Axi4Interface.protWidth);
+    axi.arQos <= Const(0, width: Axi4Interface.qosWidth);
+    axi.rReady <= Const(1);
+
+    final done =
+        (write & awDone & wDone & axi.bValid) | (read & arDone & axi.rValid);
+    final resp = mux(we, axi.bResp, axi.rResp);
+    ack <= done;
+    err <= done & resp[1];
+    exokay <= done & resp.eq(Const(1, width: resp.width));
+    dataIn <= axi.rData;
+
+    Sequential(clk, reset: reset, [
+      If.block([
         Iff(done, [awDone < Const(0), wDone < Const(0), arDone < Const(0)]),
         ElseIf(~stb, [awDone < Const(0), wDone < Const(0), arDone < Const(0)]),
         Else([

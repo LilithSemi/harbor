@@ -4,6 +4,8 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
+import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -105,7 +107,8 @@ class HarborEthernetConfig with HarborPrettyString {
 /// - 0x008: MAC_STATUS  (link, speed_actual, rx_ready, tx_ready)
 /// - 0x010: MAC_ADDR_LO (MAC address bytes 0-3)
 /// - 0x018: MAC_ADDR_HI (MAC address bytes 4-5)
-/// - 0x020: INT_STATUS  (W1C)
+/// - 0x020: INT_STATUS  (W1C, bit 4 DMA_ERR: the descriptor DMA saw an error
+///   response from the fabric on its last word access)
 /// - 0x028: INT_ENABLE
 /// - 0x040: TX_CTRL     (enable, descriptor ring base)
 /// - 0x048: TX_STATUS   (busy, descriptors used)
@@ -126,6 +129,11 @@ class HarborEthernetMac extends BridgeModule
   /// Base address in the SoC memory map.
   final int baseAddress;
 
+  /// Register slave address width. Defaults to 12 (the 0x1000 window).
+  /// Decode still uses only the low 12 bits, so a wider SoC fabric just
+  /// carries extra zero high bits through the port.
+  final int busAddressWidth;
+
   /// Bus slave port (register access).
   late final BusSlavePort bus;
 
@@ -135,6 +143,7 @@ class HarborEthernetMac extends BridgeModule
   HarborEthernetMac({
     required this.config,
     required this.baseAddress,
+    this.busAddressWidth = 12,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     bool crossFabricClock = false,
     String? name,
@@ -142,7 +151,7 @@ class HarborEthernetMac extends BridgeModule
          harborStableDefinitionName('HarborEthernetMac', [
            ...BusSlavePort.definitionNameParts(
              kind: fabricKind,
-             addressWidth: 12,
+             addressWidth: busAddressWidth,
              dataWidth: 32,
              cross: crossFabricClock,
            ),
@@ -175,13 +184,10 @@ class HarborEthernetMac extends BridgeModule
       width: config.maxSpeed == HarborEthernetSpeed.speed1000 ? 8 : 4,
     );
 
-    // DMA master interface for descriptor/data access
-    addOutput('dma_addr', width: 32);
-    addOutput('dma_wdata', width: 32);
-    createPort('dma_rdata', PortDirection.input, width: 32);
-    addOutput('dma_we');
-    addOutput('dma_stb');
-    createPort('dma_ack', PortDirection.input);
+    final fabricClock = BusSlavePort.fabricClockInputs(
+      this,
+      cross: crossFabricClock,
+    );
 
     bus = BusSlavePort.create(
       module: this,
@@ -189,13 +195,26 @@ class HarborEthernetMac extends BridgeModule
       kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
-      addressWidth: 12,
+      addressWidth: busAddressWidth,
       dataWidth: 32,
-      fabricClock: BusSlavePort.fabricClockInputs(
-        this,
-        cross: crossFabricClock,
-      ),
+      fabricClock: fabricClock,
     );
+
+    // Descriptor/data DMA master: one word (4 bytes) per fabric access.
+    final dma = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'dma',
+      kind: fabricKind,
+      config: const HarborMemoryWaistConfig(
+        addressWidth: 32,
+        dataWidth: 32,
+        idWidth: 1,
+        outstanding: 1,
+      ),
+      clk: input('clk'),
+      reset: input('reset'),
+      fabricClock: fabricClock,
+    ).waist;
 
     final clk = input('clk');
     final reset = bus.reset;
@@ -313,7 +332,14 @@ class HarborEthernetMac extends BridgeModule
     );
     // CRC32 including the byte being completed, and the resulting FCS.
     final crcWithLast = _crc32Byte(crc32, curByte);
-    final fcsVal = crcWithLast ^ Const(0xFFFFFFFF, width: 32);
+    // Set by a read error while the frame is on the wire. The FCS of that
+    // frame then goes out inverted, so the receiver drops the frame.
+    final txFeedErr = Logic(name: 'tx_feed_err');
+    final fcsVal = mux(
+      txFeedErr,
+      crcWithLast,
+      crcWithLast ^ Const(0xFFFFFFFF, width: 32),
+    );
 
     // RX framing engine. Hunts the SFD, deserializes rxd LSB-first, runs every
     // byte (payload + FCS) through CRC32 and checks the standard residue. The
@@ -362,20 +388,112 @@ class HarborEthernetMac extends BridgeModule
     const dRxD0 = 6; // read RX descriptor word 0 (buffer address)
     const dRxDrain = 7; // store received words to the buffer
     const dRxWb = 8; // write the RX descriptor length back
+    // Per-word fabric sub-phase, driving the memory master waist for one
+    // access at a time. REQ and the one WDATA beat of a write go out
+    // together, then the response ends the access.
+    const dmaSIdle = 0;
+    const dmaSReq = 1;
+    const dmaSResp = 2;
+    const intDmaErr = 0x10;
     final dmaState = Logic(name: 'eth_dma_state', width: 4);
     final descPtr = Logic(name: 'eth_desc_ptr', width: 32);
     final dmaCurAddr = Logic(name: 'eth_dma_cur', width: 32);
     final dmaAddrReg = Logic(name: 'eth_dma_addr_reg', width: 32);
     final dmaWdataReg = Logic(name: 'eth_dma_wdata_reg', width: 32);
     final dmaWeReg = Logic(name: 'eth_dma_we_reg');
-    final dmaStbReg = Logic(name: 'eth_dma_stb_reg');
+    final dmaStbReg = Logic(name: 'eth_dma_stb_reg'); // access wanted
+    // Set by an RX access error. The rest of the frame is dropped.
+    final dmaFault = Logic(name: 'eth_dma_fault');
+    final dmaSub = Logic(name: 'eth_dma_sub', width: 2);
     final txDmaPend = Logic(name: 'eth_tx_dma_pend');
     final rxDmaPend = Logic(name: 'eth_rx_dma_pend');
     final rxDmaEn = Logic(name: 'eth_rx_dma_en');
     final rxWord = Logic(name: 'eth_rx_word', width: 32);
     final rxValid = Logic(name: 'eth_rx_valid');
-    final dmaAck = input('dma_ack');
-    final dmaRdata = input('dma_rdata');
+
+    // High once the WDATA beat of the access is taken.
+    final dmaWSent = Logic(name: 'eth_dma_w_sent');
+    final dmaGo = (dmaStbReg & dmaSub.eq(Const(dmaSIdle, width: 2))).named(
+      'eth_dma_go',
+    );
+    final dmaReqValid = (dmaGo | dmaSub.eq(Const(dmaSReq, width: 2))).named(
+      'eth_dma_req_valid',
+    );
+    final dmaRespWait = dmaSub
+        .eq(Const(dmaSResp, width: 2))
+        .named('eth_dma_resp_wait');
+    final dmaWdataValid = (dmaWeReg & (dmaReqValid | dmaRespWait) & ~dmaWSent)
+        .named('eth_dma_wdata_valid');
+    final dmaReqFire = (dmaReqValid & dma.reqReady).named('eth_dma_req_fire');
+    final dmaWdataFire = (dmaWdataValid & dma.wdataReady).named(
+      'eth_dma_wdata_fire',
+    );
+    final dmaRdataFire = (dmaRespWait & ~dmaWeReg & dma.rdataValid).named(
+      'eth_dma_rdata_fire',
+    );
+    final dmaWrespFire = (dmaRespWait & dmaWeReg & dma.wrespValid).named(
+      'eth_dma_wresp_fire',
+    );
+    final dmaAck = (dmaRdataFire | dmaWrespFire).named('eth_dma_ack');
+    final dmaRdata = dma.rdataData;
+    final dmaErrNow = mux(
+      dmaWeReg,
+      dma.wrespErr,
+      dma.rdataErr,
+    ).named('eth_dma_err_now');
+    dma.reqValid <= dmaReqValid;
+    dma.reqId <= Const(0, width: dma.config.idWidth);
+    dma.reqWrite <= dmaWeReg;
+    dma.reqAddr <= dmaAddrReg;
+    dma.reqLen <= Const(0, width: HarborMemoryWaistConfig.lenWidth);
+    dma.reqSize <= Const(2, width: HarborMemoryWaistConfig.sizeWidth);
+    dma.reqBurst <=
+        Const(
+          HarborMemoryBurst.incr.value,
+          width: HarborMemoryWaistConfig.burstWidth,
+        );
+    dma.wdataValid <= dmaWdataValid;
+    dma.wdataData <= dmaWdataReg;
+    dma.wdataStrb <= Const(0xF, width: dma.config.strbWidth);
+    dma.wdataLast <= Const(1);
+    dma.rdataReady <= dmaRespWait & ~dmaWeReg;
+    dma.wrespReady <= dmaRespWait & dmaWeReg;
+
+    // One access at a time: wait for a write's WRESP before the sub-phase
+    // returns to idle, so a later read always sees it.
+    Sequential(clk, [
+      If(
+        reset,
+        then: [dmaSub < Const(dmaSIdle, width: 2), dmaWSent < Const(0)],
+        orElse: [
+          If(dmaWdataFire, then: [dmaWSent < Const(1)]),
+          Case(dmaSub, [
+            CaseItem(Const(dmaSIdle, width: 2), [
+              If(
+                dmaGo,
+                then: [
+                  dmaSub <
+                      mux(
+                        dmaReqFire,
+                        Const(dmaSResp, width: 2),
+                        Const(dmaSReq, width: 2),
+                      ),
+                ],
+              ),
+            ]),
+            CaseItem(Const(dmaSReq, width: 2), [
+              If(dmaReqFire, then: [dmaSub < Const(dmaSResp, width: 2)]),
+            ]),
+            CaseItem(Const(dmaSResp, width: 2), [
+              If(
+                dmaAck,
+                then: [dmaSub < Const(dmaSIdle, width: 2), dmaWSent < Const(0)],
+              ),
+            ]),
+          ]),
+        ],
+      ),
+    ]);
 
     interrupt <= (intStatus & intEnable).or();
 
@@ -385,10 +503,6 @@ class HarborEthernetMac extends BridgeModule
     output('mdc') <= mdcReg;
     output('mdio_out') <= mdioOutReg;
     output('mdio_oe') <= mdioOeReg;
-    output('dma_addr') <= dmaAddrReg;
-    output('dma_wdata') <= dmaWdataReg;
-    output('dma_we') <= dmaWeReg;
-    output('dma_stb') <= dmaStbReg;
 
     Sequential(clk, [
       If(
@@ -425,6 +539,7 @@ class HarborEthernetMac extends BridgeModule
           fcsCnt < Const(0, width: 3),
           crc32 < Const(0, width: 32),
           fcsShift < Const(0, width: 32),
+          txFeedErr < Const(0),
           txWord < Const(0, width: 32),
           txWordValid < Const(0),
           txByteInWord < Const(0, width: 2),
@@ -450,6 +565,7 @@ class HarborEthernetMac extends BridgeModule
           dmaWdataReg < Const(0, width: 32),
           dmaWeReg < Const(0),
           dmaStbReg < Const(0),
+          dmaFault < Const(0),
           txDmaPend < Const(0),
           rxDmaPend < Const(0),
           rxDmaEn < Const(0),
@@ -698,6 +814,13 @@ class HarborEthernetMac extends BridgeModule
           ]),
 
           // Descriptor DMA engine: shared master port, TX or RX at a time.
+          // An error response sets the sticky INT_STATUS bit. A TX
+          // descriptor or first word error skips to the write-back. An RX
+          // error drops the rest of the frame, then writes the length back.
+          If(
+            dmaAck & dmaErrNow,
+            then: [intStatus < (intStatus | Const(intDmaErr, width: 8))],
+          ),
           Case(dmaState, [
             CaseItem(Const(dIdle, width: 4), [
               If(
@@ -712,6 +835,7 @@ class HarborEthernetMac extends BridgeModule
                     rxDmaPend,
                     then: [
                       rxDmaPend < Const(0),
+                      dmaFault < Const(0),
                       descPtr < rxDescBase,
                       dmaState < Const(dRxD0, width: 4),
                     ],
@@ -730,7 +854,12 @@ class HarborEthernetMac extends BridgeModule
                 then: [
                   dmaCurAddr < dmaRdata,
                   dmaStbReg < Const(0),
-                  dmaState < Const(dTxD1, width: 4),
+                  dmaState <
+                      mux(
+                        dmaErrNow,
+                        Const(dTxWb, width: 4),
+                        Const(dTxD1, width: 4),
+                      ),
                 ],
               ),
             ]),
@@ -743,16 +872,26 @@ class HarborEthernetMac extends BridgeModule
                 then: [
                   txLenReg < dmaRdata.getRange(0, 16),
                   dmaStbReg < Const(0),
-                  dmaState < Const(dTxLoad, width: 4),
+                  dmaState <
+                      mux(
+                        dmaErrNow,
+                        Const(dTxWb, width: 4),
+                        Const(dTxLoad, width: 4),
+                      ),
                 ],
               ),
             ]),
             CaseItem(Const(dTxLoad, width: 4), [
+              txFeedErr < Const(0),
               dmaAddrReg < dmaCurAddr,
               dmaWeReg < Const(0),
               dmaStbReg < Const(1),
               If(
-                dmaAck,
+                dmaAck & dmaErrNow,
+                then: [dmaStbReg < Const(0), dmaState < Const(dTxWb, width: 4)],
+              ),
+              If(
+                dmaAck & ~dmaErrNow,
                 then: [
                   txWord < dmaRdata,
                   txWordValid < Const(1),
@@ -772,30 +911,29 @@ class HarborEthernetMac extends BridgeModule
                 ],
               ),
             ]),
+            // A read that is in flight when the frame ends still finishes
+            // here, before the write-back starts.
             CaseItem(Const(dTxFeed, width: 4), [
-              If(
-                ~txBusy,
-                then: [dmaState < Const(dTxWb, width: 4)],
-                orElse: [
+              If.block([
+                Iff(dmaStbReg, [
                   If(
-                    ~txWordValid,
+                    dmaAck,
                     then: [
-                      dmaAddrReg < dmaCurAddr,
-                      dmaWeReg < Const(0),
-                      dmaStbReg < Const(1),
-                      If(
-                        dmaAck,
-                        then: [
-                          txWord < dmaRdata,
-                          txWordValid < Const(1),
-                          dmaCurAddr < (dmaCurAddr + Const(4, width: 32)),
-                          dmaStbReg < Const(0),
-                        ],
-                      ),
+                      txWord < dmaRdata,
+                      txWordValid < Const(1),
+                      dmaCurAddr < (dmaCurAddr + Const(4, width: 32)),
+                      dmaStbReg < Const(0),
+                      If(dmaErrNow, then: [txFeedErr < Const(1)]),
                     ],
                   ),
-                ],
-              ),
+                ]),
+                ElseIf(~txBusy, [dmaState < Const(dTxWb, width: 4)]),
+                ElseIf(~txWordValid, [
+                  dmaAddrReg < dmaCurAddr,
+                  dmaWeReg < Const(0),
+                  dmaStbReg < Const(1),
+                ]),
+              ]),
             ]),
             CaseItem(Const(dTxWb, width: 4), [
               dmaAddrReg < (descPtr + Const(4, width: 32)),
@@ -807,7 +945,14 @@ class HarborEthernetMac extends BridgeModule
                 then: [
                   dmaStbReg < Const(0),
                   dmaWeReg < Const(0),
-                  intStatus < (intStatus | Const(intTxDone, width: 8)),
+                  intStatus <
+                      (intStatus |
+                          Const(intTxDone, width: 8) |
+                          mux(
+                            dmaErrNow,
+                            Const(intDmaErr, width: 8),
+                            Const(0, width: 8),
+                          )),
                   dmaState < Const(dIdle, width: 4),
                 ],
               ),
@@ -822,15 +967,20 @@ class HarborEthernetMac extends BridgeModule
                 dmaAck,
                 then: [
                   dmaCurAddr < dmaRdata,
+                  dmaFault < dmaErrNow,
                   dmaStbReg < Const(0),
                   dmaState < Const(dRxDrain, width: 4),
                 ],
               ),
             ]),
             CaseItem(Const(dRxDrain, width: 4), [
-              If(
-                rxValid,
-                then: [
+              If.block([
+                // After an access error the rest of the frame is dropped.
+                Iff(rxValid & dmaFault, [
+                  rxValid < Const(0),
+                  If(~rxBusy, then: [dmaState < Const(dRxWb, width: 4)]),
+                ]),
+                ElseIf(rxValid, [
                   dmaAddrReg < dmaCurAddr,
                   dmaWdataReg < rxWord,
                   dmaWeReg < Const(1),
@@ -839,16 +989,22 @@ class HarborEthernetMac extends BridgeModule
                     dmaAck,
                     then: [
                       dmaCurAddr < (dmaCurAddr + Const(4, width: 32)),
+                      dmaFault < dmaErrNow,
                       rxValid < Const(0),
                       dmaStbReg < Const(0),
                       dmaWeReg < Const(0),
+                      // The frame can already be fully received by the time
+                      // this word's write is acked, so move on the same
+                      // cycle instead of waiting one more to see rxValid
+                      // drop.
+                      If(~rxBusy, then: [dmaState < Const(dRxWb, width: 4)]),
                     ],
                   ),
-                ],
-                orElse: [
+                ]),
+                Else([
                   If(~rxBusy, then: [dmaState < Const(dRxWb, width: 4)]),
-                ],
-              ),
+                ]),
+              ]),
             ]),
             CaseItem(Const(dRxWb, width: 4), [
               dmaAddrReg < (descPtr + Const(4, width: 32)),
@@ -860,7 +1016,14 @@ class HarborEthernetMac extends BridgeModule
                 then: [
                   dmaStbReg < Const(0),
                   dmaWeReg < Const(0),
-                  intStatus < (intStatus | Const(intRxDone, width: 8)),
+                  intStatus <
+                      (intStatus |
+                          Const(intRxDone, width: 8) |
+                          mux(
+                            dmaErrNow,
+                            Const(intDmaErr, width: 8),
+                            Const(0, width: 8),
+                          )),
                   dmaState < Const(dIdle, width: 4),
                 ],
               ),

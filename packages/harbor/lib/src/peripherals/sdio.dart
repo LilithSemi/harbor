@@ -6,7 +6,9 @@ import '../blackbox/ecp5/ecp5.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
-import '../bus/wishbone/wishbone_interface.dart';
+import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
+import '../bus/port/port_cdc.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -178,7 +180,7 @@ class HarborSdioConfig with HarborPrettyString {
 /// Register map (each register in its own 8-byte slot; the byte-addressed fabric
 /// decodes byte-offset >> 3, so these byte offsets map to indices 0,1,2,...):
 /// - 0x00: CTRL      (enable, bus width, speed mode, reset)
-/// - 0x08: STATUS    (card_detect, card_ready, busy, error)
+/// - 0x08: STATUS    ([0] card detect, [8] busy, [9] data ready)
 /// - 0x10: CLK_DIV   (clock divider)
 /// - 0x18: CMD       (command index + argument trigger)
 /// - 0x20: CMD_ARG   (command argument)
@@ -191,12 +193,41 @@ class HarborSdioConfig with HarborPrettyString {
 /// - 0x58: BLK_COUNT (block count for multi-block transfers)
 /// - 0x60: INT_STATUS (interrupt status, write-1-to-clear)
 /// - 0x68: INT_ENABLE (interrupt enable)
-/// - 0x70: ADMA_ADDR  (descriptor table base for DMA transfers)
+/// - 0x70: ADMA_ADDR  (DMA buffer address, or descriptor table base)
 ///
 /// CMD bits: [5:0] index, [7:6] response type (0 none, 1 short, 2 long R2,
 /// 3 short+busy), [8] data present, [9] direction (0 write, 1 read), [10] use
-/// ADMA DMA. INT_STATUS bits: [0] cmd-done, [1] data-done, [2] data-request,
-/// [3] data-CRC-error, [4] cmd-timeout, [5] write-error.
+/// ADMA DMA, [11] ADMA_ADDR is a descriptor table. INT_STATUS bits (each
+/// write-1-to-clear): [0] cmd-done, [1] data-done, [2] data-request,
+/// [3] data-CRC-error, [4] cmd-timeout, [5] write-error, [6] RX overrun,
+/// [7] ADMA error.
+///
+/// DMA: with CMD[10] set and CMD[11] clear, ADMA_ADDR is the buffer address
+/// and BLK_COUNT * BLK_SIZE is its length. With CMD[11] set, ADMA_ADDR points
+/// to a table of 8-byte descriptors: word 0 is the buffer address, word 1 has
+/// the byte length in [15:0] and the end flag in [31]. Buffer addresses and
+/// lengths are word multiples.
+///
+/// The ADMA is a memory master on the interface `dma`, of the same fabric
+/// kind as `bus`. A card read sends INCR write bursts of up to
+/// [dmaBurstBeats] beats that do not cross a 4 KB boundary. On a 64-bit port
+/// an 8-byte aligned run uses full beats of two words. Data-done comes after
+/// the last write response, so the data is in memory when the driver sees
+/// it. Reads (descriptors and card-write data) go out only when no write is
+/// in flight. Add it to a SoC with
+/// `soc.addMaster(sdio, busInterfaceName: 'dma', memory: true,
+/// outstanding: sdio.dmaOutstanding)`.
+///
+/// A read or write error response sets ADMA error and stops the walker. The
+/// transfer still ends: on a card read the controller drops the rest of the
+/// card data, on a card write it sends zero words to the card until the
+/// block count ends. Each card write block from the error on goes out with
+/// an inverted CRC16, so the card rejects it and does not program it. The
+/// driver must treat the transfer as failed.
+///
+/// STATUS[8] busy is also set while an ADMA access is in flight, for example
+/// after a command timeout. A CMD write while busy is ignored, so the driver
+/// must wait for busy to clear first.
 class HarborSdioController extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -230,22 +261,20 @@ class HarborSdioController extends BridgeModule
   /// ports; genip turns it on to bind one inout pad per line to a board pin.
   final bool ownPads;
 
-  /// Expose the ADMA descriptor engine's memory port as a Wishbone-B4 master
-  /// interface named `dma` (instead of the raw addr/wdata/rdata/we/stb/ack
-  /// ports), so the SoC fabric can attach it with a single `addMaster`. Off by
-  /// default so the ADMA unit tests keep driving the raw handshake.
-  final bool fabricDma;
+  /// The ADMA memory master port, interface `dma`.
+  late final HarborMemoryMasterPort dmaPort;
 
-  /// Address width of the [fabricDma] Wishbone master. The ADMA engine computes
-  /// 32-bit addresses; on a wider fabric they are zero-extended (fine while the
-  /// addressable memory map sits below 4 GiB).
+  /// Address width of the ADMA master. The ADMA engine computes 32-bit
+  /// addresses. On a wider fabric they are zero-extended.
   final int dmaAddressWidth;
 
-  /// Data width of the [fabricDma] Wishbone master (must match the fabric: 32 or
-  /// 64). The ADMA engine moves 32-bit words; on a 64-bit fabric each word is
-  /// placed into the half of the beat its address selects (byte-enables mask the
-  /// other half), and reads extract that same half.
+  /// Data width of the ADMA master, 32 or 64. On a 64-bit port a single word
+  /// goes in the half of the beat its address selects, and reads take that
+  /// same half.
   final int dmaDataWidth;
+
+  /// Requests the ADMA master can have in flight.
+  final int dmaOutstanding;
 
   /// Controller input clock in Hz (the system clock the CLK_DIV register
   /// divides). Emitted as `clock-frequency`, because a driver cannot pick a
@@ -253,12 +282,7 @@ class HarborSdioController extends BridgeModule
   /// 0 leaves the property out.
   int clockFrequency;
 
-  /// Beats the ADMA keeps CYC asserted for before releasing the bus for a
-  /// cycle. The SoC arbiter locks the grant while a master holds CYC, so a
-  /// master that drops CYC every beat re-arbitrates per word; on a fabric whose
-  /// DDR slave is slow and whose CPU is polling the same bus, that ping-pong
-  /// dominates the transfer. Holding CYC across a burst amortises it. The cap
-  /// bounds how long another master can be kept waiting.
+  /// The most beats in one ADMA write request, 1 to 256.
   final int dmaBurstBeats;
 
   /// Depth of the elastic RX FIFO, in 32-bit words. It decouples the SD receive
@@ -274,35 +298,17 @@ class HarborSdioController extends BridgeModule
   final int busAddressWidth;
   final int busDataWidth;
 
-  /// Words the card-read ADMA buffers before it starts to drain a burst.
-  ///
-  /// The downstream DDR burst adapter combines sequential narrow writes into one
-  /// wide DRAM burst only when they reach it close together; a write that stands
-  /// alone for the adapter's idle window lands as its own single-word DRAM
-  /// command. If the ADMA drained each SD word the instant it arrived, the words
-  /// would reach the adapter one SD-clock apart, never combine, and every word
-  /// would cost a whole DRAM burst. So the ADMA holds off until [dmaWriteBatch]
-  /// words are waiting, then STREAMS them out back to back (STB held asserted).
-  /// A full 128-bit burst is four 32-bit words, so four is the natural default.
-  /// The end of the SD data phase always releases whatever partial batch is left,
-  /// so no words are stranded and the batch never deadlocks. Clamped to the RX
-  /// FIFO depth so it is always reachable.
+  /// Words the card-read ADMA waits for before it sends a write request, so
+  /// requests carry bursts and not single words. The end of the SD data phase
+  /// releases a smaller tail. Clamped to the RX FIFO depth.
   final int dmaWriteBatch;
 
-  /// Hold a card-read DMA's data-done until a read-back of the last written
-  /// address has completed on the ADMA master port.
-  ///
-  /// On a posted-write fabric (the DDR3 path: posted CDC bridge + write-combining
-  /// burst adapter) the ADMA's block writes are ACKed before they COMMIT to the
-  /// DRAM array, so raising data-done the instant the RX FIFO drains lets a
-  /// driver (or the CPU) read the buffer while the last writes are still in
-  /// flight, returning stale data. The read shares the CDC's one request FIFO
-  /// with those writes, so it is served only after every write queued before it,
-  /// and the in-order controller commits the writes (tWTR) before returning read
-  /// data. When the read acks, the block is durable, so data-done now MEANS
-  /// durable and the firmware drain guess is unnecessary. Off by default keeps
-  /// the RTL byte-identical for single-cycle-ack fabrics that need no barrier.
-  final bool readBackBarrier;
+  /// SD clocks a card write waits for the end of the card's busy after the
+  /// CRC status. Then the transfer ends with write error and data-done.
+  final int writeBusyTimeout;
+
+  /// The default [writeBusyTimeout]: 0.67 s at 25 MHz.
+  static const defaultWriteBusyTimeout = 1 << 24;
 
   // With [ownPads], the FSM's CMD/DAT input signals come from the inout pads;
   // held here so the late pad wiring can drive them.
@@ -316,27 +322,32 @@ class HarborSdioController extends BridgeModule
     bool crossFabricClock = false,
     this.target,
     this.ownPads = false,
-    this.fabricDma = false,
     this.dmaAddressWidth = 32,
     this.dmaDataWidth = 32,
+    this.dmaOutstanding = 4,
     this.busAddressWidth = 12,
     this.busDataWidth = 32,
     this.clockFrequency = 0,
     this.rxFifoDepth = 16,
     this.dmaBurstBeats = 16,
     this.dmaWriteBatch = 4,
-    this.readBackBarrier = false,
+    this.writeBusyTimeout = defaultWriteBusyTimeout,
     String? name,
   }) : assert(
          dmaDataWidth == 32 || dmaDataWidth == 64,
-         'fabricDma dataWidth must be 32 or 64',
+         'dmaDataWidth must be 32 or 64',
        ),
        assert(
          rxFifoDepth >= 2 && (rxFifoDepth & (rxFifoDepth - 1)) == 0,
          'rxFifoDepth must be a power of two, at least 2',
        ),
-       assert(dmaBurstBeats >= 1, 'dmaBurstBeats must be at least 1'),
+       assert(
+         dmaBurstBeats >= 1 && dmaBurstBeats <= 256,
+         'dmaBurstBeats must be 1 to 256',
+       ),
        assert(dmaWriteBatch >= 1, 'dmaWriteBatch must be at least 1'),
+       assert(writeBusyTimeout >= 1, 'writeBusyTimeout must be at least 1'),
+       assert(dmaOutstanding >= 1, 'dmaOutstanding must be at least 1'),
        super(
          harborStableDefinitionName('HarborSdioController', [
            ...BusSlavePort.definitionNameParts(
@@ -350,11 +361,15 @@ class HarborSdioController extends BridgeModule
            'sf${config.sampleReadOnFall}',
            if (target is HarborFpgaTarget) 'tg${target.vendor.name}',
            if (ownPads) 'pads',
-           if (fabricDma) 'fdma_a${dmaAddressWidth}_d$dmaDataWidth',
+           'ma$dmaAddressWidth',
+           'md$dmaDataWidth',
+           'mo$dmaOutstanding',
+           if (crossFabricClock) 'mx${harborCdcDepth(dmaOutstanding)}',
            'rx$rxFifoDepth',
            'db$dmaBurstBeats',
            'wb$dmaWriteBatch',
-           if (readBackBarrier) 'rbb',
+           if (writeBusyTimeout != defaultWriteBusyTimeout)
+             'bt$writeBusyTimeout',
          ]),
          name: name ?? 'sdio',
        ) {
@@ -390,34 +405,10 @@ class HarborSdioController extends BridgeModule
     createPort('sd_cd', PortDirection.input); // card detect
     addOutput('interrupt');
 
-    // Descriptor-driven DMA memory port. Either a Wishbone-B4 master (fabric)
-    // or the raw single-beat ADMA handshake ports.
-    if (fabricDma) {
-      addInterface(
-        WishboneInterface(
-          WishboneConfig(
-            addressWidth: dmaAddressWidth,
-            dataWidth: dmaDataWidth,
-          ),
-        ),
-        name: 'dma',
-        role: PairRole.provider,
-      );
-    } else {
-      addOutput('dma_addr', width: 32);
-      // The raw handshake carries a full fabric beat, like the Wishbone master
-      // does, so a 64-bit port can take a packed two-word beat.
-      addOutput('dma_wdata', width: dmaDataWidth);
-      addOutput('dma_sel', width: dmaDataWidth ~/ 8);
-      // CYC alongside STB even on the raw handshake: it spans a burst, so a
-      // consumer (and a test) can see the bus being held across beats.
-      addOutput('dma_cyc');
-      createPort('dma_rdata', PortDirection.input, width: dmaDataWidth);
-      addOutput('dma_we');
-      addOutput('dma_stb');
-      createPort('dma_ack', PortDirection.input);
-    }
-
+    final fabricClock = BusSlavePort.fabricClockInputs(
+      this,
+      cross: crossFabricClock,
+    );
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
@@ -426,14 +417,26 @@ class HarborSdioController extends BridgeModule
       reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
-      fabricClock: BusSlavePort.fabricClockInputs(
-        this,
-        cross: crossFabricClock,
+      fabricClock: fabricClock,
+    );
+    dmaPort = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'dma',
+      kind: fabricKind,
+      config: HarborMemoryWaistConfig(
+        addressWidth: dmaAddressWidth,
+        dataWidth: dmaDataWidth,
+        outstanding: dmaOutstanding,
       ),
+      clk: input('clk'),
+      reset: input('reset'),
+      fabricClock: fabricClock,
     );
 
     final clk = input('clk');
-    final reset = bus.reset;
+    final reset = crossFabricClock
+        ? (bus.reset | dmaPort.reset).named('core_reset')
+        : bus.reset;
     final cardDetect = input('sd_cd');
     // Raw CMD-in source: the inout pad's captured value (ownPads) or the split
     // input port. CMD stays SDR even in HS400, so it only gets input-delay tune.
@@ -554,26 +557,14 @@ class HarborSdioController extends BridgeModule
     final rxFull = rxCount
         .eq(Const(rxDepth, width: rxPtrW + 1))
         .named('rx_full');
-    // Shift FIFO: the head is ALWAYS at index 0. On a pop the whole array
+    // Shift FIFO: the head is always at index 0. On a pop the whole array
     // shifts down toward index 0 by the number of words retired, and a push
-    // writes at the tail. So the oldest word and the three lookahead words are
-    // plain fixed-index reads with NO muxes at all. The old moving read pointer
-    // needed a depth-wide mux for each of these four reads, which was the
-    // dominant MUXF7/MUXF8 congestion in this peripheral.
+    // writes at the tail, so the head reads need no muxes.
     //
-    // [rxHead] is the oldest word. [rxHead2] is the second oldest; a 64-bit
-    // beat carries it together with [rxHead]. [rxHead3] and [rxHead4] are the
-    // third and fourth oldest; a PACKED beat retires two words at once, so the
-    // beat that follows a packed one starts two slots on. These let the engine
-    // re-arm the next beat on the ack WITHOUT dropping STB, so the downstream
-    // burst adapter keeps combining narrow words into wide bursts (see
-    // aMemWrite streaming). Clamp the index so a small FIFO never reads out of
-    // range; the lookahead beyond the true count is gated off downstream.
-    Logic rxSlot(int i) => rxFifo[i < rxDepth ? i : rxDepth - 1];
-    final rxHead = rxSlot(0).named('rx_head');
-    final rxHead2 = rxSlot(1).named('rx_head2');
-    final rxHead3 = rxSlot(2).named('rx_head3');
-    final rxHead4 = rxSlot(3).named('rx_head4');
+    // [rxHead] is the oldest word. [rxHead2] is the second oldest, which a
+    // full 64-bit beat carries together with [rxHead].
+    final rxHead = rxFifo[0].named('rx_head');
+    final rxHead2 = rxFifo[1].named('rx_head2');
 
     // Write: set when the serializer has consumed all four bytes of the holding
     // register and needs the NEXT word before it can shift again. The SD clock
@@ -592,19 +583,17 @@ class HarborSdioController extends BridgeModule
     final statCnt = Logic(name: 'dat_stat_cnt', width: 2);
     final busySeen = Logic(name: 'dat_busy_seen');
     final statWaitCnt = Logic(name: 'dat_stat_wait', width: 16);
+    final busyW = writeBusyTimeout.bitLength;
+    final busyCnt = Logic(name: 'dat_busy_wait', width: busyW);
 
-    // ADMA descriptor DMA. The engine walks a descriptor table in memory and
-    // bridges memory to the DAT word handshake (dataReg/dataValid): on a card
-    // read it writes each produced word to memory, on a card write it fetches
-    // words from memory. Descriptor = two words: [address], [byte length in
-    // [15:0], end flag in [31]].
+    // ADMA. It bridges memory to the DAT word handshake: on a card read it
+    // writes the RX FIFO words to memory, on a card write it reads words into
+    // dataReg. It walks a descriptor table when CMD[11] is set.
     const aIdle = 0;
-    const aFetchAddr = 1; // read descriptor word 0 (address)
-    const aFetchCtrl = 2; // read descriptor word 1 (length + end flag)
-    const aMemRead = 3; // card write: fetch a word from memory
-    const aMemWrite = 4; // card read: store a produced word to memory
-    const aNext = 5; // advance within / past the current descriptor
-    const aBarrier = 6; // card read: read-back the last write before data-done
+    const aFetch = 1; // read descriptor word [fetchHi]
+    const aMemRead = 2; // card write: read a word from memory
+    const aMemWrite = 3; // card read: write FIFO words to memory
+    const aNext = 4; // advance within or past the current descriptor
 
     final dmaMode = Logic(name: 'dma_mode');
     final admaState = Logic(name: 'adma_state', width: 3);
@@ -613,50 +602,50 @@ class HarborSdioController extends BridgeModule
     final descBytes = Logic(name: 'adma_bytes', width: 16);
     final descEnd = Logic(name: 'adma_end');
     final admaBase = Logic(name: 'adma_base', width: 32);
-    final dmaWb = fabricDma
-        ? interface('dma').internalInterface! as WishboneInterface
-        : null;
-    final dmaAck = fabricDma ? dmaWb!.ack : input('dma_ack');
-    // The last address the card-read ADMA wrote, re-read after the transfer to
-    // fence the posted writes (see [readBackBarrier]). Only built when the
-    // barrier is enabled, so the RTL is byte-identical otherwise. Cycles to
-    // hold the DMA master fully idle after a card-read's last write, before
-    // data-done. The idle bus lets the burst adapter's idle-flush land its held
-    // write burst and the controller commit it (write + tWR), so data-done
-    // MEANS the block is durable in DRAM. The wait injects NO new bus
-    // transaction (an earlier read-back approach deadlocked the DRAM CDC
-    // bridge, which needs CYC to drop between transactions); the CPU polls the
-    // SDIO STATUS MMIO meanwhile, so DRAM is idle and the flush proceeds. Sized
-    // well above the adapter idle-flush window + controller commit. Only built
-    // when the barrier is enabled, so the RTL is byte-identical otherwise.
-    final barrierWait = readBackBarrier
-        ? Logic(name: 'dma_barrier_wait', width: 9)
-        : null;
-    // Master output drives (set by the ADMA FSM, default idle).
-    final dmaAddrReg = Logic(name: 'dma_addr_reg', width: 32);
-    final dmaWdataReg = Logic(name: 'dma_wdata_reg', width: 32);
-    // High half of a packed 64-bit beat, and the flag that says this beat
-    // carries two words instead of one. Only ever set when [dmaDataWidth] is
-    // 64, the target is 8-byte aligned, and two words are ready to go.
-    final dmaWdataHi = Logic(name: 'dma_wdata_hi', width: 32);
-    final dmaPack = Logic(name: 'dma_pack');
-    final dmaWeReg = Logic(name: 'dma_we_reg');
-    final dmaStbReg = Logic(name: 'dma_stb_reg');
-    // CYC is held across a burst of beats rather than pulsed per beat, so the
-    // arbiter's grant lock keeps the bus for the burst. `dmaCycRelease` drops it
-    // for one cycle at the burst boundary to let another master in.
-    final dmaCycReg = Logic(name: 'dma_cyc_reg');
-    final dmaCycRelease = Logic(name: 'dma_cyc_release');
-    final burstBits = (dmaBurstBeats <= 1) ? 1 : (dmaBurstBeats - 1).bitLength;
-    final dmaBurstCnt = Logic(name: 'dma_burst_cnt', width: burstBits);
-    // Which 32-bit word of a wide beat this address selects (bit 2 for 64-bit).
-    final dmaHiWord = dmaAddrReg[2];
-    // Reads always take one 32-bit word: the addressed half of a wide beat.
-    // Only card-read stores pack two words into a beat.
-    final dmaMiso = fabricDma ? dmaWb!.datMiso : input('dma_rdata');
-    final dmaRdata = dmaDataWidth == 32
-        ? dmaMiso
-        : mux(dmaHiWord, dmaMiso.getRange(32, 64), dmaMiso.getRange(0, 32));
+    final fetchHi = Logic(name: 'adma_fetch_hi');
+    final admaErr = Logic(name: 'adma_err');
+    // Set by an error in a card write. The CRC16 then goes out inverted.
+    final wrAbort = Logic(name: 'dat_wr_abort');
+
+    final mw = dmaPort.waist;
+    final reqValid = Logic(name: 'dma_req_valid');
+    final reqWrite = Logic(name: 'dma_req_write');
+    final reqAddr = Logic(name: 'dma_req_addr', width: 32);
+    final reqLen = Logic(name: 'dma_req_len', width: 8);
+    final reqSize = Logic(name: 'dma_req_size', width: 3);
+    // One read in flight at most, and which half of a 64-bit beat it wants.
+    final rdPending = Logic(name: 'dma_rd_pending');
+    final rdHi = Logic(name: 'dma_rd_hi');
+    // Write data of the request last sent: beats left, two words per beat,
+    // and the half a single word goes in.
+    final wActive = Logic(name: 'dma_w_active');
+    final wLeft = Logic(name: 'dma_w_left', width: 8);
+    final wPack = Logic(name: 'dma_w_pack');
+    final wHi = Logic(name: 'dma_w_hi');
+    // Write requests sent and not yet answered.
+    final ifW = (dmaOutstanding + 1).bitLength;
+    final wInflight = Logic(name: 'dma_w_inflight', width: ifW);
+
+    final reqFire = (reqValid & mw.reqReady).named('dma_req_fire');
+    final wFire = (wActive & mw.wdataReady).named('dma_w_fire');
+    final rFire = (rdPending & mw.rdataValid).named('dma_r_fire');
+    final bFire = (mw.wrespValid & mw.wrespReady).named('dma_b_fire');
+    final dmaFault = ((rFire & mw.rdataErr) | (bFire & mw.wrespErr)).named(
+      'dma_fault',
+    );
+    final writesBusy = (wActive | wInflight.neq(Const(0, width: ifW))).named(
+      'dma_writes_busy',
+    );
+    final dmaInFlight = (writesBusy | reqValid | rdPending).named(
+      'dma_in_flight',
+    );
+    final rdWord = dmaDataWidth == 32
+        ? mw.rdataData
+        : mux(
+            rdHi,
+            mw.rdataData.getRange(32, 64),
+            mw.rdataData.getRange(0, 32),
+          ).named('dma_rd_word');
     // Read assembles bytes 0..2 here, byte 3 is the live one.
     final asmB0 = Logic(name: 'dat_asm_b0', width: 8);
     final asmB1 = Logic(name: 'dat_asm_b1', width: 8);
@@ -769,18 +758,12 @@ class HarborSdioController extends BridgeModule
         (holdServed ? bus.stb & ~bus.ack & ~busServed : bus.stb & ~bus.ack)
             .named('bus_access');
 
-    // Pop strobes. The ADMA retires a word when the fabric acks the beat that
-    // carried it; the CPU retires one by reading DATA during a card read.
-    final dmaBeatDone =
-        (admaState.eq(Const(aMemWrite, width: 3)) &
-                dmaStbReg &
-                dmaWeReg &
-                dmaAck)
-            .named('dma_beat_done');
-    // A packed beat retires TWO words from the FIFO, an unpacked one retires
-    // one.
-    final rxPopAdma = (dmaBeatDone & ~dmaPack).named('rx_pop_adma');
-    final rxPopAdma2 = (dmaBeatDone & dmaPack).named('rx_pop_adma2');
+    // Pop strobes. The ADMA retires its word or words on the WDATA handshake.
+    // The CPU retires one by reading DATA during a card read. A walker that
+    // has parked during a DMA card read drops the words that are left, so a
+    // failed or short transfer cannot stall the SD clock.
+    final rxPopAdma = (wFire & ~wPack).named('rx_pop_adma');
+    final rxPopAdma2 = (wFire & wPack).named('rx_pop_adma2');
     final rxPopCpu =
         (busAccess &
                 ~bus.we &
@@ -789,7 +772,14 @@ class HarborSdioController extends BridgeModule
                 bus.windowAddr(0x1000).getRange(3).eq(Const(0x09, width: 9)) &
                 bus.selAny(0x48, 4))
             .named('rx_pop_cpu');
-    final rxPop = (rxPopAdma | rxPopCpu).named('rx_pop');
+    final rxPopDrop =
+        (dmaMode &
+                cmdDataDir &
+                admaState.eq(Const(aIdle, width: 3)) &
+                ~wActive &
+                ~rxEmpty)
+            .named('rx_pop_drop');
+    final rxPop = (rxPopAdma | rxPopCpu | rxPopDrop).named('rx_pop');
     // A word is only really taken when the FIFO had one to give.
     final rxPushOk = (rxPush & ~rxFull).named('rx_push_ok');
     // How many words leave the FIFO this cycle. A packed pop is only armed when
@@ -824,10 +814,11 @@ class HarborSdioController extends BridgeModule
       return rxFifo[i];
     }
 
-    // Two words may share a beat only on a 64-bit port, at an 8-byte aligned
-    // target, with at least 8 bytes still owed by the descriptor. An unaligned
-    // start or an odd tail word falls back to a half-width beat, so no
-    // descriptor length or alignment is refused.
+    // Card-read write requests. A request covers only words already in the
+    // RX FIFO, so its write data never waits on the card. On a 64-bit port a
+    // run at an 8-byte aligned address with at least 8 bytes left uses full
+    // beats of two words. Otherwise a beat carries one word in its addressed
+    // half.
     final packTarget = dmaDataWidth == 64
         ? (~descAddr[2] & descBytes.gte(Const(8, width: 16))).named(
             'dma_pack_target',
@@ -836,95 +827,114 @@ class HarborSdioController extends BridgeModule
     final rxHavePair = rxCount
         .gte(Const(2, width: rxPtrW + 1))
         .named('rx_have_pair');
-    // Hold a lone word back while its partner is still on the way. Sending the
-    // instant one word arrives is what kept every beat half width: the engine
-    // never had two in hand at once. `dmaTailWait` marks the end of the SD data
-    // phase, so the last odd word is always released rather than stranded.
-    final dmaWaitPair = (packTarget & ~rxHavePair & ~dmaTailWait).named(
-      'dma_wait_pair',
+    final usePack = (packTarget & rxHavePair).named('dma_use_pack');
+    // A lone word waits for its partner while the card is still sending.
+    final useSingle = (~rxEmpty & (~packTarget | dmaTailWait)).named(
+      'dma_use_single',
     );
-    final canPack = (packTarget & rxHavePair).named('dma_can_pack');
-    // Hold off starting a burst until a full wide-burst's worth of words is
-    // buffered (or the SD data phase has ended, which releases the tail). This
-    // is what lets the streamed beats reach the burst adapter close enough
-    // together to combine; draining a lone word the instant it arrives put every
-    // word into its own DRAM burst. Clamp to the FIFO depth so the threshold is
-    // always reachable and the SD-clock stall (rxFull) can never wedge it.
+    // Wait for a batch of words so a request carries a burst. The end of the
+    // SD data phase releases the tail.
     final batchWords = dmaWriteBatch > rxDepth ? rxDepth : dmaWriteBatch;
     final dmaBatchReady =
         (rxCount.gte(Const(batchWords, width: rxPtrW + 1)) | dmaTailWait).named(
           'dma_batch_ready',
         );
-    final dmaArmBeat = (~rxEmpty & ~dmaWaitPair & dmaBatchReady).named(
-      'dma_arm_beat',
-    );
+    final wRoom = wInflight
+        .lt(Const(dmaOutstanding, width: ifW))
+        .named('dma_w_room');
+    final issueWrite =
+        (admaState.eq(Const(aMemWrite, width: 3)) &
+                descBytes.neq(Const(0, width: 16)) &
+                ~wActive &
+                ~reqValid &
+                wRoom &
+                dmaBatchReady &
+                (usePack | useSingle))
+            .named('dma_issue_write');
 
-    // Streaming continuation (LiteX WishboneDMAWriter pattern). To let the
-    // downstream burst adapter combine narrow words into wide bursts, the engine
-    // holds STB asserted across beats: on each ack it re-arms the NEXT beat in
-    // place instead of dropping STB and detouring through aNext. The signals
-    // below describe that next beat, computed as if the current beat's pop has
-    // already retired its word(s). A packed current beat retires two words, so
-    // the next beat's first word sits two slots on (rxHead3) and its partner one
-    // more (rxHead4); an unpacked current beat retires one, so the next word is
-    // rxHead2 and its partner rxHead3. rxCount is reduced by the same amount,
-    // which is conservative because a concurrent push can only add words.
-    final dmaPopWords = mux(
-      dmaPack,
-      Const(2, width: rxPtrW + 1),
-      Const(1, width: rxPtrW + 1),
+    // Beats of the request: the fewest of the burst cap, the words ready, the
+    // descriptor bytes left and the beats to the next 4 KB boundary.
+    const cw = 17;
+    Logic min2(Logic a, Logic b) => mux(a.lt(b), a, b);
+    final to4k =
+        (Const(4096, width: cw) - descAddr.getRange(0, 12).zeroExtend(cw))
+            .named('dma_to_4k');
+    final bytesLeft = descBytes.zeroExtend(cw);
+    final wordsReady = rxCount.zeroExtend(cw);
+    final capBeats = Const(dmaBurstBeats, width: cw);
+    final Logic wrBeats;
+    final Logic wrBytes;
+    if (dmaDataWidth == 32) {
+      wrBeats = min2(
+        min2(capBeats, wordsReady),
+        min2((bytesLeft + Const(3, width: cw)) >> 2, to4k >> 2),
+      ).named('dma_wr_beats');
+      wrBytes = (wrBeats << 2).named('dma_wr_bytes');
+    } else {
+      final packBeats = min2(
+        min2(capBeats, wordsReady >> 1),
+        min2(bytesLeft >> 3, to4k >> 3),
+      ).named('dma_pack_beats');
+      wrBeats = mux(
+        usePack,
+        packBeats,
+        Const(1, width: cw),
+      ).named('dma_wr_beats');
+      wrBytes = mux(
+        usePack,
+        packBeats << 3,
+        Const(4, width: cw),
+      ).named('dma_wr_bytes');
+    }
+    final wrLen = (wrBeats - Const(1, width: cw)).getRange(0, 8);
+    final bytesAfter = mux(
+      bytesLeft.gt(wrBytes),
+      bytesLeft - wrBytes,
+      Const(0, width: cw),
+    ).getRange(0, 16).named('dma_bytes_after');
+
+    // Reads go out only when no write is in flight.
+    final fetchAddr =
+        (descPtr + mux(fetchHi, Const(4, width: 32), Const(0, width: 32)))
+            .named('adma_fetch_addr');
+    final readReady = (~rdPending & ~reqValid & ~writesBusy).named(
+      'dma_read_ready',
     );
-    final dmaNextAddr = mux(
-      dmaPack,
-      descAddr + Const(8, width: 32),
-      descAddr + Const(4, width: 32),
-    ).named('dma_next_addr');
-    final dmaNextBytes = mux(
-      dmaPack,
-      descBytes - Const(8, width: 16),
-      descBytes - Const(4, width: 16),
-    ).named('dma_next_bytes');
-    final dmaNextCount = (rxCount - dmaPopWords).named('dma_next_count');
-    final dmaNextHead = mux(dmaPack, rxHead3, rxHead2).named('dma_next_head');
-    final dmaNextHead2 = mux(dmaPack, rxHead4, rxHead3).named('dma_next_head2');
-    final dmaNextPackTarget = dmaDataWidth == 64
-        ? (~dmaNextAddr[2] & dmaNextBytes.gte(Const(8, width: 16))).named(
-            'dma_next_pack_target',
-          )
-        : Const(0);
-    final dmaNextHavePair = dmaNextCount
-        .gte(Const(2, width: rxPtrW + 1))
-        .named('dma_next_have_pair');
-    final dmaNextCanPack = (dmaNextPackTarget & dmaNextHavePair).named(
-      'dma_next_can_pack',
-    );
-    // Mirror dmaWaitPair for the next beat: hold a lone word back for its partner
-    // unless the SD data phase has ended (dmaTailWait), when the odd tail word is
-    // released instead of stranded.
-    final dmaNextWaitPair =
-        (dmaNextPackTarget & ~dmaNextHavePair & ~dmaTailWait).named(
-          'dma_next_wait_pair',
-        );
-    final dmaNextHaveWord = dmaNextCount
-        .gte(Const(1, width: rxPtrW + 1))
-        .named('dma_next_have_word');
-    final dmaNextArm = (dmaNextHaveWord & ~dmaNextWaitPair).named(
-      'dma_next_arm',
-    );
-    final dmaNextMore = dmaNextBytes
-        .neq(Const(0, width: 16))
-        .named('dma_next_more');
-    // Fairness boundary: the last beat of a burst window still drops CYC for
-    // one cycle so a waiting master gets in, so streaming pauses there.
-    final dmaBurstBoundary = dmaBurstCnt
-        .eq(Const(dmaBurstBeats - 1, width: burstBits))
-        .named('dma_burst_boundary');
-    // Keep STB asserted and re-arm the next beat only when the descriptor still
-    // owes bytes, the FIFO already holds the next beat's word(s), and this is not
-    // a fairness burst boundary.
-    final dmaStream = (dmaNextMore & dmaNextArm & ~dmaBurstBoundary).named(
-      'dma_stream',
-    );
+    final issueFetch = (admaState.eq(Const(aFetch, width: 3)) & readReady)
+        .named('dma_issue_fetch');
+    final issueMemRead =
+        (admaState.eq(Const(aMemRead, width: 3)) &
+                busy &
+                ~dataValid &
+                readReady)
+            .named('dma_issue_mem_read');
+
+    mw.reqValid <= reqValid;
+    mw.reqId <= Const(0, width: mw.config.idWidth);
+    mw.reqWrite <= reqWrite;
+    mw.reqAddr <=
+        (dmaAddressWidth <= 32
+            ? reqAddr.getRange(0, dmaAddressWidth)
+            : reqAddr.zeroExtend(dmaAddressWidth));
+    mw.reqLen <= reqLen;
+    mw.reqSize <= reqSize;
+    mw.reqBurst <= Const(HarborMemoryBurst.incr.value, width: 2);
+    mw.wdataValid <= wActive;
+    mw.wdataLast <= wLeft.eq(Const(0, width: 8));
+    if (dmaDataWidth == 32) {
+      mw.wdataData <= rxHead;
+      mw.wdataStrb <= Const(0xF, width: 4);
+    } else {
+      mw.wdataData <= [mux(wPack, rxHead2, rxHead), rxHead].swizzle();
+      mw.wdataStrb <=
+          mux(
+            wPack,
+            Const(0xFF, width: 8),
+            mux(wHi, Const(0xF0, width: 8), Const(0x0F, width: 8)),
+          );
+    }
+    mw.rdataReady <= rdPending;
+    mw.wrespReady <= writesBusy | (reqValid & reqWrite);
 
     output('sd_clk') <= sdClkReg & ctrlEnable;
     if (ownPads) {
@@ -947,55 +957,10 @@ class HarborSdioController extends BridgeModule
       output('sd_dat_out') <= datOutReg;
       output('sd_dat_oe') <= datOeReg;
     }
-    // The beat payload. On a 32-bit port it is simply the staged word. On a
-    // 64-bit port a PACKED beat carries two consecutive words with every byte
-    // enabled, which halves the number of round trips; an unpacked beat still
-    // goes into the addressed half with the other half masked off, which is
-    // what an unaligned start or an odd tail word needs.
-    final Logic dmaBeatData;
-    final Logic dmaBeatSel;
-    if (dmaDataWidth == 32) {
-      dmaBeatData = dmaWdataReg;
-      dmaBeatSel = Const(0xF, width: 4);
-    } else {
-      // Only a write beat can be packed, so a stale flag can never widen the
-      // byte-enables of a descriptor fetch.
-      final packBeat = (dmaPack & dmaWeReg).named('dma_pack_beat');
-      dmaBeatData = mux(
-        packBeat,
-        [dmaWdataHi, dmaWdataReg].swizzle(),
-        mux(
-          dmaHiWord,
-          [dmaWdataReg, Const(0, width: 32)].swizzle(),
-          [Const(0, width: 32), dmaWdataReg].swizzle(),
-        ),
-      ).named('dma_beat_data');
-      dmaBeatSel = mux(
-        packBeat,
-        Const(0xFF, width: 8),
-        mux(dmaHiWord, Const(0xF0, width: 8), Const(0x0F, width: 8)),
-      ).named('dma_beat_sel');
-    }
-
-    if (fabricDma) {
-      // Wishbone-B4 classic block transfer: CYC spans the burst, STB marks the
-      // individual beats. CYC == STB (a fresh bus cycle per beat) made the
-      // arbiter re-run for every word.
-      dmaWb!.cyc <= (dmaCycReg | dmaStbReg) & ~dmaCycRelease;
-      dmaWb.stb <= dmaStbReg;
-      dmaWb.we <= dmaWeReg;
-      dmaWb.adr <= dmaAddrReg.zeroExtend(dmaAddressWidth);
-      dmaWb.datMosi <= dmaBeatData;
-      dmaWb.sel <= dmaBeatSel;
-    } else {
-      output('dma_addr') <= dmaAddrReg;
-      output('dma_wdata') <= dmaBeatData;
-      output('dma_sel') <= dmaBeatSel;
-      output('dma_we') <= dmaWeReg;
-      output('dma_stb') <= dmaStbReg;
-      output('dma_cyc') <= (dmaCycReg | dmaStbReg) & ~dmaCycRelease;
-    }
-    interrupt <= (intStatus & intEnable).or();
+    final intView = (intStatus | (admaErr.zeroExtend(8) << 7)).named(
+      'int_view',
+    );
+    interrupt <= (intView & intEnable).or();
 
     // Command frame from the value being written to CMD (index + flags) plus
     // the already-latched argument: {0, 1, index[5:0], arg[31:0]} then CRC7 and
@@ -1063,6 +1028,7 @@ class HarborSdioController extends BridgeModule
           statCnt < Const(0, width: 2),
           busySeen < Const(0),
           statWaitCnt < Const(0, width: 16),
+          busyCnt < Const(0, width: busyW),
           dmaMode < Const(0),
           admaState < Const(aIdle, width: 3),
           descPtr < Const(0, width: 32),
@@ -1070,16 +1036,21 @@ class HarborSdioController extends BridgeModule
           descBytes < Const(0, width: 16),
           descEnd < Const(0),
           admaBase < Const(0, width: 32),
-          if (barrierWait != null) barrierWait < Const(0, width: 9),
-          dmaAddrReg < Const(0, width: 32),
-          dmaWdataReg < Const(0, width: 32),
-          dmaWdataHi < Const(0, width: 32),
-          dmaPack < Const(0),
-          dmaWeReg < Const(0),
-          dmaStbReg < Const(0),
-          dmaCycReg < Const(0),
-          dmaCycRelease < Const(0),
-          dmaBurstCnt < Const(0, width: burstBits),
+          fetchHi < Const(0),
+          admaErr < Const(0),
+          wrAbort < Const(0),
+          reqValid < Const(0),
+          reqWrite < Const(0),
+          reqAddr < Const(0, width: 32),
+          reqLen < Const(0, width: 8),
+          reqSize < Const(0, width: 3),
+          rdPending < Const(0),
+          rdHi < Const(0),
+          wActive < Const(0),
+          wLeft < Const(0, width: 8),
+          wPack < Const(0),
+          wHi < Const(0),
+          wInflight < Const(0, width: ifW),
           dmaTailWait < Const(0),
           asmB0 < Const(0, width: 8),
           asmB1 < Const(0, width: 8),
@@ -1467,7 +1438,7 @@ class HarborSdioController extends BridgeModule
                 If(
                   sdFall,
                   then: [
-                    datOutReg < crcOutVec,
+                    datOutReg < mux(wrAbort, ~crcOutVec & laneMask, crcOutVec),
                     for (var l = 0; l < maxW; l++)
                       crcShift[l] <
                           [crcShift[l].getRange(0, 15), Const(0)].swizzle(),
@@ -1532,18 +1503,24 @@ class HarborSdioController extends BridgeModule
                     If(
                       statCnt.eq(Const(1, width: 2)),
                       then: [
+                        // A rejected block has no busy, so the transfer
+                        // ends here.
                         If(
                           [
                             statShift.getRange(0, 2),
                             datIn[0],
                           ].swizzle().neq(Const(0x2, width: 3)),
                           then: [
+                            datState < Const(dIdle, width: 4),
+                            busy < Const(0),
                             intStatus <
-                                (intStatus | Const(intWriteErr, width: 8)),
+                                (intStatus |
+                                    Const(intWriteErr | intDataDone, width: 8)),
                           ],
+                          orElse: [datState < Const(dWBusy, width: 4)],
                         ),
-                        datState < Const(dWBusy, width: 4),
                         busySeen < Const(0),
+                        busyCnt < Const(0, width: busyW),
                       ],
                     ),
                   ],
@@ -1556,6 +1533,17 @@ class HarborSdioController extends BridgeModule
                   sdRise,
                   then: [
                     If(~datIn[0], then: [busySeen < Const(1)]),
+                    busyCnt < (busyCnt + Const(1, width: busyW)),
+                    If(
+                      busyCnt.eq(Const(writeBusyTimeout, width: busyW)),
+                      then: [
+                        datState < Const(dIdle, width: 4),
+                        busy < Const(0),
+                        intStatus <
+                            (intStatus |
+                                Const(intWriteErr | intDataDone, width: 8)),
+                      ],
+                    ),
                     If(
                       busySeen & datIn[0],
                       then: [
@@ -1630,10 +1618,33 @@ class HarborSdioController extends BridgeModule
                     ),
                   )),
 
-          // A DMA read completes when the descriptor walker has parked AND the
-          // RX FIFO has drained, so every received word is in memory.
+          // ADMA channels. A request holds until REQ_READY, and the write data
+          // of the request last sent runs on its own until LAST.
+          If(reqFire, then: [reqValid < Const(0)]),
+          If(rFire, then: [rdPending < Const(0)]),
           If(
-            dmaTailWait & admaState.eq(Const(aIdle, width: 3)) & rxEmpty,
+            wFire,
+            then: [
+              If(
+                wLeft.eq(Const(0, width: 8)),
+                then: [wActive < Const(0)],
+                orElse: [wLeft < (wLeft - Const(1, width: 8))],
+              ),
+            ],
+          ),
+          wInflight <
+              (wInflight + issueWrite.zeroExtend(ifW) - bFire.zeroExtend(ifW)),
+          If(dmaFault, then: [admaErr < Const(1)]),
+          If(dmaFault & dmaMode & ~cmdDataDir, then: [wrAbort < Const(1)]),
+
+          // A DMA read completes when the walker has parked, the RX FIFO is
+          // empty and every write response is back, so every received word
+          // is in memory.
+          If(
+            dmaTailWait &
+                admaState.eq(Const(aIdle, width: 3)) &
+                rxEmpty &
+                ~dmaInFlight,
             then: [
               dmaTailWait < Const(0),
               busy < Const(0),
@@ -1641,170 +1652,104 @@ class HarborSdioController extends BridgeModule
             ],
           ),
 
-          // Burst release pulse: one cycle with CYC low at the burst boundary,
-          // so a master that has been waiting behind the grant lock gets in.
-          If(dmaCycRelease, then: [dmaCycRelease < Const(0)]),
-
-          // ADMA descriptor walker. Runs concurrently with the DAT serial
-          // engine (which paces the SD bus) and bridges memory to the
-          // dataReg/dataValid word handshake. cmdDataDir == 1 is a card read
-          // (the engine stores produced words to memory), == 0 is a card write
-          // (it fetches words from memory).
+          // ADMA walker. cmdDataDir 1 is a card read (words go to memory), 0
+          // is a card write (words come from memory).
           Case(admaState, [
-            // Parked. Hold the master request low: a descriptor walk that ended
-            // with a request still asserted would keep winning the arbiter and
-            // starve the CPU, which looks like a whole-fabric hang.
-            CaseItem(Const(aIdle, width: 3), [
-              dmaStbReg < Const(0),
-              dmaWeReg < Const(0),
-              dmaCycReg < Const(0),
-              dmaPack < Const(0),
-              dmaBurstCnt < Const(0, width: burstBits),
-            ]),
-            CaseItem(Const(aFetchAddr, width: 3), [
-              dmaCycReg < Const(1),
-              dmaAddrReg < descPtr,
-              dmaWeReg < Const(0),
-              dmaStbReg < Const(1),
+            CaseItem(Const(aFetch, width: 3), [
               If(
-                dmaAck,
+                issueFetch,
                 then: [
-                  descAddr < dmaRdata,
-                  dmaStbReg < Const(0),
-                  admaState < Const(aFetchCtrl, width: 3),
+                  reqValid < Const(1),
+                  reqWrite < Const(0),
+                  reqAddr < fetchAddr,
+                  reqLen < Const(0, width: 8),
+                  reqSize < Const(2, width: 3),
+                  rdPending < Const(1),
+                  rdHi < fetchAddr[2],
                 ],
               ),
-            ]),
-            CaseItem(Const(aFetchCtrl, width: 3), [
-              dmaCycReg < Const(1),
-              dmaAddrReg < (descPtr + Const(4, width: 32)),
-              dmaWeReg < Const(0),
-              dmaStbReg < Const(1),
               If(
-                dmaAck,
+                rFire & ~mw.rdataErr,
                 then: [
-                  descBytes < dmaRdata.getRange(0, 16),
-                  descEnd < dmaRdata[31],
-                  dmaStbReg < Const(0),
                   If(
-                    cmdDataDir,
-                    then: [admaState < Const(aMemWrite, width: 3)],
-                    orElse: [admaState < Const(aMemRead, width: 3)],
-                  ),
-                ],
-              ),
-            ]),
-            // Card write: fetch a word into the DAT buffer when it is free.
-            CaseItem(Const(aMemRead, width: 3), [
-              // Nothing to move yet: drop CYC so a waiting master gets the bus
-              // instead of sitting behind the grant lock.
-              If(dataValid, then: [dmaCycReg < Const(0)]),
-              If(
-                ~dataValid,
-                then: [
-                  dmaCycReg < Const(1),
-                  dmaAddrReg < descAddr,
-                  dmaWeReg < Const(0),
-                  dmaStbReg < Const(1),
-                  If(
-                    dmaAck,
+                    fetchHi,
                     then: [
-                      dataReg < dmaRdata,
-                      dataValid < Const(1),
-                      dmaStbReg < Const(0),
-                      descAddr < (descAddr + Const(4, width: 32)),
-                      descBytes < (descBytes - Const(4, width: 16)),
+                      descBytes < rdWord.getRange(0, 16),
+                      descEnd < rdWord[31],
+                      fetchHi < Const(0),
                       admaState < Const(aNext, width: 3),
-                      dmaBurstCnt < (dmaBurstCnt + Const(1, width: burstBits)),
-                      If(
-                        dmaBurstCnt.eq(
-                          Const(dmaBurstBeats - 1, width: burstBits),
-                        ),
-                        then: [
-                          dmaBurstCnt < Const(0, width: burstBits),
-                          dmaCycReg < Const(0),
-                          dmaCycRelease < Const(1),
-                        ],
-                      ),
                     ],
+                    orElse: [descAddr < rdWord, fetchHi < Const(1)],
                   ),
                 ],
               ),
             ]),
-            // Card read: store produced words to memory. The words come off the
-            // RX FIFO, so the receive engine keeps running while a beat is
-            // outstanding. `rxPopAdma`/`rxPopAdma2` retire them on the ack.
-            //
-            // On a 64-bit port two consecutive words go out as ONE full-width
-            // beat, so a block costs half as many round trips. The decision is
-            // latched with the rest of the beat and held until the ack: the SD
-            // side keeps pushing while the beat is in flight, so a live
-            // `canPack` would change SEL under an asserted STB.
-            CaseItem(Const(aMemWrite, width: 3), [
-              // Never drop CYC mid-beat, only when there is nothing to send
-              // yet (empty, or one word waiting for the partner it will share
-              // a beat with).
-              If(~dmaArmBeat & ~dmaStbReg, then: [dmaCycReg < Const(0)]),
+            // Card write: read a word into the DAT buffer when it is free.
+            CaseItem(Const(aMemRead, width: 3), [
               If(
-                dmaArmBeat | dmaStbReg,
+                issueMemRead,
                 then: [
-                  dmaCycReg < Const(1),
-                  If(
-                    ~dmaStbReg,
-                    then: [
-                      dmaAddrReg < descAddr,
-                      dmaWdataReg < rxHead,
-                      dmaWdataHi < rxHead2,
-                      dmaPack < canPack,
-                      dmaWeReg < Const(1),
-                      dmaStbReg < Const(1),
-                    ],
-                  ),
-                  If(
-                    dmaAck,
-                    then: [
-                      // Advance the descriptor past the beat just accepted. The
-                      // rxPopAdma/rxPopAdma2 strobes retire its word(s) at this
-                      // same edge.
-                      descAddr < dmaNextAddr,
-                      descBytes < dmaNextBytes,
-                      // Burst accounting: hand the bus back briefly every
-                      // dmaBurstBeats so a waiting master is not starved.
-                      dmaBurstCnt < (dmaBurstCnt + Const(1, width: burstBits)),
-                      If(
-                        dmaStream,
-                        // The descriptor still owes bytes and the next beat's
-                        // word(s) are already in the FIFO: KEEP STB/WE asserted
-                        // and re-arm the next beat in place, so the burst
-                        // adapter never sees a gap and keeps combining.
-                        // Draining the whole buffered batch back to back (not
-                        // one word per SD clock) is what lands the words inside
-                        // the adapter's combine window.
-                        then: [
-                          dmaAddrReg < dmaNextAddr,
-                          dmaWdataReg < dmaNextHead,
-                          dmaWdataHi < dmaNextHead2,
-                          dmaPack < dmaNextCanPack,
-                        ],
-                        // Nothing more to send yet, a fairness boundary, or the
-                        // descriptor is exhausted: drop the request and let
-                        // aNext walk the descriptor / release the bus.
-                        orElse: [
-                          dmaStbReg < Const(0),
-                          dmaWeReg < Const(0),
-                          dmaPack < Const(0),
-                          admaState < Const(aNext, width: 3),
-                          If(
-                            dmaBurstBoundary,
-                            then: [
-                              dmaBurstCnt < Const(0, width: burstBits),
-                              dmaCycReg < Const(0),
-                              dmaCycRelease < Const(1),
-                            ],
-                          ),
-                        ],
+                  reqValid < Const(1),
+                  reqWrite < Const(0),
+                  reqAddr < descAddr,
+                  reqLen < Const(0, width: 8),
+                  reqSize < Const(2, width: 3),
+                  rdPending < Const(1),
+                  rdHi < descAddr[2],
+                ],
+              ),
+              If(
+                rFire & ~mw.rdataErr,
+                then: [
+                  dataReg < rdWord,
+                  dataValid < Const(1),
+                  descAddr < (descAddr + Const(4, width: 32)),
+                  descBytes <
+                      mux(
+                        descBytes.gt(Const(4, width: 16)),
+                        descBytes - Const(4, width: 16),
+                        Const(0, width: 16),
                       ),
-                    ],
+                  admaState < Const(aNext, width: 3),
+                ],
+              ),
+              // The card write ended before the descriptors did. A word
+              // fetched for it is dropped.
+              If(
+                ~busy & ~rdPending,
+                then: [
+                  admaState < Const(aIdle, width: 3),
+                  dataValid < Const(0),
+                ],
+              ),
+            ]),
+            // Card read: send the FIFO words as a write burst.
+            CaseItem(Const(aMemWrite, width: 3), [
+              If(
+                issueWrite,
+                then: [
+                  reqValid < Const(1),
+                  reqWrite < Const(1),
+                  reqAddr < descAddr,
+                  reqLen < wrLen,
+                  reqSize <
+                      mux(usePack, Const(3, width: 3), Const(2, width: 3)),
+                  wActive < Const(1),
+                  wLeft < wrLen,
+                  wPack < usePack,
+                  wHi < descAddr[2],
+                  descAddr < (descAddr + wrBytes.zeroExtend(32)),
+                  descBytes < bytesAfter,
+                  If(
+                    bytesAfter.eq(Const(0, width: 16)),
+                    then: [admaState < Const(aNext, width: 3)],
+                  ),
+                ],
+                // The card has finished and no word is left.
+                orElse: [
+                  If(
+                    dmaTailWait & rxEmpty,
+                    then: [admaState < Const(aIdle, width: 3)],
                   ),
                 ],
               ),
@@ -1815,25 +1760,11 @@ class HarborSdioController extends BridgeModule
                 then: [
                   If(
                     descEnd,
-                    then: [
-                      // Card read with the barrier on: fence the posted writes
-                      // with a read-back of the last write before parking (and
-                      // so before data-done). Otherwise park straight away.
-                      if (readBackBarrier)
-                        If(
-                          cmdDataDir,
-                          then: [
-                            barrierWait! < Const(256, width: 9),
-                            admaState < Const(aBarrier, width: 3),
-                          ],
-                          orElse: [admaState < Const(aIdle, width: 3)],
-                        )
-                      else
-                        admaState < Const(aIdle, width: 3),
-                    ],
+                    then: [admaState < Const(aIdle, width: 3)],
                     orElse: [
                       descPtr < (descPtr + Const(8, width: 32)),
-                      admaState < Const(aFetchAddr, width: 3),
+                      fetchHi < Const(0),
+                      admaState < Const(aFetch, width: 3),
                     ],
                   ),
                 ],
@@ -1846,24 +1777,20 @@ class HarborSdioController extends BridgeModule
                 ],
               ),
             ]),
-            // Card-read fence (readBackBarrier only): hold the DMA master fully
-            // idle so the burst adapter idle-flushes its held write burst and the
-            // controller commits it, before parking (which releases data-done).
-            // No new bus transaction is issued, so the DRAM CDC bridge is never
-            // driven back-to-back. The CPU is polling the SDIO STATUS MMIO
-            // meanwhile, so DRAM stays idle and the flush proceeds.
-            if (readBackBarrier)
-              CaseItem(Const(aBarrier, width: 3), [
-                dmaCycReg < Const(0),
-                dmaStbReg < Const(0),
-                dmaWeReg < Const(0),
-                If(
-                  barrierWait!.neq(Const(0, width: 9)),
-                  then: [barrierWait < (barrierWait - Const(1, width: 9))],
-                  orElse: [admaState < Const(aIdle, width: 3)],
-                ),
-              ]),
           ]),
+          // An error response stops the walker. Writes already sent finish.
+          If(dmaFault, then: [admaState < Const(aIdle, width: 3)]),
+          // A parked walker in a DMA card write feeds zero words, so the
+          // serializer reaches the end of the block count.
+          If(
+            dmaMode &
+                ~cmdDataDir &
+                admaState.eq(Const(aIdle, width: 3)) &
+                ~dataValid &
+                (datState.eq(Const(dWStart, width: 4)) |
+                    (datState.eq(Const(dWrite, width: 4)) & wrNeedFill)),
+            then: [dataReg < Const(0, width: 32), dataValid < Const(1)],
+          ),
 
           // Bus access.
           If(~bus.stb, then: [busServed < Const(0)]),
@@ -1919,10 +1846,13 @@ class HarborSdioController extends BridgeModule
                   ),
                 ]),
                 // 0x08: STATUS ([0] card detect, [8] busy, [9] data ready).
+                // Busy includes ADMA accesses in flight, which also block
+                // a CMD write.
                 CaseItem(Const(0x01, width: 9), [
                   bus.dataOut <
                       cardDetect.zeroExtend(dw) |
-                          (busy.zeroExtend(dw) << Const(8, width: 32)) |
+                          ((busy | dmaInFlight).zeroExtend(dw) <<
+                              Const(8, width: 32)) |
                           (mux(
                                 cmdDataDir,
                                 ~rxEmpty,
@@ -1938,70 +1868,67 @@ class HarborSdioController extends BridgeModule
                     orElse: [bus.dataOut < clkDiv.zeroExtend(dw)],
                   ),
                 ]),
-                // 0x18: CMD. Writing triggers a command when not busy.
-                // [5:0] index, [7:6] response type (0 none, 1 short, 2 long
-                // R2, 3 short+busy), [8] data present, [9] data direction
-                // (0 write, 1 read).
+                // 0x18: CMD. Writing triggers a command when not busy and the
+                // ADMA has nothing in flight. [5:0] index, [7:6] response
+                // type (0 none, 1 short, 2 long R2, 3 short+busy), [8] data
+                // present, [9] data direction (0 write, 1 read), [10] use
+                // ADMA DMA, [11] ADMA_ADDR is a descriptor table.
                 CaseItem(Const(0x03, width: 9), [
                   If(
                     bus.we & bus.selAny(0x18, 2),
                     then: [
                       If(
-                        ~busy,
+                        ~busy & ~dmaInFlight,
                         then: [
                           cmdIndex < wrIndex,
                           cmdRespType < bus.dataIn.getRange(6, 8),
                           cmdDataPresent < bus.dataIn[8],
                           cmdDataDir < bus.dataIn[9],
-                          dmaMode < bus.dataIn[10], // [10] use ADMA DMA
+                          wrAbort < Const(0),
+                          dmaMode < bus.dataIn[10],
                           cmdShift < cmdFrame,
                           cmdCnt < Const(48, width: 7),
                           cmdOut < Const(1),
                           cmdOe < Const(1),
                           busy < Const(1),
                           state < Const(sSend, width: 2),
-                          // Start every data phase from a known state: an empty
-                          // RX FIFO and a released master request. A previous
-                          // transfer that ended mid-descriptor would otherwise
-                          // leave a stale word (shifting the new block) or a
-                          // stuck bus request (starving the CPU master).
+                          // Start every data phase with an empty RX FIFO, so
+                          // a word left by an earlier transfer cannot shift
+                          // the new block.
                           If(
                             bus.dataIn[8],
-                            then: [
-                              rxCount < Const(0, width: rxPtrW + 1),
-                              dmaStbReg < Const(0),
-                              dmaWeReg < Const(0),
-                            ],
+                            then: [rxCount < Const(0, width: rxPtrW + 1)],
                           ),
-                          // Pre-fetch the ADMA descriptor NOW, at command
-                          // issue, so the two descriptor reads from memory
-                          // overlap the command+response window. The engine
-                          // then parks in its memory state, ready, before the
-                          // first data word. If it waited until the command
-                          // completed, the descriptor fetch latency dropped the
-                          // first several data words and shifted the whole
-                          // block early.
+                          // Start the ADMA at command issue, so its first
+                          // memory access overlaps the command and response.
                           If(
                             bus.dataIn[10] & bus.dataIn[8],
                             then: [
-                              // Direct single-buffer DMA: ADMA_ADDR IS the buffer
-                              // physical address and BLK_COUNT*BLK_SIZE is the
-                              // length, so the engine NEVER fetches a descriptor
-                              // from DRAM. A DRAM descriptor fetch races the CPU's
-                              // descriptor store on silicon (a stale fetch makes a
-                              // chunk write to the wrong buffer / the stack and
-                              // corrupt the return frame). No fetch == no race.
-                              descAddr < admaBase,
-                              descBytes <
-                                  (blkCount * blkSize.zeroExtend(16)).getRange(
-                                    0,
-                                    16,
-                                  ),
-                              descEnd < Const(1),
+                              fetchHi < Const(0),
                               If(
-                                bus.dataIn[9],
-                                then: [admaState < Const(aMemWrite, width: 3)],
-                                orElse: [admaState < Const(aMemRead, width: 3)],
+                                bus.dataIn[11],
+                                then: [
+                                  descPtr < admaBase,
+                                  admaState < Const(aFetch, width: 3),
+                                ],
+                                // One buffer: ADMA_ADDR is its address and
+                                // BLK_COUNT * BLK_SIZE its length.
+                                orElse: [
+                                  descAddr < admaBase,
+                                  descBytes <
+                                      (blkCount * blkSize.zeroExtend(16))
+                                          .getRange(0, 16),
+                                  descEnd < Const(1),
+                                  If(
+                                    bus.dataIn[9],
+                                    then: [
+                                      admaState < Const(aMemWrite, width: 3),
+                                    ],
+                                    orElse: [
+                                      admaState < Const(aMemRead, width: 3),
+                                    ],
+                                  ),
+                                ],
                               ),
                             ],
                           ),
@@ -2066,8 +1993,12 @@ class HarborSdioController extends BridgeModule
                 CaseItem(Const(0x0C, width: 9), [
                   If(
                     bus.we,
-                    then: [intStatus < (intStatus & ~bus.selMasked(0x60, 8))],
-                    orElse: [bus.dataOut < intStatus.zeroExtend(dw)],
+                    then: [
+                      intStatus < (intStatus & ~bus.selMasked(0x60, 8)),
+                      admaErr <
+                          ((admaErr | dmaFault) & ~bus.selMasked(0x60, 8)[7]),
+                    ],
+                    orElse: [bus.dataOut < intView.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x68: INT_ENABLE.

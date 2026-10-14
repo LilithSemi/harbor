@@ -1,5 +1,7 @@
 import 'package:rohd/rohd.dart';
 
+import '../arith/fpu_config.dart';
+import '../bus/port/memory_waist.dart';
 import '../soc/target.dart';
 import 'double_line_buffer.dart';
 import 'line_fetcher.dart';
@@ -20,10 +22,10 @@ import 'line_fetcher.dart';
 /// line had not completed by the swap.
 ///
 /// [pixel] is registered: it is the word at the [col] of the cycle before.
-/// The system side reads memory through one of two ports. Give [mDataIn]
-/// and [mAck] for a Wishbone master (`m_*`, a [HarborLineFetcher]), which
-/// gives the bus back after every [burstWords] words. Give [rqReady],
-/// [rdValid] and [rdData] for a scanout port (`rq_*`, a
+/// The system side reads memory through one of two ports. Give [memory] for
+/// a memory master waist (a [HarborLineFetcher]), which issues a new
+/// [burstWords]-beat request as soon as the waist takes the previous one.
+/// Give [rqReady], [rdValid] and [rdData] for a scanout port (`rq_*`, a
 /// [HarborScanoutFetcher]), such as a [HarborSdram] scanout port. Then
 /// [sysClk] and [sysReset] are the clock and reset of that port, and the
 /// low 2 bits of [fbBase] and [stride] are ignored.
@@ -33,14 +35,6 @@ class HarborDualClockScanout extends Module {
 
   /// Latches if a line was not ready at a swap.
   Logic get underrun => output('underrun');
-
-  /// Wishbone master (system domain).
-  Logic get mStb => output('m_stb');
-  Logic get mCyc => output('m_cyc');
-  Logic get mWe => output('m_we');
-  Logic get mAddr => output('m_adr');
-  Logic get mSel => output('m_sel');
-  Logic get mDataOut => output('m_dat_o');
 
   /// Scanout port requests (system domain).
   Logic get rqValid => output('rq_valid');
@@ -69,8 +63,7 @@ class HarborDualClockScanout extends Module {
     required Logic fbBase,
     required Logic stride,
     required Logic wordsPerLine,
-    Logic? mDataIn,
-    Logic? mAck,
+    HarborMemoryWaist? memory,
     Logic? rqReady,
     Logic? rdValid,
     Logic? rdData,
@@ -80,18 +73,25 @@ class HarborDualClockScanout extends Module {
     super.name = 'dual_clock_scanout',
   }) : scanoutPort = rqReady != null,
        super(
-         definitionName: rqReady != null
-             ? 'HarborDualClockScanoutPort_w$maxWords'
-             : 'HarborDualClockScanout',
+         definitionName: harborStableDefinitionName(
+           rqReady != null
+               ? 'HarborDualClockScanoutPort'
+               : 'HarborDualClockScanout',
+           [
+             'w$maxWords',
+             'ram${blockRam?.name ?? "flop"}',
+             if (memory != null) ...[
+               'b$burstWords',
+               'i${memory.config.idWidth}',
+               'n${memory.config.outstanding}',
+             ],
+           ],
+         ),
        ) {
-    final wishbone = mDataIn != null && mAck != null;
+    final mem = memory != null;
     final port = rqReady != null && rdValid != null && rdData != null;
-    if (wishbone == port ||
-        (!wishbone && (mDataIn != null || mAck != null)) ||
-        (!port && (rdValid != null || rdData != null))) {
-      throw ArgumentError(
-        'give either mDataIn and mAck, or rqReady, rdValid and rdData',
-      );
+    if (mem == port) {
+      throw ArgumentError('give either memory, or rqReady, rdValid and rdData');
     }
     pixelClk = addInput('pixel_clk', pixelClk);
     pixelReset = addInput('pixel_reset', pixelReset);
@@ -169,6 +169,13 @@ class HarborDualClockScanout extends Module {
         f.wrData,
       );
     } else {
+      final mWaist = memory!.clone()
+        ..pairConnectIO(
+          this,
+          memory,
+          PairRole.provider,
+          uniquify: (n) => 'm_$n',
+        );
       final f = HarborLineFetcher(
         clk: sysClk,
         reset: sysReset,
@@ -176,17 +183,10 @@ class HarborDualClockScanout extends Module {
         fetchAddr: reqAddrLatched,
         words: wordsPerLine,
         fillSel: reqFillLatched,
-        mDataIn: addInput('m_dat_i', mDataIn!, width: 32),
-        mAck: addInput('m_ack', mAck!),
+        waist: mWaist,
         maxWords: maxWords,
         burstWords: burstWords,
       );
-      addOutput('m_stb') <= f.mStb;
-      addOutput('m_cyc') <= f.mCyc;
-      addOutput('m_we') <= f.mWe;
-      addOutput('m_adr', width: 32) <= f.mAddr;
-      addOutput('m_sel', width: 4) <= f.mSel;
-      addOutput('m_dat_o', width: 32) <= f.mDataOut;
       (fetchDone, wrEn, wrSel, wrIdx, wrData) = (
         f.done,
         f.wrEn,

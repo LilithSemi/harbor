@@ -2,6 +2,7 @@ import 'dart:math';
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
+import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:test/test.dart';
 
 import 'cdc_harness.dart';
@@ -252,6 +253,21 @@ Future<void> _waitsForRequest() async {
   await b.ms.stop();
 }
 
+/// A crossed AXI4 memory master port, with its AXI4 port on `bus_*`, its
+/// device waist on `up_*` and its clocks on plain ports.
+class _CrossedMaster extends BridgeModule {
+  _CrossedMaster() : super('CdcTestCrossedMaster', name: 'top') {
+    final dev = addSubModule(
+      CdcMemDevice(_cfg, HarborFabricKind.axi4, slave: false, cross: true),
+    );
+    for (final p in ['clk', 'reset', 'fclk', 'freset']) {
+      pullUpPort(dev.port(p), newPortName: p);
+    }
+    pullUpInterface(dev.interface('bus'), newIntfName: 'bus');
+    pullUpInterface(dev.interface('up'), newIntfName: 'up');
+  }
+}
+
 void main() {
   tearDown(endAndReset);
 
@@ -284,6 +300,46 @@ void main() {
   test(
     'write data waits for its request on the device side',
     () => isolated(_waitsForRequest),
+  );
+
+  test(
+    'a read response with no read in flight never reaches the device',
+    () async {
+      final top = _CrossedMaster();
+      final clk = SimpleClockGenerator(10).clk;
+      for (final input in top.inputs.values) {
+        if (input.name != 'clk' && input.name != 'fclk') {
+          input.srcConnection!.put(0);
+        }
+      }
+      top.input('clk').srcConnection! <= clk;
+      top.input('fclk').srcConnection! <= clk;
+      await top.build();
+      void set(String p, int v) => top.input(p).srcConnection!.inject(v);
+      set('reset', 1);
+      set('freset', 1);
+      var seen = false;
+      var falls = 0;
+      clk.negedge.listen((_) {
+        falls++;
+        if (falls == 4) {
+          set('reset', 0);
+          set('freset', 0);
+        }
+        if (falls == 20) {
+          set('bus_RVALID', 1);
+          set('bus_RDATA', 0x1234);
+          set('bus_RLAST', 1);
+        }
+        if (falls == 21) set('bus_RVALID', 0);
+        if (falls > 20 && top.output('up_RDATA_VALID').value.toBool()) {
+          seen = true;
+        }
+      });
+      Simulator.setMaxSimTime(1000);
+      await Simulator.run();
+      expect(seen, isFalse);
+    },
   );
 
   test('a port on the fabric clock has no crossing', () async {

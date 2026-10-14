@@ -41,8 +41,10 @@ class _BenchMaster extends BridgeModule {
 class _BenchDisplay extends BridgeModule {
   _BenchDisplay(
     WishboneConfig cfg, {
+    required HarborFabricKind kind,
     required HarborDisplayTiming timing,
     required int burstWords,
+    int outstanding = 1,
   }) : super('BenchDisplay', name: 'display') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -50,13 +52,18 @@ class _BenchDisplay extends BridgeModule {
     createPort('pixel_reset', PortDirection.input);
     createPort('fb_base', PortDirection.input, width: 32);
     createPort('enable', PortDirection.input);
-    final bus =
-        addInterface(
-              WishboneInterface(cfg),
-              name: 'bus',
-              role: PairRole.provider,
-            ).internalInterface
-            as WishboneInterface;
+    final mem = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'bus',
+      kind: kind,
+      config: HarborMemoryWaistConfig(
+        addressWidth: cfg.addressWidth,
+        dataWidth: cfg.dataWidth,
+        outstanding: outstanding,
+      ),
+      clk: input('clk'),
+      reset: input('reset'),
+    );
     final shift = Const(0);
     final d = HarborDualClockDisplay(
       target: const HarborSimTarget(),
@@ -69,16 +76,9 @@ class _BenchDisplay extends BridgeModule {
       sysReset: input('reset'),
       enable: input('enable'),
       fbBase: input('fb_base'),
-      mDataIn: bus.datMiso,
-      mAck: bus.ack,
+      memory: mem.waist,
       burstWords: burstWords,
     );
-    bus.cyc <= d.mCyc;
-    bus.stb <= d.mStb;
-    bus.we <= d.mWe;
-    bus.adr <= d.mAddr;
-    bus.sel <= d.mSel;
-    bus.datMosi <= d.mDataOut;
     addOutput('underrun') <= d.underrun;
   }
 }
@@ -170,8 +170,15 @@ class ScanoutContentionBench {
     soc = HarborSoC(name: 'ScanoutSoC', compatible: 'test,scanout');
     bench = soc.addMaster(_BenchMaster(cfg), busInterfaceName: 'bus');
     display = soc.addMaster(
-      _BenchDisplay(cfg, timing: timing, burstWords: burstWords),
+      _BenchDisplay(
+        cfg,
+        kind: HarborFabricKind.wishbone,
+        timing: timing,
+        burstWords: burstWords,
+      ),
       busInterfaceName: 'bus',
+      memory: true,
+      outstanding: 1,
     );
     sdram = soc.addPeripheral(
       HarborSdram(

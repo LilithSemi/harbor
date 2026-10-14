@@ -5,82 +5,36 @@ import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:test/test.dart';
 
+import '../util/mem_target.dart';
 import 'test_harness.dart';
 
-/// A minimal Wishbone slave that single-cycle-acks every write and records the
-/// last address, last data, an OR of all data words, and a write count. Used to
-/// stand in for memory on the SPI controller's DMA master interface.
-class _DmaCaptureSlave extends BridgeModule {
-  _DmaCaptureSlave(WishboneConfig cfg)
-    : super('DmaCaptureSlave', name: 'capslave') {
-    createPort('clk', PortDirection.input);
-    createPort('reset', PortDirection.input);
-    final ref = addInterface(
-      WishboneInterface(cfg),
-      name: 'bus',
-      role: PairRole.consumer,
-    );
-    final wb = ref.internalInterface!;
-
-    final ack = Logic(name: 'ack');
-    final lastAddr = Logic(name: 'last_addr_r', width: cfg.addressWidth);
-    final lastData = Logic(name: 'last_data_r', width: cfg.dataWidth);
-    final count = Logic(name: 'count_r', width: 32);
-    final dataOr = Logic(name: 'data_or_r', width: cfg.dataWidth);
-
-    wb.ack <= ack;
-    wb.datMiso <= Const(0, width: cfg.dataWidth);
-    addOutput('o_last_addr', width: cfg.addressWidth) <= lastAddr;
-    addOutput('o_last_data', width: cfg.dataWidth) <= lastData;
-    addOutput('o_count', width: 32) <= count;
-    addOutput('o_data_or', width: cfg.dataWidth) <= dataOr;
-
-    Sequential(input('clk'), [
-      If(
-        input('reset'),
-        then: [
-          ack < Const(0),
-          lastAddr < Const(0, width: cfg.addressWidth),
-          lastData < Const(0, width: cfg.dataWidth),
-          count < Const(0, width: 32),
-          dataOr < Const(0, width: cfg.dataWidth),
-        ],
-        orElse: [
-          If(
-            wb.cyc & wb.stb & ~ack,
-            then: [
-              ack < Const(1),
-              If(
-                wb.we,
-                then: [
-                  lastAddr < wb.adr,
-                  lastData < wb.datMosi,
-                  dataOr < (dataOr | wb.datMosi),
-                  count < (count + Const(1, width: 32)),
-                ],
-              ),
-            ],
-            orElse: [ack < Const(0)],
-          ),
-        ],
-      ),
-    ]);
-  }
-}
-
-/// Test bench that programs the SPI controller over its slave bus and captures
-/// the DMA master's writes with a [_DmaCaptureSlave]. Mirrors
-/// [PeripheralTestBench] but also wires the `dma` master interface.
+/// Test bench that programs the SPI controller over its slave bus and
+/// captures the DMA master port's writes with a [MasterTop] + [BeatMemory].
+/// Mirrors [PeripheralTestBench] but also wires the `dma` master interface.
 class _DmaSpiBench extends BridgeModule {
   final HarborSpiController spi;
   late final WishboneMasterTestDriver master;
-  late final _DmaCaptureSlave slave;
+  late final MasterTop memTop;
+  late final BeatMemory mem;
   late final Logic clk;
   late final int _selWidth;
   int get _fullSel => (1 << _selWidth) - 1;
 
   Logic get ack => master.output('m_ack');
   Logic get datIn => master.output('m_dat_in');
+
+  /// Number of write beats the memory has seen.
+  int get writeCount => mem.log.where((e) => e.$1).length;
+
+  /// Byte address of the last write beat.
+  int get lastWriteAddr => mem.log.lastWhere((e) => e.$1).$2;
+
+  /// Data of the last write beat.
+  int get lastWriteData => mem.log.lastWhere((e) => e.$1).$3;
+
+  /// Bitwise OR of every write beat's data.
+  int get writeDataOr =>
+      mem.log.where((e) => e.$1).fold(0, (acc, e) => acc | e.$3);
 
   _DmaSpiBench(this.spi) : super('DmaSpiBench', name: 'dtb') {
     final clkGen = SimpleClockGenerator(10);
@@ -91,20 +45,31 @@ class _DmaSpiBench extends BridgeModule {
     final wb = spi.interface('bus').internalInterface! as WishboneInterface;
     _selWidth = wb.config.effectiveSelWidth;
     final dmaWb = spi.interface('dma').internalInterface! as WishboneInterface;
+    final cfg = HarborMemoryWaistConfig(
+      addressWidth: dmaWb.config.addressWidth,
+      dataWidth: dmaWb.config.dataWidth,
+    );
 
+    memTop = MasterTop(
+      spi,
+      iface: 'dma',
+      kind: HarborFabricKind.wishbone,
+      config: cfg,
+    );
     master = WishboneMasterTestDriver(config: wb.config);
-    slave = _DmaCaptureSlave(dmaWb.config);
     addSubModule(master);
-    addSubModule(spi);
-    addSubModule(slave);
+    addSubModule(memTop);
 
     connectPorts(port('clk'), master.port('clk'));
-    connectPorts(port('clk'), spi.port('clk'));
-    connectPorts(port('reset'), spi.port('reset'));
-    connectPorts(port('clk'), slave.port('clk'));
-    connectPorts(port('reset'), slave.port('reset'));
-    connectInterfaces(master.interface('bus'), spi.interface('bus'));
-    connectInterfaces(spi.interface('dma'), slave.interface('bus'));
+    connectPorts(port('clk'), memTop.port('clk'));
+    connectPorts(port('reset'), memTop.port('reset'));
+    if (memTop.inputs.containsKey('fabric_clk')) {
+      connectPorts(port('clk'), memTop.port('fabric_clk'));
+      connectPorts(port('reset'), memTop.port('fabric_reset'));
+    }
+    connectInterfaces(master.interface('bus'), memTop.interface('bus'));
+
+    mem = BeatMemory(memTop, clk);
 
     pullUpPort(master.port('m_cyc'), newPortName: 'cyc');
     pullUpPort(master.port('m_stb'), newPortName: 'stb');
@@ -127,6 +92,7 @@ class _DmaSpiBench extends BridgeModule {
     input('adr').inject(0);
     input('dat_out').inject(0);
     input('sel').inject(_fullSel);
+    mem.start();
 
     Simulator.setMaxSimTime(maxSimTime);
     unawaited(Simulator.run());
@@ -177,11 +143,6 @@ class _DmaSpiBench extends BridgeModule {
     for (var i = 0; i < n; i++) {
       await clk.nextPosedge;
     }
-  }
-
-  int slaveOut(String name) {
-    final v = slave.output(name).value;
-    return v.isValid ? v.toInt() : -1;
   }
 }
 
@@ -237,32 +198,86 @@ void main() {
       await Simulator.endSimulation();
     });
 
-    test('DMA read packs SPI bytes into memory words (32-bit fabric)', () async {
-      // dma:true adds the Wishbone master engine. Drive MISO high so every
-      // clocked-in byte is 0xFF; the capture slave acks and records each beat.
-      // 8 bytes over a 32-bit fabric = two 0xFFFFFFFF words at 0x100/0x104.
-      final spi = HarborSpiController(baseAddress: 0x5000, dma: true);
-      spi.port('spi_miso').getsLogic(Const(1));
+    test(
+      'DMA read packs SPI bytes into memory words (32-bit fabric)',
+      () async {
+        // dma:true adds the master memory port engine. Drive MISO high so every
+        // clocked-in byte is 0xFF; the memory model acks and records each beat.
+        // 8 bytes over a 32-bit fabric = two 0xFFFFFFFF words at 0x100/0x104.
+        final spi = HarborSpiController(baseAddress: 0x5000, dma: true);
+
+        final tb = _DmaSpiBench(spi);
+        tb.memTop.input('spi_miso').srcConnection! <= Const(1);
+        await tb.init();
+
+        await tb.write(0x00, 0x01); // CTRL: enable
+        await tb.write(0x18, 1); // DIVIDER: fast
+        await tb.write(0x28, 0x100); // DMA_ADDR
+        await tb.write(0x30, 8); // DMA_LEN: 8 bytes
+        await tb.write(0x38, 0x01); // DMA_CTRL: START, DIR=0
+
+        await tb.waitCycles(800);
+
+        expect(tb.writeCount, equals(2), reason: '2 word writes');
+        expect(tb.lastWriteAddr, equals(0x104));
+        expect(tb.lastWriteData, equals(0xFFFFFFFF));
+        expect(
+          tb.writeDataOr,
+          equals(0xFFFFFFFF),
+          reason: 'every packed byte was 0xFF',
+        );
+
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('DMA through a clock crossing writes each word once', () async {
+      final spi = HarborSpiController(
+        baseAddress: 0x5000,
+        dma: true,
+        crossFabricClock: true,
+      );
 
       final tb = _DmaSpiBench(spi);
+      tb.memTop.input('spi_miso').srcConnection! <= Const(1);
       await tb.init();
 
-      await tb.write(0x00, 0x01); // CTRL: enable
-      await tb.write(0x18, 1); // DIVIDER: fast
-      await tb.write(0x28, 0x100); // DMA_ADDR
-      await tb.write(0x30, 8); // DMA_LEN: 8 bytes
-      await tb.write(0x38, 0x01); // DMA_CTRL: START, DIR=0
+      await tb.write(0x00, 0x01);
+      await tb.write(0x18, 1);
+      for (final base in [0x100, 0x200]) {
+        await tb.write(0x28, base);
+        await tb.write(0x30, 8);
+        await tb.write(0x38, 0x01);
+        await tb.waitCycles(1500);
+      }
 
+      expect([
+        for (final e in tb.mem.log.where((e) => e.$1)) e.$2,
+      ], equals([0x100, 0x104, 0x200, 0x204]));
+
+      await Simulator.endSimulation();
+    });
+
+    test('a START while the DMA is busy is ignored', () async {
+      final spi = HarborSpiController(baseAddress: 0x5000, dma: true);
+
+      final tb = _DmaSpiBench(spi);
+      tb.memTop.input('spi_miso').srcConnection! <= Const(1);
+      await tb.init();
+
+      await tb.write(0x00, 0x01);
+      await tb.write(0x18, 1);
+      await tb.write(0x28, 0x100);
+      await tb.write(0x30, 8);
+      await tb.write(0x38, 0x01);
+      // The second START comes in the middle of the first word.
+      await tb.waitCycles(60);
+      await tb.write(0x38, 0x01);
       await tb.waitCycles(800);
 
-      expect(tb.slaveOut('o_count'), equals(2), reason: '2 word writes');
-      expect(tb.slaveOut('o_last_addr'), equals(0x104));
-      expect(tb.slaveOut('o_last_data'), equals(0xFFFFFFFF));
-      expect(
-        tb.slaveOut('o_data_or'),
-        equals(0xFFFFFFFF),
-        reason: 'every packed byte was 0xFF',
-      );
+      expect([
+        for (final e in tb.mem.log.where((e) => e.$1)) (e.$2, e.$3),
+      ], equals([(0x100, 0xFFFFFFFF), (0x104, 0xFFFFFFFF)]));
 
       await Simulator.endSimulation();
     });
@@ -274,9 +289,9 @@ void main() {
         // re-initialises cleanly between transfers: run two DMAs and confirm the
         // second lands the right words at the right address with DMA_DONE re-set.
         final spi = HarborSpiController(baseAddress: 0x5000, dma: true);
-        spi.port('spi_miso').getsLogic(Const(1));
 
         final tb = _DmaSpiBench(spi);
+        tb.memTop.input('spi_miso').srcConnection! <= Const(1);
         await tb.init();
 
         await tb.write(0x00, 0x01); // CTRL enable
@@ -287,8 +302,8 @@ void main() {
         await tb.write(0x30, 8);
         await tb.write(0x38, 0x01); // START
         await tb.waitCycles(800);
-        expect(tb.slaveOut('o_count'), equals(2), reason: 'first transfer');
-        expect(tb.slaveOut('o_last_addr'), equals(0x104));
+        expect(tb.writeCount, equals(2), reason: 'first transfer');
+        expect(tb.lastWriteAddr, equals(0x104));
 
         // Transfer 2: 8 bytes to a fresh 0x200 -> two more words, no leftover
         // state from transfer 1 (address/byte-index/word all re-init on START).
@@ -296,9 +311,9 @@ void main() {
         await tb.write(0x30, 8);
         await tb.write(0x38, 0x01); // START
         await tb.waitCycles(800);
-        expect(tb.slaveOut('o_count'), equals(4), reason: 'both transfers');
-        expect(tb.slaveOut('o_last_addr'), equals(0x204));
-        expect(tb.slaveOut('o_last_data'), equals(0xFFFFFFFF));
+        expect(tb.writeCount, equals(4), reason: 'both transfers');
+        expect(tb.lastWriteAddr, equals(0x204));
+        expect(tb.lastWriteData, equals(0xFFFFFFFF));
 
         // DMA_DONE is latched again after the second transfer.
         final status = await tb.read(0x08);
@@ -316,9 +331,9 @@ void main() {
       // reads). Confirm one DMA sets DONE, a non-bit-4 write leaves it, and a
       // bit-4 write clears it.
       final spi = HarborSpiController(baseAddress: 0x5000, dma: true);
-      spi.port('spi_miso').getsLogic(Const(1));
 
       final tb = _DmaSpiBench(spi);
+      tb.memTop.input('spi_miso').srcConnection! <= Const(1);
       await tb.init();
 
       await tb.write(0x00, 0x01); // CTRL enable
@@ -360,9 +375,9 @@ void main() {
         busDataWidth: 64,
         dma: true,
       );
-      spi.port('spi_miso').getsLogic(Const(1));
 
       final tb = _DmaSpiBench(spi);
+      tb.memTop.input('spi_miso').srcConnection! <= Const(1);
       await tb.init();
 
       await tb.write(0x00, 0x01); // CTRL: enable
@@ -373,9 +388,10 @@ void main() {
 
       await tb.waitCycles(1600);
 
-      expect(tb.slaveOut('o_count'), equals(2), reason: '16B = two 64b beats');
-      expect(tb.slaveOut('o_last_addr'), equals(0x208));
-      expect(tb.slaveOut('o_last_data'), equals(-1 & 0xFFFFFFFFFFFFFFFF));
+      expect(tb.writeCount, equals(2), reason: '16B = two 64b beats');
+      expect(tb.lastWriteAddr, equals(0x208));
+      // An all-ones 64-bit beat is -1 as a Dart int.
+      expect(tb.lastWriteData, equals(-1));
       await Simulator.endSimulation();
     });
 

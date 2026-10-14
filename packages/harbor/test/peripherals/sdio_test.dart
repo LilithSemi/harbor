@@ -4,6 +4,7 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/mem_target.dart';
 import '../util/reg_bus.dart';
 
 // Register byte offsets: each register in its own 8-byte slot (the byte-addressed
@@ -94,92 +95,14 @@ List<int> _fourBitStream(int word) {
   return [0, ...data, ...crc];
 }
 
-/// Wires a 16-word memory model to [sdio]'s raw ADMA master port. [ackDelay]
-/// holds every beat off that many cycles before acking, the way a real DDR
-/// controller does.
-List<Logic> _wireAdmaMemory(
-  HarborSdioController sdio,
-  Logic clk,
-  Logic reset, {
-  List<int> dmaMem = const [],
-  int ackDelay = 0,
-  int dmaDataWidth = 32,
-}) {
-  final initVals = [
-    for (var i = 0; i < 16; i++) i < dmaMem.length ? dmaMem[i] : 0,
-  ];
-  final mem = [for (var i = 0; i < 16; i++) Logic(name: 'mem$i', width: 32)];
-  final mStb = sdio.output('dma_stb');
-  final mWe = sdio.output('dma_we');
-  final mAddr = sdio.output('dma_addr');
-  final mWdata = sdio.output('dma_wdata');
-  final mSel = sdio.output('dma_sel');
-  final mIdx = mAddr.getRange(2, 6); // 32-bit word index 0..15
-  final mPair = mAddr.getRange(3, 6); // 64-bit beat index 0..7
-  final ackCnt = Logic(name: 'ack_cnt', width: 8);
-  final ackNow = (mStb & ackCnt.eq(Const(ackDelay, width: 8))).named('ack_now');
-  // Byte-enables decide which half of a 64-bit beat commits, so a packed
-  // beat (SEL=0xFF) lands both words and a half beat lands only its own.
-  final selLo = mSel.getRange(0, 4).or().named('sel_lo');
-  final selHi = dmaDataWidth == 64
-      ? mSel.getRange(4, 8).or().named('sel_hi')
-      : Const(0);
-  Sequential(
-    clk,
-    reset: reset,
-    resetValues: {
-      for (var i = 0; i < 16; i++) mem[i]: Const(initVals[i], width: 32),
-      ackCnt: Const(0, width: 8),
-    },
-    [
-      If(
-        mStb,
-        then: [
-          If(
-            ackCnt.lt(Const(ackDelay, width: 8)),
-            then: [ackCnt < (ackCnt + Const(1, width: 8))],
-          ),
-        ],
-        orElse: [ackCnt < Const(0, width: 8)],
-      ),
-      If(
-        ackNow & mWe,
-        then: [
-          if (dmaDataWidth == 32)
-            for (var i = 0; i < 16; i++)
-              If(mIdx.eq(Const(i, width: 4)), then: [mem[i] < mWdata])
-          else
-            for (var p = 0; p < 8; p++)
-              If(
-                mPair.eq(Const(p, width: 3)),
-                then: [
-                  If(selLo, then: [mem[2 * p] < mWdata.getRange(0, 32)]),
-                  If(selHi, then: [mem[2 * p + 1] < mWdata.getRange(32, 64)]),
-                ],
-              ),
-        ],
-      ),
-    ],
-  );
-  Logic mRd;
-  if (dmaDataWidth == 32) {
-    mRd = mem[15];
-    for (var i = 14; i >= 0; i--) {
-      mRd = mux(mIdx.eq(Const(i, width: 4)), mem[i], mRd);
-    }
-  } else {
-    mRd = [mem[15], mem[14]].swizzle();
-    for (var p = 6; p >= 0; p--) {
-      mRd = mux(
-        mPair.eq(Const(p, width: 3)),
-        [mem[2 * p + 1], mem[2 * p]].swizzle(),
-        mRd,
-      );
+/// Ties every input of the ADMA master interface low, for a test that does
+/// not use the ADMA.
+void _tieDma(HarborSdioController sdio) {
+  for (final e in sdio.inputs.entries) {
+    if (e.key.startsWith('dma_')) {
+      e.value.srcConnection! <= Const(0, width: e.value.width);
     }
   }
-  sdio.input('dma_rdata').srcConnection! <= mRd;
-  sdio.input('dma_ack').srcConnection! <= ackNow;
-  return mem;
 }
 
 void main() {
@@ -261,7 +184,11 @@ void main() {
     late Logic clk, reset, stb, we, adr, mosi;
     late Logic cmdIn, cmdOut, cmdOe, sdClk, irq;
     late Logic datIn, datOut, datOe;
-    late List<Logic> mem; // ADMA bus-master memory model (16 words)
+    late MasterTop top;
+    late BeatMemory memory;
+
+    // 32-bit word [i] of the ADMA memory.
+    int mem(int i) => memory.readBytes(4 * i, 4);
 
     Future<void> busWrite(int addr, int data) async {
       adr.inject(addr);
@@ -269,7 +196,7 @@ void main() {
       we.inject(1);
       stb.inject(1);
       await clk.nextPosedge;
-      while (sdio.output('bus_ACK').value.toInt() != 1) {
+      while (top.output('bus_ACK').value.toInt() != 1) {
         await clk.nextPosedge;
       }
       stb.inject(0);
@@ -285,10 +212,10 @@ void main() {
       we.inject(0);
       stb.inject(1);
       await clk.nextPosedge;
-      while (sdio.output('bus_ACK').value.toInt() != 1) {
+      while (top.output('bus_ACK').value.toInt() != 1) {
         await clk.nextPosedge;
       }
-      final v = sdio.output('bus_DAT_MISO').value.toInt();
+      final v = top.output('bus_DAT_MISO').value.toInt();
       for (var i = 0; i < hold; i++) {
         await clk.nextPosedge;
       }
@@ -302,10 +229,10 @@ void main() {
       we.inject(0);
       stb.inject(1);
       await clk.nextPosedge;
-      while (sdio.output('bus_ACK').value.toInt() != 1) {
+      while (top.output('bus_ACK').value.toInt() != 1) {
         await clk.nextPosedge;
       }
-      final v = sdio.output('bus_DAT_MISO').value.toInt();
+      final v = top.output('bus_DAT_MISO').value.toInt();
       stb.inject(0);
       await clk.nextPosedge;
       return v;
@@ -322,6 +249,16 @@ void main() {
         rxFifoDepth: fifoDepth,
         dmaDataWidth: dmaDataWidth,
       );
+      top = MasterTop(
+        sdio,
+        iface: 'dma',
+        kind: HarborFabricKind.wishbone,
+        config: HarborMemoryWaistConfig(
+          addressWidth: 32,
+          dataWidth: dmaDataWidth,
+          outstanding: 4,
+        ),
+      );
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
       stb = Logic(name: 'stb');
@@ -331,39 +268,34 @@ void main() {
       cmdIn = Logic(name: 'cmd_in');
       datIn = Logic(name: 'dat_in', width: 4);
 
-      sdio.input('clk').srcConnection! <= clk;
-      sdio.input('reset').srcConnection! <= reset;
-      sdio.input('bus_CYC').srcConnection! <= stb;
-      sdio.input('bus_STB').srcConnection! <= stb;
-      sdio.input('bus_WE').srcConnection! <= we;
-      sdio.input('bus_ADR').srcConnection! <= adr;
-      sdio.input('bus_DAT_MOSI').srcConnection! <= mosi;
-      sdio.input('bus_SEL').srcConnection! <=
-          Const(0xF, width: sdio.input('bus_SEL').width);
-      sdio.input('sd_cmd_in').srcConnection! <= cmdIn;
-      sdio.input('sd_cd').srcConnection! <= Const(0);
-      sdio.input('sd_dat_in').srcConnection! <= datIn;
+      top.input('clk').srcConnection! <= clk;
+      top.input('reset').srcConnection! <= reset;
+      top.input('bus_CYC').srcConnection! <= stb;
+      top.input('bus_STB').srcConnection! <= stb;
+      top.input('bus_WE').srcConnection! <= we;
+      top.input('bus_ADR').srcConnection! <= adr;
+      top.input('bus_DAT_MOSI').srcConnection! <= mosi;
+      top.input('bus_SEL').srcConnection! <=
+          Const(0xF, width: top.input('bus_SEL').width);
+      top.input('sd_cmd_in').srcConnection! <= cmdIn;
+      top.input('sd_cd').srcConnection! <= Const(0);
+      top.input('sd_dat_in').srcConnection! <= datIn;
 
-      // A 16-word memory model on the ADMA master port. [ackDelay] holds every
-      // beat off for that many cycles before acking, which is what a real DDR
-      // controller does and what the 1-cycle model hid.
-      mem = _wireAdmaMemory(
-        sdio,
-        clk,
-        reset,
-        dmaMem: dmaMem,
-        ackDelay: ackDelay,
-        dmaDataWidth: dmaDataWidth,
-      );
+      // [ackDelay] holds every beat off for that many cycles, the way a real
+      // DDR controller does.
+      memory = BeatMemory(top, clk, latency: ackDelay);
 
-      await sdio.build();
+      await top.build();
+      for (var i = 0; i < dmaMem.length; i++) {
+        memory.writeBytes(4 * i, dmaMem[i], 4);
+      }
 
-      cmdOut = sdio.output('sd_cmd_out');
-      cmdOe = sdio.output('sd_cmd_oe');
-      sdClk = sdio.output('sd_clk');
-      irq = sdio.output('interrupt');
-      datOut = sdio.output('sd_dat_out');
-      datOe = sdio.output('sd_dat_oe');
+      cmdOut = top.output('sd_cmd_out');
+      cmdOe = top.output('sd_cmd_oe');
+      sdClk = top.output('sd_clk');
+      irq = top.output('interrupt');
+      datOut = top.output('sd_dat_out');
+      datOe = top.output('sd_dat_oe');
 
       reset.inject(1);
       stb.inject(0);
@@ -372,6 +304,7 @@ void main() {
       mosi.inject(0);
       cmdIn.inject(1); // CMD line idles high
       datIn.inject(0);
+      memory.start();
       Simulator.setMaxSimTime(2000000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
@@ -647,8 +580,8 @@ void main() {
 
         const word = 0x11223344;
         await busWrite(_blkSize, 4);
-        // irq on data-done only, so the loop runs through the busy phase to the
-        // end and we then read the sticky write-error bit.
+        // irq on data-done only. A rejected block has no busy, so data-done
+        // comes right after the token.
         await busWrite(_intEnable, 0x02);
         await busWrite(_data, word);
         await busWrite(_cmdArg, 0);
@@ -656,8 +589,8 @@ void main() {
 
         datIn.inject(1);
         final resp = _resp48(0);
-        // Card CRC-status token 101 (not 010 = accepted), then busy-low/high.
-        const statusBusy = [0, 1, 0, 1, 0, 1];
+        // Card CRC-status token 101 (not 010 = accepted), then DAT0 high.
+        const statusBusy = [0, 1, 0, 1];
 
         var sawCmd = false, sawDat = false, ri = 0, si = 0;
         for (var i = 0; i < 8000; i++) {
@@ -825,7 +758,7 @@ void main() {
       expect(status & 0x02, equals(0x02)); // data-done
       expect(status & 0x08, equals(0)); // no CRC error
       // The engine stored the received word to the descriptor's buffer.
-      expect(mem[8].value.toInt(), equals(word));
+      expect(mem(8), equals(word));
       await Simulator.endSimulation();
     });
 
@@ -886,7 +819,8 @@ void main() {
     });
 
     // Drives one CMD17 + ADMA read of `words` words and returns how many system
-    // clocks the data phase took, so two ack latencies can be compared.
+    // clocks the SD data phase took, so two ack latencies can be compared. It
+    // returns after data-done.
     Future<int> timedAdmaRead(List<int> words) async {
       final resp = _resp48(0);
       // One block: a single start bit, every word's bits, then one CRC16 over
@@ -895,7 +829,7 @@ void main() {
       final datStream = [0, ...dataBits, ..._crc16(dataBits)];
       final total = resp.length + datStream.length;
 
-      var sawDrive = false, idx = 0, datStart = -1, cycles = 0;
+      var sawDrive = false, idx = 0, datStart = -1, datEnd = -1, cycles = 0;
       for (var i = 0; i < 40000; i++) {
         await clk.nextPosedge;
         cycles++;
@@ -909,10 +843,11 @@ void main() {
             datIn.inject(datStream[idx - resp.length]);
           }
           idx++;
+          if (idx == total) datEnd = cycles;
         }
         if (irq.value.toInt() == 1) break;
       }
-      return cycles - datStart;
+      return datEnd - datStart;
     }
 
     // Regression, found on an Arty S7 at 20 MHz: the receive engine used a
@@ -933,7 +868,7 @@ void main() {
       final fastCycles = await timedAdmaRead(words);
       expect(await busRead(_intStatus) & 0x02, equals(0x02));
       for (var i = 0; i < words.length; i++) {
-        expect(mem[8 + i].value.toInt(), equals(words[i]));
+        expect(mem(8 + i), equals(words[i]));
       }
       await Simulator.endSimulation();
       await Simulator.reset();
@@ -949,7 +884,7 @@ void main() {
       expect(await busRead(_intStatus) & 0x02, equals(0x02));
       expect(await busRead(_intStatus) & 0x08, equals(0)); // no CRC error
       for (var i = 0; i < words.length; i++) {
-        expect(mem[8 + i].value.toInt(), equals(words[i]));
+        expect(mem(8 + i), equals(words[i]));
       }
 
       // The data phase must cost the same SD bus time either way. Allow a
@@ -963,97 +898,94 @@ void main() {
       await Simulator.endSimulation();
     });
 
-    // Regression, found on an Arty S7 clock sweep: block reads were flat across
-    // an 8x SD clock range, so the cost was not the SD bus. The ADMA drove
-    // CYC == STB, and the SoC arbiter locks its grant to whoever holds CYC, so
-    // the engine handed the bus back after EVERY word and re-arbitrated against
-    // a CPU spinning on STATUS. CYC must span a burst of beats instead.
-    test('the ADMA holds the bus across a burst instead of per beat', () async {
-      const words = [
-        0x11111111,
-        0x22222222,
-        0x33333333,
-        0x44444444,
-        0x55555555,
-        0x66666666,
-        0x77777777,
-        0x88888888,
-      ];
+    // A card read must reach memory as burst requests, and data-done must come
+    // only after the last write response, so the data is in memory when the
+    // driver sees it.
+    test(
+      'the ADMA sends burst writes and ends after the last response',
+      () async {
+        const words = [
+          0x11111111,
+          0x22222222,
+          0x33333333,
+          0x44444444,
+          0x55555555,
+          0x66666666,
+          0x77777777,
+          0x88888888,
+        ];
 
-      // The bus hold only matters when the ADMA is the bottleneck, which is the
-      // hardware case: a memory slower than the SD fill rate, so the RX FIFO
-      // backs up and the engine always has a word ready. With a fast memory the
-      // engine drains instantly and releasing per beat is the right thing.
-      // Descriptor: [addr=0x20, len=32 | end]; buffer is word 8 (byte 0x20).
-      await setUpDut(dmaMem: [0x20, 0x80000020], ackDelay: 200);
-      await busWrite(_blkSize, 32);
-      await busWrite(_intEnable, 0x12);
-      await busWrite(_admaAddr, 0x20);
-      await busWrite(_cmdArg, 0);
-      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
+        await setUpDut(ackDelay: 20);
+        await busWrite(_blkSize, 32);
+        await busWrite(_intEnable, 0x12);
+        await busWrite(_admaAddr, 0x20);
+        await busWrite(_cmdArg, 0);
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
 
-      final cyc = sdio.output('dma_cyc');
-      final stb = sdio.output('dma_stb');
-      var cycRises = 0, beats = 0, prevCyc = 0, prevStb = 0;
-      final resp = _resp48(0);
-      final dataBits = [for (final w in words) ..._wordBitsMsb(w)];
-      final datStream = [0, ...dataBits, ..._crc16(dataBits)];
-      final total = resp.length + datStream.length;
-
-      var sawDrive = false, idx = 0;
-      var prevSdLow = sdClk.value.toInt() == 0;
-      for (var i = 0; i < 200000; i++) {
-        await clk.nextPosedge;
-        final c = cyc.value.toInt();
-        final st = stb.value.toInt();
-        if (c == 1 && prevCyc == 0) cycRises++;
-        if (st == 1 && prevStb == 0) beats++;
-        prevCyc = c;
-        prevStb = st;
-        final sending = cmdOe.value.toInt() == 1;
-        if (sending) sawDrive = true;
-        final sdLow = sdClk.value.toInt() == 0;
-        if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
-          if (idx < resp.length) {
-            cmdIn.inject(resp[idx]);
-          } else {
-            datIn.inject(datStream[idx - resp.length]);
+        final w = sdio.dmaPort.waist;
+        bool hi(Logic l) => l.value.isValid && l.value.toBool();
+        final lens = <int>[];
+        var cycle = 0, lastResp = -1, doneAt = -1;
+        final sub = clk.negedge.listen((_) {
+          cycle++;
+          if (hi(w.reqValid) && hi(w.reqReady) && hi(w.reqWrite)) {
+            lens.add(w.reqLen.value.toInt());
           }
-          idx++;
+          if (hi(w.wrespValid) && hi(w.wrespReady)) lastResp = cycle;
+        });
+
+        final resp = _resp48(0);
+        final dataBits = [for (final w in words) ..._wordBitsMsb(w)];
+        final datStream = [0, ...dataBits, ..._crc16(dataBits)];
+        final total = resp.length + datStream.length;
+
+        var sawDrive = false, idx = 0;
+        var prevSdLow = sdClk.value.toInt() == 0;
+        for (var i = 0; i < 200000; i++) {
+          await clk.nextPosedge;
+          final sending = cmdOe.value.toInt() == 1;
+          if (sending) sawDrive = true;
+          final sdLow = sdClk.value.toInt() == 0;
+          if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
+            if (idx < resp.length) {
+              cmdIn.inject(resp[idx]);
+            } else {
+              datIn.inject(datStream[idx - resp.length]);
+            }
+            idx++;
+          }
+          prevSdLow = sdLow;
+          if (irq.value.toInt() == 1) {
+            doneAt = cycle;
+            break;
+          }
         }
-        prevSdLow = sdLow;
-        if (irq.value.toInt() == 1) break;
-      }
+        await sub.cancel();
 
-      expect(await busRead(_intStatus) & 0x02, equals(0x02)); // data-done
-      for (var i = 0; i < words.length; i++) {
-        expect(mem[8 + i].value.toInt(), equals(words[i]));
-      }
-
-      // Before the streaming fix STB pulsed once per beat, so a bus cycle ran
-      // for every word and the STB-rise count matched the word count. The
-      // streaming ADMA now buffers a wide-burst's worth of words and STREAMS
-      // them out under ONE continuous STB, so both STB and CYC are held across
-      // the batch and their rise counts collapse far below the word count. That
-      // continuous stream is exactly what lets the burst adapter combine the
-      // narrow words into wide DRAM bursts.
-      expect(
-        beats,
-        greaterThanOrEqualTo(1),
-        reason: 'the data phase must have driven at least one bus cycle',
-      );
-      expect(
-        beats,
-        lessThan(words.length),
-        reason: 'STB is now held across the batch, not pulsed once per word',
-      );
-      expect(
-        cycRises,
-        lessThanOrEqualTo(beats),
-        reason: 'CYC is held across the burst, at least as much as STB',
-      );
-      await Simulator.endSimulation();
-    });
+        expect(await busRead(_intStatus) & 0x02, equals(0x02)); // data-done
+        for (var i = 0; i < words.length; i++) {
+          expect(mem(8 + i), equals(words[i]));
+        }
+        expect(
+          lens.fold<int>(0, (a, l) => a + l + 1),
+          words.length,
+          reason: 'every word goes out once',
+        );
+        expect(
+          lens.length,
+          lessThan(words.length),
+          reason: 'requests carry bursts, not one word each',
+        );
+        expect(lens.where((l) => l > 0), isNotEmpty);
+        expect(lastResp, greaterThan(0));
+        expect(
+          doneAt,
+          greaterThan(lastResp),
+          reason: 'data-done came before the last write response',
+        );
+        await Simulator.endSimulation();
+      },
+    );
 
     // Byte stability under backpressure. A memory far slower than the SD fill
     // rate keeps the RX FIFO pressed against full for the whole block, which is
@@ -1109,23 +1041,15 @@ void main() {
       // Every word landed exactly once and in order. A wrapped write pointer
       // shows up here as a repeated or skipped word, not as a CRC error.
       for (var i = 0; i < words.length; i++) {
-        expect(
-          mem[5 + i].value.toInt(),
-          equals(words[i]),
-          reason: 'word $i came back wrong',
-        );
+        expect(mem(5 + i), equals(words[i]), reason: 'word $i came back wrong');
       }
       await Simulator.endSimulation();
     });
 
     /// Runs one ADMA card-read of [words] and returns how many memory beats and
-    /// packed (full-width) beats the engine issued.
+    /// full-width beats reached the memory.
     Future<({int beats, int packed})> countedAdmaRead(List<int> words) async {
-      final stbSig = sdio.output('dma_stb');
-      final weSig = sdio.output('dma_we');
-      final selSig = sdio.output('dma_sel');
-      final ackSig = sdio.input('dma_ack');
-      var beats = 0, packed = 0;
+      final first = memory.log.length;
 
       final resp = _resp48(0);
       final dataBits = [for (final w in words) ..._wordBitsMsb(w)];
@@ -1136,13 +1060,6 @@ void main() {
       var prevSdLow = sdClk.value.toInt() == 0;
       for (var i = 0; i < 200000; i++) {
         await clk.nextPosedge;
-        // A retired write beat: STB + WE with the ack back this cycle.
-        if (stbSig.value.toInt() == 1 &&
-            weSig.value.toInt() == 1 &&
-            ackSig.value.toInt() == 1) {
-          beats++;
-          if (selSig.value.toInt() == 0xFF) packed++;
-        }
         final sending = cmdOe.value.toInt() == 1;
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
@@ -1157,12 +1074,23 @@ void main() {
         prevSdLow = sdLow;
         if (irq.value.toInt() == 1) break;
       }
-      return (beats: beats, packed: packed);
+      // A Wishbone slave pads a burst to its block with beats that have no
+      // byte selected, so count only the beats that write.
+      final writes = memory.log
+          .skip(first)
+          .where((e) => e.$1 && e.$4 != 0)
+          .toList();
+      return (
+        beats: writes.length,
+        packed: writes.where((e) => e.$4 == 0xFF).length,
+      );
     }
 
     // The ADMA drove one 32-bit half of every 64-bit beat and masked the other
     // with byte-enables, so a 64-bit fabric cost two round trips per 8 bytes.
     // Consecutive words must share a beat instead.
+    // The 64-bit tests keep bit 63 of each beat clear: BeatMemory reads write
+    // data through BigInt.toInt, which clamps a value at or above 2^63.
     test('a 64-bit ADMA read packs two words into one beat', () async {
       const words = [0x11112222, 0x33334444, 0x55556666, 0x77778888];
 
@@ -1186,7 +1114,7 @@ void main() {
       expect(await busRead(_intStatus) & 0x40, equals(0)); // no overrun
       for (var i = 0; i < words.length; i++) {
         expect(
-          mem[8 + i].value.toInt(),
+          mem(8 + i),
           equals(words[i]),
           reason: 'word $i must survive the packed beat',
         );
@@ -1206,7 +1134,7 @@ void main() {
     test(
       'a 64-bit ADMA read falls back for an unaligned start and an odd tail',
       () async {
-        const words = [0xAAAA0001, 0xBBBB0002, 0xCCCC0003, 0xDDDD0004];
+        const words = [0x2AAA0001, 0x3BBB0002, 0x4CCC0003, 0x5DDD0004];
 
         // Buffer at byte 0x24 = word 9, which is NOT 8-byte aligned.
         await setUpDut(
@@ -1226,18 +1154,18 @@ void main() {
         expect(await busRead(_intStatus) & 0x08, equals(0));
         for (var i = 0; i < words.length; i++) {
           expect(
-            mem[9 + i].value.toInt(),
+            mem(9 + i),
             equals(words[i]),
             reason: 'word $i must land at the unaligned target',
           );
         }
         expect(
-          mem[8].value.toInt(),
+          mem(8),
           equals(0),
           reason: 'the word before the buffer must not be touched',
         );
         expect(
-          mem[13].value.toInt(),
+          mem(13),
           equals(0),
           reason: 'the word after the buffer must not be touched',
         );
@@ -1251,8 +1179,8 @@ void main() {
     // byte-stable too, so nothing survives in the pack registers or the FIFO
     // pointers across the re-arm.
     test('back-to-back 64-bit ADMA reads stay byte-stable', () async {
-      const first = [0x1A2B3C4D, 0x5E6F7081, 0x92A3B4C5, 0xD6E7F809];
-      const second = [0x0F1E2D3C, 0x4B5A6978, 0x8796A5B4, 0xC3D2E1F0];
+      const first = [0x1A2B3C4D, 0x5E6F7081, 0x12A3B4C5, 0x56E7F809];
+      const second = [0x0F1E2D3C, 0x4B5A6978, 0x0796A5B4, 0x43D2E1F0];
 
       await setUpDut(
         dmaMem: [0x20, 0x80000010],
@@ -1280,7 +1208,7 @@ void main() {
         expect(r.packed, 2, reason: 'block $n must still pack');
         for (var i = 0; i < words.length; i++) {
           expect(
-            mem[8 + i].value.toInt(),
+            mem(8 + i),
             equals(words[i]),
             reason: 'block $n word $i came back wrong',
           );
@@ -1358,8 +1286,8 @@ void main() {
       await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
       await timedAdmaRead(first);
       expect(await busRead(_intStatus) & 0x02, equals(0x02));
-      expect(mem[8].value.toInt(), equals(first[0]));
-      expect(mem[9].value.toInt(), equals(first[1]));
+      expect(mem(8), equals(first[0]));
+      expect(mem(9), equals(first[1]));
       await busWrite(_intStatus, 0x3f); // clear before the second command
 
       // The second read must run to completion, not hang.
@@ -1373,8 +1301,8 @@ void main() {
         reason: 'the second ADMA read never finished',
       );
       expect(await busRead(_intStatus) & 0x08, equals(0)); // no CRC error
-      expect(mem[12].value.toInt(), equals(second[0]));
-      expect(mem[13].value.toInt(), equals(second[1]));
+      expect(mem(12), equals(second[0]));
+      expect(mem(13), equals(second[1]));
       await Simulator.endSimulation();
     });
 
@@ -1510,47 +1438,52 @@ void main() {
       await Simulator.reset();
     });
 
-    test(
-      'ownPads collapses CMD/DAT to bidirectional pads + a WB dma master',
-      () async {
+    test('ownPads collapses CMD/DAT to bidirectional pads', () async {
+      final sdio = HarborSdioController(
+        baseAddress: 0x60000000,
+        config: const HarborSdioConfig.sd(),
+        ownPads: true,
+      );
+      await sdio.build();
+
+      // Bidirectional pads replace the split triplets.
+      expect(sdio.tryInput('sd_cmd_in'), isNull);
+      expect(sdio.tryOutput('sd_cmd_out'), isNull);
+      expect(() => sdio.inOut('sd_cmd'), returnsNormally);
+      expect(() => sdio.inOut('sd_dat0'), returnsNormally); // per-lane pads
+      expect(() => sdio.inOut('sd_dat3'), returnsNormally);
+
+      // The ADMA master is a Wishbone memory master interface.
+      expect(() => sdio.interface('dma'), returnsNormally);
+
+      final sv = sdio.generateSynth();
+      expect(sv, contains('inout wire sd_cmd')); // bidirectional pad
+      expect(sv, contains('inout wire sd_dat0')); // per-lane pads
+      expect(sv, contains('inout wire sd_dat3'));
+      expect(sv, contains('dma_CYC'));
+    });
+
+    test('the default keeps the split ports', () async {
+      final sdio = HarborSdioController(baseAddress: 0x60000000);
+      await sdio.build();
+      expect(() => sdio.output('sd_cmd_out'), returnsNormally);
+      expect(() => sdio.input('sd_cmd_in'), returnsNormally);
+      expect(sdio.tryInOut('sd_cmd'), isNull);
+    });
+
+    test('the ADMA master port follows the fabric kind', () async {
+      for (final kind in HarborFabricKind.values) {
         final sdio = HarborSdioController(
           baseAddress: 0x60000000,
-          config: const HarborSdioConfig.sd(),
-          ownPads: true,
-          fabricDma: true,
+          fabricKind: kind,
+          dmaDataWidth: 64,
         );
-        await sdio.build();
-
-        // Bidirectional pads replace the split triplets.
-        expect(sdio.tryInput('sd_cmd_in'), isNull);
-        expect(sdio.tryOutput('sd_cmd_out'), isNull);
-        expect(() => sdio.inOut('sd_cmd'), returnsNormally);
-        expect(() => sdio.inOut('sd_dat0'), returnsNormally); // per-lane pads
-        expect(() => sdio.inOut('sd_dat3'), returnsNormally);
-
-        // The ADMA master is a Wishbone interface, not the raw ports.
-        expect(sdio.tryOutput('dma_stb'), isNull);
-        expect(() => sdio.interface('dma'), returnsNormally);
-
-        final sv = sdio.generateSynth();
-        expect(sv, contains('inout wire sd_cmd')); // bidirectional pad
-        expect(sv, contains('inout wire sd_dat0')); // per-lane pads
-        expect(sv, contains('inout wire sd_dat3'));
-        expect(sv, contains('dma_CYC')); // Wishbone master interface
-      },
-    );
-
-    test(
-      'default (no flags) keeps the split ports and raw ADMA handshake',
-      () async {
-        final sdio = HarborSdioController(baseAddress: 0x60000000);
-        await sdio.build();
-        expect(() => sdio.output('sd_cmd_out'), returnsNormally);
-        expect(() => sdio.input('sd_cmd_in'), returnsNormally);
-        expect(() => sdio.output('dma_stb'), returnsNormally);
-        expect(sdio.tryInOut('sd_cmd'), isNull);
-      },
-    );
+        expect(sdio.dmaPort.kind, kind);
+        expect(sdio.dmaPort.waist.config.dataWidth, 64);
+        expect(sdio.dmaPort.waist.config.outstanding, 4);
+        expect(sdio.definitionName, contains(kind.name));
+      }
+    });
   });
 
   // The RX FIFO pop on a DATA read is gated by SEL (see rxPopCpu in
@@ -1589,9 +1522,7 @@ void main() {
       sdio.input('sd_cmd_in').srcConnection! <= cmdIn;
       sdio.input('sd_cd').srcConnection! <= Const(0);
       sdio.input('sd_dat_in').srcConnection! <= datIn;
-      sdio.input('dma_rdata').srcConnection! <=
-          Const(0, width: sdio.input('dma_rdata').width);
-      sdio.input('dma_ack').srcConnection! <= Const(0);
+      _tieDma(sdio);
 
       await sdio.build();
 
@@ -1743,9 +1674,7 @@ void _registerTests(HarborFabricKind kind) {
       sdio.input('sd_cd').srcConnection! <= Const(0);
       sdio.input('sd_dat_in').srcConnection! <=
           Const(0, width: sdio.input('sd_dat_in').width);
-      sdio.input('dma_rdata').srcConnection! <=
-          Const(0, width: sdio.input('dma_rdata').width);
-      sdio.input('dma_ack').srcConnection! <= Const(0);
+      _tieDma(sdio);
       bus = RegBus.attach(sdio, clk);
 
       await sdio.build();

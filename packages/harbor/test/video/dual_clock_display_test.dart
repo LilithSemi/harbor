@@ -4,6 +4,10 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import 'echo_memory.dart';
+
+const _memConfig = HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32);
+
 /// End-to-end dual-clock display on a tiny 4x2 mode: pixel-domain timing drives
 /// the dual-clock scanout, which bursts from a fake system-side memory
 /// (address-as-data). After a couple of frames the buffers are primed, so every
@@ -36,8 +40,7 @@ HarborDualClockDisplay _buildDisplay({
     sysReset: Logic(name: 'sys_reset'),
     enable: Logic(name: 'enable'),
     fbBase: Logic(name: 'fb_base', width: 32),
-    mDataIn: Logic(name: 'm_dat_i', width: 32),
-    mAck: Logic(name: 'm_ack'),
+    memory: HarborMemoryWaist(_memConfig),
     pixelFormat: pixelFormat,
   );
 }
@@ -64,8 +67,7 @@ void main() {
           sysReset: Logic(),
           enable: Logic(),
           fbBase: Logic(width: 32),
-          mDataIn: Logic(width: 32),
-          mAck: Logic(),
+          memory: HarborMemoryWaist(_memConfig),
           outputType: out,
         );
     final d = make(HarborDisplayInterface.parallelRgb);
@@ -143,8 +145,7 @@ void main() {
     final sysReset = Logic(name: 'sys_reset');
     final enable = Logic(name: 'enable');
     final base = Logic(name: 'fb_base', width: 32);
-    final mDataIn = Logic(name: 'm_dat_i', width: 32);
-    final mAck = Logic(name: 'm_ack');
+    final memory = HarborMemoryWaist(_memConfig);
 
     final disp = HarborDualClockDisplay(
       target: const HarborSimTarget(),
@@ -157,18 +158,12 @@ void main() {
       sysReset: sysReset,
       enable: enable,
       fbBase: base,
-      mDataIn: mDataIn,
-      mAck: mAck,
+      memory: memory,
       pixelFormat: HarborPixelFormat.rgb565,
     );
-    mAck <= disp.mStb;
-    final fbAddr = disp.mAddr;
-    Logic fbData = Const(0, width: 32);
-    mem.forEach((a, v) {
-      fbData = mux(fbAddr.eq(Const(a, width: 32)), Const(v, width: 32), fbData);
-    });
-    mDataIn <= fbData;
+    final echo = EchoMemory(memory, sysClk, sysReset, table: mem);
     await disp.build();
+    await echo.build();
 
     pixelReset.inject(1);
     sysReset.inject(1);
@@ -232,8 +227,7 @@ void main() {
     final sysReset = Logic(name: 'sys_reset');
     final enable = Logic(name: 'enable');
     final base = Logic(name: 'fb_base', width: 32);
-    final mDataIn = Logic(name: 'm_dat_i', width: 32);
-    final mAck = Logic(name: 'm_ack');
+    final memory = HarborMemoryWaist(_memConfig);
 
     final disp = HarborDualClockDisplay(
       target: const HarborSimTarget(),
@@ -246,12 +240,11 @@ void main() {
       sysReset: sysReset,
       enable: enable,
       fbBase: base,
-      mDataIn: mDataIn,
-      mAck: mAck,
+      memory: memory,
     );
-    mAck <= disp.mStb;
-    mDataIn <= disp.mAddr;
+    final echo = EchoMemory(memory, sysClk, sysReset);
     await disp.build();
+    await echo.build();
 
     pixelReset.inject(1);
     sysReset.inject(1);
@@ -320,8 +313,7 @@ void main() {
     final sysReset = Logic(name: 'sys_reset');
     final enable = Logic(name: 'enable');
     final base = Logic(name: 'fb_base', width: 32);
-    final mDataIn = Logic(name: 'm_dat_i', width: 32);
-    final mAck = Logic(name: 'm_ack');
+    final memory = HarborMemoryWaist(_memConfig);
 
     final disp = HarborDualClockDisplay(
       target: const HarborSimTarget(),
@@ -334,12 +326,11 @@ void main() {
       sysReset: sysReset,
       enable: enable,
       fbBase: base,
-      mDataIn: mDataIn,
-      mAck: mAck,
+      memory: memory,
     );
-    mAck <= disp.mStb;
-    mDataIn <= disp.mAddr;
+    final echo = EchoMemory(memory, sysClk, sysReset);
     await disp.build();
+    await echo.build();
     final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
 
     pixelReset.inject(1);

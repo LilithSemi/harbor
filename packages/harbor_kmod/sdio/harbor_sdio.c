@@ -60,7 +60,10 @@
 #define HARBOR_SD_ST_BUSY	 BIT(8)
 #define HARBOR_SD_ST_DATA_VALID	 BIT(9)
 
-/* CMD: [5:0] index, [7:6] response type, [8] data, [9] read, [10] ADMA. */
+/*
+ * CMD: [5:0] index, [7:6] response type, [8] data, [9] read, [10] ADMA,
+ * [11] ADMA_ADDR is a descriptor table.
+ */
 #define HARBOR_SD_CMD_INDEX	 GENMASK(5, 0)
 #define HARBOR_SD_CMD_RESP_SHIFT 6
 #define HARBOR_SD_CMD_RESP_NONE	 0
@@ -70,6 +73,7 @@
 #define HARBOR_SD_CMD_DATA	 BIT(8)
 #define HARBOR_SD_CMD_READ	 BIT(9)
 #define HARBOR_SD_CMD_DMA	 BIT(10)
+#define HARBOR_SD_CMD_TABLE	 BIT(11)
 
 /* INT_STATUS, write-1-to-clear. */
 #define HARBOR_SD_INT_CMD_DONE	  BIT(0)
@@ -78,7 +82,9 @@
 #define HARBOR_SD_INT_DATA_CRC	  BIT(3)
 #define HARBOR_SD_INT_CMD_TIMEOUT BIT(4)
 #define HARBOR_SD_INT_WRITE_ERR	  BIT(5)
-#define HARBOR_SD_INT_ALL	  GENMASK(5, 0)
+#define HARBOR_SD_INT_RX_OVERRUN  BIT(6)
+#define HARBOR_SD_INT_ADMA_ERR	  BIT(7)
+#define HARBOR_SD_INT_ALL	  GENMASK(7, 0)
 
 /*
  * ADMA descriptor: two 32-bit words, [buffer address], [byte length in [15:0],
@@ -261,7 +267,8 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 	      (harbor_sd_resp_type(cmd) << HARBOR_SD_CMD_RESP_SHIFT);
 
 	if (data) {
-		val |= HARBOR_SD_CMD_DATA | HARBOR_SD_CMD_DMA;
+		val |= HARBOR_SD_CMD_DATA | HARBOR_SD_CMD_DMA |
+		       HARBOR_SD_CMD_TABLE;
 		if (data->flags & MMC_DATA_READ)
 			val |= HARBOR_SD_CMD_READ;
 
@@ -309,6 +316,8 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 
 	if (!(ist & HARBOR_SD_INT_DATA_DONE))
 		data->error = -ETIMEDOUT;
+	else if (ist & HARBOR_SD_INT_ADMA_ERR)
+		data->error = -EIO;
 	else if (ist & HARBOR_SD_INT_DATA_CRC)
 		data->error = -EILSEQ;
 	else if (ist & HARBOR_SD_INT_WRITE_ERR)

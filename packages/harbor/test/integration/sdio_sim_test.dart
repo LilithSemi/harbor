@@ -15,6 +15,9 @@ void main() {
       sdio.port('sd_cmd_in').getsLogic(Const(1));
       sdio.port('sd_dat_in').getsLogic(Const(0, width: 4));
       sdio.port('sd_cd').getsLogic(Const(0));
+      for (final p in sdio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+        sdio.port(p).getsLogic(Const(0, width: sdio.input(p).width));
+      }
 
       final tb = PeripheralTestBench(sdio);
       await tb.init();
@@ -32,6 +35,9 @@ void main() {
       sdio.port('sd_cmd_in').getsLogic(Const(1));
       sdio.port('sd_dat_in').getsLogic(Const(0, width: 4));
       sdio.port('sd_cd').getsLogic(Const(0));
+      for (final p in sdio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+        sdio.port(p).getsLogic(Const(0, width: sdio.input(p).width));
+      }
 
       final tb = PeripheralTestBench(sdio);
       await tb.init();
@@ -49,6 +55,9 @@ void main() {
       sdio.port('sd_cmd_in').getsLogic(Const(1));
       sdio.port('sd_dat_in').getsLogic(Const(0, width: 4));
       sdio.port('sd_cd').getsLogic(Const(0));
+      for (final p in sdio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+        sdio.port(p).getsLogic(Const(0, width: sdio.input(p).width));
+      }
 
       final tb = PeripheralTestBench(sdio);
       await tb.init();
@@ -67,6 +76,9 @@ void main() {
       sdio.port('sd_cmd_in').getsLogic(Const(1));
       sdio.port('sd_dat_in').getsLogic(Const(0, width: 4));
       sdio.port('sd_cd').getsLogic(Const(0));
+      for (final p in sdio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+        sdio.port(p).getsLogic(Const(0, width: sdio.input(p).width));
+      }
 
       final tb = PeripheralTestBench(sdio);
       await tb.init();

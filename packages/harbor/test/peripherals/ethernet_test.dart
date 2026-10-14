@@ -4,6 +4,7 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/mem_target.dart';
 import '../util/reg_bus.dart';
 
 // Register byte offsets: each register in its own 8-byte slot.
@@ -118,13 +119,20 @@ void main() {
   }
 }
 
+const _dmaConfig = HarborMemoryWaistConfig(
+  addressWidth: 32,
+  dataWidth: 32,
+  idWidth: 1,
+  outstanding: 1,
+);
+
 void _registerTests(HarborFabricKind kind) {
   group('HarborEthernetMac MDIO engine (${kind.name})', () {
-    late HarborEthernetMac eth;
+    late MasterTop top;
     late Logic clk, reset, mdioIn;
     late Logic mdc, mdioOut, mdioOe, irq;
     late Logic txd, txEn, rxdSig, rxDvSig;
-    late List<Logic> mem; // 16-word DMA memory model
+    late BeatMemory mem;
     late RegBus bus;
 
     Future<void> bw(int addr, int data) => bus.write(addr, data);
@@ -132,66 +140,43 @@ void _registerTests(HarborFabricKind kind) {
     Future<int> br(int addr) => bus.read(addr);
 
     Future<void> setUpDut({List<int> dmaMem = const []}) async {
-      eth = HarborEthernetMac(
+      final eth = HarborEthernetMac(
         config: const HarborEthernetConfig(
           maxSpeed: HarborEthernetSpeed.speed100,
         ),
         baseAddress: 0x40000000,
         fabricKind: kind,
       );
+      top = MasterTop(eth, iface: 'dma', kind: kind, config: _dmaConfig);
       clk = SimpleClockGenerator(10).clk;
       reset = Logic(name: 'reset');
       mdioIn = Logic(name: 'mdio_in');
 
-      eth.input('clk').srcConnection! <= clk;
-      eth.input('reset').srcConnection! <= reset;
-      bus = RegBus.attach(eth, clk);
-      eth.input('mdio_in').srcConnection! <= mdioIn;
-      rxdSig = Logic(name: 'rxd_sig', width: eth.input('rxd').width);
+      top.input('clk').srcConnection! <= clk;
+      top.input('reset').srcConnection! <= reset;
+      bus = RegBus.attach(top, clk);
+      top.input('mdio_in').srcConnection! <= mdioIn;
+      rxdSig = Logic(name: 'rxd_sig', width: top.input('rxd').width);
       rxDvSig = Logic(name: 'rx_dv_sig');
-      eth.input('rx_clk').srcConnection! <= clk;
-      eth.input('rx_dv').srcConnection! <= rxDvSig;
-      eth.input('rxd').srcConnection! <= rxdSig;
-      // 16-word memory model on the master port (ack = stb, single-cycle).
-      final initVals = [
-        for (var i = 0; i < 16; i++) i < dmaMem.length ? dmaMem[i] : 0,
-      ];
-      mem = [for (var i = 0; i < 16; i++) Logic(name: 'mem$i', width: 32)];
-      final mStb = eth.output('dma_stb');
-      final mWe = eth.output('dma_we');
-      final mAddr = eth.output('dma_addr');
-      final mWdata = eth.output('dma_wdata');
-      final mIdx = mAddr.getRange(2, 6);
-      Sequential(
+      top.input('rx_clk').srcConnection! <= clk;
+      top.input('rx_dv').srcConnection! <= rxDvSig;
+      top.input('rxd').srcConnection! <= rxdSig;
+      // Memory model on the master port: words not written read as the
+      // preloaded dmaMem word.
+      mem = BeatMemory(
+        top,
         clk,
-        reset: reset,
-        resetValues: {
-          for (var i = 0; i < 16; i++) mem[i]: Const(initVals[i], width: 32),
-        },
-        [
-          If(
-            mStb & mWe,
-            then: [
-              for (var i = 0; i < 16; i++)
-                If(mIdx.eq(Const(i, width: 4)), then: [mem[i] < mWdata]),
-            ],
-          ),
-        ],
+        fill: (i) => i < dmaMem.length ? dmaMem[i] : 0,
       );
-      Logic mRd = mem[15];
-      for (var i = 14; i >= 0; i--) {
-        mRd = mux(mIdx.eq(Const(i, width: 4)), mem[i], mRd);
-      }
-      eth.input('dma_rdata').srcConnection! <= mRd;
-      eth.input('dma_ack').srcConnection! <= mStb;
 
-      await eth.build();
-      mdc = eth.output('mdc');
-      mdioOut = eth.output('mdio_out');
-      mdioOe = eth.output('mdio_oe');
-      irq = eth.output('interrupt');
-      txd = eth.output('txd');
-      txEn = eth.output('tx_en');
+      await top.build();
+      mem.start();
+      mdc = top.output('mdc');
+      mdioOut = top.output('mdio_out');
+      mdioOe = top.output('mdio_oe');
+      irq = top.output('interrupt');
+      txd = top.output('txd');
+      txEn = top.output('tx_en');
 
       reset.inject(1);
       bus.idle();
@@ -410,10 +395,10 @@ void _registerTests(HarborFabricKind kind) {
       ];
       expect(bytes, equals(expected)); // frame came from the memory buffer
       // Wait for the DMA to write the descriptor status back.
-      for (var i = 0; i < 200 && mem[1].value.toInt() != 0; i++) {
+      for (var i = 0; i < 200 && mem.readWord(4) != 0; i++) {
         await clk.nextPosedge;
       }
-      expect(mem[1].value.toInt(), equals(0)); // descriptor status written back
+      expect(mem.readWord(4), equals(0)); // descriptor status written back
       expect(await br(_intStatus) & 0x02, equals(0x02)); // TX-done
       await Simulator.endSimulation();
     });
@@ -435,18 +420,12 @@ void _registerTests(HarborFabricKind kind) {
 
       await driveRxFrame([...payload, ...fcsBytes]);
       // Wait for the DMA to write the descriptor length back.
-      for (var i = 0; i < 200 && mem[1].value.toInt() == 0; i++) {
+      for (var i = 0; i < 200 && mem.readWord(4) == 0; i++) {
         await clk.nextPosedge;
       }
 
-      expect(
-        mem[8].value.toInt(),
-        equals(0x04030201),
-      ); // payload DMA'd to buffer
-      expect(
-        mem[1].value.toInt(),
-        equals(payload.length),
-      ); // length written back
+      expect(mem.readWord(32), equals(0x04030201)); // payload DMA'd to buffer
+      expect(mem.readWord(4), equals(payload.length)); // length written back
       expect(await br(_intStatus) & 0x08, equals(0x08)); // RX-done
       await Simulator.endSimulation();
     });

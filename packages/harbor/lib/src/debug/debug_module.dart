@@ -3,6 +3,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
+import '../bus/bus_master_port.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
@@ -45,8 +46,14 @@ class HarborDebugModule extends BridgeModule
   /// Whether to include system bus access.
   final bool hasSystemBusAccess;
 
-  /// Bus slave port for system bus access.
-  late final BusSlavePort? sysBus;
+  /// Register slave port: the debug module's own memory-mapped window at
+  /// [baseAddress]. The debug memory map is not designed yet, so it acks
+  /// every access and reads 0.
+  late final BusSlavePort bus;
+
+  /// Register master port the system bus access registers (sbcs,
+  /// sbaddress0, sbdata0) drive. Null unless [hasSystemBusAccess].
+  late final BusMasterPort? sba;
 
   HarborDebugModule({
     required this.baseAddress,
@@ -59,13 +66,13 @@ class HarborDebugModule extends BridgeModule
     String? name,
   }) : super(
          harborStableDefinitionName('HarborDebugModule', [
-           if (hasSystemBusAccess)
-             ...BusSlavePort.definitionNameParts(
-               kind: fabricKind,
-               addressWidth: 32,
-               dataWidth: 32,
-               cross: crossFabricClock,
-             ),
+           ...BusSlavePort.definitionNameParts(
+             kind: fabricKind,
+             addressWidth: 32,
+             dataWidth: 32,
+             cross: crossFabricClock,
+           ),
+           if (hasSystemBusAccess) ...[fabricKind.name, 'sba', 'e'],
            'h$numHarts',
            'pb$progBufSize',
            'ad$abstractDataCount',
@@ -108,27 +115,41 @@ class HarborDebugModule extends BridgeModule
     // Reset request output
     addOutput('ndmreset'); // non-debug module reset (resets the system)
 
-    // System bus access
-    if (hasSystemBusAccess) {
-      sysBus = BusSlavePort.create(
-        module: this,
-        name: 'sysbus',
-        kind: fabricKind,
-        clk: input('clk'),
-        reset: input('reset'),
-        addressWidth: 32,
-        dataWidth: 32,
-        fabricClock: BusSlavePort.fabricClockInputs(
-          this,
-          cross: crossFabricClock,
-        ),
-      );
-    } else {
-      sysBus = null;
-    }
+    final fabricClock = BusSlavePort.fabricClockInputs(
+      this,
+      cross: crossFabricClock,
+    );
+
+    // Register slave port: the DM's own window. Always built, so this
+    // module can be added to a SoC as an ordinary peripheral.
+    bus = BusSlavePort.create(
+      module: this,
+      name: 'bus',
+      kind: fabricKind,
+      clk: input('clk'),
+      reset: input('reset'),
+      addressWidth: 32,
+      dataWidth: 32,
+      fabricClock: fabricClock,
+    );
+
+    // Register master port for system bus access.
+    sba = hasSystemBusAccess
+        ? BusMasterPort.create(
+            module: this,
+            name: 'sba',
+            kind: fabricKind,
+            addressWidth: 32,
+            dataWidth: 32,
+            clk: input('clk'),
+            reset: input('reset'),
+            useErr: true,
+            fabricClock: fabricClock,
+          )
+        : null;
 
     final clk = input('clk');
-    final reset = sysBus?.reset ?? input('reset');
+    final reset = bus.reset;
 
     // DM registers
     final dmcontrol = Logic(name: 'dmcontrol', width: 32);
@@ -148,7 +169,282 @@ class HarborDebugModule extends BridgeModule
         Logic(name: 'data$i', width: 32),
     ];
 
-    final bus = sysBus;
+    // System bus access (sbcs/sbaddress0/sbdata0), built only when a master
+    // port exists. One access (read or write, 8/16/32-bit) runs at a time
+    // on [sba]. These lists feed the DMI read/write cases and the reset and
+    // per-cycle bodies of the main register block below.
+    final sbResetAssigns = <Conditional>[];
+    final sbCompletionAssigns = <Conditional>[];
+    final sbReadCases = <CaseItem>[];
+    final sbWriteCases = <CaseItem>[];
+
+    if (sba != null) {
+      final master = sba!;
+      final sbBusy = Logic(name: 'sb_busy');
+      final sbBusyError = Logic(name: 'sb_busyerror');
+      final sbError = Logic(name: 'sb_error', width: 3);
+      final sbReadOnAddr = Logic(name: 'sb_readonaddr');
+      final sbReadOnData = Logic(name: 'sb_readondata');
+      final sbAutoIncrement = Logic(name: 'sb_autoincrement');
+      final sbAccess = Logic(name: 'sb_access', width: 3);
+      final sbAddress = Logic(name: 'sb_address', width: 32);
+      final sbData = Logic(name: 'sb_data', width: 32);
+      final pendingWe = Logic(name: 'sb_pending_we');
+      final pendingAddr = Logic(name: 'sb_pending_addr', width: 32);
+      final pendingLane = Logic(name: 'sb_pending_lane', width: 2);
+      final pendingSize = Logic(name: 'sb_pending_size', width: 2);
+      final pendingWdata = Logic(name: 'sb_pending_wdata', width: 32);
+
+      // Byte lane select for a [size] (0=byte, 1=half, 2=word) access at
+      // byte offset [lane] (the low 2 bits of the address) within the word.
+      Logic selFor(Logic size, Logic lane) {
+        final byteSel = Const(1, width: 4) << lane;
+        final halfSel = mux(
+          lane[1],
+          Const(0xc, width: 4),
+          Const(0x3, width: 4),
+        );
+        return mux(
+          size.eq(Const(2, width: 2)),
+          Const(0xf, width: 4),
+          mux(size.eq(Const(1, width: 2)), halfSel, byteSel),
+        );
+      }
+
+      // Write data with the low byte or halfword of [data] replicated into
+      // every lane, so whichever lane [selFor] picks gets the right bytes.
+      Logic replicateFor(Logic size, Logic data) {
+        final byteVal = data.getRange(0, 8);
+        final halfVal = data.getRange(0, 16);
+        final byteRep = [byteVal, byteVal, byteVal, byteVal].swizzle();
+        final halfRep = [halfVal, halfVal].swizzle();
+        return mux(
+          size.eq(Const(2, width: 2)),
+          data,
+          mux(size.eq(Const(1, width: 2)), halfRep, byteRep),
+        );
+      }
+
+      // Read data from the selected lane of [data], shifted down to the low
+      // bits and zero-extended.
+      Logic shiftRead(Logic size, Logic lane, Logic data) {
+        final bytes = [
+          data.getRange(0, 8),
+          data.getRange(8, 16),
+          data.getRange(16, 24),
+          data.getRange(24, 32),
+        ];
+        final byteSel = mux(
+          lane.eq(Const(0, width: 2)),
+          bytes[0],
+          mux(
+            lane.eq(Const(1, width: 2)),
+            bytes[1],
+            mux(lane.eq(Const(2, width: 2)), bytes[2], bytes[3]),
+          ),
+        ).zeroExtend(32);
+        final halfSel = mux(
+          lane[1],
+          data.getRange(16, 32),
+          data.getRange(0, 16),
+        ).zeroExtend(32);
+        return mux(
+          size.eq(Const(2, width: 2)),
+          data,
+          mux(size.eq(Const(1, width: 2)), halfSel, byteSel),
+        );
+      }
+
+      // Bytes a [size] access covers, for autoincrement.
+      Logic sizeBytesFor(Logic size) => mux(
+        size.eq(Const(2, width: 2)),
+        Const(4, width: 32),
+        mux(
+          size.eq(Const(1, width: 2)),
+          Const(2, width: 32),
+          Const(1, width: 32),
+        ),
+      );
+
+      // Starts an access at byte address [addr] (word-aligned down for
+      // [pendingAddr]) once sbbusy and sberror are known clear. Sets
+      // sberror 4 for an unsupported sbaccess, 3 for a misaligned address,
+      // else latches the access and raises sbbusy.
+      List<Conditional> maybeStart({
+        required Logic we,
+        required Logic addr,
+        required Logic data,
+      }) {
+        final lane = addr.getRange(0, 2);
+        final wordAddr = [addr.getRange(2), Const(0, width: 2)].swizzle();
+        final size2 = sbAccess.getRange(0, 2);
+        final sizeValid = sbAccess.lt(Const(3, width: 3));
+        final misaligned = mux(
+          size2.eq(Const(2, width: 2)),
+          lane.neq(Const(0, width: 2)),
+          mux(size2.eq(Const(1, width: 2)), lane[0], Const(0)),
+        );
+        return [
+          If(
+            ~sbError.or() & ~sbBusyError,
+            then: [
+              If(
+                ~sizeValid,
+                then: [sbError < Const(4, width: 3)],
+                orElse: [
+                  If(
+                    misaligned,
+                    then: [sbError < Const(3, width: 3)],
+                    orElse: [
+                      sbBusy < Const(1),
+                      pendingWe < we,
+                      pendingAddr < wordAddr,
+                      pendingLane < lane,
+                      pendingSize < size2,
+                      pendingWdata < data,
+                    ],
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ];
+      }
+
+      final sbcsValue = [
+        Const(1, width: 3), // sbversion
+        Const(0, width: 6), // reserved
+        sbBusyError,
+        sbBusy,
+        sbReadOnAddr,
+        sbAccess,
+        sbAutoIncrement,
+        sbReadOnData,
+        sbError,
+        Const(32, width: 7), // sbasize
+        Const(0), // sbaccess128
+        Const(0), // sbaccess64
+        Const(1), // sbaccess32
+        Const(1), // sbaccess16
+        Const(1), // sbaccess8
+      ].swizzle();
+
+      sbResetAssigns.addAll([
+        sbBusy < Const(0),
+        sbBusyError < Const(0),
+        sbError < Const(0, width: 3),
+        sbReadOnAddr < Const(0),
+        sbReadOnData < Const(0),
+        sbAutoIncrement < Const(0),
+        sbAccess < Const(2, width: 3),
+        sbAddress < Const(0, width: 32),
+        sbData < Const(0, width: 32),
+        pendingWe < Const(0),
+        pendingAddr < Const(0, width: 32),
+        pendingLane < Const(0, width: 2),
+        pendingSize < Const(0, width: 2),
+        pendingWdata < Const(0, width: 32),
+      ]);
+
+      // An outstanding access ends here, every cycle, independent of DMI.
+      sbCompletionAssigns.add(
+        If(
+          sbBusy & master.ack,
+          then: [
+            sbBusy < Const(0),
+            If(master.err, then: [sbError < Const(2, width: 3)]),
+            If(
+              ~pendingWe & ~master.err,
+              then: [
+                sbData < shiftRead(pendingSize, pendingLane, master.dataIn),
+              ],
+            ),
+            If(
+              sbAutoIncrement & ~master.err,
+              then: [sbAddress < sbAddress + sizeBytesFor(pendingSize)],
+            ),
+          ],
+        ),
+      );
+
+      sbReadCases.addAll([
+        CaseItem(Const(0x38, width: 7), [output('dmi_data_out') < sbcsValue]),
+        CaseItem(Const(0x39, width: 7), [output('dmi_data_out') < sbAddress]),
+        CaseItem(Const(0x3C, width: 7), [
+          output('dmi_data_out') < sbData,
+          If(
+            sbBusy,
+            then: [sbBusyError < Const(1)],
+            orElse: [
+              If(
+                sbReadOnData,
+                then: maybeStart(
+                  we: Const(0),
+                  addr: sbAddress,
+                  data: Const(0, width: 32),
+                ),
+              ),
+            ],
+          ),
+        ]),
+      ]);
+
+      sbWriteCases.addAll([
+        // sbbusyerror and sberror are write-1-to-clear. The rest are plain
+        // read/write fields.
+        CaseItem(Const(0x38, width: 7), [
+          sbBusyError < (sbBusyError & ~input('dmi_data_in')[22]),
+          sbError < (sbError & ~input('dmi_data_in').getRange(12, 15)),
+          sbReadOnAddr < input('dmi_data_in')[20],
+          sbAccess < input('dmi_data_in').getRange(17, 20),
+          sbAutoIncrement < input('dmi_data_in')[16],
+          sbReadOnData < input('dmi_data_in')[15],
+        ]),
+        CaseItem(Const(0x39, width: 7), [
+          If(
+            sbBusy,
+            then: [sbBusyError < Const(1)],
+            orElse: [
+              sbAddress < input('dmi_data_in'),
+              If(
+                sbReadOnAddr,
+                then: maybeStart(
+                  we: Const(0),
+                  addr: input('dmi_data_in'),
+                  data: Const(0, width: 32),
+                ),
+              ),
+            ],
+          ),
+        ]),
+        CaseItem(Const(0x3C, width: 7), [
+          If(
+            sbBusy,
+            then: [sbBusyError < Const(1)],
+            // With sberror or sbbusyerror set, the write does nothing.
+            orElse: [
+              If(
+                ~sbError.or() & ~sbBusyError,
+                then: [
+                  sbData < input('dmi_data_in'),
+                  ...maybeStart(
+                    we: Const(1),
+                    addr: sbAddress,
+                    data: input('dmi_data_in'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ]),
+      ]);
+
+      master.addr <= pendingAddr;
+      master.we <= pendingWe;
+      master.sel <= selFor(pendingSize, pendingLane);
+      master.dataOut <= replicateFor(pendingSize, pendingWdata);
+      master.stb <= sbBusy;
+    }
 
     Sequential(clk, [
       If(
@@ -169,18 +465,16 @@ class HarborDebugModule extends BridgeModule
           ],
           for (final p in progbuf) p < Const(0, width: 32),
           for (final d in abstractData) d < Const(0, width: 32),
-          if (bus != null) ...[
-            bus.ack < Const(0),
-            bus.dataOut < Const(0, width: 32),
-          ],
+          bus.ack < Const(0),
+          bus.dataOut < Const(0, width: 32),
+          ...sbResetAssigns,
         ],
         orElse: [
-          if (bus != null) ...[
-            bus.ack < Const(0),
-            bus.dataOut < Const(0, width: 32),
-            // Debug memory is not designed yet. Every access gets ACK with 0.
-            If(bus.stb & ~bus.ack, then: [bus.ack < Const(1)]),
-          ],
+          bus.ack < Const(0),
+          bus.dataOut < Const(0, width: 32),
+          // Debug memory is not designed yet. Every access gets ACK with 0.
+          If(bus.stb & ~bus.ack, then: [bus.ack < Const(1)]),
+          ...sbCompletionAssigns,
           // DMI register access
           If(
             input('dmi_valid'),
@@ -198,6 +492,7 @@ class HarborDebugModule extends BridgeModule
                     CaseItem(Const(0x16, width: 7), [
                       output('dmi_data_out') < abstractcs,
                     ]),
+                    ...sbReadCases,
                   ]),
                 ]),
                 // Write
@@ -212,6 +507,7 @@ class HarborDebugModule extends BridgeModule
                       command < input('dmi_data_in'),
                       // Execute abstract command
                     ]),
+                    ...sbWriteCases,
                   ]),
                 ]),
               ]),

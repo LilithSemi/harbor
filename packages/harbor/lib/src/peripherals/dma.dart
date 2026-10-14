@@ -4,6 +4,9 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
+import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
+import '../bus/port/port_cdc.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -23,8 +26,8 @@ enum HarborDmaTransferType {
 
 /// Source of the data a DMA transfer moves.
 enum HarborDmaSource {
-  /// The controller reads the source beat itself over the master port
-  /// (`dma_rdata`), same as a normal memory-to-memory or memory-to-peripheral
+  /// The controller reads the source beat itself over the `dma` master
+  /// memory port, same as a normal memory-to-memory or memory-to-peripheral
   /// copy.
   mem,
 
@@ -125,6 +128,10 @@ class HarborDmaController extends BridgeModule
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
         HarborSvdPeripheralProvider {
+  /// Outstanding requests the master memory port carries. Fixed at 1: the
+  /// engine never has more than one read or write beat in flight.
+  static const int masterOutstanding = 1;
+
   /// Number of DMA channels.
   final int channels;
 
@@ -164,6 +171,10 @@ class HarborDmaController extends BridgeModule
   /// [HarborDmaTarget.sdram]. Required in that mode, unused otherwise.
   final BusAddressRange? memRange;
 
+  /// Address width of the register port. The registers decode the low 12
+  /// bits, so a SoC sets it to the fabric width.
+  final int busAddressWidth;
+
   /// Bus slave port (register access).
   late final BusSlavePort bus;
 
@@ -179,6 +190,7 @@ class HarborDmaController extends BridgeModule
     this.source = HarborDmaSource.mem,
     this.target = HarborDmaTarget.fabric,
     this.memRange,
+    this.busAddressWidth = 12,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     bool crossFabricClock = false,
     String? name,
@@ -186,7 +198,7 @@ class HarborDmaController extends BridgeModule
          harborStableDefinitionName('HarborDmaController', [
            ...BusSlavePort.definitionNameParts(
              kind: fabricKind,
-             addressWidth: 12,
+             addressWidth: busAddressWidth,
              dataWidth: 32,
              cross: crossFabricClock,
            ),
@@ -197,6 +209,8 @@ class HarborDmaController extends BridgeModule
            target.name,
            if (target == HarborDmaTarget.sdram && memRange != null)
              'mr${memRange.start}_${memRange.end}',
+           'n$masterOutstanding',
+           if (crossFabricClock) 'q${harborCdcDepth(masterOutstanding)}',
          ]),
          name: name ?? 'dma',
        ) {
@@ -215,14 +229,6 @@ class HarborDmaController extends BridgeModule
     }
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
-
-    // DMA master ports (directly exposed for memory bus connection)
-    addOutput('dma_addr', width: addressWidth);
-    addOutput('dma_wdata', width: dataWidth);
-    createPort('dma_rdata', PortDirection.input, width: dataWidth);
-    addOutput('dma_we');
-    addOutput('dma_stb');
-    createPort('dma_ack', PortDirection.input);
     addOutput('interrupt');
 
     // Peripheral stream source ports. Added only in stream mode, so a
@@ -234,19 +240,37 @@ class HarborDmaController extends BridgeModule
       addOutput('s_ready');
     }
 
+    final fabricClock = BusSlavePort.fabricClockInputs(
+      this,
+      cross: crossFabricClock,
+    );
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
       kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
-      addressWidth: 12,
+      addressWidth: busAddressWidth,
       dataWidth: 32,
-      fabricClock: BusSlavePort.fabricClockInputs(
-        this,
-        cross: crossFabricClock,
-      ),
+      fabricClock: fabricClock,
     );
+
+    // DMA master memory port. One beat at a time (outstanding: 1), ID 0.
+    final memPort = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'dma',
+      kind: fabricKind,
+      config: HarborMemoryWaistConfig(
+        addressWidth: addressWidth,
+        dataWidth: dataWidth,
+        idWidth: 1,
+        outstanding: masterOutstanding,
+      ),
+      clk: input('clk'),
+      reset: input('reset'),
+      fabricClock: fabricClock,
+    );
+    final mem = memPort.waist;
 
     final clk = input('clk');
     final reset = bus.reset;
@@ -297,10 +321,13 @@ class HarborDmaController extends BridgeModule
     final readData = Logic(name: 'read_data', width: dataWidth);
     final curSrc = Logic(name: 'cur_src', width: addressWidth);
     final curDst = Logic(name: 'cur_dst', width: addressWidth);
-    final dmaAddrReg = Logic(name: 'dma_addr_reg', width: addressWidth);
-    final dmaWdataReg = Logic(name: 'dma_wdata_reg', width: dataWidth);
-    final dmaWeReg = Logic(name: 'dma_we_reg');
-    final dmaStbReg = Logic(name: 'dma_stb_reg');
+
+    // Tracks whether this state's REQ (or WDATA) beat has already been
+    // taken, so REQ_VALID / WDATA_VALID each drop on their own handshake
+    // instead of waiting on each other. Reused across sRead and sWrite: both
+    // reset them to 0 on entry, and only one state is active at a time.
+    final reqSent = Logic(name: 'req_sent');
+    final wSent = Logic(name: 'w_sent');
 
     // Peripheral stream source state. Only built in stream mode: holds the
     // s_last seen at the accepted beat, so the write-complete check below can
@@ -320,10 +347,9 @@ class HarborDmaController extends BridgeModule
     const sWrite = 2; // issue a write of the read beat to the destination
 
     // Transfers move one bus beat. CH_LEN is in bytes (multiple of the beat
-    // size, dataWidth / 8).
+    // size, dataWidth / 8). REQ_SIZE is log2 of that beat size in bytes.
     final step = dataWidth ~/ 8;
-    final dmaAck = input('dma_ack');
-    final dmaRdata = input('dma_rdata');
+    final sizeLog2 = step.bitLength - 1;
 
     // Destination clamp for target: sdram. Only built when the clamp is
     // actually configured, so target: fabric (the default) adds no hardware
@@ -355,16 +381,131 @@ class HarborDmaController extends BridgeModule
 
     interrupt <= (intStatus & intEnable).or();
 
-    output('dma_addr') <= dmaAddrReg;
-    output('dma_wdata') <= dmaWdataReg;
-    output('dma_we') <= dmaWeReg;
-    output('dma_stb') <= dmaStbReg;
+    // Master port drive. sRead issues the source read beat (skipped for a
+    // periphToMem channel in stream mode, which takes its beat from
+    // s_data/s_valid/s_last instead). sWrite issues the destination write
+    // beat, unless target: sdram and the destination falls outside
+    // memRange, in which case no write is ever issued.
+    final inRead = dmaState.eq(Const(sRead, width: 3));
+    final inWrite = dmaState.eq(Const(sWrite, width: 3));
+    final streamRead = source == HarborDmaSource.peripheralStream;
+    final masterReadActive = streamRead ? (inRead & ~isPeriphToMem) : inRead;
+    final writeBlocked = targetSdram ? (inWrite & ~dstInRange) : Const(0);
+    final writeActive = inWrite & ~writeBlocked;
+    final requesting = (masterReadActive | writeActive) & ~reqSent;
+
+    mem.reqValid <= requesting;
+    mem.reqId <= Const(0, width: mem.config.idWidth);
+    mem.reqWrite <= writeActive;
+    mem.reqAddr <= mux(writeActive, curDst, curSrc);
+    mem.reqLen <= Const(0, width: HarborMemoryWaistConfig.lenWidth);
+    mem.reqSize <= Const(sizeLog2, width: HarborMemoryWaistConfig.sizeWidth);
+    mem.reqBurst <=
+        Const(
+          HarborMemoryBurst.incr.value,
+          width: HarborMemoryWaistConfig.burstWidth,
+        );
+
+    mem.wdataValid <= (writeActive & ~wSent);
+    mem.wdataData <= readData;
+    mem.wdataStrb <= Const((1 << step) - 1, width: mem.config.strbWidth);
+    mem.wdataLast <= Const(1);
+
+    mem.rdataReady <= masterReadActive;
+    mem.wrespReady <= writeActive;
 
     if (source == HarborDmaSource.peripheralStream) {
       // Ready to accept the next word once the engine is waiting on a beat
       // for the active periphToMem channel.
-      output('s_ready') <= dmaState.eq(Const(sRead, width: 3)) & isPeriphToMem;
+      output('s_ready') <= inRead & isPeriphToMem;
     }
+
+    // Fails the active channel and returns the engine to idle without
+    // completing it.
+    List<Conditional> abortActiveChannel() => [
+      for (var ch = 0; ch < channels; ch++)
+        If(
+          activeCh.eq(Const(ch, width: channels.bitLength)),
+          then: [chBusy[ch] < Const(0), chError[ch] < Const(1)],
+        ),
+      dmaState < Const(sIdle, width: 3),
+    ];
+
+    // Master read of the source beat. REQ_VALID drops once REQ_READY takes
+    // it; RDATA_READY stays high until the read data beat lands. RDATA_ERR
+    // aborts the channel, otherwise the beat moves on to sWrite.
+    List<Conditional> masterReadBeat() => [
+      If(mem.reqValid & mem.reqReady, then: [reqSent < Const(1)]),
+      If(
+        mem.rdataValid & mem.rdataReady,
+        then: [
+          If(
+            mem.rdataErr,
+            then: abortActiveChannel(),
+            orElse: [
+              readData < mem.rdataData,
+              reqSent < Const(0),
+              wSent < Const(0),
+              dmaState < Const(sWrite, width: 3),
+            ],
+          ),
+        ],
+      ),
+    ];
+
+    // Master write of the destination beat, then wait for WRESP. REQ_VALID
+    // and WDATA_VALID each drop on their own handshake. WRESP_ERR aborts the
+    // channel, otherwise the pointers advance and the channel either
+    // completes or loops back to sRead for the next beat.
+    List<Conditional> writeResponse() => [
+      If(mem.reqValid & mem.reqReady, then: [reqSent < Const(1)]),
+      If(mem.wdataValid & mem.wdataReady, then: [wSent < Const(1)]),
+      If(
+        mem.wrespValid & mem.wrespReady,
+        then: [
+          If(
+            mem.wrespErr,
+            then: abortActiveChannel(),
+            orElse: [
+              If(
+                srcInc,
+                then: [curSrc < (curSrc + Const(step, width: addressWidth))],
+              ),
+              If(
+                dstInc,
+                then: [curDst < (curDst + Const(step, width: addressWidth))],
+              ),
+              If(
+                streamRead
+                    ? xferCount.lte(Const(step, width: 24)) |
+                          (streamLastReg & isPeriphToMem)
+                    : xferCount.lte(Const(step, width: 24)),
+                then: [
+                  // Last word: complete the active channel and raise its
+                  // IRQ.
+                  for (var ch = 0; ch < channels; ch++)
+                    If(
+                      activeCh.eq(Const(ch, width: channels.bitLength)),
+                      then: [
+                        chBusy[ch] < Const(0),
+                        chComplete[ch] < Const(1),
+                        intStatus <
+                            (intStatus | Const(1 << ch, width: channels)),
+                      ],
+                    ),
+                  dmaState < Const(sIdle, width: 3),
+                ],
+                orElse: [
+                  xferCount < (xferCount - Const(step, width: 24)),
+                  reqSent < Const(0),
+                  dmaState < Const(sRead, width: 3),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ];
 
     Sequential(clk, [
       If(
@@ -390,10 +531,8 @@ class HarborDmaController extends BridgeModule
           readData < Const(0, width: dataWidth),
           curSrc < Const(0, width: addressWidth),
           curDst < Const(0, width: addressWidth),
-          dmaAddrReg < Const(0, width: addressWidth),
-          dmaWdataReg < Const(0, width: dataWidth),
-          dmaWeReg < Const(0),
-          dmaStbReg < Const(0),
+          reqSent < Const(0),
+          wSent < Const(0),
           if (source == HarborDmaSource.peripheralStream)
             streamLastReg < Const(0),
           bus.ack < Const(0),
@@ -417,202 +556,51 @@ class HarborDmaController extends BridgeModule
                     curSrc < chSrc[ch],
                     curDst < chDst[ch],
                     xferCount < chLen[ch],
+                    reqSent < Const(0),
                     dmaState < Const(sRead, width: 3),
                   ],
                 ),
             ]),
-            CaseItem(
-              Const(sRead, width: 3),
-              source == HarborDmaSource.peripheralStream
-                  ? [
-                      // A periphToMem channel takes its beat from the
-                      // stream (s_ready is asserted combinationally by this
-                      // state, see output('s_ready') above). Any other
-                      // channel type still reads the source over the
-                      // master port.
-                      If(
-                        isPeriphToMem,
-                        then: [
-                          If(
-                            sValid,
-                            then: [
-                              readData < sData,
-                              streamLastReg < sLast,
-                              dmaState < Const(sWrite, width: 3),
-                            ],
-                          ),
-                        ],
-                        orElse: [
-                          dmaAddrReg < curSrc,
-                          dmaWeReg < Const(0),
-                          dmaStbReg < Const(1),
-                          If(
-                            dmaAck,
-                            then: [
-                              readData < dmaRdata,
-                              dmaStbReg < Const(0),
-                              dmaState < Const(sWrite, width: 3),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ]
-                  : [
-                      dmaAddrReg < curSrc,
-                      dmaWeReg < Const(0),
-                      dmaStbReg < Const(1),
-                      If(
-                        dmaAck,
-                        then: [
-                          readData < dmaRdata,
-                          dmaStbReg < Const(0),
-                          dmaState < Const(sWrite, width: 3),
-                        ],
-                      ),
-                    ],
-            ),
-            CaseItem(
-              Const(sWrite, width: 3),
-              targetSdram
-                  ? [
-                      // target: sdram checks the destination against
-                      // memRange before it ever drives the master write. Out
-                      // of range: raise CH_STATUS.error, drive no write, and
-                      // stop the channel without completing it.
-                      dmaAddrReg < curDst,
-                      dmaWdataReg < readData,
-                      If(
-                        dstInRange,
-                        then: [
-                          dmaWeReg < Const(1),
-                          dmaStbReg < Const(1),
-                          If(
-                            dmaAck,
-                            then: [
-                              dmaStbReg < Const(0),
-                              dmaWeReg < Const(0),
-                              If(
-                                srcInc,
-                                then: [
-                                  curSrc <
-                                      (curSrc +
-                                          Const(step, width: addressWidth)),
-                                ],
-                              ),
-                              If(
-                                dstInc,
-                                then: [
-                                  curDst <
-                                      (curDst +
-                                          Const(step, width: addressWidth)),
-                                ],
-                              ),
-                              If(
-                                source == HarborDmaSource.peripheralStream
-                                    ? xferCount.lte(Const(step, width: 24)) |
-                                          (streamLastReg & isPeriphToMem)
-                                    : xferCount.lte(Const(step, width: 24)),
-                                then: [
-                                  // Last word: complete the active channel
-                                  // and raise its IRQ.
-                                  for (var ch = 0; ch < channels; ch++)
-                                    If(
-                                      activeCh.eq(
-                                        Const(ch, width: channels.bitLength),
-                                      ),
-                                      then: [
-                                        chBusy[ch] < Const(0),
-                                        chComplete[ch] < Const(1),
-                                        intStatus <
-                                            (intStatus |
-                                                Const(
-                                                  1 << ch,
-                                                  width: channels,
-                                                )),
-                                      ],
-                                    ),
-                                  dmaState < Const(sIdle, width: 3),
-                                ],
-                                orElse: [
-                                  xferCount <
-                                      (xferCount - Const(step, width: 24)),
-                                  dmaState < Const(sRead, width: 3),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ],
-                        orElse: [
-                          dmaWeReg < Const(0),
-                          dmaStbReg < Const(0),
-                          for (var ch = 0; ch < channels; ch++)
-                            If(
-                              activeCh.eq(Const(ch, width: channels.bitLength)),
-                              then: [
-                                chBusy[ch] < Const(0),
-                                chError[ch] < Const(1),
-                              ],
-                            ),
-                          dmaState < Const(sIdle, width: 3),
-                        ],
-                      ),
-                    ]
-                  : [
-                      dmaAddrReg < curDst,
-                      dmaWdataReg < readData,
-                      dmaWeReg < Const(1),
-                      dmaStbReg < Const(1),
-                      If(
-                        dmaAck,
-                        then: [
-                          dmaStbReg < Const(0),
-                          dmaWeReg < Const(0),
-                          If(
-                            srcInc,
-                            then: [
-                              curSrc <
-                                  (curSrc + Const(step, width: addressWidth)),
-                            ],
-                          ),
-                          If(
-                            dstInc,
-                            then: [
-                              curDst <
-                                  (curDst + Const(step, width: addressWidth)),
-                            ],
-                          ),
-                          If(
-                            source == HarborDmaSource.peripheralStream
-                                ? xferCount.lte(Const(step, width: 24)) |
-                                      (streamLastReg & isPeriphToMem)
-                                : xferCount.lte(Const(step, width: 24)),
-                            then: [
-                              // Last word: complete the active channel and
-                              // raise its IRQ.
-                              for (var ch = 0; ch < channels; ch++)
-                                If(
-                                  activeCh.eq(
-                                    Const(ch, width: channels.bitLength),
-                                  ),
-                                  then: [
-                                    chBusy[ch] < Const(0),
-                                    chComplete[ch] < Const(1),
-                                    intStatus <
-                                        (intStatus |
-                                            Const(1 << ch, width: channels)),
-                                  ],
-                                ),
-                              dmaState < Const(sIdle, width: 3),
-                            ],
-                            orElse: [
-                              xferCount < (xferCount - Const(step, width: 24)),
-                              dmaState < Const(sRead, width: 3),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ],
-            ),
+            CaseItem(Const(sRead, width: 3), [
+              // A periphToMem channel in stream mode takes its beat from
+              // the stream (s_ready is asserted combinationally by this
+              // state, see output('s_ready') above) instead of a master
+              // read. Any other channel type reads the source beat over
+              // the master port.
+              if (streamRead)
+                If(
+                  isPeriphToMem,
+                  then: [
+                    If(
+                      sValid,
+                      then: [
+                        readData < sData,
+                        streamLastReg < sLast,
+                        reqSent < Const(0),
+                        wSent < Const(0),
+                        dmaState < Const(sWrite, width: 3),
+                      ],
+                    ),
+                  ],
+                  orElse: masterReadBeat(),
+                )
+              else
+                ...masterReadBeat(),
+            ]),
+            CaseItem(Const(sWrite, width: 3), [
+              // target: sdram checks the destination against memRange
+              // before the write is ever issued. Out of range: abort with
+              // no master request at all (writeBlocked above keeps
+              // REQ_VALID and WDATA_VALID low for this beat).
+              if (targetSdram)
+                If(
+                  dstInRange,
+                  then: writeResponse(),
+                  orElse: abortActiveChannel(),
+                )
+              else
+                ...writeResponse(),
+            ]),
           ]),
 
           // Register access

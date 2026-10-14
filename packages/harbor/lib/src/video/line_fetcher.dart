@@ -1,27 +1,27 @@
 import 'package:rohd/rohd.dart';
 
-/// System-domain burst fetcher: reads a scanline from memory over a
-/// Wishbone-style master and streams it into an external line buffer.
-///
-/// On a [fetchStart] pulse it reads [words] sequential 32-bit words from
-/// [fetchAddr] (advancing on each `ack`), driving [wrEn]/[wrIdx]/[wrData] to
-/// write each word into the buffer selected by [fillSel]. The inputs go
-/// through one register, so the line starts one cycle after [fetchStart].
-/// [busy] is high from the cycle after [fetchStart] until the line is
-/// complete, [done] pulses for one cycle when the line is complete.
-///
-/// After every [burstWords] words the fetcher drops `cyc` for one cycle, so a
-/// shared bus arbiter that locks its grant on `cyc` can serve other masters
-/// inside a line.
-class HarborLineFetcher extends Module {
-  /// Wishbone master outputs.
-  Logic get mStb => output('m_stb');
-  Logic get mCyc => output('m_cyc');
-  Logic get mWe => output('m_we');
-  Logic get mAddr => output('m_adr');
-  Logic get mSel => output('m_sel');
-  Logic get mDataOut => output('m_dat_o');
+import '../arith/fpu_config.dart';
+import '../bus/port/memory_waist.dart';
 
+/// System-domain burst fetcher: reads a scanline from memory over a memory
+/// master waist and streams it into an external line buffer.
+///
+/// On a [fetchStart] pulse it reads [words] sequential 32-bit words starting
+/// at [fetchAddr], driving [wrEn]/[wrIdx]/[wrData] to write each word into
+/// the buffer selected by [fillSel]. The inputs go through one register, so
+/// the line starts one cycle after [fetchStart]. [busy] is high from the
+/// cycle after [fetchStart] until the line is complete, [done] pulses for one
+/// cycle when the line is complete.
+///
+/// Reads only, one ID (0), so responses stay in order. Each request is INCR,
+/// SIZE 2 (32-bit words), with LEN set for `beats = min(burstWords, words
+/// left in the line, words to the next 4 KB boundary)`. [burstWords] is the
+/// beats per request, 1 to 256: the next request goes out as soon as
+/// [waist] takes the previous one, so [waist]'s `outstanding` is what limits
+/// how far a line can pipeline. A beat with RDATA_ERR still writes zero into
+/// the line buffer and counts towards the line, and pulses [err] for that
+/// one cycle.
+class HarborLineFetcher extends Module {
   /// Line-buffer write stream.
   Logic get wrEn => output('wr_en');
   Logic get wrSel => output('wr_sel');
@@ -34,9 +34,12 @@ class HarborLineFetcher extends Module {
   /// Pulses for one cycle when a line finishes.
   Logic get done => output('done');
 
+  /// Pulses for one cycle on a read beat with RDATA_ERR.
+  Logic get err => output('err');
+
   final int maxWords;
 
-  /// Words read under one `cyc` before the fetcher gives the bus back.
+  /// Beats requested at a time, 1 to 256.
   final int burstWords;
 
   HarborLineFetcher({
@@ -46,16 +49,35 @@ class HarborLineFetcher extends Module {
     required Logic fetchAddr,
     required Logic words,
     required Logic fillSel,
-    required Logic mDataIn,
-    required Logic mAck,
+    required HarborMemoryWaist waist,
     this.maxWords = 1024,
     this.burstWords = 16,
     super.name = 'line_fetcher',
-  }) : super(definitionName: 'HarborLineFetcher_b$burstWords') {
-    if (burstWords < 1) {
-      throw ArgumentError.value(burstWords, 'burstWords', 'must be >= 1');
+  }) : super(
+         definitionName: harborStableDefinitionName('HarborLineFetcher', [
+           'b$burstWords',
+           'w$maxWords',
+           'i${waist.config.idWidth}',
+           'n${waist.config.outstanding}',
+         ]),
+       ) {
+    if (waist.config.addressWidth != 32 || waist.config.dataWidth != 32) {
+      throw ArgumentError(
+        'HarborLineFetcher needs a 32-bit address and data waist, '
+        'got ${waist.config}',
+      );
+    }
+    if (burstWords < 1 || burstWords > 256) {
+      throw ArgumentError.value(burstWords, 'burstWords', 'must be 1 to 256');
     }
     final idxW = (maxWords - 1).bitLength < 1 ? 1 : (maxWords - 1).bitLength;
+    const ww = 17;
+    const lenW = HarborMemoryWaistConfig.lenWidth;
+    const sizeW = HarborMemoryWaistConfig.sizeWidth;
+    const burstW = HarborMemoryWaistConfig.burstWidth;
+    final idW = waist.config.idWidth;
+    final dataW = waist.config.dataWidth;
+    final strbW = waist.config.strbWidth;
 
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
@@ -63,53 +85,99 @@ class HarborLineFetcher extends Module {
     fetchAddr = addInput('fetch_addr', fetchAddr, width: 32);
     words = addInput('words', words, width: 16);
     fillSel = addInput('fill_sel', fillSel);
-    mDataIn = addInput('m_dat_i', mDataIn, width: 32);
-    mAck = addInput('m_ack', mAck);
 
-    addOutput('m_stb');
-    addOutput('m_cyc');
-    addOutput('m_we');
-    addOutput('m_adr', width: 32);
-    addOutput('m_sel', width: 4);
-    addOutput('m_dat_o', width: 32);
     addOutput('wr_en');
     addOutput('wr_sel');
     addOutput('wr_idx', width: idxW);
     addOutput('wr_data', width: 32);
     addOutput('busy');
     addOutput('done');
+    addOutput('err');
+
+    final m = waist.clone()
+      ..pairConnectIO(this, waist, PairRole.provider, uniquify: (n) => 'm_$n');
+
+    Logic minOf(Logic a, Logic b) => mux(a.lt(b), a, b);
+    Logic beatsFor(Logic addrIn, Logic remain, String tag) {
+      final off = addrIn.getRange(2, 12).zeroExtend(ww).named('page_off_$tag');
+      final toBoundary = (Const(1024, width: ww) - off).named(
+        'to_boundary_$tag',
+      );
+      return minOf(
+        minOf(remain, Const(burstWords, width: ww)),
+        toBoundary,
+      ).named('beats_$tag');
+    }
 
     final reading = Logic(name: 'reading');
+    final reqValid = Logic(name: 'req_valid_reg');
     final addr = Logic(name: 'addr', width: 32);
-    final cnt = Logic(name: 'cnt', width: 16);
+    final len = Logic(name: 'len', width: lenW);
+    final reqLeft = Logic(name: 'req_left', width: ww);
     final idx = Logic(name: 'idx', width: idxW);
+    final rdLeft = Logic(name: 'rd_left', width: ww);
     final fillReg = Logic(name: 'fill_reg');
     final doneReg = Logic(name: 'done_reg');
-    final burstW = burstWords.bitLength;
-    final beat = Logic(name: 'beat', width: burstW);
-    final yieldBus = Logic(name: 'yield_bus');
-    final active = (reading & ~yieldBus).named('active');
+
     // The start inputs can come from far away, so they get a register here.
     final start1 = Logic(name: 'start_s1');
     final addr1 = Logic(name: 'addr_s1', width: 32);
     final words1 = Logic(name: 'words_s1', width: 16);
     final fill1 = Logic(name: 'fill_s1');
 
-    final capture = active & mAck;
+    final total = words1.zeroExtend(ww).named('total');
+    final firstBeats = beatsFor(addr1, total, 'first');
 
-    // Master port.
-    mStb <= active;
-    mCyc <= active;
-    mWe <= Const(0);
-    mAddr <= addr;
-    mSel <= Const(0xF, width: 4);
-    mDataOut <= Const(0, width: 32);
+    // The first request goes out from the start register in the start cycle.
+    // When it is taken there, the registers load it as usual and advance one
+    // cycle later, with the request held low in that cycle.
+    final first = (start1 & ~reading).named('first');
+    final firstValid = (first & words1.neq(0)).named('first_valid');
+    final advance = Logic(name: 'advance');
+    final reqOut = ((reqValid & ~advance) | firstValid).named('req_out');
+    final reqFire = (reqOut & m.reqReady & ~first).named('req_fire');
+    final firstFire = (firstValid & m.reqReady).named('first_fire');
+    final beatsThis = (len.zeroExtend(ww) + Const(1, width: ww)).named(
+      'beats_this',
+    );
+    // addr/len describe the request just fired. reqLeft already excludes
+    // it, so the next request's length comes from reqLeft directly, not
+    // reqLeft - beatsThis again.
+    final nextAddr = (addr + (beatsThis.zeroExtend(32) << 2)).named(
+      'next_addr',
+    );
+    final nextBeats = beatsFor(nextAddr, reqLeft, 'next');
 
-    // Write stream straight through on each captured word.
-    wrEn <= capture;
-    wrSel <= fillReg;
-    wrIdx <= idx;
-    wrData <= mDataIn;
+    final rdataFire = Logic(name: 'rdata_fire');
+
+    // Request channel: reads only, one ID, INCR, 32-bit beats.
+    m.reqValid <= reqOut;
+    m.reqId <= Const(0, width: idW);
+    m.reqWrite <= Const(0);
+    m.reqAddr <= mux(first, addr1, addr);
+    m.reqLen <= mux(first, (firstBeats - 1).getRange(0, lenW), len);
+    m.reqSize <= Const(2, width: sizeW);
+    m.reqBurst <= Const(HarborMemoryBurst.incr.value, width: burstW);
+
+    // Never writes.
+    m.wdataValid <= Const(0);
+    m.wdataData <= Const(0, width: dataW);
+    m.wdataStrb <= Const(0, width: strbW);
+    m.wdataLast <= Const(0);
+    m.wrespReady <= Const(0);
+
+    // Ready for read data while a line is in flight.
+    m.rdataReady <= reading | firstValid;
+    rdataFire <= m.rdataValid & m.rdataReady;
+
+    // Write stream straight through on each captured beat. An errored beat
+    // still writes zero and still counts.
+    // A memory can answer in the cycle it takes the first request.
+    wrEn <= rdataFire;
+    wrSel <= mux(first, fill1, fillReg);
+    wrIdx <= mux(first, Const(0, width: idxW), idx);
+    wrData <= mux(m.rdataErr, Const(0, width: 32), m.rdataData);
+    err <= rdataFire & m.rdataErr;
 
     busy <= reading | start1;
     done <= doneReg;
@@ -118,7 +186,7 @@ class HarborLineFetcher extends Module {
     Sequential(clk, reset: reset, [
       start1 < fetchStart,
       doneReg < Const(0),
-      yieldBus < Const(0),
+      advance < firstFire,
       If(
         ~reading,
         then: [
@@ -126,33 +194,33 @@ class HarborLineFetcher extends Module {
             start1,
             then: [
               addr < addr1,
-              cnt < words1,
-              idx < Const(0, width: idxW),
+              len < (firstBeats - 1).getRange(0, lenW),
+              reqLeft < (total - firstBeats),
+              reqValid < words1.neq(0),
+              idx < rdataFire.zeroExtend(idxW),
+              rdLeft < total - rdataFire.zeroExtend(ww),
               fillReg < fill1,
-              beat < Const(0, width: burstW),
-              reading < Const(1),
+              reading < words1.neq(0) & ~(rdataFire & total.eq(1)),
+              doneReg < rdataFire & total.eq(1),
             ],
           ),
         ],
         orElse: [
           If(
-            capture,
+            reqFire | advance,
             then: [
-              addr < (addr + Const(4, width: 32)),
+              addr < nextAddr,
+              len < (nextBeats - 1).getRange(0, lenW),
+              reqValid < reqLeft.neq(0),
+              reqLeft < (reqLeft - nextBeats),
+            ],
+          ),
+          If(
+            rdataFire,
+            then: [
               idx < (idx + Const(1, width: idxW)),
-              If(
-                beat.eq(burstWords - 1),
-                then: [
-                  beat < Const(0, width: burstW),
-                  yieldBus < Const(1),
-                ],
-                orElse: [beat < beat + 1],
-              ),
-              If(
-                cnt.eq(1),
-                then: [reading < Const(0), doneReg < Const(1)],
-                orElse: [cnt < (cnt - Const(1, width: 16))],
-              ),
+              rdLeft < (rdLeft - Const(1, width: ww)),
+              If(rdLeft.eq(1), then: [reading < Const(0), doneReg < Const(1)]),
             ],
           ),
         ],

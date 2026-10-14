@@ -4,7 +4,9 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
-import '../bus/wishbone/wishbone_interface.dart';
+import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
+import '../bus/port/port_cdc.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -27,6 +29,10 @@ class HarborSpiController extends BridgeModule
         HarborAcpiDeviceProvider,
         HarborSvdPeripheralProvider,
         HarborInputClockConsumer {
+  /// Outstanding requests the DMA master memory port carries. Fixed at 1:
+  /// the engine never has more than one write beat in flight.
+  static const int masterOutstanding = 1;
+
   /// Base address in the SoC memory map.
   final int baseAddress;
 
@@ -56,8 +62,8 @@ class HarborSpiController extends BridgeModule
   /// SD-over-SPI maximum clock. Conservative default for a first bring-up.
   final int sdMaxFrequency;
 
-  /// When true, the controller gains an integrated DMA engine: a wishbone
-  /// MASTER handshake (dma_*) plus DMA_ADDR/DMA_LEN/DMA_CTRL registers. The
+  /// When true, the controller gains an integrated DMA engine: a `dma`
+  /// master memory port plus DMA_ADDR/DMA_LEN/DMA_CTRL registers. The
   /// engine clocks the SPI continuously (no per-byte CPU poll) and moves bytes
   /// to/from memory itself, packing four SPI bytes into each 32-bit word write.
   /// This is the fast path for large transfers (an SD block or a kernel image).
@@ -76,11 +82,6 @@ class HarborSpiController extends BridgeModule
 
   /// Bus slave port.
   late final BusSlavePort bus;
-
-  /// DMA fabric master interface (only when [dma]). The engine drives full
-  /// bus-width beats (sel all-ones) so it needs no width conversion to sit on
-  /// the SoC arbiter alongside the core.
-  WishboneInterface? _dmaBus;
 
   /// Interrupt output.
   Logic get interrupt => output('interrupt');
@@ -112,6 +113,8 @@ class HarborSpiController extends BridgeModule
            'sd$spiDataWidth',
            if (dma) 'dma',
            if (dma) 'da$dmaAddressWidth',
+           if (dma) 'n$masterOutstanding',
+           if (dma && crossFabricClock) 'q${harborCdcDepth(masterOutstanding)}',
          ]),
          name: name ?? 'spi',
        ) {
@@ -125,28 +128,14 @@ class HarborSpiController extends BridgeModule
     addOutput('spi_cs_n', width: csCount);
     addOutput('interrupt');
 
-    // Integrated DMA engine: a real Wishbone MASTER interface (`dma`) at the
-    // fabric data width, so `HarborSoc.addMaster` wires it to the arbiter next
-    // to the core with no width conversion. Present only when [dma], so a
-    // non-DMA controller stays byte-identical.
-    if (dma) {
-      final dmaRef = addInterface(
-        WishboneInterface(
-          WishboneConfig(
-            addressWidth: dmaAddressWidth,
-            dataWidth: busDataWidth,
-          ),
-        ),
-        name: 'dma',
-        role: PairRole.provider,
-      );
-      _dmaBus = dmaRef.internalInterface as WishboneInterface;
-    }
-
     // Bus read-data width. The register file is 32-bit; a wider fabric sees the
     // registers zero-extended into the low word.
     final dw = busDataWidth;
 
+    final fabricClock = BusSlavePort.fabricClockInputs(
+      this,
+      cross: crossFabricClock,
+    );
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
@@ -155,11 +144,31 @@ class HarborSpiController extends BridgeModule
       reset: input('reset'),
       addressWidth: busAddressWidth,
       dataWidth: dw,
-      fabricClock: BusSlavePort.fabricClockInputs(
-        this,
-        cross: crossFabricClock,
-      ),
+      fabricClock: fabricClock,
     );
+
+    // Integrated DMA engine: a `dma` master memory port at the fabric data
+    // width, so `HarborSoc.addMaster` wires it to the arbiter next to the
+    // core with no width conversion. Present only when [dma], so a non-DMA
+    // controller stays byte-identical.
+    late final HarborMemoryWaist dmaWaist;
+    if (dma) {
+      final dmaPort = HarborMemoryMasterPort.create(
+        module: this,
+        name: 'dma',
+        kind: fabricKind,
+        config: HarborMemoryWaistConfig(
+          addressWidth: dmaAddressWidth,
+          dataWidth: busDataWidth,
+          idWidth: 1,
+          outstanding: masterOutstanding,
+        ),
+        clk: input('clk'),
+        reset: input('reset'),
+        fabricClock: fabricClock,
+      );
+      dmaWaist = dmaPort.waist;
+    }
 
     final clk = input('clk');
     final reset = bus.reset;
@@ -197,57 +206,67 @@ class HarborSpiController extends BridgeModule
     const dmaIdle = 0;
     const dmaKick = 1;
     const dmaWait = 2;
-    const dmaWrite = 3;
-    const dmaWriteWait = 4;
+    const dmaWriteWait = 3;
 
     // DMA engine state. Built ONLY when [dma] so a non-DMA controller is
     // byte-identical: no extra flops, no extra ports, nothing to elaborate.
     // `late` (not nullable) keeps the type non-null so no `!` is needed; every
     // reference below is inside an `if (dma)` guard, so an unbuilt controller
     // never touches them.
-    late final Logic dmaAck,
-        dmaAddr,
+    late final Logic dmaAddr,
         dmaLen,
         dmaDir,
         dmaBusy,
         dmaDone,
+        dmaError,
         dmaState,
         dmaWord,
         dmaByteIdx,
-        dmaAddrReg,
-        dmaWdataReg,
-        dmaWeReg,
-        dmaStbReg;
+        reqSent,
+        wSent;
     // One fabric beat is a full bus-width word. Packing that many SPI bytes
     // per beat (sel all-ones) keeps every write naturally aligned, so no
     // sub-word/byte-enable path is needed on a 64-bit fabric.
     final wordBytes = busDataWidth ~/ 8;
     final byteIdxWidth = (wordBytes - 1).bitLength; // 2 for x4, 3 for x8
+    final sizeLog2 = wordBytes.bitLength - 1;
     if (dma) {
-      final wb = _dmaBus!;
-      dmaAck = wb.ack;
+      final mem = dmaWaist;
       dmaAddr = Logic(name: 'dma_addr_reg', width: dmaAddressWidth);
       dmaLen = Logic(name: 'dma_len', width: 32);
       dmaDir = Logic(name: 'dma_dir'); // 0 = SD->mem, 1 = mem->SD
       dmaBusy = Logic(name: 'dma_busy');
       dmaDone = Logic(name: 'dma_done');
+      dmaError = Logic(name: 'dma_error');
       dmaState = Logic(name: 'dma_state', width: 3);
       dmaWord = Logic(name: 'dma_word', width: busDataWidth); // one beat
       dmaByteIdx = Logic(name: 'dma_byte_idx', width: byteIdxWidth);
-      dmaAddrReg = Logic(name: 'dma_addr_out', width: dmaAddressWidth);
-      dmaWdataReg = Logic(name: 'dma_wdata_out', width: busDataWidth);
-      dmaWeReg = Logic(name: 'dma_we_out');
-      dmaStbReg = Logic(name: 'dma_stb_out');
+      // Tracks whether this beat's REQ (or WDATA) has already been taken, so
+      // REQ_VALID / WDATA_VALID each drop on their own handshake instead of
+      // waiting on each other.
+      reqSent = Logic(name: 'dma_req_sent');
+      wSent = Logic(name: 'dma_w_sent');
 
-      // Drive the Wishbone master. cyc == stb (single-beat, non-pipelined),
-      // sel all-ones (full-width aligned writes). datMiso is unused on the
-      // read path (SD -> mem).
-      wb.cyc <= dmaStbReg;
-      wb.stb <= dmaStbReg;
-      wb.we <= dmaWeReg;
-      wb.adr <= dmaAddrReg;
-      wb.datMosi <= dmaWdataReg;
-      wb.sel <= Const((1 << wordBytes) - 1, width: wordBytes);
+      // The engine only writes (SD -> mem), one beat at a time. Only
+      // dmaWriteWait drives the handshake, and it tracks every fire.
+      final writeActive = dmaState.eq(Const(dmaWriteWait, width: 3));
+      mem.reqValid <= (writeActive & ~reqSent);
+      mem.reqId <= Const(0, width: mem.config.idWidth);
+      mem.reqWrite <= Const(1);
+      mem.reqAddr <= dmaAddr;
+      mem.reqLen <= Const(0, width: HarborMemoryWaistConfig.lenWidth);
+      mem.reqSize <= Const(sizeLog2, width: HarborMemoryWaistConfig.sizeWidth);
+      mem.reqBurst <=
+          Const(
+            HarborMemoryBurst.incr.value,
+            width: HarborMemoryWaistConfig.burstWidth,
+          );
+      mem.wdataValid <= (writeActive & ~wSent);
+      mem.wdataData <= dmaWord;
+      mem.wdataStrb <= Const((1 << wordBytes) - 1, width: mem.config.strbWidth);
+      mem.wdataLast <= Const(1);
+      mem.rdataReady <= Const(0);
+      mem.wrespReady <= writeActive;
     }
 
     // Status register: busy | tx_empty<<1 | rx_ready<<2, plus dma_busy<<3 |
@@ -295,15 +314,14 @@ class HarborSpiController extends BridgeModule
             dmaState < Const(0, width: 3),
             dmaBusy < Const(0),
             dmaDone < Const(0),
+            dmaError < Const(0),
             dmaAddr < Const(0, width: dmaAddressWidth),
             dmaLen < Const(0, width: 32),
             dmaDir < Const(0),
             dmaWord < Const(0, width: busDataWidth),
             dmaByteIdx < Const(0, width: byteIdxWidth),
-            dmaAddrReg < Const(0, width: dmaAddressWidth),
-            dmaWdataReg < Const(0, width: busDataWidth),
-            dmaWeReg < Const(0),
-            dmaStbReg < Const(0),
+            reqSent < Const(0),
+            wSent < Const(0),
           ],
         ],
         orElse: [
@@ -473,18 +491,22 @@ class HarborSpiController extends BridgeModule
                     ),
                   ]),
                   // 0x38: DMA_CTRL. Write bit0=START (self-clearing kick),
-                  // bit1=DIR (0 = SD->mem read, 1 = mem->SD write). Read returns
-                  // {dma_done<<1, dma_busy<<0} for polling without STATUS.
+                  // bit1=DIR (0 = SD->mem read, 1 = mem->SD write). Read
+                  // returns {dma_error<<2, dma_done<<1, dma_busy<<0} for
+                  // polling without STATUS. dma_error is sticky: it stays set
+                  // after a WRESP error until the next START clears it. A
+                  // START while dma_busy is set is ignored.
                   CaseItem(Const(0x38, width: 12), [
                     If(
                       bus.we & bus.selAny(0x38, 1),
                       then: [
                         If(
-                          bus.dataIn[0],
+                          bus.dataIn[0] & ~dmaBusy,
                           then: [
                             dmaDir < bus.dataIn[1],
                             dmaBusy < Const(1),
                             dmaDone < Const(0),
+                            dmaError < Const(0),
                             dmaByteIdx < Const(0, width: byteIdxWidth),
                             dmaWord < Const(0, width: busDataWidth),
                             dmaState < Const(dmaKick, width: 3),
@@ -494,7 +516,10 @@ class HarborSpiController extends BridgeModule
                       orElse: [
                         bus.dataOut <
                             dmaBusy.zeroExtend(dw) |
-                                (dmaDone.zeroExtend(dw) << Const(1, width: dw)),
+                                (dmaDone.zeroExtend(dw) <<
+                                    Const(1, width: dw)) |
+                                (dmaError.zeroExtend(dw) <<
+                                    Const(2, width: dw)),
                       ],
                     ),
                   ]),
@@ -552,39 +577,55 @@ class HarborSpiController extends BridgeModule
                     If(
                       dmaByteIdx.eq(Const(wordBytes - 1, width: byteIdxWidth)) |
                           dmaLen.eq(Const(1, width: 32)),
-                      then: [dmaState < Const(dmaWrite, width: 3)],
+                      then: [
+                        reqSent < Const(0),
+                        wSent < Const(0),
+                        dmaState < Const(dmaWriteWait, width: 3),
+                      ],
                       orElse: [dmaState < Const(dmaKick, width: 3)],
                     ),
                   ],
                 ),
               ]),
-              // dmaWrite: present the packed word to the fabric master.
-              CaseItem(Const(dmaWrite, width: 3), [
-                dmaAddrReg < dmaAddr,
-                dmaWdataReg < dmaWord,
-                dmaWeReg < Const(1),
-                dmaStbReg < Const(1),
-                dmaState < Const(dmaWriteWait, width: 3),
-              ]),
-              // dmaWriteWait: hold the request until the fabric acks the write.
+              // dmaWriteWait: REQ_VALID and WDATA_VALID each drop on their
+              // own handshake; the beat finishes on WRESP. A WRESP error
+              // ends the transfer with the sticky error bit set instead of
+              // completing it.
               CaseItem(Const(dmaWriteWait, width: 3), [
                 If(
-                  dmaAck,
+                  dmaWaist.reqValid & dmaWaist.reqReady,
+                  then: [reqSent < Const(1)],
+                ),
+                If(
+                  dmaWaist.wdataValid & dmaWaist.wdataReady,
+                  then: [wSent < Const(1)],
+                ),
+                If(
+                  dmaWaist.wrespValid & dmaWaist.wrespReady,
                   then: [
-                    dmaStbReg < Const(0),
-                    dmaWeReg < Const(0),
-                    dmaAddr <
-                        (dmaAddr + Const(wordBytes, width: dmaAddressWidth)),
-                    dmaWord < Const(0, width: busDataWidth),
-                    dmaByteIdx < Const(0, width: byteIdxWidth),
                     If(
-                      dmaLen.eq(Const(0, width: 32)),
+                      dmaWaist.wrespErr,
                       then: [
                         dmaBusy < Const(0),
-                        dmaDone < Const(1),
+                        dmaError < Const(1),
                         dmaState < Const(dmaIdle, width: 3),
                       ],
-                      orElse: [dmaState < Const(dmaKick, width: 3)],
+                      orElse: [
+                        dmaAddr <
+                            (dmaAddr +
+                                Const(wordBytes, width: dmaAddressWidth)),
+                        dmaWord < Const(0, width: busDataWidth),
+                        dmaByteIdx < Const(0, width: byteIdxWidth),
+                        If(
+                          dmaLen.eq(Const(0, width: 32)),
+                          then: [
+                            dmaBusy < Const(0),
+                            dmaDone < Const(1),
+                            dmaState < Const(dmaIdle, width: 3),
+                          ],
+                          orElse: [dmaState < Const(dmaKick, width: 3)],
+                        ),
+                      ],
                     ),
                   ],
                 ),

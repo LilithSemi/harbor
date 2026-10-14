@@ -12,6 +12,7 @@ import '../bus/bus.dart';
 import '../bus/bus_error_source.dart';
 import '../bus/bus_slave_port.dart';
 import '../bus/fabric.dart';
+import '../bus/port/memory_port.dart';
 import '../bus/tilelink/tilelink_interface.dart';
 import '../bus/wishbone/wishbone_arbiter.dart';
 import '../bus/wishbone/wishbone_interface.dart';
@@ -587,12 +588,16 @@ class HarborSoC extends BridgeModule {
   ///
   /// [memory] marks a memory port (see [HarborFabricMaster.memory]). Null
   /// picks true for an `Axi4Interface` and false for every other port, so a
-  /// TileLink-UH master must set it. [outstanding] is the most requests in
-  /// flight (see [HarborFabricMaster.outstanding]). [readChannel] picks the
-  /// read channel at a slave with more than one (see
+  /// master built on [HarborMemoryMasterPort] passes true. [outstanding] is
+  /// the most requests in flight (see [HarborFabricMaster.outstanding]).
+  /// [readChannel] picks the read channel at a slave with more than one (see
   /// [HarborFabricMaster.readChannel]). [exclusiveIds] turns on AXI4
   /// exclusive access for this master (see [HarborFabricMaster.exclusiveIds]
   /// and [memoryBusShape]).
+  ///
+  /// A module can be a peripheral and a master, or have more than one
+  /// master port. Its master then takes the name
+  /// `<module>_<busInterfaceName>` on the fabric.
   ///
   /// Clock and reset are auto-wired.
   T addMaster<T extends BridgeModule>(
@@ -1186,16 +1191,9 @@ class HarborSoC extends BridgeModule {
       HarborFabricKind.tilelink => intf is TileLinkInterface,
     };
     if (native) return;
-    final kind = fabricKind.name;
-    final later = switch (module) {
-      _ when role == 'master' && intf is WishboneInterface =>
-        ' A native master port for $kind is not implemented yet, only slave '
-            'ports are. Build this SoC on a wishbone fabric until it is.',
-      _ => '',
-    };
     throw StateError(
       '$role ${module.name} has a ${intf.runtimeType} port, but the fabric '
-      'of $name is $kind.$later',
+      'of $name is ${fabricKind.name}.',
     );
   }
 

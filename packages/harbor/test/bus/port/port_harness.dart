@@ -76,8 +76,13 @@ class RegFile extends BridgeModule {
 class MasterShell extends BridgeModule {
   late final BusMasterPort bus;
 
-  MasterShell(HarborFabricKind kind)
-    : super('PortTestMasterShell_${kind.name}', name: 'shell') {
+  /// With [exclusive], the port is built with `exclusive: true` and the
+  /// shell adds `m_lock` and `m_exokay`.
+  MasterShell(HarborFabricKind kind, {bool exclusive = false})
+    : super(
+        'PortTestMasterShell_${kind.name}${exclusive ? '_x' : ''}',
+        name: 'shell',
+      ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('m_addr', PortDirection.input, width: 16);
@@ -97,7 +102,12 @@ class MasterShell extends BridgeModule {
       clk: input('clk'),
       reset: input('reset'),
       useErr: true,
+      exclusive: exclusive,
     );
+    if (exclusive) {
+      bus.lock <= addInput('m_lock', Logic());
+      addOutput('m_exokay') <= bus.exokay;
+    }
     bus.addr <= input('m_addr');
     bus.dataOut <= input('m_wdata');
     bus.stb <= input('m_stb');

@@ -1,5 +1,7 @@
 import 'package:rohd/rohd.dart';
 
+import '../arith/fpu_config.dart';
+import '../bus/port/memory_waist.dart';
 import '../soc/target.dart';
 import 'tmds_serializer.dart';
 
@@ -14,11 +16,11 @@ import 'video_timing.dart';
 /// A framebuffer display that streams from shared main memory across clock
 /// domains: pixel-domain timing + TMDS, system-domain framebuffer DMA.
 ///
-/// The system-domain Wishbone master ([mStb] etc.) joins the SoC fabric
+/// The system-domain memory master waist ([memory]) joins the SoC fabric
 /// directly (no per-word CDC bridge). The clock crossing lives inside the
-/// double line buffer. The master gives the bus back after every
-/// `burstWords` words, see [HarborDualClockScanout]. Give [rqReady],
-/// [rdValid] and [rdData] in place of [mDataIn] and [mAck] to read through a
+/// double line buffer. A new [burstWords]-beat request goes out as soon as
+/// the waist takes the previous one, see [HarborDualClockScanout]. Give
+/// [rqReady], [rdValid] and [rdData] in place of [memory] to read through a
 /// scanout port (`rq_*`), such as a [HarborSdram] scanout port. Then
 /// [sysClk] and [sysReset] are that port's clock and reset, and the display
 /// ignores the low 2 bits of `fb_base`. [lineStride] is the bytes from one
@@ -66,14 +68,6 @@ class HarborDualClockDisplay extends Module {
   Logic get pixelWord => output('pixel_word');
   Logic get underrun => output('underrun');
 
-  /// Wishbone master (system domain) for framebuffer reads.
-  Logic get mStb => output('m_stb');
-  Logic get mCyc => output('m_cyc');
-  Logic get mWe => output('m_we');
-  Logic get mAddr => output('m_adr');
-  Logic get mSel => output('m_sel');
-  Logic get mDataOut => output('m_dat_o');
-
   /// Scanout port requests (system domain).
   Logic get rqValid => output('rq_valid');
   Logic get rqAddr => output('rq_addr');
@@ -98,8 +92,7 @@ class HarborDualClockDisplay extends Module {
     required Logic sysReset,
     required Logic enable,
     required Logic fbBase,
-    Logic? mDataIn,
-    Logic? mAck,
+    HarborMemoryWaist? memory,
     Logic? rqReady,
     Logic? rdValid,
     Logic? rdData,
@@ -118,7 +111,16 @@ class HarborDualClockDisplay extends Module {
                  ? 'HarborDualClockDisplayPort'
                        '_s${lineStride ?? _lineBytes(timing, pixelFormat)}'
                        '_w${_lineBytes(timing, pixelFormat) ~/ 4}'
-                 : 'HarborDualClockDisplay') +
+                 : harborStableDefinitionName('HarborDualClockDisplay', [
+                     's${lineStride ?? _lineBytes(timing, pixelFormat)}',
+                     'w${_lineBytes(timing, pixelFormat) ~/ 4}',
+                     'ram${target.blockRam?.name ?? "flop"}',
+                     if (memory != null) ...[
+                       'b$burstWords',
+                       'i${memory.config.idWidth}',
+                       'n${memory.config.outstanding}',
+                     ],
+                   ])) +
              (outputType == HarborDisplayInterface.parallelRgb
                  ? '_parallelRgb'
                  : ''),
@@ -156,8 +158,16 @@ class HarborDualClockDisplay extends Module {
     sysReset = addInput('sys_reset', sysReset);
     enable = addInput('enable', enable);
     fbBase = addInput('fb_base', fbBase, width: 32);
-    if (mDataIn != null) mDataIn = addInput('m_dat_i', mDataIn, width: 32);
-    if (mAck != null) mAck = addInput('m_ack', mAck);
+    HarborMemoryWaist? localMemory;
+    if (memory != null) {
+      localMemory = memory.clone()
+        ..pairConnectIO(
+          this,
+          memory,
+          PairRole.provider,
+          uniquify: (n) => 'm_$n',
+        );
+    }
     if (rqReady != null) rqReady = addInput('rq_ready', rqReady);
     if (rdValid != null) rdValid = addInput('rd_valid', rdValid);
     if (rdData != null) rdData = addInput('rd_data', rdData, width: 16);
@@ -226,8 +236,7 @@ class HarborDualClockDisplay extends Module {
       fbBase: fbBase,
       stride: Const(this.lineStride, width: 32),
       wordsPerLine: Const(wordsPerLine, width: 16),
-      mDataIn: mDataIn,
-      mAck: mAck,
+      memory: localMemory,
       rqReady: rqReady,
       rdValid: rdValid,
       rdData: rdData,
@@ -240,13 +249,6 @@ class HarborDualClockDisplay extends Module {
       addOutput('rq_valid') <= scanout.rqValid;
       addOutput('rq_addr', width: 32) <= scanout.rqAddr;
       addOutput('rq_words', width: scanout.rqWords.width) <= scanout.rqWords;
-    } else {
-      addOutput('m_stb') <= scanout.mStb;
-      addOutput('m_cyc') <= scanout.mCyc;
-      addOutput('m_we') <= scanout.mWe;
-      addOutput('m_adr', width: 32) <= scanout.mAddr;
-      addOutput('m_sel', width: 4) <= scanout.mSel;
-      addOutput('m_dat_o', width: 32) <= scanout.mDataOut;
     }
     underrun <= scanout.underrun;
 

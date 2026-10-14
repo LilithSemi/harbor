@@ -4,9 +4,10 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-/// Runs one 40-word line from a slave that acks [latency] cycles after the
-/// strobe. Returns the lengths of the `cyc` low gaps inside the line and the
-/// words written to the line buffer, keyed by index.
+/// Runs one 40-word line over a Wishbone memory master port, from a slave
+/// that acks [latency] cycles after the strobe. Returns the lengths of the
+/// `cyc` low gaps inside the line and the words written to the line buffer,
+/// keyed by index.
 Future<(List<int>, Map<int, int>)> _line({
   required int burstWords,
   required int latency,
@@ -15,8 +16,8 @@ Future<(List<int>, Map<int, int>)> _line({
   final clk = SimpleClockGenerator(10).clk;
   final reset = Logic()..inject(1);
   final start = Logic()..inject(0);
-  final ack = Logic()..inject(0);
-  final data = Logic(width: 32)..inject(0);
+  const config = HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32);
+  final waist = HarborMemoryWaist(config);
   final f = HarborLineFetcher(
     clk: clk,
     reset: reset,
@@ -24,8 +25,7 @@ Future<(List<int>, Map<int, int>)> _line({
     fetchAddr: Const(0x1000, width: 32),
     words: Const(words, width: 16),
     fillSel: Const(0),
-    mDataIn: data,
-    mAck: ack,
+    waist: waist,
     maxWords: 64,
     burstWords: burstWords,
   );
@@ -34,6 +34,27 @@ Future<(List<int>, Map<int, int>)> _line({
   final wrIdx = flop(clk, f.wrIdx);
   final wrData = flop(clk, f.wrData);
   await f.build();
+
+  final wb = WishboneInterface(harborWishboneMemoryConfig(config));
+  final master = HarborWishboneMemoryMaster(
+    clk: clk,
+    reset: reset,
+    waist: waist,
+    wb: wb,
+  );
+  await master.build();
+  var waited = 0;
+  // Slave: ack once the strobe has waited for the latency.
+  clk.negedge.listen((_) {
+    final stb = wb.stb.value == LogicValue.one;
+    final ackNow = stb && wb.ack.value != LogicValue.one && ++waited >= latency;
+    if (!stb || ackNow) waited = 0;
+    wb.ack.inject(ackNow ? 1 : 0);
+    wb.datMiso.inject(wb.adr.value);
+  });
+  wb.err!.inject(0);
+
+  Simulator.setMaxSimTime(4000000);
   unawaited(Simulator.run());
 
   await clk.nextPosedge;
@@ -46,20 +67,13 @@ Future<(List<int>, Map<int, int>)> _line({
   final gaps = <int>[];
   final written = <int, int>{};
   var gap = 0;
-  var waited = 0;
   for (var n = 0; n < 4000 && f.done.value != LogicValue.one; n++) {
-    // Slave: ack once the strobe has waited for the latency.
-    final stb = f.mStb.value == LogicValue.one;
-    final ackNow = stb && ack.value != LogicValue.one && ++waited >= latency;
-    if (!stb || ackNow) waited = 0;
-    ack.inject(ackNow ? 1 : 0);
-    data.inject(f.mAddr.value);
     await clk.nextPosedge;
     await clk.nextNegedge;
     if (wrEn.value == LogicValue.one) {
       written[wrIdx.value.toInt()] = wrData.value.toInt();
     }
-    if (f.busy.value == LogicValue.one && f.mCyc.value != LogicValue.one) {
+    if (f.busy.value == LogicValue.one && wb.cyc.value != LogicValue.one) {
       gap++;
     } else if (gap > 0) {
       gaps.add(gap);
@@ -76,11 +90,12 @@ void main() {
     await Simulator.reset();
   });
 
-  for (final latency in [1, 10]) {
-    test('gives the bus back for one cycle after every 16 words, '
+  for (final latency in [0, 1, 10]) {
+    test('gives the bus back between every burstWords-chunk of words, '
         'latency $latency', () async {
       final (gaps, written) = await _line(burstWords: 16, latency: latency);
-      // A 40-word line yields after words 16 and 32.
+      // A 40-word line is bursts of 16, 16 and 8 words, with one `cyc` drop
+      // between each pair.
       expect(gaps, equals([1, 1]));
       expect(written.length, equals(40));
       for (var i = 0; i < 40; i++) {
@@ -91,7 +106,8 @@ void main() {
 
   test('a burst as long as the line never drops cyc inside it', () async {
     final (gaps, written) = await _line(burstWords: 64, latency: 3);
-    expect(gaps, isEmpty);
+    // One request, one burst, no inter-burst boundary: no gap at all.
+    expect(gaps, equals(<int>[]));
     expect(written.length, equals(40));
   });
 
@@ -104,9 +120,45 @@ void main() {
         fetchAddr: Logic(width: 32),
         words: Logic(width: 16),
         fillSel: Logic(),
-        mDataIn: Logic(width: 32),
-        mAck: Logic(),
+        waist: HarborMemoryWaist(
+          const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+        ),
         burstWords: 0,
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('burstWords above 256 throws', () {
+    expect(
+      () => HarborLineFetcher(
+        clk: Logic(),
+        reset: Logic(),
+        fetchStart: Logic(),
+        fetchAddr: Logic(width: 32),
+        words: Logic(width: 16),
+        fillSel: Logic(),
+        waist: HarborMemoryWaist(
+          const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+        ),
+        burstWords: 257,
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('a non-32-bit waist throws', () {
+    expect(
+      () => HarborLineFetcher(
+        clk: Logic(),
+        reset: Logic(),
+        fetchStart: Logic(),
+        fetchAddr: Logic(width: 32),
+        words: Logic(width: 16),
+        fillSel: Logic(),
+        waist: HarborMemoryWaist(
+          const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 16),
+        ),
       ),
       throwsArgumentError,
     );

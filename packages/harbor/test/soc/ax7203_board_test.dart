@@ -119,8 +119,7 @@ class _BoardIo extends BridgeModule with HarborDeviceTreeNodeProvider {
       sysReset: reset,
       enable: Const(1),
       fbBase: Const(0, width: 32),
-      mDataIn: Const(0, width: 32),
-      mAck: Const(0),
+      memory: _idleMemory(),
       outputType: HarborDisplayInterface.parallelRgb,
       target: target,
     );
@@ -214,6 +213,17 @@ final _xdcLine = RegExp(
   r'^set_property -dict \{PACKAGE_PIN (\S+) IOSTANDARD (\S+)(.*)\} '
   r'\[get_ports (\S+)\]$',
 );
+
+/// A memory master waist with no memory behind it.
+HarborMemoryWaist _idleMemory() {
+  final w = HarborMemoryWaist(
+    const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+  );
+  for (final p in w.getPorts([PairDirection.fromConsumer]).values) {
+    p <= Const(0, width: p.width);
+  }
+  return w;
+}
 
 void main() {
   final board = HarborBoard.get('ax7203');

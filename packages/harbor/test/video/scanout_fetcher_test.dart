@@ -294,8 +294,11 @@ void main() {
       sysReset: Logic(),
       enable: Logic(),
       fbBase: Logic(width: 32),
-      mDataIn: wishbone ? Logic(width: 32) : null,
-      mAck: wishbone ? Logic() : null,
+      memory: wishbone
+          ? HarborMemoryWaist(
+              const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+            )
+          : null,
       rqReady: port ? Logic() : null,
       rdValid: port ? Logic() : null,
       rdData: port ? Logic(width: 16) : null,

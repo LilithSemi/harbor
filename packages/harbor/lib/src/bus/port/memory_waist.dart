@@ -91,6 +91,14 @@ class HarborMemoryWaistConfig {
 /// a later request, or it can hold a shared bus waiting for data that never
 /// comes.
 ///
+/// A device on a master waist holds RDATA_READY high only while a read it
+/// sent is still in flight or taken in that cycle, and WRESP_READY the same
+/// for a write. This is stricter than plain valid/ready: a READY tied high
+/// is not allowed. The Wishbone master with one request in flight passes a
+/// response through in the ACK cycle, so a READY that is high in a cycle
+/// where the device does not take the response loses it. That port stops a
+/// simulation when a device breaks this rule.
+///
 /// A memory waist device must have no read side effects. A burst that breaks
 /// the AXI4 rules still reaches the device: the slave adapter forwards it
 /// with write strobes forced to 0 and discards its read data, so the device

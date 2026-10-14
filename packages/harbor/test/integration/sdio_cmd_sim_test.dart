@@ -169,8 +169,9 @@ Future<(PeripheralTestBench, _FakeSdCard, Logic)> _bringUp() async {
   sdio.port('sd_cmd_in').getsLogic(cmdIn);
   sdio.port('sd_cd').getsLogic(cd);
   sdio.port('sd_dat_in').getsLogic(datIn);
-  sdio.port('dma_rdata').getsLogic(Logic(name: 'dma_rdata', width: 32));
-  sdio.port('dma_ack').getsLogic(Logic(name: 'dma_ack'));
+  for (final p in sdio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+    sdio.port(p).getsLogic(Const(0, width: sdio.input(p).width));
+  }
 
   final tb = PeripheralTestBench(sdio);
   final card = _FakeSdCard(sdio, cmdIn);
@@ -241,8 +242,9 @@ void main() {
       sdio.port('sd_cmd_in').getsLogic(cmdIn);
       sdio.port('sd_cd').getsLogic(cd);
       sdio.port('sd_dat_in').getsLogic(datIn);
-      sdio.port('dma_rdata').getsLogic(Logic(name: 'dma_rdata', width: 32));
-      sdio.port('dma_ack').getsLogic(Logic(name: 'dma_ack'));
+      for (final p in sdio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+        sdio.port(p).getsLogic(Const(0, width: sdio.input(p).width));
+      }
 
       final tb = PeripheralTestBench(sdio);
       final card = _FakeSdCard(sdio, cmdIn)..forceRespArg = 0x00ff8000;

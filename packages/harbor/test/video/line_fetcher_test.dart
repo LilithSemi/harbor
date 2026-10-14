@@ -2,70 +2,59 @@ import 'dart:async';
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
+import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:test/test.dart';
 
-/// Harness: a line fetcher driving a double line buffer's write port, with a
-/// fake memory on the fetcher's master port (0-latency ack, data = address).
-class _Harness extends Module {
-  Logic get rdData => output('rd_data');
-  Logic get busy => output('busy');
-  Logic get done => output('done');
+import '../util/mem_target.dart';
 
-  _Harness(
-    Logic clk,
-    Logic reset,
-    Logic fetchStart,
-    Logic fetchAddr,
-    Logic words,
-    Logic fillSel,
-    Logic rdSel,
-    Logic rdCol,
-  ) : super(definitionName: 'LineFetchHarness') {
-    clk = addInput('clk', clk);
-    reset = addInput('reset', reset);
-    fetchStart = addInput('fetch_start', fetchStart);
-    fetchAddr = addInput('fetch_addr', fetchAddr, width: 32);
-    words = addInput('words', words, width: 16);
-    fillSel = addInput('fill_sel', fillSel);
-    rdSel = addInput('rd_sel', rdSel);
-    rdCol = addInput('rd_col', rdCol, width: rdCol.width);
-    addOutput('rd_data', width: 32);
-    addOutput('busy');
-    addOutput('done');
+/// Rig: a line fetcher behind a memory master waist, driving a double line
+/// buffer's write port.
+class _FetcherRig extends BridgeModule {
+  _FetcherRig({int maxWords = 4})
+    : super('LineFetchRig_w$maxWords', name: 'rig') {
+    createPort('clk', PortDirection.input);
+    createPort('reset', PortDirection.input);
+    createPort('fetch_start', PortDirection.input);
+    createPort('fetch_addr', PortDirection.input, width: 32);
+    createPort('words', PortDirection.input, width: 16);
+    createPort('fill_sel', PortDirection.input);
+    createPort('rd_sel', PortDirection.input);
+    createPort('rd_col', PortDirection.input, width: 2);
 
-    final mDataIn = Logic(name: 'm_dat_i', width: 32);
-    final mAck = Logic(name: 'm_ack');
-
+    final mem = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'bus',
+      kind: HarborFabricKind.wishbone,
+      config: const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+      clk: input('clk'),
+      reset: input('reset'),
+    );
     final fetcher = HarborLineFetcher(
-      clk: clk,
-      reset: reset,
-      fetchStart: fetchStart,
-      fetchAddr: fetchAddr,
-      words: words,
-      fillSel: fillSel,
-      mDataIn: mDataIn,
-      mAck: mAck,
-      maxWords: 4,
+      clk: input('clk'),
+      reset: input('reset'),
+      fetchStart: input('fetch_start'),
+      fetchAddr: input('fetch_addr'),
+      words: input('words'),
+      fillSel: input('fill_sel'),
+      waist: mem.waist,
+      maxWords: maxWords,
     );
     final buffer = HarborDoubleLineBuffer(
-      wrClk: clk,
+      wrClk: input('clk'),
       wrEn: fetcher.wrEn,
       wrSel: fetcher.wrSel,
       wrIdx: fetcher.wrIdx,
       wrData: fetcher.wrData,
-      rdClk: clk,
-      rdReset: reset,
-      rdSel: rdSel,
-      rdCol: rdCol,
-      maxWords: 4,
+      rdClk: input('clk'),
+      rdReset: input('reset'),
+      rdSel: input('rd_sel'),
+      rdCol: input('rd_col'),
+      maxWords: maxWords,
     );
 
-    mAck <= fetcher.mStb;
-    mDataIn <= fetcher.mAddr;
-
-    output('rd_data') <= buffer.rdData;
-    output('busy') <= fetcher.busy;
-    output('done') <= fetcher.done;
+    addOutput('rd_data', width: 32) <= buffer.rdData;
+    addOutput('busy') <= fetcher.busy;
+    addOutput('done') <= fetcher.done;
   }
 }
 
@@ -80,17 +69,26 @@ void main() {
     final rdSel = Logic(name: 'rd_sel');
     final rdCol = Logic(name: 'rd_col', width: 2);
 
-    final h = _Harness(
-      clk,
-      reset,
-      fetchStart,
-      fetchAddr,
-      words,
-      fillSel,
-      rdSel,
-      rdCol,
+    const config = HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32);
+    final top = MasterTop(
+      _FetcherRig(maxWords: 4),
+      iface: 'bus',
+      kind: HarborFabricKind.wishbone,
+      config: config,
     );
-    await h.build();
+    top.input('clk').srcConnection! <= clk;
+    top.input('reset').srcConnection! <= reset;
+    top.input('fetch_start').srcConnection! <= fetchStart;
+    top.input('fetch_addr').srcConnection! <= fetchAddr;
+    top.input('words').srcConnection! <= words;
+    top.input('fill_sel').srcConnection! <= fillSel;
+    top.input('rd_sel').srcConnection! <= rdSel;
+    top.input('rd_col').srcConnection! <= rdCol;
+    // Fake memory: 0-latency ack, data = address (fill(i) = word i's byte
+    // address, since words are 4 bytes here).
+    final mem = BeatMemory(top, clk, fill: (i) => i * 4);
+    await top.build();
+    mem.start();
 
     reset.inject(1);
     fetchStart.inject(0);
@@ -114,7 +112,7 @@ void main() {
       await clk.nextPosedge;
       fetchStart.inject(0);
       var guard = 0;
-      while (h.busy.value.toInt() == 1 && guard < 50) {
+      while (top.output('busy').value.toInt() == 1 && guard < 50) {
         await clk.nextPosedge;
         guard++;
       }
@@ -126,7 +124,11 @@ void main() {
     for (var c = 0; c < 4; c++) {
       rdCol.inject(c);
       await clk.nextNegedge;
-      expect(h.rdData.value.toInt(), equals(0x40 + c * 4), reason: 'buf0[$c]');
+      expect(
+        top.output('rd_data').value.toInt(),
+        equals(0x40 + c * 4),
+        reason: 'buf0[$c]',
+      );
     }
 
     await fetch(0x80, 1);
@@ -134,7 +136,11 @@ void main() {
     for (var c = 0; c < 4; c++) {
       rdCol.inject(c);
       await clk.nextNegedge;
-      expect(h.rdData.value.toInt(), equals(0x80 + c * 4), reason: 'buf1[$c]');
+      expect(
+        top.output('rd_data').value.toInt(),
+        equals(0x80 + c * 4),
+        reason: 'buf1[$c]',
+      );
     }
 
     await Simulator.endSimulation();

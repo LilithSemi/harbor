@@ -297,6 +297,101 @@ void main() {
     });
   });
 
+  group('AXI4 write commit', () {
+    // The subordinate takes AW and W at once and holds B back for [bDelay]
+    // cycles. It answers [bResp] and [rResp].
+    void delayedB(Sim sim, {int bDelay = 5, int bResp = 0, int rResp = 0}) {
+      var wait = -1;
+      var rValid = false;
+      sim.onRise(() {
+        if (sim.pre('bus_BVALID') == 1) wait = -1;
+        if (sim.pre('bus_AWVALID') == 1 && sim.pre('bus_WVALID') == 1) {
+          wait = bDelay;
+        } else if (wait > 0) {
+          wait--;
+        }
+        rValid = sim.pre('bus_ARVALID') == 1;
+      });
+      sim.onFall(() {
+        sim.set('bus_AWREADY', 1);
+        sim.set('bus_WREADY', 1);
+        sim.set('bus_ARREADY', 1);
+        sim.set('bus_BVALID', wait == 0 ? 1 : 0);
+        sim.set('bus_BRESP', bResp);
+        sim.set('bus_RVALID', rValid ? 1 : 0);
+        sim.set('bus_RRESP', rResp);
+        if (sim.dut.tryInput('bus_RLAST') != null) sim.set('bus_RLAST', 1);
+      });
+    }
+
+    for (final exclusive in [false, true]) {
+      test(
+        'a write ack never comes before B${exclusive ? ', full AXI4' : ''}',
+        () async {
+          final sim = Sim(
+            MasterShell(HarborFabricKind.axi4, exclusive: exclusive),
+          );
+          delayedB(sim);
+          final acks = <int>[];
+          final bs = <int>[];
+          var cycle = 0;
+          sim.onRise(() {
+            cycle++;
+            if (sim.pre('bus_BVALID') == 1) bs.add(cycle);
+            if (sim.pre('m_ack') == 1) acks.add(cycle);
+          });
+          final m = _waist(sim);
+          await sim.start();
+          for (var i = 0; i < 3; i++) {
+            expect(await m.access(true, 4 * i, data: i), (0, 1, 0));
+          }
+          expect(acks, bs);
+          expect(acks.length, 3);
+          await sim.stop();
+        },
+      );
+    }
+
+    test(
+      'an exclusive port drives AxLOCK from lock and reports EXOKAY',
+      () async {
+        final sim = Sim(MasterShell(HarborFabricKind.axi4, exclusive: true));
+        // EXOKAY on B and R.
+        delayedB(sim, bDelay: 1, bResp: 1, rResp: 1);
+        var lock = 0;
+        final awLocks = <int>[];
+        final arLocks = <int>[];
+        final exokays = <int>[];
+        sim.onFall(() => sim.set('m_lock', lock));
+        sim.onRise(() {
+          if (sim.pre('bus_AWVALID') == 1) awLocks.add(sim.pre('bus_AWLOCK'));
+          if (sim.pre('bus_ARVALID') == 1) arLocks.add(sim.pre('bus_ARLOCK'));
+          if (sim.pre('m_ack') == 1) exokays.add(sim.pre('m_exokay'));
+          expect(sim.pre('bus_AWLEN'), 0);
+          expect(sim.pre('bus_AWSIZE'), 2);
+          expect(sim.pre('bus_AWBURST'), 1);
+          expect(sim.pre('bus_AWID'), 0);
+          expect(sim.pre('bus_ARID'), 0);
+        });
+        final m = _waist(sim);
+        await sim.start();
+        lock = 1;
+        await m.access(false, 0x10);
+        await m.access(true, 0x10, data: 1);
+        expect(awLocks.toSet(), {1});
+        expect(arLocks.toSet(), {1});
+        expect(exokays, [1, 1]);
+        await sim.stop();
+      },
+    );
+
+    for (final kind in [HarborFabricKind.tilelink, HarborFabricKind.wishbone]) {
+      test('a ${kind.name} port cannot be exclusive', () {
+        expect(() => MasterShell(kind, exclusive: true), throwsArgumentError);
+      });
+    }
+  });
+
   group('TileLink-UL register master', () {
     for (final aEvery in [1, 3]) {
       test('accesses, A_READY every $aEvery', () async {

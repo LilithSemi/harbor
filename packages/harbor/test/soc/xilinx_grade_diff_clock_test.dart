@@ -108,8 +108,9 @@ void main() {
       sysReset: l(),
       enable: l(),
       fbBase: l(32),
-      mDataIn: l(32),
-      mAck: l(),
+      memory: HarborMemoryWaist(
+        const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+      ),
       outputType: HarborDisplayInterface.parallelRgb,
     );
     await d.build();
@@ -132,8 +133,9 @@ void main() {
       sysReset: l(),
       enable: l(),
       fbBase: l(32),
-      mDataIn: l(32),
-      mAck: l(),
+      memory: HarborMemoryWaist(
+        const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+      ),
     );
     expect(tmds.definitionName, isNot(d.definitionName));
   });
@@ -195,8 +197,7 @@ void main() {
       sysReset: reset,
       enable: Const(0),
       fbBase: Const(0, width: 32),
-      mDataIn: Const(0, width: 32),
-      mAck: Const(0),
+      memory: _idleMemory(),
       outputType: HarborDisplayInterface.parallelRgb,
     );
     final single = HarborFramebufferDisplay(
@@ -252,4 +253,15 @@ void main() {
       isNot(contains('get_nets')),
     );
   });
+}
+
+/// A memory master waist with no memory behind it.
+HarborMemoryWaist _idleMemory() {
+  final w = HarborMemoryWaist(
+    const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+  );
+  for (final p in w.getPorts([PairDirection.fromConsumer]).values) {
+    p <= Const(0, width: p.width);
+  }
+  return w;
 }

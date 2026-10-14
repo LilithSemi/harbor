@@ -46,6 +46,25 @@ void _checkMatch(WishboneInterface wb, HarborMemoryWaistConfig config) {
 
 int _log2(int v) => v.bitLength - 1;
 
+/// Stops the simulation when [bad] is high on a [clk] edge out of reset.
+/// The generated RTL does not use [bad].
+void _checkInSim(Logic clk, Logic reset, Logic bad, String what) {
+  clk.glitch.listen((args) {
+    if (LogicValue.isPosedge(
+          args.previousValue,
+          args.newValue,
+          ignoreInvalid: true,
+        ) &&
+        reset.value == LogicValue.zero &&
+        bad.value == LogicValue.one) {
+      Simulator.throwException(
+        Exception('wishbone memory master: $what'),
+        StackTrace.current,
+      );
+    }
+  });
+}
+
 Logic _counter(String name, int max) => Logic(name: name, width: max.bitLength);
 
 /// Wishbone CTI codes.
@@ -318,204 +337,434 @@ class HarborWishboneMemoryMaster extends Module {
     final b = wb.clone()
       ..pairConnectIO(this, wb, PairRole.provider, uniquify: (n) => 'wb_$n');
 
-    final n = config.outstanding;
-    final idW = config.idWidth;
-    final addrW = config.addressWidth;
-    final dataW = config.dataWidth;
-    final strbW = config.strbWidth;
-    final beatLog2 = _log2(strbW);
-    const lenW = HarborMemoryWaistConfig.lenWidth;
-    const sizeW = HarborMemoryWaistConfig.sizeWidth;
-    const burstW = HarborMemoryWaistConfig.burstWidth;
-    const beatW = lenW + 1;
-
-    final inflight = _counter('inflight', n);
-    final room = inflight.lt(Const(n, width: inflight.width));
-    final start = Logic(name: 'start');
-    final reqF = HarborRegFifo(
-      name: 'req',
-      clk: c,
-      reset: r,
-      depth: n,
-      pushValid: m.reqValid & room,
-      pushData: harborPack([
-        m.reqId,
-        m.reqWrite,
-        m.reqAddr,
-        m.reqLen,
-        m.reqSize,
-        m.reqBurst,
-      ]),
-      popReady: start,
-    );
-    m.reqReady <= room & reqF.pushReady;
-    final reqFire = m.reqValid & m.reqReady;
-    final [hId, hWrite, hAddr, hLen, hSize, hBurst] = harborUnpack(
-      reqF.popData,
-      [idW, 1, addrW, lenW, sizeW, burstW],
-    );
-
-    final beatDone = Logic(name: 'beat_done');
-    // The entries reset, since DAT_MOSI comes straight from them and shows
-    // on every beat.
-    final wPop = Logic(name: 'w_pop');
-    final wF = HarborRegFifo(
-      name: 'w',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: m.wdataValid,
-      pushData: harborPack([m.wdataData, m.wdataStrb]),
-      popReady: wPop,
-      resetEntries: true,
-    );
-    m.wdataReady <= wF.pushReady;
-    final [wData, wStrb] = harborUnpack(wF.popData, [dataW, strbW]);
-
-    final act = Logic(name: 'act');
-    final gap = Logic(name: 'gap');
-    final abort = Logic(name: 'abort');
-    final cId = Logic(name: 'c_id', width: idW);
-    final cWrite = Logic(name: 'c_write');
-    final cAddr = Logic(name: 'c_addr', width: addrW);
-    final cLen = Logic(name: 'c_len', width: lenW);
-    final cSize = Logic(name: 'c_size', width: sizeW);
-    final cBurst = Logic(name: 'c_burst', width: burstW);
-    final cBurstMode = Logic(name: 'c_burst_mode');
-    final cBeat = Logic(name: 'c_beat', width: beatW);
-    final cErr = Logic(name: 'c_err');
-    // A write does not raise CYC until its first data beat is in the
-    // FIFO, so the bus is not held while this master waits for data.
-    start <= ~act & ~gap & reqF.popValid & (~hWrite | wF.popValid);
-
-    final last = cBeat.eq(cLen.zeroExtend(beatW)).named('last');
-    final rStore = Logic(name: 'r_store');
-    final bStore = Logic(name: 'b_store');
-    final rF = HarborRegFifo(
-      name: 'r',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: rStore,
-      pushData: harborPack([
-        cId,
-        mux(abort, Const(0, width: dataW), b.datMiso),
-        abort | b.err!,
-        last,
-      ]),
-      popReady: m.rdataReady,
-    );
-    final bF = HarborRegFifo(
-      name: 'b',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: bStore,
-      pushData: harborPack([cId, cErr | abort | b.err!]),
-      popReady: m.wrespReady,
-    );
-
-    // A beat can run once its data is here and its response has room.
-    final beatReady = mux(
-      cWrite,
-      wF.popValid & (~last | bF.pushReady),
-      rF.pushReady,
-    );
-    final pieceSize = mux(
-      cSize.gt(Const(beatLog2, width: sizeW)),
-      Const(beatLog2, width: sizeW),
-      cSize,
-    );
-    final lane = harborLaneMask(cAddr, pieceSize, strbW);
-    b.cyc <= act & ~abort;
-    b.stb <= act & ~abort & beatReady;
-    b.we <= cWrite;
-    b.adr <= harborWordAddress(cAddr, dataW);
-    b.datMosi <= wData;
-    b.sel <= mux(cWrite, wStrb & lane, lane);
-    b.cti! <=
-        mux(
-          cBurstMode,
-          mux(last, Const(_ctiEnd, width: 3), Const(_ctiIncr, width: 3)),
-          Const(_ctiClassic, width: 3),
-        );
-    b.bte! <= Const(0, width: 2);
-    if (b.tga != null) b.tga! <= Const(0, width: b.tga!.width);
-    if (b.tgdMosi != null) b.tgdMosi! <= Const(0, width: b.tgdMosi!.width);
-
-    final busEnd = b.stb & (b.ack | b.err!);
-    final localEnd = act & abort & beatReady;
-    beatDone <= busEnd | localEnd;
-    rStore <= beatDone & ~cWrite;
-    bStore <= beatDone & cWrite & last;
-    wPop <= beatDone & cWrite;
-
-    // Next beat address.
-    final ww = max(addrW, 16);
-    final cur = cAddr.zeroExtend(ww);
-    final bytes = Const(1, width: ww) << pieceSize;
-    final alignedCur = cur & ~(bytes - 1);
-    final wrapMask = ((cLen.zeroExtend(ww) + 1) << pieceSize) - 1;
-    final nextAddr = mux(
-      cBurst.eq(Const(HarborMemoryBurst.fixed.value, width: burstW)),
-      cur,
-      mux(
-        cBurst.eq(Const(HarborMemoryBurst.wrap.value, width: burstW)),
-        (cur & ~wrapMask) | ((alignedCur + bytes) & wrapMask),
-        alignedCur + bytes,
-      ),
-    ).getRange(0, addrW);
-
-    final rdDone = m.rdataValid & m.rdataReady & m.rdataLast;
-    final wrDone = m.wrespValid & m.wrespReady;
-    final [rId, rDat, rErr, rLast] = harborUnpack(rF.popData, [
-      idW,
-      dataW,
-      1,
-      1,
-    ]);
-    m.rdataValid <= rF.popValid;
-    m.rdataId <= rId;
-    m.rdataData <= rDat;
-    m.rdataErr <= rErr;
-    m.rdataLast <= rLast;
-    final [bId, bErr] = harborUnpack(bF.popData, [idW, 1]);
-    m.wrespValid <= bF.popValid;
-    m.wrespId <= bId;
-    m.wrespErr <= bErr;
-
-    Sequential(c, reset: r, [
-      gap < Const(0),
-      If.block([
-        Iff(start, [
-          act < Const(1),
-          abort < Const(0),
-          cId < hId,
-          cWrite < hWrite,
-          cAddr < hAddr,
-          cLen < hLen,
-          cSize < hSize,
-          cBurst < hBurst,
-          cBurstMode <
-              hBurst.eq(Const(HarborMemoryBurst.incr.value, width: burstW)) &
-                  hSize.eq(Const(beatLog2, width: sizeW)) &
-                  hLen.neq(0),
-          cBeat < Const(0, width: beatW),
-          cErr < Const(0),
-        ]),
-        ElseIf(beatDone, [
-          cBeat < cBeat + 1,
-          cAddr < nextAddr,
-          cErr < cErr | (busEnd & b.err!),
-          If(busEnd & b.err! & ~last, then: [abort < Const(1)]),
-          If(last, then: [act < Const(0), gap < Const(1)]),
-        ]),
-      ]),
-      inflight <
-          inflight +
-              reqFire.zeroExtend(inflight.width) -
-              rdDone.zeroExtend(inflight.width) -
-              wrDone.zeroExtend(inflight.width),
-    ]);
+    if (config.outstanding == 1) {
+      _buildWishboneMemoryMasterFast(c, r, m, b, config);
+    } else {
+      _buildWishboneMemoryMasterQueued(c, r, m, b, config);
+    }
   }
+}
+
+/// One request on the bus at a time, driven straight from the waist: no
+/// request queue, no registered start and no forced gap between requests.
+/// Used only when [HarborMemoryWaistConfig.outstanding] is 1.
+///
+/// REQ_READY comes only from the `busy` register, never from WDATA_VALID,
+/// RDATA_VALID or WRESP_VALID, so a device cannot close a combinational
+/// loop through this port no matter how it times its own REQ_VALID: the
+/// only way back from a response to a new request already crosses the
+/// `busy` register.
+///
+/// A write holds CYC/STB low on its first beat until WDATA_VALID arrives
+/// (REQ_READY still fires on REQ_VALID alone). Once a beat's CYC/STB goes
+/// up it never retracts before ACK/ERR: `beatActive` freezes it, so a
+/// device that lets RDATA_READY or WRESP_READY drop after its REQ never
+/// pulls a live Wishbone beat back down. RDATA and WRESP leave the same
+/// cycle as ACK/ERR when the device is ready that cycle. Otherwise the
+/// result waits in the single `pend` register, and the next beat waits for
+/// that register to drain. A device must keep RDATA_READY and WRESP_READY
+/// low in a cycle where it does not take a response. So each READY is high
+/// only while a request of its direction is in flight or taken in that
+/// cycle. A simulation stops when a device breaks this rule. A registered
+/// feedback burst (CTI 010/111) runs back to back
+/// with CYC held for the whole burst whenever the device keeps up; the
+/// only registers between the bus and the waist are this per-beat state
+/// (address, beat count, the error latched from an earlier beat, and the
+/// one-deep pend).
+void _buildWishboneMemoryMasterFast(
+  Logic c,
+  Logic r,
+  HarborMemoryWaist m,
+  WishboneInterface b,
+  HarborMemoryWaistConfig config,
+) {
+  final idW = config.idWidth;
+  final addrW = config.addressWidth;
+  final dataW = config.dataWidth;
+  final strbW = config.strbWidth;
+  final beatLog2 = _log2(strbW);
+  const lenW = HarborMemoryWaistConfig.lenWidth;
+  const sizeW = HarborMemoryWaistConfig.sizeWidth;
+  const burstW = HarborMemoryWaistConfig.burstWidth;
+  const beatW = lenW + 1;
+
+  final busy = Logic(name: 'busy');
+  final beatActive = Logic(name: 'beat_active');
+  // High from the first beat's start until the last beat resolves, so CYC
+  // stays up for the whole request (registered feedback bursts included)
+  // through any inter-beat stall. STB alone drops for a stall.
+  final cycHeld = Logic(name: 'cyc_held');
+  final abort = Logic(name: 'abort');
+  final cId = Logic(name: 'c_id', width: idW);
+  final cWrite = Logic(name: 'c_write');
+  final cAddr = Logic(name: 'c_addr', width: addrW);
+  final cLen = Logic(name: 'c_len', width: lenW);
+  final cSize = Logic(name: 'c_size', width: sizeW);
+  final cBurst = Logic(name: 'c_burst', width: burstW);
+  final cBurstMode = Logic(name: 'c_burst_mode');
+  final cBeat = Logic(name: 'c_beat', width: beatW);
+  final cErr = Logic(name: 'c_err');
+  final pendValid = Logic(name: 'pend_valid');
+  final pendData = Logic(name: 'pend_data', width: dataW);
+  final pendErr = Logic(name: 'pend_err');
+  final pendLast = Logic(name: 'pend_last');
+
+  m.reqReady <= ~busy;
+  final reqFire = (m.reqValid & ~busy).named('req_fire');
+
+  final last = cBeat.eq(cLen.zeroExtend(beatW)).named('last');
+  final pieceSize = mux(
+    cSize.gt(Const(beatLog2, width: sizeW)),
+    Const(beatLog2, width: sizeW),
+    cSize,
+  );
+  final lane = harborLaneMask(cAddr, pieceSize, strbW);
+
+  // A free slot (no beat on the bus, no held result) may start the next
+  // beat once its data is there; a read beat has none to wait for. This
+  // is checked only once, before the beat starts: it never gates a beat
+  // that is already on the bus.
+  final canAdvance = (busy & ~beatActive & ~pendValid).named('can_advance');
+  final writeDataReady = mux(cWrite, m.wdataValid, Const(1));
+  final startBus = (canAdvance & ~abort & writeDataReady).named('start_bus');
+  final fakeResolve = (canAdvance & abort & writeDataReady).named(
+    'fake_resolve',
+  );
+
+  // An error drops the bus straight away; the rest of the request then
+  // resolves on the waist only, through fakeResolve below.
+  b.cyc <= (cycHeld | startBus) & ~abort;
+  b.stb <= beatActive | startBus;
+  b.we <= cWrite;
+  b.adr <= harborWordAddress(cAddr, dataW);
+  b.datMosi <= m.wdataData;
+  b.sel <= mux(cWrite, m.wdataStrb & lane, lane);
+  b.cti! <=
+      mux(
+        cBurstMode,
+        mux(last, Const(_ctiEnd, width: 3), Const(_ctiIncr, width: 3)),
+        Const(_ctiClassic, width: 3),
+      );
+  b.bte! <= Const(0, width: 2);
+  if (b.tga != null) b.tga! <= Const(0, width: b.tga!.width);
+  if (b.tgdMosi != null) b.tgdMosi! <= Const(0, width: b.tgdMosi!.width);
+
+  final busEnd = ((beatActive | startBus) & (b.ack | b.err!)).named('bus_end');
+  final resolve = (busEnd | fakeResolve).named('resolve');
+  // Every beat of a read has a result; a write only has one on its last
+  // beat.
+  final hasResponse = (~cWrite | last).named('has_response');
+  final resultErr = mux(abort, Const(1), b.err!);
+  final resultData = mux(abort, Const(0, width: dataW), b.datMiso);
+  // A fresh result is offered the same cycle it resolves. RDATA_VALID and
+  // WRESP_VALID never read the ready signals, so a device's ready cannot
+  // close a combinational loop through this port.
+  final freshResult = (resolve & hasResponse).named('fresh_result');
+  final readyNow = mux(cWrite, m.wrespReady, m.rdataReady);
+  final pendTaken = (pendValid & readyNow).named('pend_taken');
+  final finalDelivered =
+      ((freshResult & last & readyNow) | (pendTaken & pendLast)).named(
+        'final_delivered',
+      );
+
+  m.wdataReady <= cWrite & resolve;
+  m.rdataValid <= (~cWrite & freshResult) | (pendValid & ~cWrite);
+  m.rdataId <= cId;
+  m.rdataData <= mux(pendValid, pendData, resultData);
+  m.rdataErr <= mux(pendValid, pendErr, resultErr);
+  m.rdataLast <= mux(pendValid, pendLast, last);
+  m.wrespValid <= (cWrite & freshResult) | (pendValid & cWrite);
+  m.wrespId <= cId;
+  m.wrespErr <= mux(pendValid, pendErr, resultErr);
+
+  // Next beat address, same rule as the queued path below.
+  final ww = max(addrW, 16);
+  final cur = cAddr.zeroExtend(ww);
+  final bytes = Const(1, width: ww) << pieceSize;
+  final alignedCur = cur & ~(bytes - 1);
+  final wrapMask = ((cLen.zeroExtend(ww) + 1) << pieceSize) - 1;
+  final nextAddr = mux(
+    cBurst.eq(Const(HarborMemoryBurst.fixed.value, width: burstW)),
+    cur,
+    mux(
+      cBurst.eq(Const(HarborMemoryBurst.wrap.value, width: burstW)),
+      (cur & ~wrapMask) | ((alignedCur + bytes) & wrapMask),
+      alignedCur + bytes,
+    ),
+  ).getRange(0, addrW);
+
+  final readyBad =
+      ((m.wrespReady & ~((busy & cWrite) | (reqFire & m.reqWrite))) |
+              (m.rdataReady & ~((busy & ~cWrite) | (reqFire & ~m.reqWrite))))
+          .named('ready_bad');
+  _checkInSim(
+    c,
+    r,
+    readyBad,
+    'RDATA_READY or WRESP_READY is high with no response to take',
+  );
+
+  Sequential(c, reset: r, [
+    If.block([
+      Iff(~busy, [
+        If(
+          reqFire,
+          then: [
+            busy < Const(1),
+            beatActive < Const(0),
+            cycHeld < Const(0),
+            pendValid < Const(0),
+            abort < Const(0),
+            cId < m.reqId,
+            cWrite < m.reqWrite,
+            cAddr < m.reqAddr,
+            cLen < m.reqLen,
+            cSize < m.reqSize,
+            cBurst < m.reqBurst,
+            cBurstMode <
+                m.reqBurst.eq(
+                      Const(HarborMemoryBurst.incr.value, width: burstW),
+                    ) &
+                    m.reqSize.eq(Const(beatLog2, width: sizeW)) &
+                    m.reqLen.neq(0),
+            cBeat < Const(0, width: beatW),
+            cErr < Const(0),
+          ],
+        ),
+      ]),
+      Else([
+        beatActive < (startBus | beatActive) & ~busEnd,
+        cycHeld < (startBus | cycHeld) & ~(resolve & last),
+        If.block([
+          Iff(freshResult & ~readyNow, [
+            pendValid < Const(1),
+            pendData < resultData,
+            pendErr < resultErr,
+            pendLast < last,
+          ]),
+          ElseIf(pendTaken, [pendValid < Const(0)]),
+        ]),
+        If(
+          resolve,
+          then: [
+            cBeat < cBeat + 1,
+            cAddr < nextAddr,
+            cErr < cErr | (busEnd & b.err!),
+            If(busEnd & b.err! & ~last, then: [abort < Const(1)]),
+          ],
+        ),
+        If(finalDelivered, then: [busy < Const(0)]),
+      ]),
+    ]),
+  ]);
+}
+
+/// Up to `outstanding` requests queued and issued one at a time, with a
+/// registered start and a 1-cycle gap between requests. Used when
+/// [HarborMemoryWaistConfig.outstanding] is more than 1.
+void _buildWishboneMemoryMasterQueued(
+  Logic c,
+  Logic r,
+  HarborMemoryWaist m,
+  WishboneInterface b,
+  HarborMemoryWaistConfig config,
+) {
+  final n = config.outstanding;
+  final idW = config.idWidth;
+  final addrW = config.addressWidth;
+  final dataW = config.dataWidth;
+  final strbW = config.strbWidth;
+  final beatLog2 = _log2(strbW);
+  const lenW = HarborMemoryWaistConfig.lenWidth;
+  const sizeW = HarborMemoryWaistConfig.sizeWidth;
+  const burstW = HarborMemoryWaistConfig.burstWidth;
+  const beatW = lenW + 1;
+
+  final inflight = _counter('inflight', n);
+  final room = inflight.lt(Const(n, width: inflight.width));
+  final start = Logic(name: 'start');
+  final reqF = HarborRegFifo(
+    name: 'req',
+    clk: c,
+    reset: r,
+    depth: n,
+    pushValid: m.reqValid & room,
+    pushData: harborPack([
+      m.reqId,
+      m.reqWrite,
+      m.reqAddr,
+      m.reqLen,
+      m.reqSize,
+      m.reqBurst,
+    ]),
+    popReady: start,
+  );
+  m.reqReady <= room & reqF.pushReady;
+  final reqFire = m.reqValid & m.reqReady;
+  final [hId, hWrite, hAddr, hLen, hSize, hBurst] = harborUnpack(reqF.popData, [
+    idW,
+    1,
+    addrW,
+    lenW,
+    sizeW,
+    burstW,
+  ]);
+
+  final beatDone = Logic(name: 'beat_done');
+  // The entries reset, since DAT_MOSI comes straight from them and shows
+  // on every beat.
+  final wPop = Logic(name: 'w_pop');
+  final wF = HarborRegFifo(
+    name: 'w',
+    clk: c,
+    reset: r,
+    depth: 2,
+    pushValid: m.wdataValid,
+    pushData: harborPack([m.wdataData, m.wdataStrb]),
+    popReady: wPop,
+    resetEntries: true,
+  );
+  m.wdataReady <= wF.pushReady;
+  final [wData, wStrb] = harborUnpack(wF.popData, [dataW, strbW]);
+
+  final act = Logic(name: 'act');
+  final gap = Logic(name: 'gap');
+  final abort = Logic(name: 'abort');
+  final cId = Logic(name: 'c_id', width: idW);
+  final cWrite = Logic(name: 'c_write');
+  final cAddr = Logic(name: 'c_addr', width: addrW);
+  final cLen = Logic(name: 'c_len', width: lenW);
+  final cSize = Logic(name: 'c_size', width: sizeW);
+  final cBurst = Logic(name: 'c_burst', width: burstW);
+  final cBurstMode = Logic(name: 'c_burst_mode');
+  final cBeat = Logic(name: 'c_beat', width: beatW);
+  final cErr = Logic(name: 'c_err');
+  // A write does not raise CYC until its first data beat is in the
+  // FIFO, so the bus is not held while this master waits for data.
+  start <= ~act & ~gap & reqF.popValid & (~hWrite | wF.popValid);
+
+  final last = cBeat.eq(cLen.zeroExtend(beatW)).named('last');
+  final rStore = Logic(name: 'r_store');
+  final bStore = Logic(name: 'b_store');
+  final rF = HarborRegFifo(
+    name: 'r',
+    clk: c,
+    reset: r,
+    depth: 2,
+    pushValid: rStore,
+    pushData: harborPack([
+      cId,
+      mux(abort, Const(0, width: dataW), b.datMiso),
+      abort | b.err!,
+      last,
+    ]),
+    popReady: m.rdataReady,
+  );
+  final bF = HarborRegFifo(
+    name: 'b',
+    clk: c,
+    reset: r,
+    depth: 2,
+    pushValid: bStore,
+    pushData: harborPack([cId, cErr | abort | b.err!]),
+    popReady: m.wrespReady,
+  );
+
+  // A beat can run once its data is here and its response has room.
+  final beatReady = mux(
+    cWrite,
+    wF.popValid & (~last | bF.pushReady),
+    rF.pushReady,
+  );
+  final pieceSize = mux(
+    cSize.gt(Const(beatLog2, width: sizeW)),
+    Const(beatLog2, width: sizeW),
+    cSize,
+  );
+  final lane = harborLaneMask(cAddr, pieceSize, strbW);
+  b.cyc <= act & ~abort;
+  b.stb <= act & ~abort & beatReady;
+  b.we <= cWrite;
+  b.adr <= harborWordAddress(cAddr, dataW);
+  b.datMosi <= wData;
+  b.sel <= mux(cWrite, wStrb & lane, lane);
+  b.cti! <=
+      mux(
+        cBurstMode,
+        mux(last, Const(_ctiEnd, width: 3), Const(_ctiIncr, width: 3)),
+        Const(_ctiClassic, width: 3),
+      );
+  b.bte! <= Const(0, width: 2);
+  if (b.tga != null) b.tga! <= Const(0, width: b.tga!.width);
+  if (b.tgdMosi != null) b.tgdMosi! <= Const(0, width: b.tgdMosi!.width);
+
+  final busEnd = b.stb & (b.ack | b.err!);
+  final localEnd = act & abort & beatReady;
+  beatDone <= busEnd | localEnd;
+  rStore <= beatDone & ~cWrite;
+  bStore <= beatDone & cWrite & last;
+  wPop <= beatDone & cWrite;
+
+  // Next beat address.
+  final ww = max(addrW, 16);
+  final cur = cAddr.zeroExtend(ww);
+  final bytes = Const(1, width: ww) << pieceSize;
+  final alignedCur = cur & ~(bytes - 1);
+  final wrapMask = ((cLen.zeroExtend(ww) + 1) << pieceSize) - 1;
+  final nextAddr = mux(
+    cBurst.eq(Const(HarborMemoryBurst.fixed.value, width: burstW)),
+    cur,
+    mux(
+      cBurst.eq(Const(HarborMemoryBurst.wrap.value, width: burstW)),
+      (cur & ~wrapMask) | ((alignedCur + bytes) & wrapMask),
+      alignedCur + bytes,
+    ),
+  ).getRange(0, addrW);
+
+  final rdDone = m.rdataValid & m.rdataReady & m.rdataLast;
+  final wrDone = m.wrespValid & m.wrespReady;
+  final [rId, rDat, rErr, rLast] = harborUnpack(rF.popData, [idW, dataW, 1, 1]);
+  m.rdataValid <= rF.popValid;
+  m.rdataId <= rId;
+  m.rdataData <= rDat;
+  m.rdataErr <= rErr;
+  m.rdataLast <= rLast;
+  final [bId, bErr] = harborUnpack(bF.popData, [idW, 1]);
+  m.wrespValid <= bF.popValid;
+  m.wrespId <= bId;
+  m.wrespErr <= bErr;
+
+  Sequential(c, reset: r, [
+    gap < Const(0),
+    If.block([
+      Iff(start, [
+        act < Const(1),
+        abort < Const(0),
+        cId < hId,
+        cWrite < hWrite,
+        cAddr < hAddr,
+        cLen < hLen,
+        cSize < hSize,
+        cBurst < hBurst,
+        cBurstMode <
+            hBurst.eq(Const(HarborMemoryBurst.incr.value, width: burstW)) &
+                hSize.eq(Const(beatLog2, width: sizeW)) &
+                hLen.neq(0),
+        cBeat < Const(0, width: beatW),
+        cErr < Const(0),
+      ]),
+      ElseIf(beatDone, [
+        cBeat < cBeat + 1,
+        cAddr < nextAddr,
+        cErr < cErr | (busEnd & b.err!),
+        If(busEnd & b.err! & ~last, then: [abort < Const(1)]),
+        If(last, then: [act < Const(0), gap < Const(1)]),
+      ]),
+    ]),
+    inflight <
+        inflight +
+            reqFire.zeroExtend(inflight.width) -
+            rdDone.zeroExtend(inflight.width) -
+            wrDone.zeroExtend(inflight.width),
+  ]);
 }

@@ -22,6 +22,14 @@ const _c64 = HarborMemoryWaistConfig(
   outstanding: 8,
 );
 
+/// Outstanding 1: HarborWishboneMemoryMaster takes the fast path.
+const _c1 = HarborMemoryWaistConfig(
+  addressWidth: 16,
+  dataWidth: 32,
+  idWidth: 4,
+  outstanding: 1,
+);
+
 /// The waist requests the slave port makes for [t], by its block rule.
 List<Burst> wbChunks(WbTxn t, int blockBeats, int busBytes) {
   final out = <Burst>[];
@@ -768,11 +776,125 @@ void main() {
       expect(wbMem.mem.read(0x40), 0x1234);
       await sim.stop();
     });
+
+    test('outstanding 1 fast path: random bursts and IDs, errors and '
+        'backpressure', () async {
+      await _masterRandom(_c1, seed: 51);
+    });
+
+    test('outstanding 1 fast path: no wait states', () async {
+      await _masterRandom(_c1, seed: 52, idle: 0, stall: 0, wait: 0);
+    });
+
+    test('outstanding 1 fast path: a write holds CYC low until its data '
+        'arrives', () async {
+      final sim = Sim(MemMasterShell(_c1, kind: HarborFabricKind.wishbone));
+      WbMemory(sim, 'bus', Random(53), busBytes: _c1.strbWidth, wait: 0);
+      var reqDone = false;
+      sim.onRise(() {
+        if (!reqDone &&
+            sim.pre('mem_REQ_VALID') == 1 &&
+            sim.pre('mem_REQ_READY') == 1) {
+          reqDone = true;
+        }
+      });
+      sim.onFall(() {
+        sim.set('mem_REQ_VALID', reqDone ? 0 : 1);
+        sim.set('mem_REQ_ID', 0);
+        sim.set('mem_REQ_WRITE', 1);
+        sim.set('mem_REQ_ADDR', 0x40);
+        sim.set('mem_REQ_LEN', 0);
+        sim.set('mem_REQ_SIZE', 2);
+        sim.set('mem_REQ_BURST', 1);
+        sim.set('mem_WDATA_VALID', 0);
+        sim.set('mem_WDATA_DATA', 0x1234);
+        sim.set('mem_WDATA_STRB', 0xf);
+        sim.set('mem_WDATA_LAST', 1);
+        sim.set('mem_RDATA_READY', 0);
+        sim.set('mem_WRESP_READY', reqDone ? 1 : 0);
+      });
+      await sim.start();
+      Simulator.setMaxSimTime(200000);
+      await waitUntil(sim, () => reqDone);
+      // REQ_READY fired with no data offered, so WDATA_VALID stayed low.
+      // CYC must stay low: there is no later cycle this test ever raises
+      // WDATA_VALID.
+      for (var i = 0; i < 6; i++) {
+        expect(sim.pre('bus_CYC'), 0);
+        await sim.cycles(1);
+      }
+      await sim.stop();
+    });
+
+    for (final port in ['mem_RDATA_READY', 'mem_WRESP_READY']) {
+      test('outstanding 1 fast path: $port high with nothing in flight '
+          'stops the simulation', () async {
+        final dut = MemMasterShell(_c1, kind: HarborFabricKind.wishbone);
+        final clk = SimpleClockGenerator(10).clk;
+        for (final input in dut.inputs.values) {
+          if (input.name != 'clk') input.srcConnection!.put(0);
+        }
+        dut.input('clk').srcConnection! <= clk;
+        await dut.build();
+        dut.input('reset').srcConnection!.put(1);
+        var falls = 0;
+        clk.negedge.listen((_) {
+          if (++falls == 3) dut.input('reset').srcConnection!.inject(0);
+          if (falls == 6) dut.input(port).srcConnection!.inject(1);
+        });
+        Simulator.setMaxSimTime(10000);
+        await expectLater(
+          Simulator.run(),
+          throwsA(predicate((e) => '$e'.contains('no response to take'))),
+        );
+      });
+    }
+
+    test('outstanding 1 fast path: a registered feedback burst runs back to '
+        'back and the next request has no forced gap', () async {
+      final b = _MasterBench(_c1, seed: 54, idle: 0, stall: 0, wait: 0);
+      var cycle = 0;
+      final cycAt = <int>[];
+      final ackAt = <int>[];
+      b.sim.onRise(() {
+        if (b.sim.pre('bus_CYC') == 1) cycAt.add(cycle);
+        if (b.sim.pre('bus_STB') == 1 && b.sim.pre('bus_ACK') == 1) {
+          ackAt.add(cycle);
+        }
+        cycle++;
+      });
+      await b.start();
+      // Two full-width 8 beat INCR bursts, back to back.
+      b.send(Burst(id: 0, write: false, addr: 0, len: 7, size: 2, burst: 1));
+      b.send(Burst(id: 1, write: false, addr: 32, len: 7, size: 2, burst: 1));
+      await b.drain();
+      b.check();
+      // Every beat of a burst acks on the cycle right after the one
+      // before it: a registered feedback burst with no stall between
+      // beats.
+      expect(ackAt.length, 16);
+      for (var i = 1; i < 8; i++) {
+        expect(ackAt[i] - ackAt[i - 1], 1, reason: 'beat $i of burst 0');
+      }
+      for (var i = 9; i < 16; i++) {
+        expect(ackAt[i] - ackAt[i - 1], 1, reason: 'beat ${i - 8} of burst 1');
+      }
+      // The gap between the two bursts: CYC drops for at most one cycle
+      // between the last ACK of burst 0 and the first ACK of burst 1,
+      // since nothing in this port forces more than that.
+      final gap = ackAt[8] - ackAt[7] - 1;
+      expect(gap, lessThanOrEqualTo(1), reason: 'gap between bursts');
+      await b.sim.stop();
+    });
   });
 
   group('Wishbone loopback', () {
     test('master port to slave port, 32 bit', () async {
       await _loop(_c32, seed: 21);
+    });
+
+    test('master port to slave port, outstanding 1 fast path', () async {
+      await _loop(_c1, seed: 55);
     });
 
     test('master port to slave port, 64 bit, 4 beat blocks', () async {

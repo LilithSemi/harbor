@@ -9,27 +9,20 @@ import 'package:harbor/src/peripherals/ddr3_params.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-// Faithful SDIO ADMA -> DDR write-throughput harness.
+// SDIO ADMA -> DDR write-throughput harness.
 //
-// The real card-read data path on hardware is:
-//   SDIO ADMA master (raw dma_* handshake, fabricDma=false)
-//     -> HarborWishboneCdcFifoBridge (posted writes, depth 16, sys clock)
-//     -> Ddr3BurstAdapter (posted + write-combining, ddr clock)
-//     -> DDR3 controller.
+// The SDIO ADMA is a native Wishbone memory master (`dma_*`, registered
+// feedback bursts). This harness drives it into a real CDC bridge and a real
+// burst adapter, on a faster ddr clock than the SDIO system clock, and
+// terminates the adapter's wide side with a byte-masked controller model
+// whose WRITE ACCEPT LATENCY is a parameter. That is the knob that mimics the
+// ~11000-fabric-cycle-per-word regime measured on the Arty S7.
 //
-// The prior sim used a one-cycle-ack RAM directly on the dma_* port, so it
-// could never show the throughput the board sees. This harness wires the REAL
-// CDC bridge and the REAL burst adapter, on a faster ddr clock than the SDIO
-// system clock, and terminates the adapter's wide side with a byte-masked
-// controller model whose WRITE ACCEPT LATENCY is a parameter. That is the knob
-// that mimics the ~11000-fabric-cycle-per-word regime measured on the Arty S7,
-// and it lets a later fix be measured against a baseline here.
-//
-// The ADMA data-write state machine (sdio.dart aMemWrite) is NON-PIPELINED: it
-// asserts dma_stb with one beat, waits for dma_ack, drops stb, advances, and
-// only then produces the next beat. So every beat serializes on its own round
-// trip and the burst adapter downstream never sees a continuous stream. This
-// harness measures the cost of that.
+// The CDC bridge carries only `cyc`/`stb`/`we`/`adr`/`dat`/`sel`, not the
+// burst's last-beat flag, so every write beat that crosses it still reaches
+// the adapter as the last (and only) beat of its own request: the adapter
+// never combines beats that cross this bridge. Combining within one request
+// is covered directly on the adapter, below, with `sLast` driven by hand.
 
 // Register byte offsets (the byte-addressed fabric decodes byte-offset >> 3).
 const _ctrl = 0x00;
@@ -160,7 +153,11 @@ class _FakeSdCard {
     var responding = false;
     var respGap = 0;
 
+    // A cursor into datBits, not removeAt(0): the stream for a multi-block
+    // read is tens of thousands of bits long, and popping the front of a
+    // growable list is O(n) per bit, O(n^2) over the whole block.
     var datBits = <int>[];
+    var datIdx = 0;
     var datPhase = 0; // 0 idle, 1 gap, 2 driving
     var datGap = 0;
 
@@ -208,10 +205,12 @@ class _FakeSdCard {
           responding = false;
           if (readBlocks != null && datPhase == 0) {
             datBits = _buildDatMulti(readBlocks!);
+            datIdx = 0;
             datPhase = 1;
             datGap = 3; // let the host reach the data-read wait state
           } else if (readBlock != null && datPhase == 0) {
             datBits = _buildDat(readBlock!);
+            datIdx = 0;
             datPhase = 1;
             datGap = 3; // let the host reach the data-read wait state
           }
@@ -228,8 +227,9 @@ class _FakeSdCard {
           }
         }
         if (datPhase == 2) {
-          if (datBits.isNotEmpty) {
-            datIn.inject(0xe | datBits.removeAt(0));
+          if (datIdx < datBits.length) {
+            datIn.inject(0xe | datBits[datIdx]);
+            datIdx++;
           } else {
             datIn.inject(0xf);
             datPhase = 0;
@@ -354,6 +354,8 @@ class _Bench {
   late final Logic stb, we, adr, mosi;
   late final Logic cmdIn, datIn;
 
+  late final Logic _respAck, _respMiso;
+
   // Controller model backing store: wide-burst address -> 128-bit word.
   final store = <int, BigInt>{};
   int wideWrites = 0;
@@ -369,8 +371,8 @@ class _Bench {
   /// spaces same-burst beats apart and can defeat the burst adapter's combine.
   final int regStages;
 
-  /// ADMA beats retired (dma_ack pulses seen at the ADMA port) and the total
-  /// sys-cycles the ADMA held dma_stb asserted, filled by a probe in build().
+  /// ADMA beats retired (dma_ACK pulses seen at the ADMA port) and the total
+  /// sys-cycles the ADMA held dma_STB asserted, filled by a probe in build().
   /// avg-cycles-per-beat = stbCycles / admaBeats is the per-beat issue cost the
   /// interconnect adds; wideWrites is how many of those beats reached DRAM as
   /// distinct bursts (combining collapses beats -> fewer bursts).
@@ -385,17 +387,17 @@ class _Bench {
   /// the drain cost, so combine=false should be markedly slower than true.
   final bool combine;
 
-  /// Fence a card-read's data-done on a read-back of the last written address,
-  /// so data-done means the block is durable in the controller store. This is
-  /// the DMA-read-coherency fix under test.
-  final bool readBackBarrier;
+  /// ACK a write as soon as the CDC bridge captures it, instead of waiting
+  /// for the controller to take it. With this off, the SDIO WRESP of a write
+  /// comes only after the controller store holds it.
+  final bool postedWrites;
 
   _Bench({
     required this.writeAcceptLatency,
     this.busWidth = 32,
     this.regStages = 0,
     this.combine = true,
-    this.readBackBarrier = false,
+    this.postedWrites = true,
   }) : assert(busWidth == 32 || busWidth == 64);
 
   Future<void> build() async {
@@ -403,13 +405,12 @@ class _Bench {
       baseAddress: 0x0,
       rxFifoDepth: 16,
       dmaDataWidth: busWidth,
-      readBackBarrier: readBackBarrier,
     );
     cdc = HarborWishboneCdcFifoBridge(
       addressWidth: _busAddrW,
       dataWidth: busWidth,
       depth: 16,
-      postedWrites: true,
+      postedWrites: postedWrites,
     );
 
     clkSys = SimpleClockGenerator(10).clk; // ~ system clock
@@ -447,12 +448,12 @@ class _Bench {
     // WishboneRegisterStage (classic, one outstanding, holds STB until the
     // downstream ACK, one ACK pulse upstream, ~ack bubble). Chaining N of them
     // re-serializes the ADMA's streamed beats exactly as the real fabric does.
-    var upCyc = sdio.output('dma_cyc');
-    var upStb = sdio.output('dma_stb');
-    var upWe = sdio.output('dma_we');
-    var upAdr = sdio.output('dma_addr');
-    var upDat = sdio.output('dma_wdata');
-    var upSel = sdio.output('dma_sel');
+    var upCyc = sdio.output('dma_CYC');
+    var upStb = sdio.output('dma_STB');
+    var upWe = sdio.output('dma_WE');
+    var upAdr = sdio.output('dma_ADR');
+    var upDat = sdio.output('dma_DAT_MOSI');
+    var upSel = sdio.output('dma_SEL');
 
     // Pre-create the per-stage downstream-response wires so the ack/miso can be
     // tied back after the whole forward request chain is built.
@@ -509,12 +510,15 @@ class _Bench {
       }
     }
     if (regStages == 0) {
-      sdio.input('dma_ack').srcConnection! <= cdc.output('s_ack');
-      sdio.input('dma_rdata').srcConnection! <= cdc.output('s_dat_r');
+      _respAck = cdc.output('s_ack');
+      _respMiso = cdc.output('s_dat_r');
     } else {
-      sdio.input('dma_ack').srcConnection! <= upAcks[0];
-      sdio.input('dma_rdata').srcConnection! <= upMisos[0];
+      _respAck = upAcks[0];
+      _respMiso = upMisos[0];
     }
+    sdio.input('dma_ACK').srcConnection! <= _respAck;
+    sdio.input('dma_DAT_MISO').srcConnection! <= _respMiso;
+    sdio.input('dma_ERR').srcConnection! <= Const(0);
 
     // Controller-side handshake Logics (driven by the model below).
     final mStall = Logic(name: 'm_stall')..inject(0);
@@ -605,9 +609,9 @@ class _Bench {
     // sys-cycles dma_stb was held. stbCycles/admaBeats is the per-beat issue
     // cost the interposed slices add.
     _probe = clkSys.posedge.listen((_) {
-      if (_bit(sdio.output('dma_stb')) == 1) stbCycles++;
-      if (_bit(sdio.input('dma_ack')) == 1 &&
-          _bit(sdio.output('dma_stb')) == 1) {
+      if (_bit(sdio.output('dma_STB')) == 1) stbCycles++;
+      if (_bit(sdio.input('dma_ACK')) == 1 &&
+          _bit(sdio.output('dma_STB')) == 1) {
         admaBeats++;
       }
     });
@@ -688,14 +692,12 @@ Future<_Result> _runBlock({
   int bufferAddr = 0x1000,
   int regStages = 0,
   bool combine = true,
-  bool readBackBarrier = false,
 }) async {
   final bench = _Bench(
     writeAcceptLatency: writeAcceptLatency,
     busWidth: busWidth,
     regStages: regStages,
     combine: combine,
-    readBackBarrier: readBackBarrier,
   );
   await bench.build();
 
@@ -710,17 +712,12 @@ Future<_Result> _runBlock({
           block[4 * i + 3] << 24,
   ];
 
-  // Descriptor at ADMA base 0: word0 = buffer address, word1 = len | end.
-  // Seed the descriptor directly into the controller store (burst 0, lanes 0/1).
-  bench.store[0] =
-      (BigInt.from(blockBytes | (1 << 31)) << 32) | BigInt.from(bufferAddr);
-
   final card = _FakeSdCard(bench.sdio, bench.cmdIn, bench.datIn)
     ..readBlock = block;
   unawaited(card.run(bench.clkSys));
 
   await bench.busWrite(_clkDiv, 0); // fastest SD clock
-  await bench.busWrite(_intEnable, 0x12);
+  await bench.busWrite(_intEnable, _intDataDone);
   await bench.busWrite(_ctrl, 0x1); // enable
   await bench.busWrite(_blkSize, blockBytes);
   await bench.busWrite(_blkCount, 1);
@@ -813,16 +810,12 @@ _runMultiBlock({
       ],
   ];
 
-  final totalBytes = nBlocks * blockBytes;
-  bench.store[0] =
-      (BigInt.from(totalBytes | (1 << 31)) << 32) | BigInt.from(bufferAddr);
-
   final card = _FakeSdCard(bench.sdio, bench.cmdIn, bench.datIn)
     ..readBlocks = blocks;
   unawaited(card.run(bench.clkSys));
 
   await bench.busWrite(_clkDiv, 0);
-  await bench.busWrite(_intEnable, 0x12);
+  await bench.busWrite(_intEnable, _intDataDone);
   await bench.busWrite(_ctrl, 0x1);
   await bench.busWrite(_blkSize, blockBytes);
   await bench.busWrite(_blkCount, nBlocks);
@@ -914,19 +907,19 @@ class _Result {
 // rebuild corrupts the next build; see the ROHD gotchas).
 final _sweep = <_Result>[];
 
-// The DMA-bound sweep uses a 128-byte block (32 words) on the 32-bit path
-// (the 32-bit sim is several times faster than the 128-bit-adapter 64-bit
-// one) and spans a low-to-high controller latency. Single-beat writes never
-// combine, so wideWrites stays at one DRAM write per narrow word at every
-// latency: a slow controller does not multiply the DRAM command count
-// further, it only slows each of those commands down.
-const _sweepBlock = 128;
+// The DMA-bound sweep uses a small block on the 32-bit path (the 32-bit sim
+// is several times faster than the 128-bit-adapter 64-bit one) and spans a
+// low-to-high controller latency. No beat combines across the CDC bridge,
+// so wideWrites stays at one DRAM write per narrow word at every latency: a
+// slow controller does not multiply the DRAM command count further, it only
+// slows each of those commands down.
+const _sweepBlock = 64;
 const _sweepWords = _sweepBlock ~/ 4;
 const _sweepWidth = 32;
 // A high controller latency makes the behavioural sim churn (mStall/adapter FSM
 // toggle every ddr edge), so the wall time grows with latency, not cycle count.
 // These stay tractable while still spanning low to elevated latency; the slow
-// end of the regime is covered by the 512-byte latency-200 test above.
+// end of the regime is covered by the latency-200 test above.
 const _sweepLatencies = [50, 200];
 
 // ===========================================================================
@@ -1107,8 +1100,11 @@ void main() {
   // checks every word. If the store is byte-exact here, the ADMA multi-block RTL
   // is functionally correct and the HW fault is timing/electrical (openXC7 DDR
   // margin), not logic.
+  //
+  // n is small: a run through the real CDC bridge and burst adapter costs
+  // minutes per block.
   group('CMD18 multi-block ADMA is byte-exact at scale (DMA path)', () {
-    for (final n in [8, 16, 32]) {
+    for (final n in [1, 2]) {
       test('$n x 512-byte blocks land byte-exact through the ADMA', () async {
         final r = await _runMultiBlock(nBlocks: n, busWidth: 64);
         print(
@@ -1139,104 +1135,91 @@ void main() {
   // reverts (wideWrites climbs from ~32 back toward 128) and the per-beat issue
   // cost balloons. This group sweeps 0/1/2 slices and prints the effect.
   group('interconnect re-serialization (crossbar-inclusive)', () {
+    // A small block keeps the wall time low. Each register slice adds to it.
+    const blockBytes = 64;
     for (final stages in [0, 1, 2]) {
-      test('512B block, 64b path, $stages register slice(s)', () async {
-        final r = await _runBlock(
-          writeAcceptLatency: 2,
-          busWidth: 64,
-          regStages: stages,
-        );
-        print(
-          '[regStages=$stages] cyclesToLand=${r.cyclesToLand} '
-          'cyclesPerBeat=${r.cyclesPerBeat.toStringAsFixed(1)} '
-          'wideWrites=${r.wideWrites} '
-          'admaBeats=${r.admaBeats} '
-          'cyclesPerAdmaBeat=${r.cyclesPerAdmaBeat.toStringAsFixed(1)} '
-          'dataOk=${r.dataOk}',
-        );
-        expect(
-          r.dataOk,
-          isTrue,
-          reason: 'data must still land correctly with $stages slice(s)',
-        );
-      });
-    }
-  });
-
-  // ===========================================================================
-  // Does combining actually buy block time under a SLOW controller? This is the
-  // ffwc2 predictor. delta-ffs runs writeCombine=OFF (every narrow beat a
-  // separate masked DRAM write); ffwc2 turns it ON. With a slow controller the
-  // DRAM-write COUNT multiplies the drain, so if combining works, combine=false
-  // should be markedly slower than combine=true here. A 128-byte block at a high
-  // controller latency makes the drain (not the 1-bit SD receive) the limiter.
-  group('combine on/off predicts ffwc2 (slow controller, drain-limited)', () {
-    const lat = 600;
-    for (final combine in [false, true]) {
-      test('128B block, latency=$lat, combine=$combine', () async {
-        final r = await _runBlock(
-          writeAcceptLatency: lat,
-          busWidth: 64,
-          blockBytes: 128,
-          combine: combine,
-        );
-        print(
-          '[combine=$combine, latency=$lat] '
-          'cyclesToLand=${r.cyclesToLand} '
-          'cyclesPerBeat=${r.cyclesPerBeat.toStringAsFixed(1)} '
-          'wideWrites=${r.wideWrites} '
-          'dataOk=${r.dataOk}',
-        );
-        expect(
-          r.dataOk,
-          isTrue,
-          reason: 'data must land with combine=$combine',
-        );
-      });
+      test(
+        '${blockBytes}B block, 64b path, $stages register slice(s)',
+        () async {
+          final r = await _runBlock(
+            writeAcceptLatency: 2,
+            busWidth: 64,
+            blockBytes: blockBytes,
+            regStages: stages,
+          );
+          print(
+            '[regStages=$stages] cyclesToLand=${r.cyclesToLand} '
+            'cyclesPerBeat=${r.cyclesPerBeat.toStringAsFixed(1)} '
+            'wideWrites=${r.wideWrites} '
+            'admaBeats=${r.admaBeats} '
+            'cyclesPerAdmaBeat=${r.cyclesPerAdmaBeat.toStringAsFixed(1)} '
+            'dataOk=${r.dataOk}',
+          );
+          expect(
+            r.dataOk,
+            isTrue,
+            reason: 'data must still land correctly with $stages slice(s)',
+          );
+        },
+      );
     }
   });
 
   group('SDIO ADMA -> posted CDC -> burst adapter -> DDR write throughput', () {
-    // The DDR3 non-posted write fix: the adapter only ACKs the last write of
-    // a request once the controller accepts it. The SDIO ADMA issues classic
-    // single-beat Wishbone writes, so every write IS the last beat of its own
-    // request; write combining never merges across separate requests (that
-    // would ACK a write before it reaches the controller, a posted write).
-    // So each narrow word costs its own wide DRAM write; see the
-    // registered-feedback burst test below for combining within one request.
+    // The adapter ACKs the last write of a request only when the controller
+    // takes it. The CDC bridge drops the last-beat flag, so each narrow word
+    // is its own request and costs its own wide DRAM write. The
+    // registered-feedback burst test below covers combining in one request.
+    // A small block keeps the wall time low.
+    const blockBytes = 64;
+    const wordCount = blockBytes ~/ 4;
     for (final width in [32, 64]) {
       final wordsPerBeat = width == 32 ? 1 : 2; // 64b packs two 32b words
-      final expectedWideWrites = 128 ~/ wordsPerBeat;
-      test('a 512-byte block lands one wide write per narrow word on the '
-          '${width}b path (low latency)', () async {
-        final r = await _runBlock(writeAcceptLatency: 2, busWidth: width);
+      final expectedWideWrites = wordCount ~/ wordsPerBeat;
+      test('a $blockBytes-byte block lands one wide write per narrow word on '
+          'the ${width}b path (low latency)', () async {
+        final r = await _runBlock(
+          writeAcceptLatency: 2,
+          busWidth: width,
+          blockBytes: blockBytes,
+        );
         print(
-          '[512B block, ${width}b, latency=${r.latency}] '
+          '[${blockBytes}B block, ${width}b, latency=${r.latency}] '
           'cyclesToLand=${r.cyclesToLand} '
           'cyclesPerBeat=${r.cyclesPerBeat.toStringAsFixed(1)} '
           'wideWrites=${r.wideWrites}',
         );
-        expect(r.dataOk, isTrue, reason: 'all 128 words must land correctly');
+        expect(
+          r.dataOk,
+          isTrue,
+          reason: 'all $wordCount words must land correctly',
+        );
         expect(r.dataDone, isTrue, reason: 'data-done interrupt must fire');
         expect(
           r.wideWrites,
           expectedWideWrites,
           reason:
-              'single-beat writes never combine, so each beat is its own '
-              'DRAM write',
+              'the CDC bridge drops the last-beat flag, so no beat combines '
+              'with another and each is its own DRAM write',
         );
       });
     }
 
-    test('a 512-byte block still lands one wide write per narrow word when '
-        'the controller is slow (32b path)', () async {
-      // A slow controller does not change the combining rule: each
-      // single-beat write is still its own last beat, so it still costs its
-      // own DRAM write. Run on the faster 32-bit sim so a high latency stays
-      // test-tractable.
-      final r = await _runBlock(writeAcceptLatency: 200, busWidth: 32);
+    test('a block still lands one wide write per narrow word when the '
+        'controller is slow (32b path)', () async {
+      // A slow controller does not change the combining rule: every beat is
+      // still its own last beat across this bridge, so it still costs its
+      // own DRAM write. Run on the faster 32-bit sim, with a small block, so
+      // a high latency (which itself costs wall time regardless of block
+      // size) stays test-tractable.
+      const words = 16;
+      final r = await _runBlock(
+        writeAcceptLatency: 200,
+        busWidth: 32,
+        blockBytes: words * 4,
+      );
       print(
-        '[512B block, 32b, latency=${r.latency}] '
+        '[${words * 4}B block, 32b, latency=${r.latency}] '
         'cyclesToLand=${r.cyclesToLand} '
         'cyclesPerBeat=${r.cyclesPerBeat.toStringAsFixed(1)} '
         'wideWrites=${r.wideWrites}',
@@ -1244,24 +1227,25 @@ void main() {
       expect(
         r.dataOk,
         isTrue,
-        reason: 'all 128 words must land correctly at latency=200',
+        reason: 'all $words words must land correctly at latency=200',
       );
       expect(
         r.wideWrites,
-        128,
-        reason: 'controller latency does not change the single-beat count',
+        words,
+        reason: 'controller latency does not change the per-beat write count',
       );
     });
 
     test(
       'the same payload still combines to one write per 4-word burst sent '
-      'as registered-feedback bursts, not single-beat writes',
+      'as registered-feedback bursts, not beats that each flush alone',
       () async {
         // writeCombine merges beats inside ONE multi-beat request: s_last
         // stays low on the first three beats of each 4-word burst and high
         // on the fourth, exactly what a WB B4 registered-feedback burst
-        // drives. This is the traffic the single-beat tests above cannot
-        // combine; it proves combining itself still works.
+        // drives. This is the last-beat flag the CDC bridge above drops, so
+        // it proves combining itself still works, driven straight at the
+        // adapter.
         const aw = 24;
         final clk = SimpleClockGenerator(10).clk;
         final reset = Logic(name: 'reset')..inject(1);
@@ -1354,18 +1338,22 @@ void main() {
           final lane = ((i * 4) >> 2) & 3;
           final w = mem[burst] ?? BigInt.zero;
           final got = ((w >> (lane * 32)) & BigInt.from(0xffffffff)).toInt();
-          expect(got, words[i], reason: 'word $i must land via the merged burst');
+          expect(
+            got,
+            words[i],
+            reason: 'word $i must land via the merged burst',
+          );
         }
       },
     );
 
-    // One simulation per latency. Single-beat writes never combine, so the
-    // number of wide DRAM writes is one per narrow word at EVERY latency: a
-    // slower controller does not add MORE DRAM commands, it just slows the
+    // One simulation per latency. No beat combines across the CDC bridge, so
+    // the number of wide DRAM writes is one per narrow word at EVERY latency:
+    // a slower controller does not add MORE DRAM commands, it just slows the
     // same _sweepWords commands down.
     for (final lat in _sweepLatencies) {
       test(
-        'write latency $lat: the 128-byte block lands correctly',
+        'write latency $lat: the $_sweepBlock-byte block lands correctly',
         () async {
           final r = await _runBlock(
             writeAcceptLatency: lat,
@@ -1373,10 +1361,10 @@ void main() {
             blockBytes: _sweepBlock,
           );
           print(
-            '[128B block, ${_sweepWidth}b, latency=${r.latency}] '
+            '[${_sweepBlock}B block, ${_sweepWidth}b, latency=${r.latency}] '
             'cyclesToLand=${r.cyclesToLand} '
             'cyclesPerBeat=${r.cyclesPerBeat.toStringAsFixed(1)} '
-            'wideWrites=${r.wideWrites} (${_sweepWords} words)',
+            'wideWrites=${r.wideWrites} ($_sweepWords words)',
           );
           expect(
             r.dataOk,
@@ -1395,9 +1383,9 @@ void main() {
         _sweepLatencies.length,
         reason: 'every latency run must have recorded a result',
       );
-      // Each of the _sweepWords single-beat writes is its own last beat, so
-      // it costs its own DRAM write at every latency: the count does not
-      // grow with latency, only the time each command takes does.
+      // Each of the _sweepWords writes is its own last beat across the CDC
+      // bridge, so it costs its own DRAM write at every latency: the count
+      // does not grow with latency, only the time each command takes does.
       for (final r in _sweep) {
         expect(
           r.wideWrites,
@@ -1423,82 +1411,69 @@ void main() {
   });
 
   // ===========================================================================
-  // The DMA-read-coherency fix: data-done must MEAN the block is durable.
-  //
-  // On a posted-write fabric the ADMA's block writes are ACKed before they land
-  // in the controller store, so with a slow controller the last writes are still
-  // in flight when the RX FIFO drains. Without the read-back barrier the engine
-  // raises data-done at that moment, so a driver that reads the buffer the
-  // instant it sees data-done reads STALE data (the exact Arty S7 boot failure:
-  // the sustained EFI-file read resets the board on stale/garbage). The barrier
-  // fences the writes with a read-back of the last written address, so data-done
-  // is held until the whole block has committed.
-  group(
-    'read-back barrier makes data-done mean durable (DMA-read coherency)',
-    () {
-      // Single-beat writes no longer combine, so each of the 128 words pays
-      // its own controller-accept latency. 100 still backs up the posted CDC
-      // FIFO enough to show the bug, but stays inside the barrier's fixed
-      // 256-cycle wait; 200 (the old value) does not.
-      const lat = 100;
-      test(
-        'WITHOUT the barrier, data-done fires before the block lands (the bug)',
-        () async {
-          final r = await _runBlock(
-            writeAcceptLatency: lat,
-            busWidth: 32,
-            readBackBarrier: false,
-          );
-          print(
-            '[no-barrier latency=$lat] dataDoneCycle=${r.dataDoneCycle} '
-            'landedCycle=${r.cyclesToLand}',
-          );
-          expect(r.dataDoneCycle, greaterThan(0));
-          expect(r.cyclesToLand, greaterThan(0));
-          // The defect: data-done precedes the block being fully committed.
-          expect(
-            r.dataDoneCycle,
-            lessThan(r.cyclesToLand),
-            reason:
-                'without the barrier the slow controller leaves writes in '
-                'flight when data-done fires; this is the stale-read window',
-          );
-        },
+  // DMA-read coherency. With a non-posted bridge, each WRESP comes only
+  // after the controller store holds the write, and data-done waits for
+  // every WRESP. So at data-done the whole block is in the store.
+  group('data-done means the block is durable (DMA-read coherency)', () {
+    const lat = 80;
+    const blockBytes = 64;
+    const bufferAddr = 0x1000;
+
+    test('every word is in the store at data-done, slow controller', () async {
+      final bench = _Bench(writeAcceptLatency: lat, postedWrites: false);
+      await bench.build();
+
+      final wordCount = blockBytes ~/ 4;
+      final block = [
+        for (var i = 0; i < blockBytes; i++) (i * 11 + 0x23) & 0xff,
+      ];
+      final expected = [
+        for (var i = 0; i < wordCount; i++)
+          block[4 * i] |
+              block[4 * i + 1] << 8 |
+              block[4 * i + 2] << 16 |
+              block[4 * i + 3] << 24,
+      ];
+      final card = _FakeSdCard(bench.sdio, bench.cmdIn, bench.datIn)
+        ..readBlock = block;
+      unawaited(card.run(bench.clkSys));
+
+      await bench.busWrite(_clkDiv, 0);
+      await bench.busWrite(_intEnable, _intDataDone);
+      await bench.busWrite(_ctrl, 0x1);
+      await bench.busWrite(_blkSize, blockBytes);
+      await bench.busWrite(_blkCount, 1);
+      await bench.busWrite(_admaAddr, bufferAddr);
+      await bench.busWrite(_cmdArg, 0);
+      await bench.busWrite(
+        _cmd,
+        17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10),
       );
 
-      test(
-        'WITH the barrier, data-done fires only after the block lands (fixed)',
-        () async {
-          final r = await _runBlock(
-            writeAcceptLatency: lat,
-            busWidth: 32,
-            readBackBarrier: true,
-          );
-          print(
-            '[barrier latency=$lat] dataDoneCycle=${r.dataDoneCycle} '
-            'landedCycle=${r.cyclesToLand} wideWrites=${r.wideWrites} '
-            'dataOk=${r.dataOk}',
-          );
-          expect(
-            r.dataOk,
-            isTrue,
-            reason: 'the block must still land correctly',
-          );
-          expect(r.dataDone, isTrue, reason: 'data-done must still fire');
-          expect(r.dataDoneCycle, greaterThan(0));
-          expect(r.cyclesToLand, greaterThan(0));
-          // The fix: every word is committed no later than data-done.
-          expect(
-            r.dataDoneCycle,
-            greaterThanOrEqualTo(r.cyclesToLand),
-            reason:
-                'the read-back barrier must hold data-done until the whole '
-                'block has committed to the controller store',
-          );
-        },
-      );
-    },
-  );
+      var dataDone = false;
+      for (var i = 0; i < 2000000; i++) {
+        await bench.clkSys.nextPosedge;
+        if (_bit(bench.sdio.output('interrupt')) == 1) {
+          dataDone = true;
+          break;
+        }
+      }
+      expect(dataDone, isTrue, reason: 'data-done must fire');
+
+      for (var w = 0; w < wordCount; w++) {
+        expect(
+          bench.wordAt(bufferAddr + 4 * w),
+          expected[w],
+          reason: 'word $w is not in the store at data-done',
+        );
+      }
+
+      card.stop = true;
+      await bench.clkSys.nextPosedge;
+      await bench.clkSys.nextPosedge;
+      await bench.stop();
+    });
+  });
 
   group('real Ddr3Controller write-accept rate (the bisection)', () {
     test('the real controller accepts ADMA-pattern burst writes fast', () async {

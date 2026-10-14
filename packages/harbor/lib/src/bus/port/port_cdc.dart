@@ -387,14 +387,18 @@ class HarborMemoryWaistCdc extends Module {
     final wdFire = dn.wdataValid & dn.wdataReady;
     wdLastFire <= wdFire & dn.wdataLast;
 
-    // Responses to requests sent before a device reset are dropped.
-    dn.rdataReady <= mode | ~rdF.wrFull;
+    // Responses to requests sent before a device reset are dropped. READY
+    // stays low while nothing is in flight.
+    dn.rdataReady <= (mode | ~rdF.wrFull) & nonZero(outR);
     rdF.push(
-      dn.rdataValid & ~mode,
+      dn.rdataValid & dn.rdataReady & ~mode,
       harborPack([dn.rdataId, dn.rdataData, dn.rdataErr, dn.rdataLast]),
     );
-    dn.wrespReady <= mode | ~wrF.wrFull;
-    wrF.push(dn.wrespValid & ~mode, harborPack([dn.wrespId, dn.wrespErr]));
+    dn.wrespReady <= (mode | ~wrF.wrFull) & nonZero(outW);
+    wrF.push(
+      dn.wrespValid & dn.wrespReady & ~mode,
+      harborPack([dn.wrespId, dn.wrespErr]),
+    );
     final rDone = dn.rdataValid & dn.rdataReady & dn.rdataLast;
     final bDone = dn.wrespValid & dn.wrespReady;
     final reqR = reqFire & ~write;

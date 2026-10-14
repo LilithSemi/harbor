@@ -622,6 +622,11 @@ class WaistRequester {
   int _readsDone = 0;
   int _dataDone = 0;
 
+  // Requests taken and not yet answered. RDATA_READY and WRESP_READY stay
+  // low while their count is 0.
+  int _readsOut = 0;
+  int _writesOut = 0;
+
   WaistRequester(
     this.s,
     this.p,
@@ -634,6 +639,11 @@ class WaistRequester {
     req = Source(s, '${p}_REQ_VALID', '${p}_REQ_READY', rng, idle: idle)
       ..onFire = (_) {
         final b = _issued.removeFirst();
+        if (b.write) {
+          _writesOut++;
+        } else {
+          _readsOut++;
+        }
         if (b.write && !earlyData) _queueData(b);
       };
     wdata = Source(s, '${p}_WDATA_VALID', '${p}_WDATA_READY', rng, idle: idle)
@@ -648,6 +658,7 @@ class WaistRequester {
       rng,
       _onRdata,
       stall: stall,
+      gate: () => _readsOut > 0,
     );
     wresp = Sink(
       s,
@@ -662,8 +673,10 @@ class WaistRequester {
           errors.add('WRESP before the data of its write');
         }
         writeResp.add((f['${p}_WRESP_ID']!, f['${p}_WRESP_ERR']!));
+        if (_writesOut > 0) _writesOut--;
       },
       stall: stall,
+      gate: () => _writesOut > 0,
     );
   }
 
@@ -712,6 +725,7 @@ class WaistRequester {
     if (last == 1) {
       q.removeFirst();
       _readsDone++;
+      if (_readsOut > 0) _readsOut--;
     }
   }
 
@@ -730,6 +744,8 @@ class WaistRequester {
     writeResp.clear();
     _readsDone = 0;
     _dataDone = 0;
+    _readsOut = 0;
+    _writesOut = 0;
   }
 }
 

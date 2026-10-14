@@ -237,6 +237,9 @@ class RegBus {
         final rdata = _data('D_DATA');
         final err = _high('D_DENIED') || _high('D_CORRUPT');
         await clk.nextPosedge;
+        // A response means the request was taken, even when the port took
+        // it at an edge this loop did not see.
+        _set('A_VALID', 0);
         return (data: rdata, err: err);
       }
       await clk.nextPosedge;

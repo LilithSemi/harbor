@@ -120,6 +120,135 @@ HarborSoC _soc(HarborFabricKind kind) => HarborSoC(
   ],
 );
 
+/// A module with a register master port per name in [ports], each pinned
+/// out as `<port>__<PORT>`. With [base] it is also a slave there that reads
+/// back the address it sees.
+class _Multi extends BridgeModule with HarborDeviceTreeNodeProvider {
+  final List<String> ports;
+  final int base;
+
+  _Multi(
+    HarborFabricKind kind, {
+    required this.ports,
+    this.base = 0,
+    bool slave = false,
+    String name = 'multi',
+  }) : super(
+         'FabricMulti_${kind.name}_${ports.join('_')}${slave ? '_s' : ''}',
+         name: name,
+       ) {
+    createPort('clk', PortDirection.input);
+    createPort('reset', PortDirection.input);
+    for (final p in ports) {
+      final i = BusMasterPort.create(
+        module: this,
+        name: p,
+        kind: kind,
+        addressWidth: 32,
+        dataWidth: 32,
+        clk: input('clk'),
+        reset: input('reset'),
+        useErr: true,
+      );
+      i.addr <= addInput('${p}__adr', Logic(width: 32), width: 32);
+      i.dataOut <= addInput('${p}__wdat', Logic(width: 32), width: 32);
+      i.stb <= addInput('${p}__stb', Logic());
+      i.we <= addInput('${p}__we', Logic());
+      i.sel <= addInput('${p}__sel', Logic(width: 4), width: 4);
+      addOutput('${p}__rdat', width: 32) <= i.dataIn;
+      addOutput('${p}__ack') <= i.ack;
+      addOutput('${p}__err') <= i.err;
+    }
+    if (!slave) return;
+    final bus = BusSlavePort.create(
+      module: this,
+      name: 'bus',
+      kind: kind,
+      addressWidth: 32,
+      dataWidth: 32,
+      clk: input('clk'),
+      reset: input('reset'),
+    );
+    Sequential(input('clk'), reset: bus.reset, [
+      bus.ack < (bus.stb & ~bus.ack),
+      bus.dataOut < bus.addr,
+    ]);
+  }
+
+  /// Pulls the pins of [p] up to [soc] as `<name>_<p>_<pin>`.
+  void pullUp(HarborSoC soc, String p) {
+    for (final n in [...inputs.keys, ...outputs.keys]) {
+      if (!n.startsWith('${p}__')) continue;
+      soc.pullUpPort(
+        port(n),
+        newPortName: '${name}_${p}_${n.substring(p.length + 2)}',
+      );
+    }
+  }
+
+  @override
+  HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(
+    compatible: ['test,multi'],
+    reg: BusAddressRange(base, 0x1000),
+  );
+}
+
+/// Drives the register master waist pins `<name>_*` of a [_Multi] on [soc].
+class _WaistDriver {
+  final HarborSoC soc;
+  final Logic clk;
+  final String name;
+  final Map<String, Logic> _in = {};
+
+  _WaistDriver(this.soc, this.clk, this.name) {
+    for (final p in ['adr', 'wdat', 'stb', 'we', 'sel']) {
+      final port = soc.input('${name}_$p');
+      final l = Logic(name: 'drv_${name}_$p', width: port.width);
+      port.srcConnection! <= l;
+      _in[p] = l;
+    }
+  }
+
+  void idle() {
+    for (final l in _in.values) {
+      l.inject(0);
+    }
+  }
+
+  Future<({int data, bool err})> access(
+    int addr, {
+    int data = 0,
+    bool write = false,
+  }) async {
+    await clk.nextNegedge;
+    _in['adr']!.inject(addr);
+    _in['wdat']!.inject(data);
+    _in['we']!.inject(write ? 1 : 0);
+    _in['sel']!.inject(0xf);
+    _in['stb']!.inject(1);
+    for (var i = 0; i < 2000; i++) {
+      await clk.nextPosedge;
+      if (soc.output('${name}_ack').previousValue!.toBool()) {
+        final r = (
+          data: soc.output('${name}_rdat').previousValue!.toInt(),
+          err: soc.output('${name}_err').previousValue!.toBool(),
+        );
+        await clk.nextNegedge;
+        _in['stb']!.inject(0);
+        return r;
+      }
+    }
+    throw StateError('$name access at 0x${addr.toRadixString(16)} hung');
+  }
+}
+
+List<HarborFabricMaster> _mastersOf(HarborFabricModule f) => switch (f) {
+  HarborWishboneFabric(:final masters) ||
+  HarborAxi4Fabric(:final masters) ||
+  HarborTileLinkFabric(:final masters) => masters,
+  _ => throw StateError('unknown fabric ${f.runtimeType}'),
+};
+
 List<HarborFabricSlave> _slavesOf(HarborFabricModule f) => switch (f) {
   HarborWishboneFabric(:final slaves) ||
   HarborAxi4Fabric(:final slaves) ||
@@ -428,8 +557,115 @@ void main() {
     });
   }
 
+  for (final kind in HarborFabricKind.values) {
+    test('${kind.name}: a module that is a master and a slave', () async {
+      final soc = _soc(kind);
+      final cpu = soc.addMaster(_Cpu(kind));
+      final both = _Multi(
+        kind,
+        ports: ['dataBus'],
+        base: 0x10004000,
+        slave: true,
+        name: 'both',
+      );
+      soc.addPeripheral(both);
+      soc.addMaster(both);
+      final a = soc.addPeripheral(_gpio(kind, 0x10001000, 'gpio_a'));
+      cpu.pullUp(soc);
+      both.pullUp(soc, 'dataBus');
+      soc.buildFabric();
+      expect(_mastersOf(soc.fabric!).map((m) => m.name), [
+        'cpu',
+        'both_dataBus',
+      ]);
+      expect(_slavesOf(soc.fabric!).map((s) => s.name), ['both', 'gpio_a']);
+
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset')..inject(1);
+      soc.input('clk').srcConnection! <= clk;
+      soc.input('periph_clk').srcConnection! <= Const(0);
+      soc.input('reset').srcConnection! <= reset;
+      a.input('gpio_in').srcConnection! <= Const(0, width: 32);
+      final bus = RegBus.attach(soc, clk, name: 'cpu', kind: kind);
+      final m = _WaistDriver(soc, clk, 'both_dataBus');
+      await soc.build();
+      bus.idle();
+      m.idle();
+      Simulator.setMaxSimTime(2000000);
+      unawaited(Simulator.run());
+      for (var i = 0; i < 8; i++) {
+        await clk.nextPosedge;
+      }
+      reset.inject(0);
+      for (var i = 0; i < 4; i++) {
+        await clk.nextPosedge;
+      }
+      expect(await bus.read(0x10004000 + 0x10), 0x10);
+      final w = await m.access(0x10001000 + _output, data: 0x77, write: true);
+      expect(w.err, isFalse);
+      expect((await m.access(0x10001000 + _output)).data, 0x77);
+      // The master reaches its own slave window too.
+      expect((await m.access(0x10004000 + 0x24)).data, 0x24);
+      expect(await bus.read(0x10001000 + _output), 0x77);
+      await Simulator.endSimulation();
+    });
+
+    test('${kind.name}: a module with two master ports', () async {
+      final soc = _soc(kind);
+      final cpu = _Multi(kind, ports: ['dataBus', 'instBus'], name: 'cpu');
+      soc.addMaster(cpu);
+      soc.addMaster(cpu, busInterfaceName: 'instBus');
+      final a = soc.addPeripheral(_gpio(kind, 0x10001000, 'gpio_a'));
+      cpu.pullUp(soc, 'dataBus');
+      cpu.pullUp(soc, 'instBus');
+      soc.buildFabric();
+      expect(_mastersOf(soc.fabric!).map((m) => m.name), [
+        'cpu',
+        'cpu_instBus',
+      ]);
+
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset')..inject(1);
+      soc.input('clk').srcConnection! <= clk;
+      soc.input('periph_clk').srcConnection! <= Const(0);
+      soc.input('reset').srcConnection! <= reset;
+      a.input('gpio_in').srcConnection! <= Const(0, width: 32);
+      final d = _WaistDriver(soc, clk, 'cpu_dataBus');
+      final i = _WaistDriver(soc, clk, 'cpu_instBus');
+      await soc.build();
+      d.idle();
+      i.idle();
+      Simulator.setMaxSimTime(2000000);
+      unawaited(Simulator.run());
+      for (var c = 0; c < 8; c++) {
+        await clk.nextPosedge;
+      }
+      reset.inject(0);
+      for (var c = 0; c < 4; c++) {
+        await clk.nextPosedge;
+      }
+      await d.access(0x10001000 + _output, data: 0xabcd, write: true);
+      final r = await Future.wait([
+        d.access(0x10001000 + _output),
+        i.access(0x10001000 + _output),
+      ]);
+      expect(r.map((e) => e.data), [0xabcd, 0xabcd]);
+      expect(r.any((e) => e.err), isFalse);
+      await Simulator.endSimulation();
+    });
+
+    test('${kind.name}: masters with no clash keep their names', () {
+      final soc = _soc(kind);
+      soc.addMaster(_Cpu(kind));
+      soc.addMaster(_Cpu(kind, name: 'dma'));
+      soc.addPeripheral(_gpio(kind, 0x10001000, 'gpio_a'));
+      soc.buildFabric();
+      expect(_mastersOf(soc.fabric!).map((m) => m.name), ['cpu', 'dma']);
+    });
+  }
+
   group('kind checks', () {
-    test('a Wishbone master on an AXI4 fabric names the master task', () {
+    test('a master of another kind is refused', () {
       final soc = _soc(HarborFabricKind.axi4);
       soc.addMaster(_Cpu(HarborFabricKind.wishbone));
       soc.addPeripheral(_gpio(HarborFabricKind.axi4, 0x10001000, 'gpio_a'));
@@ -439,7 +675,7 @@ void main() {
           isA<StateError>().having(
             (e) => e.message,
             'message',
-            contains('native master port for axi4 is not implemented'),
+            allOf(contains('master cpu'), contains('is axi4')),
           ),
         ),
       );

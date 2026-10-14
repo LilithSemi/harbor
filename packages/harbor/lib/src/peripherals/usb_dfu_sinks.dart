@@ -1,16 +1,21 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
-import '../bus/wishbone/wishbone_interface.dart';
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
+import '../bus/port/fabric_kind.dart';
+import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
 import '../clock/cdc.dart';
 import 'spi_flash.dart';
 import 'usb_dfu_device.dart';
 
-/// DMAs a [HarborUsbDfu] firmware download into RAM over a Wishbone master.
-/// Consumes [UsbDfuSinkInterface] (alt setting 0) through a CDC FIFO, so
-/// `ready` always reflects real FIFO space.
+/// DMAs a [HarborUsbDfu] firmware download into RAM over a memory master
+/// waist (see `HarborMemoryMasterPort`), one byte (or bus word, for an
+/// 8-bit bus) at a time. Consumes [UsbDfuSinkInterface] (alt setting 0)
+/// through a CDC FIFO, so `ready` always reflects real FIFO space.
 class UsbDfuRamSink extends BridgeModule {
-  static const int _errAddress = 0x08;
+  static const int _errAddress = 0x08; // DFU 1.1 Table 6.2 errADDRESS
+  static const int _errWrite = 0x03; // DFU 1.1 Table 6.2 errWRITE
 
   /// The RAM load address that image byte 0 is written to.
   final int loadBase;
@@ -19,10 +24,15 @@ class UsbDfuRamSink extends BridgeModule {
   /// past this raises errADDRESS and is not written.
   final int regionBytes;
 
-  /// Wishbone address bus width.
+  /// The fabric kind of the native memory master port.
+  final HarborFabricKind fabricKind;
+
+  /// Memory bus address width.
   final int busAddressWidth;
 
-  /// Wishbone data bus width (8, 16, 32 or 64).
+  /// Memory bus data width (8, 16, 32 or 64): the set every native memory
+  /// master port (AXI4, TileLink, Wishbone) and `HarborMemoryWaistConfig`
+  /// accept.
   final int busDataWidth;
 
   /// Depth of the CDC FIFO (power of two). Sized to hold a full DFU
@@ -35,11 +45,22 @@ class UsbDfuRamSink extends BridgeModule {
   UsbDfuRamSink({
     this.loadBase = 0x80000000,
     required this.regionBytes,
+    this.fabricKind = HarborFabricKind.wishbone,
     this.busAddressWidth = 32,
     this.busDataWidth = 32,
     this.fifoDepth = 128,
     String? name,
-  }) : super('UsbDfuRamSink', name: name ?? 'usb_dfu_ram_sink') {
+  }) : super(
+         harborStableDefinitionName('UsbDfuRamSink', [
+           fabricKind.name,
+           'lb$loadBase',
+           'rb$regionBytes',
+           'aw$busAddressWidth',
+           'dw$busDataWidth',
+           'fd$fifoDepth',
+         ]),
+         name: name ?? 'usb_dfu_ram_sink',
+       ) {
     if (![8, 16, 32, 64].contains(busDataWidth)) {
       throw ArgumentError(
         'busDataWidth must be one of [8,16,32,64], got $busDataWidth',
@@ -92,15 +113,6 @@ class UsbDfuRamSink extends BridgeModule {
     );
     final dfu = dfuRef.internalInterface!;
 
-    final busRef = addInterface(
-      WishboneInterface(
-        WishboneConfig(addressWidth: busAddressWidth, dataWidth: busDataWidth),
-      ),
-      name: 'bus',
-      role: PairRole.provider, // master
-    );
-    final bus = busRef.internalInterface!;
-
     addOutput('image_ready');
     addOutput('entry_addr', width: busAddressWidth);
     addOutput('bytes_written', width: 32);
@@ -121,6 +133,20 @@ class UsbDfuRamSink extends BridgeModule {
       input('usb_reset'),
       name: 'bus_join_reset',
     );
+
+    final bus = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'bus',
+      kind: fabricKind,
+      config: HarborMemoryWaistConfig(
+        addressWidth: busAddressWidth,
+        dataWidth: busDataWidth,
+        idWidth: 1,
+        outstanding: 1,
+      ),
+      clk: busClk,
+      reset: busReset,
+    ).waist;
 
     // target == 0 selects RAM. Stable for the whole transfer (the DFU
     // device drives it from alt_setting), so no synchronizer is needed.
@@ -199,28 +225,34 @@ class UsbDfuRamSink extends BridgeModule {
 
     // Bus write FSM (bus domain). Single write at a time, byte granular.
     const stIdle = 0; // FIFO empty / classify the next entry.
-    const stWrite = 1; // driving a Wishbone single write, waiting for ack.
+    const stWrite = 1; // one fabric write access, waiting for its WRESP.
     const stPop = 2; // one-cycle gap for the FWFT head to advance.
     const stClearDrain = 3; // clear requested: discard everything queued.
     const stClearPop = 4; // one-cycle gap while draining.
+
+    // stWrite offers REQ and its one WDATA beat together, then waits for
+    // WRESP before the next access, so a later read would see this write.
+    // wr_sub_q bit 0 is set once REQ is taken, bit 1 once WDATA is taken.
+    const subReq = 0;
 
     final fsm = Logic(name: 'sink_fsm', width: 3);
     final byteOff = Logic(name: 'byte_off', width: 32); // bytes written so far
     // Latched the cycle `clear` crosses in. Consumed (and the drain
     // entered) only once the FSM is back at a safe boundary: immediately
-    // if already idle, or after any write already in flight gets its ack,
-    // never by aborting a Wishbone cycle mid-flight.
+    // if already idle, or after any write already in flight gets its
+    // response, never by aborting a fabric access mid-flight.
     final pendingClearBus = Logic(name: 'pending_clear_bus_q');
 
-    final cycReg = Logic(name: 'cyc_reg');
-    final stbReg = Logic(name: 'stb_reg');
-    final weReg = Logic(name: 'we_reg');
+    final wrSub = Logic(name: 'wr_sub_q', width: 2);
     final adrReg = Logic(name: 'adr_reg', width: busAddressWidth);
     final datReg = Logic(name: 'dat_reg', width: busDataWidth);
     final selReg = Logic(name: 'sel_reg', width: selWidth);
     final rdEnReg = Logic(name: 'rd_en_reg');
     final imageReadyReg = Logic(name: 'image_ready_reg');
-    final errBus = Logic(name: 'err_bus_q'); // sticky address error (parks)
+    final errBus = Logic(name: 'err_bus_q'); // sticky error (parks)
+    // Which sticky error to report: 0 = errADDRESS (out of region), 1 =
+    // errWRITE (a WRESP error from the fabric).
+    final errIsWriteBus = Logic(name: 'err_is_write_bus_q');
     final doneToggleBus = Logic(name: 'done_toggle_bus_q');
     final errToggleBus = Logic(name: 'err_toggle_bus_q');
     final clearAckToggleBus = Logic(name: 'clear_ack_toggle_bus_q');
@@ -256,6 +288,48 @@ class UsbDfuRamSink extends BridgeModule {
       'adr_next',
     );
 
+    final writing = fsm.eq(Const(stWrite, width: 3)).named('bus_writing');
+    // A byte at the FIFO head that idle would write goes out from idle, so
+    // the access starts one cycle before stWrite.
+    final idleWrite =
+        (fsm.eq(Const(stIdle, width: 3)) &
+                ~pendingClearBus &
+                ~fifoEmpty &
+                ~fifoIsEnd &
+                ~errBus &
+                ~outOfRegion)
+            .named('bus_idle_write');
+    final busReqValid = ((writing & ~wrSub[0]) | idleWrite).named(
+      'bus_req_valid',
+    );
+    final busWdataValid = ((writing & ~wrSub[1]) | idleWrite).named(
+      'bus_wdata_valid',
+    );
+    final busRespWait = writing.named('bus_resp_wait');
+    final busReqFire = (busReqValid & bus.reqReady).named('bus_req_fire');
+    final busWdataFire = (busWdataValid & bus.wdataReady).named(
+      'bus_wdata_fire',
+    );
+    final busWrespFire = (busRespWait & bus.wrespValid).named('bus_wresp_fire');
+
+    bus.reqValid <= busReqValid;
+    bus.reqId <= Const(0, width: bus.config.idWidth);
+    bus.reqWrite <= Const(1);
+    bus.reqAddr <= mux(writing, adrReg, adrNext);
+    bus.reqLen <= Const(0, width: HarborMemoryWaistConfig.lenWidth);
+    bus.reqSize <= Const(wordShift, width: HarborMemoryWaistConfig.sizeWidth);
+    bus.reqBurst <=
+        Const(
+          HarborMemoryBurst.incr.value,
+          width: HarborMemoryWaistConfig.burstWidth,
+        );
+    bus.wdataValid <= busWdataValid;
+    bus.wdataData <= mux(writing, datReg, datPlaced);
+    bus.wdataStrb <= mux(writing, selReg, selMask);
+    bus.wdataLast <= Const(1);
+    bus.rdataReady <= Const(0); // never reads
+    bus.wrespReady <= busRespWait;
+
     Sequential(busClk, [
       If(
         busReset,
@@ -266,15 +340,14 @@ class UsbDfuRamSink extends BridgeModule {
           // watchdog then fails to dfuERROR, and the next CLRSTATUS
           // recovers.
           pendingClearBus < Const(0),
-          cycReg < Const(0),
-          stbReg < Const(0),
-          weReg < Const(0),
+          wrSub < Const(subReq, width: 2),
           adrReg < Const(0, width: busAddressWidth),
           datReg < Const(0, width: busDataWidth),
           selReg < Const(0, width: selWidth),
           rdEnReg < Const(0),
           imageReadyReg < Const(0),
           errBus < Const(0),
+          errIsWriteBus < Const(0),
           doneToggleBus < Const(0),
           errToggleBus < Const(0),
           clearAckToggleBus < Const(0),
@@ -316,6 +389,7 @@ class UsbDfuRamSink extends BridgeModule {
                                 outOfRegion & ~errBus,
                                 then: [
                                   errBus < Const(1),
+                                  errIsWriteBus < Const(0),
                                   errToggleBus < ~errToggleBus,
                                 ],
                               ),
@@ -323,12 +397,10 @@ class UsbDfuRamSink extends BridgeModule {
                               fsm < Const(stPop, width: 3),
                             ],
                             orElse: [
-                              cycReg < Const(1),
-                              stbReg < Const(1),
-                              weReg < Const(1),
                               adrReg < adrNext,
                               datReg < datPlaced,
                               selReg < selMask,
+                              wrSub < [busWdataFire, busReqFire].swizzle(),
                               fsm < Const(stWrite, width: 3),
                             ],
                           ),
@@ -340,15 +412,22 @@ class UsbDfuRamSink extends BridgeModule {
               ),
             ]),
             CaseItem(Const(stWrite, width: 3), [
+              wrSub < wrSub | [busWdataFire, busReqFire].swizzle(),
               If(
-                bus.ack,
+                busWrespFire,
                 then: [
-                  cycReg < Const(0),
-                  stbReg < Const(0),
-                  weReg < Const(0),
                   byteOff < byteOff + Const(1, width: 32),
                   rdEnReg < Const(1),
+                  wrSub < Const(subReq, width: 2),
                   fsm < Const(stPop, width: 3),
+                  If(
+                    bus.wrespErr & ~errBus,
+                    then: [
+                      errBus < Const(1),
+                      errIsWriteBus < Const(1),
+                      errToggleBus < ~errToggleBus,
+                    ],
+                  ),
                 ],
               ),
             ]),
@@ -363,6 +442,7 @@ class UsbDfuRamSink extends BridgeModule {
                 orElse: [
                   byteOff < Const(0, width: 32),
                   errBus < Const(0),
+                  errIsWriteBus < Const(0),
                   clearAckToggleBus < ~clearAckToggleBus,
                   fsm < Const(stIdle, width: 3),
                 ],
@@ -375,13 +455,6 @@ class UsbDfuRamSink extends BridgeModule {
         ],
       ),
     ]);
-
-    bus.cyc <= cycReg;
-    bus.stb <= stbReg;
-    bus.we <= weReg;
-    bus.adr <= adrReg;
-    bus.datMosi <= datReg;
-    bus.sel <= selReg;
 
     fifo.input('rd_en').srcConnection! <= rdEnReg;
 
@@ -428,8 +501,20 @@ class UsbDfuRamSink extends BridgeModule {
     final errUsbPulse = (errSync.output('sync_out') ^ errTogglePrevUsb).named(
       'err_usb_pulse',
     );
-    dfu.error <=
-        mux(errUsbPulse, Const(_errAddress, width: 4), Const(0, width: 4));
+    // errIsWriteBus is sticky and set well before the toggle it rides
+    // across with, so one synchronizer reading it is enough: by the time
+    // errUsbPulse fires it has been stable for many cycles.
+    final errIsWriteSync = HarborCdcSync(name: 'err_is_write_sync');
+    addSubModule(errIsWriteSync);
+    errIsWriteSync.input('async_in').srcConnection! <= errIsWriteBus;
+    errIsWriteSync.input('dst_clk').srcConnection! <= usbClk;
+    errIsWriteSync.input('dst_reset').srcConnection! <= usbReset;
+    final errCodeUsb = mux(
+      errIsWriteSync.output('sync_out'),
+      Const(_errWrite, width: 4),
+      Const(_errAddress, width: 4),
+    );
+    dfu.error <= mux(errUsbPulse, errCodeUsb, Const(0, width: 4));
 
     // clearAck: bus -> USB, the mirror image of `clear`. Tells the device
     // the drain above has finished and new DNLOAD data is safe to accept.

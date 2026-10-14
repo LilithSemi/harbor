@@ -19,8 +19,9 @@ void main() {
       eth.port('rx_dv').getsLogic(Const(0));
       eth.port('rxd').getsLogic(Const(0, width: 8));
       eth.port('mdio_in').getsLogic(Const(0));
-      eth.port('dma_rdata').getsLogic(Const(0, width: 32));
-      eth.port('dma_ack').getsLogic(Const(0));
+      eth.port('dma_ACK').getsLogic(Const(0));
+      eth.port('dma_DAT_MISO').getsLogic(Const(0, width: 32));
+      eth.port('dma_ERR').getsLogic(Const(0));
 
       final tb = PeripheralTestBench(eth);
       await tb.init();
@@ -42,8 +43,9 @@ void main() {
       eth.port('rx_dv').getsLogic(Const(0));
       eth.port('rxd').getsLogic(Const(0, width: 8));
       eth.port('mdio_in').getsLogic(Const(0));
-      eth.port('dma_rdata').getsLogic(Const(0, width: 32));
-      eth.port('dma_ack').getsLogic(Const(0));
+      eth.port('dma_ACK').getsLogic(Const(0));
+      eth.port('dma_DAT_MISO').getsLogic(Const(0, width: 32));
+      eth.port('dma_ERR').getsLogic(Const(0));
 
       final tb = PeripheralTestBench(eth);
       await tb.init();
@@ -65,8 +67,9 @@ void main() {
       eth.port('rx_dv').getsLogic(Const(0));
       eth.port('rxd').getsLogic(Const(0, width: 8));
       eth.port('mdio_in').getsLogic(Const(0));
-      eth.port('dma_rdata').getsLogic(Const(0, width: 32));
-      eth.port('dma_ack').getsLogic(Const(0));
+      eth.port('dma_ACK').getsLogic(Const(0));
+      eth.port('dma_DAT_MISO').getsLogic(Const(0, width: 32));
+      eth.port('dma_ERR').getsLogic(Const(0));
 
       final tb = PeripheralTestBench(eth);
       await tb.init();
@@ -88,8 +91,9 @@ void main() {
       eth.port('rx_dv').getsLogic(Const(0));
       eth.port('rxd').getsLogic(Const(0, width: 8));
       eth.port('mdio_in').getsLogic(Const(0));
-      eth.port('dma_rdata').getsLogic(Const(0, width: 32));
-      eth.port('dma_ack').getsLogic(Const(0));
+      eth.port('dma_ACK').getsLogic(Const(0));
+      eth.port('dma_DAT_MISO').getsLogic(Const(0, width: 32));
+      eth.port('dma_ERR').getsLogic(Const(0));
 
       final tb = PeripheralTestBench(eth);
       await tb.init();
@@ -111,8 +115,9 @@ void main() {
       eth.port('rx_dv').getsLogic(Const(0));
       eth.port('rxd').getsLogic(Const(0, width: 8));
       eth.port('mdio_in').getsLogic(Const(0));
-      eth.port('dma_rdata').getsLogic(Const(0, width: 32));
-      eth.port('dma_ack').getsLogic(Const(0));
+      eth.port('dma_ACK').getsLogic(Const(0));
+      eth.port('dma_DAT_MISO').getsLogic(Const(0, width: 32));
+      eth.port('dma_ERR').getsLogic(Const(0));
 
       final tb = PeripheralTestBench(eth);
       await tb.init();

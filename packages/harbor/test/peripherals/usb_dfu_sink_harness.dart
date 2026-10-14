@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:harbor/harbor.dart';
+import 'package:harbor/src/peripherals/memory_waist_beats.dart';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
@@ -11,15 +12,17 @@ import 'usb_test_host.dart';
 // a real UsbDfuRamSink / UsbDfuFlashSink against a behavioral bus-side
 // model, two independent clocks (usb_clk, bus_clk).
 
-/// A minimal behavioral Wishbone B4 slave RAM (consumer/slave role). On a
-/// write cycle it stores the selected byte lanes of `dat_mosi` into a word
-/// array and acks after [ackDelay] extra cycles. Reads are unsupported.
+/// A minimal behavioral memory slave RAM on a memory slave waist of [kind]
+/// (consumer/slave role). On a write beat it stores the selected byte lanes
+/// into a word array and acks after [ackDelay] extra cycles. Reads are
+/// unsupported (always return 0), since no sink under test ever issues one.
 class WishboneMemoryModel extends BridgeModule {
   final int addressWidth;
   final int dataWidth;
   final int loadBase;
   final int words;
   final int ackDelay;
+  final HarborFabricKind kind;
 
   int get bytesPerWord => dataWidth ~/ 8;
 
@@ -41,22 +44,29 @@ class WishboneMemoryModel extends BridgeModule {
     required this.loadBase,
     required this.words,
     this.ackDelay = 0,
+    this.kind = HarborFabricKind.wishbone,
     String? name,
   }) : super('WishboneMemoryModel', name: name ?? 'wb_mem') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
-    final ref = addInterface(
-      WishboneInterface(
-        WishboneConfig(addressWidth: addressWidth, dataWidth: dataWidth),
-      ),
-      name: 'bus',
-      role: PairRole.consumer, // slave
+    final config = HarborMemoryWaistConfig(
+      addressWidth: addressWidth,
+      dataWidth: dataWidth,
+      idWidth: 1,
+      outstanding: 1,
     );
-    final bus = ref.internalInterface!;
-
     final clk = input('clk');
     final reset = input('reset');
+    final port = HarborMemorySlavePort.create(
+      module: this,
+      name: 'bus',
+      kind: kind,
+      config: config,
+      clk: clk,
+      reset: reset,
+    );
+
     final selWidth = dataWidth ~/ 8;
     var wordShift = 0;
     for (var v = bytesPerWord; v > 1; v >>= 1) {
@@ -67,8 +77,17 @@ class WishboneMemoryModel extends BridgeModule {
       for (var i = 0; i < words; i++) Logic(name: 'mem_$i', width: dataWidth),
     ];
 
-    final wrEn = bus.cyc & bus.stb & bus.we;
-    final byteIdx = bus.adr - Const(loadBase, width: addressWidth);
+    final ack = Logic(name: 'storage_ack');
+    final dataOut = Logic(name: 'storage_data_out', width: dataWidth);
+    final beats = HarborMemoryBeats(
+      clk: clk,
+      reset: port.reset,
+      waist: port.waist,
+      ack: ack,
+      dataOut: dataOut,
+    );
+
+    final byteIdx = beats.addr - Const(loadBase, width: addressWidth);
     final wordIdx = bytesPerWord == 1
         ? byteIdx
         : byteIdx.slice(addressWidth - 1, wordShift).zeroExtend(addressWidth);
@@ -81,10 +100,10 @@ class WishboneMemoryModel extends BridgeModule {
       var out = cur;
       for (var lane = 0; lane < selWidth; lane++) {
         final lo = lane * 8;
-        final newByte = bus.datMosi.slice(lo + 7, lo);
+        final newByte = beats.dataIn.slice(lo + 7, lo);
         final keepByte = cur.slice(lo + 7, lo);
         final laneByte = mux(
-          bus.sel.slice(lane, lane).eq(Const(1)),
+          beats.sel.slice(lane, lane).eq(Const(1)),
           newByte,
           keepByte,
         );
@@ -94,8 +113,8 @@ class WishboneMemoryModel extends BridgeModule {
     }
 
     final accept = ackDelay == 0
-        ? (wrEn & ~ackReg)
-        : (wrEn & ~ackReg & waitCnt.eq(Const(ackDelay, width: waitW)));
+        ? (beats.stb & ~ackReg)
+        : (beats.stb & ~ackReg & waitCnt.eq(Const(ackDelay, width: waitW)));
 
     Sequential(clk, [
       If(
@@ -108,12 +127,12 @@ class WishboneMemoryModel extends BridgeModule {
         orElse: [
           ackReg < accept,
           If(
-            ackDelay == 0 ? Const(0) : (wrEn & ~ackReg & ~accept),
+            ackDelay == 0 ? Const(0) : (beats.stb & ~ackReg & ~accept),
             then: [waitCnt < waitCnt + 1],
             orElse: [waitCnt < Const(0, width: waitW)],
           ),
           If(
-            accept,
+            accept & beats.we,
             then: [
               for (var i = 0; i < words; i++)
                 If(
@@ -126,8 +145,8 @@ class WishboneMemoryModel extends BridgeModule {
       ),
     ]);
 
-    bus.ack <= ackReg;
-    bus.datMiso <= Const(0, width: dataWidth);
+    ack <= ackReg;
+    dataOut <= Const(0, width: dataWidth);
   }
 }
 
@@ -373,6 +392,7 @@ class RamSinkHarness extends BridgeModule {
   final int loadBase;
   final int regionBytes;
   final int words;
+  final HarborFabricKind kind;
 
   RamSinkHarness({
     this.loadBase = 0,
@@ -381,6 +401,7 @@ class RamSinkHarness extends BridgeModule {
     int pollTimeoutMs = 10,
     int fifoDepth = 128,
     int ackDelay = 0,
+    this.kind = HarborFabricKind.wishbone,
     int clearWatchdogLimit = HarborUsbDfu.defaultClearWatchdogLimit,
     String? name,
   }) : super('RamSinkHarness', name: name ?? 'ram_sink_h') {
@@ -428,6 +449,7 @@ class RamSinkHarness extends BridgeModule {
       loadBase: loadBase,
       regionBytes: regionBytes,
       fifoDepth: fifoDepth,
+      fabricKind: kind,
     );
     addSubModule(sink);
     sink.input('usb_clk').srcConnection! <= usbClk;
@@ -442,6 +464,7 @@ class RamSinkHarness extends BridgeModule {
       loadBase: loadBase,
       words: words,
       ackDelay: ackDelay,
+      kind: kind,
       name: 'mem',
     );
     addSubModule(mem);
@@ -580,14 +603,16 @@ Future<(RamSinkHarness, UsbTestHost)> buildRamSinkHarness({
   int usbClkPeriod = 10,
   int busClkPeriod = 37,
   int ackDelay = 0,
+  HarborFabricKind kind = HarborFabricKind.wishbone,
   int clearWatchdogLimit = HarborUsbDfu.defaultClearWatchdogLimit,
-  int maxSimTime = 20000000,
+  int maxSimTime = 80000000,
 }) async {
   final dut = RamSinkHarness(
     loadBase: loadBase,
     regionBytes: regionBytes,
     words: words,
     ackDelay: ackDelay,
+    kind: kind,
     clearWatchdogLimit: clearWatchdogLimit,
   );
 
@@ -735,7 +760,7 @@ buildRamSinkHarnessWithBusControl({
   int busClkPeriod = 37,
   int ackDelay = 0,
   int clearWatchdogLimit = HarborUsbDfu.defaultClearWatchdogLimit,
-  int maxSimTime = 20000000,
+  int maxSimTime = 80000000,
 }) async {
   final dut = RamSinkHarness(
     loadBase: loadBase,
@@ -948,7 +973,12 @@ Future<List<int>?> dfuDownload(
     bRequest: dfuReqDnload,
     wValue: block,
   );
-  if (!await host.controlNoData(addr, endSetup)) return null;
+  // A STALL here can be the device correctly rejecting the zero-length
+  // DNLOAD because an error from the last block already latched between
+  // that block's GETSTATUS and this request landing (the error crosses
+  // into dfuState on its own, not tied to a setup packet). Check status
+  // either way instead of treating the STALL itself as a failure.
+  await host.controlNoData(addr, endSetup);
   return _waitNotBusy(host, addr);
 }
 

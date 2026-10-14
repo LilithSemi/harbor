@@ -70,6 +70,9 @@ void main() {
       sdio.port('sd_cmd_in').getsLogic(Const(1));
       sdio.port('sd_dat_in').getsLogic(Const(0, width: 4));
       sdio.port('sd_cd').getsLogic(Const(0));
+      for (final p in sdio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+        sdio.port(p).getsLogic(Const(0, width: sdio.input(p).width));
+      }
       await _absoluteRoundTrip(sdio, 0x10010000, 0x10, 50);
     });
 
@@ -103,8 +106,9 @@ void main() {
       eth.port('rx_dv').getsLogic(Const(0));
       eth.port('rxd').getsLogic(Const(0, width: 8));
       eth.port('mdio_in').getsLogic(Const(0));
-      eth.port('dma_rdata').getsLogic(Const(0, width: 32));
-      eth.port('dma_ack').getsLogic(Const(0));
+      eth.port('dma_ACK').getsLogic(Const(0));
+      eth.port('dma_DAT_MISO').getsLogic(Const(0, width: 32));
+      eth.port('dma_ERR').getsLogic(Const(0));
       await _absoluteRoundTrip(eth, 0x1000B000, 0x10, 0xAABBCCDD);
     });
 

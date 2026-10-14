@@ -4,6 +4,10 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import 'echo_memory.dart';
+
+const _memConfig = HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32);
+
 /// Tests the dual-clock scanout: the pixel domain drives frameStart/lineStart/
 /// col. The system domain bursts lines from a fake memory into the double line
 /// buffer. A req/done toggle handshake crosses the two clocks. Fake memory
@@ -21,8 +25,7 @@ void main() {
     final stride = Logic(name: 'stride', width: 32);
     final words = Logic(name: 'words', width: 16);
 
-    final mDataIn = Logic(name: 'm_dat_i', width: 32);
-    final mAck = Logic(name: 'm_ack');
+    final memory = HarborMemoryWaist(_memConfig);
 
     final so = HarborDualClockScanout(
       pixelClk: pixelClk,
@@ -35,14 +38,13 @@ void main() {
       fbBase: fbBase,
       stride: stride,
       wordsPerLine: words,
-      mDataIn: mDataIn,
-      mAck: mAck,
+      memory: memory,
       maxWords: 4,
     );
-    // Fake memory on the system side: 0-latency ack, data = address.
-    mAck <= so.mStb;
-    mDataIn <= so.mAddr;
+    // Fake memory on the system side: 0-latency, data = address.
+    final echo = EchoMemory(memory, sysClk, sysReset);
     await so.build();
+    await echo.build();
 
     pixelReset.inject(1);
     sysReset.inject(1);
@@ -127,8 +129,7 @@ void main() {
       final fbBase = Logic(name: 'fb_base', width: 32);
       final strideIn = Logic(name: 'stride', width: 32);
       final words = Logic(name: 'words', width: 16);
-      final mDataIn = Logic(name: 'm_dat_i', width: 32);
-      final mAck = Logic(name: 'm_ack');
+      final memory = HarborMemoryWaist(_memConfig);
 
       final so = HarborDualClockScanout(
         pixelClk: pixelClk,
@@ -141,19 +142,19 @@ void main() {
         fbBase: fbBase,
         stride: strideIn,
         wordsPerLine: words,
-        mDataIn: mDataIn,
-        mAck: mAck,
+        memory: memory,
         // The burst length (what this test checks) comes from wordsPerLine,
         // not from the buffer's storage size, so a small buffer keeps
         // elaboration cheap here.
         maxWords: 4,
-        // One bus burst per line, so a line is one unbroken strobe.
-        burstWords: wordsPerLine,
+        // burstWords caps at 256 (the AXI4 beat limit), below wordsPerLine
+        // (400), so a line always takes more than one request.
+        burstWords: 256,
       );
-      // Fake memory: 0-latency ack, data unused (only the burst length matters).
-      mAck <= so.mStb;
-      mDataIn <= so.mAddr;
+      // Fake memory: 0-latency, data unused (only the burst length matters).
+      final echo = EchoMemory(memory, sysClk, sysReset);
       await so.build();
+      await echo.build();
 
       pixelReset.inject(1);
       sysReset.inject(1);
@@ -177,30 +178,34 @@ void main() {
       sysReset.inject(0);
       await pixelClk.nextNegedge;
 
-      // Counts the length of the next contiguous m_stb burst on the system
-      // clock: one word is transferred per cycle it is high. Bounded so a
-      // real regression fails fast instead of hanging.
-      Future<int> burstLength() async {
-        await sysClk.nextNegedge;
-        var waited = 0;
-        while (so.mStb.value.toInt() == 0) {
+      // Beats per waist request for the next line, split on RDATA_LAST
+      // (back-to-back requests can stream with no gap in RDATA_VALID).
+      // Bounded so a real regression fails fast instead of hanging.
+      // burstWords caps a request at 256 beats (the AXI4 limit), and a
+      // request also stops at a 4 KB boundary, so a 400-word line does
+      // not always arrive as a single run.
+      Future<List<int>> lineRuns() async {
+        final runs = <int>[];
+        var got = 0;
+        var run = 0;
+        var guard = 0;
+        while (got < wordsPerLine) {
           await sysClk.nextPosedge;
           await sysClk.nextNegedge;
-          waited++;
-          if (waited > 2 * wordsPerLine) {
-            fail('m_stb never went high waiting for the next burst');
+          guard++;
+          if (guard > 4 * wordsPerLine) {
+            fail('line did not finish after $guard cycles');
+          }
+          if (memory.rdataValid.value == LogicValue.one) {
+            got++;
+            run++;
+            if (memory.rdataLast.value == LogicValue.one) {
+              runs.add(run);
+              run = 0;
+            }
           }
         }
-        var n = 0;
-        while (so.mStb.value.toInt() == 1) {
-          n++;
-          await sysClk.nextPosedge;
-          await sysClk.nextNegedge;
-          if (n > 2 * wordsPerLine) {
-            fail('m_stb never dropped, burst ran past $n words');
-          }
-        }
-        return n;
+        return runs;
       }
 
       // Lets the done handshake cross back into the pixel domain. A
@@ -211,19 +216,30 @@ void main() {
         }
       }
 
+      void checkRuns(List<int> runs, String reason) {
+        expect(
+          runs.fold(0, (a, b) => a + b),
+          equals(wordsPerLine),
+          reason: reason,
+        );
+        for (final r in runs) {
+          expect(r, lessThanOrEqualTo(256), reason: '$reason: run $r');
+        }
+      }
+
       frameStart.inject(1);
       await pixelClk.nextPosedge;
       frameStart.inject(0);
 
       // Priming fetches row 0 then row 1 back-to-back.
-      expect(await burstLength(), equals(wordsPerLine), reason: 'line 0');
-      expect(await burstLength(), equals(wordsPerLine), reason: 'line 1');
+      checkRuns(await lineRuns(), 'line 0');
+      checkRuns(await lineRuns(), 'line 1');
       await settle();
 
       lineStart.inject(1);
       await pixelClk.nextPosedge;
       lineStart.inject(0);
-      expect(await burstLength(), equals(wordsPerLine), reason: 'line 2');
+      checkRuns(await lineRuns(), 'line 2');
     },
   );
 }

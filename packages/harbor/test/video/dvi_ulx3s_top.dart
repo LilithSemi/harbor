@@ -75,8 +75,15 @@ class DviUlx3sTop extends BridgeModule {
       ),
     );
 
-    final mAck = Logic(name: 'm_ack');
-    final mDat = Logic(name: 'm_dat', width: 32);
+    // The fetcher's bus is internal only (the pattern slave below), so it
+    // is a plain waist + Wishbone master pair, not a fabric-facing port.
+    final memWaist = HarborMemoryWaist(
+      const HarborMemoryWaistConfig(
+        addressWidth: 32,
+        dataWidth: 32,
+        outstanding: 4,
+      ),
+    );
     display = HarborDualClockDisplay(
       target: target,
       timing: timing,
@@ -88,18 +95,25 @@ class DviUlx3sTop extends BridgeModule {
       sysReset: sys.reset,
       enable: Const(1),
       fbBase: Const(0x1000, width: 32),
-      mDataIn: mDat,
-      mAck: mAck,
+      memory: memWaist,
+    );
+    final wb = WishboneInterface(harborWishboneMemoryConfig(memWaist.config));
+    HarborWishboneMemoryMaster(
+      clk: sys.clk,
+      reset: sys.reset,
+      waist: memWaist,
+      wb: wb,
     );
     final slave = DviPatternSlave(
       clk: sys.clk,
       reset: sys.reset,
-      cyc: display.mCyc,
-      stb: display.mStb,
-      adr: display.mAddr,
+      cyc: wb.cyc,
+      stb: wb.stb,
+      adr: wb.adr,
     );
-    mAck <= slave.ack;
-    mDat <= slave.datR;
+    wb.ack <= slave.ack;
+    wb.datMiso <= slave.datR;
+    wb.err! <= Const(0);
 
     output('gpdi_dp') <= display.gpdi;
     output('led') <= [Const(0, width: 7), display.underrun].swizzle();

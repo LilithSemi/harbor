@@ -30,7 +30,7 @@ void busTests(HarborFabricKind kind) {
     final reset = Logic(name: 'reset');
     dm.input('clk').srcConnection! <= clk;
     dm.input('reset').srcConnection! <= reset;
-    final bus = RegBus.attach(dm, clk, name: 'sysbus');
+    final bus = RegBus.attach(dm, clk, name: 'bus');
 
     await dm.build();
 
