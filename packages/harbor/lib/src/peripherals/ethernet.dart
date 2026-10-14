@@ -6,6 +6,7 @@ import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../bus/port/memory_port.dart';
 import '../bus/port/memory_waist.dart';
+import '../bus/port/reg_fifo.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -67,6 +68,25 @@ class HarborEthernetConfig with HarborPrettyString {
   /// Whether hardware checksum offload is supported.
   final bool checksumOffload;
 
+  /// Depth, in 32-bit words, of the TX prefetch FIFO that `dTxFeed` fills
+  /// while the framing engine shifts the current word out of `tx_word`.
+  /// `dTxFeed` only ever has one fetch in flight, so depth past 2 does not
+  /// widen the latency this covers: 2 is enough for the fetch of word N+1
+  /// to start the moment word N lands, instead of waiting for word N to
+  /// be read out of the FIFO first. The real limit is the fetch round
+  /// trip itself (measured at wishbone_memory_waist latency L: `L + 5`
+  /// cycles) against the 8 nibble times (10/100 MII) each word gets on
+  /// the wire: once a fetch costs more than 8 cycles, each later word
+  /// arrives a little later than the one before, and a long enough frame
+  /// still runs the FIFO dry. On the first word after the one `dTxLoad`
+  /// already read, the preamble and SFD buy an extra 16 cycles, so a
+  /// frame of up to about 3-4 words tolerates latencies this engine was
+  /// measured against (0, 1 and 8 cycles); latency 20 outruns even that
+  /// head start on the very first fetch. Past that budget, TX finishes
+  /// the frame with a corrupted FCS and a TX_UNDERRUN status bit instead
+  /// of resending old data as good data.
+  final int txPrefetchDepth;
+
   const HarborEthernetConfig({
     this.maxSpeed = HarborEthernetSpeed.speed1000,
     this.phyInterface = HarborEthernetPhyInterface.rgmii,
@@ -75,6 +95,7 @@ class HarborEthernetConfig with HarborPrettyString {
     this.txFifoSize = 2048,
     this.rxFifoSize = 2048,
     this.checksumOffload = false,
+    this.txPrefetchDepth = 2,
   });
 
   @override
@@ -92,6 +113,7 @@ class HarborEthernetConfig with HarborPrettyString {
     buf.writeln('${c}phy: ${phyInterface.name},');
     buf.writeln('${c}txDesc: $txDescriptors, rxDesc: $rxDescriptors,');
     buf.writeln('${c}txFifo: $txFifoSize, rxFifo: $rxFifoSize,');
+    buf.writeln('${c}txPrefetch: $txPrefetchDepth words,');
     if (checksumOffload) buf.writeln('${c}checksum offload,');
     buf.write('$p)');
     return buf.toString();
@@ -288,6 +310,7 @@ class HarborEthernetMac extends BridgeModule
     const tFcs = 3; // 4-byte CRC32 FCS
     const intTxDone = 0x02;
     const intTxReq = 0x04;
+    const intTxUnderrun = 0x20;
 
     final txLenReg = Logic(name: 'tx_len', width: 16);
     final txState = Logic(name: 'tx_state', width: 2);
@@ -303,9 +326,14 @@ class HarborEthernetMac extends BridgeModule
     final crc32 = Logic(name: 'tx_crc32', width: 32);
     final fcsShift = Logic(name: 'tx_fcs_shift', width: 32);
     final txWord = Logic(name: 'tx_word', width: 32);
+    // Set by a PIO write to TX_DATA, so a software-fed word is not
+    // overwritten by a DMA prefetch. DMA never sets this: it feeds
+    // through tx_fifo instead.
     final txWordValid = Logic(name: 'tx_word_valid');
     final txByteInWord = Logic(name: 'tx_byte_in_word', width: 2);
     final txBusy = Logic(name: 'tx_busy');
+    // Sticky once a TX underrun or feed error has corrupted this frame.
+    final txUnderrun = Logic(name: 'tx_underrun');
     final txEnReg = Logic(name: 'tx_en_reg');
     final txClkReg = Logic(name: 'tx_clk_reg');
     final txdReg = Logic(name: 'txd_reg', width: txW);
@@ -321,13 +349,22 @@ class HarborEthernetMac extends BridgeModule
       txBits - Const(txW, width: 4),
     );
     // Next byte of the holding word, selected by the (current) byte index.
+    // At index 3 the word is used up and this reads byte 0 of tx_word.
+    // A DMA word boundary loads the new word straight from tx_fifo
+    // instead of through here (see the tData case), so this branch is
+    // only reached for a PIO refill, already in tx_word, or a stale
+    // tx_word after an underrun.
     final nextPayload = mux(
       txByteInWord.eq(Const(0, width: 2)),
       txWord.getRange(8, 16),
       mux(
         txByteInWord.eq(Const(1, width: 2)),
         txWord.getRange(16, 24),
-        txWord.getRange(24, 32),
+        mux(
+          txByteInWord.eq(Const(2, width: 2)),
+          txWord.getRange(24, 32),
+          txWord.getRange(0, 8),
+        ),
       ),
     );
     // CRC32 including the byte being completed, and the resulting FCS.
@@ -405,6 +442,9 @@ class HarborEthernetMac extends BridgeModule
     // Set by an RX access error. The rest of the frame is dropped.
     final dmaFault = Logic(name: 'eth_dma_fault');
     final dmaSub = Logic(name: 'eth_dma_sub', width: 2);
+    // Payload bytes still to prefetch into tx_fifo, beyond the first word
+    // dTxLoad already read.
+    final txFetchLenCnt = Logic(name: 'eth_tx_fetch_len', width: 16);
     final txDmaPend = Logic(name: 'eth_tx_dma_pend');
     final rxDmaPend = Logic(name: 'eth_rx_dma_pend');
     final rxDmaEn = Logic(name: 'eth_rx_dma_en');
@@ -458,6 +498,30 @@ class HarborEthernetMac extends BridgeModule
     dma.wdataLast <= Const(1);
     dma.rdataReady <= dmaRespWait & ~dmaWeReg;
     dma.wrespReady <= dmaRespWait & dmaWeReg;
+
+    // TX word prefetch. dTxFeed fills this while the framing engine
+    // shifts tx_word out, so the fetch for word N+1 overlaps word N's
+    // time on the wire instead of starting only once word N is used up.
+    final txFetchAck =
+        (dmaState.eq(Const(dTxFeed, width: 4)) & dmaStbReg & dmaAck).named(
+          'eth_tx_fetch_ack',
+        );
+    final txFifoPopReady =
+        (txState.eq(Const(tData, width: 2)) &
+                byteDone &
+                txByteInWord.eq(Const(3, width: 2)) &
+                ~txLenCnt.eq(Const(1, width: 16)) &
+                ~txWordValid)
+            .named('eth_tx_fifo_pop_ready');
+    final txFifo = HarborRegFifo(
+      name: 'eth_tx_fifo',
+      clk: clk,
+      reset: reset,
+      depth: config.txPrefetchDepth,
+      pushValid: txFetchAck,
+      pushData: dmaRdata,
+      popReady: txFifoPopReady,
+    );
 
     // One access at a time: wait for a write's WRESP before the sub-phase
     // returns to idle, so a later read always sees it.
@@ -543,6 +607,8 @@ class HarborEthernetMac extends BridgeModule
           txWord < Const(0, width: 32),
           txWordValid < Const(0),
           txByteInWord < Const(0, width: 2),
+          txUnderrun < Const(0),
+          txFetchLenCnt < Const(0, width: 16),
           txBusy < Const(0),
           txEnReg < Const(0),
           txClkReg < Const(0),
@@ -669,7 +735,13 @@ class HarborEthernetMac extends BridgeModule
                 ],
               ),
             ]),
-            // Payload: emit each byte and fold it into the CRC.
+            // Payload: emit each byte and fold it into the CRC. TX_EN
+            // never drops mid-frame: on MII that would read as the frame
+            // having ended. At a word boundary, a PIO refill in tx_word
+            // or a prefetched word already in tx_fifo continues with no
+            // gap. If neither is there, that is a real underrun: keep
+            // going so the line stays continuous, but corrupt the FCS
+            // and flag it, so the stale bytes are never read as good.
             CaseItem(Const(tData, width: 2), [
               txEnReg < Const(1),
               txdReg < txByte.getRange(0, txW),
@@ -680,7 +752,6 @@ class HarborEthernetMac extends BridgeModule
                 then: [
                   crc32 < crcWithLast,
                   txLenCnt < (txLenCnt - Const(1, width: 16)),
-                  txByteInWord < (txByteInWord + Const(1, width: 2)),
                   If(
                     txLenCnt.eq(Const(1, width: 16)),
                     then: [
@@ -692,14 +763,51 @@ class HarborEthernetMac extends BridgeModule
                       txBits < Const(8, width: 4),
                     ],
                     orElse: [
-                      txByte < nextPayload,
-                      curByte < nextPayload,
-                      txBits < Const(8, width: 4),
                       If(
                         txByteInWord.eq(Const(3, width: 2)),
                         then: [
-                          txWordValid < Const(0),
                           intStatus < (intStatus | Const(intTxReq, width: 8)),
+                          If(
+                            txWordValid,
+                            then: [
+                              // A PIO refill already landed in tx_word.
+                              txWordValid < Const(0),
+                              txByte < nextPayload,
+                              curByte < nextPayload,
+                              txBits < Const(8, width: 4),
+                              txByteInWord <
+                                  (txByteInWord + Const(1, width: 2)),
+                            ],
+                            orElse: [
+                              If(
+                                txFifo.popValid,
+                                then: [
+                                  // Prefetched: continue with no gap.
+                                  txWord < txFifo.popData,
+                                  txByte < txFifo.popData.getRange(0, 8),
+                                  curByte < txFifo.popData.getRange(0, 8),
+                                  txBits < Const(8, width: 4),
+                                  txByteInWord < Const(0, width: 2),
+                                ],
+                                orElse: [
+                                  // Underrun: nothing to read yet.
+                                  txFeedErr < Const(1),
+                                  txUnderrun < Const(1),
+                                  txByte < nextPayload,
+                                  curByte < nextPayload,
+                                  txBits < Const(8, width: 4),
+                                  txByteInWord <
+                                      (txByteInWord + Const(1, width: 2)),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ],
+                        orElse: [
+                          txByte < nextPayload,
+                          curByte < nextPayload,
+                          txBits < Const(8, width: 4),
+                          txByteInWord < (txByteInWord + Const(1, width: 2)),
                         ],
                       ),
                     ],
@@ -721,7 +829,14 @@ class HarborEthernetMac extends BridgeModule
                     then: [
                       txState < Const(tIdle, width: 2),
                       txBusy < Const(0),
-                      intStatus < (intStatus | Const(intTxDone, width: 8)),
+                      intStatus <
+                          (intStatus |
+                              Const(intTxDone, width: 8) |
+                              mux(
+                                txUnderrun,
+                                Const(intTxUnderrun, width: 8),
+                                Const(0, width: 8),
+                              )),
                     ],
                     orElse: [
                       fcsCnt < (fcsCnt - Const(1, width: 3)),
@@ -894,7 +1009,6 @@ class HarborEthernetMac extends BridgeModule
                 dmaAck & ~dmaErrNow,
                 then: [
                   txWord < dmaRdata,
-                  txWordValid < Const(1),
                   dmaCurAddr < (dmaCurAddr + Const(4, width: 32)),
                   dmaStbReg < Const(0),
                   // Start the TX framing engine.
@@ -906,33 +1020,50 @@ class HarborEthernetMac extends BridgeModule
                   crc32 < Const(0xFFFFFFFF, width: 32),
                   txLenCnt < txLenReg,
                   txByteInWord < Const(0, width: 2),
+                  txUnderrun < Const(0),
                   txClkReg < Const(0),
+                  // Bytes still to prefetch into tx_fifo beyond this word.
+                  txFetchLenCnt <
+                      mux(
+                        txLenReg.gt(Const(4, width: 16)),
+                        txLenReg - Const(4, width: 16),
+                        Const(0, width: 16),
+                      ),
                   dmaState < Const(dTxFeed, width: 4),
                 ],
               ),
             ]),
-            // A read that is in flight when the frame ends still finishes
-            // here, before the write-back starts.
+            // Prefetch: keep tx_fifo full while the framing engine shifts
+            // the current word out. A read that is in flight when the
+            // frame ends still finishes here, before the write-back
+            // starts.
             CaseItem(Const(dTxFeed, width: 4), [
               If.block([
                 Iff(dmaStbReg, [
                   If(
                     dmaAck,
                     then: [
-                      txWord < dmaRdata,
-                      txWordValid < Const(1),
                       dmaCurAddr < (dmaCurAddr + Const(4, width: 32)),
                       dmaStbReg < Const(0),
+                      txFetchLenCnt <
+                          mux(
+                            txFetchLenCnt.gt(Const(4, width: 16)),
+                            txFetchLenCnt - Const(4, width: 16),
+                            Const(0, width: 16),
+                          ),
                       If(dmaErrNow, then: [txFeedErr < Const(1)]),
                     ],
                   ),
                 ]),
                 ElseIf(~txBusy, [dmaState < Const(dTxWb, width: 4)]),
-                ElseIf(~txWordValid, [
-                  dmaAddrReg < dmaCurAddr,
-                  dmaWeReg < Const(0),
-                  dmaStbReg < Const(1),
-                ]),
+                ElseIf(
+                  txFetchLenCnt.gt(Const(0, width: 16)) & txFifo.pushReady,
+                  [
+                    dmaAddrReg < dmaCurAddr,
+                    dmaWeReg < Const(0),
+                    dmaStbReg < Const(1),
+                  ],
+                ),
               ]),
             ]),
             CaseItem(Const(dTxWb, width: 4), [
