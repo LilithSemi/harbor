@@ -31,8 +31,9 @@ int harborCdcDepth(int outstanding) {
 /// Crosses a memory waist between the fabric clock and the device clock.
 ///
 /// REQ, WDATA, RDATA and WRESP each go through a [HarborCdcFifo]. The IDs,
-/// lengths and LAST pass unchanged, so the order rules of the waist hold on
-/// both sides. The device side gets write data only after its REQ is taken.
+/// lengths, LAST, REQ_EXCLUSIVE and EXOKAY pass unchanged, so the order
+/// rules and the exclusive results of the waist hold on both sides. The
+/// device side gets write data only after its REQ is taken.
 ///
 /// Either reset resets both halves of every FIFO through [harborCdcJoinReset].
 /// Device logic must reset on `device_reset`. The fabric side keeps its own
@@ -40,7 +41,8 @@ int harborCdcDepth(int outstanding) {
 ///
 /// - With [slave] set, the fabric is the requester. After a device reset, each
 ///   read in flight gets its remaining beats with ERR and data 0, each write
-///   gets WRESP with ERR, and its write data is taken and dropped.
+///   gets WRESP with ERR, and its write data is taken and dropped. These
+///   responses have EXOKAY 0.
 /// - Else the fabric is the responder. After a device reset, each write in
 ///   flight gets its remaining beats with all strobes low, and every
 ///   response in flight is dropped.
@@ -155,10 +157,11 @@ class HarborMemoryWaistCdc extends Module {
       lenW,
       HarborMemoryWaistConfig.sizeWidth,
       HarborMemoryWaistConfig.burstWidth,
+      1,
     ];
     final wdWidths = [dataW, config.strbWidth, 1];
-    final rdWidths = [idW, dataW, 1, 1];
-    final wrWidths = [idW, 1];
+    final rdWidths = [idW, dataW, 1, 1, 1];
+    final wrWidths = [idW, 1, 1];
 
     // A FIFO writes on the fabric side when the fabric sends that way.
     _Fifo fifo(String name, List<int> widths, bool down, Logic dRst) {
@@ -228,6 +231,7 @@ class HarborMemoryWaistCdc extends Module {
           up.reqLen,
           up.reqSize,
           up.reqBurst,
+          up.reqExclusive,
         ]),
       );
 
@@ -240,12 +244,16 @@ class HarborMemoryWaistCdc extends Module {
       );
 
       final [qId, qLen] = harborUnpack(rdQ.popData, [idW, lenW]);
-      final [rId, rData, rErr, rLast] = harborUnpack(rdF.rdData, rdWidths);
+      final [rId, rData, rErr, rLast, rEx] = harborUnpack(
+        rdF.rdData,
+        rdWidths,
+      );
       up.rdataValid <= mux(mode, rdQ.popValid, ~rdF.rdEmpty);
       up.rdataId <= mux(mode, qId, rId);
       up.rdataData <= mux(mode, Const(0, width: dataW), rData);
       up.rdataErr <= mode | rErr;
       up.rdataLast <= mux(mode, rBeat.eq(qLen), rLast);
+      up.rdataExOkay <= ~mode & rEx;
       rdF.pop(up.rdataReady & ~mode);
       final rdFire = up.rdataValid & up.rdataReady;
       rdLastFire <= rdFire & up.rdataLast;
@@ -253,10 +261,11 @@ class HarborMemoryWaistCdc extends Module {
       // A poisoned write gets WRESP only after all its data is taken. The
       // writes that owe data are the newest wOwed entries of wrQ.
       final wrDataDone = wrQ.count.gt(wOwed);
-      final [bId, bErr] = harborUnpack(wrF.rdData, wrWidths);
+      final [bId, bErr, bEx] = harborUnpack(wrF.rdData, wrWidths);
       up.wrespValid <= mux(mode, wrDataDone, ~wrF.rdEmpty);
       up.wrespId <= mux(mode, wrQ.popData, bId);
       up.wrespErr <= mode | bErr;
+      up.wrespExOkay <= ~mode & bEx;
       wrF.pop(up.wrespReady & ~mode);
       wrFire <= up.wrespValid & up.wrespReady;
 
@@ -282,7 +291,7 @@ class HarborMemoryWaistCdc extends Module {
       // A register copy of `d_w_pend != 0`.
       final wOpen = Logic(name: 'd_w_open');
       final open = wOpen & ~dWd;
-      final [id, write, addr, len, size, burst] = harborUnpack(
+      final [id, write, addr, len, size, burst, exclusive] = harborUnpack(
         reqF.rdData,
         reqWidths,
       );
@@ -349,6 +358,7 @@ class HarborMemoryWaistCdc extends Module {
       dn.reqLen <= len;
       dn.reqSize <= size;
       dn.reqBurst <= burst;
+      dn.reqExclusive <= exclusive;
       reqF.pop(rq & can['d_req_valid_r']!);
       dn.wdataValid <=
           out(
@@ -375,7 +385,13 @@ class HarborMemoryWaistCdc extends Module {
           );
       rdF.push(
         dn.rdataValid & can['d_rdata_ready_r']!,
-        harborPack([dn.rdataId, dn.rdataData, dn.rdataErr, dn.rdataLast]),
+        harborPack([
+          dn.rdataId,
+          dn.rdataData,
+          dn.rdataErr,
+          dn.rdataLast,
+          dn.rdataExOkay,
+        ]),
       );
       dn.wrespReady <=
           out(
@@ -385,7 +401,7 @@ class HarborMemoryWaistCdc extends Module {
           );
       wrF.push(
         dn.wrespValid & can['d_wresp_ready_r']!,
-        harborPack([dn.wrespId, dn.wrespErr]),
+        harborPack([dn.wrespId, dn.wrespErr, dn.wrespExOkay]),
       );
       return;
     }
@@ -401,6 +417,7 @@ class HarborMemoryWaistCdc extends Module {
         up.reqLen,
         up.reqSize,
         up.reqBurst,
+        up.reqExclusive,
       ]),
     );
     up.wdataReady <= ~wdF.wrFull & ~dWd;
@@ -408,17 +425,19 @@ class HarborMemoryWaistCdc extends Module {
       up.wdataValid & ~dWd,
       harborPack([up.wdataData, up.wdataStrb, up.wdataLast]),
     );
-    final [rId, rData, rErr, rLast] = harborUnpack(rdF.rdData, rdWidths);
+    final [rId, rData, rErr, rLast, rEx] = harborUnpack(rdF.rdData, rdWidths);
     up.rdataValid <= ~rdF.rdEmpty & ~dRd;
     up.rdataId <= rId;
     up.rdataData <= rData;
     up.rdataErr <= rErr;
     up.rdataLast <= rLast;
+    up.rdataExOkay <= rEx;
     rdF.pop(up.rdataReady & ~dRd);
-    final [bId, bErr] = harborUnpack(wrF.rdData, wrWidths);
+    final [bId, bErr, bEx] = harborUnpack(wrF.rdData, wrWidths);
     up.wrespValid <= ~wrF.rdEmpty & ~dWr;
     up.wrespId <= bId;
     up.wrespErr <= bErr;
+    up.wrespExOkay <= bEx;
     wrF.pop(up.wrespReady & ~dWr);
 
     // Fabric side: the responder. Write data goes out only for a write
@@ -427,7 +446,7 @@ class HarborMemoryWaistCdc extends Module {
     final mode = (recover | fJoinSync).named('fabric_mode_recover');
     final reqFire = Logic(name: 'f_req_fire');
     final wdLastFire = Logic(name: 'f_wdata_last_fire');
-    final [id, write, addr, len, size, burst] = harborUnpack(
+    final [id, write, addr, len, size, burst, exclusive] = harborUnpack(
       reqF.rdData,
       reqWidths,
     );
@@ -452,6 +471,7 @@ class HarborMemoryWaistCdc extends Module {
     dn.reqLen <= len;
     dn.reqSize <= size;
     dn.reqBurst <= burst;
+    dn.reqExclusive <= exclusive;
     reqF.pop(dn.reqReady & reqOpen);
     reqFire <= dn.reqValid & dn.reqReady;
 
@@ -470,12 +490,18 @@ class HarborMemoryWaistCdc extends Module {
     dn.rdataReady <= (mode | ~rdF.wrFull) & nonZero(outR);
     rdF.push(
       dn.rdataValid & dn.rdataReady & ~mode,
-      harborPack([dn.rdataId, dn.rdataData, dn.rdataErr, dn.rdataLast]),
+      harborPack([
+        dn.rdataId,
+        dn.rdataData,
+        dn.rdataErr,
+        dn.rdataLast,
+        dn.rdataExOkay,
+      ]),
     );
     dn.wrespReady <= (mode | ~wrF.wrFull) & nonZero(outW);
     wrF.push(
       dn.wrespValid & dn.wrespReady & ~mode,
-      harborPack([dn.wrespId, dn.wrespErr]),
+      harborPack([dn.wrespId, dn.wrespErr, dn.wrespExOkay]),
     );
     final rDone = dn.rdataValid & dn.rdataReady & dn.rdataLast;
     final bDone = dn.wrespValid & dn.wrespReady;

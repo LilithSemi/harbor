@@ -598,6 +598,7 @@ class HarborDdr3 extends BridgeModule
     m.reqLen <= pick(g, [for (final w in ws) w.reqLen]);
     m.reqSize <= pick(g, [for (final w in ws) w.reqSize]);
     m.reqBurst <= pick(g, [for (final w in ws) w.reqBurst]);
+    m.reqExclusive <= pick(g, [for (final w in ws) w.reqExclusive]);
     m.wdataValid <= ws[0].wdataValid & own[0];
     m.wdataData <= ws[0].wdataData;
     m.wdataStrb <= ws[0].wdataStrb;
@@ -612,16 +613,19 @@ class HarborDdr3 extends BridgeModule
       w.rdataData <= m.rdataData;
       w.rdataErr <= m.rdataErr;
       w.rdataLast <= m.rdataLast;
+      w.rdataExOkay <= m.rdataExOkay;
       if (c == 0) {
         w.wdataReady <= m.wdataReady & own[0];
         w.wrespValid <= m.wrespValid & own[0];
         w.wrespId <= m.wrespId;
         w.wrespErr <= m.wrespErr;
+        w.wrespExOkay <= m.wrespExOkay;
       } else {
         w.wdataReady <= Const(0);
         w.wrespValid <= Const(0);
         w.wrespId <= Const(0, width: w.config.idWidth);
         w.wrespErr <= Const(0);
+        w.wrespExOkay <= Const(0);
       }
     }
     final done =

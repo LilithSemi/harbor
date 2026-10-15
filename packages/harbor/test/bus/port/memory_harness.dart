@@ -149,10 +149,12 @@ class MemSlaveCombShell extends BridgeModule {
             ? w.reqAddr.getRange(0, dataW)
             : w.reqAddr.zeroExtend(dataW));
     w.rdataErr <= Const(0);
+    w.rdataExOkay <= Const(0);
     w.rdataLast <= Const(1);
     w.wrespValid <= w.reqValid & w.reqWrite;
     w.wrespId <= w.reqId;
     w.wrespErr <= Const(0);
+    w.wrespExOkay <= Const(0);
   }
 }
 

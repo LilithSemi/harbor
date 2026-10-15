@@ -62,10 +62,54 @@ class HarborMemoryWaistConfig {
 /// The memory waist: valid/ready channels for bursts and many requests in
 /// flight, independent of the fabric kind.
 ///
-/// - req: ID, WRITE, ADDR, LEN (beats minus one, up to 255), SIZE, BURST.
+/// - req: ID, WRITE, ADDR, LEN (beats minus one, up to 255), SIZE, BURST,
+///   EXCLUSIVE.
 /// - wdata: DATA, STRB, LAST. Write data follows write requests in order.
-/// - rdata: ID, DATA, ERR, LAST.
-/// - wresp: ID, ERR.
+/// - rdata: ID, DATA, ERR, LAST, EXOKAY.
+/// - wresp: ID, ERR, EXOKAY.
+///
+/// REQ_EXCLUSIVE high makes the request an AXI4 exclusive access. EXOKAY has
+/// the same value on every beat of a read.
+///
+/// A device makes an exclusive pair (an exclusive read, then an exclusive
+/// write to the same bytes) only by these rules:
+///
+/// - The read and the write use the same REQ_ID.
+/// - That ID has a reservation slot in the monitor. On a fabric, these are
+///   the low IDs 0 to N-1 of the master, where N comes from its
+///   `exclusiveIds` (with `HarborExclusive.auto`, N can be less than the ID
+///   count).
+/// - The bytes of the access are a power of two, at most the reservation
+///   granule and at most 128, and the address is aligned to them. LEN is at
+///   most 15 (16 beats).
+///
+/// On a response:
+///
+/// - ERR 1 is a bus error. EXOKAY is 0.
+/// - ERR 0 and EXOKAY 1: the exclusive access passed. After a read, the
+///   reservation is set. After a write, memory changed.
+/// - ERR 0 and EXOKAY 0 after an exclusive read: the path has no exclusive
+///   support for this access. Do not send the exclusive write.
+/// - ERR 0 and EXOKAY 0 after an exclusive write, when the read of the pair
+///   got EXOKAY 1 and the pair keeps the rules: the reservation was lost and
+///   memory did not change. The device can try the pair again.
+///
+/// When a device breaks the rules, EXOKAY 0 does not tell it that memory
+/// did not change. An exclusive access on an ID with no slot is a normal
+/// access: the write changes memory and gets OKAY. An access that breaks
+/// the size rules is a normal read, or a write that is dropped with OKAY.
+///
+/// A plain access always gets EXOKAY 0. Only an AXI4 master port does
+/// exclusive access. A Wishbone or TileLink master port does an exclusive
+/// request as a plain access with EXOKAY 0, so an exclusive write there
+/// changes memory. A device must check EXOKAY of the exclusive read before
+/// it sends the write.
+///
+/// A slave adapter answers exclusive access itself. It ignores the EXOKAY
+/// that the memory device drives, so a device drives 0. REQ_EXCLUSIVE on a
+/// slave waist is AXI4 LOCK when the port has an exclusive monitor, else 0.
+/// It is a hint only: it is also high for an access the monitor treats as
+/// normal or drops. The device can ignore it.
 ///
 /// A slave waist (the memory device side) returns responses in acceptance
 /// order per direction. That order is still legal AXI4 order per ID.
@@ -123,6 +167,7 @@ class HarborMemoryWaist extends PairInterface {
   Logic get reqLen => port('REQ_LEN');
   Logic get reqSize => port('REQ_SIZE');
   Logic get reqBurst => port('REQ_BURST');
+  Logic get reqExclusive => port('REQ_EXCLUSIVE');
 
   Logic get wdataValid => port('WDATA_VALID');
   Logic get wdataReady => port('WDATA_READY');
@@ -136,11 +181,13 @@ class HarborMemoryWaist extends PairInterface {
   Logic get rdataData => port('RDATA_DATA');
   Logic get rdataErr => port('RDATA_ERR');
   Logic get rdataLast => port('RDATA_LAST');
+  Logic get rdataExOkay => port('RDATA_EXOKAY');
 
   Logic get wrespValid => port('WRESP_VALID');
   Logic get wrespReady => port('WRESP_READY');
   Logic get wrespId => port('WRESP_ID');
   Logic get wrespErr => port('WRESP_ERR');
+  Logic get wrespExOkay => port('WRESP_EXOKAY');
 
   HarborMemoryWaist(this.config)
     : super(
@@ -152,6 +199,7 @@ class HarborMemoryWaist extends PairInterface {
           Logic.port('REQ_LEN', HarborMemoryWaistConfig.lenWidth),
           Logic.port('REQ_SIZE', HarborMemoryWaistConfig.sizeWidth),
           Logic.port('REQ_BURST', HarborMemoryWaistConfig.burstWidth),
+          Logic.port('REQ_EXCLUSIVE'),
           Logic.port('WDATA_VALID'),
           Logic.port('WDATA_DATA', config.dataWidth),
           Logic.port('WDATA_STRB', config.strbWidth),
@@ -167,9 +215,11 @@ class HarborMemoryWaist extends PairInterface {
           Logic.port('RDATA_DATA', config.dataWidth),
           Logic.port('RDATA_ERR'),
           Logic.port('RDATA_LAST'),
+          Logic.port('RDATA_EXOKAY'),
           Logic.port('WRESP_VALID'),
           Logic.port('WRESP_ID', config.idWidth),
           Logic.port('WRESP_ERR'),
+          Logic.port('WRESP_EXOKAY'),
         ],
       ) {
     final errors = config.validate();

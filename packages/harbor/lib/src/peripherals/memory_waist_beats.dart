@@ -114,10 +114,12 @@ class HarborMemoryBeats {
     w.rdataId <= id;
     w.rdataData <= rData;
     w.rdataErr <= Const(0);
+    w.rdataExOkay <= Const(0);
     w.rdataLast <= rLast;
     w.wrespValid <= bValid;
     w.wrespId <= id;
     w.wrespErr <= Const(0);
+    w.wrespExOkay <= Const(0);
 
     Sequential(clk, [
       If(

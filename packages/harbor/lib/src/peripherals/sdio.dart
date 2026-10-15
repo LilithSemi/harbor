@@ -919,6 +919,7 @@ class HarborSdioController extends BridgeModule
     mw.reqLen <= reqLen;
     mw.reqSize <= reqSize;
     mw.reqBurst <= Const(HarborMemoryBurst.incr.value, width: 2);
+    mw.reqExclusive <= Const(0);
     mw.wdataValid <= wActive;
     mw.wdataLast <= wLeft.eq(Const(0, width: 8));
     if (dmaDataWidth == 32) {

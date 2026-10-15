@@ -261,6 +261,7 @@ class HarborSpiController extends BridgeModule
             HarborMemoryBurst.incr.value,
             width: HarborMemoryWaistConfig.burstWidth,
           );
+      mem.reqExclusive <= Const(0);
       mem.wdataValid <= (writeActive & ~wSent);
       mem.wdataData <= dmaWord;
       mem.wdataStrb <= Const((1 << wordBytes) - 1, width: mem.config.strbWidth);

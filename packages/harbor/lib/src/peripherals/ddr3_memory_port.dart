@@ -322,6 +322,7 @@ class Ddr3MemoryPort extends Module {
       w.rdataData <= out.popData;
       w.rdataId <= rId;
       w.rdataErr <= Const(0);
+      w.rdataExOkay <= Const(0);
       w.rdataLast <= rLastBeat;
 
       final aIdx = aP.getRange(0, rbW);
@@ -423,6 +424,7 @@ class Ddr3MemoryPort extends Module {
         w.wrespValid <= Const(0);
         w.wrespId <= Const(0, width: idW);
         w.wrespErr <= Const(0);
+        w.wrespExOkay <= Const(0);
       }
       w.reqReady <= ~clr & reqRoom.reduce((a, b) => a & b);
     }
@@ -612,6 +614,7 @@ class Ddr3MemoryPort extends Module {
     w.wrespValid <= wrespCnt.neq(0);
     w.wrespId <= wrId.data;
     w.wrespErr <= Const(0);
+    w.wrespExOkay <= Const(0);
 
     Sequential(clk, [
       // The data resets so a masked lane never carries X to the pins.

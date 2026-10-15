@@ -65,10 +65,12 @@ class _ErrorTarget extends BridgeModule {
     w.rdataId <= id;
     w.rdataData <= Const(0, width: config.dataWidth);
     w.rdataErr <= err;
+    w.rdataExOkay <= Const(0);
     w.rdataLast <= Const(1);
     w.wrespValid <= bValid;
     w.wrespId <= id;
     w.wrespErr <= err;
+    w.wrespExOkay <= Const(0);
 
     Sequential(clk, [
       If(

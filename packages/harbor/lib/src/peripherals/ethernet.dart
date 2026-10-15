@@ -492,6 +492,7 @@ class HarborEthernetMac extends BridgeModule
           HarborMemoryBurst.incr.value,
           width: HarborMemoryWaistConfig.burstWidth,
         );
+    dma.reqExclusive <= Const(0);
     dma.wdataValid <= dmaWdataValid;
     dma.wdataData <= dmaWdataReg;
     dma.wdataStrb <= Const(0xF, width: dma.config.strbWidth);

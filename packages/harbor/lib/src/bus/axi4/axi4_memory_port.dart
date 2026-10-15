@@ -48,6 +48,10 @@ Logic _counter(String name, int max) => Logic(name: name, width: max.bitLength);
 /// write reaches the memory with all strobes low and gets OKAY.
 /// [deviceAddressWidth] is the number of low address bits the memory
 /// decodes. The monitor keys on them, so it sees aliases as one address.
+///
+/// REQ_EXCLUSIVE is LOCK with a monitor, else 0. It is a hint only: it is
+/// also high for an access the monitor treats as normal or drops. The port
+/// ignores RDATA_EXOKAY and WRESP_EXOKAY from the memory.
 class HarborAxi4MemorySlave extends Module {
   /// Depth of the W FIFO, which is the most W beats taken before their AW.
   static const int wBuffer = 2;
@@ -177,7 +181,7 @@ class HarborAxi4MemorySlave extends Module {
     pickWrite <= mux(held, heldWrite, awHead & (~arHead | ~lastWrite));
     final canIssue = inflight.lt(Const(n, width: inflight.width));
     final head = mux(pickWrite, awF.popData, arF.popData);
-    final [id, addr, len, size, burst, illegal, ...] = harborUnpack(
+    final [id, addr, len, size, burst, illegal, ...headLock] = harborUnpack(
       head,
       reqWidths,
     );
@@ -194,6 +198,7 @@ class HarborAxi4MemorySlave extends Module {
           Const(HarborMemoryBurst.fixed.value, width: burstW),
           burst,
         );
+    m.reqExclusive <= (ex ? headLock.first : Const(0));
     reqFire <= m.reqValid & m.reqReady;
 
     HarborAxi4ExclusiveMonitor? mon;
@@ -427,7 +432,8 @@ class HarborAxi4MemorySlave extends Module {
 /// Built like the read side of [HarborAxi4MemorySlave]: AR goes into a 2
 /// entry FIFO, R comes back through a 2 entry FIFO, and up to `outstanding`
 /// reads are in flight. The waist's write side is never used: REQ_WRITE is
-/// always 0, WDATA_VALID is always 0, and WRESP_READY stays high.
+/// always 0, WDATA_VALID is always 0, and WRESP_READY stays high. LOCK is
+/// ignored and REQ_EXCLUSIVE is always 0.
 class HarborAxi4MemorySlaveReadOnly extends Module {
   HarborAxi4MemorySlaveReadOnly({
     required Logic clk,
@@ -503,6 +509,7 @@ class HarborAxi4MemorySlaveReadOnly extends Module {
     m.reqValid <= canIssue & arF.popValid;
     m.reqId <= id;
     m.reqWrite <= Const(0);
+    m.reqExclusive <= Const(0);
     m.reqAddr <= addr;
     m.reqLen <= len;
     m.reqSize <= mux(illegal, Const(busSize, width: sizeW), size);
@@ -586,6 +593,12 @@ class HarborAxi4MemorySlaveReadOnly extends Module {
 /// and different IDs may come back in any order. AXI4 already keeps order
 /// per ID, so AW and AR go out as soon as their FIFO and the outstanding
 /// limit allow, with no extra guard.
+///
+/// REQ_EXCLUSIVE is AWLOCK or ARLOCK of its request. RDATA_EXOKAY and
+/// WRESP_EXOKAY are high when RRESP or BRESP is EXOKAY. The port does not
+/// check the exclusive pair rules of [HarborMemoryWaist]. The device keeps
+/// them, and uses only the IDs that get a slot from the fabric master's
+/// `exclusiveIds`.
 class HarborAxi4MemoryMaster extends Module {
   HarborAxi4MemoryMaster({
     required Logic clk,
@@ -616,7 +629,7 @@ class HarborAxi4MemoryMaster extends Module {
     const lenW = Axi4Interface.lenWidth;
     const sizeW = Axi4Interface.sizeWidth;
     const burstW = Axi4Interface.burstWidth;
-    final reqWidths = [idW, addrW, lenW, sizeW, burstW];
+    final reqWidths = [idW, addrW, lenW, sizeW, burstW, 1];
 
     final inflight = _counter('inflight', n);
     final reqFire = Logic(name: 'req_fire');
@@ -626,6 +639,7 @@ class HarborAxi4MemoryMaster extends Module {
       m.reqLen,
       m.reqSize,
       m.reqBurst,
+      m.reqExclusive,
     ]);
     final awFire = Logic(name: 'aw_fire');
     final arFire = Logic(name: 'ar_fire');
@@ -658,7 +672,7 @@ class HarborAxi4MemoryMaster extends Module {
             arF.pushReady;
     reqFire <= m.reqValid & m.reqReady;
 
-    final [awId, awAddr, awLen, awSize, awBurst] = harborUnpack(
+    final [awId, awAddr, awLen, awSize, awBurst, awLock] = harborUnpack(
       awF.popData,
       reqWidths,
     );
@@ -668,9 +682,10 @@ class HarborAxi4MemoryMaster extends Module {
     a.awLen <= awLen;
     a.awSize <= awSize;
     a.awBurst <= awBurst;
+    a.awLock <= awLock;
     awFire <= a.awValid & a.awReady;
 
-    final [arId, arAddr, arLen, arSize, arBurst] = harborUnpack(
+    final [arId, arAddr, arLen, arSize, arBurst, arLock] = harborUnpack(
       arF.popData,
       reqWidths,
     );
@@ -680,10 +695,10 @@ class HarborAxi4MemoryMaster extends Module {
     a.arLen <= arLen;
     a.arSize <= arSize;
     a.arBurst <= arBurst;
+    a.arLock <= arLock;
     arFire <= a.arValid & a.arReady;
 
     for (final p in ['AW', 'AR']) {
-      a.port('${p}LOCK') <= Const(0);
       a.port('${p}CACHE') <= Const(0, width: Axi4Interface.cacheWidth);
       a.port('${p}PROT') <= Const(0, width: Axi4Interface.protWidth);
       a.port('${p}QOS') <= Const(0, width: Axi4Interface.qosWidth);
@@ -709,20 +724,23 @@ class HarborAxi4MemoryMaster extends Module {
     a.wLast <= wLast;
 
     // SLVERR and DECERR both have bit 1 set.
+    Logic exOkay(Logic resp) =>
+        resp.eq(Const(Axi4RespField.exOkay.value, width: resp.width));
     final bF = HarborRegFifo(
       name: 'b',
       clk: c,
       reset: r,
       depth: 2,
       pushValid: a.bValid,
-      pushData: harborPack([a.bId, a.bResp[1]]),
+      pushData: harborPack([a.bId, a.bResp[1], exOkay(a.bResp)]),
       popReady: m.wrespReady,
     );
     a.bReady <= bF.pushReady;
-    final [bId, bErr] = harborUnpack(bF.popData, [idW, 1]);
+    final [bId, bErr, bEx] = harborUnpack(bF.popData, [idW, 1, 1]);
     m.wrespValid <= bF.popValid;
     m.wrespId <= bId;
     m.wrespErr <= bErr;
+    m.wrespExOkay <= bEx;
 
     final rF = HarborRegFifo(
       name: 'r',
@@ -730,13 +748,20 @@ class HarborAxi4MemoryMaster extends Module {
       reset: r,
       depth: 2,
       pushValid: a.rValid,
-      pushData: harborPack([a.rId, a.rData, a.rResp[1], a.rLast]),
+      pushData: harborPack([
+        a.rId,
+        a.rData,
+        a.rResp[1],
+        a.rLast,
+        exOkay(a.rResp),
+      ]),
       popReady: m.rdataReady,
     );
     a.rReady <= rF.pushReady;
-    final [rId, rData, rErr, rLast] = harborUnpack(rF.popData, [
+    final [rId, rData, rErr, rLast, rEx] = harborUnpack(rF.popData, [
       idW,
       dataW,
+      1,
       1,
       1,
     ]);
@@ -745,6 +770,7 @@ class HarborAxi4MemoryMaster extends Module {
     m.rdataData <= rData;
     m.rdataErr <= rErr;
     m.rdataLast <= rLast;
+    m.rdataExOkay <= rEx;
 
     final done = [
       m.rdataValid & m.rdataReady & m.rdataLast,

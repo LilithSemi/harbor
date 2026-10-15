@@ -38,6 +38,7 @@ class EchoMemory extends Module {
     m.wrespValid <= Const(0);
     m.wrespId <= Const(0, width: idW);
     m.wrespErr <= Const(0);
+    m.wrespExOkay <= Const(0);
 
     final curAddr = mux(reqFire, m.reqAddr, addr).named('cur_addr');
     final curId = mux(reqFire, m.reqId, id).named('cur_id');
@@ -62,6 +63,7 @@ class EchoMemory extends Module {
     m.rdataId <= curId;
     m.rdataData <= dataOf(curAddr);
     m.rdataErr <= Const(0);
+    m.rdataExOkay <= Const(0);
     m.rdataLast <= curBeat.eq(curLen);
 
     Sequential(clk, reset: reset, [

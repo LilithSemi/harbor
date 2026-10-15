@@ -181,6 +181,7 @@ class HarborWishboneMemorySlave extends Module {
     m.reqLen <= qLen;
     m.reqSize <= Const(beatLog2, width: sizeW);
     m.reqBurst <= Const(HarborMemoryBurst.incr.value, width: burstW);
+    m.reqExclusive <= Const(0);
     final reqFire = m.reqValid & m.reqReady;
 
     // Write beats, then pad beats with no strobes once the master is done.
@@ -315,6 +316,11 @@ class HarborWishboneMemorySlave extends Module {
 ///   of the request itself with err set: read beats of zero, and write data
 ///   taken and dropped.
 /// - Responses carry the waist ID of their request.
+///
+/// The port has no exclusive access. A request with REQ_EXCLUSIVE runs as a
+/// plain access and gets RDATA_EXOKAY and WRESP_EXOKAY 0. So an exclusive
+/// write changes memory: a device must check EXOKAY of the exclusive read
+/// first.
 class HarborWishboneMemoryMaster extends Module {
   HarborWishboneMemoryMaster({
     required Logic clk,
@@ -476,6 +482,8 @@ void _buildWishboneMemoryMasterFast(
   m.wrespValid <= (cWrite & freshResult) | (pendValid & cWrite);
   m.wrespId <= cId;
   m.wrespErr <= mux(pendValid, pendErr, resultErr);
+  m.rdataExOkay <= Const(0);
+  m.wrespExOkay <= Const(0);
 
   // Next beat address, same rule as the queued path below.
   final ww = max(addrW, 16);
@@ -733,6 +741,8 @@ void _buildWishboneMemoryMasterQueued(
   m.wrespValid <= bF.popValid;
   m.wrespId <= bId;
   m.wrespErr <= bErr;
+  m.rdataExOkay <= Const(0);
+  m.wrespExOkay <= Const(0);
 
   Sequential(c, reset: r, [
     gap < Const(0),

@@ -323,6 +323,7 @@ class UsbDfuRamSink extends BridgeModule {
           HarborMemoryBurst.incr.value,
           width: HarborMemoryWaistConfig.burstWidth,
         );
+    bus.reqExclusive <= Const(0);
     bus.wdataValid <= busWdataValid;
     bus.wdataData <= mux(writing, datReg, datPlaced);
     bus.wdataStrb <= mux(writing, selReg, selMask);

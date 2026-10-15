@@ -230,6 +230,7 @@ class HarborTileLinkMemorySlave extends Module {
     m.reqLen <= qLen;
     m.reqSize <= qSize;
     m.reqBurst <= Const(HarborMemoryBurst.incr.value, width: burstW);
+    m.reqExclusive <= Const(0);
     final reqFire = m.reqValid & m.reqReady;
 
     // Write data. A beat reaches the waist only while a taken write still
@@ -477,6 +478,11 @@ class HarborTileLinkMemorySlave extends Module {
 ///   Other writes are PutPartialData.
 /// - Read beats and write responses go back tagged with their ID. err is
 ///   d_denied or d_corrupt. Different IDs may come back in any order.
+///
+/// The port has no exclusive access. A request with REQ_EXCLUSIVE runs as a
+/// plain access and gets RDATA_EXOKAY and WRESP_EXOKAY 0. So an exclusive
+/// write changes memory: a device must check EXOKAY of the exclusive read
+/// first.
 class HarborTileLinkMemoryMaster extends Module {
   HarborTileLinkMemoryMaster({
     required Logic clk,
@@ -724,6 +730,8 @@ class HarborTileLinkMemoryMaster extends Module {
     m.wrespValid <= dIn.popValid & isAck & (~piece | pieceLast);
     m.wrespId <= dSrc;
     m.wrespErr <= dErr | (piece & cErr);
+    m.rdataExOkay <= Const(0);
+    m.wrespExOkay <= Const(0);
     dPop <=
         dIn.popValid &
             mux(

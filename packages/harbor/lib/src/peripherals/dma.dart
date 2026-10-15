@@ -405,6 +405,7 @@ class HarborDmaController extends BridgeModule
           HarborMemoryBurst.incr.value,
           width: HarborMemoryWaistConfig.burstWidth,
         );
+    mem.reqExclusive <= Const(0);
 
     mem.wdataValid <= (writeActive & ~wSent);
     mem.wdataData <= readData;

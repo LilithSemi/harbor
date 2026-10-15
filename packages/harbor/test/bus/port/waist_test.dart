@@ -48,6 +48,7 @@ void main() {
         'REQ_LEN',
         'REQ_SIZE',
         'REQ_BURST',
+        'REQ_EXCLUSIVE',
         'WDATA_VALID',
         'WDATA_DATA',
         'WDATA_STRB',
@@ -63,9 +64,11 @@ void main() {
         'RDATA_DATA',
         'RDATA_ERR',
         'RDATA_LAST',
+        'RDATA_EXOKAY',
         'WRESP_VALID',
         'WRESP_ID',
         'WRESP_ERR',
+        'WRESP_EXOKAY',
       ]);
       expect(w.reqLen.width, 8);
       expect(w.wdataStrb.width, 16);

@@ -223,6 +223,13 @@ class HarborMemorySlavePort {
 /// one carries its ID, and different IDs may come back in any order. Read
 /// beats of different IDs may interleave with each other beat by beat,
 /// mid-burst.
+///
+/// On AXI4 the device can do exclusive access with REQ_EXCLUSIVE. Add the
+/// port to a fabric with `exclusiveIds`. Only the low IDs 0 to N-1 get a
+/// reservation slot. An exclusive pair must use one of these IDs for both
+/// accesses and keep the size rules in [HarborMemoryWaist]. Else an
+/// exclusive write can change memory and still get EXOKAY 0. On Wishbone
+/// and TileLink an exclusive request is a plain access with EXOKAY 0.
 class HarborMemoryMasterPort {
   /// The waist the device drives as the provider.
   final HarborMemoryWaist waist;

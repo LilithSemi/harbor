@@ -224,6 +224,7 @@ class WaistLineFetcher extends Module {
     m.reqLen <= len;
     m.reqSize <= Const(2, width: 3);
     m.reqBurst <= Const(HarborMemoryBurst.incr.value, width: 2);
+    m.reqExclusive <= Const(0);
     m.wdataValid <= Const(0);
     m.wdataData <= Const(0, width: 32);
     m.wdataStrb <= Const(0, width: 4);

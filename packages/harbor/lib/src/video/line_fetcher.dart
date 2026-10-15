@@ -158,6 +158,7 @@ class HarborLineFetcher extends Module {
     m.reqLen <= mux(first, (firstBeats - 1).getRange(0, lenW), len);
     m.reqSize <= Const(2, width: sizeW);
     m.reqBurst <= Const(HarborMemoryBurst.incr.value, width: burstW);
+    m.reqExclusive <= Const(0);
 
     // Never writes.
     m.wdataValid <= Const(0);

@@ -316,6 +316,7 @@ class SdramMemoryPort extends Module {
     w.wrespValid <= (clrNext == null ? wrespCnt.neq(0) : wrespValidR);
     w.wrespId <= widQ.data;
     w.wrespErr <= Const(0);
+    w.wrespExOkay <= Const(0);
 
     // --- splitter ---
     final sWrite = Logic(name: 's_write');
@@ -462,6 +463,7 @@ class SdramMemoryPort extends Module {
       rdataFire = rdRegs.popFire;
     }
     w.rdataErr <= Const(0);
+    w.rdataExOkay <= Const(0);
     rdQPop <= rdataFire & rLast;
     rdQPopLocal <= w.rdataValid & rLast;
 

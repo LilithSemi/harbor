@@ -56,11 +56,13 @@ class _AlwaysErrSlave extends BridgeModule {
     w.rdataId <= Const(0, width: config.idWidth);
     w.rdataData <= Const(0, width: config.dataWidth);
     w.rdataErr <= Const(1);
+    w.rdataExOkay <= Const(0);
     w.rdataLast <= Const(1);
     final rdataFire = w.rdataValid & w.rdataReady;
     w.wrespValid <= (busy & isWrite & gotData);
     w.wrespId <= Const(0, width: config.idWidth);
     w.wrespErr <= Const(1);
+    w.wrespExOkay <= Const(0);
     final wrespFire = w.wrespValid & w.wrespReady;
 
     Sequential(clk, [
