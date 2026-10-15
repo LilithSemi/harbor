@@ -35,7 +35,10 @@ import 'sdram_port.dart';
 /// requests and responses of the waist, but the write words of a request
 /// already sent to the port still go out, so no sdram write is torn.
 /// `clear` must be `reset | abort`. The front end uses only `reset` and
-/// `clear`, so a build can drive each from one flop.
+/// `clear`, so a build can drive each from one flop. A build can give
+/// [clearNext], the value `clear` has one cycle later, in place of `clear`.
+/// The port then makes `clear` with its own flop, and every waist output is
+/// a flop, so the waist can cross a long distance.
 class SdramMemoryPort extends Module {
   /// Largest sdram request, in 16-bit words.
   static const maxWords = 8;
@@ -51,6 +54,7 @@ class SdramMemoryPort extends Module {
     required Logic reset,
     required Logic abort,
     Logic? clear,
+    Logic? clearNext,
     required HarborMemoryWaist waist,
     required SdramPortInterface port,
     Logic? writeTaken,
@@ -90,7 +94,15 @@ class SdramMemoryPort extends Module {
     final clearSrc = clear ?? (reset | abort);
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
-    final clr = addInput('clear', clearSrc);
+    final Logic clr;
+    Logic? clrNext;
+    if (clearNext != null) {
+      clrNext = addInput('clear_next', clearNext);
+      clr = Logic(name: 'clear');
+      Sequential(clk, [clr < clrNext]);
+    } else {
+      clr = addInput('clear', clearSrc);
+    }
     if (writeTaken != null) writeTaken = addInput('wr_taken', writeTaken);
 
     final w = waist.clone()
@@ -111,6 +123,21 @@ class SdramMemoryPort extends Module {
     final idW = cfg.idWidth;
     final n = cfg.outstanding;
 
+    // The nets from the other end of the waist. Queue flags make their next
+    // values for each value of these nets ahead, so they select last.
+    final far = [
+      w.reqValid,
+      w.reqWrite,
+      w.wdataValid,
+      w.wdataLast,
+      w.rdataReady,
+      w.wrespReady,
+    ];
+    const fRv = 0, fRw = 1, fWv = 2, fWl = 3, fRr = 4, fBr = 5;
+    Logic ahead(Logic Function(_Far b) f) => _ahead(far, f);
+    Logic on(bool x, Logic y) => x ? y : Const(0, width: y.width);
+    final rdQPopLocal = Logic(name: 'rd_q_pop_local');
+
     // --- requests in ---
     final load = Logic(name: 'load');
     final rdQPop = Logic(name: 'rd_q_pop');
@@ -125,6 +152,9 @@ class SdramMemoryPort extends Module {
       reqFire & ~w.reqWrite,
       [w.reqId, w.reqLen].rswizzle(),
       rdQPop,
+      ahead: ahead,
+      pushOf: (b) => on(b[fRv] && !b[fRw], w.reqReady),
+      popOf: (b) => on(b[fRr], rdQPopLocal),
     );
     final widQ = _Queue(
       'wid_q',
@@ -134,6 +164,10 @@ class SdramMemoryPort extends Module {
       reqFire & w.reqWrite,
       w.reqId,
       widQPop,
+      headRegister: clearNext != null,
+      ahead: ahead,
+      pushOf: (b) => on(b[fRv] && b[fRw], w.reqReady),
+      popOf: (b) => on(b[fBr], w.wrespValid),
     );
     final oor = aw > memAW ? w.reqAddr.getRange(memAW).or() : Const(0);
     final oorQ = _Queue(
@@ -144,6 +178,9 @@ class SdramMemoryPort extends Module {
       reqFire & w.reqWrite,
       oor,
       oorQPop,
+      ahead: ahead,
+      pushOf: (b) => on(b[fRv] && b[fRw], w.reqReady),
+      popOf: (b) => on(b[fWv] && b[fWl], w.wdataReady),
     );
     final reqWidths = [1, memAW, lenW, sizeW, burstW];
     final reqPacked = harborPack([
@@ -172,8 +209,30 @@ class SdramMemoryPort extends Module {
         pushData: reqPacked,
         popReady: load,
       );
-      w.reqReady <=
-          reqIn.pushReady & ~clr & rdQ.ready & widQ.ready & oorQ.ready;
+      final ready = reqIn.pushReady & ~clr & rdQ.ready & widQ.ready;
+      if (clrNext == null) {
+        w.reqReady <= ready & oorQ.ready;
+      } else {
+        // A register with the value of `ready` in each cycle.
+        final cnt = reqIn.count;
+        final cntNext = mux(
+          clr,
+          Const(0, width: cnt.width),
+          cnt +
+              reqIn.pushFire.zeroExtend(cnt.width) -
+              reqIn.popFire.zeroExtend(cnt.width),
+        );
+        final readyR = Logic(name: 'req_ready_r');
+        Sequential(clk, [
+          readyR <
+              ~clrNext &
+                  cntNext.neq(2) &
+                  rdQ.readyNext &
+                  widQ.readyNext &
+                  oorQ.readyNext,
+        ]);
+        w.reqReady <= readyR;
+      }
       headValid = reqIn.popValid;
       headData = reqIn.popData;
     }
@@ -190,9 +249,13 @@ class SdramMemoryPort extends Module {
       for (var i = 0; i < writeBeats; i++) Logic(name: 'wb_data_$i', width: 36),
     ];
     final wbCount = (wPtr - rPtr).named('wb_count');
-    final wbFree = (wPtr - cPtr).named('wb_uncommitted');
+    // `wb_wr - wb_commit`, kept as a register.
+    final wbFree = Logic(name: 'wb_uncommitted', width: wbW + 1);
+    final wdReadyR = Logic(name: 'wdata_ready_r');
     w.wdataReady <=
-        wbCount.neq(Const(writeBeats, width: wbW + 1)) & ~clr & oorQ.valid;
+        (clrNext == null
+            ? wbCount.neq(Const(writeBeats, width: wbW + 1)) & ~clr & oorQ.valid
+            : wdReadyR);
     final wPush = (w.wdataValid & w.wdataReady).named('wb_push');
     oorQPop <= wPush & w.wdataLast;
     final strb = w.wdataStrb & ~oorQ.data.replicate(4);
@@ -216,11 +279,41 @@ class SdramMemoryPort extends Module {
     );
     final rIdx = rPtr.getRange(0, wbW);
     final beat = _pick(rIdx, wbData);
+    final zero = Const(0, width: wbW + 1);
+    Logic wNext(_Far b) => mux(
+      reset,
+      zero,
+      mux(clr, cPtr, mux(on(b[fWv], w.wdataReady), wPtr + 1, wPtr)),
+    );
+    if (clrNext != null) {
+      // A register with the value of the WDATA ready in each cycle, from a
+      // register copy of `wb_count`.
+      final cnt = Logic(name: 'wb_count_r', width: wbW + 1);
+      final rNext = mux(reset, zero, mux(hLoad, rPtr + 1, rPtr));
+      final clrCnt = mux(reset, zero, cPtr - rNext);
+      final cut = reset | clr;
+      Logic step(_Far b, Logic Function(Logic c) f) {
+        final wp = on(b[fWv], w.wdataReady);
+        return mux(
+          cut,
+          f(clrCnt),
+          mux(hLoad, mux(wp, f(cnt), f(cnt - 1)), mux(wp, f(cnt + 1), f(cnt))),
+        );
+      }
+
+      Logic notFull(Logic c) => c.neq(Const(writeBeats, width: wbW + 1));
+      Sequential(clk, [
+        cnt < ahead((b) => step(b, (c) => c)),
+        wdReadyR <
+            ahead((b) => ~clrNext! & step(b, notFull) & oorQ.validNextOf(b)),
+      ]);
+    }
 
     final wrespCnt = Logic(name: 'wresp_count', width: n.bitLength);
     final wrespFire = (w.wrespValid & w.wrespReady).named('wresp_fire');
     widQPop <= wrespFire;
-    w.wrespValid <= wrespCnt.neq(0);
+    final wrespValidR = Logic(name: 'wresp_valid_r');
+    w.wrespValid <= (clrNext == null ? wrespCnt.neq(0) : wrespValidR);
     w.wrespId <= widQ.data;
     w.wrespErr <= Const(0);
 
@@ -272,23 +365,44 @@ class SdramMemoryPort extends Module {
                     writeTaken,
                   ))
             .named('write_done');
+    final wrespBase = wrespCnt + wEvent.zeroExtend(wrespCnt.width);
+    Logic wrespNext(_Far b) => mux(
+      clr,
+      Const(0, width: wrespCnt.width),
+      mux(on(b[fBr], w.wrespValid), wrespBase - 1, wrespBase),
+    );
+    if (clrNext != null) {
+      // A register with the value of `wresp_count != 0` in each cycle.
+      Sequential(clk, [wrespValidR < ahead((b) => wrespNext(b).neq(0))]);
+    }
 
     // --- read data back ---
+    // The port read data can come from far away, so it goes into a register
+    // stage first. The beat in that stage is the tail of the read buffer:
+    // while the buffer is empty it is the head, so no cycle is added.
+    final rdIn = Logic(name: 'rd_in');
+    final rdInData = Logic(name: 'rd_in_data', width: 16);
+    final clrLate = Logic(name: 'clear_late');
+    Sequential(clk, [
+      rdIn < p.rdValid & ~clr,
+      rdInData < p.rdData,
+      clrLate < clr,
+    ]);
     final rHalf = Logic(name: 'rd_half');
     final rLo = Logic(name: 'rd_lo', width: 16);
-    final rdIn = (p.rdValid & ~clr).named('rd_in');
-    final rbPush = (rdIn & rHalf).named('rb_push');
+    final tailValid = (rdIn & rHalf).named('rd_tail_valid');
+    final tailData = [rLo, rdInData].rswizzle();
     final rbPop = Logic(name: 'rb_pop');
-    final rb = _Queue(
-      'rb',
-      clk,
-      clr,
-      readBeats,
-      rbPush,
-      [rLo, p.rdData].rswizzle(),
-      rbPop,
+    final rbPush = Logic(name: 'rb_push');
+    final rbBufPop = Logic(name: 'rb_buf_pop');
+    final rbBuf = _Queue('rb', clk, clr, readBeats, rbPush, tailData, rbBufPop);
+    rbBufPop <= rbPop & rbBuf.valid;
+    rbPush <= tailValid & ~(rbPop & ~rbBuf.valid);
+    _check(clk, clr, rbPush & ~rbBuf.ready, 'read buffer pushed while full');
+    final rb = (
+      valid: (rbBuf.valid | tailValid).named('rb_head_valid'),
+      data: mux(rbBuf.valid, rbBuf.data, tailData).named('rb_head'),
     );
-    _check(clk, clr, rbPush & ~rb.ready, 'read buffer pushed while full');
     // With one request in flight the read buffer is small, so its read mux
     // drives RDATA directly. Else a 2 entry FIFO cuts the path.
     final Logic outValid, outData;
@@ -296,7 +410,7 @@ class SdramMemoryPort extends Module {
       rbPop <= rb.valid & w.rdataReady;
       outValid = rb.valid;
       outData = rb.data;
-    } else {
+    } else if (clrNext == null) {
       final out = HarborRegFifo(
         name: 'rd_out',
         clk: clk,
@@ -309,23 +423,77 @@ class SdramMemoryPort extends Module {
       rbPop <= out.pushFire;
       outValid = out.popValid;
       outData = out.popData;
+    } else {
+      outValid = Logic(name: 'rd_out_valid');
+      outData = Logic(name: 'rd_out_data', width: 32);
     }
     final rBeat = Logic(name: 'rd_beat', width: lenW);
-    final rdHead = harborUnpack(rdQ.data, [idW, lenW]);
-    final rLast = rBeat.eq(rdHead[1]);
-    w.rdataValid <= outValid;
-    w.rdataData <= outData;
-    w.rdataId <= rdHead[0];
+    final Logic rLast;
+    final Logic rdataFire;
+    if (direct || clrNext == null) {
+      final rdHead = harborUnpack(rdQ.data, [idW, lenW]);
+      rLast = rBeat.eq(rdHead[1]);
+      w.rdataValid <= outValid;
+      w.rdataData <= outData;
+      w.rdataId <= rdHead[0];
+      w.rdataLast <= rLast;
+      rdataFire = (w.rdataValid & w.rdataReady).named('rdata_fire');
+    } else {
+      // A 2 entry FIFO whose head is a register. Each beat takes its ID
+      // and LAST as it goes in, from the read request it belongs to.
+      final rdRegs = _rdOut(
+        clk,
+        clr,
+        rb.valid,
+        rb.data,
+        w.rdataReady,
+        rdQ.entries,
+        idW,
+        lenW,
+      );
+      rbPop <= rdRegs.pushFire;
+      rLast = rdRegs.last;
+      outValid <= rdRegs.valid;
+      outData <= rdRegs.data;
+      w.rdataValid <= rdRegs.valid;
+      w.rdataData <= rdRegs.data;
+      w.rdataId <= rdRegs.id;
+      w.rdataLast <= rdRegs.last;
+      rdataFire = rdRegs.popFire;
+    }
     w.rdataErr <= Const(0);
-    w.rdataLast <= rLast;
-    final rdataFire = (w.rdataValid & w.rdataReady).named('rdata_fire');
     rdQPop <= rdataFire & rLast;
+    rdQPopLocal <= w.rdataValid & rLast;
 
-    final wbIdx = wPtr.getRange(0, wbW);
+    // A one-hot copy of the low bits of `wb_wr`, so the write enable of a
+    // buffer word is one LUT.
+    final wbSel = Logic(name: 'wb_wr_sel', width: writeBeats);
+    Logic oneHot(Logic idx) =>
+        [for (var i = writeBeats - 1; i >= 0; i--) idx.eq(i)].swizzle();
     Sequential(clk, [
+      wrespCnt < ahead(wrespNext),
+      wbSel <
+          mux(
+            reset,
+            Const(1, width: writeBeats),
+            mux(
+              clr,
+              oneHot(cPtr.getRange(0, wbW)),
+              ahead(
+                (b) => mux(
+                  on(b[fWv], w.wdataReady),
+                  [
+                    wbSel.getRange(0, writeBeats - 1),
+                    wbSel[writeBeats - 1],
+                  ].swizzle(),
+                  wbSel,
+                ),
+              ),
+            ),
+          ),
       for (var i = 0; i < writeBeats; i++)
         If(
-          wPush & wbIdx.eq(i),
+          wPush & wbSel[i],
           then: [
             wbData[i] < [w.wdataData, strb].rswizzle(),
           ],
@@ -353,10 +521,7 @@ class SdramMemoryPort extends Module {
           qWrite < 0,
         ],
         orElse: [
-          If.block([
-            Iff(clr, [wPtr < cPtr]),
-            ElseIf(wPush, [wPtr < wPtr + 1]),
-          ]),
+          wPtr < ahead(wNext),
           If(issue & sWrite, then: [cPtr < cPtr + kWide]),
           If(feed, then: [fHalf < ~fHalf]),
           If(hLoad, then: [rPtr < rPtr + 1]),
@@ -430,9 +595,8 @@ class SdramMemoryPort extends Module {
           sValid < 0,
           kValid < 0,
           credit < readBeats,
-          rHalf < 0,
+          wbFree < 0,
           rBeat < 0,
-          wrespCnt < 0,
         ],
         orElse: [
           If.block([
@@ -440,26 +604,40 @@ class SdramMemoryPort extends Module {
             ElseIf(issue, [sValid < ~lastChunk, kValid < 0]),
             ElseIf(sValid, [kValid < 1]),
           ]),
+          // The counts are made ahead, so the late issue and fire signals
+          // only select one.
           credit <
-              credit +
-                  rdataFire.zeroExtend(rbW) -
-                  mux(
-                    issue & ~sWrite,
-                    kReg.zeroExtend(rbW),
-                    Const(0, width: rbW),
-                  ),
-          If(rdIn, then: [rHalf < ~rHalf]),
+              ahead(
+                (b) => _step(
+                  credit,
+                  issue & ~sWrite,
+                  kReg.zeroExtend(rbW),
+                  on(b[fRr], w.rdataValid),
+                ),
+              ),
+          wbFree <
+              ahead(
+                (b) => _step(
+                  wbFree,
+                  issue & sWrite,
+                  kWide,
+                  on(b[fWv], w.wdataReady),
+                ),
+              ),
           If(
             rdataFire,
             then: [rBeat < mux(rLast, Const(0, width: lenW), rBeat + 1)],
           ),
-          wrespCnt <
-              wrespCnt +
-                  wEvent.zeroExtend(wrespCnt.width) -
-                  wrespFire.zeroExtend(wrespCnt.width),
         ],
       ),
-      If(rdIn & ~rHalf, then: [rLo < p.rdData]),
+      If(
+        clrLate,
+        then: [rHalf < 0],
+        orElse: [
+          If(rdIn, then: [rHalf < ~rHalf]),
+        ],
+      ),
+      If(rdIn & ~rHalf, then: [rLo < rdInData]),
     ]);
   }
 
@@ -518,6 +696,104 @@ class SdramMemoryPort extends Module {
       addr,
       mux(burst.eq(HarborMemoryBurst.wrap.value), wrapNext, incr),
     );
+  }
+
+  /// The RDATA output FIFO: 2 entries, with the head in registers. A pushed
+  /// beat gets the ID of the read request at the push side head of
+  /// [rdQ], and LAST when it is the last beat of that request.
+  static ({
+    Logic pushFire,
+    Logic popFire,
+    Logic valid,
+    Logic data,
+    Logic id,
+    Logic last,
+  })
+  _rdOut(
+    Logic clk,
+    Logic clr,
+    Logic inValid,
+    Logic inData,
+    Logic ready,
+    List<Logic> rdQ,
+    int idW,
+    int lenW,
+  ) {
+    final d = rdQ.length;
+    final pSel = Logic(name: 'rd_out_req_sel', width: d);
+    final pBeat = Logic(name: 'rd_out_beat', width: lenW);
+    final req = [
+      for (var i = 0; i < d; i++) rdQ[i] & pSel[i].replicate(rdQ[i].width),
+    ].reduce((a, b) => a | b);
+    final [id, len] = harborUnpack(req, [idW, lenW]);
+    final pLast = pBeat.eq(len);
+    final w = inData.width + idW + 1;
+    final inBeat = [inData, id, pLast].swizzle();
+    final oV = Logic(name: 'rd_out_valid_r');
+    final sV = Logic(name: 'rd_out_spill_valid');
+    final oD = Logic(name: 'rd_out_r', width: w);
+    final sD = Logic(name: 'rd_out_spill', width: w);
+    final pushFire = (inValid & ~(oV & sV)).named('rd_out_push_fire');
+    final popFire = (oV & ready).named('rd_out_pop_fire');
+    // The ready comes from far away, so it selects last.
+    Logic byReady(Logic Function(Logic pop) f) =>
+        mux(ready, f(oV), f(Const(0)));
+    Sequential(clk, [
+      oD < byReady((po) => mux(po, mux(sV, sD, inBeat), mux(oV, oD, inBeat))),
+      If(pushFire & mux(popFire, sV, oV), then: [sD < inBeat]),
+      If(
+        clr,
+        then: [oV < 0, sV < 0, pBeat < 0, pSel < 1],
+        orElse: [
+          oV < byReady((po) => mux(po, sV | pushFire, oV | pushFire)),
+          sV < byReady((po) => mux(po, sV & pushFire, sV | (oV & pushFire))),
+          If(
+            pushFire,
+            then: [
+              If(
+                pLast,
+                then: [
+                  pBeat < 0,
+                  pSel < [pSel.getRange(0, d - 1), pSel[d - 1]].swizzle(),
+                ],
+                orElse: [pBeat < pBeat + 1],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ]);
+    return (
+      pushFire: pushFire,
+      popFire: popFire,
+      valid: oV,
+      data: oD.getRange(idW + 1),
+      id: oD.getRange(1, idW + 1),
+      last: oD[0],
+    );
+  }
+
+  /// [count] minus [k] when [sub], plus 1 when [add].
+  static Logic _step(Logic count, Logic sub, Logic k, Logic add) =>
+      mux(add, mux(sub, count - k + 1, count + 1), mux(sub, count - k, count));
+
+  /// [f] for each value of the [far] nets it reads, picked by those nets.
+  /// A net is read only where [f] needs it, so a data net that is X while
+  /// its valid is low does not make the result X.
+  static Logic _ahead(List<Logic> far, Logic Function(_Far b) f) {
+    Logic build(Map<int, bool> fixed) {
+      try {
+        return f(_Far(fixed));
+      } on _Need catch (n) {
+        return mux(
+          far[n.index],
+          build({...fixed, n.index: true}),
+          build({...fixed, n.index: false}),
+        );
+      }
+    }
+
+    return build(const {});
   }
 
   /// [vals] picked by [idx], as one case mux.
@@ -586,16 +862,41 @@ class SdramMemoryPort extends Module {
   }
 }
 
-/// A FIFO of [depth] entries rounded up to a power of two, with a case mux
-/// on the read side. [ready] is low when full and [valid] high when not
-/// empty. Pushing while full and popping while empty are not allowed.
+/// A FIFO of [depth] entries rounded up to a power of two. [ready] is low
+/// when full and [valid] high when not empty. Pushing while full and
+/// popping while empty are not allowed. One-hot registers select the entry
+/// to write and the entry to read, so the write enable of an entry is one
+/// LUT and the read is an AND-OR. [ready] and [valid] are flops.
 class _Queue {
   final Logic ready;
   final Logic valid;
   final Logic data;
 
-  _Queue._(this.ready, this.valid, this.data);
+  /// The values [ready] and [valid] have one cycle later.
+  final Logic readyNext;
+  final Logic validNext;
 
+  /// [validNext] for the far net values `b`.
+  final Logic Function(_Far b) validNextOf;
+
+  /// The entries, in write order from the reset.
+  final List<Logic> entries;
+
+  _Queue._(
+    this.ready,
+    this.valid,
+    this.data,
+    this.readyNext,
+    this.validNext,
+    this.validNextOf,
+    this.entries,
+  );
+
+  /// With [headRegister], [data] is a register that holds the head entry.
+  ///
+  /// [pushOf] and [popOf] give [push] and [pop] for the far net values `b`,
+  /// and [ahead] picks by those nets, so the next state of the flags and
+  /// the head is one LUT after them.
   factory _Queue(
     String name,
     Logic clk,
@@ -603,38 +904,95 @@ class _Queue {
     int depth,
     Logic push,
     Logic pushData,
-    Logic pop,
-  ) {
+    Logic pop, {
+    bool headRegister = false,
+    Logic Function(Logic Function(_Far b) f)? ahead,
+    Logic Function(_Far b)? pushOf,
+    Logic Function(_Far b)? popOf,
+  }) {
     var d = 2;
     while (d < depth) {
       d <<= 1;
     }
     final pw = d.bitLength - 1;
+    final width = pushData.width;
     final wr = Logic(name: '${name}_wr', width: pw + 1);
     final rd = Logic(name: '${name}_rd', width: pw + 1);
     final entries = [
-      for (var i = 0; i < d; i++)
-        Logic(name: '${name}_e$i', width: pushData.width),
+      for (var i = 0; i < d; i++) Logic(name: '${name}_e$i', width: width),
     ];
-    final empty = wr.eq(rd);
-    final full = (wr ^ rd).eq(Const(d, width: pw + 1));
-    final wIdx = wr.getRange(0, pw);
+    final count = wr - rd;
+    final one = count.eq(Const(1, width: pw + 1));
+    final almostFull = count.eq(Const(d - 1, width: pw + 1));
+    final empty = Logic(name: '${name}_empty');
+    final full = Logic(name: '${name}_full');
+    final sel = Logic(name: '${name}_wr_sel', width: d);
+    final rSel = Logic(name: '${name}_rd_sel', width: d);
+    Logic rotate(Logic x) => [x.getRange(0, d - 1), x[d - 1]].swizzle();
+    Logic emptyOf(Logic pu, Logic po) =>
+        reset | (~pu & mux(empty, Const(1), po & one));
+    Logic fullOf(Logic pu, Logic po) =>
+        ~reset & mux(pu, full | (~po & almostFull), full & ~po);
+    Logic pick(Logic Function(Logic pu, Logic po) g) =>
+        ahead == null ? g(push, pop) : ahead((b) => g(pushOf!(b), popOf!(b)));
+    final emptyNext = pick(emptyOf);
+    final fullNext = pick(fullOf);
     Sequential(clk, [
       for (var i = 0; i < d; i++)
-        If(push & wIdx.eq(i), then: [entries[i] < pushData]),
+        If(push & sel[i], then: [entries[i] < pushData]),
+      empty < emptyNext,
+      full < fullNext,
       If(
         reset,
-        then: [wr < 0, rd < 0],
+        then: [wr < 0, rd < 0, sel < 1, rSel < 1],
         orElse: [
-          If(push, then: [wr < wr + 1]),
-          If(pop, then: [rd < rd + 1]),
+          If(push, then: [wr < wr + 1, sel < rotate(sel)]),
+          If(pop, then: [rd < rd + 1, rSel < rotate(rSel)]),
         ],
       ),
     ]);
+    Logic at(Logic oneHot) => [
+      for (var i = 0; i < d; i++) entries[i] & oneHot[i].replicate(width),
+    ].reduce((a, b) => a | b);
+    var data = at(rSel);
+    if (headRegister) {
+      // The head after this cycle: the pushed entry when the push writes
+      // the slot the head moves to, else that slot.
+      Logic after(Logic oneHot, Logic pu) =>
+          mux(pu & (sel & oneHot).or(), pushData, at(oneHot));
+      final head = Logic(name: '${name}_head', width: width);
+      Sequential(clk, [
+        head <
+            pick(
+              (pu, po) =>
+                  mux(po & ~reset, after(rotate(rSel), pu), after(rSel, pu)),
+            ),
+      ]);
+      data = head;
+    }
     return _Queue._(
       (~full).named('${name}_ready'),
       (~empty).named('${name}_valid'),
-      SdramMemoryPort._pick(rd.getRange(0, pw), entries).named('${name}_data'),
+      data.named('${name}_data'),
+      ~fullNext,
+      ~emptyNext,
+      (b) => ~emptyOf(pushOf!(b), popOf!(b)),
+      entries,
     );
   }
+}
+
+/// The values of the far nets in one branch of [SdramMemoryPort._ahead].
+class _Far {
+  final Map<int, bool> _fixed;
+
+  _Far(this._fixed);
+
+  bool operator [](int i) => _fixed[i] ?? (throw _Need(i));
+}
+
+class _Need {
+  final int index;
+
+  _Need(this.index);
 }

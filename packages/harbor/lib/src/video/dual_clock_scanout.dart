@@ -137,8 +137,9 @@ class HarborDualClockScanout extends Module {
     final fetchStartReg = Logic(name: 'fetch_start_reg');
     final rSync0 = Logic(name: 'r_sync0');
     final rSync1 = Logic(name: 'r_sync1');
-    final rPrev = Logic(name: 'r_prev');
-    final reqEdge = rSync1 ^ rPrev;
+    // A register with the value of `r_sync1 ^ r_sync1 one cycle ago`, so the
+    // request edge is a flop next to the loads it enables.
+    final reqEdge = Logic(name: 'req_edge');
 
     final Logic fetchDone;
     final Logic wrEn;
@@ -268,7 +269,7 @@ class HarborDualClockScanout extends Module {
     Sequential(sysClk, reset: sysReset, [
       rSync0 < reqToggle,
       rSync1 < rSync0,
-      rPrev < rSync1,
+      reqEdge < rSync0 ^ rSync1,
       fetchStartReg < Const(0),
       If(
         ~sysBusy,

@@ -767,7 +767,6 @@ class HarborSdram extends BridgeModule
       return;
     }
 
-    final Logic portClear;
     final port = _busPort(
       memClk,
       cdcReset,
@@ -796,12 +795,16 @@ class HarborSdram extends BridgeModule
       pd: Const(0),
       name: 'engine_abort',
     ).q;
-    // The front end clear is port reset or front reset, from one flop.
-    portClear = Ecp5Fd1s3bx(
-      d: memReset | abortNext,
+    // The front end clear is port reset or front reset, from one flop in
+    // the port. [portReset] has the same value as [frontLocalReset], and
+    // `port_abort` has the same value as `front_reset_0`. These copies
+    // load only the port, so the clear flop stays next to the port and
+    // not the engine.
+    final portAbort = Ecp5Fd1s3bx(
+      d: portReset | joined,
       ck: memClk,
       pd: Const(0),
-      name: 'port_clear',
+      name: 'port_abort',
     ).q;
     _busError(clk, reset, Const(0));
 
@@ -813,7 +816,7 @@ class HarborSdram extends BridgeModule
       clk: memClk,
       reset: portReset,
       abort: frontReset,
-      clear: portClear,
+      clearNext: memReset | portReset | portAbort,
       waist: port.waist,
       port: clientPort,
       writeTaken: busWrTaken,

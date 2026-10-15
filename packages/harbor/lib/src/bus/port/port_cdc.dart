@@ -163,6 +163,9 @@ class HarborMemoryWaistCdc extends Module {
     // A FIFO writes on the fabric side when the fabric sends that way.
     _Fifo fifo(String name, List<int> widths, bool down, Logic dRst) {
       final fabricWrites = down == slave;
+      // With reset copies, the device side of a slave gives an enable only
+      // when the FIFO can take it.
+      final checked = deviceResetCopy != null && slave;
       return _Fifo(
         name,
         widths.reduce((a, b) => a + b),
@@ -171,6 +174,8 @@ class HarborMemoryWaistCdc extends Module {
         fabricWrites ? fJoin : dRst,
         fabricWrites ? dClk : fClk,
         fabricWrites ? dRst : fJoin,
+        trustWrite: checked && !down,
+        trustRead: checked && down,
       );
     }
 
@@ -274,41 +279,114 @@ class HarborMemoryWaistCdc extends Module {
 
       // Device side: the memory. Write data waits for its REQ.
       final wPend = Logic(name: 'd_w_pend', width: cntW);
-      final open = nonZero(wPend) & ~dWd;
+      // A register copy of `d_w_pend != 0`.
+      final wOpen = Logic(name: 'd_w_open');
+      final open = wOpen & ~dWd;
       final [id, write, addr, len, size, burst] = harborUnpack(
         reqF.rdData,
         reqWidths,
       );
-      dn.reqValid <= ~reqF.rdEmpty & ~dReq;
+      // With reset copies, the valid and ready outputs of the device side
+      // are registers with the same value in each cycle, so the device can
+      // sit far away. The join reset is the next value of each copy.
+      final copies = dSet != null;
+      // Each also has a vendor copy, low when the FIFO can move, for the
+      // FIFO enable. Synthesis does not merge it with the output, so the
+      // device and the FIFO do not share one LUT.
+      final can = <String, Logic>{};
+      Logic out(String name, Logic now, Logic next) {
+        if (!copies) {
+          can[name] = now;
+          return now;
+        }
+        final r = Logic(name: name);
+        Sequential(dClk, [r < next & ~dJoin], reset: dSet, asyncReset: true);
+        can[name] = ~deviceResetCopy!(dClk, ~next | dJoin, dSet, '${name}_n');
+        return r;
+      }
+
+      // The far handshake inputs only select between values made ahead.
+      final rq = dn.reqReady;
+      final wd = dn.wdataReady;
+      Logic ahead(Logic Function(bool rq, bool wd) f) => mux(
+        rq,
+        mux(wd, f(true, true), f(true, false)),
+        mux(wd, f(false, true), f(false, false)),
+      );
+      final reqTake = ~reqF.rdEmpty & ~dReq;
+      final wdTake = ~wdF.rdEmpty & open;
+      Logic reqEmptyNext(bool r) => r
+          ? mux(reqTake, reqF.rdEmptyIfPop, reqF.rdEmptyIfHold)
+          : reqF.rdEmptyIfHold;
+      Logic wdEmptyNext(bool w) => w
+          ? mux(wdTake, wdF.rdEmptyIfPop, wdF.rdEmptyIfHold)
+          : wdF.rdEmptyIfHold;
+      // These use the flags and not the valid registers, so synthesis does
+      // not share one LUT with the device for both sides.
+      Logic dReqW(bool r) => r ? reqTake & write : Const(0);
+      final [wData, wStrb, wLast] = harborUnpack(wdF.rdData, wdWidths);
+      Logic dLast(bool w) => w ? wdTake & wLast : Const(0);
+      final up1 = wPend + 1;
+      final dn1 = wPend - 1;
+      Logic openNext(bool r, bool w) =>
+          ~dWd &
+          mux(
+            dReqW(r),
+            mux(dLast(w), nonZero(wPend), nonZero(up1)),
+            mux(dLast(w), nonZero(dn1), nonZero(wPend)),
+          );
+      Logic pendNext(bool r, bool w) => mux(
+        dWd,
+        Const(0, width: cntW),
+        mux(dReqW(r), mux(dLast(w), wPend, up1), mux(dLast(w), dn1, wPend)),
+      );
+
+      dn.reqValid <=
+          out('d_req_valid_r', reqTake, ahead((r, _) => ~reqEmptyNext(r)));
       dn.reqId <= id;
       dn.reqWrite <= write;
       dn.reqAddr <= addr;
       dn.reqLen <= len;
       dn.reqSize <= size;
       dn.reqBurst <= burst;
-      reqF.pop(dn.reqReady & ~dReq);
-      final [wData, wStrb, wLast] = harborUnpack(wdF.rdData, wdWidths);
-      dn.wdataValid <= ~wdF.rdEmpty & open;
+      reqF.pop(rq & can['d_req_valid_r']!);
+      dn.wdataValid <=
+          out(
+            'd_wdata_valid_r',
+            wdTake,
+            ahead((r, w) => ~wdEmptyNext(w) & openNext(r, w)),
+          );
       dn.wdataData <= wData;
       dn.wdataStrb <= wStrb;
       dn.wdataLast <= wLast;
-      wdF.pop(dn.wdataReady & open);
-      final dReqW = dn.reqValid & dn.reqReady & write;
-      final dLast = dn.wdataValid & dn.wdataReady & wLast;
-      Sequential(dClk, reset: dWd, [
-        If.block([
-          Iff(dReqW & ~dLast, [wPend < wPend + 1]),
-          ElseIf(dLast & ~dReqW, [wPend < wPend - 1]),
-        ]),
-      ]);
+      wdF.pop(wd & can['d_wdata_valid_r']!);
+      Sequential(dClk, [wOpen < ahead(openNext), wPend < ahead(pendNext)]);
       // Nothing crosses to or from a device side in reset.
-      dn.rdataReady <= ~rdF.wrFull & ~dRd;
+      Logic fullNext(_Fifo f, Logic valid, Logic dRst) => ~mux(
+        valid,
+        mux(dRst | f.wrFull, f.wrFullIfHold, f.wrFullIfPush),
+        f.wrFullIfHold,
+      );
+      dn.rdataReady <=
+          out(
+            'd_rdata_ready_r',
+            ~rdF.wrFull & ~dRd,
+            fullNext(rdF, dn.rdataValid, dRd),
+          );
       rdF.push(
-        dn.rdataValid & ~dRd,
+        dn.rdataValid & can['d_rdata_ready_r']!,
         harborPack([dn.rdataId, dn.rdataData, dn.rdataErr, dn.rdataLast]),
       );
-      dn.wrespReady <= ~wrF.wrFull & ~dWr;
-      wrF.push(dn.wrespValid & ~dWr, harborPack([dn.wrespId, dn.wrespErr]));
+      dn.wrespReady <=
+          out(
+            'd_wresp_ready_r',
+            ~wrF.wrFull & ~dWr,
+            fullNext(wrF, dn.wrespValid, dWr),
+          );
+      wrF.push(
+        dn.wrespValid & can['d_wresp_ready_r']!,
+        harborPack([dn.wrespId, dn.wrespErr]),
+      );
       return;
     }
 
@@ -432,37 +510,215 @@ class HarborMemoryWaistCdc extends Module {
 typedef HarborResetCopy =
     Logic Function(Logic clk, Logic d, Logic set, String name);
 
-/// One [HarborCdcFifo] with its clocks and resets wired.
+/// One [HarborWaistCdcFifo] with its clocks and resets wired.
 class _Fifo {
-  final HarborCdcFifo fifo;
+  final Logic _wrEn;
+  final Logic _wrData;
+  final Logic _rdEn;
+  final HarborWaistCdcFifo fifo;
 
-  _Fifo(
+  _Fifo._(this._wrEn, this._wrData, this._rdEn, this.fifo);
+
+  factory _Fifo(
     String name,
     int width,
     int depth,
     Logic wrClk,
     Logic wrReset,
     Logic rdClk,
-    Logic rdReset,
-  ) : fifo = HarborCdcFifo(dataWidth: width, depth: depth, name: name) {
-    fifo.input('wr_clk').srcConnection! <= wrClk;
-    fifo.input('wr_reset').srcConnection! <= wrReset;
-    fifo.input('rd_clk').srcConnection! <= rdClk;
-    fifo.input('rd_reset').srcConnection! <= rdReset;
+    Logic rdReset, {
+    bool trustWrite = false,
+    bool trustRead = false,
+  }) {
+    final wrEn = Logic(name: '${name}_wr_en');
+    final wrData = Logic(name: '${name}_wr_data', width: width);
+    final rdEn = Logic(name: '${name}_rd_en');
+    return _Fifo._(
+      wrEn,
+      wrData,
+      rdEn,
+      HarborWaistCdcFifo(
+        wrClk: wrClk,
+        wrReset: wrReset,
+        wrEn: wrEn,
+        wrData: wrData,
+        rdClk: rdClk,
+        rdReset: rdReset,
+        rdEn: rdEn,
+        depth: depth,
+        trustWrite: trustWrite,
+        trustRead: trustRead,
+        name: name,
+      ),
+    );
   }
 
-  Logic get wrFull => fifo.output('wr_full');
-  Logic get rdEmpty => fifo.output('rd_empty');
-  Logic get rdData => fifo.output('rd_data');
+  Logic get wrFull => fifo.wrFull;
+  Logic get wrFullIfPush => fifo.output('wr_full_push');
+  Logic get wrFullIfHold => fifo.output('wr_full_hold');
+  Logic get rdEmpty => fifo.rdEmpty;
+  Logic get rdEmptyIfPop => fifo.output('rd_empty_pop');
+  Logic get rdEmptyIfHold => fifo.output('rd_empty_hold');
+  Logic get rdData => fifo.rdData;
 
   /// Pushes [data] when [valid] is high and the FIFO is not full.
   void push(Logic valid, Logic data) {
-    fifo.input('wr_en').srcConnection! <= valid & ~wrFull;
-    fifo.input('wr_data').srcConnection! <= data;
+    _wrEn <= valid;
+    _wrData <= data;
   }
 
   /// Pops the head when [ready] is high and the FIFO is not empty.
   void pop(Logic ready) {
-    fifo.input('rd_en').srcConnection! <= ready;
+    _rdEn <= ready;
+  }
+}
+
+/// A gray pointer FIFO between two clocks, for a waist crossing whose two
+/// sides can sit far from the logic that uses them.
+///
+/// It has the cycle timing of a flop array [HarborCdcFifo]. The outputs are
+/// flops: `rd_data` is a head register that holds the entry at the read
+/// pointer. `wr_full_push` and `wr_full_hold` give the next full flag with
+/// and without a push, and `rd_empty_pop` and `rd_empty_hold` the next empty
+/// flag with and without a pop. With `trustWrite` or `trustRead`, the user
+/// gives that enable only when the FIFO can take it. Each side makes its next state for both values of its enable
+/// ahead, so `wr_en` and `rd_en` only select one.
+class HarborWaistCdcFifo extends Module {
+  Logic get wrFull => output('wr_full');
+  Logic get rdEmpty => output('rd_empty');
+  Logic get rdData => output('rd_data');
+
+  HarborWaistCdcFifo({
+    required Logic wrClk,
+    required Logic wrReset,
+    required Logic wrEn,
+    required Logic wrData,
+    required Logic rdClk,
+    required Logic rdReset,
+    required Logic rdEn,
+    required int depth,
+    bool trustWrite = false,
+    bool trustRead = false,
+    super.name = 'waist_cdc_fifo',
+  }) : super(
+         definitionName:
+             'HarborWaistCdcFifo_${wrData.width}w${depth}d'
+             '${trustWrite ? '_tw' : ''}${trustRead ? '_tr' : ''}',
+       ) {
+    if (depth < 2 || depth & (depth - 1) != 0) {
+      throw ArgumentError.value(depth, 'depth', 'must be a power of two >= 2');
+    }
+    final width = wrData.width;
+    wrClk = addInput('wr_clk', wrClk);
+    wrReset = addInput('wr_reset', wrReset);
+    wrEn = addInput('wr_en', wrEn);
+    wrData = addInput('wr_data', wrData, width: width);
+    rdClk = addInput('rd_clk', rdClk);
+    rdReset = addInput('rd_reset', rdReset);
+    rdEn = addInput('rd_en', rdEn);
+
+    final pw = depth.bitLength;
+    Logic gray(Logic b) => b ^ (b >>> 1);
+    Logic rotate(Logic x) => [x.getRange(0, depth - 1), x[depth - 1]].swizzle();
+    Logic pick(Logic sel, List<Logic> v) => [
+      for (var i = 0; i < depth; i++) v[i] & sel[i].replicate(width),
+    ].reduce((a, b) => a | b);
+    final mem = [
+      for (var i = 0; i < depth; i++) Logic(name: 'mem_$i', width: width),
+    ];
+
+    // Write side.
+    final wrPtr = Logic(name: 'wr_ptr', width: pw);
+    final rdGray = Logic(name: 'rd_ptr_gray', width: pw);
+    final wrGray = Logic(name: 'wr_ptr_gray', width: pw);
+    final wrFull = Logic(name: 'wr_full_reg');
+    final wrSel = Logic(name: 'wr_sel', width: depth);
+    final rdGraySync0 = Logic(name: 'rd_gray_sync0', width: pw);
+    final rdGraySync = Logic(name: 'rd_ptr_gray_sync', width: pw);
+    // Full: the write gray equals the read gray with the top 2 bits
+    // inverted.
+    Logic fullAt(Logic g) => g.eq(
+      [~rdGraySync.getRange(pw - 2), rdGraySync.getRange(0, pw - 2)].swizzle(),
+    );
+    // Registers that hold the pointer plus one and its gray code.
+    final wrPtr1 = Logic(name: 'wr_ptr_1', width: pw);
+    final wrGray1 = Logic(name: 'wr_ptr_gray_1', width: pw);
+    final push = (trustWrite ? wrEn : wrEn & ~wrFull).named('wr_push');
+    final fullNext = mux(push, fullAt(wrGray1), fullAt(wrGray));
+    addOutput('wr_full_push') <= ~wrReset & fullAt(wrGray1);
+    addOutput('wr_full_hold') <= ~wrReset & fullAt(wrGray);
+    Sequential(wrClk, [
+      for (var i = 0; i < depth; i++)
+        If(push & wrSel[i], then: [mem[i] < wrData]),
+      If(
+        wrReset,
+        then: [
+          wrPtr < 0,
+          wrGray < 0,
+          wrPtr1 < 1,
+          wrGray1 < 1,
+          wrFull < 0,
+          wrSel < 1,
+          rdGraySync0 < 0,
+          rdGraySync < 0,
+        ],
+        orElse: [
+          rdGraySync0 < rdGray,
+          rdGraySync < rdGraySync0,
+          wrPtr < mux(push, wrPtr1, wrPtr),
+          wrGray < mux(push, wrGray1, wrGray),
+          wrPtr1 < mux(push, wrPtr1 + 1, wrPtr1),
+          wrGray1 < mux(push, gray(wrPtr1 + 1), wrGray1),
+          wrFull < fullNext,
+          wrSel < mux(push, rotate(wrSel), wrSel),
+        ],
+      ),
+    ]);
+    addOutput('wr_full') <= wrFull;
+
+    // Read side. The head register loads the entry at the next read
+    // pointer each cycle. An entry is written at least two read clock
+    // edges before the empty flag falls, so the head holds it by then.
+    final rdPtr = Logic(name: 'rd_ptr', width: pw);
+    final rdEmpty = Logic(name: 'rd_empty_reg');
+    final rdSel = Logic(name: 'rd_sel', width: depth);
+    final head = Logic(name: 'rd_head', width: width);
+    final wrGraySync0 = Logic(name: 'wr_gray_sync0', width: pw);
+    final wrGraySync = Logic(name: 'wr_ptr_gray_sync', width: pw);
+    final rdPtr1 = Logic(name: 'rd_ptr_1', width: pw);
+    final rdGray1 = Logic(name: 'rd_ptr_gray_1', width: pw);
+    final rdSel1 = rotate(rdSel);
+    final pop = (trustRead ? rdEn : rdEn & ~rdEmpty).named('rd_pop');
+    final emptyNext = mux(pop, rdGray1.eq(wrGraySync), rdGray.eq(wrGraySync));
+    addOutput('rd_empty_pop') <= rdReset | rdGray1.eq(wrGraySync);
+    addOutput('rd_empty_hold') <= rdReset | rdGray.eq(wrGraySync);
+    Sequential(rdClk, [
+      head < mux(pop, pick(rdSel1, mem), pick(rdSel, mem)),
+      If(
+        rdReset,
+        then: [
+          rdPtr < 0,
+          rdGray < 0,
+          rdPtr1 < 1,
+          rdGray1 < 1,
+          rdEmpty < 1,
+          rdSel < 1,
+          wrGraySync0 < 0,
+          wrGraySync < 0,
+        ],
+        orElse: [
+          wrGraySync0 < wrGray,
+          wrGraySync < wrGraySync0,
+          rdPtr < mux(pop, rdPtr1, rdPtr),
+          rdGray < mux(pop, rdGray1, rdGray),
+          rdPtr1 < mux(pop, rdPtr1 + 1, rdPtr1),
+          rdGray1 < mux(pop, gray(rdPtr1 + 1), rdGray1),
+          rdEmpty < emptyNext,
+          rdSel < mux(pop, rdSel1, rdSel),
+        ],
+      ),
+    ]);
+    addOutput('rd_empty') <= rdEmpty;
+    addOutput('rd_data', width: width) <= head;
   }
 }
