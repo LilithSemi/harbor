@@ -51,7 +51,9 @@ int harborCdcDepth(int outstanding) {
 ///
 /// With [deviceResetCopy], each FIFO device half and the device side logic
 /// of its channel reset on their own copy of `device_reset`, so no single
-/// reset net spans the die. A copy is one cycle later than `device_reset`.
+/// reset net spans the die. A copy is two flops after `device_reset`, so it
+/// releases two cycles later, and it sets at once when either reset input
+/// asserts. Only the first flop of each copy loads `device_reset`.
 class HarborMemoryWaistCdc extends Module {
   /// Entries in each FIFO.
   final int depth;
@@ -128,13 +130,25 @@ class HarborMemoryWaistCdc extends Module {
     final dSet = deviceResetCopy == null
         ? null
         : (dReset | fReset).named('device_join_reset_set');
-    Logic dCopy(String n) => deviceResetCopy == null
-        ? dJoin
-        : deviceResetCopy(dClk, dJoin, dSet!, '${n}_device_reset');
-    final dReq = dCopy('req');
-    final dWd = dCopy('wdata');
-    final dRd = dCopy('rdata');
-    final dWr = dCopy('wresp');
+    // With copies, `early` is the next value of the channel copy.
+    ({Logic early, Logic reset}) dCopy(String n) {
+      if (deviceResetCopy == null) return (early: dJoin, reset: dJoin);
+      final early = deviceResetCopy(
+        dClk,
+        dJoin,
+        dSet!,
+        '${n}_device_reset_early',
+      );
+      return (
+        early: early,
+        reset: deviceResetCopy(dClk, early, dSet, '${n}_device_reset'),
+      );
+    }
+
+    final (early: dReqEarly, reset: dReq) = dCopy('req');
+    final (early: dWdEarly, reset: dWd) = dCopy('wdata');
+    final (early: dRdEarly, reset: dRd) = dCopy('rdata');
+    final (early: dWrEarly, reset: dWr) = dCopy('wresp');
     // The fabric side record resets only on fReset, so it must see the
     // device reset on clock edges only.
     final fJoinSync = harborCdcSyncReset(
@@ -244,10 +258,7 @@ class HarborMemoryWaistCdc extends Module {
       );
 
       final [qId, qLen] = harborUnpack(rdQ.popData, [idW, lenW]);
-      final [rId, rData, rErr, rLast, rEx] = harborUnpack(
-        rdF.rdData,
-        rdWidths,
-      );
+      final [rId, rData, rErr, rLast, rEx] = harborUnpack(rdF.rdData, rdWidths);
       up.rdataValid <= mux(mode, rdQ.popValid, ~rdF.rdEmpty);
       up.rdataId <= mux(mode, qId, rId);
       up.rdataData <= mux(mode, Const(0, width: dataW), rData);
@@ -297,20 +308,21 @@ class HarborMemoryWaistCdc extends Module {
       );
       // With reset copies, the valid and ready outputs of the device side
       // are registers with the same value in each cycle, so the device can
-      // sit far away. The join reset is the next value of each copy.
+      // sit far away. The early copy of the channel is the next value of
+      // its copy.
       final copies = dSet != null;
       // Each also has a vendor copy, low when the FIFO can move, for the
       // FIFO enable. Synthesis does not merge it with the output, so the
       // device and the FIFO do not share one LUT.
       final can = <String, Logic>{};
-      Logic out(String name, Logic now, Logic next) {
+      Logic out(String name, Logic now, Logic next, Logic early) {
         if (!copies) {
           can[name] = now;
           return now;
         }
         final r = Logic(name: name);
-        Sequential(dClk, [r < next & ~dJoin], reset: dSet, asyncReset: true);
-        can[name] = ~deviceResetCopy!(dClk, ~next | dJoin, dSet, '${name}_n');
+        Sequential(dClk, [r < next & ~early], reset: dSet, asyncReset: true);
+        can[name] = ~deviceResetCopy!(dClk, ~next | early, dSet, '${name}_n');
         return r;
       }
 
@@ -351,7 +363,12 @@ class HarborMemoryWaistCdc extends Module {
       );
 
       dn.reqValid <=
-          out('d_req_valid_r', reqTake, ahead((r, _) => ~reqEmptyNext(r)));
+          out(
+            'd_req_valid_r',
+            reqTake,
+            ahead((r, _) => ~reqEmptyNext(r)),
+            dReqEarly,
+          );
       dn.reqId <= id;
       dn.reqWrite <= write;
       dn.reqAddr <= addr;
@@ -365,6 +382,7 @@ class HarborMemoryWaistCdc extends Module {
             'd_wdata_valid_r',
             wdTake,
             ahead((r, w) => ~wdEmptyNext(w) & openNext(r, w)),
+            dWdEarly,
           );
       dn.wdataData <= wData;
       dn.wdataStrb <= wStrb;
@@ -382,6 +400,7 @@ class HarborMemoryWaistCdc extends Module {
             'd_rdata_ready_r',
             ~rdF.wrFull & ~dRd,
             fullNext(rdF, dn.rdataValid, dRd),
+            dRdEarly,
           );
       rdF.push(
         dn.rdataValid & can['d_rdata_ready_r']!,
@@ -398,6 +417,7 @@ class HarborMemoryWaistCdc extends Module {
             'd_wresp_ready_r',
             ~wrF.wrFull & ~dWr,
             fullNext(wrF, dn.wrespValid, dWr),
+            dWrEarly,
           );
       wrF.push(
         dn.wrespValid & can['d_wresp_ready_r']!,
@@ -530,11 +550,6 @@ class HarborMemoryWaistCdc extends Module {
     ]);
   }
 }
-
-/// Makes a flop on [clk] that loads [d] and sets at once on [set], under
-/// [name]. A vendor flop keeps synthesis from merging two copies.
-typedef HarborResetCopy =
-    Logic Function(Logic clk, Logic d, Logic set, String name);
 
 /// One [HarborWaistCdcFifo] with its clocks and resets wired.
 class _Fifo {

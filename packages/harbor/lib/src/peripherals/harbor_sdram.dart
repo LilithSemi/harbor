@@ -427,11 +427,12 @@ class HarborSdram extends BridgeModule
     deviceAddressWidth: (config.sizeBytes - 1).bitLength,
     fabricClock: fabric,
     cdcDepth: fabric == null ? null : cdcDepth,
-    deviceResetCopy: fabric == null
-        ? null
-        : (ck, d, set, name) =>
-              Ecp5Fd1s3bx(d: d, ck: ck, pd: set, name: name).q,
+    deviceResetCopy: fabric == null ? null : _resetCopy,
   );
+
+  /// A reset copy flop on [clk] that loads [d] and sets at once on [set].
+  static Logic _resetCopy(Logic clk, Logic d, Logic set, String name) =>
+      Ecp5Fd1s3bx(d: d, ck: clk, pd: set, name: name).q;
 
   /// The Wishbone port `bus`, with the signals of a Wishbone memory slave.
   /// It ignores CTI and BTE and never drives ERR.
@@ -682,16 +683,35 @@ class HarborSdram extends BridgeModule
     // One copy of the reset per block, so no single reset net spans the
     // die. Each copy follows [memReset] one cycle later. Only the two
     // synchronizer flops see the raw reset, so the placer can keep that
-    // async path short. Every block resets synchronously anyway.
-    Logic localReset(String n) => Ecp5Fd1s3bx(
-      d: memReset,
-      ck: memClk,
-      pd: Const(0),
-      name: '${n}_reset',
-    ).q;
-    final frontLocalReset = localReset('front');
+    // async path short. Every block resets synchronously anyway. A
+    // synchronizer output goes only to copy flops, never to logic.
+    Logic copy(Logic d, String n) => _resetCopy(memClk, d, Const(0), n);
+    Logic localReset(String n) => copy(memReset, '${n}_reset');
+    // The engine gets its own copy of [frontLocalReset] for its abort next
+    // value, so that value is a LUT of copies next to the engine.
+    final Logic frontLocalReset, engineFrontReset, portReset;
+    Logic? portEarly;
+    if (wishbone) {
+      frontLocalReset = localReset('front');
+      engineFrontReset = busClockSync
+          ? frontLocalReset
+          : localReset('engine_front');
+      portReset = localReset('wb');
+    } else {
+      // The memory port gets the next value of its clear, so it needs a
+      // copy one cycle before [portReset]. Thus [portReset] and
+      // [frontLocalReset] release one cycle after the other copies. The
+      // front reset releases at the same time as before, because the
+      // joined reset holds it longer.
+      portEarly = localReset('port_early');
+      portReset = copy(portEarly, 'port_reset');
+      frontLocalReset = copy(localReset('front_early'), 'front_local_reset');
+      engineFrontReset = copy(
+        localReset('engine_front_early'),
+        'engine_front_reset',
+      );
+    }
     final cdcReset = localReset('cdc');
-    final portReset = localReset(wishbone ? 'wb' : 'port');
     final arbiterReset = localReset('arbiter');
     final engineReset = localReset('engine');
     final engineDataReset = localReset('engine_data');
@@ -720,6 +740,7 @@ class HarborSdram extends BridgeModule
         reset,
         memClk,
         frontLocalReset,
+        engineFrontReset,
         cdcReset,
       );
       frontReset = front.frontReset;
@@ -774,38 +795,27 @@ class HarborSdram extends BridgeModule
     );
     bus = port;
     // The joined reset asserts without the clock, so it goes through two
-    // flops before the front end uses it.
+    // flops before the front end uses it. The first flop is a copy, because
+    // the joined reset comes from a synchronizer.
     final joined = port.reset;
-    final abort0 = Logic(name: 'front_reset_0');
+    final abort0 = copy(joined, 'front_reset_0');
     final front = Logic(name: 'front_reset');
     Sequential(memClk, [
-      If(
-        frontLocalReset,
-        then: [abort0 < 1, front < 1],
-        orElse: [abort0 < joined, front < abort0],
-      ),
+      If(frontLocalReset, then: [front < 1], orElse: [front < abort0]),
     ]);
     frontReset = front;
     // A copy of [frontReset] for the engine, which the placer can keep
-    // next to its loads. The engine also gets its next value.
-    abortNext = frontLocalReset | abort0;
-    engineAbort = Ecp5Fd1s3bx(
-      d: abortNext,
-      ck: memClk,
-      pd: Const(0),
-      name: 'engine_abort',
-    ).q;
+    // next to its loads. The engine also gets its next value, made from
+    // its own copies of [frontLocalReset] and `front_reset_0`.
+    abortNext = engineFrontReset | copy(joined, 'engine_reset_0');
+    engineAbort = copy(abortNext, 'engine_abort');
     // The front end clear is port reset or front reset, from one flop in
-    // the port. [portReset] has the same value as [frontLocalReset], and
-    // `port_abort` has the same value as `front_reset_0`. These copies
-    // load only the port, so the clear flop stays next to the port and
-    // not the engine.
-    final portAbort = Ecp5Fd1s3bx(
-      d: portReset | joined,
-      ck: memClk,
-      pd: Const(0),
-      name: 'port_abort',
-    ).q;
+    // the port. Its next value is `port_early | port_reset | port_abort`.
+    // [portReset] has the same value as [frontLocalReset], `port_early` is
+    // its next value, and `port_abort` has the same value as
+    // `front_reset_0`. These copies load only the port, so the clear flop
+    // stays next to the port and not the engine.
+    final portAbort = copy(joined, 'port_abort');
     _busError(clk, reset, Const(0));
 
     final clientPort = SdramPortInterface(
@@ -816,7 +826,7 @@ class HarborSdram extends BridgeModule
       clk: memClk,
       reset: portReset,
       abort: frontReset,
-      clearNext: memReset | portReset | portAbort,
+      clearNext: portEarly! | portReset | portAbort,
       waist: port.waist,
       port: clientPort,
       writeTaken: busWrTaken,
@@ -858,6 +868,7 @@ class HarborSdram extends BridgeModule
     Logic reset,
     Logic memClk,
     Logic frontLocalReset,
+    Logic engineFrontReset,
     Logic cdcReset,
   ) {
     if (busClockSync) {
@@ -903,6 +914,7 @@ class HarborSdram extends BridgeModule
       // removed wb_slice stage gives the request to the port 1 mem_clk
       // cycle earlier, and done_r pushes the response 1 mem_clk cycle later.
       registerMaster: true,
+      masterResetCopy: _resetCopy,
       name: 'sdram_cdc',
     );
     addSubModule(cdc);
@@ -919,26 +931,24 @@ class HarborSdram extends BridgeModule
     cdc.input('m_clk').srcConnection! <= memClk;
     cdc.input('m_reset').srcConnection! <= cdcReset;
     // The joined reset asserts without the clock, so it goes through two
-    // flops before the front end uses it.
+    // flops before the front end uses it. The first flop is a copy, because
+    // the joined reset comes from a synchronizer.
     final joined = cdc.output('m_reset_joined');
-    final abort0 = Logic(name: 'front_reset_0');
+    Logic copy(Logic d, String n) => _resetCopy(memClk, d, Const(0), n);
+    final abort0 = copy(joined, 'front_reset_0');
     final frontReset = Logic(name: 'front_reset');
     Sequential(memClk, [
       If(
         frontLocalReset,
-        then: [abort0 < Const(1), frontReset < Const(1)],
-        orElse: [abort0 < joined, frontReset < abort0],
+        then: [frontReset < Const(1)],
+        orElse: [frontReset < abort0],
       ),
     ]);
     // A copy of [frontReset] for the engine, which the placer can keep
-    // next to its loads. The engine also gets its next value.
-    final abortNext = frontLocalReset | abort0;
-    final engineAbort = Ecp5Fd1s3bx(
-      d: abortNext,
-      ck: memClk,
-      pd: Const(0),
-      name: 'engine_abort',
-    ).q;
+    // next to its loads. The engine also gets its next value, made from
+    // its own copies of [frontLocalReset] and `front_reset_0`.
+    final abortNext = engineFrontReset | copy(joined, 'engine_reset_0');
+    final engineAbort = copy(abortNext, 'engine_abort');
     addOutput('bus_error') <= cdc.output('s_bus_error');
     return (
       cdc: cdc,

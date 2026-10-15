@@ -43,6 +43,11 @@ import 'wishbone_cdc.dart' show stickyCdcError;
 ///
 /// With [registerMaster], every master side output is a flop and the master
 /// side inputs go into flops before any other logic. See [registerMaster].
+///
+/// With [masterResetCopy], the master side logic and each FIFO master half
+/// reset on their own copy of `m_reset_joined`, so the synchronizer output
+/// loads only copy flops. A copy releases one cycle after
+/// `m_reset_joined` and sets at once when either reset input asserts.
 class HarborWishboneCdcFifoBridge extends BridgeModule {
   /// Address bus width.
   final int addressWidth;
@@ -93,6 +98,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     this.postedWrites = false,
     this.useErr = false,
     this.registerMaster = false,
+    HarborResetCopy? masterResetCopy,
     super.name = 'wishbone_cdc_fifo',
   }) : selWidth = selWidth ?? (dataWidth ~/ 8),
        super(
@@ -106,6 +112,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
            posted: postedWrites,
            useErr: useErr,
            registerMaster: registerMaster,
+           resetCopy: masterResetCopy != null,
          ),
        ) {
     final sw = this.selWidth;
@@ -144,14 +151,23 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
       input('m_reset'),
       name: 's_join_reset',
     );
-    final mReset = harborCdcJoinReset(
+    final mJoin = harborCdcJoinReset(
       mClk,
       input('m_reset'),
       input('s_reset'),
       name: 'm_join_reset',
     );
     // Logic on the master clock behind this bridge must reset with it.
-    addOutput('m_reset_joined') <= mReset;
+    addOutput('m_reset_joined') <= mJoin;
+    final mSet = masterResetCopy == null
+        ? null
+        : (input('m_reset') | input('s_reset')).named('m_join_reset_set');
+    Logic mCopy(String n) => masterResetCopy == null
+        ? mJoin
+        : masterResetCopy(mClk, mJoin, mSet!, '${n}_m_reset');
+    final mReset = mCopy('logic');
+    final reqRdReset = mCopy('req_rd');
+    final respWrReset = mCopy('resp_wr');
     // The slave domain registers reset on a copy of sReset that changes only
     // on edges of sClk, so they never see the master reset mid cycle.
     final sState = harborCdcSyncReset(
@@ -293,6 +309,8 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
         respFifo: respFifo,
         mClk: mClk,
         mReset: mReset,
+        reqRdReset: reqRdReset,
+        respWrReset: respWrReset,
         startServe: startServe,
         serving: serving,
         mCycReg: mCycReg,
@@ -312,13 +330,13 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
           : complete;
 
       reqFifo.input('rd_clk').srcConnection! <= mClk;
-      reqFifo.input('rd_reset').srcConnection! <= mReset;
+      reqFifo.input('rd_reset').srcConnection! <= reqRdReset;
       // Keep the head in the FIFO while serving (drives m_adr etc. directly).
       // Pop it only on completion.
       reqFifo.input('rd_en').srcConnection! <= complete;
 
       respFifo.input('wr_clk').srcConnection! <= mClk;
-      respFifo.input('wr_reset').srcConnection! <= mReset;
+      respFifo.input('wr_reset').srcConnection! <= respWrReset;
       respFifo.input('wr_en').srcConnection! <= respPush;
       respFifo.input('wr_data').srcConnection! <=
           (useErr
@@ -386,6 +404,8 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     required HarborCdcFifo respFifo,
     required Logic mClk,
     required Logic mReset,
+    required Logic reqRdReset,
+    required Logic respWrReset,
     required Logic startServe,
     required Logic serving,
     required Logic mCycReg,
@@ -406,10 +426,10 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     final selReg = Logic(name: 'm_sel_r', width: sw);
 
     reqFifo.input('rd_clk').srcConnection! <= mClk;
-    reqFifo.input('rd_reset').srcConnection! <= mReset;
+    reqFifo.input('rd_reset').srcConnection! <= reqRdReset;
     reqFifo.input('rd_en').srcConnection! <= doneReg;
     respFifo.input('wr_clk').srcConnection! <= mClk;
-    respFifo.input('wr_reset').srcConnection! <= mReset;
+    respFifo.input('wr_reset').srcConnection! <= respWrReset;
     respFifo.input('wr_en').srcConnection! <= pushReg;
     respFifo.input('wr_data').srcConnection! <= respReg;
 
@@ -486,6 +506,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
     required bool posted,
     required bool useErr,
     required bool registerMaster,
+    bool resetCopy = false,
   }) {
     _checkDepth(depth, 'depth');
     _checkDepth(respDepth, 'respDepth');
@@ -500,10 +521,12 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
         respDepth == 2 &&
         !blockRam &&
         !useErr &&
-        !registerMaster;
+        !registerMaster &&
+        !resetCopy;
     if (arty) return base;
     return '${base}_${addressWidth}a${dataWidth}d${selWidth}s'
         '${depth}q${respDepth}r${blockRam ? '_bram' : ''}'
-        '${useErr ? '_err' : ''}${registerMaster ? '_mreg' : ''}';
+        '${useErr ? '_err' : ''}${registerMaster ? '_mreg' : ''}'
+        '${resetCopy ? '_rc' : ''}';
   }
 }

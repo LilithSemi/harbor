@@ -547,3 +547,8 @@ class HarborCdcFifo extends BridgeModule {
     return result;
   }
 }
+
+/// Makes a flop on [clk] that loads [d] and sets at once on [set], under
+/// [name]. A vendor flop keeps synthesis from merging two copies.
+typedef HarborResetCopy =
+    Logic Function(Logic clk, Logic d, Logic set, String name);

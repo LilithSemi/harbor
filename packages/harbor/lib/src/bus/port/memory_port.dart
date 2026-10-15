@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
+import '../../clock/cdc.dart';
 import '../axi4/axi4_exclusive.dart';
 import '../axi4/axi4_interface.dart';
 import '../axi4/axi4_memory_port.dart';

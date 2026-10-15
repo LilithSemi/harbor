@@ -170,8 +170,24 @@ void main() {
           (m) => m.definitionName.startsWith('HarborMemoryWaistCdcSlave'),
         );
         expect(cdc.definitionName, endsWith('_r'));
-        // One device reset copy per channel.
-        expect(cdc.subModules.whereType<Ecp5Fd1s3bx>(), hasLength(4));
+        // Per channel: a device reset copy and its early flop. Per device
+        // valid or ready output: one enable copy.
+        final copies = [
+          for (final c in cdc.subModules.whereType<Ecp5Fd1s3bx>()) c.name,
+        ];
+        expect(copies, hasLength(12));
+        for (final ch in ['req', 'wdata', 'rdata', 'wresp']) {
+          expect(copies, contains('${ch}_device_reset'));
+          expect(copies, contains('${ch}_device_reset_early'));
+        }
+        for (final o in [
+          'req_valid',
+          'wdata_valid',
+          'rdata_ready',
+          'wresp_ready',
+        ]) {
+          expect(copies, contains('d_${o}_r_n'));
+        }
         expect(defs.where((d) => d.contains('CdcFifoBridge')), isEmpty);
         expect(
           defs.where((d) => d.startsWith('SdramMemoryPort')),
