@@ -707,10 +707,12 @@ const _artyS7_50 = HarborBoard(
 /// fabric the MAC DMA port is one request at a time. Use AXI4 for the full
 /// rate.
 ///
-/// These are on the board and are left out of [pins] on purpose:
-/// - 125 MHz GTP reference clock MGT_CLK0 P/N = F6/E6 (p.11-12).
-/// - PCIe x4: 100 MHz host reference clock F10/E10, PERST J20, lanes RX0-3
-///   D11/C11 B8/A8 B10/A10 D9/C9 and TX0-3 D5/C5 B4/A4 B6/A6 D7/C7 (p.29-31).
+/// The PCIe x4 connector is hardware-proven at Gen1 x1 through the openXC7
+/// flow: the 100 MHz host reference clock is on MGTREFCLK1 of quad 216, so a
+/// 7-series hard-IP wrapper must use GTREFCLK1 and PLL0REFCLKSEL=3'b010. Lane
+/// zero is channel 1 (GTPE2_CHANNEL_X0Y5), not channel 0. The remaining board
+/// lane/channel order is 1/0, 2/2, 3/3. The `MGT` pin-map marker suppresses an
+/// invalid IOSTANDARD property on transceiver and reference-clock pads.
 const _ax7203 = HarborBoard(
   name: 'ax7203',
   vendor: HarborFpgaVendor.openXc7,
@@ -740,6 +742,35 @@ const _ax7203 = HarborBoard(
     // Carrier keys KEY1 and KEY2, active low (p.40-41).
     'key_n[0]': 'J21 LVCMOS33',
     'key_n[1]': 'E13 LVCMOS33',
+    // On-board 125 MHz SiT9102 GTP reference clock (p.11-12).
+    'gtp_refclk_p': 'F6 MGT',
+    'gtp_refclk_n': 'E6 MGT',
+    // PCIe x4 (p.29-31). These are MGT pads except PERST#.
+    'pcie_refclk_p': 'F10 MGT',
+    'pcie_refclk_n': 'E10 MGT',
+    'pcie_perst_n': 'J20 LVCMOS33 PULLUP=TRUE',
+    'pcie_rxp[0]': 'D11 MGT',
+    'pcie_rxn[0]': 'C11 MGT',
+    'pcie_txp[0]': 'D5 MGT',
+    'pcie_txn[0]': 'C5 MGT',
+    'pcie_rxp[1]': 'B8 MGT',
+    'pcie_rxn[1]': 'A8 MGT',
+    'pcie_txp[1]': 'B4 MGT',
+    'pcie_txn[1]': 'A4 MGT',
+    'pcie_rxp[2]': 'B10 MGT',
+    'pcie_rxn[2]': 'A10 MGT',
+    'pcie_txp[2]': 'B6 MGT',
+    'pcie_txn[2]': 'A6 MGT',
+    'pcie_rxp[3]': 'D9 MGT',
+    'pcie_rxn[3]': 'C9 MGT',
+    'pcie_txp[3]': 'D7 MGT',
+    'pcie_txn[3]': 'C7 MGT',
+    // N25Q128 configuration flash (p.13). CCLK is driven through STARTUPE2.
+    'spi_cs_n': 'T19 LVCMOS33',
+    'spi_io[0]': 'P22 LVCMOS33',
+    'spi_io[1]': 'R22 LVCMOS33',
+    'spi_io[2]': 'P21 LVCMOS33',
+    'spi_io[3]': 'R21 LVCMOS33',
     // SiI9134 HDMI transmitter, parallel input (p.31-32). hdmi_d[23:16],
     // [15:8] and [7:0] drive the top 8 bits of the SiI9134 D[35:24], D[23:12]
     // and D[11:0] channels. The color of each channel is set by the SiI9134

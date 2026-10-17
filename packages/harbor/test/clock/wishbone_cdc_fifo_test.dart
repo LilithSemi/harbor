@@ -584,35 +584,42 @@ void main() {
         return rd;
       }
 
-      test('an m_reset mid-serve leaves no stale or duplicate response', () async {
-        final h = build(ackDelay: 3);
-        await startAndRelease(h);
+      test(
+        'an m_reset mid-serve leaves no stale or duplicate response',
+        () async {
+          final h = build(ackDelay: 3);
+          await startAndRelease(h);
 
-        // Start a read the master side never finishes: land the reset
-        // while it is still serving, before any ack.
-        h.sAdr.inject(0x40);
-        h.sWe.inject(0);
-        h.sCyc.inject(1);
-        h.sStb.inject(1);
-        while (h.dut.output('m_cyc').value != LogicValue.one) {
-          await h.mClk.nextPosedge;
-        }
-        h.mReset.inject(1);
-        for (var i = 0; i < 4; i++) {
-          await h.mClk.nextPosedge;
-        }
-        h.sCyc.inject(0);
-        h.sStb.inject(0);
-        h.mReset.inject(0);
-        for (var i = 0; i < 8; i++) {
-          await h.sClk.nextPosedge;
-        }
+          // Start a read the master side never finishes: land the reset
+          // while it is still serving, before any ack.
+          h.sAdr.inject(0x40);
+          h.sWe.inject(0);
+          h.sCyc.inject(1);
+          h.sStb.inject(1);
+          while (h.dut.output('m_cyc').value != LogicValue.one) {
+            await h.mClk.nextPosedge;
+          }
+          h.mReset.inject(1);
+          for (var i = 0; i < 4; i++) {
+            await h.mClk.nextPosedge;
+          }
+          h.sCyc.inject(0);
+          h.sStb.inject(0);
+          h.mReset.inject(0);
+          for (var i = 0; i < 8; i++) {
+            await h.sClk.nextPosedge;
+          }
 
-        final rd = await readAt(h, 0x80);
-        expect(rd, equals(0x80), reason: 'no stale data after a mid-serve reset');
+          final rd = await readAt(h, 0x80);
+          expect(
+            rd,
+            equals(0x80),
+            reason: 'no stale data after a mid-serve reset',
+          );
 
-        await Simulator.endSimulation();
-      });
+          await Simulator.endSimulation();
+        },
+      );
 
       test(
         'an m_reset in the done_r cycle leaves no stale or duplicate response',
@@ -705,35 +712,38 @@ void main() {
         );
       }
 
-      test('an orphan read leaves no stale response for the next read', () async {
-        final h = build(ackDelay: 2);
-        await startAndRelease(h);
+      test(
+        'an orphan read leaves no stale response for the next read',
+        () async {
+          final h = build(ackDelay: 2);
+          await startAndRelease(h);
 
-        // Start a read, let it get accepted, then abandon it before any ack.
-        h.sAdr.inject(0x40);
-        h.sWe.inject(0);
-        h.sCyc.inject(1);
-        h.sStb.inject(1);
-        while (!pending(h)) {
-          await h.sClk.nextPosedge;
-        }
-        h.sCyc.inject(0);
-        h.sStb.inject(0);
-        // A real idle cycle so the bridge samples cyc low at least once:
-        // the orphan flag only sets on `pending & ~sReq`.
-        for (var i = 0; i < 6; i++) {
-          await h.sClk.nextPosedge;
-        }
+          // Start a read, let it get accepted, then abandon it before any ack.
+          h.sAdr.inject(0x40);
+          h.sWe.inject(0);
+          h.sCyc.inject(1);
+          h.sStb.inject(1);
+          while (!pending(h)) {
+            await h.sClk.nextPosedge;
+          }
+          h.sCyc.inject(0);
+          h.sStb.inject(0);
+          // A real idle cycle so the bridge samples cyc low at least once:
+          // the orphan flag only sets on `pending & ~sReq`.
+          for (var i = 0; i < 6; i++) {
+            await h.sClk.nextPosedge;
+          }
 
-        final rd = await readAt(h, 0x84);
-        expect(
-          rd,
-          equals(0x84),
-          reason: 'the next read must not see the orphan response',
-        );
+          final rd = await readAt(h, 0x84);
+          expect(
+            rd,
+            equals(0x84),
+            reason: 'the next read must not see the orphan response',
+          );
 
-        await Simulator.endSimulation();
-      });
+          await Simulator.endSimulation();
+        },
+      );
     });
   });
 }

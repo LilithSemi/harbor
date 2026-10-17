@@ -46,14 +46,14 @@
 #define HARBOR_USB_CTRL_ENABLE	BIT(0)
 #define HARBOR_USB_CTRL_CONNECT BIT(1)
 
-#define HARBOR_USB_INT_RESET  BIT(0)
-#define HARBOR_USB_INT_SOF    BIT(1)
+#define HARBOR_USB_INT_RESET BIT(0)
+#define HARBOR_USB_INT_SOF   BIT(1)
 /* The controller's USB side was reset on its own. Hardware drops the
  * pullup for a short time, so the host sees a detach.
  */
 #define HARBOR_USB_INT_LOCAL_RESET BIT(2)
-#define HARBOR_USB_INT_OUT(n) BIT(8 + (n))
-#define HARBOR_USB_INT_IN(n)  BIT(16 + (n))
+#define HARBOR_USB_INT_OUT(n)	   BIT(8 + (n))
+#define HARBOR_USB_INT_IN(n)	   BIT(16 + (n))
 
 #define HARBOR_USB_EP_BASE   0x200
 #define HARBOR_USB_EP_STRIDE 0x40
@@ -82,7 +82,7 @@
 #define HARBOR_USB_OUT_STAT_LEN_SHIFT 8
 #define HARBOR_USB_OUT_STAT_LEN_MASK  GENMASK(15, 8)
 
-#define HARBOR_USB_IN_STAT_FREE  BIT(0)
+#define HARBOR_USB_IN_STAT_FREE	 BIT(0)
 #define HARBOR_USB_IN_STAT_ACKED BIT(1)
 
 #define HARBOR_USB_TYPE_CONTROL 0
@@ -102,12 +102,15 @@ struct harbor_usb_ep {
 	struct harbor_usb *hu;
 	struct list_head queue;
 	u8 idx;
-	bool is_in;		/* non-zero endpoints only. EP0 uses ep0_dir_in */
+	bool is_in; /* non-zero endpoints only. EP0 uses ep0_dir_in */
 	bool halted;
-	bool wedged;		/* halted, and a host CLEAR_FEATURE(HALT) must not clear it */
-	bool in_armed;		 /* IN direction: a packet is committed, no IN-done yet */
-	bool in_last_committed; /* IN direction: this commit finishes the request */
-	unsigned int in_last_chunk; /* bytes in the armed commit, unconfirmed until IN-done */
+	bool
+	    wedged; /* halted, and a host CLEAR_FEATURE(HALT) must not clear it */
+	bool in_armed; /* IN direction: a packet is committed, no IN-done yet */
+	bool
+	    in_last_committed; /* IN direction: this commit finishes the request */
+	unsigned int
+	    in_last_chunk; /* bytes in the armed commit, unconfirmed until IN-done */
 };
 
 struct harbor_usb {
@@ -122,13 +125,15 @@ struct harbor_usb {
 	struct harbor_usb_ep ep0;
 	struct harbor_usb_ep *ep_in;  /* index 1..num_ep-1 */
 	struct harbor_usb_ep *ep_out; /* index 1..num_ep-1 */
-	unsigned int *ep_enable_count; /* shared per hw index, IN+OUT together */
-	u8 *ep_type;			/* last type applied to a hw index */
+	unsigned int
+	    *ep_enable_count; /* shared per hw index, IN+OUT together */
+	u8 *ep_type;	      /* last type applied to a hw index */
 
 	u8 setup_buf[8];
 	bool ep0_dir_in;
 	bool ep0_internal_status; /* a status ZLP this driver armed itself */
-	bool ep0_delayed_status;  /* setup() returned USB_GADGET_DELAYED_STATUS */
+	bool
+	    ep0_delayed_status; /* setup() returned USB_GADGET_DELAYED_STATUS */
 	bool addr_pending;
 	u8 pending_addr;
 };
@@ -205,11 +210,13 @@ static void harbor_usb_nuke(struct harbor_usb *hu, struct harbor_usb_ep *ep,
 {
 	struct harbor_usb_req *req;
 
-	if (flush && !list_empty(&ep->queue) && harbor_ep_is_in(ep) && ep->in_armed)
+	if (flush && !list_empty(&ep->queue) && harbor_ep_is_in(ep) &&
+	    ep->in_armed)
 		harbor_usb_in_flush_armed(hu, ep);
 
 	while (!list_empty(&ep->queue)) {
-		req = list_first_entry(&ep->queue, struct harbor_usb_req, queue);
+		req =
+		    list_first_entry(&ep->queue, struct harbor_usb_req, queue);
 		list_del_init(&req->queue);
 		req->req.status = status;
 		spin_unlock(&hu->lock);
@@ -322,7 +329,8 @@ static void harbor_usb_out_advance(struct harbor_usb *hu,
 		return;
 
 	req = list_first_entry(&ep->queue, struct harbor_usb_req, queue);
-	full_len = (stat0 & HARBOR_USB_OUT_STAT_LEN_MASK) >> HARBOR_USB_OUT_STAT_LEN_SHIFT;
+	full_len = (stat0 & HARBOR_USB_OUT_STAT_LEN_MASK) >>
+		   HARBOR_USB_OUT_STAT_LEN_SHIFT;
 	room = req->req.length - req->req.actual;
 	len = min(full_len, room);
 
@@ -387,12 +395,16 @@ static void harbor_usb_ep_halt(struct harbor_usb_ep *ep, bool halt)
 	u32 cfg;
 
 	if (ep->idx == 0)
-		cfg = halt ? (HARBOR_USB_EP_CFG_STALL_OUT | HARBOR_USB_EP_CFG_STALL_IN)
-			   : (HARBOR_USB_EP_CFG_CLEAR_OUT | HARBOR_USB_EP_CFG_CLEAR_IN);
+		cfg = halt ? (HARBOR_USB_EP_CFG_STALL_OUT |
+			      HARBOR_USB_EP_CFG_STALL_IN)
+			   : (HARBOR_USB_EP_CFG_CLEAR_OUT |
+			      HARBOR_USB_EP_CFG_CLEAR_IN);
 	else if (harbor_ep_is_in(ep))
-		cfg = halt ? HARBOR_USB_EP_CFG_STALL_IN : HARBOR_USB_EP_CFG_CLEAR_IN;
+		cfg = halt ? HARBOR_USB_EP_CFG_STALL_IN
+			   : HARBOR_USB_EP_CFG_CLEAR_IN;
 	else
-		cfg = halt ? HARBOR_USB_EP_CFG_STALL_OUT : HARBOR_USB_EP_CFG_CLEAR_OUT;
+		cfg = halt ? HARBOR_USB_EP_CFG_STALL_OUT
+			   : HARBOR_USB_EP_CFG_CLEAR_OUT;
 	harbor_usb_ep_cfg_write(hu, ep->idx, cfg);
 	ep->halted = halt;
 }
@@ -404,7 +416,7 @@ static void harbor_usb_ep_halt(struct harbor_usb_ep *ep, bool halt)
  * stalls (USB 2.0 9.4.9). Returns true if this call owned the request.
  */
 static bool harbor_usb_dev_std_request(struct harbor_usb *hu,
-					const struct usb_ctrlrequest *ctrl)
+				       const struct usb_ctrlrequest *ctrl)
 {
 	u8 data[2];
 	unsigned int len;
@@ -417,7 +429,8 @@ static bool harbor_usb_dev_std_request(struct harbor_usb *hu,
 	case USB_REQ_GET_STATUS:
 		data[0] = hu->gadget.is_selfpowered << USB_DEVICE_SELF_POWERED;
 		data[1] = 0;
-		len = min_t(unsigned int, le16_to_cpu(ctrl->wLength), sizeof(data));
+		len = min_t(unsigned int, le16_to_cpu(ctrl->wLength),
+			    sizeof(data));
 		harbor_usb_ep0_in_internal(hu, data, len);
 		return true;
 	case USB_REQ_CLEAR_FEATURE:
@@ -440,9 +453,9 @@ static bool harbor_usb_dev_std_request(struct harbor_usb *hu,
  * interface-recipient SET/CLEAR_FEATURE in USB 2.0 full speed.
  */
 static bool harbor_usb_iface_std_request(struct harbor_usb *hu,
-					  const struct usb_ctrlrequest *ctrl)
+					 const struct usb_ctrlrequest *ctrl)
 {
-	static const u8 data[2] = { 0, 0 };
+	static const u8 data[2] = {0, 0};
 	unsigned int len;
 
 	if ((ctrl->bRequestType & USB_TYPE_MASK) != USB_TYPE_STANDARD ||
@@ -461,7 +474,7 @@ static bool harbor_usb_iface_std_request(struct harbor_usb *hu,
  * 9.4.5). Returns true if this call owned the request.
  */
 static bool harbor_usb_ep0_std_request(struct harbor_usb *hu,
-					const struct usb_ctrlrequest *ctrl)
+				       const struct usb_ctrlrequest *ctrl)
 {
 	struct harbor_usb_ep *ep;
 	unsigned int idx = le16_to_cpu(ctrl->wIndex) & USB_ENDPOINT_NUMBER_MASK;
@@ -485,7 +498,8 @@ static bool harbor_usb_ep0_std_request(struct harbor_usb *hu,
 	case USB_REQ_GET_STATUS:
 		data[0] = ep->halted ? 1 : 0;
 		data[1] = 0;
-		len = min_t(unsigned int, le16_to_cpu(ctrl->wLength), sizeof(data));
+		len = min_t(unsigned int, le16_to_cpu(ctrl->wLength),
+			    sizeof(data));
 		harbor_usb_ep0_in_internal(hu, data, len);
 		return true;
 	case USB_REQ_SET_FEATURE:
@@ -598,8 +612,8 @@ static void harbor_usb_handle_out_ready(struct harbor_usb *hu,
 		 * will not come.
 		 */
 		if (ep->in_last_committed && !list_empty(&ep->queue)) {
-			struct harbor_usb_req *req =
-			    list_first_entry(&ep->queue, struct harbor_usb_req, queue);
+			struct harbor_usb_req *req = list_first_entry(
+			    &ep->queue, struct harbor_usb_req, queue);
 
 			ep->in_armed = false;
 			ep->in_last_committed = false;
@@ -633,9 +647,9 @@ static void harbor_usb_handle_in_done(struct harbor_usb *hu,
 		if (hu->addr_pending) {
 			writel(hu->pending_addr, hu->base + HARBOR_USB_ADDR);
 			hu->addr_pending = false;
-			usb_gadget_set_state(&hu->gadget,
-					     hu->pending_addr ? USB_STATE_ADDRESS :
-								 USB_STATE_DEFAULT);
+			usb_gadget_set_state(
+			    &hu->gadget, hu->pending_addr ? USB_STATE_ADDRESS
+							  : USB_STATE_DEFAULT);
 		}
 		return;
 	}
@@ -761,7 +775,7 @@ static irqreturn_t harbor_usb_irq(int irq, void *data)
 }
 
 static struct usb_request *harbor_usb_ep_alloc_request(struct usb_ep *_ep,
-							gfp_t gfp)
+						       gfp_t gfp)
 {
 	struct harbor_usb_req *req;
 
@@ -787,11 +801,12 @@ static int harbor_usb_ep_enable(struct usb_ep *_ep,
 	unsigned int maxp;
 	u32 type;
 
-	if (!desc || (!usb_endpoint_xfer_bulk(desc) && !usb_endpoint_xfer_int(desc)))
+	if (!desc ||
+	    (!usb_endpoint_xfer_bulk(desc) && !usb_endpoint_xfer_int(desc)))
 		return -EINVAL;
 
-	type = usb_endpoint_xfer_bulk(desc) ? HARBOR_USB_TYPE_BULK :
-					      HARBOR_USB_TYPE_INT;
+	type = usb_endpoint_xfer_bulk(desc) ? HARBOR_USB_TYPE_BULK
+					    : HARBOR_USB_TYPE_INT;
 	ep->is_in = usb_endpoint_dir_in(desc);
 	ep->halted = false;
 	_ep->desc = desc;
@@ -808,8 +823,8 @@ static int harbor_usb_ep_enable(struct usb_ep *_ep,
 	 * toggle together with the enable and type write.
 	 */
 	harbor_usb_ep_cfg_write(hu, ep->idx,
-				ep->is_in ? HARBOR_USB_EP_CFG_TOGGLE_IN :
-					    HARBOR_USB_EP_CFG_TOGGLE_OUT);
+				ep->is_in ? HARBOR_USB_EP_CFG_TOGGLE_IN
+					  : HARBOR_USB_EP_CFG_TOGGLE_OUT);
 	spin_unlock_irqrestore(&hu->lock, flags);
 	return 0;
 }
@@ -941,12 +956,14 @@ static int harbor_usb_ep_dequeue(struct usb_ep *_ep, struct usb_request *_req)
 	int ret = -EINVAL;
 
 	spin_lock_irqsave(&hu->lock, flags);
-	list_for_each_entry(req, &ep->queue, queue) {
+	list_for_each_entry(req, &ep->queue, queue)
+	{
 		if (&req->req == _req) {
-			bool is_head = req == list_first_entry(&ep->queue,
-								struct harbor_usb_req,
-								queue);
-			bool was_armed = is_head && harbor_ep_is_in(ep) && ep->in_armed;
+			bool is_head = req == list_first_entry(
+						  &ep->queue,
+						  struct harbor_usb_req, queue);
+			bool was_armed =
+			    is_head && harbor_ep_is_in(ep) && ep->in_armed;
 
 			if (was_armed)
 				harbor_usb_in_flush_armed(hu, ep);
@@ -980,7 +997,8 @@ static int harbor_usb_ep_set_halt(struct usb_ep *_ep, int halt)
 	int ret = 0;
 
 	spin_lock_irqsave(&hu->lock, flags);
-	if (halt && ep->idx != 0 && harbor_ep_is_in(ep) && !list_empty(&ep->queue)) {
+	if (halt && ep->idx != 0 && harbor_ep_is_in(ep) &&
+	    !list_empty(&ep->queue)) {
 		ret = -EAGAIN;
 		goto out;
 	}
@@ -1111,12 +1129,14 @@ static int harbor_usb_probe(struct platform_device *pdev)
 	spin_lock_init(&hu->lock);
 	hu->ep0_dir_in = true;
 
-	hu->ep_in = devm_kcalloc(&pdev->dev, num_ep, sizeof(*hu->ep_in), GFP_KERNEL);
-	hu->ep_out = devm_kcalloc(&pdev->dev, num_ep, sizeof(*hu->ep_out), GFP_KERNEL);
-	hu->ep_enable_count = devm_kcalloc(&pdev->dev, num_ep,
-					   sizeof(*hu->ep_enable_count), GFP_KERNEL);
-	hu->ep_type = devm_kcalloc(&pdev->dev, num_ep, sizeof(*hu->ep_type),
-				  GFP_KERNEL);
+	hu->ep_in =
+	    devm_kcalloc(&pdev->dev, num_ep, sizeof(*hu->ep_in), GFP_KERNEL);
+	hu->ep_out =
+	    devm_kcalloc(&pdev->dev, num_ep, sizeof(*hu->ep_out), GFP_KERNEL);
+	hu->ep_enable_count = devm_kcalloc(
+	    &pdev->dev, num_ep, sizeof(*hu->ep_enable_count), GFP_KERNEL);
+	hu->ep_type =
+	    devm_kcalloc(&pdev->dev, num_ep, sizeof(*hu->ep_type), GFP_KERNEL);
 	if (!hu->ep_in || !hu->ep_out || !hu->ep_enable_count || !hu->ep_type)
 		return -ENOMEM;
 
@@ -1157,7 +1177,8 @@ static int harbor_usb_probe(struct platform_device *pdev)
 		in->idx = i;
 		in->is_in = true;
 		in->ep.ops = &harbor_usb_ep_ops;
-		in->ep.name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "ep%uin", i);
+		in->ep.name =
+		    devm_kasprintf(&pdev->dev, GFP_KERNEL, "ep%uin", i);
 		if (!in->ep.name)
 			return -ENOMEM;
 		in->ep.caps.type_bulk = true;
@@ -1171,7 +1192,8 @@ static int harbor_usb_probe(struct platform_device *pdev)
 		out->idx = i;
 		out->is_in = false;
 		out->ep.ops = &harbor_usb_ep_ops;
-		out->ep.name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "ep%uout", i);
+		out->ep.name =
+		    devm_kasprintf(&pdev->dev, GFP_KERNEL, "ep%uout", i);
 		if (!out->ep.name)
 			return -ENOMEM;
 		out->ep.caps.type_bulk = true;

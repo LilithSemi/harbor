@@ -373,10 +373,65 @@ void main() {
     expect(byBall.values.where((v) => v.length > 1), isEmpty);
   });
 
-  test('PCIe and the GTP reference clock are not wired', () {
-    final balls = {for (final v in board.pins.values) v.split(' ').first};
-    for (final ball in ['F6', 'E6', 'F10', 'E10', 'J20']) {
-      expect(balls, isNot(contains(ball)));
+  test('PCIe x4 and both GTP reference clocks are mapped', () {
+    const expected = {
+      'gtp_refclk_p': 'F6 MGT',
+      'gtp_refclk_n': 'E6 MGT',
+      'pcie_refclk_p': 'F10 MGT',
+      'pcie_refclk_n': 'E10 MGT',
+      'pcie_perst_n': 'J20 LVCMOS33 PULLUP=TRUE',
+      'pcie_rxp[0]': 'D11 MGT',
+      'pcie_rxn[0]': 'C11 MGT',
+      'pcie_txp[0]': 'D5 MGT',
+      'pcie_txn[0]': 'C5 MGT',
+      'pcie_rxp[1]': 'B8 MGT',
+      'pcie_rxn[1]': 'A8 MGT',
+      'pcie_txp[1]': 'B4 MGT',
+      'pcie_txn[1]': 'A4 MGT',
+      'pcie_rxp[2]': 'B10 MGT',
+      'pcie_rxn[2]': 'A10 MGT',
+      'pcie_txp[2]': 'B6 MGT',
+      'pcie_txn[2]': 'A6 MGT',
+      'pcie_rxp[3]': 'D9 MGT',
+      'pcie_rxn[3]': 'C9 MGT',
+      'pcie_txp[3]': 'D7 MGT',
+      'pcie_txn[3]': 'C7 MGT',
+    };
+    for (final entry in expected.entries) {
+      expect(board.pins[entry.key], entry.value, reason: entry.key);
+    }
+  });
+
+  test('MGT constraints have package pins and no SelectIO standard', () {
+    final target = board.fpgaTarget(
+      pins: ['pcie_refclk_p', 'pcie_refclk_n', 'pcie_perst_n', 'pcie_rxp[0]'],
+    );
+    final xdc = target.generateConstraints();
+    for (final port in ['pcie_refclk_p', 'pcie_refclk_n', 'pcie_rxp[0]']) {
+      final line = xdc
+          .split('\n')
+          .singleWhere((l) => l.endsWith('[get_ports $port]'));
+      expect(line, contains('PACKAGE_PIN'));
+      expect(line, isNot(contains('IOSTANDARD')));
+      expect(line, isNot(contains('MGT')));
+    }
+    final perst = xdc
+        .split('\n')
+        .singleWhere((l) => l.endsWith('[get_ports pcie_perst_n]'));
+    expect(perst, contains('IOSTANDARD LVCMOS33'));
+    expect(perst, contains('PULLUP TRUE'));
+  });
+
+  test('configuration flash pads are mapped', () {
+    const expected = {
+      'spi_cs_n': 'T19 LVCMOS33',
+      'spi_io[0]': 'P22 LVCMOS33',
+      'spi_io[1]': 'R22 LVCMOS33',
+      'spi_io[2]': 'P21 LVCMOS33',
+      'spi_io[3]': 'R21 LVCMOS33',
+    };
+    for (final entry in expected.entries) {
+      expect(board.pins[entry.key], entry.value, reason: entry.key);
     }
   });
 

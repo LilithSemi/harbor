@@ -29,112 +29,112 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 
-#define HETH_ID			0x000
-#define HETH_HW_CAPS		0x004
-#define HETH_CTRL		0x008
-#define HETH_STATUS		0x00c
-#define HETH_INT_STATUS		0x010
-#define HETH_INT_ENABLE		0x014
-#define HETH_MAC_LO		0x018
-#define HETH_MAC_HI		0x01c
-#define HETH_MC_HASH_LO		0x020
-#define HETH_MC_HASH_HI		0x024
-#define HETH_TX_RING		0x030
-#define HETH_RX_RING		0x050
-#define HETH_RING_LO		0x00
-#define HETH_RING_HI		0x04
-#define HETH_RING_SIZE		0x08
-#define HETH_RING_TAIL		0x0c
-#define HETH_RING_HEAD		0x10
-#define HETH_MDIO_CTRL		0x070
-#define HETH_MDIO_DATA		0x074
-#define HETH_MDIO_DIV		0x078
-#define HETH_CNT_BASE		0x080
+#define HETH_ID		0x000
+#define HETH_HW_CAPS	0x004
+#define HETH_CTRL	0x008
+#define HETH_STATUS	0x00c
+#define HETH_INT_STATUS 0x010
+#define HETH_INT_ENABLE 0x014
+#define HETH_MAC_LO	0x018
+#define HETH_MAC_HI	0x01c
+#define HETH_MC_HASH_LO 0x020
+#define HETH_MC_HASH_HI 0x024
+#define HETH_TX_RING	0x030
+#define HETH_RX_RING	0x050
+#define HETH_RING_LO	0x00
+#define HETH_RING_HI	0x04
+#define HETH_RING_SIZE	0x08
+#define HETH_RING_TAIL	0x0c
+#define HETH_RING_HEAD	0x10
+#define HETH_MDIO_CTRL	0x070
+#define HETH_MDIO_DATA	0x074
+#define HETH_MDIO_DIV	0x078
+#define HETH_CNT_BASE	0x080
 
-#define HETH_ID_VALUE		0x45544831
+#define HETH_ID_VALUE 0x45544831
 
-#define HETH_CAPS_MII		BIT(0)
-#define HETH_CAPS_RMII		BIT(1)
-#define HETH_CAPS_RGMII		BIT(2)
-#define HETH_CAPS_GIGABIT	BIT(3)
-#define HETH_CAPS_MC_HASH	BIT(4)
-#define HETH_CAPS_PROMISC	BIT(5)
-#define HETH_CAPS_PAUSE		BIT(6)
-#define HETH_CAPS_MDIO_C45	BIT(9)
-#define HETH_CAPS_DESC_LOG2	GENMASK(15, 12)
+#define HETH_CAPS_MII	    BIT(0)
+#define HETH_CAPS_RMII	    BIT(1)
+#define HETH_CAPS_RGMII	    BIT(2)
+#define HETH_CAPS_GIGABIT   BIT(3)
+#define HETH_CAPS_MC_HASH   BIT(4)
+#define HETH_CAPS_PROMISC   BIT(5)
+#define HETH_CAPS_PAUSE	    BIT(6)
+#define HETH_CAPS_MDIO_C45  BIT(9)
+#define HETH_CAPS_DESC_LOG2 GENMASK(15, 12)
 
-#define HETH_CTRL_TX_EN		BIT(0)
-#define HETH_CTRL_RX_EN		BIT(1)
-#define HETH_CTRL_PROMISC	BIT(2)
-#define HETH_CTRL_KEEP_BAD	BIT(3)
-#define HETH_CTRL_SPEED		GENMASK(5, 4)
-#define HETH_CTRL_FULL_DUPLEX	BIT(6)
-#define HETH_CTRL_SOFT_RESET	BIT(7)
+#define HETH_CTRL_TX_EN	      BIT(0)
+#define HETH_CTRL_RX_EN	      BIT(1)
+#define HETH_CTRL_PROMISC     BIT(2)
+#define HETH_CTRL_KEEP_BAD    BIT(3)
+#define HETH_CTRL_SPEED	      GENMASK(5, 4)
+#define HETH_CTRL_FULL_DUPLEX BIT(6)
+#define HETH_CTRL_SOFT_RESET  BIT(7)
 
-#define HETH_SPEED_10		0
-#define HETH_SPEED_100		1
-#define HETH_SPEED_1000		2
+#define HETH_SPEED_10	0
+#define HETH_SPEED_100	1
+#define HETH_SPEED_1000 2
 
-#define HETH_ST_TX_RUNNING	BIT(0)
-#define HETH_ST_RX_RUNNING	BIT(1)
-#define HETH_ST_TX_RING_ERR	BIT(2)
-#define HETH_ST_RX_RING_ERR	BIT(3)
-#define HETH_ST_RX_CLK_LOST	BIT(4)
-#define HETH_ST_TX_CLK_LOST	BIT(5)
+#define HETH_ST_TX_RUNNING  BIT(0)
+#define HETH_ST_RX_RUNNING  BIT(1)
+#define HETH_ST_TX_RING_ERR BIT(2)
+#define HETH_ST_RX_RING_ERR BIT(3)
+#define HETH_ST_RX_CLK_LOST BIT(4)
+#define HETH_ST_TX_CLK_LOST BIT(5)
 
-#define HETH_INT_TX_DONE	BIT(0)
-#define HETH_INT_RX_DONE	BIT(1)
-#define HETH_INT_TX_ERR		BIT(2)
-#define HETH_INT_RX_ERR		BIT(3)
-#define HETH_INT_RX_MISSED	BIT(4)
-#define HETH_INT_ALL		GENMASK(4, 0)
+#define HETH_INT_TX_DONE   BIT(0)
+#define HETH_INT_RX_DONE   BIT(1)
+#define HETH_INT_TX_ERR	   BIT(2)
+#define HETH_INT_RX_ERR	   BIT(3)
+#define HETH_INT_RX_MISSED BIT(4)
+#define HETH_INT_ALL	   GENMASK(4, 0)
 
-#define HETH_MDIO_REG		GENMASK(4, 0)
-#define HETH_MDIO_PHY		GENMASK(9, 5)
-#define HETH_MDIO_WRITE		BIT(10)
-#define HETH_MDIO_C45		BIT(11)
-#define HETH_MDIO_START		BIT(12)
-#define HETH_MDIO_BUSY		BIT(13)
-#define HETH_MDIO_DEVAD		GENMASK(20, 16)
-#define HETH_MDIO_DATA_VAL	GENMASK(15, 0)
-#define HETH_MDIO_DATA_ADDR	GENMASK(31, 16)
-#define HETH_MDC_MAX_HZ		2500000
+#define HETH_MDIO_REG	    GENMASK(4, 0)
+#define HETH_MDIO_PHY	    GENMASK(9, 5)
+#define HETH_MDIO_WRITE	    BIT(10)
+#define HETH_MDIO_C45	    BIT(11)
+#define HETH_MDIO_START	    BIT(12)
+#define HETH_MDIO_BUSY	    BIT(13)
+#define HETH_MDIO_DEVAD	    GENMASK(20, 16)
+#define HETH_MDIO_DATA_VAL  GENMASK(15, 0)
+#define HETH_MDIO_DATA_ADDR GENMASK(31, 16)
+#define HETH_MDC_MAX_HZ	    2500000
 
 /* Descriptor word 2. */
-#define HETH_DESC_LEN		GENMASK(15, 0)
-#define HETH_DESC_SOP		BIT(16)
-#define HETH_DESC_EOP		BIT(17)
-#define HETH_DESC_IRQ		BIT(18)
-#define HETH_DESC_OWN		BIT(31)
+#define HETH_DESC_LEN GENMASK(15, 0)
+#define HETH_DESC_SOP BIT(16)
+#define HETH_DESC_EOP BIT(17)
+#define HETH_DESC_IRQ BIT(18)
+#define HETH_DESC_OWN BIT(31)
 
 /* TX descriptor word 3. */
-#define HETH_TXS_DONE		BIT(0)
-#define HETH_TXS_ERR		GENMASK(3, 1)
+#define HETH_TXS_DONE BIT(0)
+#define HETH_TXS_ERR  GENMASK(3, 1)
 
 /* RX descriptor word 3. */
-#define HETH_RXS_LEN		GENMASK(15, 0)
-#define HETH_RXS_SOP		BIT(16)
-#define HETH_RXS_EOP		BIT(17)
-#define HETH_RXS_ERR		GENMASK(24, 22)
+#define HETH_RXS_LEN GENMASK(15, 0)
+#define HETH_RXS_SOP BIT(16)
+#define HETH_RXS_EOP BIT(17)
+#define HETH_RXS_ERR GENMASK(24, 22)
 
-#define HETH_TX_ERR_CLK_LOST	4
+#define HETH_TX_ERR_CLK_LOST 4
 
-#define HETH_RX_ERR_FCS		1
-#define HETH_RX_ERR_RUNT	2
-#define HETH_RX_ERR_OVERSIZE	3
-#define HETH_RX_ERR_CUT		6
-#define HETH_RX_ERR_PHY		7
+#define HETH_RX_ERR_FCS	     1
+#define HETH_RX_ERR_RUNT     2
+#define HETH_RX_ERR_OVERSIZE 3
+#define HETH_RX_ERR_CUT	     6
+#define HETH_RX_ERR_PHY	     7
 
-#define HETH_TX_ORDER		8
-#define HETH_RX_ORDER		8
-#define HETH_RX_BUF_SIZE	2048
-#define HETH_MAX_FRAME		1518
-#define HETH_STOP_TIMEOUT_US	50000
+#define HETH_TX_ORDER	     8
+#define HETH_RX_ORDER	     8
+#define HETH_RX_BUF_SIZE     2048
+#define HETH_MAX_FRAME	     1518
+#define HETH_STOP_TIMEOUT_US 50000
 
-static const char * const heth_counter_names[] = {
-	"hw_tx_frames", "hw_rx_frames", "hw_rx_fcs_err",
-	"hw_rx_missed", "hw_rx_overflow", "hw_rx_runt",
-	"hw_rx_oversize", "hw_tx_pause", "hw_rx_pause",
+static const char *const heth_counter_names[] = {
+    "hw_tx_frames",   "hw_rx_frames",	"hw_rx_fcs_err",
+    "hw_rx_missed",   "hw_rx_overflow", "hw_rx_runt",
+    "hw_rx_oversize", "hw_tx_pause",	"hw_rx_pause",
 };
 
 enum {
@@ -227,8 +227,8 @@ static struct heth_desc *heth_desc(void *ring, struct heth_priv *p,
 
 static unsigned int heth_num_counters(struct heth_priv *p)
 {
-	return (p->caps & HETH_CAPS_PAUSE) ? HETH_NUM_COUNTERS :
-					     HETH_CNT_TX_PAUSE;
+	return (p->caps & HETH_CAPS_PAUSE) ? HETH_NUM_COUNTERS
+					   : HETH_CNT_TX_PAUSE;
 }
 
 /* The counters wrap at 32 bits. Each read adds the change since the last. */
@@ -270,12 +270,13 @@ static int heth_wait_stopped(struct heth_priv *p, u32 mask)
 	u32 st;
 
 	heth_wr(p, HETH_STATUS, HETH_ST_TX_CLK_LOST | HETH_ST_RX_CLK_LOST);
-	return readl_poll_timeout(p->base + HETH_STATUS, st,
-		(!(mask & HETH_ST_TX_RUNNING) || !(st & HETH_ST_TX_RUNNING) ||
-		 (st & HETH_ST_TX_CLK_LOST)) &&
+	return readl_poll_timeout(
+	    p->base + HETH_STATUS, st,
+	    (!(mask & HETH_ST_TX_RUNNING) || !(st & HETH_ST_TX_RUNNING) ||
+	     (st & HETH_ST_TX_CLK_LOST)) &&
 		(!(mask & HETH_ST_RX_RUNNING) || !(st & HETH_ST_RX_RUNNING) ||
 		 (st & HETH_ST_RX_CLK_LOST)),
-		10, HETH_STOP_TIMEOUT_US);
+	    10, HETH_STOP_TIMEOUT_US);
 }
 
 /* MDIO */
@@ -285,8 +286,8 @@ static int heth_mdio_wait(struct heth_priv *p)
 	u32 v;
 
 	return readl_poll_timeout(p->base + HETH_MDIO_CTRL, v,
-				  !(v & (HETH_MDIO_BUSY | HETH_MDIO_START)),
-				  10, 10000);
+				  !(v & (HETH_MDIO_BUSY | HETH_MDIO_START)), 10,
+				  10000);
 }
 
 static int heth_mdio_xfer(struct heth_priv *p, u32 ctrl, u32 data)
@@ -308,32 +309,37 @@ static int heth_mdio_xfer(struct heth_priv *p, u32 ctrl, u32 data)
 
 static int heth_mdio_read(struct mii_bus *bus, int addr, int reg)
 {
-	return heth_mdio_xfer(bus->priv, FIELD_PREP(HETH_MDIO_PHY, addr) |
-			      FIELD_PREP(HETH_MDIO_REG, reg), 0);
+	return heth_mdio_xfer(bus->priv,
+			      FIELD_PREP(HETH_MDIO_PHY, addr) |
+				  FIELD_PREP(HETH_MDIO_REG, reg),
+			      0);
 }
 
 static int heth_mdio_write(struct mii_bus *bus, int addr, int reg, u16 val)
 {
-	return heth_mdio_xfer(bus->priv, FIELD_PREP(HETH_MDIO_PHY, addr) |
-			      FIELD_PREP(HETH_MDIO_REG, reg) |
-			      HETH_MDIO_WRITE, val);
+	return heth_mdio_xfer(bus->priv,
+			      FIELD_PREP(HETH_MDIO_PHY, addr) |
+				  FIELD_PREP(HETH_MDIO_REG, reg) |
+				  HETH_MDIO_WRITE,
+			      val);
 }
 
-static int heth_mdio_read_c45(struct mii_bus *bus, int addr, int devad,
-			      int reg)
+static int heth_mdio_read_c45(struct mii_bus *bus, int addr, int devad, int reg)
 {
-	return heth_mdio_xfer(bus->priv, FIELD_PREP(HETH_MDIO_PHY, addr) |
-			      FIELD_PREP(HETH_MDIO_DEVAD, devad) |
-			      HETH_MDIO_C45,
+	return heth_mdio_xfer(bus->priv,
+			      FIELD_PREP(HETH_MDIO_PHY, addr) |
+				  FIELD_PREP(HETH_MDIO_DEVAD, devad) |
+				  HETH_MDIO_C45,
 			      FIELD_PREP(HETH_MDIO_DATA_ADDR, reg));
 }
 
 static int heth_mdio_write_c45(struct mii_bus *bus, int addr, int devad,
 			       int reg, u16 val)
 {
-	return heth_mdio_xfer(bus->priv, FIELD_PREP(HETH_MDIO_PHY, addr) |
-			      FIELD_PREP(HETH_MDIO_DEVAD, devad) |
-			      HETH_MDIO_C45 | HETH_MDIO_WRITE,
+	return heth_mdio_xfer(bus->priv,
+			      FIELD_PREP(HETH_MDIO_PHY, addr) |
+				  FIELD_PREP(HETH_MDIO_DEVAD, devad) |
+				  HETH_MDIO_C45 | HETH_MDIO_WRITE,
 			      FIELD_PREP(HETH_MDIO_DATA_ADDR, reg) | val);
 }
 
@@ -347,7 +353,8 @@ static int heth_mdio_init(struct heth_priv *p, struct clk *clk)
 
 	if (clk)
 		rate = clk_get_rate(clk);
-	if (!rate && !device_property_read_u32(p->dev, "clock-frequency", &freq))
+	if (!rate &&
+	    !device_property_read_u32(p->dev, "clock-frequency", &freq))
 		rate = freq;
 	if (rate)
 		heth_wr(p, HETH_MDIO_DIV,
@@ -387,8 +394,8 @@ static int heth_mdio_init(struct heth_priv *p, struct clk *clk)
 
 static void heth_write_mac(struct heth_priv *p, const u8 *a)
 {
-	heth_wr(p, HETH_MAC_LO, a[0] | (a[1] << 8) | (a[2] << 16) |
-		((u32)a[3] << 24));
+	heth_wr(p, HETH_MAC_LO,
+		a[0] | (a[1] << 8) | (a[2] << 16) | ((u32)a[3] << 24));
 	heth_wr(p, HETH_MAC_HI, a[4] | (a[5] << 8));
 }
 
@@ -403,8 +410,8 @@ static void heth_set_rx_mode(struct net_device *ndev)
 	if (ndev->flags & IFF_ALLMULTI) {
 		mc = ~0ULL;
 	} else {
-		netdev_for_each_mc_addr(ha, ndev)
-			mc |= 1ULL << (ether_crc(ETH_ALEN, ha->addr) >> 26);
+		netdev_for_each_mc_addr(ha, ndev) mc |=
+		    1ULL << (ether_crc(ETH_ALEN, ha->addr) >> 26);
 	}
 	/* With no hash filter, multicast needs promiscuous mode. */
 	if (mc && !hash)
@@ -673,8 +680,8 @@ static netdev_tx_t heth_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 			skb_frag_t *f = &skb_shinfo(skb)->frags[i - 1];
 
 			len = skb_frag_size(f);
-			dma = skb_frag_dma_map(p->dev, f, 0, len,
-					       DMA_TO_DEVICE);
+			dma =
+			    skb_frag_dma_map(p->dev, f, 0, len, DMA_TO_DEVICE);
 		}
 		if (dma_mapping_error(p->dev, dma))
 			goto unmap;
@@ -763,8 +770,7 @@ static void heth_tx_clean(struct heth_priv *p)
 		p->tx_clean = (i + 1) & (p->tx_count - 1);
 	}
 	netdev_completed_queue(ndev, pkts, bytes);
-	if (netif_queue_stopped(ndev) &&
-	    heth_tx_free(p) >= MAX_SKB_FRAGS + 1)
+	if (netif_queue_stopped(ndev) && heth_tx_free(p) >= MAX_SKB_FRAGS + 1)
 		netif_wake_queue(ndev);
 	spin_unlock_irqrestore(&p->tx_lock, flags);
 }
@@ -810,7 +816,7 @@ static int heth_rx(struct heth_priv *p, int budget)
 		len = FIELD_GET(HETH_RXS_LEN, st);
 		err = FIELD_GET(HETH_RXS_ERR, st);
 		if (!err && ((st & (HETH_RXS_SOP | HETH_RXS_EOP)) !=
-			     (HETH_RXS_SOP | HETH_RXS_EOP) ||
+				 (HETH_RXS_SOP | HETH_RXS_EOP) ||
 			     len < ETH_HLEN || len > HETH_RX_BUF_SIZE))
 			err = HETH_RX_ERR_OVERSIZE;
 
@@ -839,7 +845,7 @@ static int heth_rx(struct heth_priv *p, int budget)
 		ndev->stats.rx_packets++;
 		ndev->stats.rx_bytes += len;
 		napi_gro_receive(&p->napi, skb);
-next:
+	next:
 		heth_rx_arm(p, i);
 		p->rx_next = (i + 1) & (p->rx_count - 1);
 		done++;
@@ -938,8 +944,9 @@ static void heth_hw_start(struct heth_priv *p)
 {
 	struct net_device *ndev = p->ndev;
 
-	heth_wr(p, HETH_STATUS, HETH_ST_TX_RING_ERR | HETH_ST_RX_RING_ERR |
-		HETH_ST_TX_CLK_LOST | HETH_ST_RX_CLK_LOST);
+	heth_wr(p, HETH_STATUS,
+		HETH_ST_TX_RING_ERR | HETH_ST_RX_RING_ERR |
+		    HETH_ST_TX_CLK_LOST | HETH_ST_RX_CLK_LOST);
 	heth_wr(p, HETH_INT_STATUS, HETH_INT_ALL);
 	heth_write_mac(p, ndev->dev_addr);
 	heth_set_rx_mode(ndev);
@@ -951,11 +958,12 @@ static void heth_hw_start(struct heth_priv *p)
 		       p->rx_count - 1);
 
 	heth_wr(p, HETH_INT_ENABLE, HETH_INT_ALL);
-	heth_write_ctrl(p, HETH_CTRL_TX_EN | HETH_CTRL_RX_EN |
-			HETH_CTRL_FULL_DUPLEX | heth_speed_bits(p->speed) |
-			((ndev->features & NETIF_F_RXALL) ?
-			 HETH_CTRL_KEEP_BAD : 0),
-			HETH_CTRL_SPEED | HETH_CTRL_KEEP_BAD);
+	heth_write_ctrl(
+	    p,
+	    HETH_CTRL_TX_EN | HETH_CTRL_RX_EN | HETH_CTRL_FULL_DUPLEX |
+		heth_speed_bits(p->speed) |
+		((ndev->features & NETIF_F_RXALL) ? HETH_CTRL_KEEP_BAD : 0),
+	    HETH_CTRL_SPEED | HETH_CTRL_KEEP_BAD);
 }
 
 static void heth_adjust_link(struct net_device *ndev)
@@ -966,8 +974,8 @@ static void heth_adjust_link(struct net_device *ndev)
 
 	if (!phy->link || phy->speed == p->speed) {
 		if (phy->link)
-			heth_wr(p, HETH_STATUS, HETH_ST_TX_CLK_LOST |
-				HETH_ST_RX_CLK_LOST);
+			heth_wr(p, HETH_STATUS,
+				HETH_ST_TX_CLK_LOST | HETH_ST_RX_CLK_LOST);
 		phy_print_status(phy);
 		return;
 	}
@@ -997,8 +1005,8 @@ static int heth_phy_connect(struct heth_priv *p)
 
 	np = of_parse_phandle(p->dev->of_node, "phy-handle", 0);
 	if (np) {
-		phy = of_phy_connect(ndev, np, heth_adjust_link, 0,
-				     p->phy_iface);
+		phy =
+		    of_phy_connect(ndev, np, heth_adjust_link, 0, p->phy_iface);
 		of_node_put(np);
 	} else {
 		phy = phy_find_first(p->mii);
@@ -1132,16 +1140,16 @@ static void heth_get_stats64(struct net_device *ndev,
 }
 
 static const struct net_device_ops heth_netdev_ops = {
-	.ndo_open		= heth_open,
-	.ndo_stop		= heth_stop,
-	.ndo_start_xmit		= heth_start_xmit,
-	.ndo_set_rx_mode	= heth_set_rx_mode,
-	.ndo_set_mac_address	= heth_set_mac_address,
-	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_eth_ioctl		= phy_do_ioctl_running,
-	.ndo_tx_timeout		= heth_tx_timeout,
-	.ndo_set_features	= heth_set_features,
-	.ndo_get_stats64	= heth_get_stats64,
+    .ndo_open = heth_open,
+    .ndo_stop = heth_stop,
+    .ndo_start_xmit = heth_start_xmit,
+    .ndo_set_rx_mode = heth_set_rx_mode,
+    .ndo_set_mac_address = heth_set_mac_address,
+    .ndo_validate_addr = eth_validate_addr,
+    .ndo_eth_ioctl = phy_do_ioctl_running,
+    .ndo_tx_timeout = heth_tx_timeout,
+    .ndo_set_features = heth_set_features,
+    .ndo_get_stats64 = heth_get_stats64,
 };
 
 /* ethtool */
@@ -1187,14 +1195,14 @@ static void heth_get_ethtool_stats(struct net_device *ndev,
 }
 
 static const struct ethtool_ops heth_ethtool_ops = {
-	.get_drvinfo		= heth_get_drvinfo,
-	.get_link		= ethtool_op_get_link,
-	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
-	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
-	.nway_reset		= phy_ethtool_nway_reset,
-	.get_sset_count		= heth_get_sset_count,
-	.get_strings		= heth_get_strings,
-	.get_ethtool_stats	= heth_get_ethtool_stats,
+    .get_drvinfo = heth_get_drvinfo,
+    .get_link = ethtool_op_get_link,
+    .get_link_ksettings = phy_ethtool_get_link_ksettings,
+    .set_link_ksettings = phy_ethtool_set_link_ksettings,
+    .nway_reset = phy_ethtool_nway_reset,
+    .get_sset_count = heth_get_sset_count,
+    .get_strings = heth_get_strings,
+    .get_ethtool_stats = heth_get_ethtool_stats,
 };
 
 /* Probe */
@@ -1318,16 +1326,15 @@ static int heth_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id heth_of_match[] = {
-	{ .compatible = "harbor,ethernet-1" },
-	{ }
-};
+    {.compatible = "harbor,ethernet-1"}, {}};
 MODULE_DEVICE_TABLE(of, heth_of_match);
 
 static struct platform_driver heth_driver = {
-	.probe = heth_probe,
-	.driver = {
-		.name = "harbor-ethernet",
-		.of_match_table = heth_of_match,
+    .probe = heth_probe,
+    .driver =
+	{
+	    .name = "harbor-ethernet",
+	    .of_match_table = heth_of_match,
 	},
 };
 module_platform_driver(heth_driver);

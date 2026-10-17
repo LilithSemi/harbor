@@ -109,12 +109,7 @@ void main() {
       )) {
         eth.port(p).getsLogic(Const(0, width: eth.input(p).width));
       }
-      await _absoluteRoundTrip(
-        eth,
-        0x1000B000,
-        HarborEthReg.macLo,
-        0xAABBCCDD,
-      );
+      await _absoluteRoundTrip(eth, 0x1000B000, HarborEthReg.macLo, 0xAABBCCDD);
     });
 
     test('temperature sensor', () async {

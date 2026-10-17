@@ -63,11 +63,11 @@
 #define HARBOR_I2C_CTRL_ENABLE BIT(0)
 #define HARBOR_I2C_CTRL_IRQ_EN BIT(1)
 
-#define HARBOR_I2C_ST_BUSY         BIT(0)
-#define HARBOR_I2C_ST_ACK          BIT(1)
-#define HARBOR_I2C_ST_ARB_LOST     BIT(2)
-#define HARBOR_I2C_ST_RX_READY     BIT(4)
-#define HARBOR_I2C_ST_CMD_DONE     BIT(5)
+#define HARBOR_I2C_ST_BUSY	   BIT(0)
+#define HARBOR_I2C_ST_ACK	   BIT(1)
+#define HARBOR_I2C_ST_ARB_LOST	   BIT(2)
+#define HARBOR_I2C_ST_RX_READY	   BIT(4)
+#define HARBOR_I2C_ST_CMD_DONE	   BIT(5)
 #define HARBOR_I2C_ST_CMD_REJECTED BIT(6)
 
 #define HARBOR_I2C_CMD_START BIT(0)
@@ -90,7 +90,8 @@ static int harbor_i2c_wait_done(struct harbor_i2c *hi)
 	for (;;) {
 		st = readl(hi->base + HARBOR_I2C_STATUS);
 		if (st & HARBOR_I2C_ST_CMD_REJECTED) {
-			writel(HARBOR_I2C_ST_CMD_REJECTED, hi->base + HARBOR_I2C_STATUS);
+			writel(HARBOR_I2C_ST_CMD_REJECTED,
+			       hi->base + HARBOR_I2C_STATUS);
 			return -EBUSY;
 		}
 		if (st & HARBOR_I2C_ST_CMD_DONE)
@@ -122,7 +123,7 @@ static u32 harbor_i2c_prescale(u32 input_clock_hz, u32 bus_freq_hz)
 		t_low_min_ns = 500;
 
 	prescale = DIV_ROUND_UP_ULL(t_low_min_ns * (u64)input_clock_hz,
-				     2ULL * NSEC_PER_SEC);
+				    2ULL * NSEC_PER_SEC);
 	return prescale ? (u32)prescale : 1;
 }
 
@@ -188,10 +189,10 @@ static int harbor_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 			if (msg->flags & I2C_M_RD) {
 				bool last_byte = j == msg->len - 1;
 
-				writel(HARBOR_I2C_CMD_READ |
-					   (last_byte ? HARBOR_I2C_CMD_NACK :
-							0),
-				       hi->base + HARBOR_I2C_CMD);
+				writel(
+				    HARBOR_I2C_CMD_READ |
+					(last_byte ? HARBOR_I2C_CMD_NACK : 0),
+				    hi->base + HARBOR_I2C_CMD);
 				ret = harbor_i2c_wait_done(hi);
 				if (ret)
 					goto out;

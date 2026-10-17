@@ -319,7 +319,10 @@ class HarborAxi4Fabric extends HarborFabricModule {
       'err',
     ];
     final tIdW = [for (final a in sa) a.idWidth, fullIdWidth];
-    final tN = [for (final s in tSlave) slaves[s].outstanding, errorOutstanding];
+    final tN = [
+      for (final s in tSlave) slaves[s].outstanding,
+      errorOutstanding,
+    ];
     final tRemap = [for (var t = 0; t < nt; t++) tIdW[t] < fullIdWidth];
 
     const restFields = [

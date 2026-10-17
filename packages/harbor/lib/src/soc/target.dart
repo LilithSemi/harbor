@@ -991,7 +991,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
 
   /// A pin map value is the site name, optionally followed by
   /// whitespace-separated IO attributes (e.g. `"C17 SSTL135_I
-  /// TERMINATION=OFF"`). The site is always the first token.
+  /// TERMINATION=OFF"`). The site is always the first token. `MGT` is a
+  /// Xilinx-only marker for a transceiver/refclk package pin: it emits the
+  /// PACKAGE_PIN property but deliberately no IOSTANDARD property (MGT pads
+  /// have no SelectIO standard).
   static String _site(String value) => value.trim().split(RegExp(r'\s+')).first;
 
   /// The IO attributes of a pin map value (everything after the site).
@@ -1114,11 +1117,12 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       // No braces around the port name in get_ports: the open-source
       // nextpnr-xilinx XDC parser rejects `[get_ports {name}]` (asserts on the
       // brace token), unlike Vivado which accepts either form.
-      buf.writeln(
-        'set_property -dict {PACKAGE_PIN ${_site(entry.value)} '
-        'IOSTANDARD ${ioStandard ?? 'LVCMOS33'}$extras} '
-        '[get_ports ${entry.key}]',
-      );
+      final properties = StringBuffer('PACKAGE_PIN ${_site(entry.value)}');
+      if (ioStandard != 'MGT') {
+        properties.write(' IOSTANDARD ${ioStandard ?? 'LVCMOS33'}');
+      }
+      properties.write(extras);
+      buf.writeln('set_property -dict {$properties} [get_ports ${entry.key}]');
     }
     if (frequency > 0) {
       final periodNs = 1e9 / frequency;
