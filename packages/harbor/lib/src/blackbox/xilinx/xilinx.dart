@@ -567,6 +567,8 @@ class XilinxBufg extends BridgeModule {
   XilinxBufg({super.name = 'bufg'}) : super('BUFG', isSystemVerilogLeaf: true) {
     createPort('I', PortDirection.input);
     addOutput('O');
+    // Sim only: the buffer is a wire. Synthesis gets the ports only.
+    output('O') <= input('I');
   }
 }
 
@@ -588,6 +590,9 @@ class XilinxBufr extends BridgeModule {
     addInput('CE', Const(1));
     addInput('CLR', Const(0));
     addOutput('O');
+    // Sim only: with BYPASS the buffer is a wire. A divider has no sim body.
+    // Synthesis gets the ports only.
+    if (bufrDivide == 'BYPASS') output('O') <= input('I');
   }
 }
 
@@ -604,6 +609,8 @@ class XilinxBufio extends BridgeModule {
     : super('BUFIO', isSystemVerilogLeaf: true) {
     addInput('I', i);
     addOutput('O');
+    // Sim only: the buffer is a wire. Synthesis gets the ports only.
+    output('O') <= input('I');
   }
 }
 
@@ -944,7 +951,13 @@ class XilinxOddr extends BridgeModule {
     addInput('D2', d2);
     addInput('R', r ?? Const(0));
     addInput('S', Const(0));
-    addOutput('Q');
+    final q = addOutput('Q');
+    // Sim only, SAME_EDGE: both halves latch on the rise, then Q shows D1
+    // while C is high and D2 while C is low. CE, R and S are not modelled.
+    final qRise = Logic(name: '${name}_sim_rise');
+    final qFall = Logic(name: '${name}_sim_fall');
+    Sequential(input('C'), [qRise < input('D1'), qFall < input('D2')]);
+    q <= mux(input('C'), qRise, qFall);
   }
 }
 
@@ -977,8 +990,21 @@ class XilinxIddr extends BridgeModule {
     addInput('D', d);
     addInput('R', r ?? Const(0));
     addInput('S', Const(0));
-    addOutput('Q1');
-    addOutput('Q2');
+    final q1 = addOutput('Q1');
+    final q2 = addOutput('Q2');
+    // Sim only, SAME_EDGE: at a rise, Q1 takes D at that rise and Q2 takes D
+    // from the fall before it. CE, R and S are not modelled.
+    final fallHeld = Logic(name: '${name}_sim_fall');
+    final q1r = Logic(name: '${name}_sim_q1');
+    final q2r = Logic(name: '${name}_sim_q2');
+    Sequential.multi(
+      [],
+      [fallHeld < input('D')],
+      negedgeTriggers: [input('C')],
+    );
+    Sequential(input('C'), [q1r < input('D'), q2r < fallHeld]);
+    q1 <= q1r;
+    q2 <= q2r;
   }
 }
 
@@ -1164,6 +1190,8 @@ class XilinxIdelaye2 extends BridgeModule {
     addInput('CNTVALUEIN', cntValueIn ?? Const(0, width: 5), width: 5);
     addOutput('DATAOUT');
     addOutput('CNTVALUEOUT', width: 5);
+    // Sim only: the delay is a wire. The tap is not modelled.
+    output('DATAOUT') <= input('IDATAIN');
   }
 }
 

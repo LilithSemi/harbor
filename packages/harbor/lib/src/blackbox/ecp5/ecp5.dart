@@ -821,14 +821,13 @@ class Ecp5Oddrx2f extends BridgeModule {
 }
 
 /// ECP5 IDDRX1F: 1:2 gearing DDR input register. [q0] is the bit captured
-/// on the rising edge of [sclk], [q1] the falling-edge bit, and both move
-/// to the fabric together on the rise. No sim model ships for this cell in
-/// yosys or prjtrellis: this is the ordinary 1:2 DDR input gearbox shape
-/// FPGA-TN-02035 section 6.2 describes for the x2 family, applied to a
-/// single edge pair. [q0]'s own timing (whether it is really available
-/// with zero added latency past a plain rising-edge sample, the way this
-/// model gives it) is not checked against any vendor model either: none
-/// exists to check it against.
+/// on a rising edge of [sclk] and [q1] the bit captured on the falling edge
+/// after it. Both move to the fabric together on the next rise, so one
+/// output is one aligned (rise, fall) pair, one clock late. LiteEth's ECP5
+/// RGMII PHY (liteeth/phy/parallel/rgmii/ecp5.py, through LiteX
+/// LatticeECP5DDRInputImpl) uses Q0 as the low nibble and Q1 as the high
+/// nibble of the same output with no realignment, and it works on silicon.
+/// No vendor sim model ships for this cell in yosys or prjtrellis.
 class Ecp5Iddrx1f extends BridgeModule {
   Logic get q0 => output('Q0');
   Logic get q1 => output('Q1');
@@ -844,17 +843,15 @@ class Ecp5Iddrx1f extends BridgeModule {
     d = addInput('D', d);
     final q0 = addOutput('Q0');
     final q1 = addOutput('Q1');
-    // sim-only: at a fall, d is latched into a holding bit (its own single-
-    // edge trigger, since sampling sclk itself as data in a block it also
-    // triggers reads back as x). At the next rise, q0 takes d right then and
-    // q1 takes that held falling-edge bit, so both outputs move together on
-    // the rise. RST is not modeled (every caller ties it to a constant). No
-    // effect on synth.
+    // Sim only: a rise latches d into [riseHeld], the fall after it latches
+    // d into [fallHeld], and the next rise moves both to the outputs. RST is
+    // not modelled (every caller ties it to a constant). No effect on synth.
+    final riseHeld = Logic(name: '${name}_sim_rise');
     final fallHeld = Logic(name: '${name}_sim_fall');
     final q0r = Logic(name: '${name}_sim_q0');
     final q1r = Logic(name: '${name}_sim_q1');
     Sequential.multi([], [fallHeld < d], negedgeTriggers: [sclk]);
-    Sequential(sclk, [q0r < d, q1r < fallHeld]);
+    Sequential(sclk, [riseHeld < d, q0r < riseHeld, q1r < fallHeld]);
     q0 <= q0r;
     q1 <= q1r;
   }

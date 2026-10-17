@@ -7,24 +7,35 @@ import '../soc/target.dart';
 /// Clock domain crossing synchronizer.
 ///
 /// Implements a multi-stage flip-flop synchronizer for safely
-/// crossing single-bit signals between clock domains.
+/// crossing single-bit signals between clock domains. With [width] above 1
+/// each bit has its own chain, so during a change the output can have a mix
+/// of old and new bits. Use it for bits that are independent of each other,
+/// or for values that do not change while the destination uses them.
 ///
 /// For multi-bit data, use [HarborCdcHandshake] or [HarborCdcFifo].
 class HarborCdcSync extends BridgeModule {
   /// Number of synchronizer stages (minimum 2).
   final int stages;
 
+  /// Number of bits.
+  final int width;
+
   /// Synchronized output.
   Logic get syncOut => output('sync_out');
 
-  HarborCdcSync({this.stages = 2, super.name = 'cdc_sync'})
-    : super('HarborCdcSync') {
+  HarborCdcSync({this.stages = 2, this.width = 1, super.name = 'cdc_sync'})
+    : super(
+        stages == 2 && width == 1
+            ? 'HarborCdcSync'
+            : 'HarborCdcSync_S${stages}_W$width',
+      ) {
     assert(stages >= 2, 'CDC synchronizer requires at least 2 stages');
+    assert(width >= 1, 'CDC synchronizer requires at least 1 bit');
 
-    createPort('async_in', PortDirection.input);
+    createPort('async_in', PortDirection.input, width: width);
     createPort('dst_clk', PortDirection.input);
     createPort('dst_reset', PortDirection.input);
-    addOutput('sync_out');
+    addOutput('sync_out', width: width);
 
     final dstClk = input('dst_clk');
     final dstReset = input('dst_reset');
@@ -32,13 +43,14 @@ class HarborCdcSync extends BridgeModule {
 
     // Chain of flip-flops
     final regs = <Logic>[
-      for (var i = 0; i < stages; i++) Logic(name: 'sync_stage_$i'),
+      for (var i = 0; i < stages; i++)
+        Logic(name: 'sync_stage_$i', width: width),
     ];
 
     Sequential(dstClk, [
       If(
         dstReset,
-        then: [for (final r in regs) r < Const(0)],
+        then: [for (final r in regs) r < Const(0, width: width)],
         orElse: [
           regs[0] < asyncIn,
           for (var i = 1; i < stages; i++) regs[i] < regs[i - 1],

@@ -646,6 +646,24 @@ class HarborSoC extends BridgeModule {
   /// pulled up with [exposePin].
   final Map<BridgeModule, Map<String, String>> _exposedPins = {};
 
+  /// Lines of every [HarborPinConstraintProvider] peripheral, each line once.
+  List<String> _devicePinConstraints(HarborFpgaTarget t) {
+    final lines = <String>{};
+    for (final e in _peripherals) {
+      final m = e.module;
+      if (m is! HarborPinConstraintProvider) continue;
+      final pins = _exposedPins[m] ?? const {};
+      lines.addAll(
+        (m as HarborPinConstraintProvider).pinConstraints(
+          t,
+          (p) => pins[p],
+          m.name,
+        ),
+      );
+    }
+    return lines.toList();
+  }
+
   /// Top-level names of [peripheral]'s exposed pins. Empty if it has none.
   Map<String, String> exposedPinsOf(BridgeModule peripheral) =>
       Map.unmodifiable(_exposedPins[peripheral] ?? const {});
@@ -1585,9 +1603,12 @@ class HarborSoC extends BridgeModule {
               );
             }
           }
-          File(
-            '$path/$name.${t.constraintExtension}',
-          ).writeAsStringSync(t.generateConstraints(knownPorts: knownPorts));
+          File('$path/$name.${t.constraintExtension}').writeAsStringSync(
+            t.generateConstraints(
+              knownPorts: knownPorts,
+              deviceLines: _devicePinConstraints(t),
+            ),
+          );
           final rtlDir = Directory('$path/rtl');
           final svFiles = rtlDir.existsSync()
               // The file system order is not stable, so sort the list.

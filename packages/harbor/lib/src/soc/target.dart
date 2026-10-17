@@ -920,16 +920,30 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// a board defines pins for every connector it carries (e.g. an unused HDMI
   /// header), but a constraint for a port the netlist does not expose makes the
   /// place-and-route tool reject the design. When null, every pin is emitted.
-  String generateConstraints({Set<String>? knownPorts}) {
-    switch (vendor) {
-      case HarborFpgaVendor.ice40:
-        return _generatePcf(knownPorts);
-      case HarborFpgaVendor.ecp5:
-        return _generateLpf(knownPorts);
-      case HarborFpgaVendor.vivado:
-      case HarborFpgaVendor.openXc7:
-        return _generateXdc(knownPorts);
+  ///
+  /// [deviceLines] are lines from the devices of the design, see
+  /// [HarborPinConstraintProvider]. They go before [extraConstraints].
+  String generateConstraints({
+    Set<String>? knownPorts,
+    List<String> deviceLines = const [],
+  }) {
+    final out = switch (vendor) {
+      HarborFpgaVendor.ice40 => _generatePcf(knownPorts),
+      HarborFpgaVendor.ecp5 => _generateLpf(knownPorts),
+      HarborFpgaVendor.vivado ||
+      HarborFpgaVendor.openXc7 => _generateXdc(knownPorts),
+    };
+    if (deviceLines.isEmpty) return out;
+    final block = StringBuffer('# BEGIN device constraints\n');
+    for (final line in deviceLines) {
+      block.writeln(line);
     }
+    block.writeln('# END device constraints');
+    const extra = '# BEGIN extraConstraints';
+    final at = out.indexOf(extra);
+    return at < 0
+        ? '$out$block'
+        : '${out.substring(0, at)}$block${out.substring(at)}';
   }
 
   /// The internal VREF in mV that the SSTL inputs in [pinMap] need: 675 for
@@ -2393,4 +2407,22 @@ mixin HarborNextpnrPreplaceProvider {
   /// pin on [ctx]. Return null (not an empty string) for a part or a family
   /// this peripheral has no verified placement for.
   String? nextpnrPreplacePy(HarborNextpnrPreplaceContext ctx);
+}
+
+/// A device that adds timing constraints for its own pins, such as the
+/// clocks and IO delays of an RGMII front end.
+///
+/// The SoC calls [pinConstraints] when it writes the constraint file and
+/// puts the lines after the pin lines.
+mixin HarborPinConstraintProvider {
+  /// Constraint lines in the language of [target], or an empty list.
+  ///
+  /// [topPort] gives the top-level port name of a device port, or null
+  /// when the port is not on the top level. [instance] is the instance name
+  /// of the device in the SoC, for cell and pin patterns.
+  List<String> pinConstraints(
+    HarborFpgaTarget target,
+    String? Function(String port) topPort,
+    String instance,
+  );
 }

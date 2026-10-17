@@ -14,7 +14,8 @@ import 'cpu.dart';
 /// both container nodes (e.g. `partitions`) and unit-addressed leaves (e.g.
 /// `partition@0`, whose `reg` is a `<offset size>` pair under the container's own
 /// #address-cells/#size-cells). Values follow the same encoding as node
-/// properties: [String] -> "str", [int] -> <n>, [List<int>] -> <0x.. 0x..>.
+/// properties: [String] -> "str", [int] -> <n>, [List<int>] -> <0x.. 0x..>,
+/// [HarborDeviceTreeRef] -> <&label>.
 class HarborDeviceTreeChild {
   /// The literal node name, e.g. `partitions` or `partition@300000`.
   final String name;
@@ -25,11 +26,25 @@ class HarborDeviceTreeChild {
   /// Nested child nodes, one level deeper.
   final List<HarborDeviceTreeChild> children;
 
+  /// Label of the node, for a [HarborDeviceTreeRef] to it. It must be unique
+  /// in the device tree.
+  final String? label;
+
   const HarborDeviceTreeChild({
     required this.name,
     this.properties = const {},
     this.children = const [],
+    this.label,
   });
+}
+
+/// A property value that refers to the node with [label], written as
+/// `<&label>`.
+class HarborDeviceTreeRef {
+  /// Label of the node.
+  final String label;
+
+  const HarborDeviceTreeRef(this.label);
 }
 
 /// One context (hart-facing register block) of an interrupt controller.
@@ -439,7 +454,8 @@ class HarborDeviceTreeGenerator {
 
   /// Recursively emits a nested [HarborDeviceTreeChild] at [indent].
   void _emitChild(StringBuffer buf, HarborDeviceTreeChild c, String indent) {
-    buf.writeln('$indent${c.name} {');
+    final label = c.label == null ? '' : '${c.label}: ';
+    buf.writeln('$indent$label${c.name} {');
     for (final entry in c.properties.entries) {
       _emitProperty(buf, '$indent    ', entry.key, entry.value);
     }
@@ -468,6 +484,7 @@ class HarborDeviceTreeGenerator {
   String _formatValue(Object value) {
     if (value is String) return '"$value"';
     if (value is int) return '<$value>';
+    if (value is HarborDeviceTreeRef) return '<&${value.label}>';
     if (value is List<int>) {
       return '<${value.map((v) => '0x${v.toRadixString(16)}').join(' ')}>';
     }

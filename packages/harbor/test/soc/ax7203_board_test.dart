@@ -52,6 +52,44 @@ const _hdmiD = [
   'L18', 'M18', 'N18', 'N19', 'M20', 'N20', 'L21', 'M21',
 ]; // p.32
 
+/// KSZ9031 PHY1 and PHY2 (p.28-29): GTXC, TXD0-3, TXEN, RXC, RXD0-3, RXDV,
+/// MDC, MDIO, RESET.
+const _ethSites = [
+  (
+    txc: 'E18',
+    txd: ['C20', 'D20', 'A19', 'A18'],
+    txCtl: 'F18',
+    rxc: 'B17',
+    rxd: ['A16', 'B18', 'C18', 'C19'],
+    rxCtl: 'A15',
+    mdc: 'B16',
+    mdio: 'B15',
+    rst: 'D16',
+  ),
+  (
+    txc: 'A14',
+    txd: ['E17', 'C14', 'C15', 'A13'],
+    txCtl: 'D17',
+    rxc: 'E19',
+    rxd: ['A20', 'B20', 'D19', 'C17'],
+    rxCtl: 'F19',
+    mdc: 'F20',
+    mdio: 'C22',
+    rst: 'B22',
+  ),
+];
+
+const _ethPorts = [
+  'rgmii_txc',
+  'rgmii_txd',
+  'rgmii_tx_ctl',
+  'rgmii_rxc',
+  'rgmii_rxd',
+  'rgmii_rx_ctl',
+  'mdc',
+  'mdio',
+];
+
 /// Port -> (site, IO standard) for every pin the test SoC exposes.
 Map<String, (String, String)> _expected() {
   final e = <String, (String, String)>{};
@@ -79,6 +117,17 @@ Map<String, (String, String)> _expected() {
   e['sdram_reset_n'] = ('W6', 'LVCMOS15');
   _hdmiCtl.forEach((k, v) => e[k] = (v, 'LVCMOS33'));
   bus('hdmi_d', _hdmiD, 'LVCMOS33');
+  for (final (n, p) in _ethSites.indexed) {
+    e['eth${n}_rgmii_txc'] = (p.txc, 'LVCMOS33');
+    bus('eth${n}_rgmii_txd', p.txd, 'LVCMOS33');
+    e['eth${n}_rgmii_tx_ctl'] = (p.txCtl, 'LVCMOS33');
+    e['eth${n}_rgmii_rxc'] = (p.rxc, 'LVCMOS33');
+    bus('eth${n}_rgmii_rxd', p.rxd, 'LVCMOS33');
+    e['eth${n}_rgmii_rx_ctl'] = (p.rxCtl, 'LVCMOS33');
+    e['eth${n}_mdc'] = (p.mdc, 'LVCMOS33');
+    e['eth${n}_mdio'] = (p.mdio, 'LVCMOS33');
+    e['eth${n}_rst_n'] = (p.rst, 'LVCMOS33');
+  }
   return e;
 }
 
@@ -100,10 +149,14 @@ const _ddrPads = [
   'sdram_reset_n',
 ];
 
-/// Board IO for the test: a parallel RGB display on the SiI9134 pins, plus
-/// the LEDs and keys.
+/// Board IO for the test: a parallel RGB display on the SiI9134 pins, the
+/// LEDs and keys, the PHY resets, and a PLL that makes the 125 MHz RGMII
+/// clocks from the 100 MHz sys clock.
 class _BoardIo extends BridgeModule with HarborDeviceTreeNodeProvider {
   late final HarborDualClockDisplay display;
+
+  Logic get clk125 => output('clk125');
+  Logic get clk125_90 => output('clk125_90');
 
   _BoardIo(HarborDeviceTarget target) : super('Ax7203BoardIo', name: 'io') {
     final clk = createPort('clk', PortDirection.input).port;
@@ -133,6 +186,31 @@ class _BoardIo extends BridgeModule with HarborDeviceTreeNodeProvider {
     addOutput('gpdi_sda') <= Const(1);
     addOutput('led_n', width: 4) <= ~display.vsync.replicate(4);
     addOutput('som_led') <= input('key_n')[0];
+    for (var n = 0; n < _ethSites.length; n++) {
+      addOutput('eth${n}_rst_n') <= ~reset;
+    }
+
+    // VCO 1000 MHz, CLKOUT0 and CLKOUT1 are 125 MHz at 0 and 90 degrees.
+    final pll = XilinxPlle2Adv(
+      clkfboutMult: 10,
+      divclkDivide: 1,
+      clkinPeriod: 10.0,
+      clkout0Divide: 8,
+      clkout1Divide: 8,
+      clkout1Phase: 90.0,
+      name: 'eth_pll',
+    );
+    pll.input('CLKIN1').srcConnection! <= clk;
+    pll.input('CLKIN2').srcConnection! <= Const(0);
+    pll.input('CLKINSEL').srcConnection! <= Const(1);
+    pll.input('CLKFBIN').srcConnection! <= pll.output('CLKFBOUT');
+    pll.input('RST').srcConnection! <= reset;
+    pll.input('PWRDWN').srcConnection! <= Const(0);
+    for (final (o, n) in [('CLKOUT0', 'clk125'), ('CLKOUT1', 'clk125_90')]) {
+      final b = XilinxBufg(name: '${n}_bufg');
+      b.input('I').srcConnection! <= pll.output(o);
+      addOutput(n) <= b.output('O');
+    }
   }
 
   @override
@@ -156,7 +234,11 @@ const _ioPorts = [
   'som_led',
 ];
 
-HarborSoC _soc(HarborFpgaTarget target, {bool withDdr = true}) {
+HarborSoC _soc(
+  HarborFpgaTarget target, {
+  bool withDdr = true,
+  bool withEth = true,
+}) {
   final soc = HarborSoC(
     name: 'Ax7203Soc',
     compatible: 'test,ax7203-soc',
@@ -182,6 +264,33 @@ HarborSoC _soc(HarborFpgaTarget target, {bool withDdr = true}) {
   final io = soc.addPeripheral(_BoardIo(target));
   for (final p in _ioPorts) {
     soc.exposePin(io, p, externalName: p);
+  }
+  if (withEth) {
+    for (var n = 0; n < _ethSites.length; n++) {
+      final mac = HarborEthernetMac(
+        baseAddress: 0x30000000 + 0x1000 * n,
+        config: HarborEthernetConfig.ax7203(),
+        fabricKind: HarborFabricKind.wishbone,
+        target: target,
+        mdioPad: true,
+        idelayCtrl: false,
+        name: 'eth$n',
+      );
+      soc.addPeripheral(mac);
+      soc.addMaster(
+        mac,
+        busInterfaceName: 'dma',
+        memory: true,
+        // A Wishbone fabric port takes one request at a time.
+        outstanding: 1,
+      );
+      mac.input('clk125').srcConnection! <= io.clk125;
+      mac.input('clk125_90').srcConnection! <= io.clk125_90;
+      for (final p in _ethPorts) {
+        soc.exposePin(mac, p, externalName: 'eth${n}_$p');
+      }
+      soc.exposePin(io, 'eth${n}_rst_n', externalName: 'eth${n}_rst_n');
+    }
   }
   if (withDdr) {
     final tree = soc.xilinxDdr3Clocks!;
@@ -345,6 +454,136 @@ void main() {
       expect(rtl, contains(RegExp(r'\[255:0\]\s+calib_data')));
     });
 
+    test('the RGMII RX clocks are on clock capable balls', () {
+      for (final p in _ethSites) {
+        expect(board.siteIsClockCapable(p.rxc), isTrue, reason: p.rxc);
+      }
+    });
+
+    test('each MAC has its own RGMII clocks and delays', () {
+      final text = File('${dir.path}/Ax7203Soc.xdc').readAsStringSync();
+      for (var n = 0; n < _ethSites.length; n++) {
+        final e = 'eth$n';
+        expect(
+          text,
+          contains(
+            'create_clock -name ${e}_rgmii_rxc -period 8.000 '
+            '[get_ports ${e}_rgmii_rxc]',
+          ),
+        );
+        expect(
+          text,
+          contains(
+            'create_generated_clock -name ${e}_rgmii_txc -source '
+            '[get_pins -hierarchical -filter {NAME =~ *$e/*/txc_oddr/C}] '
+            '-multiply_by 1 [get_ports ${e}_rgmii_txc]',
+          ),
+        );
+        // RX data valid 0.04 ns before to 1.86 ns after each RX clock edge,
+        // the MAC shifts the TX clock.
+        for (final (k, v) in [('max', '3.960'), ('min', '1.860')]) {
+          expect(
+            text,
+            contains(
+              'set_input_delay -clock ${e}_rgmii_rxc -$k $v '
+              '[get_ports {${e}_rgmii_rxd[*] ${e}_rgmii_rx_ctl}]',
+            ),
+          );
+        }
+        expect(
+          text,
+          contains(
+            'create_generated_clock -name ${e}_rgmii_rxc_bufr '
+            '-source [get_ports ${e}_rgmii_rxc] -divide_by 1 '
+            '[get_pins -hierarchical -filter {NAME =~ *$e/*/rx_bufr/O}]',
+          ),
+        );
+        expect(
+          text,
+          contains(
+            'set_output_delay -clock ${e}_rgmii_txc -min -1.000 '
+            '[get_ports {${e}_rgmii_txd[*] ${e}_rgmii_tx_ctl}]',
+          ),
+        );
+      }
+      expect(
+        RegExp('set_multicycle_path -setup 2').allMatches(text),
+        hasLength(1),
+        reason: 'one line for both MACs',
+      );
+    });
+
+    test('each MAC has its clock domain crossing constraints', () {
+      final lines = File('${dir.path}/Ax7203Soc.xdc').readAsLinesSync();
+      for (var n = 0; n < _ethSites.length; n++) {
+        final e = 'eth$n';
+        String cells(List<String> c) =>
+            '[get_cells -hierarchical -filter {'
+            '${c.map((p) => 'NAME =~ *$e/*$p').join(' || ')}}]';
+        final rxEn =
+            'set_max_delay -datapath_only '
+            '-from ${cells(['eth_regs/rx_en_r*'])} '
+            '-to ${cells(['rx_en_sync/sync_stage_0*'])} ';
+        expect(lines.where((l) => l.startsWith(rxEn)), hasLength(1));
+        expect(
+          lines.where(
+            (l) => l.startsWith('set_bus_skew') && l.contains('*$e/'),
+          ),
+          hasLength(4),
+        );
+      }
+    });
+
+    test('the device tree has both MACs in rgmii-rxid mode', () {
+      final dts = File('${dir.path}/Ax7203Soc.dts').readAsStringSync();
+      expect(
+        RegExp('"harbor,ethernet-1"').allMatches(dts),
+        hasLength(_ethSites.length),
+      );
+      expect(
+        RegExp('phy-mode = "rgmii-rxid"').allMatches(dts),
+        hasLength(_ethSites.length),
+      );
+    });
+
+    test('each MAC has a PHY node at MDIO address 1 and a phy-handle', () {
+      final dts = File('${dir.path}/Ax7203Soc.dts').readAsStringSync();
+      for (var n = 0; n < _ethSites.length; n++) {
+        expect(dts, contains('phy-handle = <&eth${n}_phy>;'));
+        expect(
+          dts,
+          contains(
+            RegExp(
+              'mdio \\{[^}]*eth${n}_phy: ethernet-phy@1 \\{\\s*'
+              'reg = <1>;\\s*rxc-skew-ps = <240>;',
+            ),
+          ),
+        );
+      }
+    });
+
+    test('the MDIO pads are tristate and RX uses BUFIO and BUFR only', () {
+      final rtl = Directory('${dir.path}/rtl')
+          .listSync()
+          .whereType<File>()
+          .map((f) => f.readAsStringSync())
+          .join('\n');
+      expect(rtl, contains(RegExp(r'inout\s+(wire\s+)?(logic\s+)?eth0_mdio')));
+      // Only the DDR3 PHY has an IDELAYCTRL, the RX pins have no IDELAY.
+      expect(
+        RegExp(r'^\s*IDELAYCTRL\s', multiLine: true).allMatches(rtl),
+        hasLength(1),
+      );
+      expect(rtl, isNot(contains('rxd_0_idelay')));
+      for (final cell in ['BUFIO', 'BUFR']) {
+        expect(rtl, contains(RegExp('^\\s*$cell\\s', multiLine: true)));
+      }
+      expect(
+        rtl,
+        isNot(contains(RegExp(r'^\s*BUFG\s+rx_bufg', multiLine: true))),
+      );
+    });
+
     test('the Makefile names the -2 prjxray part', () {
       final mk = File('${dir.path}/Makefile').readAsStringSync();
       expect(mk, contains('PART ?= \$(DEVICE)\$(PACKAGE)-2'));
@@ -362,11 +601,29 @@ void main() {
     });
   });
 
+  test('a MAC with no PHY address has an empty mdio node', () {
+    final mac = HarborEthernetMac(
+      baseAddress: 0x30000000,
+      config: HarborEthernetConfig.basic(phy: HarborEthPhy.mii),
+      fabricKind: HarborFabricKind.wishbone,
+      target: const HarborSimTarget(),
+    );
+    final node = mac.dtNode;
+    expect(node.properties.containsKey('phy-handle'), isFalse);
+    expect(node.children.single.name, 'mdio');
+    expect(node.children.single.children, isEmpty);
+    expect(HarborEthernetConfig.ax7203().phyAddress, 1);
+    expect(
+      () => HarborEthernetConfig(phy: HarborEthPhy.mii, phyAddress: 32),
+      throwsArgumentError,
+    );
+  });
+
   test('a top-level port with no pin fails generation by name', () async {
     final target = board.fpgaTarget(
       pins: board.pins.keys.where((k) => k != 'som_led'),
     );
-    final soc = _soc(target, withDdr: false);
+    final soc = _soc(target, withDdr: false, withEth: false);
     final dir = Directory.systemTemp.createTempSync('harbor_ax7203_miss_');
     addTearDown(() => dir.deleteSync(recursive: true));
     await expectLater(

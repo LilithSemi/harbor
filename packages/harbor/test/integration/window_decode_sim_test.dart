@@ -99,17 +99,22 @@ void main() {
 
     test('ethernet', () async {
       final eth = HarborEthernetMac(
-        config: const HarborEthernetConfig(),
+        config: HarborEthernetConfig.basic(phy: HarborEthPhy.mii),
         baseAddress: 0x1000B000,
+        fabricKind: HarborFabricKind.wishbone,
+        target: const HarborSimTarget(),
       );
-      eth.port('rx_clk').getsLogic(Const(0));
-      eth.port('rx_dv').getsLogic(Const(0));
-      eth.port('rxd').getsLogic(Const(0, width: 8));
-      eth.port('mdio_in').getsLogic(Const(0));
-      eth.port('dma_ACK').getsLogic(Const(0));
-      eth.port('dma_DAT_MISO').getsLogic(Const(0, width: 32));
-      eth.port('dma_ERR').getsLogic(Const(0));
-      await _absoluteRoundTrip(eth, 0x1000B000, 0x10, 0xAABBCCDD);
+      for (final p in eth.inputs.keys.where(
+        (p) => p.startsWith('mii_') || p.startsWith('dma_') || p == 'mdio_in',
+      )) {
+        eth.port(p).getsLogic(Const(0, width: eth.input(p).width));
+      }
+      await _absoluteRoundTrip(
+        eth,
+        0x1000B000,
+        HarborEthReg.macLo,
+        0xAABBCCDD,
+      );
     });
 
     test('temperature sensor', () async {

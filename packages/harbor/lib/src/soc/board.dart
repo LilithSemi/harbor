@@ -691,6 +691,22 @@ const _artyS7_50 = HarborBoard(
 /// hardware-proven with this PHY on openXC7. LiteX uses DIFF_SSTL15 for DQS.
 /// DQ and DQS take IN_TERM=UNTUNED_SPLIT_50 as in LiteX.
 ///
+/// The two KSZ9031 RGMII PHYs are `eth0` (PHY1) and `eth1` (PHY2), both at
+/// MDIO address 1 (p.27-29). Each has `eth<n>_rgmii_*` pins with the port
+/// names of an RGMII `HarborEthernetMac`, and `eth<n>_mdc`, `eth<n>_mdio`
+/// and `eth<n>_rst_n`. Use `HarborEthernetConfig.ax7203()` for the MACs,
+/// with `mdioPad: true`. All pins of both PHYs are in bank 16, so each RX
+/// clock (B17 and E19, SRCC) reaches its RX pins through a BUFIO. The
+/// preset has no RX delay taps, so the MACs need no IDELAYCTRL. If taps are
+/// added, the bank 16 clock region needs its own IDELAYCTRL, since the DDR3
+/// one is in bank 34 or 35.
+///
+/// The top must give each MAC `clk125` and `clk125_90` from an MMCM or PLL
+/// output that the DDR3 tree does not use, and must drive `eth<n>_rst_n`.
+/// The KSZ9031 needs its reset low for 10 ms after power up. On a Wishbone
+/// fabric the MAC DMA port is one request at a time. Use AXI4 for the full
+/// rate.
+///
 /// These are on the board and are left out of [pins] on purpose:
 /// - 125 MHz GTP reference clock MGT_CLK0 P/N = F6/E6 (p.11-12).
 /// - PCIe x4: 100 MHz host reference clock F10/E10, PERST J20, lanes RX0-3
@@ -837,7 +853,40 @@ const _ax7203 = HarborBoard(
     'sdram_dq[29]': 'N5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
     'sdram_dq[30]': 'P6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
     'sdram_dq[31]': 'P2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    // KSZ9031 PHY1, RGMII (p.28-29). LVCMOS33 is from LiteX.
+    'eth0_rgmii_txc': 'E18 LVCMOS33',
+    'eth0_rgmii_txd[0]': 'C20 LVCMOS33',
+    'eth0_rgmii_txd[1]': 'D20 LVCMOS33',
+    'eth0_rgmii_txd[2]': 'A19 LVCMOS33',
+    'eth0_rgmii_txd[3]': 'A18 LVCMOS33',
+    'eth0_rgmii_tx_ctl': 'F18 LVCMOS33',
+    'eth0_rgmii_rxc': 'B17 LVCMOS33',
+    'eth0_rgmii_rxd[0]': 'A16 LVCMOS33',
+    'eth0_rgmii_rxd[1]': 'B18 LVCMOS33',
+    'eth0_rgmii_rxd[2]': 'C18 LVCMOS33',
+    'eth0_rgmii_rxd[3]': 'C19 LVCMOS33',
+    'eth0_rgmii_rx_ctl': 'A15 LVCMOS33',
+    'eth0_mdc': 'B16 LVCMOS33',
+    'eth0_mdio': 'B15 LVCMOS33',
+    'eth0_rst_n': 'D16 LVCMOS33',
+    // KSZ9031 PHY2, RGMII (p.29). LVCMOS33 is from LiteX.
+    'eth1_rgmii_txc': 'A14 LVCMOS33',
+    'eth1_rgmii_txd[0]': 'E17 LVCMOS33',
+    'eth1_rgmii_txd[1]': 'C14 LVCMOS33',
+    'eth1_rgmii_txd[2]': 'C15 LVCMOS33',
+    'eth1_rgmii_txd[3]': 'A13 LVCMOS33',
+    'eth1_rgmii_tx_ctl': 'D17 LVCMOS33',
+    'eth1_rgmii_rxc': 'E19 LVCMOS33',
+    'eth1_rgmii_rxd[0]': 'A20 LVCMOS33',
+    'eth1_rgmii_rxd[1]': 'B20 LVCMOS33',
+    'eth1_rgmii_rxd[2]': 'D19 LVCMOS33',
+    'eth1_rgmii_rxd[3]': 'C17 LVCMOS33',
+    'eth1_rgmii_rx_ctl': 'F19 LVCMOS33',
+    'eth1_mdc': 'F20 LVCMOS33',
+    'eth1_mdio': 'C22 LVCMOS33',
+    'eth1_rst_n': 'B22 LVCMOS33',
   },
-  // R4 is the P side of a bank 34 MRCC pair (p.10).
-  clockCapableSites: {'R4'},
+  // R4 is the P side of a bank 34 MRCC pair (p.10). B17 and E19 are the
+  // RGMII RX clocks, on SRCC pins.
+  clockCapableSites: {'R4', 'B17', 'E19'},
 );

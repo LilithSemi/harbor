@@ -358,15 +358,16 @@ void main() {
   });
 
   group('Ecp5Iddrx1f', () {
-    test('q0/q1 track a changing d across several cycles, both moving '
-        'together on the rise', () async {
+    test('q0/q1 give the rise and the fall after it as one pair, both '
+        'moving together on the next rise', () async {
       final d = Logic(name: 'd')..put(0);
       final sclk = SimpleClockGenerator(10).clk;
       final iddr = Ecp5Iddrx1f(sclk: sclk, rst: Const(0), d: d);
       await iddr.build();
 
-      // d0Seq[i]/d1Seq[i]: the bit d must hold at rise i / at the fall
-      // just before rise i, so q0(i)=d0Seq[i] and q1(i)=d1Seq[i].
+      // d0Seq[i]/d1Seq[i]: the bit d holds at rise i / at the fall just
+      // before rise i. At rise i the pair is (rise i-1, fall after it), so
+      // q0(i)=d0Seq[i-1] and q1(i)=d1Seq[i].
       const d0Seq = [1, 0, 1, 1, 0];
       const d1Seq = [0, 1, 1, 0, 1, 0];
       Simulator.setMaxSimTime(200);
@@ -380,13 +381,13 @@ void main() {
         await sclk.nextPosedge;
         expect(
           iddr.q0.value.toInt(),
-          equals(d0Seq[i]),
-          reason: 'q0 is d at the rise, i=$i',
+          equals(d0Seq[i - 1]),
+          reason: 'q0 is d at the rise before, i=$i',
         );
         expect(
           iddr.q1.value.toInt(),
           equals(d1Seq[i]),
-          reason: 'q1 is d at the fall just before, i=$i',
+          reason: 'q1 is d at the fall after that rise, i=$i',
         );
       }
       await Simulator.endSimulation();
