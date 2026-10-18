@@ -1645,22 +1645,23 @@ class HarborSoC extends BridgeModule {
           // Makefile --pre-place hook empty.
           final preplacePy = <String>[];
 
-          // openXC7 DDR3 nextpnr helper scripts. The DDR PHY's bitslip-
-          // reference train SERDES must be pinned off the dead _SING tile;
-          // these ride nextpnr-xilinx --pre-place (constraints.py) and
-          // --pre-route (show_bels.py). Emitted only for the open-source
-          // Xilinx flow when a HarborDdr3 controller is present.
+          // openXC7 DDR3 nextpnr helper scripts. Legacy nextpnr-xilinx needs
+          // the train SERDES pinned off the dead _SING tile through pre-place.
+          // Himbächel pairs the SERDES during packing, so it only uses the
+          // clock constraint script below.
           if (t.vendor == HarborFpgaVendor.openXc7) {
             final ddr = peripherals.whereType<HarborDdr3>().firstOrNull;
             if (ddr != null) {
-              preplacePy.add(t.generateDdrPreplacePy(lanes: ddr.lanes));
-              Directory('$path/support/nextpnr').createSync(recursive: true);
-              File(
-                '$path/support/nextpnr/show_bels.py',
-              ).writeAsStringSync(t.generateDdrShowBelsPy());
+              if (!t.useHimbaechel) {
+                preplacePy.add(t.generateDdrPreplacePy(lanes: ddr.lanes));
+                Directory('$path/support/nextpnr').createSync(recursive: true);
+                File(
+                  '$path/support/nextpnr/show_bels.py',
+                ).writeAsStringSync(t.generateDdrShowBelsPy());
+              }
               // Over-constrain the derived core + DDR-controller clocks via a
-              // --pre-pack addClock. nextpnr-xilinx does NOT propagate the XDC
-              // create_clock through the PLL/BUFG, so these domains reach the
+              // --pre-pack addClock. The open Xilinx flows do not reliably
+              // propagate the XDC clock through the PLL/BUFG, so these domains
               // timing engine UNCONSTRAINED (zero margin, setup-only, single-
               // corner). addClock at a rate ABOVE the real one forces timing-
               // driven placement/routing to prioritise them and makes silicon
@@ -1675,6 +1676,7 @@ class HarborSoC extends BridgeModule {
               // identical for the legacy path.
               final ddrCtrlMhz = xilinxDdr3Clocks?.controllerClkMhz;
               if (coreMhz != null && ddrCtrlMhz != null) {
+                Directory('$path/support/nextpnr').createSync(recursive: true);
                 File('$path/support/nextpnr/clocks.py').writeAsStringSync(
                   t.generateClockConstraintPy(
                     coreClkMhz: coreMhz,
@@ -1689,16 +1691,18 @@ class HarborSoC extends BridgeModule {
           // the part those cells must land on comes down in the context, so a
           // provider can decline a family or a device it has no verified
           // placement for.
-          final preplaceCtx = HarborNextpnrPreplaceContext(
-            vendor: t.vendor,
-            device: t.device,
-            package: t.package,
-          );
-          for (final p
-              in peripherals.whereType<HarborNextpnrPreplaceProvider>()) {
-            final fragment = p.nextpnrPreplacePy(preplaceCtx);
-            if (fragment == null || fragment.trim().isEmpty) continue;
-            preplacePy.add(fragment);
+          if (!t.useHimbaechel) {
+            final preplaceCtx = HarborNextpnrPreplaceContext(
+              vendor: t.vendor,
+              device: t.device,
+              package: t.package,
+            );
+            for (final p
+                in peripherals.whereType<HarborNextpnrPreplaceProvider>()) {
+              final fragment = p.nextpnrPreplacePy(preplaceCtx);
+              if (fragment == null || fragment.trim().isEmpty) continue;
+              preplacePy.add(fragment);
+            }
           }
 
           if (preplacePy.isNotEmpty) {

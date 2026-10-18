@@ -179,7 +179,11 @@ class HarborBoard {
     int? frequency,
     Map<String, String> extraPins = const {},
     bool? ddrDllOn,
+    bool useHimbaechel = false,
   }) {
+    if (useHimbaechel && vendor != HarborFpgaVendor.openXc7) {
+      throw ArgumentError('Himbächel is only available for openXC7 boards.');
+    }
     // "All pins" (pins: null) includes the ambiguous sdram_dqs* entries
     // whenever this board has any, same as naming them explicitly.
     final wantsDdrDqs =
@@ -229,6 +233,7 @@ class HarborBoard {
       clockNPortName: clockNPortName,
       speedGrade: speedGrade,
       progCommand: progCommand,
+      useHimbaechel: useHimbaechel,
     );
   }
 }

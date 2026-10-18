@@ -222,6 +222,7 @@ void main() {
       ),
       'fastSim': _arty(HarborFabricKind.axi4, fastSim: true),
       'readGap': _arty(HarborFabricKind.axi4, readGap: 0),
+      'himbaechel': _arty(HarborFabricKind.axi4, himbaechel: true),
     };
     final names = {base.definitionName};
     for (final MapEntry(:key, :value) in variants.entries) {
@@ -299,6 +300,7 @@ HarborDdr3 _arty(
   int addressWidth = 28,
   bool fastSim = false,
   int readGap = 1,
+  bool himbaechel = false,
   HarborDdrConfig config = const HarborDdrConfig.artyS7(),
 }) => HarborDdr3(
   config: config,
@@ -315,5 +317,9 @@ HarborDdr3 _arty(
   readWords: readWords,
   fastSim: fastSim,
   readGap: readGap,
-  target: const HarborFpgaTarget.spartan7(device: 's50', package: 'csga324'),
+  target: HarborFpgaTarget.spartan7(
+    device: 's50',
+    package: 'csga324',
+    useHimbaechel: himbaechel,
+  ),
 );

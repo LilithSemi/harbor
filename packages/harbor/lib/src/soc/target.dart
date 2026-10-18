@@ -88,6 +88,9 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// FPGA vendor.
   final HarborFpgaVendor vendor;
 
+  /// Uses nextpnr's Himbächel Xilinx backend for the openXC7 flow.
+  final bool useHimbaechel;
+
   /// Device part number (e.g., `'up5k'`, `'lfe5u-45f'`, `'xc7s50'`).
   final String device;
 
@@ -215,7 +218,9 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.speedGrade = '1',
     this.progCommand,
     this.ecp5Autoname = false,
-  }) : _xilinxFamily = null;
+    this.useHimbaechel = false,
+  }) : assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
+       _xilinxFamily = null;
 
   /// iCE40 UP5K target using Yosys + nextpnr-ice40.
   const HarborFpgaTarget.ice40({
@@ -231,6 +236,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
        _xilinxFamily = null,
        clockNPortName = null,
        speedGrade = '1',
+       useHimbaechel = false,
        ecp5Autoname = false;
 
   /// Lattice ECP5 target using Yosys + nextpnr-ecp5.
@@ -247,6 +253,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
        vendor = HarborFpgaVendor.ecp5,
        clockNPortName = null,
        speedGrade = '1',
+       useHimbaechel = false,
        _xilinxFamily = null;
 
   /// Xilinx Spartan-7 target using Vivado or openXC7.
@@ -264,8 +271,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.speedGrade = '1',
     this.progCommand,
     bool useOpenXc7 = false,
+    this.useHimbaechel = false,
   }) : name = 'spartan7-$device',
-       vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
+       vendor = useOpenXc7 || useHimbaechel
+           ? HarborFpgaVendor.openXc7
+           : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.spartan7,
        ecp5Autoname = false;
 
@@ -284,8 +294,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.speedGrade = '1',
     this.progCommand,
     bool useOpenXc7 = false,
+    this.useHimbaechel = false,
   }) : name = 'artix7-$device',
-       vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
+       vendor = useOpenXc7 || useHimbaechel
+           ? HarborFpgaVendor.openXc7
+           : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.artix7,
        ecp5Autoname = false;
 
@@ -304,8 +317,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.speedGrade = '1',
     this.progCommand,
     bool useOpenXc7 = false,
+    this.useHimbaechel = false,
   }) : name = 'kintex7-$device',
-       vendor = useOpenXc7 ? HarborFpgaVendor.openXc7 : HarborFpgaVendor.vivado,
+       vendor = useOpenXc7 || useHimbaechel
+           ? HarborFpgaVendor.openXc7
+           : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.kintex7,
        ecp5Autoname = false;
 
@@ -790,33 +806,39 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       buf.writeln('\$(TOP).$bitstreamExtension: $intermediate');
       buf.writeln('\t$packCmd');
     } else if (vendor == HarborFpgaVendor.openXc7) {
-      // openXC7 (nextpnr-xilinx + prjxray) flow: json -> fasm -> frames -> bit.
-      // The tools nextpnr-xilinx / fasm2frames / xc7frames2bit are assumed on
+      // openXC7 flow: json -> fasm -> frames -> bit. The nextpnr backend and
+      // fasm2frames / xc7frames2bit are assumed on
       // PATH in the dev shell; the data files come from Make variables the
       // caller (nix/user) can override with `?=`.
       buf.writeln();
       buf.writeln(
-        '# openXC7 (nextpnr-xilinx + prjxray) place-and-route + pack.',
+        '# openXC7 (${useHimbaechel ? 'Himbächel' : 'nextpnr-xilinx'} + '
+        'prjxray) place-and-route + pack.',
       );
       buf.writeln(
-        '# CHIPDB / XRAY_DB / PART / SEED are overridable (nix supplies them).',
+        '# XRAY_DB / PART / SEED are overridable (nix supplies them).',
       );
-      buf.writeln(
-        '# Default CHIPDB is the nextpnr-xilinx chipdb for this device/package.',
-      );
-      buf.writeln(
-        'CHIPDB ?= \$(NEXTPNR_XILINX_CHIPDB)/\$(DEVICE)\$(PACKAGE).bin',
-      );
+      if (!useHimbaechel) {
+        buf.writeln(
+          '# Default CHIPDB is the nextpnr-xilinx chipdb for this '
+          'device/package.',
+        );
+        buf.writeln(
+          'CHIPDB ?= \$(NEXTPNR_XILINX_CHIPDB)/\$(DEVICE)\$(PACKAGE).bin',
+        );
+      }
       buf.writeln('XRAY_DB ?= \$(PRJXRAY_DB)');
       buf.writeln('PART ?= \$(DEVICE)\$(PACKAGE)-$speedGrade');
       buf.writeln('FAMILY = $_prjxrayFamily');
       buf.writeln('SEED ?= 1');
-      buf.writeln(
-        '# nextpnr-xilinx has no --threads flag, but it links OpenMP, so the',
-      );
-      buf.writeln(
-        '# thread count is set through OMP_NUM_THREADS on the pnr command below.',
-      );
+      if (!useHimbaechel) {
+        buf.writeln(
+          '# nextpnr-xilinx has no --threads flag, but it links OpenMP, so the',
+        );
+        buf.writeln(
+          '# thread count is set through OMP_NUM_THREADS on the pnr command.',
+        );
+      }
       buf.writeln(
         '# Defaults to all host cores; override with e.g. THREADS=8.',
       );
@@ -829,26 +851,33 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         'threaded and slow; sa is an alternative when heap stalls.',
       );
       buf.writeln('PLACER ?= heap');
-      buf.writeln(
-        '# --pre-place/--pre-route hooks activate only when Harbor emitted the',
-      );
-      buf.writeln(
-        '# matching script (openXC7 + DDR peripheral, or any peripheral that',
-      );
-      buf.writeln(
-        '# contributes a fragment); empty otherwise. The two are tested apart,',
-      );
-      buf.writeln(
-        '# so a design with a pre-place script but no BEL dump still routes.',
-      );
-      buf.writeln(
-        'PREPLACE := \$(if \$(wildcard support/nextpnr/constraints.py),'
-        '--pre-place support/nextpnr/constraints.py,)',
-      );
-      buf.writeln(
-        'PREROUTE := \$(if \$(wildcard support/nextpnr/show_bels.py),'
-        '--pre-route support/nextpnr/show_bels.py,)',
-      );
+      if (useHimbaechel) {
+        buf.writeln('ROUTER ?= router2');
+      } else {
+        buf.writeln(
+          '# --pre-place/--pre-route hooks activate only when Harbor emitted '
+          'the',
+        );
+        buf.writeln(
+          '# matching script (openXC7 + DDR peripheral, or any peripheral '
+          'that',
+        );
+        buf.writeln(
+          '# contributes a fragment); empty otherwise. The two are tested '
+          'apart,',
+        );
+        buf.writeln(
+          '# so a design with a pre-place script but no BEL dump still routes.',
+        );
+        buf.writeln(
+          'PREPLACE := \$(if \$(wildcard support/nextpnr/constraints.py),'
+          '--pre-place support/nextpnr/constraints.py,)',
+        );
+        buf.writeln(
+          'PREROUTE := \$(if \$(wildcard support/nextpnr/show_bels.py),'
+          '--pre-route support/nextpnr/show_bels.py,)',
+        );
+      }
       buf.writeln(
         '# --pre-pack over-constrains the PLL/BUFG-derived clocks (which',
       );
@@ -863,13 +892,24 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       buf.writeln();
       buf.writeln('pnr: \$(TOP).fasm');
       buf.writeln('\$(TOP).fasm: \$(TOP).json \$(TOP).$constraintExtension');
-      buf.writeln(
-        '\tOMP_NUM_THREADS=\$(THREADS) nextpnr-xilinx --chipdb \$(CHIPDB) '
-        '--xdc \$(TOP).$constraintExtension '
-        '--json \$(TOP).json --write \$(TOP)_routed.json --fasm \$(TOP).fasm '
-        '\$(PREPACK) \$(PREPLACE) \$(PREROUTE) --placer \$(PLACER) '
-        '--seed \$(SEED) \$(PNRFLAGS)',
-      );
+      if (useHimbaechel) {
+        buf.writeln(
+          '\tnextpnr-himbaechel --device \$(PART) '
+          '-o xdc=\$(TOP).$constraintExtension '
+          '--json \$(TOP).json --write \$(TOP)_routed.json '
+          '-o fasm=\$(TOP).fasm \$(PREPACK) --placer \$(PLACER) '
+          '--router \$(ROUTER) --threads \$(THREADS) --seed \$(SEED) '
+          '\$(PNRFLAGS)',
+        );
+      } else {
+        buf.writeln(
+          '\tOMP_NUM_THREADS=\$(THREADS) nextpnr-xilinx --chipdb \$(CHIPDB) '
+          '--xdc \$(TOP).$constraintExtension '
+          '--json \$(TOP).json --write \$(TOP)_routed.json '
+          '--fasm \$(TOP).fasm \$(PREPACK) \$(PREPLACE) \$(PREROUTE) '
+          '--placer \$(PLACER) --seed \$(SEED) \$(PNRFLAGS)',
+        );
+      }
       // nextpnr-xilinx always writes the 0.675 V internal VREF (SSTL135) for
       // a bank with SSTL inputs and ignores INTERNAL_VREF. SSTL15 needs 0.75 V.
       if (sstlVrefMv == 750) {

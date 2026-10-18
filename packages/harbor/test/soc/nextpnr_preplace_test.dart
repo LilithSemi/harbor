@@ -65,6 +65,15 @@ const _openXc7 = HarborFpgaTarget.spartan7(
   useOpenXc7: true,
 );
 
+const _himbaechel = HarborFpgaTarget.artix7(
+  device: 'xc7a200t',
+  package: 'fbg484',
+  frequency: 100000000,
+  pinMap: {'clk': 'E18', 'reset': 'T6'},
+  speedGrade: '2',
+  useHimbaechel: true,
+);
+
 HarborSoC _soc({
   HarborDeviceTarget? target,
   List<BridgeModule> extra = const [],
@@ -135,6 +144,7 @@ void main() {
         (_ice40, 'nextpnr-ice40'),
         (_ecp5, 'nextpnr-ecp5'),
         (_openXc7, 'nextpnr-xilinx'),
+        (_himbaechel, 'nextpnr-himbaechel'),
       ]) {
         final mk = t.generateMakefile('TopCell');
         expect(mk.split('\n'), contains('PNRFLAGS ?='), reason: tool);
@@ -240,6 +250,26 @@ void main() {
       );
       expect(mk, contains('xc7frames2bit --part_file '));
     });
+
+    test('Himbächel uses the native backend without pre-place hooks', () {
+      final mk = _himbaechel.generateMakefile('TopCell');
+      expect(_himbaechel.vendor, HarborFpgaVendor.openXc7);
+      expect(mk, contains('PART ?= \$(DEVICE)\$(PACKAGE)-2'));
+      expect(mk, contains('ROUTER ?= router2'));
+      expect(
+        mk,
+        contains(
+          '\tnextpnr-himbaechel --device \$(PART) -o xdc=\$(TOP).xdc '
+          '--json \$(TOP).json --write \$(TOP)_routed.json '
+          '-o fasm=\$(TOP).fasm \$(PREPACK) --placer \$(PLACER) '
+          '--router \$(ROUTER) --threads \$(THREADS) --seed \$(SEED)',
+        ),
+      );
+      expect(mk, isNot(contains('nextpnr-xilinx')));
+      expect(mk, isNot(contains('PREPLACE')));
+      expect(mk, isNot(contains('PREROUTE')));
+      expect(mk, isNot(contains('CHIPDB')));
+    });
   });
 
   group('generateAll pre-place collection', () {
@@ -305,6 +335,20 @@ void main() {
       );
       final dir = await _generate(_soc(target: _ice40, extra: [declines]));
       expect(declines.seenContexts, hasLength(1));
+      expect(
+        File('${dir.path}/support/nextpnr/constraints.py').existsSync(),
+        isFalse,
+      );
+    });
+
+    test('Himbächel does not collect legacy pre-place fragments', () async {
+      final mock = _PreplaceMock(
+        fragment: "print('MUST NOT RUN')\n",
+        baseAddress: 0x40000000,
+        name: 'mock_himbaechel',
+      );
+      final dir = await _generate(_soc(target: _himbaechel, extra: [mock]));
+      expect(mock.seenContexts, isEmpty);
       expect(
         File('${dir.path}/support/nextpnr/constraints.py').existsSync(),
         isFalse,

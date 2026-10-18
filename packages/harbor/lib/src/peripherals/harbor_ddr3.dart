@@ -533,7 +533,8 @@ class HarborDdr3 extends BridgeModule
     final phy = switch (target) {
       null => 'generic',
       HarborSimTarget() => simExternalMem ? 'simext' : 'sim',
-      HarborFpgaTarget(:final vendor) => vendor.name,
+      HarborFpgaTarget(:final vendor, :final useHimbaechel) =>
+        useHimbaechel ? '${vendor.name}_himbaechel' : vendor.name,
       _ => target.name.replaceAll(RegExp('[^A-Za-z0-9]'), '_'),
     };
     final burst = protocol == HarborFabricKind.wishbone
@@ -1165,6 +1166,10 @@ struct DramStore {
       dqPad: dqPad,
       dqsPad: dqsPad,
       dqsNPad: dqsNPad,
+      himbaechel: switch (target) {
+        HarborFpgaTarget(useHimbaechel: true) => true,
+        _ => false,
+      },
     );
 
     // Lattice ECP5 PHY (gearRatio 1 only, so straight from the controller).

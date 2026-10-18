@@ -112,6 +112,7 @@ class Ddr3Phy extends Ddr3PhyBase {
     // [dqsNPad].
     required LogicNet dqsPad,
     required LogicNet dqsNPad,
+    bool himbaechel = false,
     super.name = 'ddr3_phy',
   }) {
     // --- clocks/reset ---
@@ -224,6 +225,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       d1: Const(0),
       d2: Const(1),
       r: syncRst,
+      omitInactiveSet: himbaechel,
       name: 'ck_oddr',
     );
     final ckDiff = XilinxObufds(i: ckOddr.q, name: 'ck_obufds');

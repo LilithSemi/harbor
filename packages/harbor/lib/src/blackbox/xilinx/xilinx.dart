@@ -939,6 +939,7 @@ class XilinxOddr extends BridgeModule {
     required Logic d2,
     Logic? ce,
     Logic? r,
+    bool omitInactiveSet = false,
     String ddrClkEdge = 'SAME_EDGE',
     super.name = 'oddr',
   }) : super('ODDR', isSystemVerilogLeaf: true) {
@@ -950,7 +951,7 @@ class XilinxOddr extends BridgeModule {
     addInput('D1', d1);
     addInput('D2', d2);
     addInput('R', r ?? Const(0));
-    addInput('S', Const(0));
+    if (!omitInactiveSet) addInput('S', Const(0));
     final q = addOutput('Q');
     // Sim only, SAME_EDGE: both halves latch on the rise, then Q shows D1
     // while C is high and D2 while C is low. CE, R and S are not modelled.

@@ -354,6 +354,38 @@ void main() {
     );
   });
 
+  test('board target can select Himbächel', () {
+    final t = board.fpgaTarget(pins: ['clk', 'reset_n'], useHimbaechel: true);
+    expect(t.vendor, HarborFpgaVendor.openXc7);
+    expect(t.useHimbaechel, isTrue);
+    expect(t.generateMakefile('Top'), contains('nextpnr-himbaechel'));
+  });
+
+  test('Himbächel DDR generation emits clocks without legacy hooks', () async {
+    final dir = Directory.systemTemp.createTempSync('harbor_ax7203_himb_');
+    addTearDown(() async {
+      dir.deleteSync(recursive: true);
+      await Simulator.reset();
+    });
+    final target = board.fpgaTarget(useHimbaechel: true);
+    await _soc(target, withEth: false).generateAll(dir);
+
+    expect(File('${dir.path}/support/nextpnr/clocks.py').existsSync(), isTrue);
+    expect(
+      File('${dir.path}/support/nextpnr/constraints.py').existsSync(),
+      isFalse,
+    );
+    expect(
+      File('${dir.path}/support/nextpnr/show_bels.py').existsSync(),
+      isFalse,
+    );
+    final ckOddr = File(
+      '${dir.path}/rtl/Ddr3Phy.sv',
+    ).readAsLinesSync().singleWhere((line) => line.contains(' ck_oddr('));
+    expect(ckOddr, contains('.R(sync_rst)'));
+    expect(ckOddr, isNot(contains('.S(')));
+  });
+
   test('one leg of the differential clock binds both', () {
     for (final leg in ['clk', 'clk_n']) {
       final t = board.fpgaTarget(pins: [leg, 'led_n[0]']);
