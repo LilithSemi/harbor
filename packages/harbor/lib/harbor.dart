@@ -382,6 +382,7 @@ export 'src/peripherals/imsic.dart';
 export 'src/peripherals/iommu.dart';
 export 'src/peripherals/maskrom.dart';
 export 'src/peripherals/pcie.dart';
+export 'src/peripherals/pcie_dma.dart';
 export 'src/peripherals/pcie_option_rom.dart';
 export 'src/peripherals/plic.dart';
 export 'src/peripherals/pmu.dart';
