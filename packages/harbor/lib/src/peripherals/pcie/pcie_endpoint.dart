@@ -17,6 +17,7 @@ class HarborPcieEndpointConfig {
   final int bar0Bytes;
   final int optionRomBytes;
   final int deviceSerialNumber;
+  final int packetMemoryEntries;
 
   const HarborPcieEndpointConfig({
     this.vendorId = 0x10ee,
@@ -28,6 +29,7 @@ class HarborPcieEndpointConfig {
     this.bar0Bytes = 4096,
     this.optionRomBytes = 0,
     this.deviceSerialNumber = 0,
+    this.packetMemoryEntries = 2048,
   });
 }
 
@@ -150,6 +152,7 @@ class HarborPcieEndpoint extends Module {
               ? 0
               : (_barMask(config.optionRomBytes) | 1),
         ),
+        ..._packetMemoryParameters(config.packetMemoryEntries),
       },
     );
 
@@ -209,6 +212,7 @@ class HarborPcieEndpoint extends Module {
       readEnable: hardBlock.output('MIMTXREN'),
       readAddress: hardBlock.output('MIMTXRADDR'),
       width: 69,
+      depth: config.packetMemoryEntries,
       name: 'tx_packet_ram',
     );
     final rxRam = _HarborPcieBlockRam(
@@ -219,6 +223,7 @@ class HarborPcieEndpoint extends Module {
       readEnable: hardBlock.output('MIMRXREN'),
       readAddress: hardBlock.output('MIMRXRADDR'),
       width: 68,
+      depth: config.packetMemoryEntries,
       name: 'rx_packet_ram',
     );
     mimTxReadData <= txRam.readData;
@@ -291,7 +296,30 @@ class HarborPcieEndpoint extends Module {
     }
     _checkRegion('bar0Bytes', config.bar0Bytes, allowZero: false);
     _checkRegion('optionRomBytes', config.optionRomBytes, allowZero: true);
+    if (config.packetMemoryEntries != 1024 &&
+        config.packetMemoryEntries != 2048) {
+      throw ArgumentError.value(
+        config.packetMemoryEntries,
+        'packetMemoryEntries',
+        'must be 1024 or 2048',
+      );
+    }
   }
+
+  static Map<String, String> _packetMemoryParameters(int entries) =>
+      entries == 1024
+      ? const {
+          'DEV_CAP_MAX_PAYLOAD_SUPPORTED': '1',
+          'VC0_RX_RAM_LIMIT': "13'h3FF",
+          'VC0_TOTAL_CREDITS_CD': '370',
+          'VC0_TOTAL_CREDITS_CH': '72',
+          'VC0_TOTAL_CREDITS_NPH': '4',
+          'VC0_TOTAL_CREDITS_NPD': '8',
+          'VC0_TOTAL_CREDITS_PD': '32',
+          'VC0_TOTAL_CREDITS_PH': '4',
+          'VC0_TX_LASTPACKET': '28',
+        }
+      : const {};
 
   static void _checkRegion(String name, int bytes, {required bool allowZero}) {
     if ((allowZero && bytes == 0) ||
@@ -321,22 +349,24 @@ class _HarborPcieBlockRam extends Module {
     required Logic readEnable,
     required Logic readAddress,
     required int width,
+    required int depth,
     super.name,
-  }) : super(definitionName: 'HarborPcieBlockRam_$width') {
+  }) : super(definitionName: 'HarborPcieBlockRam_${width}x$depth') {
     clk = addInput('clk', clk);
     writeEnable = addInput('write_enable', writeEnable);
     writeAddress = addInput('write_address', writeAddress, width: 13);
     writeData = addInput('write_data', writeData, width: width);
     readEnable = addInput('read_enable', readEnable);
     readAddress = addInput('read_address', readAddress, width: 13);
+    final addressWidth = (depth - 1).bitLength;
     final ram = HarborBram(
       clk,
       width: width,
-      depth: 2048,
+      depth: depth,
       wrEn: writeEnable,
-      wrAddr: writeAddress.slice(10, 0),
+      wrAddr: writeAddress.slice(addressWidth - 1, 0),
       wrData: writeData,
-      rdAddr: readAddress.slice(10, 0),
+      rdAddr: readAddress.slice(addressWidth - 1, 0),
     );
     final enableDelay = Logic(name: 'read_enable_delay');
     final data = Logic(name: 'read_data_reg', width: width);
