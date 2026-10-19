@@ -44,6 +44,14 @@ class HarborPcieDma extends BridgeModule {
   /// One PCIe Memory Read is outstanding at a time.
   static const outstandingReads = 1;
 
+  /// BAR0 size in words.
+  static const barWords = 0x400;
+
+  /// First BAR0 word of the [infoWords] aperture.
+  static const infoFirstWord = 0x40;
+
+  static const infoMaxWords = barWords - infoFirstWord;
+
   /// Local memory manager.
   late final HarborMemoryMasterPort memory;
 
@@ -55,6 +63,10 @@ class HarborPcieDma extends BridgeModule {
 
   /// Bit in `rx_user` that marks a BAR0 hit.
   final int barHitBit;
+
+  /// Read-only words in BAR0 from [infoFirstWord]. A word past the end
+  /// reads 0.
+  final List<int> infoWords;
 
   HarborPcieDma({
     required Logic clk,
@@ -68,9 +80,11 @@ class HarborPcieDma extends BridgeModule {
     this.fabricKind = HarborFabricKind.axi4,
     this.localAddressWidth = 32,
     this.barHitBit = 2,
+    this.infoWords = const [],
     String? name,
   }) : super(
-         'HarborPcieDma_A${localAddressWidth}_${fabricKind.name}_B$barHitBit',
+         'HarborPcieDma_A${localAddressWidth}_${fabricKind.name}_B$barHitBit'
+         '_I${_infoTag(infoWords)}',
          name: name ?? 'pcie_dma',
        ) {
     if (localAddressWidth < 3 || localAddressWidth > 64) {
@@ -78,6 +92,9 @@ class HarborPcieDma extends BridgeModule {
     }
     if (barHitBit < 0 || barHitBit >= 22) {
       throw RangeError.range(barHitBit, 0, 21, 'barHitBit');
+    }
+    if (infoWords.length > infoMaxWords) {
+      throw RangeError.range(infoWords.length, 0, infoMaxWords, 'infoWords');
     }
 
     clk = addInput('clk', clk);
@@ -210,6 +227,11 @@ class HarborPcieDma extends BridgeModule {
         CaseItem(Const(10, width: 10), [
           barReadData < errorCode.zeroExtend(32),
         ]),
+        for (var i = 0; i < infoWords.length; i++)
+          if (infoWords[i] != 0)
+            CaseItem(Const(infoFirstWord + i, width: 10), [
+              barReadData < Const(infoWords[i], width: 32),
+            ]),
       ]),
     ]);
 
@@ -615,5 +637,17 @@ class HarborPcieDma extends BridgeModule {
         ]),
       ]),
     ], reset: reset);
+  }
+
+  /// Word count and FNV-1a hash, so different tables get different
+  /// definition names.
+  static String _infoTag(List<int> words) {
+    var hash = 0x811c9dc5;
+    for (final word in words) {
+      for (var shift = 0; shift < 32; shift += 8) {
+        hash = ((hash ^ ((word >>> shift) & 0xff)) * 0x01000193) & 0xffffffff;
+      }
+    }
+    return '${words.length}_${hash.toRadixString(16)}';
   }
 }

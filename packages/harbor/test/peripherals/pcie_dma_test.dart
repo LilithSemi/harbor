@@ -109,6 +109,69 @@ void main() {
     expect(fixture.error.value.toInt(), 0);
     await Simulator.endSimulation();
   });
+
+  test('serves the info words above the registers', () async {
+    const words = [0x47444556, 1, 0x5a5a1234];
+    final fixture = await _Fixture.create(infoWords: words);
+
+    for (var i = 0; i < words.length; i++) {
+      expect(
+        await fixture.readWord((HarborPcieDma.infoFirstWord + i) * 4),
+        words[i],
+        reason: 'word $i',
+      );
+    }
+    // The engine keeps its own registers, which the aperture sits above.
+    expect(
+      await fixture.readWord(HarborPcieDma.registerIdentifier),
+      HarborPcieDma.identifier,
+    );
+    await Simulator.endSimulation();
+  });
+
+  test('a word past the end of the info words reads zero', () async {
+    final fixture = await _Fixture.create(infoWords: const [0x47444556]);
+    expect(await fixture.readWord((HarborPcieDma.infoFirstWord + 1) * 4), 0);
+    await Simulator.endSimulation();
+  });
+
+  test('two different word lists are two definitions', () {
+    HarborPcieDma build(List<int> words) => HarborPcieDma(
+      clk: Logic(),
+      reset: Logic(),
+      completerId: Logic(width: 16),
+      rxData: Logic(width: 64),
+      rxValid: Logic(),
+      rxLast: Logic(),
+      rxUser: Logic(width: 22),
+      txReady: Logic(),
+      infoWords: words,
+    );
+
+    final empty = build(const []).definitionName;
+    final one = build(const [1]).definitionName;
+    final other = build(const [2]).definitionName;
+    expect(one, isNot(empty));
+    // Same length, different contents. A count alone would collide here.
+    expect(one, isNot(other));
+  });
+
+  test('more words than the aperture holds is refused', () {
+    expect(
+      () => HarborPcieDma(
+        clk: Logic(),
+        reset: Logic(),
+        completerId: Logic(width: 16),
+        rxData: Logic(width: 64),
+        rxValid: Logic(),
+        rxLast: Logic(),
+        rxUser: Logic(width: 22),
+        txReady: Logic(),
+        infoWords: List<int>.filled(HarborPcieDma.infoMaxWords + 1, 0),
+      ),
+      throwsA(isA<RangeError>()),
+    );
+  });
 }
 
 class _Fixture {
@@ -142,6 +205,7 @@ class _Fixture {
 
   static Future<_Fixture> create({
     HarborFabricKind kind = HarborFabricKind.wishbone,
+    List<int> infoWords = const [],
   }) async {
     final dma = HarborPcieDma(
       clk: Logic(),
@@ -154,6 +218,7 @@ class _Fixture {
       txReady: Logic(),
       fabricKind: kind,
       localAddressWidth: 32,
+      infoWords: infoWords,
     );
     const config = HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32);
     final top = MasterTop(dma, iface: 'memory', kind: kind, config: config);
@@ -237,6 +302,18 @@ class _Fixture {
     (_swapBytes(data) << 32) | (tag << 8),
     user: 0,
   );
+
+  /// One BAR0 word, in host byte order.
+  ///
+  /// The completion carries the payload in the second beat, byte swapped on
+  /// the wire, so this undoes both.
+  Future<int> readWord(int address) async {
+    await barRead(address);
+    await clk.nextPosedge;
+    final wire = ((txData.value.toBigInt() >> 32) & BigInt.from(0xffffffff))
+        .toInt();
+    return _swapBytes(wire);
+  }
 
   Future<bool> waitForDone() async {
     for (var cycle = 0; cycle < 100; cycle++) {
