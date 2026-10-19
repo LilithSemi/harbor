@@ -110,7 +110,7 @@ class _Bench {
     );
   }
 
-  Future<void> start() async {
+  Future<void> start({bool startUpSink = true}) async {
     Simulator.setMaxSimTime(20000000);
     unawaited(Simulator.run());
     await clk.nextPosedge;
@@ -119,7 +119,7 @@ class _Bench {
     }
     reset.inject(0);
     await clk.nextPosedge;
-    upSink.start();
+    if (startUpSink) upSink.start();
     for (final s in clientSinks.values) {
       s.start();
     }
@@ -139,6 +139,21 @@ class _Bench {
     await clk.nextPosedge;
     await Simulator.endSimulation();
   }
+}
+
+/// A TLP with arbitrary wire DWs, used for types the host model lacks.
+class _RawTlp extends PcieTlp {
+  final List<int> raw;
+
+  _RawTlp(this.raw, {required int payloadDw})
+    : super(
+        kind: PcieTlpKind.memWrite32,
+        lengthDw: payloadDw,
+        data: Uint8List(payloadDw * 4),
+      );
+
+  @override
+  List<int> wireDwords() => raw;
 }
 
 const _bar0 = HarborPcieStream.userBar0;
@@ -279,6 +294,97 @@ void main() {
         expect(bench.clientSinks['mem']!.received, isEmpty);
         await bench.finish();
       });
+
+      test('holds the TX source while a beat waits for ready', () async {
+        final bench = await _Bench.create(
+          width: width,
+          clients: _allClients,
+          gapChance: 0,
+        );
+        await bench.start(startUpSink: false);
+        final random = Random(11);
+        final slow = PcieTlp.memWrite(address: 0x40, data: _bytes(random, 48));
+        final fast = PcieTlp.memWrite(address: 0x80, data: _bytes(random, 48));
+        unawaited(bench.clientDrivers['rom']!.send(slow));
+        await bench.idle(5);
+        final tx = bench.upTx;
+        String snapshot() =>
+            '${tx.valid.value} ${tx.data.value} ${tx.keep.value} '
+            '${tx.last.value} ${tx.user.value}';
+        await bench.clk.nextNegedge;
+        expect(tx.valid.value.toBool(), isTrue);
+        final before = snapshot();
+        // A higher priority client starts while ready is low.
+        unawaited(bench.clientDrivers['dma']!.send(fast));
+        for (var i = 0; i < 12; i++) {
+          await bench.clk.nextNegedge;
+          expect(snapshot(), before, reason: 'cycle $i');
+        }
+        bench.upSink.start();
+        await bench.upSink.waitFor(2);
+        expect(_dwords(bench.upSink.received), _dwords([slow, fast]));
+        await bench.finish();
+      });
+
+      for (final (label, header, payload) in [
+        ('IO write', 0x42000001, 1),
+        ('atomic with 4 DW', 0x4e000004, 4),
+      ]) {
+        test('drains a $label that no client claims', () async {
+          final bench = await _Bench.create(
+            width: width,
+            clients: [_allClients[0], _allClients[1]],
+          );
+          await bench.start();
+          final headers = <int>[];
+          var running = true;
+          unawaited(() async {
+            var atStart = true;
+            while (running) {
+              await bench.clk.nextNegedge;
+              final tx = bench.upTx;
+              if (tx.valid.value.toBool() && tx.ready.value.toBool()) {
+                if (atStart)
+                  headers.add(
+                    (tx.data.value.toBigInt() & BigInt.from(0xffffffff))
+                        .toInt(),
+                  );
+                atStart = tx.last.value.toBool();
+              }
+            }
+          }());
+          const tcAttr = (5 << 20) | (3 << 12);
+          final unclaimed = _RawTlp([
+            header | tcAttr,
+            0x0abc2a0f,
+            0x00001000,
+            for (var i = 0; i < payload; i++) 0xdead0000 + i,
+          ], payloadDw: payload);
+          final next = PcieTlp.memWrite(
+            address: 0x20,
+            data: [1, 2, 3, 4],
+            tag: 9,
+          );
+          await bench.upDriver.send(unclaimed, user: _rom);
+          await bench.upDriver.send(next, user: _bar0);
+          await bench.upSink.waitFor(1);
+          await bench.clientSinks['dma']!.waitFor(1);
+          await bench.idle(30);
+          expect(bench.upSink.received, hasLength(1));
+          final cpl = bench.upSink.received.single;
+          expect(cpl.kind, PcieTlpKind.cpl);
+          expect(cpl.status, PcieCplStatus.unsupported);
+          expect(cpl.byteCount, 4);
+          expect(cpl.completerId, _completerId);
+          expect(cpl.requesterId, 0x0abc);
+          expect(cpl.tag, 0x2a);
+          expect(headers, [0x0a000000 | tcAttr]);
+          expect(_dwords(bench.clientSinks['dma']!.received), _dwords([next]));
+          expect(bench.clientSinks['mem']!.received, isEmpty);
+          running = false;
+          await bench.finish();
+        });
+      }
 
       test('drops unclaimed posted packets and stray completions', () async {
         final bench = await _Bench.create(

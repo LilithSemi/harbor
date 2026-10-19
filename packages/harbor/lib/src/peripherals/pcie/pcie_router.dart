@@ -120,7 +120,7 @@ class HarborPcieRouter extends Module {
 
   /// Builds the RX side. Returns the pending UR request as
   /// (pending, requester ID, tag).
-  (Logic, Logic, Logic) _buildRx(
+  (Logic, Logic, Logic, Logic, Logic) _buildRx(
     Logic clk,
     Logic reset,
     HarborPcieStream rx,
@@ -132,6 +132,8 @@ class HarborPcieRouter extends Module {
     final urPending = Logic(name: 'ur_pending');
     final urRequester = Logic(name: 'ur_requester', width: 16);
     final urTag = Logic(name: 'ur_tag', width: 8);
+    final urTc = Logic(name: 'ur_tc', width: 3);
+    final urAttr = Logic(name: 'ur_attr', width: 2);
 
     final first = ~inPacket;
     final fmt = rx.data.slice(31, 29);
@@ -196,6 +198,8 @@ class HarborPcieRouter extends Module {
                   urPending < 1,
                   urRequester < rx.data.slice(63, 48),
                   urTag < rx.data.slice(47, 40),
+                  urTc < rx.data.slice(22, 20),
+                  urAttr < rx.data.slice(13, 12),
                 ],
               ),
             ],
@@ -204,7 +208,7 @@ class HarborPcieRouter extends Module {
         ],
       ),
     ]);
-    return (urPending, urRequester, urTag);
+    return (urPending, urRequester, urTag, urTc, urAttr);
   }
 
   final Logic _urDone = Logic(name: 'ur_done');
@@ -215,14 +219,21 @@ class HarborPcieRouter extends Module {
     Logic completerId,
     HarborPcieStream tx,
     List<HarborPcieStream> fromClient,
-    (Logic, Logic, Logic) urRequest,
+    (Logic, Logic, Logic, Logic, Logic) urRequest,
   ) {
-    final (urPending, urRequester, urTag) = urRequest;
+    final (urPending, urRequester, urTag, urTc, urAttr) = urRequest;
     final n = clients.length + 1;
 
     // The UR slot is the last source.
     final urBeat = Logic(name: 'ur_beat');
-    final dw0 = Const(0x0a000000, width: 32);
+    final dw0 = [
+      Const(0x0a, width: 8),
+      Const(0, width: 1),
+      urTc,
+      Const(0, width: 6),
+      urAttr,
+      Const(0, width: 12),
+    ].swizzle();
     final dw1 = [completerId, Const(1 << 13 | 4, width: 16)].swizzle();
     final dw2 = [urRequester, urTag, Const(0, width: 8)].swizzle();
     final Logic urData;
@@ -310,6 +321,10 @@ class HarborPcieRouter extends Module {
                 then: [locked < 0, lastGrant < currentWord],
                 orElse: [locked < 1, grant < currentWord],
               ),
+            ],
+            orElse: [
+              // Hold the source while a presented beat waits for ready.
+              If(tx.valid, then: [locked < 1, grant < currentWord]),
             ],
           ),
           If(
