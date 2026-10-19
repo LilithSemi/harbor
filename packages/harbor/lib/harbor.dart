@@ -388,6 +388,7 @@ export 'src/peripherals/pcie/gtp_pcie_phy.dart';
 export 'src/peripherals/pcie/gtp_primitives.dart';
 export 'src/peripherals/pcie/pcie_pipe.dart';
 export 'src/peripherals/pcie/pcie_stream.dart';
+export 'src/peripherals/pcie/pcie_router.dart';
 export 'src/peripherals/pcie/pcie_trn_axi.dart';
 export 'src/peripherals/pcie/pcie_2_1_params.dart';
 export 'src/peripherals/pcie/pcie_2_1.dart';
