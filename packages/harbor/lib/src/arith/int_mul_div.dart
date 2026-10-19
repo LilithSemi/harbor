@@ -170,7 +170,8 @@ typedef _State = Map<String, Logic>;
 /// Multiply has two modes. [HarborIntMulMode.pipelined] computes `a * b` as
 /// a plain operator on magnitude operands, so ECP5 MULT18X18D and Xilinx
 /// DSP48 can infer it, and [mulStages] registers cut the pre, multiply and
-/// post stages. A stall holds every stage. [HarborIntMulMode.iterative] is
+/// post stages. A fourth stage adds an output hold after the post stage. A
+/// stall holds every stage. [HarborIntMulMode.iterative] is
 /// a shift and add multiplier, `mulRadix` bits a cycle, one op at a time.
 /// mulh, mulhsu and mulhu read the full `2 * width` product. mul and mulw
 /// read the low word, which does not depend on signedness, so both modes
@@ -448,8 +449,8 @@ class HarborIntMulDiv extends Module {
         throw ArgumentError.value(mulRadix, 'mulRadix', 'must be 1 to width');
       }
       if (mulMode == HarborIntMulMode.pipelined &&
-          (mulStages < 1 || mulStages > 3)) {
-        throw ArgumentError.value(mulStages, 'mulStages', 'must be 1 to 3');
+          (mulStages < 1 || mulStages > 4)) {
+        throw ArgumentError.value(mulStages, 'mulStages', 'must be 1 to 4');
       }
     }
     if (divMode != null) {
@@ -662,8 +663,10 @@ class HarborIntMulDiv extends Module {
         'result': _mulResult(width, s['prod']!, s['sign']!, s['op']!),
       };
 
-      final units = [preMulS, mulUnitS, postMulS];
-      final ends = _cuts([1, 2, 1], mulStages);
+      _State holdMulS(_State s) => s;
+
+      final units = [preMulS, mulUnitS, postMulS, if (mulStages == 4) holdMulS];
+      final ends = _cuts([1, 2, 1, if (mulStages == 4) 1], mulStages);
       // The stall uses the raw last valid, so in_ready has no path from
       // kill_mask. A killed op in the last stage frees the pipe next cycle.
       final en = Logic(name: 'mul_stage_en');

@@ -544,6 +544,10 @@ class Ddr3Controller extends Module {
         s2Pending & pickBank(bankStatusQ) & pickBank(bankRowQ).eq(s2Row);
     final s2LaunchWrite = s2RightRow & s2We & pickBank(dWrQ).eq(0);
     final s2LaunchRead = s2RightRow & ~s2We & pickBank(dRdQ).eq(0);
+    final s2ReadyNext =
+        (s2RightRow &
+                mux(s2We, pickBank(dWrQ).lte(dc(1)), pickBank(dRdQ).lte(dc(1))))
+            .named('s2_ready_next');
     final cmdOdtVal = mux(
       s2LaunchWrite,
       Const(1),
@@ -808,19 +812,10 @@ class Ddr3Controller extends Module {
         ],
       ),
       // --- stall control ---
-      If(
-        s2Pending,
-        then: [
-          for (var b = 0; b < nBanks; b++)
-            If(
-              s2Bank.eq(b) & bankStatusD[b] & bankRowD[b].eq(s2Row),
-              then: [
-                If(s2We & dWrD[b].eq(0), then: [stage2Stall < Const(0)]),
-                If(~s2We & dRdD[b].eq(0), then: [stage2Stall < Const(0)]),
-              ],
-            ),
-        ],
-      ),
+      // Release the bus one cycle before a selected timer reaches zero. This
+      // preserves the scheduler look-ahead without putting bankStatusD,
+      // bankRowD and every timer-D update on the Wishbone-stall path.
+      If(s2ReadyNext, then: [stage2Stall < Const(0)]),
       If(
         oWbStallQ,
         then: [oWbStallD < stage2Stall],

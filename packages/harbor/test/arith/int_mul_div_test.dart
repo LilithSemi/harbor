@@ -661,7 +661,7 @@ void main() {
     }) {
       final clk = Logic(name: 'clk');
       final reset = Logic(name: 'reset');
-      final n = mulMode == _pipelined && (mulStages < 1 || mulStages > 3)
+      final n = mulMode == _pipelined && (mulStages < 1 || mulStages > 4)
           ? 1
           : HarborIntMulDiv.slotCountOf(mulMode, mulStages, divMode, divStages);
       final killMask = Logic(name: 'kill_mask', width: maskWidth ?? n);
@@ -701,7 +701,7 @@ void main() {
 
     test('bad mulStages rejected', () {
       expect(() => build(mulStages: 0), throwsArgumentError);
-      expect(() => build(mulStages: 4), throwsArgumentError);
+      expect(() => build(mulStages: 5), throwsArgumentError);
     });
 
     test('bad divRadix rejected', () {
@@ -733,8 +733,8 @@ void main() {
     });
 
     test('latency getters', () {
-      final pipe = build(mulMode: _pipelined, mulStages: 3);
-      expect(pipe.mulLatency, 3);
+      final pipe = build(mulMode: _pipelined, mulStages: 4);
+      expect(pipe.mulLatency, 4);
       final iter = build(mulMode: _iterative, mulRadix: 2, width: 32);
       expect(iter.mulLatency, 16 + 1);
       final div = build(divMode: _divIter, divRadix: 2, width: 32);
@@ -1941,6 +1941,11 @@ void main() {
           name: 'pipelined stages 3',
           b: _build(32, mulMode: _pipelined, mulStages: 3, divMode: null),
           seed: 814,
+        ),
+        (
+          name: 'pipelined stages 4',
+          b: _build(32, mulMode: _pipelined, mulStages: 4, divMode: null),
+          seed: 815,
         ),
         (
           name: 'iterative',
