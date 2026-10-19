@@ -15,6 +15,7 @@ class _HardBlockStub {
   final Logic busMaster;
   final Random random;
   final msis = <int>[];
+  final msiTimes = <int>[];
   final intx = <bool>[];
   final violations = <String>[];
   var requestCycles = 0;
@@ -32,8 +33,9 @@ class _HardBlockStub {
 
   Future<void> run() async {
     int? delay;
-    int? heldDi;
-    bool? heldAssert;
+    var heldDi = 0;
+    var heldAssert = false;
+    var heldMsi = false;
     while (_running) {
       await clk.nextNegedge;
       if (rdyN.value.toInt() == 0) {
@@ -41,6 +43,7 @@ class _HardBlockStub {
         continue;
       }
       if (dut.interruptN.value.toInt() != 0) {
+        if (delay != null) violations.add('request dropped without RDYN');
         delay = null;
         continue;
       }
@@ -51,6 +54,10 @@ class _HardBlockStub {
         delay = random.nextInt(5);
         heldDi = di;
         heldAssert = assertMessage;
+        heldMsi = msiEnable.value.toInt() != 0;
+        if (heldMsi && busMaster.value.toInt() == 0) {
+          violations.add('MSI without BME');
+        }
       } else if (di != heldDi || assertMessage != heldAssert) {
         violations.add('request changed while held');
       }
@@ -60,12 +67,12 @@ class _HardBlockStub {
       }
       delay = null;
       rdyN.inject(0);
-      if (msiEnable.value.toInt() != 0) {
-        if (busMaster.value.toInt() == 0) violations.add('MSI without BME');
+      if (heldMsi) {
         if (di >= 1 << min(mmEnable.value.toInt(), 3)) {
           violations.add('MSI vector $di above the granted count');
         }
         msis.add(di);
+        msiTimes.add(Simulator.time);
       } else {
         intx.add(assertMessage);
       }
@@ -278,4 +285,101 @@ void main() {
     expect(counts, expected);
     await bench.finish();
   });
+
+  test('sends Deassert_INTA when Interrupt Disable sets', () async {
+    final bench = _Bench();
+    await bench.start(msi: false);
+    await bench.set(bench.irq, 0x01);
+    await bench.idle(20);
+    expect(bench.stub.intx, [true]);
+    await bench.set(bench.intDisable, 1);
+    await bench.idle(20);
+    await bench.set(bench.irq, 0);
+    await bench.idle(20);
+    expect(bench.stub.intx, [true, false]);
+    await bench.set(bench.intDisable, 0);
+    await bench.idle(20);
+    expect(bench.stub.intx, [true, false]);
+    await bench.finish();
+  });
+
+  test('completes a held MSI once when bus master enable drops', () async {
+    final bench = _Bench();
+    await bench.start(seed: 5);
+    await bench.set(bench.irq, 0x04);
+    while (bench.dut.interruptN.value.toInt() != 0) {
+      await bench.clk.nextNegedge;
+    }
+    bench.busMaster.inject(0);
+    await bench.idle(30);
+    expect(bench.stub.msis, [2]);
+    await bench.set(bench.busMaster, 1);
+    await bench.idle(30);
+    expect(bench.stub.msis, [2]);
+    await bench.finish();
+  });
+
+  test('sends one MSI when MSI turns on with a level high', () async {
+    final bench = _Bench();
+    await bench.start(msi: false);
+    await bench.set(bench.irq, 0x04);
+    await bench.idle(20);
+    expect(bench.stub.intx, [true]);
+    await bench.set(bench.msiEnable, 1);
+    await bench.idle(30);
+    expect(bench.stub.msis, [2]);
+    expect(bench.stub.intx, [true]);
+    await bench.set(bench.msiEnable, 0);
+    await bench.idle(20);
+    expect(bench.stub.intx, [true, true]);
+    await bench.finish();
+  });
+
+  for (final msi in [true, false]) {
+    test('follows fast random levels with ${msi ? 'MSI' : 'INTx'}', () async {
+      final bench = _Bench();
+      await bench.start(msi: msi, seed: 9);
+      final random = Random(13);
+      final edges = List.filled(8, 0);
+      final lastEdge = List.filled(8, -1);
+      var level = 0;
+      for (var i = 0; i < 400; i++) {
+        final next = i == 399 ? 0 : random.nextInt(256);
+        await bench.clk.nextNegedge;
+        for (var bit = 0; bit < 8; bit++) {
+          if (next & ~level & (1 << bit) != 0) {
+            edges[bit]++;
+            lastEdge[bit] = Simulator.time;
+          }
+        }
+        level = next;
+        bench.irq.inject(level);
+        bench.txBusy.inject(random.nextInt(4) == 0 ? 1 : 0);
+        await bench.idle(random.nextInt(6));
+      }
+      await bench.set(bench.txBusy, 0);
+      await bench.idle(100);
+      if (msi) {
+        for (var bit = 0; bit < 8; bit++) {
+          final times = [
+            for (var j = 0; j < bench.stub.msis.length; j++)
+              if (bench.stub.msis[j] == bit) bench.stub.msiTimes[j],
+          ];
+          expect(times.length, lessThanOrEqualTo(edges[bit]));
+          if (edges[bit] > 0) {
+            expect(times, isNotEmpty);
+            expect(times.last, greaterThan(lastEdge[bit]));
+          }
+        }
+      } else {
+        final intx = bench.stub.intx;
+        expect(intx, isNotEmpty);
+        for (var j = 0; j < intx.length; j++) {
+          expect(intx[j], j.isEven);
+        }
+        expect(intx.last, isFalse);
+      }
+      await bench.finish();
+    });
+  }
 }

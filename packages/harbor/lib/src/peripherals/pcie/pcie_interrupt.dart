@@ -37,7 +37,6 @@ class HarborPcieInterrupt extends Module {
     final active = Logic(name: 'active');
     final activeMsi = Logic(name: 'active_msi');
     final vector = Logic(name: 'vector', width: 8);
-    final clearMask = Logic(name: 'clear_mask', width: 8);
     final assertMessage = Logic(name: 'assert_message');
     final intxAsserted = Logic(name: 'intx_asserted');
 
@@ -71,34 +70,26 @@ class HarborPcieInterrupt extends Module {
     );
 
     final accepted = (active & ~interruptRdyN).named('accepted');
-    final abort =
-        (active &
-                interruptRdyN &
-                mux(
-                  activeMsi,
-                  ~msiEnable | ~busMasterEnable,
-                  msiEnable | interruptDisable,
-                ))
-            .named('abort');
-    final intxWant = (irqPending.or() & ~interruptDisable & ~msiEnable).named(
-      'intx_want',
-    );
+    final level = irqPending.or().named('level');
     final startMsi =
         (~active & msiEnable & busMasterEnable & ~txBusy & latched.or()).named(
           'start_msi',
         );
-    final startIntx =
+    final startAssert =
         (~active &
                 ~msiEnable &
                 ~interruptDisable &
-                intxWant.neq(intxAsserted) &
-                (~intxWant | ~txBusy))
-            .named('start_intx');
+                ~txBusy &
+                level &
+                ~intxAsserted)
+            .named('start_assert');
+    final startDeassert =
+        (~active & ~msiEnable & intxAsserted & (~level | interruptDisable))
+            .named('start_deassert');
     final edges = (irqPending & ~previous).named('edges');
     // Bits leave the latch when their request starts, so an edge that comes
-    // while the request is held starts a new MSI. An abort puts them back.
+    // while the request is held starts a new MSI.
     final taken = mux(startMsi, latched & ~msiClear, latched);
-    final cleared = mux(abort & activeMsi, taken | clearMask, taken);
 
     Sequential(clk, [
       If(
@@ -109,38 +100,35 @@ class HarborPcieInterrupt extends Module {
           active < 0,
           activeMsi < 0,
           vector < 0,
-          clearMask < 0,
           assertMessage < 0,
           intxAsserted < 0,
         ],
         orElse: [
           If(
             msiEnable,
-            then: [previous < irqPending, latched < (cleared | edges)],
+            then: [previous < irqPending, latched < (taken | edges)],
             orElse: [previous < 0, latched < 0],
           ),
           If.block([
-            Iff(accepted | abort, [
+            Iff(accepted, [
               active < 0,
-              If(accepted & ~activeMsi, then: [intxAsserted < assertMessage]),
+              If(~activeMsi, then: [intxAsserted < assertMessage]),
             ]),
             ElseIf(startMsi, [
               active < 1,
               activeMsi < 1,
               vector < msiVector,
-              clearMask < msiClear,
               assertMessage < 0,
             ]),
-            ElseIf(startIntx, [
+            ElseIf(startAssert | startDeassert, [
               active < 1,
               activeMsi < 0,
               vector < 0,
-              clearMask < 0,
-              assertMessage < intxWant,
+              assertMessage < startAssert,
             ]),
-            ElseIf(~active & (msiEnable | interruptDisable), [
-              intxAsserted < 0,
-            ]),
+            // With MSI on, cfg_interrupt sends an MSI, so no Deassert_INTA
+            // can go out. Drivers set Interrupt Disable before MSI Enable.
+            ElseIf(~active & msiEnable, [intxAsserted < 0]),
           ]),
         ],
       ),
