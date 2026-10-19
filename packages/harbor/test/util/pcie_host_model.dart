@@ -73,6 +73,8 @@ class PcieTlp {
   final Uint8List data;
   final bool poisoned;
   final PcieCplStatus status;
+
+  /// Remaining bytes of a completion. On the wire 4096 is written as 0.
   final int byteCount;
   final int lowerAddress;
 
@@ -98,6 +100,9 @@ class PcieTlp {
       throw ArgumentError('$kind has no payload');
     }
     if (kind.isRequest) {
+      if (lengthDw == 1 && lastBe != 0) {
+        throw ArgumentError('lastBe must be 0 for a 1 DW request');
+      }
       if (lengthDw < 1 || lengthDw > 1024) {
         throw RangeError.range(lengthDw, 1, 1024, 'lengthDw');
       }
@@ -230,7 +235,7 @@ class PcieTlp {
         (s) => s.code == code,
         orElse: () => throw FormatException('bad completion status $code'),
       ),
-      byteCount: dw1 & 0xfff,
+      byteCount: (dw1 & 0xfff) == 0 ? 4096 : dw1 & 0xfff,
       requesterId: dw2 >> 16,
       tag: (dw2 >> 8) & 0xff,
       lowerAddress: dw2 & 0x7f,
@@ -361,7 +366,11 @@ class PcieReadResponder {
     this.rcb = 64,
     this.maxPayload = 128,
     this.statusFor,
-  }) : _random = Random(seed);
+  }) : _random = Random(seed) {
+    if (maxPayload < rcb) {
+      throw ArgumentError('maxPayload $maxPayload is below rcb $rcb');
+    }
+  }
 
   bool get hasPending => _pending.isNotEmpty;
 
@@ -394,11 +403,19 @@ class PcieReadResponder {
       _pending.add([completion(begin, end)]);
       return;
     }
+    if (maxPayload < rcb) {
+      throw StateError('maxPayload $maxPayload is below rcb $rcb');
+    }
+    // The first chunk ends at the next RCB boundary. Later chunks are one
+    // RCB or the largest multiple of RCB that fits in the maximum payload.
+    final largeChunks = _random.nextBool();
+    final later = largeChunks ? maxPayload ~/ rcb * rcb : rcb;
     final chunks = <PcieTlp>[];
     for (var start = begin; start < end;) {
       final dwStart = start & ~3;
-      final boundary = (start ~/ rcb + 1) * rcb;
-      final stop = min(min(end, boundary), dwStart + maxPayload);
+      final stop = chunks.isEmpty
+          ? min(end, (start ~/ rcb + 1) * rcb)
+          : min(end, start + later);
       final dwStop = (stop + 3) & ~3;
       chunks.add(
         completion(start, stop, data: memory.read(dwStart, dwStop - dwStart)),
@@ -474,7 +491,10 @@ class PcieHostModel {
       );
 
   /// Records an MSI with [vector].
-  void recordMsi(int vector) => msis.add(vector);
+  void recordMsi(int vector) {
+    if (!busMasterEnable) violations.add('MSI $vector sent without bus master');
+    msis.add(vector);
+  }
 
   /// Handles a TLP sent by the endpoint. Writes go to memory, reads are
   /// queued in the responder and completions are kept in [completions].

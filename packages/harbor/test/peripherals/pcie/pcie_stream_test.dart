@@ -142,6 +142,13 @@ List<PcieTlp> _everyKind(Random random) {
       completerId: id(),
       requesterId: id(),
       tag: tag(),
+      byteCount: 4096,
+      data: _bytes(random, 8),
+    ),
+    PcieTlp.completion(
+      completerId: id(),
+      requesterId: id(),
+      tag: tag(),
       byteCount: 4,
       lowerAddress: 0x7c,
       data: _bytes(random, 4),
@@ -188,6 +195,25 @@ void main() {
         }
       });
     }
+
+    test('writes and decodes a byte count of 4096 as 0', () {
+      final cpl = PcieTlp.completion(
+        completerId: 1,
+        requesterId: 2,
+        tag: 3,
+        byteCount: 4096,
+        data: List.filled(64, 0),
+      );
+      expect(cpl.wireDwords()[1] & 0xfff, 0);
+      expect(PcieTlp.fromDwords(cpl.wireDwords()).byteCount, 4096);
+    });
+
+    test('rejects lastBe on a 1 DW request', () {
+      expect(
+        () => PcieTlp.memRead(address: 0, lengthDw: 1, lastBe: 0xf),
+        throwsArgumentError,
+      );
+    });
 
     test('decodes fields', () {
       final tlp = PcieTlp.fromDwords(
@@ -259,14 +285,71 @@ void main() {
           expect(chunk.lowerAddress, address & 0x7f);
           expect(chunk.byteCount, 0x1010 + 400 - address);
           final end = chunk.data.length + address;
-          expect(end <= (address ~/ rcb + 1) * rcb, isTrue);
           expect(chunk.data, responder.memory.read(address, chunk.data.length));
           address = end;
         }
         expect(address, 0x1010 + 400);
-        expect(chunks.length, greaterThan(400 ~/ rcb));
       });
     }
+
+    for (final (rcb, mps) in [(64, 128), (64, 256), (128, 128), (128, 256)]) {
+      test('follows every split rule with RCB $rcb and MPS $mps', () {
+        var sawLarge = false;
+        var sawSmall = false;
+        for (var seed = 0; seed < 12; seed++) {
+          final responder = make(seed, rcb: rcb, maxPayload: mps);
+          const begin = 0x1008;
+          const total = 128 * 4;
+          responder.accept(
+            PcieTlp.memRead(address: begin, lengthDw: total ~/ 4, tag: 1),
+          );
+          final chunks = <PcieTlp>[];
+          for (var c = responder.next(); c != null; c = responder.next()) {
+            chunks.add(c);
+          }
+          var address = begin;
+          for (var i = 0; i < chunks.length; i++) {
+            final chunk = chunks[i];
+            final size = chunk.data.length;
+            final isLast = i == chunks.length - 1;
+            expect(size, lessThanOrEqualTo(mps));
+            expect(chunk.byteCount, begin + total - address);
+            expect(chunk.lowerAddress, address & 0x7f);
+            if (i == 0) {
+              expect(
+                address + size,
+                (address ~/ rcb + 1) * rcb,
+                reason: 'first chunk ends at the boundary',
+              );
+            } else {
+              expect(address % rcb, 0);
+              if (!isLast) expect(size % rcb, 0, reason: 'middle chunk');
+            }
+            if (i > 0 && !isLast) {
+              sawLarge |= size > rcb;
+              sawSmall |= size == rcb;
+            }
+            expect(chunk.data, responder.memory.read(address, size));
+            address += size;
+          }
+          expect(address, begin + total);
+        }
+        expect(sawSmall, isTrue);
+        expect(sawLarge, mps > rcb);
+      });
+    }
+
+    test('rejects a maximum payload below RCB', () {
+      expect(
+        () => PcieReadResponder(
+          memory: PcieHostMemory(),
+          seed: 1,
+          rcb: 128,
+          maxPayload: 64,
+        ),
+        throwsArgumentError,
+      );
+    });
 
     test('answers reads in a seeded random order', () {
       List<int> order(int seed) {
@@ -307,7 +390,15 @@ void main() {
         ..busMasterEnable = false;
       host.receive(PcieTlp.memWrite(address: 0xff0, data: List.filled(32, 0)));
       host.receive(PcieTlp.memRead(address: 0, lengthDw: 128));
-      expect(host.violations, hasLength(4));
+      host.recordMsi(3);
+      expect(host.violations, hasLength(5));
+      expect(host.violations, [
+        contains('without bus master'),
+        contains('crosses a 4 KB boundary'),
+        contains('without bus master'),
+        contains('larger than the maximum read request'),
+        'MSI 3 sent without bus master',
+      ]);
     });
   });
 
@@ -345,11 +436,22 @@ void main() {
         final random = Random(6);
         final seen = <Map<String, BigInt>>[];
         var sending = true;
+        var beatIndex = 0;
+        final headerBeat = width == 64 ? 1 : 0;
+        final wrongHeaderValid = <int>[];
         unawaited(() async {
           while (sending) {
             final ready = random.nextDouble() < 0.5;
             readyIn.inject(ready ? 1 : 0);
             await clk.nextNegedge;
+            if (outer.valid.value.toBool()) {
+              final high = probe.output('header_valid').value.toBool();
+              if (high != (beatIndex == headerBeat)) {
+                wrongHeaderValid.add(beatIndex);
+              }
+              if (ready)
+                beatIndex = outer.last.value.toBool() ? 0 : beatIndex + 1;
+            }
             if (ready &&
                 outer.valid.value.toBool() &&
                 probe.output('header_valid').value.toBool()) {
@@ -372,6 +474,7 @@ void main() {
         await clk.nextPosedge;
         await Simulator.endSimulation();
 
+        expect(wrongHeaderValid, isEmpty);
         expect(seen, hasLength(tlps.length));
         for (var i = 0; i < tlps.length; i++) {
           final tlp = tlps[i];
@@ -411,7 +514,7 @@ void main() {
           } else {
             expect(field('completer_id'), tlp.completerId, reason: reason);
             expect(field('cpl_status'), tlp.status.code, reason: reason);
-            expect(field('byte_count'), tlp.byteCount, reason: reason);
+            expect(field('byte_count'), tlp.byteCount & 0xfff, reason: reason);
             expect(field('cpl_requester_id'), tlp.requesterId, reason: reason);
             expect(field('cpl_tag'), tlp.tag, reason: reason);
             expect(field('lower_address'), tlp.lowerAddress, reason: reason);

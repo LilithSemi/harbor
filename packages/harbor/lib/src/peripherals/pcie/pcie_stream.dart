@@ -165,7 +165,7 @@ Logic tlpCompleterId(PcieHeader header) => header.slice(63, 48);
 /// Completion status of a completion.
 Logic tlpCplStatus(PcieHeader header) => header.slice(47, 45);
 
-/// Remaining byte count of a completion.
+/// Remaining byte count of a completion. The value 0 means 4096.
 Logic tlpByteCount(PcieHeader header) => header.slice(43, 32);
 
 /// Requester ID of a completion.
@@ -223,7 +223,7 @@ class HarborPcieHeaderCapture extends Module {
     final last = addInput('rx_last', stream.last);
 
     final beat = Logic(name: 'beat', width: 2);
-    final low = Logic(name: 'header_low', width: 64);
+    final low = width == 64 ? Logic(name: 'header_low', width: 64) : null;
     final fire = valid & ready;
     Sequential(clk, [
       If(
@@ -240,7 +240,7 @@ class HarborPcieHeaderCapture extends Module {
                   If(beat.lt(2), then: [beat < beat + 1]),
                 ],
               ),
-              If(beat.eq(0), then: [low < data.slice(63, 0)]),
+              if (low != null) If(beat.eq(0), then: [low < data.slice(63, 0)]),
             ],
           ),
         ],
@@ -251,7 +251,7 @@ class HarborPcieHeaderCapture extends Module {
     final Logic atHeader;
     final Logic payload;
     if (width == 64) {
-      head = [data, low].swizzle();
+      head = [data, low!].swizzle();
       atHeader = beat.eq(1);
       payload = data.slice(63, 32);
     } else {
