@@ -22,7 +22,9 @@ import '../bus/wishbone/wishbone_interface.dart';
 /// goes straight from the waist to the storage, and one register holds a read
 /// beat until the waist takes it. A request ends with its last read beat or
 /// its write response, and only then is REQ_READY high again. The storage
-/// cannot fail a beat, so ERR is always low.
+/// can fail a beat with `err` high in the `ack` cycle. A failed read beat
+/// gets ERR. A write response gets ERR when any beat of its request failed.
+/// With no `err`, ERR is always low.
 class HarborMemoryBeats {
   /// High while a beat is presented to the storage.
   final Logic stb;
@@ -59,6 +61,7 @@ class HarborMemoryBeats {
     required HarborMemoryWaist waist,
     required Logic ack,
     required Logic dataOut,
+    Logic? err,
     String name = 'beats',
   }) {
     final w = waist;
@@ -81,6 +84,9 @@ class HarborMemoryBeats {
     final rData = Logic(name: '${name}_r_data', width: c.dataWidth);
     final rLast = Logic(name: '${name}_r_last');
     final bValid = Logic(name: '${name}_b_valid');
+    final rErr = Logic(name: '${name}_r_err');
+    final wErr = Logic(name: '${name}_w_err');
+    final beatErr = err ?? Const(0);
 
     final issuing = (busy & ~done).named('${name}_issuing');
     final want = (issuing & mux(isWrite, w.wdataValid, ~rValid | w.rdataReady))
@@ -113,12 +119,12 @@ class HarborMemoryBeats {
     w.rdataValid <= rValid;
     w.rdataId <= id;
     w.rdataData <= rData;
-    w.rdataErr <= Const(0);
+    w.rdataErr <= rErr;
     w.rdataExOkay <= Const(0);
     w.rdataLast <= rLast;
     w.wrespValid <= bValid;
     w.wrespId <= id;
-    w.wrespErr <= Const(0);
+    w.wrespErr <= wErr;
     w.wrespExOkay <= Const(0);
 
     Sequential(clk, [
@@ -138,6 +144,8 @@ class HarborMemoryBeats {
           rData < 0,
           rLast < 0,
           bValid < 0,
+          rErr < 0,
+          wErr < 0,
         ],
         orElse: [
           If(
@@ -158,8 +166,14 @@ class HarborMemoryBeats {
                 isWrite,
                 then: [
                   If(final_, then: [bValid < 1]),
+                  wErr < wErr | beatErr,
                 ],
-                orElse: [rValid < 1, rData < dataOut, rLast < final_],
+                orElse: [
+                  rValid < 1,
+                  rData < dataOut,
+                  rLast < final_,
+                  rErr < beatErr,
+                ],
               ),
             ],
           ),
@@ -168,6 +182,7 @@ class HarborMemoryBeats {
             then: [
               busy < 1,
               done < 0,
+              wErr < 0,
               isWrite < w.reqWrite,
               id < w.reqId,
               beatAddr < w.reqAddr,

@@ -7,16 +7,18 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 /// through [HarborMemoryBeats].
 ///
 /// Outputs: `t_stb`, `t_we`, `t_addr`, `t_wdata`, `t_sel`. Inputs: `t_ack`
-/// and `t_rdata`. See [HarborMemoryBeats] for the beat handshake.
+/// and `t_rdata`, and `t_err` when [withErr] is set. See [HarborMemoryBeats]
+/// for the beat handshake.
 class MemBeatTarget extends BridgeModule {
   MemBeatTarget(
     HarborFabricKind kind,
     HarborMemoryWaistConfig config, {
     int burstBeats = 8,
+    bool withErr = false,
   }) : super(
          'MemBeatTarget_${kind.name}_a${config.addressWidth}'
          '_d${config.dataWidth}_i${config.idWidth}_n${config.outstanding}'
-         '_b$burstBeats',
+         '_b$burstBeats${withErr ? '_e' : ''}',
          name: 'mem_target',
        ) {
     createPort('clk', PortDirection.input);
@@ -40,6 +42,7 @@ class MemBeatTarget extends BridgeModule {
         Logic(width: config.dataWidth),
         width: config.dataWidth,
       ),
+      err: withErr ? addInput('t_err', Logic()) : null,
     );
     addOutput('t_stb') <= beats.stb;
     addOutput('t_we') <= beats.we;
@@ -64,11 +67,14 @@ class MasterTop extends BridgeModule {
     required HarborFabricKind kind,
     required HarborMemoryWaistConfig config,
     int burstBeats = 8,
+    bool withErr = false,
   }) : super('MasterTop_${dut.definitionName}', name: 'top') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     addSubModule(dut);
-    target = addSubModule(MemBeatTarget(kind, config, burstBeats: burstBeats));
+    target = addSubModule(
+      MemBeatTarget(kind, config, burstBeats: burstBeats, withErr: withErr),
+    );
     for (final m in [dut, target]) {
       m.input('clk').srcConnection! <= input('clk');
       m.input('reset').srcConnection! <= input('reset');

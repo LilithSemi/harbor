@@ -338,6 +338,94 @@ class PcieHostMemory {
   }
 }
 
+/// The first byte and the end byte of a memory read, as completions count
+/// them. A zero-length read (1 DW, no byte enabled) has byte count 1.
+(int, int) pcieReadSpan(PcieTlp request) {
+  if (request.lengthDw == 1 && request.firstBe == 0) {
+    return (request.address, request.address + 1);
+  }
+  final firstEnabled = request.firstBe == 0
+      ? 0
+      : (request.firstBe & -request.firstBe).bitLength - 1;
+  final tailBe = request.lengthDw == 1 ? request.firstBe : request.lastBe;
+  final tailTrim = tailBe == 0 ? 0 : 4 - tailBe.bitLength;
+  return (
+    request.address + firstEnabled,
+    request.address + request.lengthDw * 4 - tailTrim,
+  );
+}
+
+/// Checks the completions that answer the memory read [request].
+///
+/// The completions must be in address order, each non-last one must end on
+/// an [rcb] boundary, and each payload must be at most [maxPayload] bytes.
+/// Byte count, lower address, IDs and tag must be correct, and the payload
+/// must be the bytes [read] returns for its DWs. When [allowAbort] is set,
+/// the last completion can have status CA and no data, for the rest of the
+/// request. Returns the rule breaks, empty when all is correct.
+List<String> pcieCheckReadCompletions(
+  PcieTlp request,
+  List<PcieTlp> completions, {
+  required int rcb,
+  required int maxPayload,
+  required int completerId,
+  required Uint8List Function(int address, int length) read,
+  bool allowAbort = false,
+}) {
+  final errors = <String>[];
+  final (begin, end) = pcieReadSpan(request);
+  var start = begin;
+  for (final (i, c) in completions.indexed) {
+    final where = '$request completion $i';
+    if (start >= end) {
+      errors.add('$where: extra completion');
+      break;
+    }
+    if (c.tag != request.tag || c.requesterId != request.requesterId) {
+      errors.add('$where: tag or requester ID is wrong');
+    }
+    if (c.completerId != completerId) {
+      errors.add('$where: completer ID 0x${c.completerId.toRadixString(16)}');
+    }
+    if (c.byteCount != end - start) {
+      errors.add('$where: byte count ${c.byteCount}, expected ${end - start}');
+    }
+    if (c.lowerAddress != start & 0x7f) {
+      errors.add('$where: lower address ${c.lowerAddress}');
+    }
+    if (c.status == PcieCplStatus.abort && allowAbort) {
+      if (c.kind != PcieTlpKind.cpl) errors.add('$where: CA with data');
+      if (i != completions.length - 1) errors.add('$where: CA is not last');
+      return errors;
+    }
+    if (c.status != PcieCplStatus.success || c.kind != PcieTlpKind.cplD) {
+      errors.add('$where: status ${c.status.name}, kind ${c.kind.name}');
+      return errors;
+    }
+    final dwStart = start & ~3;
+    final bytes = c.lengthDw * 4;
+    final stop = min(end, dwStart + bytes);
+    if (bytes > maxPayload) errors.add('$where: $bytes bytes over $maxPayload');
+    if (stop < end) {
+      if (stop % rcb != 0) errors.add('$where: ends at $stop, not on RCB');
+    } else if (dwStart + bytes != (end + 3) & ~3) {
+      errors.add('$where: last completion has $bytes bytes');
+    }
+    final want = read(dwStart, bytes);
+    for (var b = 0; b < bytes; b++) {
+      if (c.data[b] != want[b]) {
+        errors.add(
+          '$where: byte ${dwStart + b} is ${c.data[b]}, expected ${want[b]}',
+        );
+        break;
+      }
+    }
+    start = stop;
+  }
+  if (start < end) errors.add('$request: completions end at $start of $end');
+  return errors;
+}
+
 /// Answers memory reads with completions in random order.
 ///
 /// Each read is split at read completion boundary multiples and at the
@@ -377,16 +465,7 @@ class PcieReadResponder {
   /// Queues the completions for [request].
   void accept(PcieTlp request) {
     final failure = statusFor?.call(request);
-    final firstEnabled = request.firstBe == 0
-        ? 0
-        : (request.firstBe & -request.firstBe).bitLength - 1;
-    final tailBe = request.lengthDw == 1 ? request.firstBe : request.lastBe;
-    final tailTrim = tailBe == 0 ? 0 : 4 - tailBe.bitLength;
-    final begin = request.address + firstEnabled;
-    final end = max(
-      begin + 1,
-      request.address + request.lengthDw * 4 - tailTrim,
-    );
+    final (begin, end) = pcieReadSpan(request);
 
     PcieTlp completion(int start, int stop, {List<int> data = const []}) =>
         PcieTlp.completion(
