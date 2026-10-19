@@ -394,6 +394,7 @@ export 'src/peripherals/pcie/pcie_2_1_params.dart';
 export 'src/peripherals/pcie/pcie_2_1.dart';
 export 'src/peripherals/pcie/pcie_2_1_ports.dart';
 export 'src/peripherals/pcie/pcie_endpoint.dart';
+export 'src/peripherals/pcie/pcie_interrupt.dart';
 export 'src/peripherals/pcie/pipe_clock.dart';
 export 'src/peripherals/pcie_dma.dart';
 export 'src/peripherals/pcie_option_rom.dart';

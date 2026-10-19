@@ -116,6 +116,78 @@ void main() {
     timeout: const Timeout(Duration(minutes: 3)),
   );
 
+  test(
+    'configures BAR2, MSI vectors and interrupt ports',
+    () async {
+      final dut = endpoint(
+        const HarborFpgaTarget.artix7(
+          device: 'xc7a200t',
+          package: 'fbg484',
+          useOpenXc7: true,
+        ),
+        config: const HarborPcieEndpointConfig(
+          bar2Bytes: 16 << 20,
+          msiVectors: 8,
+        ),
+      );
+      await dut.build();
+      final sv = dut.generateSynth();
+      expect(sv, contains(".BAR2(32'hff00000c)"));
+      expect(sv, contains(".BAR3(32'hffffffff)"));
+      expect(sv, contains('.MSI_CAP_MULTIMSGCAP(3)'));
+      expect(sv, contains('HarborPcieInterrupt'));
+      expect(
+        dut.definitionName,
+        'HarborPcieEndpoint_Xilinx7_X1_Bar2x1000000_Msi8',
+      );
+      expect(dut.input('irq_pending').width, 8);
+      expect(dut.maxPayload.width, 3);
+      expect(dut.maxReadRequest.width, 3);
+      expect(dut.rcb128.width, 1);
+      expect(dut.busMasterEnable.width, 1);
+      expect(dut.msiEnable.width, 1);
+      expect(dut.msiVectorsGranted.width, 3);
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+  );
+
+  test('leaves BAR2 off by default', () async {
+    final dut = endpoint(
+      const HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+        useOpenXc7: true,
+      ),
+    );
+    await dut.build();
+    final sv = dut.generateSynth();
+    expect(sv, contains(".BAR2(32'h00000000)"));
+    expect(sv, contains(".BAR3(32'h00000000)"));
+    expect(sv, contains('.MSI_CAP_MULTIMSGCAP(0)'));
+  }, timeout: const Timeout(Duration(minutes: 3)));
+
+  test('rejects bad BAR2 sizes and MSI vector counts', () {
+    const target = HarborFpgaTarget.artix7(
+      device: 'xc7a200t',
+      package: 'fbg484',
+      useOpenXc7: true,
+    );
+    expect(
+      () => endpoint(
+        target,
+        config: const HarborPcieEndpointConfig(bar2Bytes: 3000),
+      ),
+      throwsArgumentError,
+    );
+    expect(
+      () => endpoint(
+        target,
+        config: const HarborPcieEndpointConfig(msiVectors: 3),
+      ),
+      throwsArgumentError,
+    );
+  });
+
   test('rejects unsupported packet SRAM depths', () {
     expect(
       () => endpoint(

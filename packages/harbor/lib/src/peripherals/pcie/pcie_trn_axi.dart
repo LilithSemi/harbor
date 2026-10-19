@@ -9,6 +9,9 @@ class HarborPcieTrnAxi extends Module {
   Logic get rxUser => output('rx_user');
   Logic get txReady => output('tx_ready');
 
+  /// High when no TX beat is held and no TX packet is in progress.
+  Logic get txIdle => output('tx_idle');
+
   Logic get trnRxReady => output('trn_rx_ready');
   Logic get trnTxData => output('trn_tx_data');
   Logic get trnTxRem => output('trn_tx_rem');
@@ -157,6 +160,7 @@ class HarborPcieTrnAxi extends Module {
     ].swizzle();
 
     addOutput('tx_ready') <= acceptTx & linkUp & ~trnTxCfgReq;
+    addOutput('tx_idle') <= ~txValidReg & ~txInPacket;
     addOutput('trn_tx_data', width: 128) <= swappedTx.zeroExtend(128);
     addOutput('trn_tx_rem', width: 2) <= txKeepReg[7].zeroExtend(2);
     addOutput('trn_tx_sof') <= txValidReg & ~txInPacket;

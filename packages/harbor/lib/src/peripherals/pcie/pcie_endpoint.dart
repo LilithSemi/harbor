@@ -4,6 +4,7 @@ import '../../soc/target.dart';
 import '../bram.dart';
 import 'gtp_primitives.dart';
 import 'pcie_2_1.dart';
+import 'pcie_interrupt.dart';
 import 'pcie_pipe.dart';
 import 'pcie_trn_axi.dart';
 
@@ -19,6 +20,12 @@ class HarborPcieEndpointConfig {
   final int deviceSerialNumber;
   final int packetMemoryEntries;
 
+  /// BAR2 size in bytes, 64-bit and prefetchable. 0 disables BAR2.
+  final int bar2Bytes;
+
+  /// Number of MSI vectors the endpoint asks for: 1, 2, 4 or 8.
+  final int msiVectors;
+
   const HarborPcieEndpointConfig({
     this.vendorId = 0x10ee,
     this.deviceId = 0x7203,
@@ -30,6 +37,8 @@ class HarborPcieEndpointConfig {
     this.optionRomBytes = 0,
     this.deviceSerialNumber = 0,
     this.packetMemoryEntries = 2048,
+    this.bar2Bytes = 0,
+    this.msiVectors = 1,
   });
 }
 
@@ -47,6 +56,14 @@ class HarborPcieEndpoint extends Module {
   Logic get rxValid => output('rx_valid');
   Logic get rxUser => output('rx_user');
   Logic get txReady => output('tx_ready');
+  Logic get maxPayload => output('max_payload');
+  Logic get maxReadRequest => output('max_read_request');
+  Logic get rcb128 => output('rcb_128');
+  Logic get busMasterEnable => output('bus_master_enable');
+  Logic get msiEnable => output('msi_enable');
+
+  /// Granted MSI vector count as log2, from the MSI Multiple Message Enable.
+  Logic get msiVectorsGranted => output('msi_vectors_granted');
 
   /// MMCM lock, not synchronised.
   Logic get mmcmLock => output('mmcm_lock');
@@ -73,9 +90,10 @@ class HarborPcieEndpoint extends Module {
     required Logic txLast,
     required Logic txValid,
     Logic? txUser,
+    Logic? irqPending,
     this.config = const HarborPcieEndpointConfig(),
     super.name = 'pcie_endpoint',
-  }) : super(definitionName: 'HarborPcieEndpoint_Xilinx7_X1') {
+  }) : super(definitionName: _definitionName(config)) {
     _checkTarget(target);
     _checkConfig(config);
     refClkP = addInput('refclk_p', refClkP);
@@ -92,6 +110,11 @@ class HarborPcieEndpoint extends Module {
       'tx_user',
       txUser ?? Const(0, width: 4),
       width: 4,
+    );
+    irqPending = addInput(
+      'irq_pending',
+      irqPending ?? Const(0, width: 8),
+      width: 8,
     );
 
     final pipe = HarborPciePipeLane();
@@ -152,6 +175,12 @@ class HarborPcieEndpoint extends Module {
     hardInputs['TRNTCFGGNT'] = trnTxCfgGrant;
     hardInputs['MIMTXRDATA'] = mimTxReadData;
     hardInputs['MIMRXRDATA'] = mimRxReadData;
+    final interruptN = Logic(name: 'cfg_interrupt_n');
+    final interruptDi = Logic(name: 'cfg_interrupt_di', width: 8);
+    final interruptAssertN = Logic(name: 'cfg_interrupt_assert_n');
+    hardInputs['CFGINTERRUPTN'] = interruptN;
+    hardInputs['CFGINTERRUPTDI'] = interruptDi;
+    hardInputs['CFGINTERRUPTASSERTN'] = interruptAssertN;
 
     final hardBlock = HarborXilinxPcie21(
       inputs: hardInputs,
@@ -164,6 +193,11 @@ class HarborPcieEndpoint extends Module {
               ? 0
               : (_barMask(config.optionRomBytes) | 1),
         ),
+        if (config.bar2Bytes != 0) ...{
+          'BAR2': _hex32(_barMask(config.bar2Bytes) | 0xc),
+          'BAR3': _hex32(0xffffffff),
+        },
+        'MSI_CAP_MULTIMSGCAP': '${config.msiVectors.bitLength - 1}',
         ..._packetMemoryParameters(config.packetMemoryEntries),
       },
     );
@@ -215,6 +249,21 @@ class HarborPcieEndpoint extends Module {
     trnTxStr <= stream.trnTxStr;
     trnTxEcrcGen <= stream.trnTxEcrcGen;
     trnTxCfgGrant <= stream.trnTxCfgGrant;
+
+    final interrupt = HarborPcieInterrupt(
+      clk: phy.userClk2,
+      reset: reset | ~link,
+      irqPending: irqPending,
+      txBusy: txValid | ~stream.txIdle,
+      msiEnable: hardBlock.output('CFGINTERRUPTMSIENABLE'),
+      mmEnable: hardBlock.output('CFGINTERRUPTMMENABLE'),
+      busMasterEnable: hardBlock.output('CFGCOMMANDBUSMASTERENABLE'),
+      interruptDisable: hardBlock.output('CFGCOMMANDINTERRUPTDISABLE'),
+      interruptRdyN: hardBlock.output('CFGINTERRUPTRDYN'),
+    );
+    interruptN <= interrupt.interruptN;
+    interruptDi <= interrupt.interruptDi;
+    interruptAssertN <= interrupt.interruptAssertN;
 
     final txRam = _HarborPcieBlockRam(
       clk: phy.userClk1,
@@ -282,6 +331,16 @@ class HarborPcieEndpoint extends Module {
     addOutput('rx_valid') <= stream.rxValid;
     addOutput('rx_user', width: 22) <= stream.rxUser;
     addOutput('tx_ready') <= stream.txReady;
+    addOutput('max_payload', width: 3) <=
+        hardBlock.output('CFGDEVCONTROLMAXPAYLOAD');
+    addOutput('max_read_request', width: 3) <=
+        hardBlock.output('CFGDEVCONTROLMAXREADREQ');
+    addOutput('rcb_128') <= hardBlock.output('CFGLINKCONTROLRCB');
+    addOutput('bus_master_enable') <=
+        hardBlock.output('CFGCOMMANDBUSMASTERENABLE');
+    addOutput('msi_enable') <= hardBlock.output('CFGINTERRUPTMSIENABLE');
+    addOutput('msi_vectors_granted', width: 3) <=
+        hardBlock.output('CFGINTERRUPTMMENABLE');
   }
 
   final HarborPcieEndpointConfig config;
@@ -312,6 +371,14 @@ class HarborPcieEndpoint extends Module {
     }
     _checkRegion('bar0Bytes', config.bar0Bytes, allowZero: false);
     _checkRegion('optionRomBytes', config.optionRomBytes, allowZero: true);
+    _checkRegion('bar2Bytes', config.bar2Bytes, allowZero: true);
+    if (!const {1, 2, 4, 8}.contains(config.msiVectors)) {
+      throw ArgumentError.value(
+        config.msiVectors,
+        'msiVectors',
+        'must be 1, 2, 4 or 8',
+      );
+    }
     if (config.packetMemoryEntries != 1024 &&
         config.packetMemoryEntries != 2048) {
       throw ArgumentError.value(
@@ -321,6 +388,13 @@ class HarborPcieEndpoint extends Module {
       );
     }
   }
+
+  static String _definitionName(HarborPcieEndpointConfig config) => [
+    'HarborPcieEndpoint_Xilinx7_X1',
+    if (config.packetMemoryEntries != 2048) 'Pm${config.packetMemoryEntries}',
+    if (config.bar2Bytes != 0) 'Bar2x${config.bar2Bytes.toRadixString(16)}',
+    if (config.msiVectors != 1) 'Msi${config.msiVectors}',
+  ].join('_');
 
   static Map<String, String> _packetMemoryParameters(int entries) =>
       entries == 1024
