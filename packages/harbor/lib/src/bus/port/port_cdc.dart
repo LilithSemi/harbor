@@ -261,7 +261,7 @@ class HarborMemoryWaistCdc extends Module {
       final [rId, rData, rErr, rLast, rEx] = harborUnpack(rdF.rdData, rdWidths);
       up.rdataValid <= mux(mode, rdQ.popValid, ~rdF.rdEmpty);
       up.rdataId <= mux(mode, qId, rId);
-      up.rdataData <= mux(mode, Const(0, width: dataW), rData);
+      up.rdataData <= rData & (~mode).replicate(dataW);
       up.rdataErr <= mode | rErr;
       up.rdataLast <= mux(mode, rBeat.eq(qLen), rLast);
       up.rdataExOkay <= ~mode & rEx;
@@ -498,7 +498,7 @@ class HarborMemoryWaistCdc extends Module {
     final [wData, wStrb, wLast] = harborUnpack(wdF.rdData, wdWidths);
     final wOpen = lenQ.popValid;
     dn.wdataValid <= wOpen & (mode | ~wdF.rdEmpty);
-    dn.wdataData <= mux(mode, Const(0, width: dataW), wData);
+    dn.wdataData <= wData & (~mode).replicate(dataW);
     dn.wdataStrb <= mux(mode, Const(0, width: config.strbWidth), wStrb);
     dn.wdataLast <= mux(mode, wBeat.eq(lenQ.popData), wLast);
     wdF.pop(dn.wdataReady & wOpen & ~mode);

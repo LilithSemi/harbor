@@ -644,7 +644,7 @@ class HarborTileLinkMemoryMaster extends Module {
         cId,
         aAddr,
         mux(cWrite, wMask, lane),
-        mux(cWrite, wData, Const(0, width: dataW)),
+        wData & cWrite.replicate(dataW),
       ]),
       popReady: a.aReady,
     );

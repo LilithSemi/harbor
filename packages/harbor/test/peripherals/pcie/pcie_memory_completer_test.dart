@@ -638,7 +638,7 @@ void main() {
       final bench = await _Bench.create(_Config(width: width), seed: 25);
       await bench.start();
       // An IO read with tag 0x1a, then a memory read behind it.
-      await bench.sendRaw([0x02000001, 0x00101a0f, 0x00000010]);
+      await bench.sendRaw([0x02502001, 0x00101a0f, 0x00000010]);
       final tlp = PcieTlp.memRead(address: 0xc0000010, lengthDw: 2, tag: 3);
       final want = await bench.read(tlp);
       await bench.sink.waitFor(2);
@@ -646,6 +646,8 @@ void main() {
       expect(ur.kind, PcieTlpKind.cpl);
       expect(ur.status, PcieCplStatus.unsupported);
       expect(ur.tag, 0x1a);
+      expect(ur.tc, 5);
+      expect(ur.attr, 2);
       expect(ur.requesterId, 0x0010);
       expect(ur.completerId, _completerId);
       bench.sink.received.removeAt(0);
@@ -653,6 +655,31 @@ void main() {
       await bench.finish();
     });
   }
+
+  test('completions echo the request TC and attr', () async {
+    const config = _Config(width: 64, dataWidth: 64);
+    final bench = await _Bench.create(config, seed: 33);
+    await bench.start();
+    final reads = <(PcieTlp, Uint8List)>[];
+    for (final (i, (tc, attr, len)) in [
+      (1, 1, 4),
+      (7, 3, 100),
+      (3, 2, 1),
+      (6, 0, 70),
+    ].indexed) {
+      final tlp = PcieTlp.memRead(
+        address: 0xc0000100 + i * 0x400,
+        lengthDw: len,
+        tag: i,
+        tc: tc,
+        attr: attr,
+      );
+      reads.add((tlp, await bench.read(tlp)));
+    }
+    await bench.checkReads(reads, rcb: 64, maxPayload: 256);
+    expect(bench.sink.received.every((c) => c.tc != 0 || c.attr != 0), isTrue);
+    await bench.finish();
+  });
 
   test('read after write sees the write', () async {
     const config = _Config(width: 64, dataWidth: 64);

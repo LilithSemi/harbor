@@ -36,8 +36,6 @@ void main() {
         for (final l in drv.values) {
           l.inject(0);
         }
-        drv['mem_RDATA_READY']!.inject(1);
-        drv['mem_WRESP_READY']!.inject(1);
         reset.inject(1);
         mem.start();
         Simulator.setMaxSimTime(200000);
@@ -46,6 +44,24 @@ void main() {
           await clk.nextPosedge;
         }
         reset.inject(0);
+
+        // A response READY is high only while a response is due.
+        var writeDue = false;
+        var readDue = 0;
+        clk.posedge.listen((_) {
+          if (top.output('mem_WRESP_VALID').previousValue!.toBool() &&
+              drv['mem_WRESP_READY']!.previousValue!.toBool()) {
+            writeDue = false;
+          }
+          if (top.output('mem_RDATA_VALID').previousValue!.toBool() &&
+              drv['mem_RDATA_READY']!.previousValue!.toBool()) {
+            readDue--;
+          }
+        });
+        clk.negedge.listen((_) {
+          drv['mem_WRESP_READY']!.inject(writeDue ? 1 : 0);
+          drv['mem_RDATA_READY']!.inject(readDue > 0 ? 1 : 0);
+        });
 
         Future<void> req(bool write, int addr, int len) async {
           await clk.nextNegedge;
@@ -61,6 +77,11 @@ void main() {
           }
           await clk.nextNegedge;
           drv['mem_REQ_VALID']!.inject(0);
+          if (write) {
+            writeDue = true;
+          } else {
+            readDue = len + 1;
+          }
         }
 
         await req(true, 0x100, 3);
@@ -76,7 +97,7 @@ void main() {
           await clk.nextNegedge;
         }
         drv['mem_WDATA_VALID']!.inject(0);
-        while (!top.output('mem_WRESP_VALID').value.toBool()) {
+        while (writeDue) {
           await clk.nextNegedge;
         }
         for (var b = 0; b < 4; b++) {

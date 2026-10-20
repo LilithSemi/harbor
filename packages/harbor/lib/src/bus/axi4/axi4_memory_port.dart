@@ -344,7 +344,7 @@ class HarborAxi4MemorySlave extends Module {
       pushValid: m.rdataValid,
       pushData: harborPack([
         m.rdataId,
-        mux(rIllegal, Const(0, width: dataW), m.rdataData),
+        m.rdataData & (~rIllegal).replicate(dataW),
         m.rdataErr | rIllegal,
         m.rdataLast,
         if (ex) rFlag.popData[1],
@@ -547,7 +547,7 @@ class HarborAxi4MemorySlaveReadOnly extends Module {
       pushValid: m.rdataValid,
       pushData: harborPack([
         m.rdataId,
-        mux(rFlag.popData, Const(0, width: dataW), m.rdataData),
+        m.rdataData & (~rFlag.popData).replicate(dataW),
         m.rdataErr | rFlag.popData,
         m.rdataLast,
       ]),

@@ -74,6 +74,12 @@ class PcieTlp {
   final bool poisoned;
   final PcieCplStatus status;
 
+  /// Traffic class, 0 to 7.
+  final int tc;
+
+  /// Attr bits 1 and 0 of the header.
+  final int attr;
+
   /// Remaining bytes of a completion. On the wire 4096 is written as 0.
   final int byteCount;
   final int lowerAddress;
@@ -90,6 +96,8 @@ class PcieTlp {
     Uint8List? data,
     this.poisoned = false,
     this.status = PcieCplStatus.success,
+    this.tc = 0,
+    this.attr = 0,
     this.byteCount = 0,
     this.lowerAddress = 0,
   }) : data = data ?? Uint8List(0) {
@@ -122,6 +130,8 @@ class PcieTlp {
     int? lastBe,
     bool poisoned = false,
     bool wide = false,
+    int tc = 0,
+    int attr = 0,
   }) {
     final dwords = data.length ~/ 4;
     return PcieTlp(
@@ -136,6 +146,8 @@ class PcieTlp {
       lastBe: lastBe ?? (dwords > 1 ? 0xf : 0),
       data: Uint8List.fromList(data),
       poisoned: poisoned,
+      tc: tc,
+      attr: attr,
     );
   }
 
@@ -148,6 +160,8 @@ class PcieTlp {
     int firstBe = 0xf,
     int? lastBe,
     bool wide = false,
+    int tc = 0,
+    int attr = 0,
   }) => PcieTlp(
     kind: wide || address > 0xffffffff
         ? PcieTlpKind.memRead64
@@ -158,6 +172,8 @@ class PcieTlp {
     lengthDw: lengthDw,
     firstBe: firstBe,
     lastBe: lastBe ?? (lengthDw > 1 ? 0xf : 0),
+    tc: tc,
+    attr: attr,
   );
 
   /// A completion. It carries data when [data] is not empty.
@@ -170,6 +186,8 @@ class PcieTlp {
     int lowerAddress = 0,
     List<int> data = const [],
     bool poisoned = false,
+    int tc = 0,
+    int attr = 0,
   }) => PcieTlp(
     kind: data.isEmpty ? PcieTlpKind.cpl : PcieTlpKind.cplD,
     completerId: completerId,
@@ -179,6 +197,8 @@ class PcieTlp {
     data: Uint8List.fromList(data),
     poisoned: poisoned,
     status: status,
+    tc: tc,
+    attr: attr,
     byteCount: byteCount,
     lowerAddress: lowerAddress,
   );
@@ -197,6 +217,8 @@ class PcieTlp {
     final rawLength = dw0 & 0x3ff;
     final length = rawLength == 0 ? 1024 : rawLength;
     final poisoned = ((dw0 >> 14) & 1) == 1;
+    final tc = (dw0 >> 20) & 7;
+    final attr = (dw0 >> 12) & 3;
     final lengthDw = kind.hasData ? length : (kind.isRequest ? length : 0);
     final payloadEnd = headerDwords + (kind.hasData ? lengthDw : 0);
     if (dwords.length != payloadEnd) {
@@ -225,6 +247,8 @@ class PcieTlp {
         lengthDw: lengthDw,
         data: bytes,
         poisoned: poisoned,
+        tc: tc,
+        attr: attr,
       );
     }
     final code = (dw1 >> 13) & 7;
@@ -235,6 +259,8 @@ class PcieTlp {
         (s) => s.code == code,
         orElse: () => throw FormatException('bad completion status $code'),
       ),
+      tc: tc,
+      attr: attr,
       byteCount: (dw1 & 0xfff) == 0 ? 4096 : dw1 & 0xfff,
       requesterId: dw2 >> 16,
       tag: (dw2 >> 8) & 0xff,
@@ -263,6 +289,8 @@ class PcieTlp {
   List<int> wireDwords() {
     final dw0 =
         (kind.fmtType << 24) |
+        (tc << 20) |
+        (attr << 12) |
         (poisoned ? 1 << 14 : 0) |
         (kind.hasData || kind.isRequest ? lengthDw & 0x3ff : 0);
     final List<int> header;
@@ -306,7 +334,7 @@ class PcieTlp {
   @override
   String toString() =>
       'PcieTlp(${kind.name} addr=0x${address.toRadixString(16)} '
-      'len=$lengthDw tag=$tag)';
+      'len=$lengthDw tag=$tag tc=$tc attr=$attr)';
 }
 
 /// Sparse byte memory of the host. Unwritten bytes read as zero.
@@ -383,6 +411,12 @@ List<String> pcieCheckReadCompletions(
     }
     if (c.tag != request.tag || c.requesterId != request.requesterId) {
       errors.add('$where: tag or requester ID is wrong');
+    }
+    if (c.tc != request.tc || c.attr != request.attr) {
+      errors.add(
+        '$where: TC ${c.tc} attr ${c.attr}, expected '
+        '${request.tc} ${request.attr}',
+      );
     }
     if (c.completerId != completerId) {
       errors.add('$where: completer ID 0x${c.completerId.toRadixString(16)}');
