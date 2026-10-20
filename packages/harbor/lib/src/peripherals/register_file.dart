@@ -151,10 +151,30 @@ class HarborRegisterFile extends BridgeModule {
     required int readLatency,
     required int writeBufferDepth,
     required bool reservedZero,
+    required String backend,
   }) =>
       'HarborRegisterFile_E${numEntries}_W${dataWidth}_'
       'R${numReadPorts}_W${numWritePorts}_B${numBanks}_'
-      'L${readLatency}_BUF${writeBufferDepth}_Z${reservedZero ? 1 : 0}';
+      'L${readLatency}_BUF${writeBufferDepth}_Z${reservedZero ? 1 : 0}_'
+      '$backend';
+
+  /// Name of the storage backend that [target] selects for this shape.
+  static String _backendName(
+    HarborDeviceTarget? target,
+    int numWritePorts,
+    int numBanks,
+  ) {
+    if (target is! HarborFpgaTarget) return 'flop';
+    switch (target.vendor) {
+      case HarborFpgaVendor.ice40:
+        return 'ice40';
+      case HarborFpgaVendor.ecp5:
+        return 'ecp5';
+      case HarborFpgaVendor.vivado:
+      case HarborFpgaVendor.openXc7:
+        return (numWritePorts == 1 && numBanks == 1) ? 'xilinx' : 'flop';
+    }
+  }
 
   HarborRegisterFile({
     this.numEntries = 32,
@@ -191,6 +211,7 @@ class HarborRegisterFile extends BridgeModule {
                _defaultReadLatency(target, numWritePorts, numBanks),
            writeBufferDepth: writeBufferDepth,
            reservedZero: reservedZero,
+           backend: _backendName(target, numWritePorts, numBanks),
          ),
          name: name ?? 'regfile',
        ) {
@@ -405,11 +426,17 @@ class HarborRegisterFile extends BridgeModule {
       readLatency,
       'rfBramDepthQ_$r',
     );
-    var word = words.first;
-    for (var d = 1; d < words.length; d++) {
-      word = mux(block.eq(d), words[d], word);
+    // Balanced tree, one select bit per level. An odd last word passes up.
+    var level = words;
+    for (var bit = 0; level.length > 1; bit++) {
+      level = [
+        for (var i = 0; i < level.length; i += 2)
+          i + 1 < level.length
+              ? mux(block[bit], level[i + 1], level[i])
+              : level[i],
+      ];
     }
-    return word;
+    return level.first;
   }
 
   /// iCE40 EBR-backed storage. One SB_RAM40_4K copy per read port (the EBR is
@@ -450,9 +477,7 @@ class HarborRegisterFile extends BridgeModule {
           // combinational to the posedge pipeline, while staying in the clk
           // domain (RCLK = clk, the falling edge is internal), phase-related,
           // so the read of a posedge-launched address is timed correctly.
-          final ebr = Ice40SbRam40_4kNR(
-            name: depthEbrs == 1 ? 'ebr_r${r}_w$w' : 'ebr_r${r}_d${d}_w$w',
-          );
+          final ebr = Ice40SbRam40_4kNR(name: 'ebr_r${r}_d${d}_w$w');
           addSubModule(ebr);
 
           // Write port (posedge).
@@ -547,9 +572,7 @@ class HarborRegisterFile extends BridgeModule {
           // Separate write and read ports, so a write does not take the read
           // port away. The same-entry case is the bypass below.
           final bram = Ecp5Dp16kd(
-            name: depthEbrs == 1
-                ? 'rf_ebr_r${r}_w$w'
-                : 'rf_ebr_r${r}_d${d}_w$w',
+            name: 'rf_ebr_r${r}_d${d}_w$w',
             dataWidthA: ebrWidth,
             dataWidthB: ebrWidth,
             clkA: clk,
@@ -608,10 +631,10 @@ class HarborRegisterFile extends BridgeModule {
 
   /// Xilinx 7-series RAMB36E1-backed storage. Like [_buildEcp5Ebr], one true
   /// dual-port block (or `ceil(dataWidth/32)` in x36 mode) per read port and
-  /// 1024-word depth block: port
-  /// A is the shared write port and port B is that port's read, both on the
-  /// posedge of clk. The RAMB read is synchronous, so this is a registered
-  /// full-cycle read ([readLatency] == 1), keeping the read off the
+  /// 1024-word depth block: port A is the shared write port and port B is that
+  /// port's read, both on the posedge of clk. The RAMB read is synchronous,
+  /// so this is a registered full-cycle read ([readLatency] == 1), keeping
+  /// the read off the
   /// combinational ALU path. Writes are whole-word, so all four byte-write
   /// enables follow wrEn. Single write port, single bank. The primitive is a
   /// blackbox with no simulation model, so this path is only selected for

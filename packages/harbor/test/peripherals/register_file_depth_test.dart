@@ -79,9 +79,9 @@ void main() {
     });
   }
 
-  test('ECP5 4096-entry file keeps entries of each block apart', () async {
+  test('ECP5 6144-entry file keeps entries of each block apart', () async {
     final rf = HarborRegisterFile(
-      numEntries: 4096,
+      numEntries: 6144,
       dataWidth: 32,
       numReadPorts: 1,
       reservedZero: false,
@@ -102,7 +102,7 @@ void main() {
     unawaited(Simulator.run());
 
     int value(int a) => 0x5a000000 ^ (a * 0x10001);
-    const addresses = [0, 5, 2047, 2048, 2053, 4095];
+    const addresses = [0, 5, 2047, 2048, 2053, 4095, 4096, 4101, 6143];
     ins['wr_en']!.inject(1);
     for (final a in addresses) {
       ins['wr_addr']!.inject(a);
@@ -118,4 +118,38 @@ void main() {
     }
     await Simulator.endSimulation();
   });
+
+  test('flop and block RAM files of one shape get different names', () async {
+    final top = _TwoFiles(ecp5);
+    await top.build();
+    final names = {for (final m in top.subModules) m.name: m.definitionName};
+    expect(names['flop'], isNot(names['ebr']));
+    expect(names['flop'], endsWith('_flop'));
+    expect(names['ebr'], endsWith('_ecp5'));
+    expect(top.generateSynth(), contains(names['ebr']));
+  });
+}
+
+/// One flop register file and one ECP5 register file of the same shape and
+/// read latency.
+class _TwoFiles extends Module {
+  _TwoFiles(HarborDeviceTarget target) : super(name: 'two_files') {
+    final clk = addInput('clk', Logic());
+    final addr = addInput('addr', Logic(width: 5), width: 5);
+    final data = addInput('data', Logic(width: 32), width: 32);
+    final out = addOutput('out', width: 32);
+    final files = [
+      HarborRegisterFile(numReadPorts: 1, forceReadLatency: 1, name: 'flop'),
+      HarborRegisterFile(numReadPorts: 1, target: target, name: 'ebr'),
+    ];
+    for (final rf in files) {
+      rf.input('clk').srcConnection! <= clk;
+      rf.input('reset').srcConnection! <= Const(0);
+      rf.input('rd0_addr').srcConnection! <= addr;
+      rf.input('wr_en').srcConnection! <= Const(1);
+      rf.input('wr_addr').srcConnection! <= addr;
+      rf.input('wr_data').srcConnection! <= data;
+    }
+    out <= files[0].readData(0) ^ files[1].readData(0);
+  }
 }

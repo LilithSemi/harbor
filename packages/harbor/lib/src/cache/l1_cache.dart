@@ -6,7 +6,7 @@ import '../soc/target.dart';
 import 'cache_config.dart';
 
 /// Largest L1 tag store, in bits, that stays in flops. One iCE40 block RAM
-/// holds 4096 bits, so a smaller tag store does not use a block RAM.
+/// holds 4096 bits. A tag store of this size or smaller stays in flops.
 const harborL1TagFlopBits = 4096;
 
 /// Line tag store of an L1 cache. Its read latency is 1 on every target. A
@@ -194,8 +194,9 @@ class HarborL1ICache extends BridgeModule {
     // this instead of [xlen], so a cache over a narrow map does not pay for a
     // full 64-bit tag. Null = xlen. See the note on tag width below.
     int? reqAddrBits,
-    // FPGA/ASIC target for the data block RAM. Null (simulation / std-cell) uses
-    // the flop backend at the same forced read latency.
+    // FPGA/ASIC target for the data block RAM, and for the tag store when it
+    // is larger than [harborL1TagFlopBits]. Null (simulation / std-cell) uses
+    // the flop backend at the same read latency.
     HarborDeviceTarget? target,
     super.name = 'l1i',
   }) : super('HarborL1ICache') {
@@ -653,9 +654,9 @@ class HarborL1DCache extends BridgeModule {
   /// In the default virtual placement, the pipeline presents a virtual address
   /// and only a miss reaches the MMU, which translates it and checks the PTE.
   /// In that placement, a LOAD HIT is decided by the tag and valid bit alone,
-  /// so no permission
-  /// check runs on it. A line that one privilege mode was allowed to fill
-  /// therefore stays readable by a mode the page table forbids: user code read
+  /// so no permission check runs on it. A line that one privilege mode was
+  /// allowed to fill therefore stays readable by a mode the page table
+  /// forbids: user code read
   /// a supervisor-only page out of the cache, and a supervisor load with
   /// sstatus.SUM clear read a user page out of it.
   ///
@@ -736,6 +737,8 @@ class HarborL1DCache extends BridgeModule {
     Logic? memFaultIn,
     // Significant low bits of [reqAddr]. See the note on tag width below.
     int? reqAddrBits,
+    // FPGA/ASIC target for the data block RAM, and for the tag store when it
+    // is larger than [harborL1TagFlopBits]. Null uses the flop backend.
     HarborDeviceTarget? target,
     super.name = 'l1d',
   }) : super('HarborL1DCache') {
