@@ -5,6 +5,43 @@ import '../peripherals/register_file.dart';
 import '../soc/target.dart';
 import 'cache_config.dart';
 
+/// Line tag store of an L1 cache. Its read latency is 1 on every target.
+class _L1TagStore {
+  final HarborRegisterFile ram;
+  final Logic _clk;
+  final int _latency;
+
+  _L1TagStore(
+    BridgeModule parent, {
+    required Logic clk,
+    required Logic reset,
+    required int lines,
+    required int width,
+    required int readPorts,
+    required HarborDeviceTarget? target,
+    required String name,
+  }) : _clk = clk,
+       _latency = HarborRegisterFile.blockRamReadLatency(target) ?? 1,
+       ram = HarborRegisterFile(
+         numEntries: lines,
+         dataWidth: width,
+         numReadPorts: readPorts,
+         reservedZero: false,
+         target: target,
+         forceReadLatency: HarborRegisterFile.blockRamReadLatency(target) ?? 1,
+         name: name,
+       ) {
+    parent.addSubModule(ram);
+    ram.input('clk').srcConnection! <= clk;
+    ram.input('reset').srcConnection! <= reset;
+  }
+
+  /// Tag of read port [r], one cycle after its address. The iCE40 block RAM
+  /// reads in 0 cycles, so one flop follows it.
+  Logic read(int r) =>
+      _latency == 1 ? ram.readData(r) : flop(_clk, ram.readData(r));
+}
+
 /// L1 cache request type.
 enum HarborL1RequestType {
   /// Instruction fetch.
@@ -236,22 +273,19 @@ class HarborL1ICache extends BridgeModule {
 
     // Valid bits flush in one cycle; tags and data share registered read timing.
     final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
-    final tagRam = HarborRegisterFile(
-      numEntries: numLines,
-      dataWidth: lineTagBits,
-      numReadPorts: dualPort ? 2 : 1,
-      numWritePorts: 1,
-      reservedZero: false,
+    final tagRam = _L1TagStore(
+      this,
+      clk: clk,
+      reset: reset,
+      lines: numLines,
+      width: lineTagBits,
+      readPorts: dualPort ? 2 : 1,
       target: target,
-      forceReadLatency: 1,
       name: 'l1i_tags',
     );
-    addSubModule(tagRam);
-    tagRam.input('clk').srcConnection! <= clk;
-    tagRam.input('reset').srcConnection! <= reset;
-    tagRam.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
+    tagRam.ram.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
     if (dualPort) {
-      tagRam.input('rd1_addr').srcConnection! <= idxOf(reqAddr1);
+      tagRam.ram.input('rd1_addr').srcConnection! <= idxOf(reqAddr1);
     }
 
     // Balanced mux tree (log2(numLines) deep) when the line count is a power of
@@ -337,7 +371,7 @@ class HarborL1ICache extends BridgeModule {
     final blockHit = (filling | fillSettle).named('blockHit');
 
     Logic committedHit(Logic a, [int port = 0]) =>
-        muxLine(lineValid, idxOf(a)) & tagRam.readData(port).eq(fullTagOf(a));
+        muxLine(lineValid, idxOf(a)) & tagRam.read(port).eq(fullTagOf(a));
 
     final ans = (reqValid & reqAddr.eq(addrQ)).named('ans');
     final hit = (ans & committedHit(addrQ) & ~blockHit).named('hit');
@@ -403,9 +437,10 @@ class HarborL1ICache extends BridgeModule {
     dataRam.input('wr_data').srcConnection! <= memRdata;
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
-    tagRam.input('wr_en').srcConnection! <= fillWrEn & fillWord.eq(lastWord);
-    tagRam.input('wr_addr').srcConnection! <= fillIdx;
-    tagRam.input('wr_data').srcConnection! <= fillTag;
+    tagRam.ram.input('wr_en').srcConnection! <=
+        fillWrEn & fillWord.eq(lastWord);
+    tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
+    tagRam.ram.input('wr_data').srcConnection! <= fillTag;
 
     Sequential(clk, [
       addrQ < reqAddr,
@@ -804,20 +839,17 @@ class HarborL1DCache extends BridgeModule {
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits);
 
     final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
-    final tagRam = HarborRegisterFile(
-      numEntries: numLines,
-      dataWidth: lineTagBits,
-      numReadPorts: 1,
-      numWritePorts: 1,
-      reservedZero: false,
+    final tagRam = _L1TagStore(
+      this,
+      clk: clk,
+      reset: reset,
+      lines: numLines,
+      width: lineTagBits,
+      readPorts: 1,
       target: target,
-      forceReadLatency: 1,
       name: 'l1d_tags',
     );
-    addSubModule(tagRam);
-    tagRam.input('clk').srcConnection! <= clk;
-    tagRam.input('reset').srcConnection! <= reset;
-    tagRam.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
+    tagRam.ram.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
 
     // Select arr[idx]. A balanced mux tree (log2(numLines) deep) when the line
     // count is a power of two, folding pairs on one index bit per level. The
@@ -848,7 +880,7 @@ class HarborL1DCache extends BridgeModule {
     // Match address and permission context. Stores invalidate by index and
     // require no asynchronous tag read.
     Logic committedHitOf(Logic a) =>
-        muxLine(lineValid, idxOf(a)) & tagRam.readData(0).eq(fullTagOf(a));
+        muxLine(lineValid, idxOf(a)) & tagRam.read(0).eq(fullTagOf(a));
 
     final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
     final dataRam = HarborRegisterFile(
@@ -989,9 +1021,10 @@ class HarborL1DCache extends BridgeModule {
     dataRam.input('wr_data').srcConnection! <= memRdata;
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
-    tagRam.input('wr_en').srcConnection! <= fillWrEn & fillWord.eq(lastWord);
-    tagRam.input('wr_addr').srcConnection! <= fillIdx;
-    tagRam.input('wr_data').srcConnection! <= fillTag;
+    tagRam.ram.input('wr_en').srcConnection! <=
+        fillWrEn & fillWord.eq(lastWord);
+    tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
+    tagRam.ram.input('wr_data').srcConnection! <= fillTag;
 
     Sequential(clk, [
       addrQ < reqAddr,
