@@ -62,7 +62,12 @@ class _Bench {
   }
 }
 
-Future<_Bench> _build(String kind, int xlen, int lines) async {
+Future<_Bench> _build(
+  String kind,
+  int xlen,
+  int lines, {
+  HarborDeviceTarget? target,
+}) async {
   final clk = SimpleClockGenerator(10).clk;
   final fault = Logic();
   final Module cache = kind == 'd'
@@ -72,6 +77,7 @@ Future<_Bench> _build(String kind, int xlen, int lines) async {
           reqAddrBits: xlen,
           ctxBits: 2,
           memFaultIn: fault,
+          target: target,
         )
       : HarborL1ICache(
           config: HarborL1iCacheConfig(size: lines * 16, ways: 1, lineSize: 16),
@@ -79,6 +85,7 @@ Future<_Bench> _build(String kind, int xlen, int lines) async {
           reqAddrBits: xlen,
           ctxBits: 2,
           dualPort: kind == 'i2',
+          target: target,
         );
   final p = <String, Logic>{};
   for (final entry in cache.inputs.entries) {
@@ -108,60 +115,74 @@ Future<_Bench> _build(String kind, int xlen, int lines) async {
 
 void main() {
   tearDown(() async => Simulator.reset());
-  for (final xlen in [32, 64]) {
-    for (final kind in ['d', 'i', 'i2']) {
-      for (final lines in [1, 4]) {
-        test(
-          '$kind RV$xlen $lines lines align tags, data and contexts',
-          () async {
-            final b = await _build(kind, xlen, lines);
-            final a = BigInt.from(0x80000000);
-            final otherIndex = a + BigInt.from(16);
-            final conflict =
-                a + (xlen == 64 ? BigInt.one << 32 : BigInt.from(4096));
-            final beats = 16 ~/ (xlen ~/ 8);
-            expect(await b.read(a), beats);
-            expect(await b.read(a), 0);
-            expect(await b.read(conflict), beats);
-            expect(await b.read(a), beats);
-            // A changed permission context must not reuse a resident tag.
-            expect(await b.read(a, context: 3), beats);
-            expect(await b.read(a, context: 3), 0);
-            if (lines > 1) {
-              expect(await b.read(otherIndex, context: 3), beats);
-              final before = b.reads;
-              b.p['req_valid']!.inject(1);
-              if (kind == 'i2') b.p['req_valid1']!.inject(1);
-              for (var i = 0; i < 12; i++) {
-                final address = i.isEven ? a : otherIndex;
-                final address1 = i.isEven ? otherIndex : a;
-                b.p['req_addr']!.inject(LogicValue.ofBigInt(address, xlen));
-                if (kind == 'i2') {
-                  b.p['req_addr1']!.inject(LogicValue.ofBigInt(address1, xlen));
-                }
-                await b.step();
-                expect(b.cache.output('resp_valid').value.toBool(), isTrue);
-                expect(
-                  b.cache.output('resp_data').value.toBigInt(),
-                  b.value(address, 3),
-                );
-                if (kind == 'i2') {
-                  expect(b.cache.output('resp_valid1').value.toBool(), isTrue);
+  // On ECP5 the data RAM is a DP16KD. With 256 lines the tags are too.
+  const ecp5 = HarborFpgaTarget.ecp5(device: 'lfe5u-25f', package: 'CABGA256');
+  for (final (target, lineCounts) in [
+    (null, [1, 4]),
+    (ecp5, [4, 256]),
+  ]) {
+    final on = target == null ? '' : ' on ECP5';
+    for (final xlen in [32, 64]) {
+      for (final kind in ['d', 'i', 'i2']) {
+        for (final lines in lineCounts) {
+          test(
+            '$kind RV$xlen $lines lines align tags, data and contexts$on',
+            () async {
+              final b = await _build(kind, xlen, lines, target: target);
+              final a = BigInt.from(0x80000000);
+              // A different index and a different tag, so a stale tag read misses.
+              final otherIndex = a + BigInt.from(16 + 8192);
+              final conflict =
+                  a + (xlen == 64 ? BigInt.one << 32 : BigInt.from(4096));
+              final beats = 16 ~/ (xlen ~/ 8);
+              expect(await b.read(a), beats);
+              expect(await b.read(a), 0);
+              expect(await b.read(conflict), beats);
+              expect(await b.read(a), beats);
+              // A changed permission context must not reuse a resident tag.
+              expect(await b.read(a, context: 3), beats);
+              expect(await b.read(a, context: 3), 0);
+              if (lines > 1) {
+                expect(await b.read(otherIndex, context: 3), beats);
+                final before = b.reads;
+                b.p['req_valid']!.inject(1);
+                if (kind == 'i2') b.p['req_valid1']!.inject(1);
+                for (var i = 0; i < 12; i++) {
+                  final address = i.isEven ? a : otherIndex;
+                  final address1 = i.isEven ? otherIndex : a;
+                  b.p['req_addr']!.inject(LogicValue.ofBigInt(address, xlen));
+                  if (kind == 'i2') {
+                    b.p['req_addr1']!.inject(
+                      LogicValue.ofBigInt(address1, xlen),
+                    );
+                  }
+                  await b.step();
+                  expect(b.cache.output('resp_valid').value.toBool(), isTrue);
                   expect(
-                    b.cache.output('resp_data1').value.toBigInt(),
-                    b.value(address1, 3),
+                    b.cache.output('resp_data').value.toBigInt(),
+                    b.value(address, 3),
                   );
+                  if (kind == 'i2') {
+                    expect(
+                      b.cache.output('resp_valid1').value.toBool(),
+                      isTrue,
+                    );
+                    expect(
+                      b.cache.output('resp_data1').value.toBigInt(),
+                      b.value(address1, 3),
+                    );
+                  }
                 }
+                expect(
+                  b.reads,
+                  before,
+                  reason: 'warm streaming hits must not refill',
+                );
               }
-              expect(
-                b.reads,
-                before,
-                reason: 'warm streaming hits must not refill',
-              );
-            }
-            await Simulator.endSimulation();
-          },
-        );
+              await Simulator.endSimulation();
+            },
+          );
+        }
       }
     }
   }
