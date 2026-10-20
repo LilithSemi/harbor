@@ -320,7 +320,7 @@ class _Bench {
     hostAddress & 0xffffffff,
     hostAddress >> 32,
     localAddress & 0xffffffff,
-    0,
+    localAddress >> 32,
     length,
     (deviceToHost ? HarborPcieDma.flagDeviceToHost : 0) |
         (irq ? HarborPcieDma.flagIrq : 0),
@@ -470,7 +470,8 @@ void main() {
       await b.writeReg(HarborPcieDma.registerCplBaseHigh, 0x55667788);
       await b.writeReg(HarborPcieDma.registerCplSize, 0xfffffff5);
       await b.writeReg(HarborPcieDma.registerCplHead, 0x00010003);
-      expect(await b.readReg(HarborPcieDma.registerCplBaseLow), 0x11223344);
+      // Bits 3:0 of the ring base read 0.
+      expect(await b.readReg(HarborPcieDma.registerCplBaseLow), 0x11223340);
       expect(await b.readReg(HarborPcieDma.registerCplBaseHigh), 0x55667788);
       expect(await b.readReg(HarborPcieDma.registerCplSize), 5);
       expect(await b.readReg(HarborPcieDma.registerCplHead), 3);
@@ -482,7 +483,7 @@ void main() {
         0xaabbccdd,
         firstBe: 0x6,
       );
-      expect(await b.readReg(HarborPcieDma.registerCplBaseLow), 0x11bbcc44);
+      expect(await b.readReg(HarborPcieDma.registerCplBaseLow), 0x11bbcc40);
 
       // A 2 DW write and a 2 DW read.
       await b.writeRegs(HarborPcieDma.registerCplBaseLow, [
@@ -490,7 +491,7 @@ void main() {
         0x00000012,
       ]);
       expect(await b.readRegs(HarborPcieDma.registerCplBaseLow, 2), [
-        0xcafef00d,
+        0xcafef000,
         0x12,
       ]);
 
@@ -503,11 +504,11 @@ void main() {
       expect(await b.readReg(HarborPcieDma.registerDescBaseLow), 0);
       expect(await b.readReg(0x0a0), 0);
 
-      // A read longer than 2 DW gets CA with the full byte count.
-      final ca = await b.readRaw(HarborPcieDma.registerId, 3);
+      // A read longer than 32 DW gets CA with the full byte count.
+      final ca = await b.readRaw(HarborPcieDma.registerId, 33);
       expect(ca.status, PcieCplStatus.abort);
       expect(ca.kind, PcieTlpKind.cpl);
-      expect(ca.byteCount, 12);
+      expect(ca.byteCount, 132);
       expect(b.sink.received.where((t) => t.kind.isRequest), isEmpty);
       await b.finish();
     });
@@ -673,6 +674,9 @@ void main() {
       (0x80000000, 0x1, 8, true),
       (0x80000000, 0x0, 6, true),
       (0x80000000, 0x0, 8, false),
+      // Local ranges that do not fit in 20 address bits.
+      (0x80000000, 0xffff0, 0x20, true),
+      (0x80000000, 1 << 32, 8, true),
     ];
     for (final (i, (h, l, len, d2h)) in bad.indexed) {
       await b.push(
@@ -695,6 +699,7 @@ void main() {
       expect(status & HarborPcieDma.statusHalted, isNonZero);
       expect(status >> 8 & 0xff, HarborPcieDma.errorAlignment);
       expect(status >> 16, 63);
+      expect(status & HarborPcieDma.statusBusy, 0);
       expect(
         await b.readReg(HarborPcieDma.registerIrqCause),
         HarborPcieDma.causeError,
@@ -774,9 +779,10 @@ void main() {
     for (var i = 0; i < 3; i++) {
       await b.push(hostAddress: 0x80000000, localAddress: 0, length: 4);
     }
+    // The engine is off, so the queue is not busy.
     expect(
       await b.readReg(HarborPcieDma.registerStatus),
-      HarborPcieDma.statusBusy | HarborPcieDma.statusOverflow,
+      HarborPcieDma.statusOverflow,
     );
     await b.engineReset();
     expect(await b.readReg(HarborPcieDma.registerStatus), 2 << 16);
@@ -843,6 +849,128 @@ void main() {
     expect(await b.readReg(HarborPcieDma.registerIrqCause), 1 << 14);
     await b.writeReg(HarborPcieDma.registerIrqCause, 1 << 14);
     expect(await b.readReg(HarborPcieDma.registerIrqCause), 0);
+    await b.finish();
+  });
+
+  for (final width in [64, 128]) {
+    test('long BAR0 reads return every DW, W$width', () async {
+      final words = [for (var i = 0; i < 20; i++) 0x01010101 * i + 0x10];
+      final b = await _Bench.create(
+        _Config(width: width, dataWidth: width, infoWords: words),
+      );
+      await b.start();
+      List<int> info(int from, int count) => [
+        for (var i = from; i < from + count; i++)
+          i >= 0 && i < words.length ? words[i] : 0,
+      ];
+      expect(await b.readRegs(HarborPcieDma.registerId, 3), [
+        HarborPcieDma.identifier,
+        b.dut.caps,
+        0,
+      ]);
+      for (var i = 0; i < 7; i++) {
+        await b.writeReg(HarborPcieDma.registerPush + 4 * i, 0x100 + i);
+      }
+      expect(await b.readRegs(HarborPcieDma.registerPush, 16), [
+        for (var i = 0; i < 7; i++) 0x100 + i,
+        ...List.filled(9, 0),
+      ]);
+      const first = HarborPcieDma.infoFirstWord * 4;
+      expect(await b.readRegs(first, 32), info(0, 32));
+      expect(await b.readRegs(first + 8, 16), info(2, 16));
+      expect(await b.readRegs(first - 16, 32), [0, 0, 0, 0, ...info(0, 28)]);
+      expect(await b.readRegs(0xf80, 32), List.filled(32, 0));
+      // Writes in between still work.
+      await b.writeReg(HarborPcieDma.registerIrqMask, 3);
+      expect(await b.readRegs(HarborPcieDma.registerIrqCause, 3), [0, 3, 0]);
+      await b.finish();
+    });
+  }
+
+  test('records stay 16 byte aligned', () async {
+    final b = await _Bench.create(const _Config());
+    await b.start();
+    await b.setupRing(0x90000ffc, 4);
+    b.cplBase = 0x90000ff0;
+    expect(await b.readReg(HarborPcieDma.registerCplBaseLow), 0x90000ff0);
+    await b.enable();
+    await b.push(hostAddress: 0x80000000, localAddress: 0, length: 4);
+    await b.waitRecordWrites(0, 1);
+    expect(b.record(0).bytes, 4);
+    expect(b.host.violations, isEmpty);
+    await b.finish();
+  });
+
+  test('engine reset during the ring full wait', () async {
+    final b = await _Bench.create(const _Config());
+    await b.start();
+    await b.setupRing(_cplBase, 1);
+    await b.enable();
+    await b.push(hostAddress: 0x80000000, localAddress: 0, length: 16);
+    await b.push(hostAddress: 0x80000100, localAddress: 0x100, length: 16);
+    await b.push(hostAddress: 0x80000200, localAddress: 0x200, length: 16);
+    await b.waitRecordWrites(0, 1);
+    await b.cycles(200);
+    expect(await b.readReg(HarborPcieDma.registerStatus), 1 | 63 << 16);
+    await b.engineReset();
+    await b.cycles(2);
+    expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+    expect(await b.readReg(HarborPcieDma.registerCplTail), 0);
+    await b.cycles(100);
+    expect(b.recordWrites(1), isEmpty);
+    expect(b.host.memory.read(0x80000200, 16), everyElement(0));
+    await b.push(
+      hostAddress: 0x80000300,
+      localAddress: 0x300,
+      length: 16,
+      cookie: 3,
+    );
+    await b.waitRecordWrites(0, 2);
+    expect(b.record(0).cookie, 3);
+    b.checkCopy(0x80000300, 0x300, 16);
+    await b.finish();
+  });
+
+  test('engine reset during the bus master wait', () async {
+    final b = await _Bench.create(const _Config());
+    await b.start();
+    await b.setupRing(_cplBase, 4);
+    await b.enable();
+    b.busMaster.inject(0);
+    await b.push(hostAddress: 0x80000000, localAddress: 0, length: 64);
+    await b.cycles(200);
+    expect(await b.readReg(HarborPcieDma.registerStatus), 1 | 64 << 16);
+    await b.engineReset();
+    await b.cycles(2);
+    expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+    b.busMaster.inject(1);
+    await b.cycles(200);
+    expect(b.sink.received.where((t) => t.kind.isRequest), isEmpty);
+    await b.push(
+      hostAddress: 0x80001000,
+      localAddress: 0x40,
+      length: 64,
+      cookie: 4,
+    );
+    await b.waitRecordWrites(0, 1);
+    expect(b.record(0).cookie, 4);
+    b.checkCopy(0x80001000, 0x40, 64);
+    expect(b.host.memory.read(0x80000000, 64), everyElement(0));
+    await b.finish();
+  });
+
+  test('lines with no vectors granted all use vector 0', () async {
+    final b = await _Bench.create(const _Config(irqLines: 2));
+    await b.start();
+    await b.enable(mask: 0x0303);
+    b.msiEnable.inject(1);
+    b.granted.inject(0);
+    b.lines!.inject(2);
+    await b.cycles(3);
+    expect(b.irqPending, 0x01);
+    b.granted.inject(2);
+    await b.cycles(2);
+    expect(b.irqPending, 0x04);
     await b.finish();
   });
 

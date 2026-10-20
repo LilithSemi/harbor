@@ -24,9 +24,9 @@ import 'pcie_stream.dart';
 /// completion ring is full, the engine waits.
 ///
 /// BAR0 is 1 DW registers. A write of more than 1 DW writes the DWs in
-/// order. A read of up to [maxReadDw] DWs gets one completion with data. A
-/// longer read gets a completion with status CA. Other non-posted requests
-/// get status UR.
+/// order. A read of up to [maxReadDw] DWs gets one completion with data,
+/// read one DW per cycle. A longer read gets a completion with status CA.
+/// Other non-posted requests get status UR.
 class HarborPcieDma extends BridgeModule {
   /// Value of the ID register.
   static const identifier = 0x48444d41;
@@ -37,6 +37,7 @@ class HarborPcieDma extends BridgeModule {
   static const registerStatus = 0x00c;
   static const registerIrqCause = 0x010;
   static const registerIrqMask = 0x014;
+  /// Bits 3:0 of the ring base are always 0.
   static const registerCplBaseLow = 0x020;
   static const registerCplBaseHigh = 0x024;
   static const registerCplSize = 0x028;
@@ -81,8 +82,9 @@ class HarborPcieDma extends BridgeModule {
   /// Bit 31 of the record status DW.
   static const recordPhase = 1 << 31;
 
-  /// Longest BAR0 read that gets data.
-  static const maxReadDw = 2;
+  /// Longest BAR0 read that gets data. 128 bytes fit in one completion at
+  /// every max payload size. A CPU load does not make a longer read.
+  static const maxReadDw = 32;
 
   /// BAR0 size in words.
   static const barWords = 0x400;
@@ -375,6 +377,7 @@ class HarborPcieDma extends BridgeModule {
     final done = Logic(name: 'done', width: 32);
     final dFlags = Logic(name: 'd_flags', width: 2);
     final dCookie = Logic(name: 'd_cookie', width: 32);
+    final dLocalBad = Logic(name: 'd_local_bad');
     final code = Logic(name: 'code', width: 8);
 
     final lane0 = Logic(name: 'lane0', width: 2);
@@ -406,9 +409,9 @@ class HarborPcieDma extends BridgeModule {
     final cStatus = Logic(name: 'c_status', width: 3);
     final cByteCount = Logic(name: 'c_byte_count', width: 12);
     final cLowAddr = Logic(name: 'c_low_addr', width: 7);
-    final cDw = Logic(name: 'c_dw', width: 2);
-    final cG = Logic(name: 'c_g', width: 1);
-    final cT = Logic(name: 'c_t', width: 4);
+    final cDw = Logic(name: 'c_dw', width: 6);
+    final cG = Logic(name: 'c_g', width: 5);
+    final cT = Logic(name: 'c_t', width: 6);
     final cData = [
       for (var i = 0; i < maxReadDw; i++) Logic(name: 'c_data_$i', width: 32),
     ];
@@ -494,7 +497,8 @@ class HarborPcieDma extends BridgeModule {
       Const(0, width: 5),
       overflow,
       halted,
-      ~halted & (~inState(sIdle) | ~qCount.eq(0)),
+      // Busy means a descriptor is in the engine.
+      ~inState(sIdle),
     ].swizzle().named('status');
     final regValue = Logic(name: 'reg_value', width: 32);
     final Logic? infoWord;
@@ -538,13 +542,14 @@ class HarborPcieDma extends BridgeModule {
     ]);
 
     // Queue storage.
+    final local64 = [stage[3], stage[2]].swizzle();
+    final localHigh = aw == 64 ? Const(0) : local64.slice(63, aw).or();
     final pushData = [
+      localHigh,
       stage[6],
       stage[5].slice(1, 0),
       stage[4],
-      (aw <= 32
-          ? stage[2].slice(aw - 1, 0)
-          : [stage[3], stage[2]].swizzle().slice(aw - 1, 0)),
+      local64.slice(aw - 1, 0),
       stage[1],
       stage[0],
     ].swizzle();
@@ -566,7 +571,12 @@ class HarborPcieDma extends BridgeModule {
     final rdLen = rd.slice(95 + aw, 64 + aw);
     final rdFlags = rd.slice(97 + aw, 96 + aw);
     final rdCookie = rd.slice(129 + aw, 98 + aw);
+    final rdLocalHigh = rd[130 + aw];
     final pop = inState(sLoad);
+
+    // The local range must fit in the fabric address space.
+    final localEnd = (lAddr.zeroExtend(aw + 33) + left.zeroExtend(aw + 33))
+        .named('local_end');
 
     // Completion ring.
     final cplNext = ((cplTail + 1) & cplMask).named('cpl_next');
@@ -675,15 +685,17 @@ class HarborPcieDma extends BridgeModule {
       ].swizzle(),
       [completerId, cStatus, Const(0, width: 1), cByteCount].swizzle(),
       [cReqId, cTag, Const(0, width: 1), cLowAddr].swizzle(),
-      for (final d in cData) tlpSwapBytes(d),
     ];
-    final cTotal = (Const(3, width: 4) + cDw.zeroExtend(4)).named('c_total');
+    // The payload shifts down after each beat, so lane i of a payload beat
+    // is c_data_i and the first payload DW is c_data_0.
+    final cTotal = (Const(3, width: 6) + cDw).named('c_total');
     final cLanes = <Logic>[];
     final cKeep = <Logic>[];
     for (var i = 0; i < n; i++) {
       final t = cT + i;
-      Logic value = Const(0, width: 32);
-      for (var h = cHdr.length - 1; h >= 0; h--) {
+      Logic value = tlpSwapBytes(cData[i]);
+      if (3 % n == i) value = mux(t.eq(3), tlpSwapBytes(cData[0]), value);
+      for (var h = 2; h >= 0; h--) {
         if (h % n != i) continue;
         value = mux(t.eq(h), cHdr[h], value);
       }
@@ -750,6 +762,11 @@ class HarborPcieDma extends BridgeModule {
           tailTrim.zeroExtend(13),
     ).named('byte_count');
     final readOk = hdrLen.lte(maxReadDw);
+    final cShift = mux(
+      (cT + n).lte(3),
+      Const(0, width: 3),
+      mux(cT.lte(3), Const(1, width: 3), Const(n, width: 3)),
+    ).named('c_shift');
 
     final fill = <Conditional>[];
     final recWords = [
@@ -828,7 +845,8 @@ class HarborPcieDma extends BridgeModule {
               cplBase <
                   [
                     cplBase.slice(63, 32),
-                    merge(cplBase.slice(31, 0)),
+                    merge(cplBase.slice(31, 0)).slice(31, 4),
+                    Const(0, width: 4),
                   ].swizzle(),
             ],
           ),
@@ -904,7 +922,7 @@ class HarborPcieDma extends BridgeModule {
                   If.block([
                     Iff(isMRd & readOk, [
                       cStatus < 0,
-                      cDw < hdrLen.slice(1, 0),
+                      cDw < hdrLen.slice(5, 0),
                       cByteCount < byteCount.slice(11, 0),
                       cLowAddr < aByte + fe.zeroExtend(7),
                       cState < cGather,
@@ -931,7 +949,7 @@ class HarborPcieDma extends BridgeModule {
               for (var i = 0; i < maxReadDw; i++)
                 If(cG.eq(i), then: [cData[i] < regValue]),
               If(
-                (cG.zeroExtend(2) + 1).eq(cDw),
+                (cG.zeroExtend(6) + 1).eq(cDw),
                 then: [cState < cSend],
                 orElse: [cG < cG + 1],
               ),
@@ -940,7 +958,23 @@ class HarborPcieDma extends BridgeModule {
               If(
                 cFire,
                 then: [
-                  If(cLast, then: [cState < cIdle], orElse: [cT < cT + n]),
+                  If(
+                    cLast,
+                    then: [cState < cIdle],
+                    orElse: [
+                      cT < cT + n,
+                      for (var i = 0; i < maxReadDw; i++)
+                        Case(cShift, [
+                          for (final k in {1, n})
+                            CaseItem(Const(k, width: 3), [
+                              cData[i] <
+                                  (i + k < maxReadDw
+                                      ? cData[i + k]
+                                      : Const(0, width: 32)),
+                            ]),
+                        ]),
+                    ],
+                  ),
                 ],
               ),
             ]),
@@ -975,6 +1009,7 @@ class HarborPcieDma extends BridgeModule {
               left < rdLen,
               dFlags < rdFlags,
               dCookie < rdCookie,
+              dLocalBad < rdLocalHigh,
               done < 0,
               code < 0,
               state < sCheck,
@@ -984,6 +1019,8 @@ class HarborPcieDma extends BridgeModule {
                 Iff(
                   hAddr.slice(1, 0).or() |
                       lAddr.slice(1, 0).or() |
+                      dLocalBad |
+                      localEnd.gt(Const(BigInt.one << aw, width: aw + 33)) |
                       left.slice(1, 0).or() |
                       ~dFlags[0],
                   [code < errorAlignment, state < sRecWait],
