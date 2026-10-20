@@ -1071,6 +1071,86 @@ void main() {
     });
   }
 
+  for (final config in [
+    const DmaConfig(),
+    const DmaConfig(width: 128, kind: HarborFabricKind.wishbone),
+  ]) {
+    test('engine reset waits for a local write burst, $config', () async {
+      final b = await DmaBench.create(config, seed: 91);
+      final slotBeats = 512 ~/ (config.dataWidth ~/ 8);
+      b.seedHost(0x80000000, 0x2000);
+      b.memory.writeLimit = 0;
+      await b.start();
+      await b.setupRing(dmaCplBase, 4);
+      await b.enable();
+      await b.push(
+        hostAddress: 0x80000000,
+        localAddress: 0x4000,
+        length: 0x2000,
+        deviceToHost: false,
+      );
+      // All 8 tags are in, and the drain waits on its first write beat.
+      await b.waitUntil(() => b.reads.length == 8, what: '8 reads');
+      await b.waitUntil(
+        () => !b.host.responder.hasPending,
+        what: 'completions sent',
+      );
+      await b.cycles(50);
+      // A BAR0 completion holds the stopped port. The drain writes tag 0 and
+      // stops in tag 1. The freed tag gives a read that waits behind the
+      // completion.
+      b.sink.stop();
+      final read = b.readRaw(HarborPcieDma.registerId, 1);
+      await b.waitUntil(
+        () => b.sink.stream.valid.value.toBool(),
+        what: 'completion on the port',
+      );
+      b.memory.writeLimit = slotBeats + 10;
+      await b.waitUntil(
+        () => b.memory.writeBeats == slotBeats + 10,
+        what: 'drain in tag 1',
+      );
+      await b.cycles(50);
+      b.busMaster.inject(0);
+      final reset = b.engineReset();
+      await b.cycles(20);
+      b.sink.start();
+      await read;
+      await reset;
+      await b.cycles(100);
+      expect(
+        await b.readReg(HarborPcieDma.registerControl),
+        3,
+        reason: 'the reset waits for the burst',
+      );
+      b.memory.writeLimit = null;
+      var control = 3;
+      for (var i = 0; i < 50 && control != 1; i++) {
+        control = await b.readReg(HarborPcieDma.registerControl);
+      }
+      expect(control, 1, reason: 'engine reset taken');
+      expect(b.memory.writeBeats, 2 * slotBeats);
+      b.checkLocal(0x80000000, 0x4000, 0x400);
+      expect(b.memory.bytes.containsKey(0x4400), isFalse);
+      b.busMaster.inject(1);
+      await b.cycles(300);
+      expect(b.reads, hasLength(8));
+      await b.push(
+        hostAddress: 0x80001000,
+        localAddress: 0x8000,
+        length: 0x80,
+        deviceToHost: false,
+        cookie: 4,
+      );
+      await b.waitRecordWrites(0, 1);
+      expect(b.record(0).cookie, 4);
+      expect(b.record(0).code, 0);
+      b.checkLocal(0x80001000, 0x8000, 0x80);
+      expect(b.host.violations, isEmpty);
+      await b.finish();
+    });
+  }
+
   test('lines with no vectors granted all use vector 0', () async {
     final b = await DmaBench.create(const DmaConfig(irqLines: 2));
     await b.start();

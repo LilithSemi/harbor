@@ -14,6 +14,12 @@ class PcieFabricMemory {
 
   /// Beat addresses that answer with an error.
   final Set<int> errorBeats = {};
+
+  /// When set, write beats after this many get no answer.
+  int? writeLimit;
+
+  /// Write beats answered.
+  int writeBeats = 0;
   final Logic _ack = Logic(name: 'tb_ack');
   final Logic _err = Logic(name: 'tb_err');
   final Logic _rdata;
@@ -48,6 +54,13 @@ class PcieFabricMemory {
       _wait = -1;
       return;
     }
+    final limit = writeLimit;
+    if (limit != null &&
+        writeBeats >= limit &&
+        top.output('t_we').value.toBool()) {
+      _wait = -1;
+      return;
+    }
     if (_wait < 0) _wait = _random.nextInt(3);
     if (_wait > 0) {
       _wait--;
@@ -57,6 +70,7 @@ class PcieFabricMemory {
     final base = top.output('t_addr').value.toInt() & ~(busBytes - 1);
     final fail = errorBeats.contains(base);
     if (top.output('t_we').value.toBool()) {
+      writeBeats++;
       // Lanes with no strobe can hold X.
       final data = top.output('t_wdata').value;
       final sel = top.output('t_sel').value.toInt();

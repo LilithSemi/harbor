@@ -1013,7 +1013,10 @@ class HarborPcieDma extends BridgeModule {
     final eShown = (txLock & txOwner.eq(0) | txs.valid & pick.eq(0)).named(
       'e_shown',
     );
-    final eStaged = inState(sTx) | inState(sRecTx) | inH2d & iBusy;
+    // In the H2D state the drain must also be idle, so no local write
+    // burst is cut. The drain only writes data that is in the buffer, so
+    // it ends.
+    final eStaged = inState(sTx) | inState(sRecTx) | inH2d & iBusy & inD(dIdle);
     engReset <=
         resetReq &
             ~fValid &
