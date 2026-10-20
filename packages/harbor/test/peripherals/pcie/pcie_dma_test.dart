@@ -28,6 +28,7 @@ class _Config {
   final int irqLines;
   final List<int> infoWords;
   final int timeoutCycles;
+  final int maxReadRequestBytes;
 
   const _Config({
     this.width = 64,
@@ -38,6 +39,7 @@ class _Config {
     this.irqLines = 0,
     this.infoWords = const [],
     this.timeoutCycles = 6250000,
+    this.maxReadRequestBytes = 512,
   });
 
   @override
@@ -152,6 +154,7 @@ class _Bench {
       irqLines: config.irqLines,
       infoWords: config.infoWords,
       timeoutCycles: config.timeoutCycles,
+      maxReadRequestBytes: config.maxReadRequestBytes,
     );
     final top = MasterTop(
       dut,
@@ -493,6 +496,7 @@ void main() {
     const _Config(),
     const _Config(width: 128, dataWidth: 128),
     const _Config(dataWidth: 32),
+    const _Config(dataWidth: 128),
     const _Config(width: 128, kind: HarborFabricKind.wishbone),
   ]) {
     test('host to device copies edge sizes, $config', () async {
@@ -811,6 +815,114 @@ void main() {
     expect(await b.readReg(HarborPcieDma.registerStatus) >> 8 & 0xff, 4);
     await b.finish();
   });
+
+  test(
+    'a late completion after timeout and reset does not hit 15 tags',
+    () async {
+      final b = await _Bench.create(
+        const _Config(readTags: 15, timeoutCycles: 2000),
+        seed: 15,
+      );
+      b.seedHost(0x80000000, 0x3000);
+      PcieTlp? late;
+      var drop = true;
+      b.sink.onTlp = (t) {
+        final isRead =
+            t.kind == PcieTlpKind.memRead32 || t.kind == PcieTlpKind.memRead64;
+        if (isRead && drop) {
+          drop = false;
+          late = PcieTlp.completion(
+            completerId: 0x55,
+            requesterId: t.requesterId,
+            tag: t.tag,
+            byteCount: t.lengthDw * 4,
+            lowerAddress: t.address & 0x7f,
+            data: b.host.memory.read(t.address, t.lengthDw * 4),
+          );
+          return;
+        }
+        b.host.receive(t);
+      };
+      await b.start();
+      await b.setupRing(_cplBase, 4);
+      await b.enable();
+      await b.push(
+        hostAddress: 0x80000000,
+        localAddress: 0x1000,
+        length: 0x40,
+        deviceToHost: false,
+      );
+      await b.waitRecordWrites(0, 1);
+      expect(b.record(0).code, HarborPcieDma.errorTimeout);
+      await b.engineReset();
+      b.holdCompletions = true;
+      await b.push(
+        hostAddress: 0x80001000,
+        localAddress: 0x4000,
+        length: 0x1e00,
+        deviceToHost: false,
+        cookie: 2,
+      );
+      await b.waitUntil(() => b.reads.length >= 16, what: 'new reads');
+      expect(b.reads.skip(1).map((t) => t.tag), contains(late!.tag + 15));
+      b.injected.add(late!);
+      b.holdCompletions = false;
+      await b.waitRecordWrites(0, 2);
+      expect(b.record(0).cookie, 2);
+      expect(b.record(0).code, 0);
+      b.checkLocal(0x80001000, 0x4000, 0x1e00);
+      expect(await b.readReg(HarborPcieDma.registerStaleCompletions), 1);
+      expect(b.memory.bytes.containsKey(0x1000), isFalse);
+      await b.finish();
+    },
+  );
+
+  for (final width in [64, 128]) {
+    test('a 1024 DW completion stays in its slot, W$width', () async {
+      final b = await _Bench.create(
+        _Config(width: width, dataWidth: width, maxReadRequestBytes: 4096),
+        seed: 40 + width,
+      );
+      b.seedHost(0x80002000, 0x2000);
+      b.maxReadRequest.inject(5);
+      final reads = <PcieTlp>[];
+      b.sink.onTlp = (t) {
+        if (t.kind != PcieTlpKind.memRead32) {
+          b.host.receive(t);
+          return;
+        }
+        reads.add(t);
+        if (reads.length < 2) return;
+        // The second read is answered first, then one 1024 DW completion
+        // for the first read.
+        for (final r in reads.reversed) {
+          b.injected.add(
+            PcieTlp.completion(
+              completerId: 0x55,
+              requesterId: r.requesterId,
+              tag: r.tag,
+              byteCount: 4096,
+              data: b.host.memory.read(r.address, 4096),
+            ),
+          );
+        }
+      };
+      await b.start();
+      await b.setupRing(_cplBase, 4);
+      await b.enable();
+      await b.push(
+        hostAddress: 0x80002000,
+        localAddress: 0x8000,
+        length: 0x2000,
+        deviceToHost: false,
+      );
+      await b.waitRecordWrites(0, 1);
+      expect(reads.map((t) => t.lengthDw), [1024, 1024]);
+      expect(b.record(0).code, 0);
+      b.checkLocal(0x80002000, 0x8000, 0x2000);
+      await b.finish();
+    });
+  }
 
   test('engine reset with reads in flight drops their completions', () async {
     final b = await _Bench.create(const _Config(), seed: 9);

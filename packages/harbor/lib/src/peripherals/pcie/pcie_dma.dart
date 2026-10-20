@@ -268,9 +268,8 @@ class HarborPcieDma extends BridgeModule {
         'power of two from 2 to 4096',
       );
     }
-    // Tag values have 5 bits. With at most 16 slots, a tag value comes back
-    // only after two aborts.
-    if (readTags < 1 || readTags > 15) {
+    // Read tags plus the reserved fetch tag are at most 16 slots.
+    if (readTags < 1 || readTags + 1 > 16) {
       throw RangeError.range(readTags, 1, 15, 'readTags');
     }
     if (irqLines < 0 || irqLines > 7) {
@@ -1277,6 +1276,8 @@ class HarborPcieDma extends BridgeModule {
               ),
             ]),
             CaseItem(Const(sH2d, width: 4), [
+              // After an error the drain still writes the rest of its tag,
+              // and that tag counts in bytes done.
               If(
                 errNow & code.eq(0),
                 then: [

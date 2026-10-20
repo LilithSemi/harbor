@@ -12,9 +12,10 @@ import 'pcie_stream.dart';
 /// payload at the next offset of its slot. The engine drains the oldest slot
 /// when all its bytes are in, then frees it.
 ///
-/// A tag value is `(base + slot) mod 32`. An abort frees all slots and moves
-/// base forward by the slot count. Thus a completion for a request from
-/// before the abort does not match a new request, until base wraps.
+/// A tag value is `(base + slot) mod 32`. An abort frees all slots. When a
+/// read was still in flight, it also moves base forward by the slot count.
+/// Thus a completion for a request from before the abort does not match a
+/// new request, until base wraps.
 ///
 /// With [reservedTags] 1, slot [readTags] is reserved for another reader.
 /// It has no buffer. A completion for it gives `reserved_cpl` and nothing
@@ -101,11 +102,13 @@ class HarborPcieDmaTags extends Module {
              '_T${readTags}_V${reservedTags}_R${maxReadRequestBytes}'
              '_O$timeoutCycles',
        ) {
-    if (readTags < 1 || readTags > 16) {
-      throw RangeError.range(readTags, 1, 16, 'readTags');
-    }
     if (reservedTags < 0 || reservedTags > 1) {
       throw RangeError.range(reservedTags, 0, 1, 'reservedTags');
+    }
+    // At most 16 slots, so a tag value comes back only after two aborts with
+    // reads in flight.
+    if (readTags < 1 || readTags + reservedTags > 16) {
+      throw RangeError.range(readTags, 1, 16 - reservedTags, 'readTags');
     }
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
@@ -331,13 +334,23 @@ class HarborPcieDmaTags extends Module {
         ].swizzle();
 
     final completes = (cplGood & bc13.eq(len13)).named('cpl_completes');
+    final inFlight = [
+      for (var i = 0; i < readTags; i++) sBusy[i] & ~sDone[i],
+    ].reduce((a, b) => a | b).named('in_flight');
+    final staleCpl = (cplHeader & ~hit & ~rsvHit).named('stale_cpl');
     final more = cplGood & ~rxLast;
     Sequential(clk, [
       rot < rdLow,
       If(
         reset | abort,
         then: [
-          If(reset, then: [base < 0], orElse: [base < base + slots]),
+          If(
+            reset,
+            then: [base < 0],
+            orElse: [
+              If(inFlight, then: [base < base + slots]),
+            ],
+          ),
           allocPtr < 0,
           headPtr < 0,
           count < 0,
@@ -347,14 +360,17 @@ class HarborPcieDmaTags extends Module {
             sTimer[i] < 0,
           ],
           inPkt < 0,
-          If(reset | clearStale, then: [stale < 0]),
+          If.block([
+            Iff(reset | clearStale, [stale < 0]),
+            ElseIf(staleCpl, [stale < stale + 1]),
+          ]),
         ],
         orElse: [
           If(
             clearStale,
             then: [stale < 0],
             orElse: [
-              If(cplHeader & ~hit & ~rsvHit, then: [stale < stale + 1]),
+              If(staleCpl, then: [stale < stale + 1]),
             ],
           ),
           If(issue & issueReady, then: [allocPtr < next(allocPtr)]),
@@ -397,7 +413,12 @@ class HarborPcieDmaTags extends Module {
               inPkt < more,
               pktSlot < sel,
               pktPtr < hdrStart + 1,
-              pktLeft < lenDw.zeroExtend(11) - 1,
+              pktLeft <
+                  mux(
+                    lenDw.eq(0),
+                    Const(1023, width: 11),
+                    lenDw.zeroExtend(11) - 1,
+                  ),
               pktFinal < completes,
             ],
             orElse: [
