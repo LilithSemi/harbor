@@ -5,7 +5,13 @@ import '../peripherals/register_file.dart';
 import '../soc/target.dart';
 import 'cache_config.dart';
 
-/// Line tag store of an L1 cache. Its read latency is 1 on every target.
+/// Largest L1 tag store, in bits, that stays in flops. One iCE40 block RAM
+/// holds 4096 bits, so a smaller tag store does not use a block RAM.
+const harborL1TagFlopBits = 4096;
+
+/// Line tag store of an L1 cache. Its read latency is 1 on every target. A
+/// store of up to [harborL1TagFlopBits] bits uses flops, a larger one uses the
+/// block RAM of the target.
 class _L1TagStore {
   final HarborRegisterFile ram;
   final Logic _clk;
@@ -20,8 +26,27 @@ class _L1TagStore {
     required int readPorts,
     required HarborDeviceTarget? target,
     required String name,
-  }) : _clk = clk,
-       _latency = HarborRegisterFile.blockRamReadLatency(target) ?? 1,
+  }) : this._(
+         parent,
+         clk,
+         reset,
+         lines * width > harborL1TagFlopBits ? target : null,
+         lines: lines,
+         width: width,
+         readPorts: readPorts,
+         name: name,
+       );
+
+  _L1TagStore._(
+    BridgeModule parent,
+    this._clk,
+    Logic reset,
+    HarborDeviceTarget? target, {
+    required int lines,
+    required int width,
+    required int readPorts,
+    required String name,
+  }) : _latency = HarborRegisterFile.blockRamReadLatency(target) ?? 1,
        ram = HarborRegisterFile(
          numEntries: lines,
          dataWidth: width,
@@ -32,7 +57,7 @@ class _L1TagStore {
          name: name,
        ) {
     parent.addSubModule(ram);
-    ram.input('clk').srcConnection! <= clk;
+    ram.input('clk').srcConnection! <= _clk;
     ram.input('reset').srcConnection! <= reset;
   }
 
@@ -271,7 +296,8 @@ class HarborL1ICache extends BridgeModule {
         ? Const(0, width: 1)
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits);
 
-    // Valid bits flush in one cycle; tags and data share registered read timing.
+    // Valid bits flush in one cycle. Tags and data have the same registered
+    // read timing.
     final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
     final tagRam = _L1TagStore(
       this,
