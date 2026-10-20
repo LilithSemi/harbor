@@ -3,8 +3,12 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../bus/bus_master_port.dart';
 import '../bus/port/fabric_kind.dart';
+import 'pcie/pcie_stream.dart';
 
-/// Serves a memory-backed PCI expansion ROM on the Xilinx 7-series AXI stream.
+/// Serves a memory-backed PCI expansion ROM on a 64 bit [HarborPcieStream].
+///
+/// The block answers 3DW memory reads with the ROM hit bit in `rx_user`. It
+/// drops other packets.
 class HarborPcieOptionRom extends BridgeModule {
   late final BusMasterPort memory;
 
@@ -12,11 +16,8 @@ class HarborPcieOptionRom extends BridgeModule {
     required Logic clk,
     required Logic reset,
     required Logic completerId,
-    required Logic rxData,
-    required Logic rxValid,
-    required Logic rxLast,
-    required Logic rxUser,
-    required Logic txReady,
+    required HarborPcieStream rx,
+    required HarborPcieStream tx,
     this.romSize = 256 * 1024,
     this.memoryOffset = 0,
     int? memoryAddressWidth,
@@ -27,6 +28,9 @@ class HarborPcieOptionRom extends BridgeModule {
          'HarborPcieOptionRom_S${romSize}_O${memoryOffset}_A${memoryAddressWidth ?? (memoryOffset + romSize - 1).bitLength}_${fabricKind.name}',
          name: name ?? 'pcie_option_rom',
        ) {
+    if (rx.width != 64 || tx.width != 64) {
+      throw ArgumentError('the option ROM stream width must be 64');
+    }
     if (romSize < 512 || (romSize & (romSize - 1)) != 0) {
       throw ArgumentError.value(romSize, 'romSize', 'must be a power of 2');
     }
@@ -41,21 +45,24 @@ class HarborPcieOptionRom extends BridgeModule {
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
     completerId = addInput('completer_id', completerId, width: 16);
-    rxData = addInput('rx_data', rxData, width: 64);
-    rxValid = addInput('rx_valid', rxValid);
-    rxLast = addInput('rx_last', rxLast);
-    rxUser = addInput('rx_user', rxUser, width: 22);
-    txReady = addInput('tx_ready', txReady);
+    final rxs = HarborPcieStream.addSink(this, rx);
+    final txs = HarborPcieStream.addSource(this, tx);
+    final rxData = rxs.data;
+    final rxValid = rxs.valid;
+    final rxLast = rxs.last;
+    final rxUser = rxs.user;
+    final txReady = txs.ready;
     final rcb128 = addInput(
       'read_completion_boundary_128',
       readCompletionBoundary128 ?? Const(0),
     );
 
-    final rxReady = addOutput('rx_ready');
-    final txData = addOutput('tx_data', width: 64);
-    final txKeep = addOutput('tx_keep', width: 8);
-    final txLast = addOutput('tx_last');
-    final txValid = addOutput('tx_valid');
+    final rxReady = rxs.ready;
+    final txData = txs.data;
+    final txKeep = txs.keep;
+    final txLast = txs.last;
+    final txValid = txs.valid;
+    txs.user <= Const(0, width: HarborPcieStream.userWidth);
     final romReads = addOutput('rom_reads', width: 16);
     final completions = addOutput('completions', width: 16);
 

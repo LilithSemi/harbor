@@ -152,16 +152,26 @@ void main() {
         clk: Logic(),
         reset: Logic(),
         completerId: Logic(width: 16),
-        rxData: Logic(width: 64),
-        rxValid: Logic(),
-        rxLast: Logic(),
-        rxUser: Logic(width: 22),
-        txReady: Logic(),
+        rx: HarborPcieStream(width: 64),
+        tx: HarborPcieStream(width: 64),
         romSize: 256 * 1024,
         memoryOffset: 0xc00000,
         memoryAddressWidth: 20,
       ),
       throwsRangeError,
+    );
+  });
+
+  test('rejects a 128 bit stream', () {
+    expect(
+      () => HarborPcieOptionRom(
+        clk: Logic(),
+        reset: Logic(),
+        completerId: Logic(width: 16),
+        rx: HarborPcieStream(width: 128),
+        tx: HarborPcieStream(width: 128),
+      ),
+      throwsArgumentError,
     );
   });
 }
@@ -312,16 +322,21 @@ class _Harness extends BridgeModule {
     txReady = addInput('tx_ready', txReady);
     readData = addInput('read_data', readData, width: 32);
     readAllow = addInput('read_allow', readAllow);
+    final rx = HarborPcieStream(width: 64, name: 'rx');
+    final tx = HarborPcieStream(width: 64, name: 'tx');
+    rx.data <= rxData;
+    rx.keep <= Const(0xff, width: 8);
+    rx.valid <= rxValid;
+    rx.last <= rxLast;
+    rx.user <= rxUser;
+    tx.ready <= txReady;
     option = addSubModule(
       HarborPcieOptionRom(
         clk: clk,
         reset: reset,
         completerId: completerId,
-        rxData: rxData,
-        rxValid: rxValid,
-        rxLast: rxLast,
-        rxUser: rxUser,
-        txReady: txReady,
+        rx: rx,
+        tx: tx,
         memoryOffset: 0xc00000,
         memoryAddressWidth: 24,
         readCompletionBoundary128: Const(rcb128 ? 1 : 0),
@@ -394,11 +409,8 @@ class _SpiChain extends BridgeModule {
         clk: clk,
         reset: reset,
         completerId: Const(0, width: 16),
-        rxData: Const(0, width: 64),
-        rxValid: Const(0),
-        rxLast: Const(0),
-        rxUser: Const(0, width: 22),
-        txReady: Const(1),
+        rx: _idleStream(),
+        tx: _idleStream(ready: true),
         memoryOffset: 0xc00000,
         memoryAddressWidth: 24,
         fabricKind: kind,
@@ -423,4 +435,18 @@ class _SpiChain extends BridgeModule {
     flash.input('wr_data').srcConnection! <= Const(0, width: 8);
     connectInterfaces(option.interface('memory'), flash.interface('bus'));
   }
+}
+
+HarborPcieStream _idleStream({bool ready = false}) {
+  final s = HarborPcieStream(width: 64, name: 'idle');
+  if (ready) {
+    s.ready <= Const(1);
+  } else {
+    s.data <= Const(0, width: 64);
+    s.keep <= Const(0, width: 8);
+    s.valid <= Const(0);
+    s.last <= Const(0);
+    s.user <= Const(0, width: HarborPcieStream.userWidth);
+  }
+  return s;
 }
