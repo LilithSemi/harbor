@@ -22,9 +22,9 @@ import 'pcie_stream.dart';
 /// holds `reserved_busy` high until it has all completions. The tag value is
 /// kept while `reserved_busy` is high. A completion for it gives
 /// `reserved_cpl` and nothing more. A busy reserved slot is a read in flight
-/// for the first abort after its request only. Thus base moves at most once
-/// for one reserved read, and its tag value does not come back while a late
-/// completion for it can still arrive.
+/// for the first abort after its request only, so one reserved read moves
+/// base at most once. As for a read slot, its tag value can come back after
+/// two more base moves once the read has ended.
 ///
 /// A completion for a tag that is not in flight is dropped and counted in
 /// `stale_count`. A completion for a tag in flight with an error gives

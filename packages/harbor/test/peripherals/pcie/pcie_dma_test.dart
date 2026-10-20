@@ -1008,6 +1008,69 @@ void main() {
     await b.finish();
   });
 
+  for (final d2h in [true, false]) {
+    test('engine reset drops a packet that waits for bus master enable, '
+        '${d2h ? 'D2H' : 'H2D'}', () async {
+      final b = await DmaBench.create(const DmaConfig(), seed: d2h ? 81 : 82);
+      b.seedHost(0x80000000, 0x400);
+      await b.start();
+      await b.setupRing(dmaCplBase, 4);
+      await b.enable();
+      // The engine gets its descriptor ready while bus master enable is 0.
+      b.sink.stop();
+      b.busMaster.inject(0);
+      await b.push(
+        hostAddress: 0x80000000,
+        localAddress: 0x100,
+        length: 0x400,
+        deviceToHost: d2h,
+      );
+      await b.cycles(200);
+      // A BAR0 completion holds the stopped port. Then the engine stages its
+      // packet behind it, and bus master enable goes low again.
+      final read = b.readRaw(HarborPcieDma.registerId, 1);
+      await b.waitUntil(
+        () => b.sink.stream.valid.value.toBool(),
+        what: 'completion on the port',
+      );
+      b.busMaster.inject(1);
+      await b.cycles(20);
+      b.busMaster.inject(0);
+      final reset = b.engineReset();
+      await b.cycles(20);
+      b.sink.start();
+      await read;
+      await reset;
+      var control = 3;
+      for (var i = 0; i < 50 && control != 1; i++) {
+        control = await b.readReg(HarborPcieDma.registerControl);
+      }
+      expect(control, 1, reason: 'engine reset taken');
+      expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+      b.busMaster.inject(1);
+      await b.cycles(300);
+      expect(b.sink.received.where((t) => t.kind.isRequest), isEmpty);
+      expect(b.memory.bytes.containsKey(0x100), isFalse);
+      await b.push(
+        hostAddress: 0x80001000,
+        localAddress: 0x2000,
+        length: 0x40,
+        deviceToHost: d2h,
+        cookie: 6,
+      );
+      await b.waitRecordWrites(0, 1);
+      expect(b.record(0).cookie, 6);
+      expect(b.record(0).code, 0);
+      if (d2h) {
+        b.checkCopy(0x80001000, 0x2000, 0x40);
+      } else {
+        b.checkLocal(0x80001000, 0x2000, 0x40);
+      }
+      expect(b.host.violations, isEmpty);
+      await b.finish();
+    });
+  }
+
   test('lines with no vectors granted all use vector 0', () async {
     final b = await DmaBench.create(const DmaConfig(irqLines: 2));
     await b.start();

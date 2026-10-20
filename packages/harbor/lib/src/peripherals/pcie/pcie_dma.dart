@@ -1007,14 +1007,22 @@ class HarborPcieDma extends BridgeModule {
             ~left.eq(0) &
             tags.issueReady &
             busMasterEnable;
-    // A fetch read that is on the TX port finishes first.
+    // A fetch read that is on the TX port finishes first. An engine packet
+    // that has not shown a beat yet is dropped. A packet that has shown a
+    // beat finishes first.
+    final eShown = (txLock & txOwner.eq(0) | txs.valid & pick.eq(0)).named(
+      'e_shown',
+    );
+    final eStaged = inState(sTx) | inState(sRecTx) | inH2d & iBusy;
     engReset <=
         resetReq &
             ~fValid &
             (inState(sIdle) |
                 inState(sTxWait) |
                 inState(sRecWait) |
-                inH2d & dSafe);
+                inH2d & inD(dIdle) |
+                eStaged) &
+            ~(eStaged & eShown);
     tagAbort <= errNow | engReset;
     drainDone <=
         inH2d &
@@ -1640,6 +1648,7 @@ class HarborPcieDma extends BridgeModule {
                   ),
                 ],
               ),
+              If(engReset, then: engineReset()),
             ]),
             CaseItem(Const(sH2d, width: 4), [
               // After an error the drain still writes the rest of its tag,
@@ -1782,6 +1791,7 @@ class HarborPcieDma extends BridgeModule {
                   ),
                 ],
               ),
+              If(engReset, then: engineReset()),
             ]),
           ]),
         ],
