@@ -6,6 +6,7 @@ import '../../bus/port/memory_port.dart';
 import '../../bus/port/memory_waist.dart';
 import '../../bus/port/reg_fifo.dart';
 import '../bram.dart';
+import 'pcie_dma_tags.dart';
 import 'pcie_stream.dart';
 
 /// A PCIe DMA engine with a descriptor queue and a completion record ring.
@@ -14,10 +15,14 @@ import 'pcie_stream.dart';
 /// `HarborPcieRouter` that takes BAR0 packets and completions. The engine
 /// takes one descriptor at a time from the queue. A device to host
 /// descriptor reads local memory in bursts and writes it to the host in
-/// memory writes of at most the maximum payload size. Then the engine writes
-/// a 16 byte record to the completion ring on the same stream. When the
-/// descriptor asks for it, the done cause rises after the last record beat
-/// leaves the TX port.
+/// memory writes of at most the maximum payload size. A host to device
+/// descriptor sends up to [readTags] memory reads at a time. The completions
+/// go into a reorder buffer, and the engine writes each read to local memory
+/// in request order. Then the engine writes a 16 byte record to the
+/// completion ring on the same stream. For a host to device descriptor, the
+/// record goes after the last local write response. When the descriptor asks
+/// for it, the done cause rises after the last record beat leaves the TX
+/// port.
 ///
 /// A descriptor with an error gets a record with the error code, and then
 /// the engine halts. An engine reset clears the halt and the queue. When the
@@ -37,6 +42,10 @@ class HarborPcieDma extends BridgeModule {
   static const registerStatus = 0x00c;
   static const registerIrqCause = 0x010;
   static const registerIrqMask = 0x014;
+
+  /// Count of completions that match no read in flight. Read only.
+  static const registerStaleCompletions = 0x018;
+
   /// Bits 3:0 of the ring base are always 0.
   static const registerCplBaseLow = 0x020;
   static const registerCplBaseHigh = 0x024;
@@ -127,6 +136,10 @@ class HarborPcieDma extends BridgeModule {
   /// Largest memory write payload the engine sends.
   final int maxPayloadBytes;
 
+  /// Largest memory read the engine sends, and the reorder buffer size of
+  /// each tag.
+  final int maxReadRequestBytes;
+
   /// Read-only words in BAR0 from [infoFirstWord]. A word past the end
   /// reads 0.
   final List<int> infoWords;
@@ -160,6 +173,7 @@ class HarborPcieDma extends BridgeModule {
     this.irqLines = 0,
     this.timeoutCycles = 6250000,
     this.maxPayloadBytes = 256,
+    this.maxReadRequestBytes = 512,
     this.infoWords = const [],
     String? name,
   }) : width = rx.width,
@@ -167,7 +181,8 @@ class HarborPcieDma extends BridgeModule {
          'HarborPcieDma_W${rx.width}_D${dataWidth}_A${addressWidth}_'
          '${fabricKind.name}_S${fifoSource ? 'f' : ''}${ringSource ? 'r' : ''}'
          '_Q${queueDepth}_T${readTags}_L${irqLines}_O${timeoutCycles}'
-         '_P${maxPayloadBytes}_I${_infoTag(infoWords)}',
+         '_P${maxPayloadBytes}_R${maxReadRequestBytes}'
+         '_I${_infoTag(infoWords)}',
          name: name ?? 'pcie_dma',
        ) {
     _validate(tx, irqInputs);
@@ -176,7 +191,8 @@ class HarborPcieDma extends BridgeModule {
     reset = addInput('reset', reset);
     completerId = addInput('completer_id', completerId, width: 16);
     maxPayload = addInput('max_payload', maxPayload, width: 3);
-    addInput('max_read_request', maxReadRequest, width: 3);
+    maxReadRequest = addInput('max_read_request', maxReadRequest, width: 3);
+    // Completions are checked against the request only, so RCB is not used.
     addInput('rcb_128', rcb128);
     busMasterEnable = addInput('bus_master_enable', busMasterEnable);
     msiEnable = addInput('msi_enable', msiEnable);
@@ -207,6 +223,7 @@ class HarborPcieDma extends BridgeModule {
       reset,
       completerId,
       maxPayload,
+      maxReadRequest,
       busMasterEnable,
       msiEnable,
       msiVectorsGranted,
@@ -251,8 +268,10 @@ class HarborPcieDma extends BridgeModule {
         'power of two from 2 to 4096',
       );
     }
-    if (readTags < 1 || readTags > 32) {
-      throw RangeError.range(readTags, 1, 32, 'readTags');
+    // Tag values have 5 bits. With at most 16 slots, a tag value comes back
+    // only after two aborts.
+    if (readTags < 1 || readTags > 15) {
+      throw RangeError.range(readTags, 1, 15, 'readTags');
     }
     if (irqLines < 0 || irqLines > 7) {
       throw RangeError.range(irqLines, 0, 7, 'irqLines');
@@ -269,6 +288,15 @@ class HarborPcieDma extends BridgeModule {
       throw ArgumentError.value(
         maxPayloadBytes,
         'maxPayloadBytes',
+        'power of two from 128 to 4096',
+      );
+    }
+    if (!_pow2(maxReadRequestBytes) ||
+        maxReadRequestBytes < 128 ||
+        maxReadRequestBytes > 4096) {
+      throw ArgumentError.value(
+        maxReadRequestBytes,
+        'maxReadRequestBytes',
         'power of two from 128 to 4096',
       );
     }
@@ -312,6 +340,7 @@ class HarborPcieDma extends BridgeModule {
     Logic reset,
     Logic completerId,
     Logic maxPayload,
+    Logic maxReadRequest,
     Logic busMasterEnable,
     Logic msiEnable,
     Logic msiVectorsGranted,
@@ -368,6 +397,7 @@ class HarborPcieDma extends BridgeModule {
     const sTx = 7;
     const sRecWait = 8;
     const sRecTx = 9;
+    const sH2d = 10;
     final state = Logic(name: 'state', width: 4);
     Logic inState(int s) => state.eq(Const(s, width: 4));
 
@@ -389,6 +419,22 @@ class HarborPcieDma extends BridgeModule {
 
     final pktAddr = Logic(name: 'pkt_addr', width: 64);
     final pktDw = Logic(name: 'pkt_dw', width: 11);
+    final pktRead = Logic(name: 'pkt_read');
+    final pktTag = Logic(name: 'pkt_tag', width: 8);
+
+    // Host to device: the read sender and the local write drain.
+    const dIdle = 0;
+    const dReq = 1;
+    const dPrime = 2;
+    const dData = 3;
+    const dResp = 4;
+    final iBusy = Logic(name: 'i_busy');
+    final dState = Logic(name: 'd_state', width: 3);
+    Logic inD(int s) => dState.eq(Const(s, width: 3));
+    final slotW = (readTags - 1).bitLength < 1 ? 1 : (readTags - 1).bitLength;
+    final dSlot = Logic(name: 'd_slot', width: slotW);
+    final dLen = Logic(name: 'd_len', width: 13);
+    final wBeat = Logic(name: 'w_beat', width: 12);
     final txT = Logic(name: 'tx_t', width: 12);
     final txBase = Logic(name: 'tx_base', width: idxW);
 
@@ -442,6 +488,7 @@ class HarborPcieDma extends BridgeModule {
     ).named('hdr_len');
     final hdrFirstBe = tlpFirstBe(header);
     final hdrLastBe = tlpLastBe(header);
+    final isCpl = type.eq(0x0a);
 
     final afterHdr = Logic(name: 'after_hdr');
     final wMode = Logic(name: 'w_mode');
@@ -460,6 +507,40 @@ class HarborPcieDma extends BridgeModule {
     final rxFire = rxs.valid & rxs.ready;
     final hdrWrite =
         hdrFire & isMWr & ~tlpPoisoned(header) & capture.payloadInHeaderBeat;
+
+    final tagAbort = Logic(name: 'tag_abort');
+    final engReset = Logic(name: 'eng_reset');
+    final issueGo = Logic(name: 'issue_go');
+    final reqBytes = Logic(name: 'req_bytes', width: 13);
+    final drainDone = Logic(name: 'drain_done');
+    final rdIndex = Logic(
+      name: 'rd_index',
+      width: slotW + _log2(maxReadRequestBytes ~/ 4),
+    );
+    final tags = HarborPcieDmaTags(
+      clk: clk,
+      reset: reset,
+      abort: tagAbort,
+      clearStale: engReset,
+      cplHeader: hdrFire & isCpl,
+      header: header,
+      firstDw: capture.firstPayloadDw,
+      rxFire: rxs.valid & rxs.ready,
+      rxLast: rxs.last,
+      rxData: rxs.data,
+      issue: issueGo,
+      issueLen: reqBytes,
+      issueLocal: lAddr,
+      issueHostLow: hAddr.slice(6, 0),
+      drainDone: drainDone,
+      rdSlot: dSlot,
+      rdIndex: rdIndex,
+      dataWidth: dataWidth,
+      addressWidth: aw,
+      readTags: readTags,
+      maxReadRequestBytes: maxReadRequestBytes,
+      timeoutCycles: timeoutCycles,
+    );
     final wDo = afterHdr & wMode & rxs.valid & ~wLeft.eq(0);
     final laneDw = [
       for (var i = 0; i < n; i++) rxs.data.slice(32 * i + 31, 32 * i),
@@ -530,6 +611,7 @@ class HarborPcieDma extends BridgeModule {
         reg(registerStatus, status),
         reg(registerIrqCause, cause),
         reg(registerIrqMask, mask),
+        reg(registerStaleCompletions, tags.staleCount),
         reg(registerCplBaseLow, cplBase.slice(31, 0)),
         reg(registerCplBaseHigh, cplBase.slice(63, 32)),
         reg(registerCplSize, cplLog),
@@ -599,6 +681,16 @@ class HarborPcieDma extends BridgeModule {
     final chunk = _min(_min(left13, mpsBytes), toPage).named('chunk');
     final chunkDw = chunk.slice(12, 2).zeroExtend(11).named('chunk_dw');
 
+    // Read size: the smallest of bytes left, max read request, 4 KB page end.
+    final mrrMax = _log2(maxReadRequestBytes ~/ 128);
+    final mrrCode = mux(
+      maxReadRequest.gt(Const(mrrMax, width: 3)),
+      Const(mrrMax, width: 3),
+      maxReadRequest,
+    );
+    final mrrBytes = Const(128, width: 13) << mrrCode;
+    reqBytes <= _min(_min(left13, mrrBytes), toPage);
+
     // Fabric reads.
     Logic laneOf(Logic addr) => dpb == 1
         ? Const(0, width: 2)
@@ -610,9 +702,10 @@ class HarborPcieDma extends BridgeModule {
     final cap = mux(to4k.lt(256), to4k, Const(256, width: 13));
     final burst = mux(beats13.lt(cap), beats13, cap).named('burst');
 
-    mem.reqValid <= inState(sReq);
+    final inH2d = inState(sH2d);
+    mem.reqValid <= inState(sReq) | inH2d & inD(dReq);
     mem.reqId <= Const(0, width: mem.config.idWidth);
-    mem.reqWrite <= Const(0);
+    mem.reqWrite <= inH2d & inD(dReq);
     mem.reqAddr <= curAddr;
     mem.reqLen <= (burst - 1).slice(HarborMemoryWaistConfig.lenWidth - 1, 0);
     mem.reqSize <= Const(sizeLog, width: HarborMemoryWaistConfig.sizeWidth);
@@ -622,27 +715,60 @@ class HarborPcieDma extends BridgeModule {
           width: HarborMemoryWaistConfig.burstWidth,
         );
     mem.reqExclusive <= Const(0);
-    mem.wdataValid <= Const(0);
-    mem.wdataData <= Const(0, width: dataWidth);
-    mem.wdataStrb <= Const(0, width: beatBytes);
-    mem.wdataLast <= Const(0);
-    mem.wrespReady <= Const(0);
     mem.rdataReady <= inState(sRdata);
     final reqFire = mem.reqValid & mem.reqReady;
     final rFire = mem.rdataValid & mem.rdataReady;
+
+    // Local writes from the reorder buffer. Lane l of beat w_beat holds DW
+    // w_beat * dpb + l - lane0 of the tag.
+    final dLenDw = dLen.slice(12, 2).zeroExtend(13);
+    final strobes = <Logic>[];
+    for (var l = 0; l < dpb; l++) {
+      final p = ((wBeat.zeroExtend(13) << dpbLog) + l).named('d_pos_$l');
+      final inRange =
+          p.gte(lane0.zeroExtend(13)) & p.lt(lane0.zeroExtend(13) + dLenDw);
+      strobes.add(inRange.replicate(4));
+    }
+    final strb = strobes.rswizzle().named('d_strb');
+    mem.wdataValid <= inH2d & inD(dData);
+    mem.wdataData <=
+        [
+          for (var b = beatBytes - 1; b >= 0; b--)
+            mux(
+              strb[b],
+              tags.rdData.slice(8 * b + 7, 8 * b),
+              Const(0, width: 8),
+            ),
+        ].swizzle();
+    mem.wdataStrb <= strb;
+    mem.wdataLast <= burstLeft.eq(1);
+    mem.wrespReady <= inH2d & inD(dResp);
+    final wFire = mem.wdataValid & mem.wdataReady;
+    final bFire = mem.wrespValid & mem.wrespReady;
+    // The buffer address leads the beat by one cycle.
+    final wBeatNext = mux(wFire, wBeat + 1, wBeat);
+    rdIndex <=
+        (((wBeatNext.zeroExtend(16) << dpbLog) - lane0.zeroExtend(16)).slice(
+          rdIndex.width - 1,
+          0,
+        )).named('rd_index_value');
 
     // Engine TX: memory write of pkt_dw DWs from buf, from lane0 on.
     final is4 = pktAddr.slice(63, 32).or();
     final hdrDws = mux(is4, Const(4, width: 12), Const(3, width: 12));
     final eHdr = [
       [
-        mux(is4, Const(0x60, width: 8), Const(0x40, width: 8)),
+        mux(
+          pktRead,
+          mux(is4, Const(0x20, width: 8), Const(0x00, width: 8)),
+          mux(is4, Const(0x60, width: 8), Const(0x40, width: 8)),
+        ),
         Const(0, width: 14),
         pktDw.slice(9, 0),
       ].swizzle(),
       [
         completerId,
-        Const(0, width: 8),
+        pktTag,
         mux(pktDw.gt(1), Const(0xf, width: 4), Const(0, width: 4)),
         Const(0xf, width: 4),
       ].swizzle(),
@@ -653,7 +779,9 @@ class HarborPcieDma extends BridgeModule {
       ),
       [pktAddr.slice(31, 2), Const(0, width: 2)].swizzle(),
     ];
-    final eTotal = (hdrDws + pktDw.zeroExtend(12)).named('e_total');
+    final eTotal =
+        (hdrDws + mux(pktRead, Const(0, width: 12), pktDw.zeroExtend(12)))
+            .named('e_total');
     final eLanes = <Logic>[];
     final eKeep = <Logic>[];
     for (var i = 0; i < n; i++) {
@@ -670,7 +798,7 @@ class HarborPcieDma extends BridgeModule {
       eKeep.add(live.replicate(4));
     }
     final eLast = (txT + n).gte(eTotal);
-    final eValid = inState(sTx) | inState(sRecTx);
+    final eValid = inState(sTx) | inState(sRecTx) | inH2d & iBusy;
 
     // BAR0 completion TX.
     final cHdr = [
@@ -719,6 +847,35 @@ class HarborPcieDma extends BridgeModule {
     final eFire = txFire & ~pickCpl;
     final cFire = txFire & pickCpl;
     final recDone = (inState(sRecTx) & eFire & eLast).named('rec_done');
+
+    // Host to device control.
+    final wrespErr = inH2d & inD(dResp) & bFire & mem.wrespErr;
+    final errNow = (inH2d & tags.err | wrespErr).named('err_now');
+    final dSafe = (~iBusy & inD(dIdle)).named('d_safe');
+    issueGo <=
+        inH2d &
+            ~iBusy &
+            code.eq(0) &
+            ~errNow &
+            ~resetReq &
+            ~left.eq(0) &
+            tags.issueReady &
+            busMasterEnable;
+    engReset <=
+        resetReq &
+            (inState(sIdle) |
+                inState(sTxWait) |
+                inState(sRecWait) |
+                inH2d & dSafe);
+    tagAbort <= errNow | engReset;
+    drainDone <=
+        inH2d &
+            inD(dData) &
+            wFire &
+            burstLeft.eq(1) &
+            beatsLeft.eq(0) &
+            code.eq(0);
+    final headLane = laneOf(tags.headLocal);
 
     // Interrupt causes.
     final doneSet = recDone & code.eq(0) & dFlags[1];
@@ -802,6 +959,8 @@ class HarborPcieDma extends BridgeModule {
       cplTail < 0,
       phase < 1,
       resetReq < 0,
+      iBusy < 0,
+      dState < dIdle,
     ];
     final pktBytes = (pktDw.zeroExtend(32) << 2).named('pkt_bytes');
 
@@ -823,6 +982,8 @@ class HarborPcieDma extends BridgeModule {
           txOwnerCpl < 0,
           code < 0,
           dFlags < 0,
+          pktRead < 0,
+          pktTag < 0,
           ...engineReset(),
         ],
         orElse: [
@@ -1021,17 +1182,19 @@ class HarborPcieDma extends BridgeModule {
                       lAddr.slice(1, 0).or() |
                       dLocalBad |
                       localEnd.gt(Const(BigInt.one << aw, width: aw + 33)) |
-                      left.slice(1, 0).or() |
-                      ~dFlags[0],
+                      left.slice(1, 0).or(),
                   [code < errorAlignment, state < sRecWait],
                 ),
                 ElseIf(left.eq(0), [state < sRecWait]),
-                Else([state < sChunk]),
+                ElseIf(dFlags[0], [state < sChunk]),
+                Else([state < sH2d]),
               ]),
             ]),
             CaseItem(Const(sChunk, width: 4), [
               pktAddr < hAddr,
               pktDw < chunkDw,
+              pktRead < 0,
+              pktTag < 0,
               lane0 < laneOf(lAddr),
               curAddr < (lAddr & ~Const(beatBytes - 1, width: aw)),
               beatsLeft <
@@ -1113,12 +1276,116 @@ class HarborPcieDma extends BridgeModule {
                 ],
               ),
             ]),
+            CaseItem(Const(sH2d, width: 4), [
+              If(
+                errNow & code.eq(0),
+                then: [
+                  code <
+                      mux(
+                        tags.err,
+                        tags.errCode.zeroExtend(8),
+                        Const(errorFabric, width: 8),
+                      ),
+                ],
+              ),
+              If(
+                issueGo,
+                then: [
+                  pktAddr < hAddr,
+                  pktDw < reqBytes.slice(12, 2).zeroExtend(11),
+                  pktRead < 1,
+                  pktTag < tags.issueTag,
+                  txT < 0,
+                  iBusy < 1,
+                  hAddr < hAddr + reqBytes.zeroExtend(64),
+                  lAddr <
+                      lAddr +
+                          reqBytes
+                              .zeroExtend(aw > 13 ? aw : 13)
+                              .slice(aw - 1, 0),
+                  left < left - reqBytes.zeroExtend(32),
+                ],
+              ),
+              If(
+                iBusy & eFire,
+                then: [
+                  If(eLast, then: [iBusy < 0], orElse: [txT < txT + n]),
+                ],
+              ),
+              Case(dState, [
+                CaseItem(Const(dIdle, width: 3), [
+                  If(
+                    code.eq(0) & ~errNow & ~resetReq & tags.headReady,
+                    then: [
+                      dSlot < tags.headSlot,
+                      dLen < tags.headLen,
+                      lane0 < headLane,
+                      curAddr <
+                          (tags.headLocal & ~Const(beatBytes - 1, width: aw)),
+                      beatsLeft <
+                          ((headLane.zeroExtend(12) +
+                                  tags.headLen.slice(12, 2).zeroExtend(12) +
+                                  (dpb - 1)) >>
+                              dpbLog),
+                      wBeat < 0,
+                      dState < dReq,
+                    ],
+                  ),
+                ]),
+                CaseItem(Const(dReq, width: 3), [
+                  If(
+                    reqFire,
+                    then: [
+                      burstLeft < burst.slice(8, 0),
+                      beatsLeft < beatsLeft - burst.slice(11, 0),
+                      curAddr < curAddr + (burst.zeroExtend(aw) << sizeLog),
+                      dState < dPrime,
+                    ],
+                  ),
+                ]),
+                CaseItem(Const(dPrime, width: 3), [dState < dData]),
+                CaseItem(Const(dData, width: 3), [
+                  If(
+                    wFire,
+                    then: [
+                      wBeat < wBeat + 1,
+                      burstLeft < burstLeft - 1,
+                      If(burstLeft.eq(1), then: [dState < dResp]),
+                    ],
+                  ),
+                ]),
+                CaseItem(Const(dResp, width: 3), [
+                  If(
+                    bFire,
+                    then: [
+                      If.block([
+                        Iff(mem.wrespErr, [dState < dIdle]),
+                        ElseIf(beatsLeft.eq(0), [
+                          done < done + dLen.zeroExtend(32),
+                          dState < dIdle,
+                        ]),
+                        Else([dState < dReq]),
+                      ]),
+                    ],
+                  ),
+                ]),
+              ]),
+              If.block([
+                Iff(engReset, engineReset()),
+                ElseIf(dSafe & ~code.eq(0), [state < sRecWait]),
+                ElseIf(dSafe & code.eq(0) & ~errNow & left.eq(0) & ~tags.busy, [
+                  state < sRecWait,
+                ]),
+              ]),
+            ]),
             CaseItem(Const(sRecWait, width: 4), [
               If.block([
                 Iff(resetReq, engineReset()),
                 ElseIf(recLoad, [
                   pktAddr < recAddr,
                   pktDw < 4,
+                  pktRead < 0,
+                  pktTag < 0,
                   lane0 < 0,
                   txT < 0,
                   txBase <

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:harbor/harbor.dart';
@@ -16,6 +17,8 @@ const _cplBase = 0x90000000;
 
 int _fill(int address) => (address * 13 + (address >> 8) + 5) & 0xff;
 
+int _hostFill(int address) => (address * 7 + (address >> 9) + 0x31) & 0xff;
+
 class _Config {
   final int width;
   final int dataWidth;
@@ -24,6 +27,7 @@ class _Config {
   final int readTags;
   final int irqLines;
   final List<int> infoWords;
+  final int timeoutCycles;
 
   const _Config({
     this.width = 64,
@@ -33,6 +37,7 @@ class _Config {
     this.readTags = 8,
     this.irqLines = 0,
     this.infoWords = const [],
+    this.timeoutCycles = 6250000,
   });
 
   @override
@@ -71,6 +76,7 @@ class _Bench {
   final Logic clk;
   final Logic reset;
   final Logic maxPayload;
+  final Logic maxReadRequest;
   final Logic busMaster;
   final Logic msiEnable;
   final Logic granted;
@@ -81,6 +87,14 @@ class _Bench {
   final PcieHostModel host;
   int _tag = 0;
   int cplBase = _cplBase;
+  Future<void> _sendLock = Future.value();
+
+  /// Completions wait while this is set.
+  bool holdCompletions = false;
+
+  /// TLPs sent before the responder completions.
+  final List<PcieTlp> injected = [];
+  bool _pumping = false;
 
   _Bench._(
     this.config,
@@ -89,6 +103,7 @@ class _Bench {
     this.clk,
     this.reset,
     this.maxPayload,
+    this.maxReadRequest,
     this.busMaster,
     this.msiEnable,
     this.granted,
@@ -108,6 +123,7 @@ class _Bench {
     final clk = SimpleClockGenerator(10).clk;
     final reset = Logic(name: 'reset');
     final maxPayload = Logic(name: 'max_payload', width: 3);
+    final maxReadRequest = Logic(name: 'max_read_request', width: 3);
     final busMaster = Logic(name: 'bus_master');
     final msiEnable = Logic(name: 'msi_enable');
     final granted = Logic(name: 'granted', width: 3);
@@ -135,6 +151,7 @@ class _Bench {
       readTags: config.readTags,
       irqLines: config.irqLines,
       infoWords: config.infoWords,
+      timeoutCycles: config.timeoutCycles,
     );
     final top = MasterTop(
       dut,
@@ -154,7 +171,7 @@ class _Bench {
     top.input('reset').srcConnection! <= reset;
     top.input('completer_id').srcConnection! <= completerId;
     top.input('max_payload').srcConnection! <= maxPayload;
-    top.input('max_read_request').srcConnection! <= Const(2, width: 3);
+    top.input('max_read_request').srcConnection! <= maxReadRequest;
     top.input('rcb_128').srcConnection! <= Const(0);
     top.input('bus_master_enable').srcConnection! <= busMaster;
     top.input('msi_enable').srcConnection! <= msiEnable;
@@ -169,6 +186,7 @@ class _Bench {
 
     completerId.inject(_completerId);
     maxPayload.inject(0);
+    maxReadRequest.inject(2);
     busMaster.inject(1);
     msiEnable.inject(0);
     granted.inject(0);
@@ -184,6 +202,7 @@ class _Bench {
       clk,
       reset,
       maxPayload,
+      maxReadRequest,
       busMaster,
       msiEnable,
       granted,
@@ -220,9 +239,34 @@ class _Bench {
     reset.inject(0);
     await clk.nextPosedge;
     sink.start();
+    _pumping = true;
+    unawaited(_pump());
+  }
+
+  /// Sends TLPs on RX one at a time.
+  Future<void> send(PcieTlp tlp) {
+    final done = _sendLock.then((_) => driver.send(tlp));
+    _sendLock = done;
+    return done;
+  }
+
+  Future<void> _pump() async {
+    while (_pumping) {
+      final tlp = holdCompletions
+          ? null
+          : (injected.isNotEmpty
+                ? injected.removeAt(0)
+                : host.responder.next());
+      if (tlp == null) {
+        await clk.nextPosedge;
+      } else {
+        await send(tlp);
+      }
+    }
   }
 
   Future<void> finish() async {
+    _pumping = false;
     sink.stop();
     await clk.nextPosedge;
     await Simulator.endSimulation();
@@ -246,7 +290,7 @@ class _Bench {
   }
 
   Future<void> writeRegs(int offset, List<int> values, {int firstBe = 0xf}) =>
-      driver.send(
+      send(
         PcieTlp.memWrite(
           address: _bar0 + offset,
           data: [for (final v in values) ..._leBytes(v)],
@@ -268,7 +312,7 @@ class _Bench {
       attr: 1,
     );
     final before = host.completions.length;
-    await driver.send(request);
+    await send(request);
     await waitUntil(
       () => host.completions.length > before,
       what: 'BAR0 read 0x${offset.toRadixString(16)}',
@@ -347,6 +391,37 @@ class _Bench {
     what: 'record write $count at slot $slot',
   );
 
+  /// Memory reads the engine sent.
+  List<PcieTlp> get reads => [
+    for (final t in sink.received)
+      if (t.kind == PcieTlpKind.memRead32 || t.kind == PcieTlpKind.memRead64) t,
+  ];
+
+  /// Fills host memory with a pattern.
+  void seedHost(int address, int length) {
+    host.memory.write(address, [
+      for (var i = 0; i < length; i++) _hostFill(address + i),
+    ]);
+  }
+
+  /// Returns the first local byte that differs from the host, or null.
+  String? localDiff(int hostAddress, int localAddress, int length) {
+    final want = host.memory.read(hostAddress, length);
+    for (var i = 0; i < length; i++) {
+      if (want[i] != memory.byte(localAddress + i)) {
+        return 'local byte 0x${(localAddress + i).toRadixString(16)} is '
+            '${memory.byte(localAddress + i)}, expected ${want[i]}';
+      }
+    }
+    return null;
+  }
+
+  /// Checks fabric bytes against host bytes.
+  void checkLocal(int hostAddress, int localAddress, int length) {
+    final diff = localDiff(hostAddress, localAddress, length);
+    if (diff != null) fail(diff);
+  }
+
   /// Checks host bytes against fabric bytes.
   void checkCopy(int hostAddress, int localAddress, int length) {
     final got = host.memory.read(hostAddress, length);
@@ -369,6 +444,7 @@ HarborPcieDma _dma({
   int readTags = 8,
   int irqLines = 0,
   int timeoutCycles = 6250000,
+  int maxReadRequestBytes = 512,
   List<int> infoWords = const [],
 }) => HarborPcieDma(
   clk: Logic(),
@@ -389,50 +465,393 @@ HarborPcieDma _dma({
   readTags: readTags,
   irqLines: irqLines,
   timeoutCycles: timeoutCycles,
+  maxReadRequestBytes: maxReadRequestBytes,
   infoWords: infoWords,
 );
 
 void main() {
   tearDown(() async => Simulator.reset());
 
-  group('build', () {
-    test('definition names differ per parameter set', () {
-      final names = {
-        _dma().definitionName,
-        _dma(width: 128).definitionName,
-        _dma(queueDepth: 16).definitionName,
-        _dma(readTags: 4).definitionName,
-        _dma(irqLines: 3).definitionName,
-        _dma(timeoutCycles: 100).definitionName,
-        _dma(infoWords: const [1]).definitionName,
-        _dma(infoWords: const [2]).definitionName,
-      };
-      expect(names, hasLength(8));
-    });
+  // ROHD keeps the wires of earlier benches in the tick loop after a reset,
+  // so later tests run slower. Long simulations go first, the build checks
+  // last.
+  for (final (config, count) in [
+    (const _Config(), 500),
+    (const _Config(width: 128, dataWidth: 128), 60),
+    (const _Config(width: 128, kind: HarborFabricKind.wishbone), 60),
+  ]) {
+    test(
+      'random mix of $count descriptors, $config',
+      () async {
+        await _randomMix(config, count);
+      },
+      timeout: const Timeout(Duration(hours: 3)),
+    );
+  }
 
-    test('bad parameters are refused', () {
-      expect(() => _dma(ringSource: true), throwsArgumentError);
-      expect(() => _dma(fifoSource: false), throwsArgumentError);
-      expect(() => _dma(queueDepth: 48), throwsArgumentError);
-      expect(() => _dma(readTags: 0), throwsRangeError);
-      expect(() => _dma(irqLines: 8), throwsRangeError);
-      expect(
-        () => _dma(
-          infoWords: List<int>.filled(HarborPcieDma.infoMaxWords + 1, 0),
-        ),
-        throwsRangeError,
+  for (final config in [
+    const _Config(),
+    const _Config(width: 128, dataWidth: 128),
+    const _Config(dataWidth: 32),
+    const _Config(width: 128, kind: HarborFabricKind.wishbone),
+  ]) {
+    test('host to device copies edge sizes, $config', () async {
+      final b = await _Bench.create(
+        config,
+        seed: config.width + config.dataWidth + 3,
       );
+      final jobs = [
+        (0x80000000, 0x01000, 4),
+        (0x80001000, 0x02000, 128),
+        (0x80002000, 0x03004, 132),
+        (0x80003f40, 0x04008, 0x180),
+        (0x180004104, 0x0500c, 1000),
+        (0x80006000, 0x06000, 0),
+        (0x80008004, 0x08008, 0x2000),
+      ];
+      for (final (h, _, len) in jobs) {
+        b.seedHost(h, len);
+      }
+      // Each record must come after the local data of its descriptor.
+      final early = <String>[];
+      b.sink.onTlp = (t) {
+        final slot = (t.address - _cplBase) ~/ 16;
+        if (t.kind.hasData && slot >= 0 && slot < jobs.length) {
+          final (h, l, len) = jobs[slot];
+          final diff = b.localDiff(h, l, len);
+          if (diff != null) early.add('record $slot: $diff');
+        }
+        b.host.receive(t);
+      };
+      await b.start();
+      await b.setupRing(_cplBase, 4);
+      await b.enable();
+      for (final (i, (h, l, len)) in jobs.indexed) {
+        await b.push(
+          hostAddress: h,
+          localAddress: l,
+          length: len,
+          deviceToHost: false,
+          cookie: 0xd00 + i,
+        );
+      }
+      await b.waitRecordWrites(jobs.length - 1, 1);
+      expect(b.host.violations, isEmpty);
+      expect(early, isEmpty);
+      for (final (i, (h, l, len)) in jobs.indexed) {
+        b.checkLocal(h, l, len);
+        expect(b.memory.bytes.containsKey(l - 1), isFalse, reason: 'job $i');
+        expect(b.memory.bytes.containsKey(l + len), isFalse, reason: 'job $i');
+        final r = b.record(i);
+        expect(r.cookie, 0xd00 + i);
+        expect(r.code, 0);
+        expect(r.bytes, len);
+      }
+      for (final t in b.reads) {
+        expect(t.requesterId, _completerId);
+        expect(t.lengthDw * 4, lessThanOrEqualTo(512));
+        expect(
+          t.kind,
+          t.address > 0xffffffff
+              ? PcieTlpKind.memRead64
+              : PcieTlpKind.memRead32,
+        );
+      }
+      expect(b.reads.where((t) => t.address > 0xffffffff), isNotEmpty);
+      expect(await b.readReg(HarborPcieDma.registerStaleCompletions), 0);
+      expect(await b.readReg(HarborPcieDma.registerStatus) & 3, 0);
+      await b.finish();
     });
+  }
 
-    test('an empty info list emits no info logic', () async {
-      final empty = _dma();
-      await empty.build();
-      expect(empty.generateSynth(), isNot(contains('info_word')));
-      Simulator.reset();
-      final full = _dma(infoWords: const [0x12345678]);
-      await full.build();
-      expect(full.generateSynth(), contains('info_word'));
-    });
+  test('8 reads in flight at the host', () async {
+    final b = await _Bench.create(const _Config(), seed: 21);
+    b.seedHost(0x80010000, 0x2000);
+    b.holdCompletions = true;
+    await b.start();
+    await b.setupRing(_cplBase, 4);
+    await b.enable();
+    await b.push(
+      hostAddress: 0x80010000,
+      localAddress: 0x10000,
+      length: 0x2000,
+      deviceToHost: false,
+    );
+    await b.waitUntil(() => b.reads.length >= 8, what: '8 reads');
+    await b.cycles(300);
+    expect(b.reads, hasLength(8));
+    expect(b.reads.map((t) => t.tag).toSet(), hasLength(8));
+    expect(b.reads.every((t) => t.lengthDw == 128), isTrue);
+    b.holdCompletions = false;
+    await b.waitRecordWrites(0, 1);
+    expect(b.reads, hasLength(16));
+    expect(b.record(0).bytes, 0x2000);
+    b.checkLocal(0x80010000, 0x10000, 0x2000);
+    expect(b.host.violations, isEmpty);
+    await b.finish();
+  });
+
+  test('read size follows max read request and the build limit', () async {
+    final b = await _Bench.create(const _Config(width: 128, dataWidth: 128));
+    b.host.responder.rcb = 128;
+    b.host.responder.maxPayload = 256;
+    b.seedHost(0x80000000, 0x3000);
+    b.maxReadRequest.inject(0);
+    await b.start();
+    await b.setupRing(_cplBase, 4);
+    await b.enable();
+    await b.push(
+      hostAddress: 0x80000040,
+      localAddress: 0x100,
+      length: 0x7c0,
+      deviceToHost: false,
+    );
+    await b.waitRecordWrites(0, 1);
+    expect(b.reads.map((t) => t.lengthDw * 4).toSet(), {64, 128});
+    b.checkLocal(0x80000040, 0x100, 0x7c0);
+    // 1024 is above the 512 byte buffer of a tag.
+    b.maxReadRequest.inject(3);
+    final before = b.reads.length;
+    await b.push(
+      hostAddress: 0x80001000,
+      localAddress: 0x2000,
+      length: 0x1000,
+      deviceToHost: false,
+    );
+    await b.waitRecordWrites(1, 1);
+    expect(b.reads.skip(before).map((t) => t.lengthDw * 4), [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+    ]);
+    b.checkLocal(0x80001000, 0x2000, 0x1000);
+    expect(b.host.violations, isEmpty);
+    await b.finish();
+  });
+
+  test('no memory read goes out without bus master enable', () async {
+    final b = await _Bench.create(const _Config());
+    b.seedHost(0x80000000, 64);
+    await b.start();
+    await b.setupRing(_cplBase, 4);
+    await b.enable();
+    b.busMaster.inject(0);
+    await b.push(
+      hostAddress: 0x80000000,
+      localAddress: 0,
+      length: 64,
+      deviceToHost: false,
+    );
+    await b.cycles(300);
+    expect(b.sink.received.where((t) => t.kind.isRequest), isEmpty);
+    b.busMaster.inject(1);
+    await b.waitRecordWrites(0, 1);
+    b.checkLocal(0x80000000, 0, 64);
+    await b.finish();
+  });
+
+  test('completion errors and timeout halt with their code', () async {
+    final b = await _Bench.create(const _Config(timeoutCycles: 3000));
+    b.seedHost(0x80000000, 0x400);
+    String? mode;
+    PcieTlp? dropped;
+    b.sink.onTlp = (t) {
+      final isRead =
+          t.kind == PcieTlpKind.memRead32 || t.kind == PcieTlpKind.memRead64;
+      if (!isRead || mode == null) {
+        b.host.receive(t);
+        return;
+      }
+      final bytes = b.host.memory.read(t.address, t.lengthDw * 4);
+      PcieTlp cpl({
+        PcieCplStatus status = PcieCplStatus.success,
+        int? byteCount,
+        int? lowerAddress,
+        List<int>? data,
+        bool poisoned = false,
+      }) => PcieTlp.completion(
+        completerId: 0x55,
+        requesterId: t.requesterId,
+        tag: t.tag,
+        status: status,
+        byteCount: byteCount ?? t.lengthDw * 4,
+        lowerAddress: lowerAddress ?? t.address & 0x7f,
+        data: data ?? (status == PcieCplStatus.success ? bytes : const []),
+        poisoned: poisoned,
+      );
+      switch (mode) {
+        case 'ur':
+          b.injected.add(cpl(status: PcieCplStatus.unsupported));
+        case 'ca':
+          b.injected.add(cpl(status: PcieCplStatus.abort));
+        case 'poisoned':
+          b.injected.add(cpl(poisoned: true));
+        case 'byte count':
+          b.injected.add(cpl(byteCount: t.lengthDw * 4 + 4));
+        case 'lower address':
+          b.injected.add(cpl(lowerAddress: (t.address + 4) & 0x7f));
+        case 'too long':
+          b.injected.add(cpl(data: [...bytes, 1, 2, 3, 4]));
+        case 'no data':
+          b.injected.add(cpl(data: const []));
+        case 'timeout':
+          dropped = cpl();
+      }
+      mode = null;
+    };
+    await b.start();
+    await b.setupRing(_cplBase, 4);
+    await b.enable(mask: HarborPcieDma.causeError);
+
+    // A completion with no read in flight is dropped and counted.
+    b.injected.add(
+      PcieTlp.completion(
+        completerId: 0x55,
+        requesterId: _completerId,
+        tag: 3,
+        byteCount: 4,
+        data: const [1, 2, 3, 4],
+      ),
+    );
+    await b.waitUntil(() => b.injected.isEmpty, what: 'stale send');
+    await b.cycles(20);
+    expect(await b.readReg(HarborPcieDma.registerStaleCompletions), 1);
+
+    final cases = [
+      ('ur', HarborPcieDma.errorCompletion),
+      ('ca', HarborPcieDma.errorCompletion),
+      ('poisoned', HarborPcieDma.errorPoisoned),
+      ('byte count', HarborPcieDma.errorLength),
+      ('lower address', HarborPcieDma.errorLength),
+      ('too long', HarborPcieDma.errorLength),
+      ('no data', HarborPcieDma.errorLength),
+      ('timeout', HarborPcieDma.errorTimeout),
+    ];
+    for (final (i, (name, code)) in cases.indexed) {
+      mode = name;
+      await b.push(
+        hostAddress: 0x80000000 + 0x40 * i,
+        localAddress: 0x40000 + 0x100 * i,
+        length: 0x40,
+        deviceToHost: false,
+        cookie: 0x60 + i,
+      );
+      await b.push(
+        hostAddress: 0x80000300,
+        localAddress: 0x50000,
+        length: 4,
+        deviceToHost: false,
+      );
+      await b.waitRecordWrites(0, i + 1);
+      final r = b.record(0);
+      expect(r.code, code, reason: name);
+      expect(r.cookie, 0x60 + i, reason: name);
+      expect(r.bytes, 0, reason: name);
+      expect(b.memory.bytes.containsKey(0x40000 + 0x100 * i), isFalse);
+      await b.cycles(100);
+      expect(b.recordWrites(1), isEmpty, reason: 'halted, $name');
+      final status = await b.readReg(HarborPcieDma.registerStatus);
+      expect(status & HarborPcieDma.statusHalted, isNonZero);
+      expect(status >> 8 & 0xff, code);
+      expect(b.irqPending, 1);
+      await b.writeReg(
+        HarborPcieDma.registerIrqCause,
+        HarborPcieDma.causeError,
+      );
+      await b.engineReset();
+      await b.cycles(2);
+      expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+    }
+    expect(b.memory.bytes.containsKey(0x50000), isFalse);
+
+    // The late completion of the read that timed out is dropped.
+    b.injected.add(dropped!);
+    await b.waitUntil(() => b.injected.isEmpty, what: 'late send');
+    await b.cycles(20);
+    expect(await b.readReg(HarborPcieDma.registerStaleCompletions), 1);
+    expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+    await b.push(
+      hostAddress: 0x80000300,
+      localAddress: 0x50000,
+      length: 0x80,
+      deviceToHost: false,
+    );
+    await b.waitRecordWrites(0, cases.length + 1);
+    expect(b.record(0).code, 0);
+    b.checkLocal(0x80000300, 0x50000, 0x80);
+    await b.finish();
+  });
+
+  test('a fabric write error gives code 4', () async {
+    final b = await _Bench.create(const _Config());
+    b.seedHost(0x80000000, 0x400);
+    await b.start();
+    await b.setupRing(_cplBase, 4);
+    await b.enable();
+    b.memory.errorBeats.add(0x2000 + 0x250);
+    await b.push(
+      hostAddress: 0x80000000,
+      localAddress: 0x2000,
+      length: 0x400,
+      deviceToHost: false,
+      cookie: 8,
+    );
+    await b.waitRecordWrites(0, 1);
+    final r = b.record(0);
+    expect(r.code, HarborPcieDma.errorFabric);
+    expect(r.cookie, 8);
+    // Only whole reads before the failing one count.
+    expect(r.bytes, 0x200);
+    b.checkLocal(0x80000000, 0x2000, 0x200);
+    expect(await b.readReg(HarborPcieDma.registerStatus) >> 8 & 0xff, 4);
+    await b.finish();
+  });
+
+  test('engine reset with reads in flight drops their completions', () async {
+    final b = await _Bench.create(const _Config(), seed: 9);
+    b.seedHost(0x80000000, 0x2000);
+    b.holdCompletions = true;
+    await b.start();
+    await b.setupRing(_cplBase, 4);
+    await b.enable();
+    await b.push(
+      hostAddress: 0x80000000,
+      localAddress: 0x1000,
+      length: 0x1000,
+      deviceToHost: false,
+    );
+    await b.waitUntil(() => b.reads.length >= 8, what: 'old reads');
+    await b.engineReset();
+    await b.cycles(5);
+    expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+    // The new reads use other tags, so old completions do not match them.
+    await b.push(
+      hostAddress: 0x80001000,
+      localAddress: 0x3000,
+      length: 0x1000,
+      deviceToHost: false,
+      cookie: 5,
+    );
+    await b.waitUntil(() => b.reads.length >= 16, what: 'new reads');
+    final oldTags = b.reads.take(8).map((t) => t.tag).toSet();
+    final newTags = b.reads.skip(8).map((t) => t.tag).toSet();
+    expect(oldTags.intersection(newTags), isEmpty);
+    b.holdCompletions = false;
+    await b.waitRecordWrites(0, 1);
+    expect(b.record(0).cookie, 5);
+    expect(b.record(0).code, 0);
+    b.checkLocal(0x80001000, 0x3000, 0x1000);
+    expect(b.memory.bytes.containsKey(0x1000), isFalse);
+    expect(
+      await b.readReg(HarborPcieDma.registerStaleCompletions),
+      greaterThanOrEqualTo(8),
+    );
+    await b.finish();
   });
 
   for (final (config, caps) in [
@@ -664,7 +1083,7 @@ void main() {
     await b.finish();
   });
 
-  test('bad alignment and host to device give code 5, halt, reset', () async {
+  test('bad alignment gives code 5, halt, reset', () async {
     final b = await _Bench.create(const _Config(width: 128, dataWidth: 128));
     await b.start();
     await b.setupRing(_cplBase, 4);
@@ -673,7 +1092,7 @@ void main() {
       (0x80000002, 0x0, 8, true),
       (0x80000000, 0x1, 8, true),
       (0x80000000, 0x0, 6, true),
-      (0x80000000, 0x0, 8, false),
+      (0x80000000, 0x2, 8, false),
       // Local ranges that do not fit in 20 address bits.
       (0x80000000, 0xffff0, 0x20, true),
       (0x80000000, 1 << 32, 8, true),
@@ -998,6 +1417,49 @@ void main() {
       await _causeAfterLastBeat(width);
     });
   }
+  group('build', () {
+    test('definition names differ per parameter set', () {
+      final names = {
+        _dma().definitionName,
+        _dma(width: 128).definitionName,
+        _dma(queueDepth: 16).definitionName,
+        _dma(readTags: 4).definitionName,
+        _dma(irqLines: 3).definitionName,
+        _dma(timeoutCycles: 100).definitionName,
+        _dma(infoWords: const [1]).definitionName,
+        _dma(infoWords: const [2]).definitionName,
+        _dma(maxReadRequestBytes: 1024).definitionName,
+      };
+      expect(names, hasLength(9));
+    });
+
+    test('bad parameters are refused', () {
+      expect(() => _dma(ringSource: true), throwsArgumentError);
+      expect(() => _dma(fifoSource: false), throwsArgumentError);
+      expect(() => _dma(queueDepth: 48), throwsArgumentError);
+      expect(() => _dma(readTags: 0), throwsRangeError);
+      expect(() => _dma(readTags: 16), throwsRangeError);
+      expect(() => _dma(maxReadRequestBytes: 64), throwsArgumentError);
+      expect(() => _dma(maxReadRequestBytes: 768), throwsArgumentError);
+      expect(() => _dma(irqLines: 8), throwsRangeError);
+      expect(
+        () => _dma(
+          infoWords: List<int>.filled(HarborPcieDma.infoMaxWords + 1, 0),
+        ),
+        throwsRangeError,
+      );
+    });
+
+    test('an empty info list emits no info logic', () async {
+      final empty = _dma();
+      await empty.build();
+      expect(empty.generateSynth(), isNot(contains('info_word')));
+      Simulator.reset();
+      final full = _dma(infoWords: const [0x12345678]);
+      await full.build();
+      expect(full.generateSynth(), contains('info_word'));
+    });
+  });
 }
 
 /// Runs a D2H descriptor with the router between the engine and the
@@ -1161,4 +1623,87 @@ Future<void> _causeAfterLastBeat(int width) async {
   }
   expect(samples.length, greaterThan(recordEnd + 1));
   await Simulator.endSimulation();
+}
+
+/// Runs [count] random descriptors in both directions and compares both
+/// memories with a model at the end.
+Future<void> _randomMix(_Config config, int count) async {
+  final b = await _Bench.create(config, seed: count + config.width);
+  final random = Random(count * 31 + config.width);
+  const hostBase = 0x80000000;
+  const hostHigh = 0x240000000;
+  const hostSpan = 0x10000;
+  const localSpan = 0x40000;
+  b.seedHost(hostBase, hostSpan);
+  b.seedHost(hostHigh, hostSpan);
+  final modelHost = <int, int>{};
+  final modelLocal = <int, int>{};
+  int hostByte(int a) => modelHost[a] ?? b.host.memory.read(a, 1)[0];
+  int localByte(int a) => modelLocal[a] ?? _fill(a);
+
+  final jobs = <(int, int, int, bool)>[];
+  for (var i = 0; i < count; i++) {
+    final roll = random.nextInt(10);
+    final len = roll == 0 ? 4 * random.nextInt(1025) : 4 * random.nextInt(97);
+    final h =
+        (random.nextBool() ? hostBase : hostHigh) +
+        4 * random.nextInt((hostSpan - len) ~/ 4 + 1);
+    final l = 4 * random.nextInt((localSpan - len) ~/ 4 + 1);
+    final d2h = random.nextBool();
+    jobs.add((h, l, len, d2h));
+    for (var k = 0; k < len; k++) {
+      if (d2h) {
+        modelHost[h + k] = localByte(l + k);
+      } else {
+        modelLocal[l + k] = hostByte(h + k);
+      }
+    }
+  }
+
+  var records = 0;
+  b.sink.onTlp = (t) {
+    if (t.kind.hasData &&
+        t.address >= _cplBase &&
+        t.address < _cplBase + 16 * 1024) {
+      records++;
+    }
+    b.host.receive(t);
+  };
+  await b.start();
+  await b.setupRing(_cplBase, 10);
+  await b.enable();
+  for (final (i, (h, l, len, d2h)) in jobs.indexed) {
+    while (i - records >= config.queueDepth - 4) {
+      await b.cycles(20);
+    }
+    await b.push(
+      hostAddress: h,
+      localAddress: l,
+      length: len,
+      deviceToHost: d2h,
+      cookie: i,
+    );
+  }
+  await b.waitUntil(
+    () => records >= count,
+    timeout: 4000000,
+    what: 'all records',
+  );
+  expect(b.host.violations, isEmpty);
+  for (final (i, (h, l, len, _)) in jobs.indexed) {
+    final r = b.record(i);
+    expect(r.cookie, i);
+    expect(r.code, 0, reason: 'descriptor $i');
+    expect(r.bytes, len);
+    final host = b.host.memory.read(h, len);
+    for (var k = 0; k < len; k++) {
+      if (host[k] != hostByte(h + k)) {
+        fail('descriptor $i: host byte 0x${(h + k).toRadixString(16)}');
+      }
+      if (b.memory.byte(l + k) != localByte(l + k)) {
+        fail('descriptor $i: local byte 0x${(l + k).toRadixString(16)}');
+      }
+    }
+  }
+  await b.finish();
 }
