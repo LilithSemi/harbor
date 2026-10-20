@@ -374,9 +374,48 @@ class HarborRegisterFile extends BridgeModule {
     return mux(hit, data, ram).named('rfRead_$r');
   }
 
+  /// Number of block RAMs of `1 << blockBits` words that hold every entry.
+  /// A deep file puts contiguous entry ranges into different blocks.
+  int _depthBlocks(int blockBits) =>
+      (numEntries + (1 << blockBits) - 1) >> blockBits;
+
+  /// The word address of [a] in its depth block, zero extended to [width].
+  Logic _blockAddr(Logic a, int blockBits, int width) =>
+      (a.width > blockBits ? a.getRange(0, blockBits) : a).zeroExtend(width);
+
+  /// Write enable of depth block [d].
+  Logic _depthWrite(Logic wrEn, Logic wrAddr, int d, int blockBits) =>
+      addrWidth > blockBits
+      ? wrEn & wrAddr.getRange(blockBits, addrWidth).eq(d)
+      : wrEn;
+
+  /// Selects the word of the depth block that [rdAddr] reads. The select is
+  /// delayed by [readLatency] to match the RAM read.
+  Logic _depthSelect(
+    Logic clk,
+    int r,
+    Logic rdAddr,
+    List<Logic> words,
+    int blockBits,
+  ) {
+    if (words.length == 1) return words.first;
+    final block = _registerN(
+      clk,
+      rdAddr.getRange(blockBits, addrWidth),
+      readLatency,
+      'rfBramDepthQ_$r',
+    );
+    var word = words.first;
+    for (var d = 1; d < words.length; d++) {
+      word = mux(block.eq(d), words[d], word);
+    }
+    return word;
+  }
+
   /// iCE40 EBR-backed storage. One SB_RAM40_4K copy per read port (the EBR is
-  /// single-read-port), `ceil(dataWidth/16)` wide. Read clock is inverted so
-  /// the registered read completes mid-cycle. Single write port, single bank.
+  /// single-read-port), `ceil(dataWidth/16)` wide and one block deep per 256
+  /// entries (the default 256x16 mode). Read clock is inverted so the
+  /// registered read completes mid-cycle. Single write port, single bank.
   void _buildIce40Ebr(
     Logic clk,
     List<Logic> rdAddrs,
@@ -387,44 +426,59 @@ class HarborRegisterFile extends BridgeModule {
   ) {
     const ebrWidth = 16;
     const ebrAddrBits = 11;
+    // Mode 0 (256x16) uses RADDR[7:0] and WADDR[7:0].
+    const blockBits = 8;
     final widthEbrs = (dataWidth + ebrWidth - 1) ~/ ebrWidth;
+    final depthEbrs = _depthBlocks(blockBits);
 
-    final wrAddrExt = wrAddr.zeroExtend(ebrAddrBits);
+    final wrAddrExt = _blockAddr(wrAddr, blockBits, ebrAddrBits);
 
     for (var r = 0; r < rdAddrs.length; r++) {
-      final rdAddrExt = rdAddrs[r].zeroExtend(ebrAddrBits);
-      final slices = <Logic>[];
+      final rdAddrExt = _blockAddr(rdAddrs[r], blockBits, ebrAddrBits);
+      final words = <Logic>[];
 
-      for (var w = 0; w < widthEbrs; w++) {
-        final lo = w * ebrWidth;
-        final hi = (lo + ebrWidth) > dataWidth ? dataWidth : lo + ebrWidth;
-        final sliceWidth = hi - lo;
+      for (var d = 0; d < depthEbrs; d++) {
+        final blockWrite = _depthWrite(wrEn, wrAddr, d, blockBits);
+        final slices = <Logic>[];
 
-        // Negative-edge-read EBR: read completes mid-cycle so it appears
-        // combinational to the posedge pipeline, while staying in the clk
-        // domain (RCLK = clk, the falling edge is internal), phase-related,
-        // so the read of a posedge-launched address is timed correctly.
-        final ebr = Ice40SbRam40_4kNR(name: 'ebr_r${r}_w$w');
-        addSubModule(ebr);
+        for (var w = 0; w < widthEbrs; w++) {
+          final lo = w * ebrWidth;
+          final hi = (lo + ebrWidth) > dataWidth ? dataWidth : lo + ebrWidth;
+          final sliceWidth = hi - lo;
 
-        // Write port (posedge).
-        ebr.input('WCLK').srcConnection! <= clk;
-        ebr.input('WCLKE').srcConnection! <= Const(1);
-        ebr.input('WE').srcConnection! <= wrEn;
-        ebr.input('WADDR').srcConnection! <= wrAddrExt;
-        ebr.input('WDATA').srcConnection! <=
-            wrData.getRange(lo, hi).zeroExtend(ebrWidth);
-        // MASK is a no-write mask. 0 writes every bit.
-        ebr.input('MASK').srcConnection! <= Const(0, width: ebrWidth);
+          // Negative-edge-read EBR: read completes mid-cycle so it appears
+          // combinational to the posedge pipeline, while staying in the clk
+          // domain (RCLK = clk, the falling edge is internal), phase-related,
+          // so the read of a posedge-launched address is timed correctly.
+          final ebr = Ice40SbRam40_4kNR(
+            name: depthEbrs == 1 ? 'ebr_r${r}_w$w' : 'ebr_r${r}_d${d}_w$w',
+          );
+          addSubModule(ebr);
 
-        // Read port (negedge of clk, internal to the NR primitive, whose read
-        // clock port is RCLKN).
-        ebr.input('RCLKN').srcConnection! <= clk;
-        ebr.input('RCLKE').srcConnection! <= Const(1);
-        ebr.input('RE').srcConnection! <= Const(1);
-        ebr.input('RADDR').srcConnection! <= rdAddrExt;
+          // Write port (posedge).
+          ebr.input('WCLK').srcConnection! <= clk;
+          ebr.input('WCLKE').srcConnection! <= Const(1);
+          ebr.input('WE').srcConnection! <= blockWrite;
+          ebr.input('WADDR').srcConnection! <= wrAddrExt;
+          ebr.input('WDATA').srcConnection! <=
+              wrData.getRange(lo, hi).zeroExtend(ebrWidth);
+          // MASK is a no-write mask. 0 writes every bit.
+          ebr.input('MASK').srcConnection! <= Const(0, width: ebrWidth);
 
-        slices.add(ebr.output('RDATA').getRange(0, sliceWidth));
+          // Read port (negedge of clk, internal to the NR primitive, whose
+          // read clock port is RCLKN).
+          ebr.input('RCLKN').srcConnection! <= clk;
+          ebr.input('RCLKE').srcConnection! <= Const(1);
+          ebr.input('RE').srcConnection! <= Const(1);
+          ebr.input('RADDR').srcConnection! <= rdAddrExt;
+
+          slices.add(ebr.output('RDATA').getRange(0, sliceWidth));
+        }
+        words.add(
+          slices.length == 1
+              ? slices.first.zeroExtend(dataWidth)
+              : slices.rswizzle().getRange(0, dataWidth),
+        );
       }
 
       // The negedge read comes before the write edge, so it needs the bypass.
@@ -435,9 +489,7 @@ class HarborRegisterFile extends BridgeModule {
         wrAddr,
         wrData,
         rdAddrs[r],
-        slices.length == 1
-            ? slices.first.zeroExtend(dataWidth)
-            : slices.rswizzle().getRange(0, dataWidth),
+        _depthSelect(clk, r, rdAddrs[r], words, blockBits),
       );
 
       // x0 reads as zero (only when entry 0 is reserved).
@@ -456,8 +508,9 @@ class HarborRegisterFile extends BridgeModule {
   /// is the shared write port and port B is that port's read, both on the
   /// posedge of clk. The read is registered ([readLatency] == 1), which keeps it
   /// off the combinational ALU path. The consumer aligns its read handshake to
-  /// the extra cycle. The blocks use x9 mode, `ceil(dataWidth/9)` per read
-  /// port. Single write port, single bank.
+  /// the extra cycle. The blocks use x9 mode, `ceil(dataWidth/9)` wide and one
+  /// block deep per 2048 entries for each read port. Single write port, single
+  /// bank.
   void _buildEcp5Ebr(
     Logic clk,
     List<Logic> rdAddrs,
@@ -468,46 +521,60 @@ class HarborRegisterFile extends BridgeModule {
   ) {
     const ebrWidth = 9;
     const ebrAddrBits = 14;
+    const blockBits = ebrAddrBits - 3;
     final widthEbrs = (dataWidth + ebrWidth - 1) ~/ ebrWidth;
+    final depthEbrs = _depthBlocks(blockBits);
     // x9 addressing: the word index sits in AD[13:3], low 3 bits tied zero.
     // An x18 write needs its byte enables in AD[1:0]. x9 is the mode that
     // silicon tests showed to work, so it stays.
     Logic toAd(Logic a) =>
-        [a.zeroExtend(ebrAddrBits - 3), Const(0, width: 3)].swizzle();
+        [_blockAddr(a, blockBits, blockBits), Const(0, width: 3)].swizzle();
     final wrAd = toAd(wrAddr);
 
     for (var r = 0; r < rdAddrs.length; r++) {
       final rdAd = toAd(rdAddrs[r]);
-      final slices = <Logic>[];
+      final words = <Logic>[];
 
-      for (var w = 0; w < widthEbrs; w++) {
-        final lo = w * ebrWidth;
-        final hi = (lo + ebrWidth) > dataWidth ? dataWidth : lo + ebrWidth;
-        final sliceWidth = hi - lo;
+      for (var d = 0; d < depthEbrs; d++) {
+        final blockWrite = _depthWrite(wrEn, wrAddr, d, blockBits);
+        final slices = <Logic>[];
 
-        // Separate write and read ports, so a write does not take the read
-        // port away. The same-entry case is the bypass below.
-        final bram = Ecp5Dp16kd(
-          name: 'rf_ebr_r${r}_w$w',
-          dataWidthA: ebrWidth,
-          dataWidthB: ebrWidth,
-          clkA: clk,
-          ceA: Const(1),
-          weA: wrEn,
-          oceA: Const(0),
-          rstA: Const(0),
-          adA: wrAd,
-          diA: wrData.getRange(lo, hi).zeroExtend(ebrWidth),
-          clkB: clk,
-          ceB: Const(1),
-          weB: Const(0),
-          oceB: Const(0),
-          rstB: Const(0),
-          adB: rdAd,
-          diB: Const(0, width: ebrWidth),
+        for (var w = 0; w < widthEbrs; w++) {
+          final lo = w * ebrWidth;
+          final hi = (lo + ebrWidth) > dataWidth ? dataWidth : lo + ebrWidth;
+          final sliceWidth = hi - lo;
+
+          // Separate write and read ports, so a write does not take the read
+          // port away. The same-entry case is the bypass below.
+          final bram = Ecp5Dp16kd(
+            name: depthEbrs == 1
+                ? 'rf_ebr_r${r}_w$w'
+                : 'rf_ebr_r${r}_d${d}_w$w',
+            dataWidthA: ebrWidth,
+            dataWidthB: ebrWidth,
+            clkA: clk,
+            ceA: Const(1),
+            weA: blockWrite,
+            oceA: Const(0),
+            rstA: Const(0),
+            adA: wrAd,
+            diA: wrData.getRange(lo, hi).zeroExtend(ebrWidth),
+            clkB: clk,
+            ceB: Const(1),
+            weB: Const(0),
+            oceB: Const(0),
+            rstB: Const(0),
+            adB: rdAd,
+            diB: Const(0, width: ebrWidth),
+          );
+
+          slices.add(bram.doB.getRange(0, sliceWidth));
+        }
+        words.add(
+          slices.length == 1
+              ? slices.first.zeroExtend(dataWidth)
+              : slices.rswizzle().getRange(0, dataWidth),
         );
-
-        slices.add(bram.doB.getRange(0, sliceWidth));
       }
 
       // Lattice does not define the read data when the other port writes the
@@ -519,9 +586,7 @@ class HarborRegisterFile extends BridgeModule {
         wrAddr,
         wrData,
         rdAddrs[r],
-        slices.length == 1
-            ? slices.first.zeroExtend(dataWidth)
-            : slices.rswizzle().getRange(0, dataWidth),
+        _depthSelect(clk, r, rdAddrs[r], words, blockBits),
       );
 
       // x0 reads as zero (only when entry 0 is reserved). The BRAM read is
@@ -561,13 +626,12 @@ class HarborRegisterFile extends BridgeModule {
   ) {
     const blockDataWidth = 32;
     final widthBlocks = (dataWidth + blockDataWidth - 1) ~/ blockDataWidth;
-    // Each x36 block holds 1024 words. Deeper files stripe contiguous ranges
-    // across blocks; select the read block with the same latency as its data.
-    final depthBlocks = (numEntries + 1023) ~/ 1024;
-    Logic depthOf(Logic a) => a.getRange(10, addrWidth);
+    // Each x36 block holds 1024 words.
+    const blockBits = 10;
+    final depthBlocks = _depthBlocks(blockBits);
     Logic toAd(Logic a) => [
       Const(0, width: 1),
-      a.width > 10 ? a.getRange(0, 10) : a.zeroExtend(10),
+      _blockAddr(a, blockBits, blockBits),
       Const(0, width: 5),
     ].swizzle().getRange(0, 16);
     final wrAd = toAd(wrAddr);
@@ -576,9 +640,7 @@ class HarborRegisterFile extends BridgeModule {
       final rdAd = toAd(rdAddrs[r]);
       final depthWords = <Logic>[];
       for (var d = 0; d < depthBlocks; d++) {
-        final blockWrite = depthBlocks == 1
-            ? wrEn
-            : wrEn & depthOf(wrAddr).eq(d);
+        final blockWrite = _depthWrite(wrEn, wrAddr, d, blockBits);
         final slices = <Logic>[];
 
         for (var w = 0; w < widthBlocks; w++) {
@@ -621,31 +683,12 @@ class HarborRegisterFile extends BridgeModule {
             : slices.rswizzle().getRange(0, dataWidth);
         depthWords.add(word);
       }
-      var rawBram = depthWords.first;
-      if (depthBlocks > 1) {
-        final depthQ = _registerN(
-          clk,
-          depthOf(rdAddrs[r]),
-          readLatency,
-          'rfBramDepthQ_$r',
-        );
-        for (var d = 1; d < depthBlocks; d++) {
-          rawBram = mux(depthQ.eq(d), depthWords[d], rawBram);
-        }
-      }
+      final rawBram = _depthSelect(clk, r, rdAddrs[r], depthWords, blockBits);
 
       // A same-cycle write and read of one entry is a RAMB36E1 port
       // collision, and port B then returns X (UG473). The bypass supplies the
       // new data.
-      final raw = _rdwBypass(
-        clk,
-        r,
-        wrEn,
-        wrAddr,
-        wrData,
-        rdAddrs[r],
-        rawBram,
-      );
+      final raw = _rdwBypass(clk, r, wrEn, wrAddr, wrData, rdAddrs[r], rawBram);
 
       // x0 reads as zero (only when entry 0 is reserved), delayed to match the
       // registered read latency.
