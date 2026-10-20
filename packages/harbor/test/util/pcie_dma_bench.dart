@@ -28,6 +28,8 @@ class DmaConfig {
   final List<int> infoWords;
   final int timeoutCycles;
   final int maxReadRequestBytes;
+  final bool fifoSource;
+  final bool ringSource;
 
   const DmaConfig({
     this.width = 64,
@@ -39,6 +41,8 @@ class DmaConfig {
     this.infoWords = const [],
     this.timeoutCycles = 6250000,
     this.maxReadRequestBytes = 512,
+    this.fifoSource = true,
+    this.ringSource = false,
   });
 
   @override
@@ -89,6 +93,8 @@ class DmaBench {
   final PcieHostModel host;
   int _tag = 0;
   int cplBase = dmaCplBase;
+  int descBase = 0;
+  int descLog2 = 0;
   Future<void> _sendLock = Future.value();
 
   /// Completions wait while this is set.
@@ -155,6 +161,8 @@ class DmaBench {
       infoWords: config.infoWords,
       timeoutCycles: config.timeoutCycles,
       maxReadRequestBytes: config.maxReadRequestBytes,
+      fifoSource: config.fifoSource,
+      ringSource: config.ringSource,
     );
     final top = MasterTop(
       dut,
@@ -338,6 +346,51 @@ class DmaBench {
   }
 
   Future<int> readReg(int offset) async => (await readRegs(offset, 1)).first;
+
+  Future<void> setupDescRing(int base, int log2) async {
+    descBase = base;
+    descLog2 = log2;
+    await writeReg(HarborPcieDma.registerDescBaseLow, base & 0xffffffff);
+    await writeReg(HarborPcieDma.registerDescBaseHigh, base >> 32);
+    await writeReg(HarborPcieDma.registerDescSize, log2);
+  }
+
+  /// Writes a descriptor to slot [slot] of the host descriptor ring.
+  void writeDesc(
+    int slot, {
+    required int hostAddress,
+    required int localAddress,
+    required int length,
+    bool deviceToHost = true,
+    bool irq = false,
+    int cookie = 0,
+  }) {
+    host.memory.write(descBase + 32 * slot, [
+      ...leBytes(hostAddress, 8),
+      ...leBytes(localAddress, 8),
+      ...leBytes(length),
+      ...leBytes(
+        (deviceToHost ? HarborPcieDma.flagDeviceToHost : 0) |
+            (irq ? HarborPcieDma.flagIrq : 0),
+      ),
+      ...leBytes(cookie),
+      ...leBytes(0),
+    ]);
+  }
+
+  Future<void> doorbell(int tail) =>
+      writeReg(HarborPcieDma.registerDescTail, tail);
+
+  bool isFetch(PcieTlp t) =>
+      (t.kind == PcieTlpKind.memRead32 || t.kind == PcieTlpKind.memRead64) &&
+      t.address >= descBase &&
+      t.address < descBase + (32 << descLog2);
+
+  /// Descriptor reads the engine sent.
+  List<PcieTlp> get fetches => [
+    for (final t in sink.received)
+      if (isFetch(t)) t,
+  ];
 
   Future<void> setupRing(int base, int log2) async {
     cplBase = base;

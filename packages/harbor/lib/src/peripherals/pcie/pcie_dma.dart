@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
@@ -24,9 +26,16 @@ import 'pcie_stream.dart';
 /// for it, the done cause rises after the last record beat leaves the TX
 /// port.
 ///
+/// The queue gets descriptors from the BAR0 push registers, from a
+/// descriptor ring in host memory, or from both with a select bit in
+/// CONTROL. The ring fetcher reads up to 4 descriptors in one memory read
+/// with its own tag. The ring head moves when a descriptor goes into the
+/// queue. A fetch error, or a tail outside the ring, gets a record with
+/// cookie 0 after the queue is empty.
+///
 /// A descriptor with an error gets a record with the error code, and then
-/// the engine halts. An engine reset clears the halt and the queue. When the
-/// completion ring is full, the engine waits.
+/// the engine halts. An engine reset clears the halt, the queue and the ring
+/// head and tail. When the completion ring is full, the engine waits.
 ///
 /// BAR0 is 1 DW registers. A write of more than 1 DW writes the DWs in
 /// order. A read of up to [maxReadDw] DWs gets one completion with data,
@@ -52,6 +61,8 @@ class HarborPcieDma extends BridgeModule {
   static const registerCplSize = 0x028;
   static const registerCplHead = 0x02c;
   static const registerCplTail = 0x030;
+
+  /// Bits 4:0 of the ring base are always 0.
   static const registerDescBaseLow = 0x040;
   static const registerDescBaseHigh = 0x044;
   static const registerDescSize = 0x048;
@@ -64,6 +75,9 @@ class HarborPcieDma extends BridgeModule {
 
   static const controlEnable = 1 << 0;
   static const controlEngineReset = 1 << 1;
+
+  /// Selects the ring when both sources are built. A change waits until
+  /// the engine is idle.
   static const controlRingSource = 1 << 2;
 
   static const statusBusy = 1 << 0;
@@ -249,10 +263,7 @@ class HarborPcieDma extends BridgeModule {
     if (tx.width != width) {
       throw ArgumentError('tx width ${tx.width} differs from rx width $width');
     }
-    if (ringSource) {
-      throw ArgumentError.value(ringSource, 'ringSource', 'is not built yet');
-    }
-    if (!fifoSource) {
+    if (!fifoSource && !ringSource) {
       throw ArgumentError('no descriptor source is built');
     }
     if (![32, 64, 128].contains(dataWidth)) {
@@ -376,8 +387,50 @@ class HarborPcieDma extends BridgeModule {
     final cplTail = Logic(name: 'cpl_tail', width: 16);
     final phase = Logic(name: 'phase');
     final stage = [
-      for (var i = 0; i < 7; i++) Logic(name: 'push_$i', width: 32),
+      if (fifoSource)
+        for (var i = 0; i < 7; i++) Logic(name: 'push_$i', width: 32),
     ];
+
+    // Source select, used only when both sources are built. A new select
+    // waits until the engine, the queue and the fetcher are idle.
+    final both = fifoSource && ringSource;
+    final selReq = Logic(name: 'sel_req');
+    final selActive = Logic(name: 'sel_active');
+    final Logic ringActive = ringSource
+        ? (fifoSource ? selActive : Const(1))
+        : Const(0);
+    final Logic fifoActive = fifoSource ? ~ringActive : Const(0);
+    final selPending = both
+        ? (~selReq.eq(selActive)).named('sel_pending')
+        : Const(0);
+
+    // Descriptor ring and its fetcher.
+    final descBase = Logic(name: 'desc_base', width: 64);
+    final descLog = Logic(name: 'desc_log2', width: 4);
+    final descTail = Logic(name: 'desc_tail', width: 16);
+    final descHead = Logic(name: 'desc_head', width: 16);
+    const fIdle = 0;
+    const fSend = 1;
+    const fWait = 2;
+    final fState = Logic(name: 'f_state', width: 2);
+    final fAddr = Logic(name: 'f_addr', width: 64);
+    final fCount = Logic(name: 'f_count', width: 3);
+    final fTag = Logic(name: 'f_tag', width: 8);
+    final fT = Logic(name: 'f_t', width: 3);
+    final fGot = Logic(name: 'f_got', width: 6);
+    final fPushed = Logic(name: 'f_pushed', width: 3);
+    final fErr = Logic(name: 'f_err', width: 8);
+    final fInPkt = Logic(name: 'f_in_pkt');
+    final fLeft = Logic(name: 'f_left', width: 11);
+    final fTimer = Logic(
+      name: 'f_timer',
+      width: max(1, timeoutCycles.bitLength),
+    );
+    final fBuf = [
+      if (ringSource)
+        for (var j = 0; j < 32; j++) Logic(name: 'f_buf_$j', width: 32),
+    ];
+    final fBusy = ringSource ? (~fState.eq(fIdle)).named('f_busy') : Const(0);
 
     // Descriptor queue.
     final qHead = Logic(name: 'q_head', width: qBits);
@@ -532,6 +585,7 @@ class HarborPcieDma extends BridgeModule {
       issueLocal: lAddr,
       issueHostLow: hAddr.slice(6, 0),
       drainDone: drainDone,
+      reservedBusy: fBusy,
       rdSlot: dSlot,
       rdIndex: rdIndex,
       dataWidth: dataWidth,
@@ -539,6 +593,7 @@ class HarborPcieDma extends BridgeModule {
       readTags: readTags,
       maxReadRequestBytes: maxReadRequestBytes,
       timeoutCycles: timeoutCycles,
+      reservedTags: ringSource ? 1 : 0,
     );
     final wDo = afterHdr & wMode & rxs.valid & ~wLeft.eq(0);
     final laneDw = [
@@ -606,7 +661,10 @@ class HarborPcieDma extends BridgeModule {
       Case(rAddr, [
         reg(registerId, Const(identifier, width: 32)),
         reg(registerCaps, Const(caps, width: 32)),
-        reg(registerControl, [Const(0, width: 2), enable].swizzle()),
+        reg(
+          registerControl,
+          [both ? selReq : Const(0), Const(0), enable].swizzle(),
+        ),
         reg(registerStatus, status),
         reg(registerIrqCause, cause),
         reg(registerIrqMask, mask),
@@ -616,26 +674,54 @@ class HarborPcieDma extends BridgeModule {
         reg(registerCplSize, cplLog),
         reg(registerCplHead, cplHead),
         reg(registerCplTail, cplTail),
-        for (var i = 0; i < 7; i++) reg(registerPush + 4 * i, stage[i]),
+        if (ringSource) ...[
+          reg(registerDescBaseLow, descBase.slice(31, 0)),
+          reg(registerDescBaseHigh, descBase.slice(63, 32)),
+          reg(registerDescSize, descLog),
+          reg(registerDescTail, descTail),
+          reg(registerDescHead, descHead),
+        ],
+        for (var i = 0; i < stage.length; i++)
+          reg(registerPush + 4 * i, stage[i]),
       ]),
       if (infoWord != null)
         If(rAddr.gte(infoFirstWord), then: [regValue < infoWord]),
     ]);
 
-    // Queue storage.
-    final local64 = [stage[3], stage[2]].swizzle();
-    final localHigh = aw == 64 ? Const(0) : local64.slice(63, aw).or();
-    final pushData = [
-      localHigh,
-      stage[6],
-      stage[5].slice(1, 0),
-      stage[4],
-      local64.slice(aw - 1, 0),
-      stage[1],
-      stage[0],
-    ].swizzle();
-    final commit = writes(registerPushCommit ~/ 4);
-    final push = (commit & ~qFull).named('q_push');
+    // Queue storage. An entry is DWs 0 to 6 of a descriptor.
+    Logic pack(List<Logic> d) {
+      final local64 = [d[3], d[2]].swizzle();
+      final localHigh = aw == 64 ? Const(0) : local64.slice(63, aw).or();
+      return [
+        localHigh,
+        d[6],
+        d[5].slice(1, 0),
+        d[4],
+        local64.slice(aw - 1, 0),
+        d[1],
+        d[0],
+      ].swizzle();
+    }
+
+    final commit = fifoSource ? writes(registerPushCommit ~/ 4) : Const(0);
+    final fifoPush = (commit & fifoActive & ~qFull).named('fifo_push');
+    final fPush = Logic(name: 'f_push');
+    final push = (fifoPush | fPush).named('q_push');
+    Logic? fifoData = fifoSource ? pack(stage) : null;
+    Logic? fetchData;
+    if (ringSource) {
+      for (var k = 3; k >= 0; k--) {
+        final d = pack(fBuf.sublist(8 * k, 8 * k + 7));
+        fetchData = fetchData == null
+            ? d
+            : harborBitMux(fPushed.eq(k), d, fetchData);
+      }
+    }
+    final pushData = fifoData == null
+        ? fetchData!
+        : fetchData == null
+        ? fifoData
+        : harborBitMux(fPush, fetchData, fifoData);
     final ram = HarborBram(
       clk,
       width: pushData.width,
@@ -833,18 +919,70 @@ class HarborPcieDma extends BridgeModule {
     final cLast = (cT + n).gte(cTotal);
     final cValid = cState.eq(cSend);
 
-    // The TX port keeps a source until its last beat.
+    // Fetch TX: a memory read of f_count descriptors.
+    final fIs4 = fAddr.slice(63, 32).or();
+    final fAddrLow = [fAddr.slice(31, 2), Const(0, width: 2)].swizzle();
+    final fHdr = [
+      [
+        mux(fIs4, Const(0x20, width: 8), Const(0x00, width: 8)),
+        Const(0, width: 14),
+        [fCount, Const(0, width: 3)].swizzle().zeroExtend(10),
+      ].swizzle(),
+      [completerId, fTag, Const(0xff, width: 8)].swizzle(),
+      mux(fIs4, fAddr.slice(63, 32), fAddrLow),
+      fAddrLow,
+    ];
+    final fTotal = mux(fIs4, Const(4, width: 3), Const(3, width: 3));
+    final fLanes = <Logic>[];
+    final fKeep = <Logic>[];
+    for (var i = 0; i < n; i++) {
+      final t = fT + i;
+      Logic value = Const(0, width: 32);
+      for (var h = 3; h >= 0; h--) {
+        if (h % n != i) continue;
+        value = mux(t.eq(h), fHdr[h], value);
+      }
+      final live = t.lt(fTotal);
+      fLanes.add(mux(live, value, Const(0, width: 32)));
+      fKeep.add(live.replicate(4));
+    }
+    final fLast = (fT + n).gte(fTotal);
+    final fValid = ringSource ? fState.eq(fSend) : Const(0);
+
+    // The TX port keeps a source until its last beat. Owner 0 is the
+    // engine, 1 the BAR0 completion, 2 the fetcher.
     final txLock = Logic(name: 'tx_lock');
-    final txOwnerCpl = Logic(name: 'tx_owner_cpl');
-    final pickCpl = mux(txLock, txOwnerCpl, cValid).named('pick_cpl');
-    txs.valid <= mux(pickCpl, cValid, eValid);
-    txs.data <= harborBitMux(pickCpl, cLanes.rswizzle(), eLanes.rswizzle());
-    txs.keep <= mux(pickCpl, cKeep.rswizzle(), eKeep.rswizzle());
-    txs.last <= mux(pickCpl, cLast, eLast);
+    final txOwner = Logic(name: 'tx_owner', width: 2);
+    final pick = mux(
+      txLock,
+      txOwner,
+      mux(
+        cValid,
+        Const(1, width: 2),
+        mux(fValid, Const(2, width: 2), Const(0, width: 2)),
+      ),
+    ).named('tx_pick');
+    final pickCpl = pick.eq(1);
+    final pickFetch = pick.eq(2);
+    txs.valid <= mux(pickCpl, cValid, mux(pickFetch, fValid, eValid));
+    txs.data <=
+        harborBitMux(
+          pickCpl,
+          cLanes.rswizzle(),
+          harborBitMux(pickFetch, fLanes.rswizzle(), eLanes.rswizzle()),
+        );
+    txs.keep <=
+        mux(
+          pickCpl,
+          cKeep.rswizzle(),
+          mux(pickFetch, fKeep.rswizzle(), eKeep.rswizzle()),
+        );
+    txs.last <= mux(pickCpl, cLast, mux(pickFetch, fLast, eLast));
     txs.user <= Const(0, width: HarborPcieStream.userWidth);
     final txFire = txs.valid & txs.ready;
-    final eFire = txFire & ~pickCpl;
+    final eFire = txFire & pick.eq(0);
     final cFire = txFire & pickCpl;
+    final fFire = txFire & pickFetch;
     final recDone = (inState(sRecTx) & eFire & eLast).named('rec_done');
 
     // Host to device control.
@@ -860,8 +998,10 @@ class HarborPcieDma extends BridgeModule {
             ~left.eq(0) &
             tags.issueReady &
             busMasterEnable;
+    // A fetch read that is on the TX port finishes first.
     engReset <=
         resetReq &
+            ~fValid &
             (inState(sIdle) |
                 inState(sTxWait) |
                 inState(sRecWait) |
@@ -875,6 +1015,152 @@ class HarborPcieDma extends BridgeModule {
             beatsLeft.eq(0) &
             code.eq(0);
     final headLane = laneOf(tags.headLocal);
+
+    // Fetch size: the smallest of descriptors ready, 4, slots to the ring
+    // end, slots to the 4 KB page end and free queue entries.
+    final descMask = ((Const(1, width: 17) << descLog) - 1).slice(15, 0);
+    final fetchAddr = (descBase + (descHead.zeroExtend(64) << 5)).named(
+      'fetch_addr',
+    );
+    Logic cap4(Logic v) {
+      final w = v.width < 3 ? v.zeroExtend(3) : v;
+      return mux(w.gte(4), Const(4, width: 3), w.slice(2, 0));
+    }
+
+    final fN = _min(
+      _min(
+        cap4((descTail - descHead) & descMask),
+        cap4(descMask.zeroExtend(17) - descHead.zeroExtend(17) + 1),
+      ),
+      _min(
+        cap4(Const(128, width: 8) - fetchAddr.slice(11, 5).zeroExtend(8)),
+        cap4(Const(queueDepth, width: qBits + 1) - qCount),
+      ),
+    ).named('f_n');
+    final badTail = (descTail & ~descMask).or().named('bad_tail');
+    final fMay =
+        ringActive &
+        fState.eq(fIdle) &
+        enable &
+        ~halted &
+        ~resetReq &
+        fErr.eq(0) &
+        ~selPending;
+    final fStart = (fMay & ~badTail & busMasterEnable & ~fN.eq(0)).named(
+      'f_start',
+    );
+    final fBadTail = (fMay & badTail).named('f_bad_tail');
+
+    // Fetch completions. They come in address order, so DW k of the read
+    // goes to f_buf_k.
+    final fInWait = fState.eq(fWait) & fErr.eq(0);
+    final fRsv = (tags.reservedCpl & fInWait).named('f_cpl');
+    final fRem =
+        ([fCount, Const(0, width: 5)].swizzle().zeroExtend(13) -
+                (fGot.zeroExtend(13) << 2))
+            .named('f_rem');
+    final fBc = tlpByteCount(header);
+    final fBc13 = mux(fBc.eq(0), Const(4096, width: 13), fBc.zeroExtend(13));
+    final fLen13 = (hdrLen.zeroExtend(13) << 2).named('f_cpl_bytes');
+    final fExpLow = (fAddr.slice(6, 0) + (fGot.zeroExtend(7) << 2)).named(
+      'f_exp_low',
+    );
+    final fBad =
+        ~hasData |
+        fLen13.gt(fRem) |
+        ~fBc13.eq(fRem) |
+        ~tlpLowerAddress(header).eq(fExpLow);
+    final fCode = mux(
+      ~tlpCplStatus(header).eq(0),
+      Const(errorCompletion, width: 8),
+      mux(
+        tlpPoisoned(header),
+        Const(errorPoisoned, width: 8),
+        mux(fBad, Const(errorLength, width: 8), Const(0, width: 8)),
+      ),
+    ).named('f_code');
+    final fGood = (fRsv & fCode.eq(0)).named('f_good');
+    final fBeat = (fInPkt & rxFire & fInWait).named('f_beat');
+    final fCnt = mux(fLeft.lt(n), fLeft.slice(2, 0), Const(n, width: 3));
+    final fWant = [fCount, Const(0, width: 3)].swizzle();
+    final fExpired = (fInWait & fGot.lt(fWant) & fTimer.eq(timeoutCycles - 1))
+        .named('f_expired');
+    if (ringSource) {
+      fPush <=
+          fInWait &
+              fPushed.lt(fCount) &
+              fGot.gte([fPushed + 1, Const(0, width: 3)].swizzle());
+    } else {
+      fPush <= Const(0);
+    }
+    final fFill = <Conditional>[
+      for (var j = 0; j < fBuf.length; j++)
+        If.block([
+          Iff(fGood & fGot.eq(j), [
+            fBuf[j] < tlpSwapBytes(capture.firstPayloadDw),
+          ]),
+          for (var i = 0; i < n && i <= j; i++)
+            ElseIf(fBeat & fGot.eq(j - i) & fCnt.gt(i), [
+              fBuf[j] < tlpSwapBytes(laneDw[i]),
+            ]),
+        ]),
+    ];
+    final fetcher = <Conditional>[
+      ...fFill,
+      Case(fState, [
+        CaseItem(Const(fIdle, width: 2), [
+          If(fBadTail, then: [fErr < errorAlignment]),
+          If(
+            fStart,
+            then: [
+              fAddr < fetchAddr,
+              fCount < fN,
+              fTag < tags.reservedTag,
+              fT < 0,
+              fGot < 0,
+              fPushed < 0,
+              fTimer < 0,
+              fInPkt < 0,
+              fState < fSend,
+            ],
+          ),
+        ]),
+        CaseItem(Const(fSend, width: 2), [
+          If(
+            fFire,
+            then: [
+              If(fLast, then: [fState < fWait], orElse: [fT < fT + n]),
+            ],
+          ),
+        ]),
+        CaseItem(Const(fWait, width: 2), [
+          If(fInWait & fGot.lt(fWant), then: [fTimer < fTimer + 1]),
+          If(fExpired, then: [fErr < errorTimeout]),
+          If.block([
+            Iff(fRsv & ~fCode.eq(0), [fErr < fCode, fInPkt < 0]),
+            ElseIf(fGood, [
+              fGot < fGot + 1,
+              fInPkt < ~rxs.last,
+              fLeft < hdrLen - 1,
+            ]),
+            ElseIf(fBeat, [
+              fGot < fGot + fCnt.zeroExtend(6),
+              fLeft < fLeft - fCnt.zeroExtend(11),
+              If(rxs.last, then: [fInPkt < 0]),
+            ]),
+          ]),
+          If(
+            fPush,
+            then: [
+              fPushed < fPushed + 1,
+              descHead < ((descHead + 1) & descMask),
+            ],
+          ),
+          // The last push was in an earlier cycle.
+          If(fInWait & fPushed.eq(fCount), then: [fState < fIdle]),
+        ]),
+      ]),
+    ];
 
     // Interrupt causes.
     final doneSet = recDone & code.eq(0) & dFlags[1];
@@ -960,6 +1246,13 @@ class HarborPcieDma extends BridgeModule {
       resetReq < 0,
       iBusy < 0,
       dState < dIdle,
+      if (ringSource) ...[
+        fState < fIdle,
+        fErr < 0,
+        fInPkt < 0,
+        descHead < 0,
+        descTail < 0,
+      ],
     ];
     final pktBytes = (pktDw.zeroExtend(32) << 2).named('pkt_bytes');
 
@@ -978,7 +1271,11 @@ class HarborPcieDma extends BridgeModule {
           wMode < 0,
           cState < cIdle,
           txLock < 0,
-          txOwnerCpl < 0,
+          txOwner < 0,
+          selReq < 0,
+          selActive < 0,
+          descBase < 0,
+          descLog < 0,
           code < 0,
           dFlags < 0,
           pktRead < 0,
@@ -992,6 +1289,7 @@ class HarborPcieDma extends BridgeModule {
             then: [
               enable < wData[0],
               If(wData[1], then: [resetReq < 1]),
+              if (both) selReq < wData[2],
             ],
           ),
           cause < causeNext & Const(causeBits, width: causeWidth),
@@ -1022,15 +1320,54 @@ class HarborPcieDma extends BridgeModule {
           ),
           If(writes(registerCplSize ~/ 4), then: [cplLog < merge(cplLog)]),
           If(writes(registerCplHead ~/ 4), then: [cplHead < merge(cplHead)]),
-          for (var i = 0; i < 7; i++)
+          for (var i = 0; i < stage.length; i++)
             If(
               writes(registerPush ~/ 4 + i),
               then: [stage[i] < merge(stage[i])],
             ),
+          if (ringSource) ...[
+            If(
+              writes(registerDescBaseLow ~/ 4),
+              then: [
+                descBase <
+                    [
+                      descBase.slice(63, 32),
+                      merge(descBase.slice(31, 0)).slice(31, 5),
+                      Const(0, width: 5),
+                    ].swizzle(),
+              ],
+            ),
+            If(
+              writes(registerDescBaseHigh ~/ 4),
+              then: [
+                descBase <
+                    [
+                      merge(descBase.slice(63, 32)),
+                      descBase.slice(31, 0),
+                    ].swizzle(),
+              ],
+            ),
+            If(writes(registerDescSize ~/ 4), then: [descLog < merge(descLog)]),
+            If(
+              writes(registerDescTail ~/ 4),
+              then: [descTail < merge(descTail)],
+            ),
+          ],
+          if (both)
+            If(
+              selPending &
+                  inState(sIdle) &
+                  qCount.eq(0) &
+                  fState.eq(fIdle) &
+                  fErr.eq(0),
+              then: [selActive < selReq],
+            ),
 
           // Queue.
           If(push, then: [qTail < qTail + 1]),
-          If(commit & qFull, then: [overflow < 1]),
+          // A commit is lost when the queue is full or the ring is the
+          // source.
+          If(commit & (qFull | ~fifoActive), then: [overflow < 1]),
           If(pop, then: [qHead < qHead + 1]),
           If.block([
             Iff(push & ~pop, [qCount < qCount + 1]),
@@ -1147,20 +1484,31 @@ class HarborPcieDma extends BridgeModule {
               If(
                 txs.last,
                 then: [txLock < 0],
-                orElse: [txLock < 1, txOwnerCpl < pickCpl],
+                orElse: [txLock < 1, txOwner < pick],
               ),
             ],
             orElse: [
-              If(txs.valid, then: [txLock < 1, txOwnerCpl < pickCpl]),
+              If(txs.valid, then: [txLock < 1, txOwner < pick]),
             ],
           ),
+
+          if (ringSource) ...fetcher,
 
           // Engine.
           Case(state, [
             CaseItem(Const(sIdle, width: 4), [
               If.block([
-                Iff(resetReq, engineReset()),
+                Iff(resetReq, [If(engReset, then: engineReset())]),
                 ElseIf(enable & ~halted & ~qCount.eq(0), [state < sLoad]),
+                // A fetch error gets a record after the queue is empty.
+                if (ringSource)
+                  ElseIf(enable & ~halted & ~fErr.eq(0), [
+                    dCookie < 0,
+                    dFlags < 0,
+                    done < 0,
+                    code < fErr,
+                    state < sRecWait,
+                  ]),
               ]),
             ]),
             CaseItem(Const(sLoad, width: 4), [
@@ -1241,7 +1589,7 @@ class HarborPcieDma extends BridgeModule {
             ]),
             CaseItem(Const(sTxWait, width: 4), [
               If.block([
-                Iff(resetReq, engineReset()),
+                Iff(resetReq, [If(engReset, then: engineReset())]),
                 ElseIf(busMasterEnable, [
                   txT < 0,
                   txBase < lane0.zeroExtend(idxW) - hdrDws.slice(idxW - 1, 0),
@@ -1381,7 +1729,7 @@ class HarborPcieDma extends BridgeModule {
             ]),
             CaseItem(Const(sRecWait, width: 4), [
               If.block([
-                Iff(resetReq, engineReset()),
+                Iff(resetReq, [If(engReset, then: engineReset())]),
                 ElseIf(recLoad, [
                   pktAddr < recAddr,
                   pktDw < 4,

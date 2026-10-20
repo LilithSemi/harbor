@@ -1059,13 +1059,15 @@ void main() {
         _dma(infoWords: const [1]).definitionName,
         _dma(infoWords: const [2]).definitionName,
         _dma(maxReadRequestBytes: 1024).definitionName,
+        _dma(ringSource: true).definitionName,
+        _dma(fifoSource: false, ringSource: true).definitionName,
       };
-      expect(names, hasLength(9));
+      expect(names, hasLength(11));
     });
 
     test('bad parameters are refused', () {
-      expect(() => _dma(ringSource: true), throwsArgumentError);
       expect(() => _dma(fifoSource: false), throwsArgumentError);
+      expect(() => _dma(readTags: 15, ringSource: true), returnsNormally);
       expect(() => _dma(queueDepth: 48), throwsArgumentError);
       expect(() => _dma(readTags: 0), throwsRangeError);
       expect(() => _dma(readTags: 16), throwsRangeError);

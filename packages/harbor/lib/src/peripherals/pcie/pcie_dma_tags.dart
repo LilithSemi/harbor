@@ -18,8 +18,11 @@ import 'pcie_stream.dart';
 /// new request, until base wraps.
 ///
 /// With [reservedTags] 1, slot [readTags] is reserved for another reader.
-/// It has no buffer. A completion for it gives `reserved_cpl` and nothing
-/// more.
+/// It has no buffer. The reader sends its request with `reserved_tag` and
+/// holds `reserved_busy` high until it has all completions. The tag value is
+/// kept while `reserved_busy` is high. A completion for it gives
+/// `reserved_cpl` and nothing more. A busy reserved slot is a read in flight
+/// for an abort.
 ///
 /// A completion for a tag that is not in flight is dropped and counted in
 /// `stale_count`. A completion for a tag in flight with an error gives
@@ -82,6 +85,7 @@ class HarborPcieDmaTags extends Module {
     required Logic issueLocal,
     required Logic issueHostLow,
     required Logic drainDone,
+    required Logic reservedBusy,
     required Logic rdSlot,
     required Logic rdIndex,
     required this.dataWidth,
@@ -125,6 +129,7 @@ class HarborPcieDmaTags extends Module {
     issueLocal = addInput('issue_local', issueLocal, width: addressWidth);
     issueHostLow = addInput('issue_host_low', issueHostLow, width: 7);
     drainDone = addInput('drain_done', drainDone);
+    reservedBusy = addInput('reserved_busy', reservedBusy);
     rdSlot = addInput('rd_slot', rdSlot, width: slotWidth);
     rdIndex = addInput('rd_index', rdIndex, width: indexWidth);
     _build(
@@ -143,6 +148,7 @@ class HarborPcieDmaTags extends Module {
       issueLocal,
       issueHostLow,
       drainDone,
+      reservedBusy,
       rdSlot,
       rdIndex,
     );
@@ -166,6 +172,7 @@ class HarborPcieDmaTags extends Module {
     Logic issueLocal,
     Logic issueHostLow,
     Logic drainDone,
+    Logic reservedBusy,
     Logic rdSlot,
     Logic rdIndex,
   ) {
@@ -234,9 +241,12 @@ class HarborPcieDmaTags extends Module {
     final hit = (inRange & sel.selectFrom(sBusy, defaultValue: Const(0))).named(
       'cpl_hit',
     );
+    final rsvTag = Logic(name: 'rsv_tag', width: 5);
     final rsvHit = reservedTags == 0
         ? Const(0)
-        : (low & rel.eq(readTags)).named('cpl_reserved');
+        : (low & reservedBusy & tag.slice(4, 0).eq(rsvTag)).named(
+            'cpl_reserved',
+          );
     final selLen = sel.selectFrom(sLen, defaultValue: Const(0, width: 13));
     final selRecv = sel.selectFrom(sRecv, defaultValue: Const(0, width: 13));
     final selHost = sel.selectFrom(sHost, defaultValue: Const(0, width: 7));
@@ -336,11 +346,13 @@ class HarborPcieDmaTags extends Module {
     final completes = (cplGood & bc13.eq(len13)).named('cpl_completes');
     final inFlight = [
       for (var i = 0; i < readTags; i++) sBusy[i] & ~sDone[i],
+      if (reservedTags > 0) reservedBusy,
     ].reduce((a, b) => a | b).named('in_flight');
     final staleCpl = (cplHeader & ~hit & ~rsvHit).named('stale_cpl');
     final more = cplGood & ~rxLast;
     Sequential(clk, [
       rot < rdLow,
+      If(~reservedBusy, then: [rsvTag < reservedTag.slice(4, 0)]),
       If(
         reset | abort,
         then: [
