@@ -85,6 +85,9 @@ class HarborPcieDma extends BridgeModule {
 
   /// A commit came while the queue was full. The descriptor is lost.
   static const statusOverflow = 1 << 2;
+
+  /// The ring is the active descriptor source.
+  static const statusRingSource = 1 << 3;
   static const statusErrorShift = 8;
   static const statusFreeShift = 16;
 
@@ -409,6 +412,7 @@ class HarborPcieDma extends BridgeModule {
     final descLog = Logic(name: 'desc_log2', width: 4);
     final descTail = Logic(name: 'desc_tail', width: 16);
     final descHead = Logic(name: 'desc_head', width: 16);
+    final descRung = Logic(name: 'desc_rung');
     const fIdle = 0;
     const fSend = 1;
     const fWait = 2;
@@ -629,7 +633,8 @@ class HarborPcieDma extends BridgeModule {
     final status = [
       (Const(queueDepth, width: qBits + 1) - qCount).zeroExtend(16),
       errCode,
-      Const(0, width: 5),
+      Const(0, width: 4),
+      ringActive,
       overflow,
       halted,
       // Busy means a descriptor is in the engine.
@@ -663,7 +668,7 @@ class HarborPcieDma extends BridgeModule {
         reg(registerCaps, Const(caps, width: 32)),
         reg(
           registerControl,
-          [both ? selReq : Const(0), Const(0), enable].swizzle(),
+          [both ? selReq : Const(0), resetReq, enable].swizzle(),
         ),
         reg(registerStatus, status),
         reg(registerIrqCause, cause),
@@ -883,7 +888,15 @@ class HarborPcieDma extends BridgeModule {
       eKeep.add(live.replicate(4));
     }
     final eLast = (txT + n).gte(eTotal);
-    final eValid = inState(sTx) | inState(sRecTx) | inH2d & iBusy;
+    // The TX port keeps a source until its last beat. Owner 0 is the
+    // engine, 1 the BAR0 completion, 2 the fetcher. A request shows no beat
+    // while bus master enable is 0, but a packet that holds the port ends.
+    final txLock = Logic(name: 'tx_lock');
+    final txOwner = Logic(name: 'tx_owner', width: 2);
+    Logic mayRequest(int owner) =>
+        busMasterEnable | txLock & txOwner.eq(Const(owner, width: 2));
+    final eValid =
+        (inState(sTx) | inState(sRecTx) | inH2d & iBusy) & mayRequest(0);
 
     // BAR0 completion TX.
     final cHdr = [
@@ -947,12 +960,8 @@ class HarborPcieDma extends BridgeModule {
       fKeep.add(live.replicate(4));
     }
     final fLast = (fT + n).gte(fTotal);
-    final fValid = ringSource ? fState.eq(fSend) : Const(0);
+    final fValid = ringSource ? fState.eq(fSend) & mayRequest(2) : Const(0);
 
-    // The TX port keeps a source until its last beat. Owner 0 is the
-    // engine, 1 the BAR0 completion, 2 the fetcher.
-    final txLock = Logic(name: 'tx_lock');
-    final txOwner = Logic(name: 'tx_owner', width: 2);
     final pick = mux(
       txLock,
       txOwner,
@@ -1049,7 +1058,10 @@ class HarborPcieDma extends BridgeModule {
     final fStart = (fMay & ~badTail & busMasterEnable & ~fN.eq(0)).named(
       'f_start',
     );
-    final fBadTail = (fMay & badTail).named('f_bad_tail');
+    // A ring of 1 slot can hold no descriptor.
+    final fBadTail = (fMay & (badTail | descRung & descLog.eq(0))).named(
+      'f_bad_tail',
+    );
 
     // Fetch completions. They come in address order, so DW k of the read
     // goes to f_buf_k.
@@ -1252,6 +1264,7 @@ class HarborPcieDma extends BridgeModule {
         fInPkt < 0,
         descHead < 0,
         descTail < 0,
+        descRung < 0,
       ],
     ];
     final pktBytes = (pktDw.zeroExtend(32) << 2).named('pkt_bytes');
@@ -1319,7 +1332,12 @@ class HarborPcieDma extends BridgeModule {
             ],
           ),
           If(writes(registerCplSize ~/ 4), then: [cplLog < merge(cplLog)]),
-          If(writes(registerCplHead ~/ 4), then: [cplHead < merge(cplHead)]),
+          // Ring pointer writes are dropped while an engine reset waits,
+          // because the reset clears them.
+          If(
+            writes(registerCplHead ~/ 4) & ~resetReq,
+            then: [cplHead < merge(cplHead)],
+          ),
           for (var i = 0; i < stage.length; i++)
             If(
               writes(registerPush ~/ 4 + i),
@@ -1349,8 +1367,8 @@ class HarborPcieDma extends BridgeModule {
             ),
             If(writes(registerDescSize ~/ 4), then: [descLog < merge(descLog)]),
             If(
-              writes(registerDescTail ~/ 4),
-              then: [descTail < merge(descTail)],
+              writes(registerDescTail ~/ 4) & ~resetReq,
+              then: [descTail < merge(descTail), descRung < 1],
             ),
           ],
           if (both)

@@ -22,7 +22,9 @@ import 'pcie_stream.dart';
 /// holds `reserved_busy` high until it has all completions. The tag value is
 /// kept while `reserved_busy` is high. A completion for it gives
 /// `reserved_cpl` and nothing more. A busy reserved slot is a read in flight
-/// for an abort.
+/// for the first abort after its request only. Thus base moves at most once
+/// for one reserved read, and its tag value does not come back while a late
+/// completion for it can still arrive.
 ///
 /// A completion for a tag that is not in flight is dropped and counted in
 /// `stale_count`. A completion for a tag in flight with an error gives
@@ -344,15 +346,23 @@ class HarborPcieDmaTags extends Module {
         ].swizzle();
 
     final completes = (cplGood & bc13.eq(len13)).named('cpl_completes');
+    final rsvMoved = Logic(name: 'rsv_moved');
     final inFlight = [
       for (var i = 0; i < readTags; i++) sBusy[i] & ~sDone[i],
-      if (reservedTags > 0) reservedBusy,
+      if (reservedTags > 0) reservedBusy & ~rsvMoved,
     ].reduce((a, b) => a | b).named('in_flight');
     final staleCpl = (cplHeader & ~hit & ~rsvHit).named('stale_cpl');
     final more = cplGood & ~rxLast;
     Sequential(clk, [
       rot < rdLow,
       If(~reservedBusy, then: [rsvTag < reservedTag.slice(4, 0)]),
+      If(
+        reset | ~reservedBusy,
+        then: [rsvMoved < 0],
+        orElse: [
+          If(abort & inFlight, then: [rsvMoved < 1]),
+        ],
+      ),
       If(
         reset | abort,
         then: [

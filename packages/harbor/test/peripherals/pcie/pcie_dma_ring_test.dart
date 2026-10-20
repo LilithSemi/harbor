@@ -11,6 +11,11 @@ const _ring = 0x88000000;
 
 const _ringOnly = DmaConfig(fifoSource: false, ringSource: true);
 
+/// STATUS of an idle ring source engine with an empty 64 entry queue.
+const _ringIdle = HarborPcieDma.statusRingSource | 64 << 16;
+
+Future<int> _status(DmaBench b) => b.readReg(HarborPcieDma.registerStatus);
+
 /// Checks the descriptor reads: each one is in the ring, does not pass its
 /// end, reads at most [maxCount] descriptors, and the reads take the slots
 /// in order from [firstSlot].
@@ -92,7 +97,7 @@ void main() {
       expect(await b.readReg(HarborPcieDma.registerPush), 0);
       expect(
         await b.readReg(HarborPcieDma.registerStatus),
-        config.queueDepth << 16,
+        HarborPcieDma.statusRingSource | config.queueDepth << 16,
       );
 
       // Bits 4:0 of the ring base read 0.
@@ -302,6 +307,7 @@ void main() {
     await b.doorbell(1);
     await b.cycles(300);
     expect(b.fetches, isEmpty);
+    expect(await _status(b) & HarborPcieDma.statusRingSource, 0);
 
     // Ring source.
     await b.writeReg(
@@ -311,6 +317,7 @@ void main() {
     expect(await b.readReg(HarborPcieDma.registerControl), 5);
     await expectRecord(2);
     expect(b.fetches, hasLength(1));
+    expect(await _status(b) & HarborPcieDma.statusRingSource, isNonZero);
 
     // A commit while the ring is the source is lost and sets overflow.
     await b.push(
@@ -323,7 +330,7 @@ void main() {
     expect(b.recordWrites(records), isEmpty);
     expect(
       await b.readReg(HarborPcieDma.registerStatus),
-      HarborPcieDma.statusOverflow | 64 << 16,
+      HarborPcieDma.statusOverflow | _ringIdle,
     );
 
     // A switch with a fetch in flight waits until the engine is idle.
@@ -344,6 +351,7 @@ void main() {
       HarborPcieDma.controlEnable,
     );
     expect(await b.readReg(HarborPcieDma.registerControl), 1);
+    expect(await _status(b) & HarborPcieDma.statusRingSource, isNonZero);
     await b.doorbell(4);
     b.holdCompletions = false;
     await expectRecord(0x11);
@@ -352,6 +360,7 @@ void main() {
     expect(b.fetches, hasLength(2));
     expect(b.recordWrites(records), isEmpty);
     expect(await b.readReg(HarborPcieDma.registerDescHead), 3);
+    expect(await _status(b) & HarborPcieDma.statusRingSource, 0);
     await b.push(
       hostAddress: 0x80000500,
       localAddress: 0x500,
@@ -364,135 +373,213 @@ void main() {
     await b.finish();
   });
 
-  test('fetch errors halt with their code', () async {
-    final b = await DmaBench.create(
-      const DmaConfig(fifoSource: false, ringSource: true, timeoutCycles: 3000),
-      seed: 44,
+  for (final width in [64, 128]) {
+    test('fetch errors halt with their code, W$width', () async {
+      await _fetchErrors(width);
+    });
+  }
+
+  test('ring pointer writes wait for a pending engine reset', () async {
+    final b = await DmaBench.create(_ringOnly, seed: 61);
+    await b.start();
+    await b.setupDescRing(_ring, 4);
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable();
+    b.writeDesc(0, hostAddress: 0x80000000, localAddress: 0, length: 0x400);
+    await b.doorbell(1);
+    await b.waitUntil(
+      () => b.sink.received.any((t) => t.kind.hasData),
+      what: 'first data write',
     );
-    String? mode;
-    PcieTlp? dropped;
+    // With TX stopped the engine holds the port in a data write, where an
+    // engine reset waits.
+    b.sink.stop();
+    await b.waitUntil(
+      () => b.sink.stream.valid.value.toBool(),
+      what: 'data write on the stopped port',
+    );
+    await b.engineReset();
+    await b.doorbell(5);
+    await b.writeReg(HarborPcieDma.registerCplHead, 3);
+    final pending = b.readRaw(HarborPcieDma.registerControl, 1);
+    await b.cycles(50);
+    b.sink.start();
+    final c = await pending;
+    expect(c.data.sublist(0, 4), [3, 0, 0, 0], reason: 'reset pending');
+    var control = 3;
+    for (var i = 0; i < 50 && control != 1; i++) {
+      control = await b.readReg(HarborPcieDma.registerControl);
+    }
+    expect(control, 1);
+    expect(await b.readRegs(HarborPcieDma.registerDescTail, 2), [0, 0]);
+    expect(await b.readReg(HarborPcieDma.registerCplHead), 0);
+    expect(await _status(b), _ringIdle);
+    b.writeDesc(
+      0,
+      hostAddress: 0x80001000,
+      localAddress: 0x100,
+      length: 0x20,
+      cookie: 0x22,
+    );
+    await b.doorbell(1);
+    await b.waitRecordWrites(0, 1);
+    expect(b.record(0).cookie, 0x22);
+    b.checkCopy(0x80001000, 0x100, 0x20);
+    await b.finish();
+  });
+
+  test('a 1 slot ring gives code 5', () async {
+    final b = await DmaBench.create(_ringOnly, seed: 62);
+    await b.start();
+    await b.setupDescRing(_ring, 0);
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable(mask: HarborPcieDma.causeError);
+    await b.cycles(50);
+    expect(b.recordWrites(0), isEmpty);
+    await b.doorbell(0);
+    await b.waitRecordWrites(0, 1);
+    expect(b.record(0).code, HarborPcieDma.errorAlignment);
+    expect(b.record(0).cookie, 0);
+    expect(b.fetches, isEmpty);
+    expect(await _status(b) >> 8 & 0xff, HarborPcieDma.errorAlignment);
+    expect(b.irqPending, 1);
+    await b.finish();
+  });
+
+  test('no fetch read goes out without bus master enable', () async {
+    final b = await DmaBench.create(_ringOnly, seed: 63);
+    await b.start();
+    await b.setupDescRing(_ring, 4);
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable();
+    b.writeDesc(0, hostAddress: 0x80000000, localAddress: 0, length: 0x400);
+    b.writeDesc(1, hostAddress: 0x80001000, localAddress: 0x1000, length: 16);
+    await b.doorbell(1);
+    await b.waitUntil(
+      () => b.sink.received.any((t) => t.kind.hasData),
+      what: 'first data write',
+    );
+    // The engine holds the stopped TX port. The fetch for slot 1 starts
+    // and waits for the port, then bus master enable goes low.
+    b.sink.stop();
+    await b.waitUntil(
+      () => b.sink.stream.valid.value.toBool(),
+      what: 'data write on the stopped port',
+    );
+    await b.doorbell(2);
+    await b.cycles(20);
+    b.busMaster.inject(0);
+    final before = b.sink.received.where((t) => t.kind.isRequest).length;
+    b.sink.start();
+    await b.cycles(300);
+    // Only the write that held the port finishes.
+    final after = b.sink.received.where((t) => t.kind.isRequest).toList();
+    expect(after.length, before + 1);
+    expect(after.last.kind.hasData, isTrue);
+    expect(b.fetches, hasLength(1));
+    b.busMaster.inject(1);
+    await b.waitRecordWrites(1, 1);
+    b.checkCopy(0x80000000, 0, 0x400);
+    b.checkCopy(0x80001000, 0x1000, 16);
+    expect(b.fetches, hasLength(2));
+    await b.finish();
+  });
+
+  test('two aborts during one fetch do not bring its tag back', () async {
+    final b = await DmaBench.create(
+      const DmaConfig(
+        fifoSource: false,
+        ringSource: true,
+        readTags: 15,
+        timeoutCycles: 3000,
+      ),
+      seed: 71,
+    );
+    b.seedHost(0x80000000, 0x40);
+    PcieTlp? heldRead;
+    PcieTlp? late;
+    var dropFetch = false;
     b.sink.onTlp = (t) {
-      if (!b.isFetch(t) || mode == null) {
-        b.host.receive(t);
+      final isRead =
+          t.kind == PcieTlpKind.memRead32 || t.kind == PcieTlpKind.memRead64;
+      if (isRead && !b.isFetch(t)) {
+        heldRead = t;
         return;
       }
-      final bytes = b.host.memory.read(t.address, t.lengthDw * 4);
-      PcieTlp cpl({
-        PcieCplStatus status = PcieCplStatus.success,
-        int? byteCount,
-        bool poisoned = false,
-        List<int>? data,
-      }) => PcieTlp.completion(
-        completerId: 0x55,
-        requesterId: t.requesterId,
-        tag: t.tag,
-        status: status,
-        byteCount: byteCount ?? t.lengthDw * 4,
-        lowerAddress: t.address & 0x7f,
-        data: data ?? (status == PcieCplStatus.success ? bytes : const []),
-        poisoned: poisoned,
-      );
-      switch (mode) {
-        case 'ur':
-          b.injected.add(cpl(status: PcieCplStatus.unsupported));
-        case 'ca':
-          b.injected.add(cpl(status: PcieCplStatus.abort));
-        case 'poisoned':
-          b.injected.add(cpl(poisoned: true));
-        case 'byte count':
-          b.injected.add(cpl(byteCount: t.lengthDw * 4 + 4));
-        case 'too long':
-          b.injected.add(cpl(data: [...bytes, 1, 2, 3, 4]));
-        case 'timeout':
-          dropped = cpl();
+      if (b.isFetch(t) && dropFetch) {
+        dropFetch = false;
+        late = PcieTlp.completion(
+          completerId: 0x55,
+          requesterId: t.requesterId,
+          tag: t.tag,
+          byteCount: t.lengthDw * 4,
+          lowerAddress: t.address & 0x7f,
+          data: b.host.memory.read(t.address, t.lengthDw * 4),
+        );
+        return;
       }
-      mode = null;
+      b.host.receive(t);
     };
     await b.start();
     await b.setupDescRing(_ring, 4);
     await b.setupRing(dmaCplBase, 4);
-    await b.enable(mask: HarborPcieDma.causeError);
-
-    Future<void> expectHalt(int code, String name) async {
-      final r = b.record(0);
-      expect(r.code, code, reason: name);
-      expect(r.cookie, 0, reason: name);
-      expect(r.bytes, 0, reason: name);
-      final status = await b.readReg(HarborPcieDma.registerStatus);
-      expect(status & HarborPcieDma.statusHalted, isNonZero, reason: name);
-      expect(status >> 8 & 0xff, code, reason: name);
-      expect(b.irqPending, 1, reason: name);
-      await b.writeReg(
-        HarborPcieDma.registerIrqCause,
-        HarborPcieDma.causeError,
-      );
-      await b.engineReset();
-      await b.cycles(2);
-      expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
-      expect(await b.readRegs(HarborPcieDma.registerDescTail, 2), [0, 0]);
-    }
-
-    final cases = [
-      ('ur', HarborPcieDma.errorCompletion),
-      ('ca', HarborPcieDma.errorCompletion),
-      ('poisoned', HarborPcieDma.errorPoisoned),
-      ('byte count', HarborPcieDma.errorLength),
-      ('too long', HarborPcieDma.errorLength),
-      ('timeout', HarborPcieDma.errorTimeout),
-    ];
-    var recordCount = 0;
-    for (final (i, (name, code)) in cases.indexed) {
-      for (var s = 0; s < 2; s++) {
-        b.writeDesc(
-          s,
-          hostAddress: 0x80000000 + 0x100 * i + 0x40 * s,
-          localAddress: 0x100 * i,
-          length: 0x40,
-          cookie: 0x70 + i,
-        );
-      }
-      mode = name;
-      await b.doorbell(2);
-      recordCount++;
-      await b.waitRecordWrites(0, recordCount);
-      await b.cycles(100);
-      expect(b.recordWrites(1), isEmpty, reason: 'halted, $name');
-      expect(
-        b.host.memory.read(0x80000000 + 0x100 * i, 0x80),
-        everyElement(0),
-        reason: name,
-      );
-      await expectHalt(code, name);
-    }
-
-    // A tail past the ring end.
-    await b.doorbell(16);
-    recordCount++;
-    await b.waitRecordWrites(0, recordCount);
-    expect(b.fetches, hasLength(cases.length));
-    await expectHalt(HarborPcieDma.errorAlignment, 'tail');
-
-    // The late answer to the read that timed out matches nothing.
-    b.injected.add(dropped!);
-    await b.waitUntil(() => b.injected.isEmpty, what: 'late send');
-    await b.cycles(20);
-    expect(await b.readReg(HarborPcieDma.registerStaleCompletions), 1);
-    expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+    await b.enable();
+    b.writeDesc(
+      0,
+      hostAddress: 0x80000000,
+      localAddress: 0x100,
+      length: 0x40,
+      deviceToHost: false,
+      cookie: 1,
+    );
+    await b.doorbell(1);
+    await b.waitUntil(() => heldRead != null, what: 'host read');
+    b.writeDesc(
+      1,
+      hostAddress: 0x80002000,
+      localAddress: 0x2000,
+      length: 0x7c,
+      cookie: 0xbad,
+    );
+    dropFetch = true;
+    await b.doorbell(2);
+    await b.waitUntil(() => late != null, what: 'second fetch');
+    // An H2D error while the fetch is out is the first abort, the engine
+    // reset is the second.
+    b.injected.add(
+      PcieTlp.completion(
+        completerId: 0x55,
+        requesterId: heldRead!.requesterId,
+        tag: heldRead!.tag,
+        status: PcieCplStatus.unsupported,
+        byteCount: 0x40,
+      ),
+    );
+    await b.waitRecordWrites(0, 1);
+    expect(b.record(0).code, HarborPcieDma.errorCompletion);
+    await b.engineReset();
+    await b.cycles(5);
+    expect(await _status(b), _ringIdle);
 
     b.writeDesc(
       0,
-      hostAddress: 0x80002000,
-      localAddress: 0x2000,
-      length: 0x40,
-      cookie: 0x99,
+      hostAddress: 0x80001000,
+      localAddress: 0x1000,
+      length: 0x20,
+      cookie: 0x55,
     );
+    b.holdCompletions = true;
     await b.doorbell(1);
-    recordCount++;
-    await b.waitRecordWrites(0, recordCount);
+    await b.waitUntil(() => b.fetches.length == 3, what: 'new fetch');
+    expect(b.fetches.last.tag, isNot(late!.tag));
+    b.injected.add(late!);
+    b.holdCompletions = false;
+    await b.waitRecordWrites(0, 2);
+    expect(b.record(0).cookie, 0x55);
     expect(b.record(0).code, 0);
-    expect(b.record(0).cookie, 0x99);
-    expect(b.fetches.last.tag, isNot(dropped!.tag));
-    b.checkCopy(0x80002000, 0x2000, 0x40);
+    b.checkCopy(0x80001000, 0x1000, 0x20);
+    expect(b.host.memory.read(0x80002000, 4), everyElement(0));
+    expect(await b.readReg(HarborPcieDma.registerStaleCompletions), 1);
     await b.finish();
   });
 
@@ -548,7 +635,7 @@ void main() {
     await b.cycles(30);
     expect(await b.readReg(HarborPcieDma.registerStaleCompletions), 1);
     expect(await b.readReg(HarborPcieDma.registerDescHead), 0);
-    expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+    expect(await b.readReg(HarborPcieDma.registerStatus), _ringIdle);
     expect(b.recordWrites(0), isEmpty);
     await b.doorbell(1);
     await b.waitRecordWrites(0, 1);
@@ -643,5 +730,140 @@ Future<void> _ringMix(DmaConfig config, int count) async {
       }
     }
   }
+  await b.finish();
+}
+
+Future<void> _fetchErrors(int width) async {
+  final b = await DmaBench.create(
+    DmaConfig(
+      width: width,
+      dataWidth: width,
+      fifoSource: false,
+      ringSource: true,
+      timeoutCycles: 3000,
+    ),
+    seed: 44 + width,
+  );
+  String? mode;
+  PcieTlp? dropped;
+  b.sink.onTlp = (t) {
+    if (!b.isFetch(t) || mode == null) {
+      b.host.receive(t);
+      return;
+    }
+    final bytes = b.host.memory.read(t.address, t.lengthDw * 4);
+    PcieTlp cpl({
+      PcieCplStatus status = PcieCplStatus.success,
+      int? byteCount,
+      bool poisoned = false,
+      List<int>? data,
+    }) => PcieTlp.completion(
+      completerId: 0x55,
+      requesterId: t.requesterId,
+      tag: t.tag,
+      status: status,
+      byteCount: byteCount ?? t.lengthDw * 4,
+      lowerAddress: t.address & 0x7f,
+      data: data ?? (status == PcieCplStatus.success ? bytes : const []),
+      poisoned: poisoned,
+    );
+    switch (mode) {
+      case 'ur':
+        b.injected.add(cpl(status: PcieCplStatus.unsupported));
+      case 'ca':
+        b.injected.add(cpl(status: PcieCplStatus.abort));
+      case 'poisoned':
+        b.injected.add(cpl(poisoned: true));
+      case 'byte count':
+        b.injected.add(cpl(byteCount: t.lengthDw * 4 + 4));
+      case 'too long':
+        b.injected.add(cpl(data: [...bytes, 1, 2, 3, 4]));
+      case 'timeout':
+        dropped = cpl();
+    }
+    mode = null;
+  };
+  await b.start();
+  await b.setupDescRing(_ring, 4);
+  await b.setupRing(dmaCplBase, 4);
+  await b.enable(mask: HarborPcieDma.causeError);
+
+  Future<void> expectHalt(int code, String name) async {
+    final r = b.record(0);
+    expect(r.code, code, reason: name);
+    expect(r.cookie, 0, reason: name);
+    expect(r.bytes, 0, reason: name);
+    final status = await b.readReg(HarborPcieDma.registerStatus);
+    expect(status & HarborPcieDma.statusHalted, isNonZero, reason: name);
+    expect(status >> 8 & 0xff, code, reason: name);
+    expect(b.irqPending, 1, reason: name);
+    await b.writeReg(HarborPcieDma.registerIrqCause, HarborPcieDma.causeError);
+    await b.engineReset();
+    await b.cycles(2);
+    expect(await b.readReg(HarborPcieDma.registerStatus), _ringIdle);
+    expect(await b.readRegs(HarborPcieDma.registerDescTail, 2), [0, 0]);
+  }
+
+  final cases = [
+    ('ur', HarborPcieDma.errorCompletion),
+    ('ca', HarborPcieDma.errorCompletion),
+    ('poisoned', HarborPcieDma.errorPoisoned),
+    ('byte count', HarborPcieDma.errorLength),
+    ('too long', HarborPcieDma.errorLength),
+    ('timeout', HarborPcieDma.errorTimeout),
+  ];
+  var recordCount = 0;
+  for (final (i, (name, code)) in cases.indexed) {
+    for (var s = 0; s < 2; s++) {
+      b.writeDesc(
+        s,
+        hostAddress: 0x80000000 + 0x100 * i + 0x40 * s,
+        localAddress: 0x100 * i,
+        length: 0x40,
+        cookie: 0x70 + i,
+      );
+    }
+    mode = name;
+    await b.doorbell(2);
+    recordCount++;
+    await b.waitRecordWrites(0, recordCount);
+    await b.cycles(100);
+    expect(b.recordWrites(1), isEmpty, reason: 'halted, $name');
+    expect(
+      b.host.memory.read(0x80000000 + 0x100 * i, 0x80),
+      everyElement(0),
+      reason: name,
+    );
+    await expectHalt(code, name);
+  }
+
+  // A tail past the ring end.
+  await b.doorbell(16);
+  recordCount++;
+  await b.waitRecordWrites(0, recordCount);
+  expect(b.fetches, hasLength(cases.length));
+  await expectHalt(HarborPcieDma.errorAlignment, 'tail');
+
+  // The late answer to the read that timed out matches nothing.
+  b.injected.add(dropped!);
+  await b.waitUntil(() => b.injected.isEmpty, what: 'late send');
+  await b.cycles(20);
+  expect(await b.readReg(HarborPcieDma.registerStaleCompletions), 1);
+  expect(await b.readReg(HarborPcieDma.registerStatus), _ringIdle);
+
+  b.writeDesc(
+    0,
+    hostAddress: 0x80002000,
+    localAddress: 0x2000,
+    length: 0x40,
+    cookie: 0x99,
+  );
+  await b.doorbell(1);
+  recordCount++;
+  await b.waitRecordWrites(0, recordCount);
+  expect(b.record(0).code, 0);
+  expect(b.record(0).cookie, 0x99);
+  expect(b.fetches.last.tag, isNot(dropped!.tag));
+  b.checkCopy(0x80002000, 0x2000, 0x40);
   await b.finish();
 }
