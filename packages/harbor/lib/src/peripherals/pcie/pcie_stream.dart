@@ -1,5 +1,7 @@
 import 'package:rohd/rohd.dart';
 
+import '../../bus/port/reg_fifo.dart';
+
 /// A PCIe packet stream with data width 64 or 128.
 ///
 /// DW0 of a beat is in bits 31:0. A packet always starts in DW0 of a beat.
@@ -318,25 +320,23 @@ class HarborPcieStreamRegister extends Module {
           for (final r in [...main, ...skid]) r < 0,
         ],
         orElse: [
+          // Data loads do not wait for upstream valid, so the upstream
+          // decode does not drive the flop enables.
+          If(
+            ~skidValid,
+            then: [for (var i = 0; i < skid.length; i++) skid[i] < upFields[i]],
+          ),
+          If(
+            take,
+            then: [
+              for (var i = 0; i < main.length; i++)
+                main[i] < harborBitMux(skidValid, skid[i], upFields[i]),
+            ],
+          ),
           If.block([
-            Iff(take & skidValid, [
-              for (var i = 0; i < main.length; i++) main[i] < skid[i],
-              mainValid < 1,
-              skidValid < 0,
-            ]),
-            ElseIf(take, [
-              If(
-                upFire,
-                then: [
-                  for (var i = 0; i < main.length; i++) main[i] < upFields[i],
-                ],
-              ),
-              mainValid < upFire,
-            ]),
-            ElseIf(upFire, [
-              for (var i = 0; i < skid.length; i++) skid[i] < upFields[i],
-              skidValid < 1,
-            ]),
+            Iff(take & skidValid, [mainValid < 1, skidValid < 0]),
+            ElseIf(take, [mainValid < upFire]),
+            ElseIf(upFire, [skidValid < 1]),
           ]),
         ],
       ),

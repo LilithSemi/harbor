@@ -358,6 +358,15 @@ class HarborPcieDma extends BridgeModule {
 
   static Logic _min(Logic a, Logic b) => mux(a.lt(b), a, b);
 
+  /// The smallest of [left] (32 bits), [limit] and [toPage]. The two limits
+  /// are at most 4096, so the three compares run side by side.
+  static Logic _sizeOf(Logic left, Logic limit, Logic toPage) {
+    final low = left.slice(12, 0);
+    final small = ~left.slice(31, 13).or();
+    final leftFirst = small & low.lt(limit) & low.lt(toPage);
+    return mux(leftFirst, low, _min(limit, toPage));
+  }
+
   void _build(
     Logic clk,
     Logic reset,
@@ -432,6 +441,10 @@ class HarborPcieDma extends BridgeModule {
     final fTag = Logic(name: 'f_tag', width: 8);
     final fT = Logic(name: 'f_t', width: 3);
     final fGot = Logic(name: 'f_got', width: 6);
+    // fCount * 32 - fGot * 4 and fAddr + fGot * 4 (mod 128), kept in
+    // registers next to fGot, so the completion check has no adder.
+    final fRemReg = Logic(name: 'f_rem_reg', width: 13);
+    final fExpReg = Logic(name: 'f_exp_reg', width: 7);
     final fPushed = Logic(name: 'f_pushed', width: 3);
     final fErr = Logic(name: 'f_err', width: 8);
     final fInPkt = Logic(name: 'f_in_pkt');
@@ -589,6 +602,9 @@ class HarborPcieDma extends BridgeModule {
       abort: tagAbort,
       clearStale: engReset,
       cplHeader: hdrFire & isCpl,
+      // Without the tag check or ready, so the read issue does not wait for
+      // the slot compare.
+      cplSeen: capture.headerValid & isCpl,
       header: header,
       firstDw: capture.firstPayloadDw,
       rxFire: rxs.valid & rxs.ready,
@@ -773,12 +789,7 @@ class HarborPcieDma extends BridgeModule {
     );
     final mpsBytes = Const(128, width: 13) << mpsCode;
     final toPage = Const(0x1000, width: 13) - hAddr.slice(11, 0).zeroExtend(13);
-    final left13 = mux(
-      left.gt(Const(0x1000, width: 32)),
-      Const(0x1000, width: 13),
-      left.slice(12, 0),
-    );
-    final chunk = _min(_min(left13, mpsBytes), toPage).named('chunk');
+    final chunk = _sizeOf(left, mpsBytes, toPage).named('chunk');
     final chunkDw = chunk.slice(12, 2).zeroExtend(11).named('chunk_dw');
 
     // Read size: the smallest of bytes left, max read request, 4 KB page end.
@@ -791,7 +802,7 @@ class HarborPcieDma extends BridgeModule {
     final mrrBytes = Const(128, width: 13) << mrrCode;
     // The read size is registered. A read does not start in the cycle after
     // the one before it, when the register still holds the old size.
-    final reqNext = _min(_min(left13, mrrBytes), toPage).named('req_next');
+    final reqNext = _sizeOf(left, mrrBytes, toPage).named('req_next');
     final reqStale = Logic(name: 'req_stale');
     Sequential(clk, [reqBytes < reqNext, reqStale < issueGo], reset: reset);
 
@@ -1096,16 +1107,11 @@ class HarborPcieDma extends BridgeModule {
     // goes to f_buf_k.
     final fInWait = fState.eq(fWait) & fErr.eq(0);
     final fRsv = (tags.reservedCpl & fInWait).named('f_cpl');
-    final fRem =
-        ([fCount, Const(0, width: 5)].swizzle().zeroExtend(13) -
-                (fGot.zeroExtend(13) << 2))
-            .named('f_rem');
+    final fRem = fRemReg;
     final fBc = tlpByteCount(header);
     final fBc13 = mux(fBc.eq(0), Const(4096, width: 13), fBc.zeroExtend(13));
     final fLen13 = (hdrLen.zeroExtend(13) << 2).named('f_cpl_bytes');
-    final fExpLow = (fAddr.slice(6, 0) + (fGot.zeroExtend(7) << 2)).named(
-      'f_exp_low',
-    );
+    final fExpLow = fExpReg;
     final fBad =
         ~hasData |
         fLen13.gt(fRem) |
@@ -1137,7 +1143,9 @@ class HarborPcieDma extends BridgeModule {
     final fFill = <Conditional>[
       for (var j = 0; j < fBuf.length; j++)
         If.block([
-          Iff(fGood & fGot.eq(j), [
+          // Any fetch completion header writes its DW. A bad one ends the
+          // fetch, and that DW is past every pushed descriptor.
+          Iff(fRsv & fGot.eq(j), [
             fBuf[j] < tlpSwapBytes(capture.firstPayloadDw),
           ]),
           for (var i = 0; i < n && i <= j; i++)
@@ -1159,6 +1167,8 @@ class HarborPcieDma extends BridgeModule {
               fTag < tags.reservedTag,
               fT < 0,
               fGot < 0,
+              fRemReg < [fN, Const(0, width: 5)].swizzle().zeroExtend(13),
+              fExpReg < fetchAddr.slice(6, 0),
               fPushed < 0,
               fTimer < 0,
               fInPkt < 0,
@@ -1181,11 +1191,15 @@ class HarborPcieDma extends BridgeModule {
             Iff(fRsv & ~fCode.eq(0), [fErr < fCode, fInPkt < 0]),
             ElseIf(fGood, [
               fGot < fGot + 1,
+              fRemReg < fRemReg - 4,
+              fExpReg < fExpReg + 4,
               fInPkt < ~rxs.last,
               fLeft < hdrLen - 1,
             ]),
             ElseIf(fBeat, [
               fGot < fGot + fCnt.zeroExtend(6),
+              fRemReg < fRemReg - (fCnt.zeroExtend(13) << 2),
+              fExpReg < fExpReg + (fCnt.zeroExtend(7) << 2),
               fLeft < fLeft - fCnt.zeroExtend(11),
               If(rxs.last, then: [fInPkt < 0]),
             ]),

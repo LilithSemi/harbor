@@ -26,6 +26,7 @@ void main() {
         abort: abort,
         clearStale: Const(0),
         cplHeader: cplHeader,
+        cplSeen: cplHeader,
         header: header,
         firstDw: Const(0, width: 32),
         rxFire: cplHeader,

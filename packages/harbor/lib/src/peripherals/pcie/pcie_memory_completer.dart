@@ -89,7 +89,17 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     maxPayload = addInput('max_payload', maxPayload, width: 3);
     rcb128 = addInput('rcb_128', rcb128);
     completerId = addInput('completer_id', completerId, width: 16);
-    final rxs = HarborPcieStream.addSink(this, rx);
+    // A register stage on RX keeps the request decode away from the
+    // endpoint and the router decode.
+    final rxIn = HarborPcieStream.addSink(this, rx);
+    final rxs = HarborPcieStream(width: width, name: 'rx_reg');
+    HarborPcieStreamRegister(
+      clk: clk,
+      reset: reset,
+      upstream: rxIn,
+      downstream: rxs,
+      name: 'rx_register',
+    );
     final txs = HarborPcieStream.addSource(this, tx);
 
     memory = HarborMemoryMasterPort.create(

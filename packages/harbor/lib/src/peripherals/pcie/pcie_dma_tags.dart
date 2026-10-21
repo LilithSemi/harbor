@@ -67,8 +67,8 @@ class HarborPcieDmaTags extends Module {
   Logic get err => output('err');
   Logic get errCode => output('err_code');
 
-  /// High in a cycle that can give [err] in the next cycle: a completion
-  /// header for a tag in flight, or a timeout.
+  /// High in a cycle that can give [err] in the next cycle: `cpl_seen` (a
+  /// completion header is on the stream, taken or not), or a timeout.
   Logic get errAhead => output('err_ahead');
   Logic get staleCount => output('stale_count');
 
@@ -81,6 +81,7 @@ class HarborPcieDmaTags extends Module {
     required Logic abort,
     required Logic clearStale,
     required Logic cplHeader,
+    required Logic cplSeen,
     required Logic header,
     required Logic firstDw,
     required Logic rxFire,
@@ -125,6 +126,7 @@ class HarborPcieDmaTags extends Module {
     abort = addInput('abort', abort);
     clearStale = addInput('clear_stale', clearStale);
     cplHeader = addInput('cpl_header', cplHeader);
+    cplSeen = addInput('cpl_seen', cplSeen);
     header = addInput('header', header, width: 128);
     firstDw = addInput('first_dw', firstDw, width: 32);
     rxFire = addInput('rx_fire', rxFire);
@@ -320,7 +322,7 @@ class HarborPcieDmaTags extends Module {
     ]);
     addOutput('err') <= errReg;
     addOutput('err_code', width: 3) <= errCodeReg;
-    addOutput('err_ahead') <= cplHeader & hit | timeout;
+    addOutput('err_ahead') <= input('cpl_seen') | timeout;
     addOutput('reserved_cpl') <= cplHeader & rsvHit;
 
     // Payload writes. The header beat holds the first payload DW.
@@ -334,14 +336,16 @@ class HarborPcieDmaTags extends Module {
         ([sel, Const(0, width: sLog)].swizzle() +
                 selRecv.slice(sLog + 1, 2).zeroExtend(gw))
             .named('hdr_start');
-    final start = mux(cplGood, hdrStart, pktPtr).named('w_start');
+    // The address, data and count use the header strobe, not the check.
+    // A header beat is never a payload beat, so only cpl_good enables it.
+    final start = mux(cplHeader, hdrStart, pktPtr).named('w_start');
     final lanes = [
       for (var i = 0; i < n; i++)
         tlpSwapBytes(rxData.slice(32 * i + 31, 32 * i)),
     ];
     final firstMem = tlpSwapBytes(firstDw);
     final countN = mux(pktLeft.lt(n), pktLeft.slice(2, 0), Const(n, width: 3));
-    final wCount = mux(cplGood, Const(1, width: 3), countN).named('w_count');
+    final wCount = mux(cplHeader, Const(1, width: 3), countN).named('w_count');
     final wEn = (cplGood | beatWrite).named('w_en');
     final startLow = start.slice(bLog - 1, 0);
     final startHigh = (start >> bLog).slice(bankAw - 1, 0);
@@ -355,7 +359,7 @@ class HarborPcieDmaTags extends Module {
     for (var b = 0; b < banks; b++) {
       final cb = Const(b, width: bLog);
       final l = (cb - startLow).named('w_lane_$b');
-      final data = _laneMux(cplGood, firstMem, l, lanes);
+      final data = _laneMux(cplHeader, firstMem, l, lanes);
       final ram = _ReorderRam(
         clk,
         width: 32,

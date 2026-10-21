@@ -266,23 +266,24 @@ class HarborPcieRouter extends Module {
     final grant = Logic(name: 'tx_grant', width: n);
     final lastGrant = Logic(name: 'tx_last_grant', width: n);
 
-    // Round robin: the source after the last granted one has top priority.
-    final pick = <Logic>[];
-    for (var i = 0; i < n; i++) {
-      final terms = <Logic>[];
-      for (var l = 0; l < n; l++) {
-        final distance = (i - l) % n == 0 ? n : (i - l) % n;
-        Logic blocked = Const(0);
-        for (var k = 1; k < distance; k++) {
-          blocked = blocked | valid[(l + k) % n];
-        }
-        terms.add(lastGrant[l] & valid[i] & ~blocked);
-      }
-      pick.add(_or(terms));
-    }
-    final current = [
-      for (var i = 0; i < n; i++) mux(locked, grant[i], pick[i]),
+    // Round robin: the source after [base] has top priority.
+    List<Logic> pickAfter(Logic base) => [
+      for (var i = 0; i < n; i++)
+        _or([
+          for (var l = 0; l < n; l++)
+            () {
+              final distance = (i - l) % n == 0 ? n : (i - l) % n;
+              Logic blocked = Const(0);
+              for (var k = 1; k < distance; k++) {
+                blocked = blocked | valid[(l + k) % n];
+              }
+              return base[l] & valid[i] & ~blocked;
+            }(),
+        ]),
     ];
+    // The grant is a register, so the client ready does not depend on the
+    // client valids. A new grant starts one cycle after the pick.
+    final current = [for (var i = 0; i < n; i++) grant[i]];
 
     Logic select(List<Logic> sources) => _or([
       for (var i = 0; i < n; i++)
@@ -302,7 +303,8 @@ class HarborPcieRouter extends Module {
     _urDone <= urFire & urLast;
 
     final fire = tx.valid & tx.ready;
-    final currentWord = current.rswizzle();
+    final pickNext = pickAfter(grant).rswizzle();
+    final pickIdle = pickAfter(lastGrant).rswizzle();
     Sequential(clk, [
       If(
         reset,
@@ -313,20 +315,17 @@ class HarborPcieRouter extends Module {
           urBeat < 0,
         ],
         orElse: [
-          If(
-            fire,
-            then: [
-              If(
-                tx.last,
-                then: [locked < 0, lastGrant < currentWord],
-                orElse: [locked < 1, grant < currentWord],
-              ),
-            ],
-            orElse: [
-              // Hold the source while a presented beat waits for ready.
-              If(tx.valid, then: [locked < 1, grant < currentWord]),
-            ],
-          ),
+          If.block([
+            Iff(fire & tx.last, [
+              locked < 0,
+              lastGrant < grant,
+              grant < pickNext,
+            ]),
+            ElseIf(fire, [locked < 1]),
+            // A source that is not mid packet and shows nothing loses the
+            // grant. A packet keeps it through valid gaps.
+            ElseIf(~locked & ~tx.valid, [grant < pickIdle]),
+          ]),
           If(
             urFire,
             then: [
