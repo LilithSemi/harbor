@@ -38,11 +38,7 @@ import 'package:rohd/rohd.dart';
 /// river_hdl's jtag_tunnel_dm_test.dart); the config-JTAG primitive is an
 /// unsimulatable blackbox and the async synchronizers only matter on silicon.
 class JtagBscanTunnel extends Module {
-  /// Width of the widest inner scan (the DMI register, ~41 bits). Sizes the
-  /// payload counter.
-  final int maxScanBits;
-
-  JtagBscanTunnel({this.maxScanBits = 64, super.name = 'jtag_bscan_tunnel'})
+  JtagBscanTunnel({super.name = 'jtag_bscan_tunnel'})
     : super(definitionName: 'JtagBscanTunnel') {
     final clk = addInput('clk', Logic());
     final reset = addInput('reset', Logic());
@@ -78,7 +74,9 @@ class JtagBscanTunnel extends Module {
     final jce1S = jce1Sync[1];
     final jrstnS = jrstnSync[1];
 
-    final cntW = (maxScanBits + 16).bitLength;
+    // The 7-bit width field allows N up to 127, so a frame is at most 139
+    // bits. The counter stops at its top value and does not wrap.
+    const cntW = 8;
     final cnt = Logic(name: 'bit_cnt', width: cntW); // frame bit index
     final sel = Logic(name: 'sel'); // 1=DR, 0=IR
     final width = Logic(name: 'width', width: 7); // inner scan length N
@@ -143,7 +141,7 @@ class JtagBscanTunnel extends Module {
               If(
                 active,
                 then: [
-                  cnt < cnt + 1,
+                  cnt < mux(cnt.eq(Const(255, width: cntW)), cnt, cnt + 1),
                   If(cnt.eq(Const(0, width: cntW)), then: [sel < jtdiS]),
                   // Shift width in LSB-first across bits 1..7.
                   If(
