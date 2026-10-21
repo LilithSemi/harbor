@@ -2,12 +2,21 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../util/pcie_gpu_bench.dart';
 import 'test_harness.dart';
 
 void main() {
   tearDown(() async {
     await Simulator.reset();
   });
+
+  // This long sim runs first, before other sims add listeners.
+  test(
+    'PCIe GPU W64: 1 MB each way from a host SG list, records, MSIs, '
+    'BAR2 and ROM in parallel',
+    () async => PcieGpuRun(await PcieGpuBench.create(64)).run(),
+    timeout: const Timeout(Duration(hours: 5)),
+  );
 
   group('PCIe sim', () {
     test('write CTRL enable and read back', () async {
