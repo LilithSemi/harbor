@@ -17,6 +17,8 @@ const _timeouts = HarborGtpPcieTimeouts(
   rate: 60,
 );
 
+const _porFlops = {'por_lock_0', 'por_lock_1', 'por_count'};
+
 const _goodOrder = [
   _S.cfgWait,
   _S.pllReset,
@@ -73,6 +75,7 @@ class _Bench {
     bool drivePllReset = false,
     bool waitRxPmaResetDone = true,
     bool waitForRxResetStatus = true,
+    bool perstEdge = true,
     void Function(Gtpe2StatusModel m)? setup,
   }) async {
     final pclk = SimpleClockGenerator(8).clk;
@@ -113,7 +116,11 @@ class _Bench {
       p.txSwing.inject(0);
       p.txDeemph.inject(0);
     }
-    perstN.inject(0);
+    // FPGA flops with no reset start at zero after configuration.
+    for (final l in phy.internalSignals) {
+      if (_porFlops.contains(l.name)) l.inject(0);
+    }
+    perstN.inject(perstEdge ? 0 : 1);
     final b = _Bench(phy, model, pipes, common, channels, perstN, pclk);
     Simulator.setMaxSimTime(10000000);
     unawaited(Simulator.run());
@@ -123,7 +130,7 @@ class _Bench {
     for (var i = 0; i < 4; i++) {
       await pclk.nextPosedge;
     }
-    perstN.inject(1);
+    if (perstEdge) perstN.inject(1);
     return b;
   }
 
@@ -315,6 +322,35 @@ void main() {
       await b.finish();
     });
 
+    test('PERST# high from power-up with no edge reaches idle', () async {
+      final b = await _Bench.start(perstEdge: false);
+      await b.waitFor(_S.idle);
+      expect(b.trace, _goodOrder);
+      expect(b.retries, 0);
+      expect(b.hi(b.phy.phyReady), isTrue);
+      b.perstN.inject(0);
+      await b.cycles(4);
+      expect(b.state, _S.cfgWait);
+      expect(b.hi(b.phy.phyReady), isFalse);
+      b.perstN.inject(1);
+      await b.waitFor(_S.idle);
+      expect(b.traceFrom(_S.cfgWait), _goodOrder);
+      await b.finish();
+    });
+
+    test('power-on reset holds until the MMCM locks', () async {
+      final b = await _Bench.start(
+        perstEdge: false,
+        setup: (m) => m.mmcmLockDelay = 300,
+      );
+      await b.cycles(290);
+      expect(b.state, _S.cfgWait);
+      expect(b.first('gt_reset_rise'), -1);
+      await b.waitFor(_S.idle);
+      expect(b.first('mmcm_lock_rise'), lessThan(b.first('gt_reset_rise')));
+      await b.finish();
+    });
+
     test('PERST# mid sequence restarts from the top', () async {
       final b = await _Bench.start();
       await b.waitFor(_S.txPhInit);
@@ -364,7 +400,6 @@ void main() {
       // count a retry.
       final faults = <String, void Function(Gtpe2StatusModel m)>{
         'pll lock': (m) => m.pllStuck = true,
-        'mmcm lock': (m) => m.mmcmLockDelay = 1 << 30,
         'reset done': (m) => m.resetDoneDelay = 1 << 30,
         'pma high': (m) => m.pmaRiseDelay = 1 << 30,
         'tx sync': (m) => m.syncDelay = 1 << 30,
@@ -377,6 +412,16 @@ void main() {
         await b.finish();
         await Simulator.reset();
       }
+
+      // The power-on reset waits for the first MMCM lock, so the lock goes
+      // away after the sequence starts.
+      final b = await _Bench.start();
+      await b.waitFor(_S.gtReset);
+      b.model.dropMmcmLock(1 << 30);
+      await b.cycles(800);
+      expect(b.retries, greaterThan(0), reason: 'mmcm lock');
+      expect(b.trace, isNot(contains(_S.idle)), reason: 'mmcm lock');
+      await b.finish();
     });
   });
 

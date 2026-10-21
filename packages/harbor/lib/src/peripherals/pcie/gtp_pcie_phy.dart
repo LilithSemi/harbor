@@ -510,7 +510,24 @@ class HarborGtpPciePhy extends Module {
     addOutput('userclk2') <= clk.userClk2;
     addOutput('mmcm_lock') <= clk.mmcmLock;
 
-    final rst = harborCdcJoinReset(pclk, ~perstN, Const(0), name: 'perst_rst');
+    // Power-on reset. These flops have no reset because FPGA flops are zero
+    // after configuration. The reset holds until the MMCM locks, then for 64
+    // clean cycles. A later lock loss does not set it again.
+    final porLock0 = Logic(name: 'por_lock_0');
+    final porLock1 = Logic(name: 'por_lock_1');
+    final porCount = Logic(name: 'por_count', width: 7);
+    Sequential(pclk, [
+      porLock0 < clk.mmcmLock,
+      porLock1 < porLock0,
+      If(
+        ~porCount[6],
+        then: [
+          If(porLock1, then: [porCount < porCount + 1], orElse: [porCount < 0]),
+        ],
+      ),
+    ]);
+    final por = (~porCount[6]).named('por_reset');
+    final rst = harborCdcJoinReset(pclk, ~perstN, por, name: 'perst_rst');
 
     Logic sync(Logic d, String name) {
       final s = HarborCdcSync(name: '${name}_sync');
