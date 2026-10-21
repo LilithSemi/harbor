@@ -26,8 +26,8 @@ import 'pcie_stream.dart';
 /// base at most once. As for a read slot, its tag value can come back after
 /// two more base moves once the read has ended.
 ///
-/// A completion for a tag that is not in flight is dropped and counted in
-/// `stale_count`. A completion for a tag in flight with an error gives
+/// A completion for a tag that is not in flight, or one in an abort cycle,
+/// is dropped and counted in `stale_count`. A completion for a tag in flight with an error gives
 /// `err` in the next cycle with code 1 (status not SC), 3 (poisoned) or 6
 /// (length, byte count or lower address does not fit). A tag that waits
 /// [timeoutCycles] gives code 2 one cycle later.
@@ -383,7 +383,9 @@ class HarborPcieDmaTags extends Module {
       for (var i = 0; i < readTags; i++) sBusy[i] & ~sDone[i],
       if (reservedTags > 0) reservedBusy & ~rsvMoved,
     ].reduce((a, b) => a | b).named('in_flight');
-    final staleCpl = (cplHeader & ~hit & ~rsvHit).named('stale_cpl');
+    // A hit in an abort cycle is dropped as stale too: the abort comes one
+    // cycle after the error, and the slot is free after it.
+    final staleCpl = (cplHeader & ~rsvHit & (~hit | abort)).named('stale_cpl');
     final more = cplGood & ~rxLast;
     Sequential(clk, [
       rot < rdLow,
