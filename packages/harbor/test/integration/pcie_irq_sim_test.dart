@@ -106,4 +106,44 @@ void main() {
       await b.finish();
     });
   }
+
+  test('a completion ring of 1 slot halts with code 5 and no record', () async {
+    final b = await _start(3, cplLog: 0);
+    await _push(b, 1);
+    await _msi(b, 1);
+    expect(b.host.msis, [0]);
+    final status = await b.readReg(HarborPcieDma.registerStatus);
+    expect(status & HarborPcieDma.statusHalted, HarborPcieDma.statusHalted);
+    expect(
+      (status >> HarborPcieDma.statusErrorShift) & 0xff,
+      HarborPcieDma.errorAlignment,
+    );
+    expect(
+      await b.readReg(HarborPcieDma.registerIrqCause),
+      HarborPcieDma.causeError,
+    );
+    expect(
+      b.sink.received.where((t) => t.kind.hasData && t.kind.isRequest),
+      isEmpty,
+      reason: 'no data and no record',
+    );
+    // Engine reset clears the halt. A ring of 16 slots then works.
+    await b.writeReg(
+      HarborPcieDma.registerControl,
+      HarborPcieDma.controlEnable | HarborPcieDma.controlEngineReset,
+    );
+    while ((await b.readReg(HarborPcieDma.registerControl) &
+            HarborPcieDma.controlEngineReset) !=
+        0) {}
+    final cleared = await b.readReg(HarborPcieDma.registerStatus);
+    expect(cleared & (HarborPcieDma.statusHalted | 0xff00), 0);
+    await b.writeReg(HarborPcieDma.registerIrqCause, HarborPcieDma.causeError);
+    await b.writeReg(HarborPcieDma.registerCplSize, 4);
+    await _push(b, 2);
+    await b.waitUntil(
+      () => DmaRecord(b.host.memory.read(_cplBase, 16)).cookie == 2,
+      what: 'record after reset',
+    );
+    await b.finish();
+  });
 }

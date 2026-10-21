@@ -1218,8 +1218,19 @@ class HarborPcieDma extends BridgeModule {
     ];
 
     // Interrupt causes.
+    // A completion ring of 1 slot is always full, so the engine halts with
+    // code 5 before it starts, and writes no record.
+    final startWanted =
+        (enable & ~halted & ~resetReq & ~qCount.eq(0) |
+                (ringSource
+                    ? enable & ~halted & ~resetReq & ~fErr.eq(0)
+                    : Const(0)))
+            .named('start_wanted');
+    final cplSizeBad = (inState(sIdle) & startWanted & cplLog.eq(0)).named(
+      'cpl_size_bad',
+    );
     final doneSet = recDone & code.eq(0) & dFlags[1];
-    final errSet = recDone & ~code.eq(0);
+    final errSet = recDone & ~code.eq(0) | cplSizeBad;
     final sets = [
       if (irqLines < 7) Const(0, width: causeWidth - causeLineShift - irqLines),
       ?lines,
@@ -1587,6 +1598,7 @@ class HarborPcieDma extends BridgeModule {
             CaseItem(Const(sIdle, width: 4), [
               If.block([
                 Iff(resetReq, [If(engReset, then: engineReset())]),
+                ElseIf(cplSizeBad, [halted < 1, errCode < errorAlignment]),
                 ElseIf(enable & ~halted & ~qCount.eq(0), [state < sLoad]),
                 // A fetch error gets a record after the queue is empty.
                 if (ringSource)
