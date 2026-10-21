@@ -48,6 +48,18 @@ class HarborPcieEndpoint extends Module {
   Logic get rxUser => output('rx_user');
   Logic get txReady => output('tx_ready');
 
+  /// MMCM lock, not synchronised.
+  Logic get mmcmLock => output('mmcm_lock');
+
+  /// Current [HarborGtpResetState] code.
+  Logic get resetState => output('reset_state');
+
+  /// [HarborGtpResetState] code of the last failure.
+  Logic get resetFailState => output('reset_fail_state');
+
+  /// Number of failures since reset, it stops at 255.
+  Logic get resetRetries => output('reset_retries');
+
   HarborPcieEndpoint({
     required HarborDeviceTarget target,
     required Logic refClkP,
@@ -258,6 +270,10 @@ class HarborPcieEndpoint extends Module {
     addOutput('user_clk') <= phy.userClk2;
     addOutput('user_reset') <= reset;
     addOutput('link_up') <= link;
+    addOutput('mmcm_lock') <= phy.mmcmLock;
+    addOutput('reset_state', width: 4) <= phy.resetState;
+    addOutput('reset_fail_state', width: 4) <= phy.resetFailState;
+    addOutput('reset_retries', width: 8) <= phy.resetRetries;
     addOutput('completer_id', width: 16) <=
         [busNumber, deviceNumber, functionNumber].swizzle();
     addOutput('rx_data', width: 64) <= stream.rxData;

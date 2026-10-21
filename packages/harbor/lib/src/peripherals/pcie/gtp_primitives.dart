@@ -90,6 +90,18 @@ class HarborArtix7PciePhy extends Module {
   Logic get userClk2 => output('userclk2');
   Logic get ready => output('ready');
 
+  /// MMCM lock, not synchronised.
+  Logic get mmcmLock => output('mmcm_lock');
+
+  /// Current [HarborGtpResetState] code.
+  Logic get resetState => output('reset_state');
+
+  /// [HarborGtpResetState] code of the last failure.
+  Logic get resetFailState => output('reset_fail_state');
+
+  /// Number of failures since reset, it stops at 255.
+  Logic get resetRetries => output('reset_retries');
+
   HarborArtix7PciePhy({
     required Logic refClkP,
     required Logic refClkN,
@@ -137,6 +149,10 @@ class HarborArtix7PciePhy extends Module {
     addOutput('userclk1') <= phy.userClk1;
     addOutput('userclk2') <= phy.userClk2;
     addOutput('ready') <= phy.phyReady;
+    addOutput('mmcm_lock') <= phy.mmcmLock;
+    addOutput('reset_state', width: 4) <= phy.resetState;
+    addOutput('reset_fail_state', width: 4) <= phy.resetFailState;
+    addOutput('reset_retries', width: 8) <= phy.resetRetries;
   }
 
   /// Wait for RXRESETDONE and startup PHYSTATUS before TX buffer alignment.

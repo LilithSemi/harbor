@@ -427,7 +427,7 @@ class HarborGtpPciePhy extends Module {
   /// [HarborGtpResetState] code of the last failure.
   Logic get resetFailState => output('reset_fail_state');
 
-  /// Number of failures since PERST#, it stops at 255.
+  /// Number of failures since reset, it stops at 255.
   Logic get resetRetries => output('reset_retries');
 
   /// High when the PIPE side is up.

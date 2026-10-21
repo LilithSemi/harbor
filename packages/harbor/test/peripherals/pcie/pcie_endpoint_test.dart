@@ -81,6 +81,41 @@ void main() {
     timeout: const Timeout(Duration(minutes: 3)),
   );
 
+  test(
+    'reset status comes from the GTP PHY',
+    () async {
+      final dut = endpoint(
+        const HarborFpgaTarget.artix7(
+          device: 'xc7a200t',
+          package: 'fbg484',
+          useOpenXc7: true,
+        ),
+      );
+      await dut.build();
+      // The simulated sequence for these outputs is in gtp_pcie_phy_test.
+      // The GT primitives are black boxes, so this test follows the wires.
+      List<Logic> path(Logic l) => [
+        for (Logic? at = l; at != null; at = at.srcConnection) at,
+      ];
+
+      final widths = {
+        'mmcm_lock': 1,
+        'reset_state': 4,
+        'reset_fail_state': 4,
+        'reset_retries': 8,
+      };
+      for (final e in widths.entries) {
+        final out = dut.output(e.key);
+        expect(out.width, e.value, reason: e.key);
+        final phyOut = path(out).where(
+          (l) => l.parentModule is HarborGtpPciePhy && l.isOutput,
+        );
+        expect(phyOut.map((l) => l.name), [e.key], reason: e.key);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+  );
+
   test('rejects unsupported packet SRAM depths', () {
     expect(
       () => endpoint(
