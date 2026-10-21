@@ -30,6 +30,7 @@ class DmaConfig {
   final int maxReadRequestBytes;
   final bool fifoSource;
   final bool ringSource;
+  final int addressWidth;
 
   const DmaConfig({
     this.width = 64,
@@ -43,6 +44,7 @@ class DmaConfig {
     this.maxReadRequestBytes = 512,
     this.fifoSource = true,
     this.ringSource = false,
+    this.addressWidth = dmaAddressWidth,
   });
 
   @override
@@ -154,7 +156,7 @@ class DmaBench {
       irqInputs: config.irqLines == 0 ? null : Logic(width: config.irqLines),
       fabricKind: config.kind,
       dataWidth: config.dataWidth,
-      addressWidth: dmaAddressWidth,
+      addressWidth: config.addressWidth,
       queueDepth: config.queueDepth,
       readTags: config.readTags,
       irqLines: config.irqLines,
@@ -169,7 +171,7 @@ class DmaBench {
       iface: 'memory',
       kind: config.kind,
       config: HarborMemoryWaistConfig(
-        addressWidth: dmaAddressWidth,
+        addressWidth: config.addressWidth,
         dataWidth: config.dataWidth,
       ),
       withErr: true,

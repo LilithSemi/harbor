@@ -92,7 +92,10 @@ Future<void> _randomMix(DmaConfig config, int count) async {
   final jobs = <(int, int, int, bool)>[];
   for (var i = 0; i < count; i++) {
     final roll = random.nextInt(10);
-    final len = roll == 0 ? 4 * random.nextInt(1025) : 4 * random.nextInt(97);
+    // Length 0 is refused with code 9, so the mix has none.
+    final len = roll == 0
+        ? 4 * (1 + random.nextInt(1024))
+        : 4 * (1 + random.nextInt(96));
     final h =
         (random.nextBool() ? hostBase : hostHigh) +
         4 * random.nextInt((hostSpan - len) ~/ 4 + 1);

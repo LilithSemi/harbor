@@ -20,6 +20,9 @@ class PcieFabricMemory {
 
   /// Write beats answered.
   int writeBeats = 0;
+
+  /// Read beats answered.
+  int readBeats = 0;
   final Logic _ack = Logic(name: 'tb_ack');
   final Logic _err = Logic(name: 'tb_err');
   final Logic _rdata;
@@ -80,6 +83,7 @@ class PcieFabricMemory {
         }
       }
     } else {
+      readBeats++;
       var data = BigInt.zero;
       for (var b = 0; b < busBytes; b++) {
         data |= BigInt.from(byte(base + b)) << (8 * b);

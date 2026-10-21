@@ -78,7 +78,6 @@ void main() {
         (0x80000000, 0x01000, 64, true),
         (0x80001000, 0x02000, 0x180, false),
         (0x180004104, 0x0500c, 1000, true),
-        (0x80006000, 0x06000, 0, true),
         (0x80003f40, 0x04008, 0x180, false),
         (0x80008000, 0x08000, 0x400, true),
         (0x80009004, 0x0a008, 0x204, false),
@@ -137,7 +136,7 @@ void main() {
         expect(r.code, 0);
         expect(r.bytes, len);
       }
-      expect(b.fetches.map((t) => t.lengthDw), [32, 24]);
+      expect(b.fetches.map((t) => t.lengthDw), [32, 16]);
       _checkFetches(b, b.fetches, firstSlot: 0, count: jobs.length);
       final fetchTags = b.fetches.map((t) => t.tag).toSet();
       final readTags = b.reads.where((t) => !b.isFetch(t)).map((t) => t.tag);
@@ -428,7 +427,7 @@ void main() {
     await b.finish();
   });
 
-  test('a 1 slot ring gives code 5', () async {
+  test('a 1 slot ring gives code 10', () async {
     final b = await DmaBench.create(_ringOnly, seed: 62);
     await b.start();
     await b.setupDescRing(_ring, 0);
@@ -438,10 +437,29 @@ void main() {
     expect(b.recordWrites(0), isEmpty);
     await b.doorbell(0);
     await b.waitRecordWrites(0, 1);
-    expect(b.record(0).code, HarborPcieDma.errorAlignment);
+    expect(b.record(0).code, HarborPcieDma.errorDescRing);
     expect(b.record(0).cookie, 0);
     expect(b.fetches, isEmpty);
-    expect(await _status(b) >> 8 & 0xff, HarborPcieDma.errorAlignment);
+    expect(await _status(b) >> 8 & 0xff, HarborPcieDma.errorDescRing);
+    expect(b.irqPending, 1);
+    await b.finish();
+  });
+
+  test('a descriptor ring past 2^64 gives code 10 and no fetch', () async {
+    final b = await DmaBench.create(_ringOnly, seed: 64);
+    await b.start();
+    await b.setupDescRing(0xffffffffffffff00, 4);
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable(mask: HarborPcieDma.causeError);
+    await b.cycles(50);
+    expect(b.recordWrites(0), isEmpty);
+    await b.doorbell(1);
+    await b.waitRecordWrites(0, 1);
+    expect(b.record(0).code, HarborPcieDma.errorDescRing);
+    expect(b.record(0).cookie, 0);
+    expect(b.fetches, isEmpty);
+    expect(b.reads, isEmpty);
+    expect(await _status(b) >> 8 & 0xff, HarborPcieDma.errorDescRing);
     expect(b.irqPending, 1);
     await b.finish();
   });
@@ -668,7 +686,10 @@ Future<void> _ringMix(DmaConfig config, int count) async {
   final jobs = <(int, int, int, bool)>[];
   for (var i = 0; i < count; i++) {
     final roll = random.nextInt(10);
-    final len = roll == 0 ? 4 * random.nextInt(513) : 4 * random.nextInt(97);
+    // Length 0 is refused with code 9, so the mix has none.
+    final len = roll == 0
+        ? 4 * (1 + random.nextInt(512))
+        : 4 * (1 + random.nextInt(96));
     final h =
         (random.nextBool() ? hostBase : hostHigh) +
         4 * random.nextInt((hostSpan - len) ~/ 4 + 1);
@@ -842,7 +863,7 @@ Future<void> _fetchErrors(int width) async {
   recordCount++;
   await b.waitRecordWrites(0, recordCount);
   expect(b.fetches, hasLength(cases.length));
-  await expectHalt(HarborPcieDma.errorAlignment, 'tail');
+  await expectHalt(HarborPcieDma.errorDescRing, 'tail');
 
   // The late answer to the read that timed out matches nothing.
   b.injected.add(dropped!);

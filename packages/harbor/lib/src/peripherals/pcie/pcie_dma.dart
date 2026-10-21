@@ -109,8 +109,27 @@ class HarborPcieDma extends BridgeModule {
   static const errorTimeout = 2;
   static const errorPoisoned = 3;
   static const errorFabric = 4;
-  static const errorAlignment = 5;
+
+  /// The local range does not fit in the fabric address space.
+  static const errorLocalRange = 5;
   static const errorLength = 6;
+
+  /// A host address, local address or length is not a multiple of 4.
+  static const errorAlignment = 7;
+
+  /// The host range crosses 2^64.
+  static const errorHostRange = 8;
+
+  /// The length is 0.
+  static const errorZeroLength = 9;
+
+  /// The descriptor ring is not valid: log2 size 0 with a doorbell, a tail
+  /// outside the ring, or base + size past 2^64.
+  static const errorDescRing = 10;
+
+  /// The completion ring is not valid: log2 size 0, or base + size past
+  /// 2^64. The engine halts with no record.
+  static const errorCplRing = 11;
 
   /// Bit 31 of the record status DW.
   static const recordPhase = 1 << 31;
@@ -795,6 +814,12 @@ class HarborPcieDma extends BridgeModule {
     // The local range must fit in the fabric address space.
     final localEnd = (lAddr.zeroExtend(aw + 33) + left.zeroExtend(aw + 33))
         .named('local_end');
+    Logic wrapsPast64(Logic base, Logic bytes) {
+      final end = base.zeroExtend(66) + bytes.zeroExtend(66);
+      return end.slice(65, 64).or() & end.slice(63, 0).or() | end[65];
+    }
+
+    final hostWraps = wrapsPast64(hAddr, left).named('host_wraps');
 
     // Completion ring.
     final cplNext = ((cplTail + 1) & cplMask).named('cpl_next');
@@ -1115,13 +1140,15 @@ class HarborPcieDma extends BridgeModule {
         ~resetReq &
         fErr.eq(0) &
         ~selPending;
-    final fStart = (fMay & ~badTail & busMasterEnable & ~fN.eq(0)).named(
-      'f_start',
-    );
+    final descWraps = wrapsPast64(
+      descBase,
+      (Const(32, width: 21) << descLog).zeroExtend(64),
+    ).named('desc_wraps');
+    final fStart = (fMay & ~badTail & ~descWraps & busMasterEnable & ~fN.eq(0))
+        .named('f_start');
     // A ring of 1 slot can hold no descriptor.
-    final fBadTail = (fMay & (badTail | descRung & descLog.eq(0))).named(
-      'f_bad_tail',
-    );
+    final fBadTail = (fMay & (badTail | descRung & (descLog.eq(0) | descWraps)))
+        .named('f_bad_tail');
 
     // Fetch completions. They come in address order, so DW k of the read
     // goes to f_buf_k.
@@ -1178,7 +1205,7 @@ class HarborPcieDma extends BridgeModule {
       ...fFill,
       Case(fState, [
         CaseItem(Const(fIdle, width: 2), [
-          If(fBadTail, then: [fErr < errorAlignment]),
+          If(fBadTail, then: [fErr < errorDescRing]),
           If(
             fStart,
             then: [
@@ -1238,17 +1265,23 @@ class HarborPcieDma extends BridgeModule {
     ];
 
     // Interrupt causes.
-    // A completion ring of 1 slot is always full, so the engine halts with
-    // code 5 before it starts, and writes no record.
+    // A completion ring of 1 slot is always full, and a ring past 2^64 has
+    // no valid record address. The engine halts with code 11 before it
+    // starts and writes no record. The error cause still rises.
     final startWanted =
         (enable & ~halted & ~resetReq & ~qCount.eq(0) |
                 (ringSource
                     ? enable & ~halted & ~resetReq & ~fErr.eq(0)
                     : Const(0)))
             .named('start_wanted');
-    final cplSizeBad = (inState(sIdle) & startWanted & cplLog.eq(0)).named(
-      'cpl_size_bad',
+    final cplWraps = wrapsPast64(
+      cplBase,
+      (Const(16, width: 20) << cplLog).zeroExtend(64),
     );
+    final cplSizeBad =
+        (inState(sIdle) & startWanted & (cplLog.eq(0) | cplWraps)).named(
+          'cpl_ring_bad',
+        );
     final doneSet = recDone & code.eq(0) & dFlags[1];
     final errSet = recDone & ~code.eq(0) | cplSizeBad;
     final sets = [
@@ -1629,7 +1662,7 @@ class HarborPcieDma extends BridgeModule {
             CaseItem(Const(sIdle, width: 4), [
               If.block([
                 Iff(resetReq, [If(engReset, then: engineReset())]),
-                ElseIf(cplSizeBad, [halted < 1, errCode < errorAlignment]),
+                ElseIf(cplSizeBad, [halted < 1, errCode < errorCplRing]),
                 ElseIf(enable & ~halted & ~qCount.eq(0), [state < sLoad]),
                 // A fetch error gets a record after the queue is empty.
                 if (ringSource)
@@ -1658,12 +1691,18 @@ class HarborPcieDma extends BridgeModule {
                 Iff(
                   hAddr.slice(1, 0).or() |
                       lAddr.slice(1, 0).or() |
-                      dLocalBad |
-                      localEnd.gt(Const(BigInt.one << aw, width: aw + 33)) |
                       left.slice(1, 0).or(),
                   [code < errorAlignment, state < sRecWait],
                 ),
-                ElseIf(left.eq(0), [state < sRecWait]),
+                ElseIf(left.eq(0), [code < errorZeroLength, state < sRecWait]),
+                // The ends are one bit wider than the address, so no range
+                // wraps past these checks.
+                ElseIf(
+                  dLocalBad |
+                      localEnd.gt(Const(BigInt.one << aw, width: aw + 33)),
+                  [code < errorLocalRange, state < sRecWait],
+                ),
+                ElseIf(hostWraps, [code < errorHostRange, state < sRecWait]),
                 ElseIf(dFlags[0], [state < sChunk]),
                 Else([state < sH2d]),
               ]),

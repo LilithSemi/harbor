@@ -66,7 +66,6 @@ void main() {
         (0x80002000, 0x03004, 132),
         (0x80003f40, 0x04008, 0x180),
         (0x180004104, 0x0500c, 1000),
-        (0x80006000, 0x06000, 0),
         (0x80008004, 0x08008, 0x2000),
       ];
       for (final (h, _, len) in jobs) {
@@ -601,7 +600,6 @@ void main() {
         (0x80002000, 0x03004, 132),
         (0x80003f40, 0x04008, 0x180),
         (0x180004104, 0x0500c, 1000),
-        (0x80006000, 0x06000, 0),
       ];
       for (final (i, (h, l, len)) in jobs.indexed) {
         await b.push(
@@ -711,23 +709,39 @@ void main() {
     await b.finish();
   });
 
-  test('bad alignment gives code 5, halt, reset', () async {
+  test('refused descriptors give their code, halt, reset', () async {
     final b = await DmaBench.create(
       const DmaConfig(width: 128, dataWidth: 128),
     );
     await b.start();
     await b.setupRing(dmaCplBase, 4);
     await b.enable(mask: HarborPcieDma.causeError);
+    const align = HarborPcieDma.errorAlignment;
+    const local = HarborPcieDma.errorLocalRange;
+    const host = HarborPcieDma.errorHostRange;
+    const zero = HarborPcieDma.errorZeroLength;
     final bad = [
-      (0x80000002, 0x0, 8, true),
-      (0x80000000, 0x1, 8, true),
-      (0x80000000, 0x0, 6, true),
-      (0x80000000, 0x2, 8, false),
-      // Local ranges that do not fit in 20 address bits.
-      (0x80000000, 0xffff0, 0x20, true),
-      (0x80000000, 1 << 32, 8, true),
+      (0x80000002, 0x0, 8, true, align),
+      (0x80000000, 0x1, 8, true, align),
+      (0x80000000, 0x0, 6, true, align),
+      (0x80000000, 0x2, 8, false, align),
+      (0x80000000, 0x0, 0, true, zero),
+      (0x80000000, 0x0, 0, false, zero),
+      // Local ranges that do not fit in 20 address bits, also at the top
+      // edge, where a narrow sum would wrap.
+      (0x80000000, 0xffff0, 0x20, true, local),
+      (0x80000000, 0xffffc, 8, true, local),
+      (0x80000000, 0xffffc, 8, false, local),
+      (0x80000000, 1 << 32, 8, true, local),
+      // Host ranges that cross 2^64.
+      (0xfffffffffffff000, 0x0, 0x2000, true, host),
+      (0xfffffffffffff000, 0x0, 0x2000, false, host),
+      (0xfffffffffffffffc, 0x0, 8, true, host),
     ];
-    for (final (i, (h, l, len, d2h)) in bad.indexed) {
+    for (final (i, (h, l, len, d2h, want)) in bad.indexed) {
+      final writes = b.memory.writeBeats;
+      final reads = b.memory.readBeats;
+      final packets = b.sink.received.length;
       await b.push(
         hostAddress: h,
         localAddress: l,
@@ -739,14 +753,18 @@ void main() {
       // An engine reset starts the ring again at slot 0.
       await b.waitRecordWrites(0, i + 1);
       final r = b.record(0);
-      expect(r.code, HarborPcieDma.errorAlignment, reason: 'case $i');
+      expect(r.code, want, reason: 'case $i');
+      // Nothing but the record goes out, and the fabric is not touched.
+      expect(b.memory.writeBeats, writes, reason: 'case $i');
+      expect(b.memory.readBeats, reads, reason: 'case $i');
+      expect(b.sink.received.length, packets + 1, reason: 'case $i');
       expect(r.cookie, 0x50 + i);
       expect(r.bytes, 0);
       await b.cycles(100);
       expect(b.recordWrites(1), isEmpty, reason: 'halted, case $i');
       final status = await b.readReg(HarborPcieDma.registerStatus);
       expect(status & HarborPcieDma.statusHalted, isNonZero);
-      expect(status >> 8 & 0xff, HarborPcieDma.errorAlignment);
+      expect(status >> 8 & 0xff, want);
       expect(status >> 16, 63);
       expect(status & HarborPcieDma.statusBusy, 0);
       expect(
@@ -771,6 +789,51 @@ void main() {
     b.checkCopy(0x80001000, 0, 4);
     await b.finish();
   });
+
+  for (final aw in [20, 32]) {
+    test('local ranges at the top of $aw address bits', () async {
+      final b = await DmaBench.create(DmaConfig(addressWidth: aw));
+      await b.start();
+      await b.setupRing(dmaCplBase, 4);
+      await b.enable(mask: HarborPcieDma.causeError);
+      final top = 1 << aw;
+      // A range that ends at the top fits, both ways.
+      b.seedHost(0x80002000, 0x1000);
+      await b.push(
+        hostAddress: 0x80001000,
+        localAddress: top - 0x1000,
+        length: 0x1000,
+        cookie: 1,
+      );
+      await b.push(
+        hostAddress: 0x80002000,
+        localAddress: top - 0x2000,
+        length: 0x1000,
+        deviceToHost: false,
+        cookie: 2,
+      );
+      await b.waitRecordWrites(1, 1);
+      expect([b.record(0).code, b.record(1).code], [0, 0]);
+      b.checkCopy(0x80001000, top - 0x1000, 0x1000);
+      b.checkLocal(0x80002000, top - 0x2000, 0x1000);
+      // One DW past the top is refused, with no fabric access.
+      final writes = b.memory.writeBeats;
+      final reads = b.memory.readBeats;
+      await b.push(
+        hostAddress: 0x80003000,
+        localAddress: top - 4,
+        length: 8,
+        cookie: 3,
+      );
+      await b.waitRecordWrites(2, 1);
+      expect(b.record(2).code, HarborPcieDma.errorLocalRange);
+      expect(b.record(2).bytes, 0);
+      expect(b.memory.writeBeats, writes);
+      expect(b.memory.readBeats, reads);
+      expect(b.host.memory.read(0x80003000, 8), everyElement(0));
+      await b.finish();
+    });
+  }
 
   test('a fabric error gives code 4 and halts', () async {
     final b = await DmaBench.create(const DmaConfig());
