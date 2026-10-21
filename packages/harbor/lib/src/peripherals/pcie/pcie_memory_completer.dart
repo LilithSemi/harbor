@@ -100,7 +100,17 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       downstream: rxs,
       name: 'rx_register',
     );
-    final txs = HarborPcieStream.addSource(this, tx);
+    // A register stage on TX keeps the completion beat logic away from the
+    // router mux and the endpoint.
+    final txOut = HarborPcieStream.addSource(this, tx);
+    final txs = HarborPcieStream(width: width, name: 'tx_reg');
+    HarborPcieStreamRegister(
+      clk: clk,
+      reset: reset,
+      upstream: txs,
+      downstream: txOut,
+      name: 'tx_register',
+    );
 
     memory = HarborMemoryMasterPort.create(
       module: this,
