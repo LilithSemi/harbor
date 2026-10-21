@@ -4,6 +4,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../../bus/port/fabric_kind.dart';
 import '../../bus/port/memory_port.dart';
 import '../../bus/port/memory_waist.dart';
+import 'pcie_endpoint.dart';
 import 'pcie_stream.dart';
 
 /// Gives the host access to local memory through a memory BAR.
@@ -70,15 +71,18 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     this.fabricKind = HarborFabricKind.axi4,
     this.dataWidth = 64,
     this.addressWidth = 32,
-    this.barBytes = 16 << 20,
+    HarborPcieEndpointConfig? endpointConfig,
+    int? barBytes,
     this.memoryOffset = 0,
     this.barHitBit = 4,
     this.maxPayloadBytes = 256,
     String? name,
   }) : width = rx.width,
+       barBytes = _barSize(endpointConfig, barBytes),
        super(
          'HarborPcieMemoryCompleter_W${rx.width}_D${dataWidth}_A$addressWidth'
-         '_${fabricKind.name}_S${barBytes.toRadixString(16)}'
+         '_${fabricKind.name}'
+         '_S${_barSize(endpointConfig, barBytes).toRadixString(16)}'
          '_O${memoryOffset.toRadixString(16)}_B${barHitBit}_P$maxPayloadBytes',
          name: name ?? 'pcie_memory_completer',
        ) {
@@ -124,6 +128,23 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       reset: reset,
     );
     _build(clk, reset, maxPayload, rcb128, completerId, rxs, txs);
+  }
+
+  /// The BAR size: the BAR2 size of [endpoint] when it is given, else
+  /// [barBytes], else 16 MB. With both, they must be equal.
+  static int _barSize(HarborPcieEndpointConfig? endpoint, int? barBytes) {
+    if (endpoint == null) return barBytes ?? 16 << 20;
+    if (endpoint.bar2Bytes == 0) {
+      throw ArgumentError('the endpoint config has no BAR2');
+    }
+    if (barBytes != null && barBytes != endpoint.bar2Bytes) {
+      throw ArgumentError.value(
+        barBytes,
+        'barBytes',
+        'differs from the endpoint BAR2 size ${endpoint.bar2Bytes}',
+      );
+    }
+    return endpoint.bar2Bytes;
   }
 
   static int _log2(int v) => v.bitLength - 1;

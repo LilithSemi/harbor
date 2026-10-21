@@ -358,6 +358,35 @@ Future<void> _mixed(
 void main() {
   tearDown(() async => Simulator.reset());
 
+  test('the BAR size comes from the endpoint BAR2 size', () {
+    HarborPcieMemoryCompleter make({
+      HarborPcieEndpointConfig? endpoint,
+      int? barBytes,
+    }) => HarborPcieMemoryCompleter(
+      clk: Logic(),
+      reset: Logic(),
+      maxPayload: Logic(width: 3),
+      rcb128: Logic(),
+      completerId: Logic(width: 16),
+      rx: HarborPcieStream(width: 64),
+      tx: HarborPcieStream(width: 64),
+      endpointConfig: endpoint,
+      barBytes: barBytes,
+    );
+    const bar2 = HarborPcieEndpointConfig(bar2Bytes: 1 << 20);
+    expect(make(endpoint: bar2).barBytes, 1 << 20);
+    expect(make(endpoint: bar2, barBytes: 1 << 20).barBytes, 1 << 20);
+    expect(make(endpoint: bar2).definitionName, contains('_S100000_'));
+    expect(() => make(endpoint: bar2, barBytes: 16 << 20), throwsArgumentError);
+    expect(
+      () => make(endpoint: const HarborPcieEndpointConfig()),
+      throwsArgumentError,
+      reason: 'no BAR2',
+    );
+    expect(make(barBytes: 1 << 16).barBytes, 1 << 16);
+    expect(make().barBytes, 16 << 20);
+  });
+
   test('definition names differ per parameter set', () async {
     String nameOf(_Config c) => HarborPcieMemoryCompleter(
       clk: Logic(),

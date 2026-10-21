@@ -38,6 +38,15 @@ const ax7203InfoWords = [0x47504755, 0x00000001];
 const ax7203IrqLines = 1;
 const ax7203MsiVectors = 2;
 
+/// The endpoint config. The completer takes its BAR2 size from it.
+const ax7203EndpointConfig = HarborPcieEndpointConfig(
+  classCode: 0x038000,
+  packetMemoryEntries: 1024,
+  optionRomBytes: ax7203OptionRomBytes,
+  bar2Bytes: 16 << 20,
+  msiVectors: ax7203MsiVectors,
+);
+
 class Ax7203PcieGpu extends BridgeModule {
   late final HarborPcieEndpoint endpoint;
   late final HarborPcieDma dma;
@@ -74,13 +83,7 @@ class Ax7203PcieGpu extends BridgeModule {
       txLast: down.last,
       txValid: down.valid,
       irqPending: irqPending,
-      config: const HarborPcieEndpointConfig(
-        classCode: 0x038000,
-        packetMemoryEntries: 1024,
-        optionRomBytes: ax7203OptionRomBytes,
-        bar2Bytes: 16 << 20,
-        msiVectors: ax7203MsiVectors,
-      ),
+      config: ax7203EndpointConfig,
     );
     up.data <= endpoint.rxData;
     up.keep <= endpoint.rxKeep;
@@ -147,6 +150,7 @@ class Ax7203PcieGpu extends BridgeModule {
         completerId: endpoint.completerId,
         rx: memRx,
         tx: memTx,
+        endpointConfig: ax7203EndpointConfig,
         addressWidth: ax7203LocalAddressWidth,
       ),
     );

@@ -16,6 +16,12 @@ const gpuBar0 = 0xf7000000;
 const gpuBar2 = 0x3800000000;
 const gpuRom = 0xf7100000;
 const gpuRomBytes = 4096;
+
+/// The endpoint the bench stands for. The completer takes its BAR2 size.
+const gpuEndpointConfig = HarborPcieEndpointConfig(
+  bar2Bytes: 16 << 20,
+  msiVectors: 2,
+);
 const gpuInfoWords = [0x47504955, 0x00010002, 0, 0xdeadbeef];
 
 int gpuRomWord(int index) => (index * 0x01030507 + 0x55aa1234) & 0xffffffff;
@@ -123,6 +129,7 @@ class PcieGpuTop extends BridgeModule {
       completerId: completerId,
       rx: memRx,
       tx: memTx,
+      endpointConfig: gpuEndpointConfig,
       dataWidth: width,
       addressWidth: gpuAddressWidth,
     );
