@@ -27,10 +27,10 @@ import 'pcie_stream.dart';
 /// two more base moves once the read has ended.
 ///
 /// A completion for a tag that is not in flight, or one in an abort cycle,
-/// is dropped and counted in `stale_count`. A completion for a tag in flight with an error gives
-/// `err` in the next cycle with code 1 (status not SC), 3 (poisoned) or 6
-/// (length, byte count or lower address does not fit). A tag that waits
-/// [timeoutCycles] gives code 2 one cycle later.
+/// is dropped and counted in `stale_count`. A completion for a tag in
+/// flight with an error gives `err` in the next cycle with code 1 (status
+/// not SC), 3 (poisoned) or 6 (length, byte count or lower address does not
+/// fit). A tag that waits [timeoutCycles] gives code 2 one cycle later.
 class HarborPcieDmaTags extends Module {
   static const codeCompletion = 1;
   static const codeTimeout = 2;
