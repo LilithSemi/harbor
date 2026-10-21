@@ -230,7 +230,6 @@ class GpuDesc {
 /// A whole-system bench: host model, router and all clients.
 class PcieGpuBench {
   final int width;
-  final bool withRom;
   final PcieGpuTop top;
   final Logic clk;
   final Logic reset;
@@ -253,7 +252,6 @@ class PcieGpuBench {
 
   PcieGpuBench._(
     this.width,
-    this.withRom,
     this.top,
     this.clk,
     this.reset,
@@ -268,7 +266,6 @@ class PcieGpuBench {
   );
 
   static Future<PcieGpuBench> create(int width, {int seed = 3}) async {
-    final withRom = width == 64;
     final clk = SimpleClockGenerator(10).clk;
     final reset = Logic(name: 'reset');
     final completerId = Logic(name: 'completer_id', width: 16);
@@ -295,7 +292,7 @@ class PcieGpuBench {
       interruptDisable: intDisable,
       interruptRdyN: rdyN,
       irqLine: irqLine,
-      withRom: withRom,
+      withRom: true,
     );
     await top.build();
     top.input('clk').srcConnection! <= clk;
@@ -315,7 +312,6 @@ class PcieGpuBench {
     final host = PcieHostModel(seed: seed, maxPayload: 256);
     final bench = PcieGpuBench._(
       width,
-      withRom,
       top,
       clk,
       reset,
@@ -344,7 +340,7 @@ class PcieGpuBench {
         seed: s,
       ).start();
     }
-    if (withRom) bench._romMemory();
+    bench._romMemory();
     return bench;
   }
 
@@ -504,9 +500,13 @@ class PcieGpuBench {
 class PcieGpuRun {
   final PcieGpuBench b;
   static const cplBase = 0x90000000;
-  static const cplLog = 10;
   static const descBase = 0x80000000;
-  static const descLog = 10;
+
+  /// Both rings have 128 slots, so 513 records and 512 descriptors wrap
+  /// each ring four times.
+  static const cplLog = 7;
+  static const descLog = 7;
+  static const ringSlots = 1 << 7;
   static const page = 4096;
   static const d2hLocal = 0x000000;
   static const h2dLocal = 0x100000;
@@ -515,12 +515,25 @@ class PcieGpuRun {
   static const bar2WindowBytes = 0x10000;
 
   final List<GpuDesc> descs = [];
+  final Map<int, bool> irqOfCookie = {1: true};
   final Map<int, int> shadow = {};
-  int recordsSeen = 0;
   int clearedAtPackets = 0;
   int bar2Writes = 0;
   int bar2Reads = 0;
   int bar2SourceReads = 0;
+  int romReads = 0;
+  int romReadsDuringDma = 0;
+  bool dmaDone = false;
+
+  // Driver state of the completion ring.
+  int cplHead = 0;
+  bool cplPhase = true;
+  int records = 0;
+  int phaseFlips = 0;
+
+  // Driver state of the descriptor ring, in descriptors written and taken.
+  int descWritten = 0;
+  int descTaken = 0;
 
   /// Bytes in each direction.
   final int size;
@@ -557,8 +570,23 @@ class PcieGpuRun {
         ),
       );
     }
-    for (final (slot, d) in descs.indexed) {
-      b.host.memory.write(descBase + 32 * slot, [
+    for (final d in descs) {
+      irqOfCookie[d.cookie] = d.irq;
+    }
+  }
+
+  /// Writes descriptors into free ring slots and rings the doorbell, as a
+  /// driver does. One slot stays empty, so a full ring is not empty.
+  Future<void> feedRing() async {
+    final head = await b.readReg(HarborPcieDma.registerDescHead);
+    descTaken += (head - descTaken) % ringSlots;
+    final free = ringSlots - 1 - (descWritten - descTaken);
+    final count = min(free, descs.length - descWritten);
+    if (count < 16 && descWritten + count < descs.length) return;
+    if (count == 0) return;
+    for (var i = descWritten; i < descWritten + count; i++) {
+      final d = descs[i];
+      b.host.memory.write(descBase + 32 * (i % ringSlots), [
         ...leBytes(d.host, 8),
         ...leBytes(d.local, 8),
         ...leBytes(d.length),
@@ -570,24 +598,47 @@ class PcieGpuRun {
         ...leBytes(0),
       ]);
     }
+    descWritten += count;
+    await b.writeReg(HarborPcieDma.registerDescTail, descWritten % ringSlots);
   }
 
-  DmaRecord record(int slot) =>
-      DmaRecord(b.host.memory.read(cplBase + 16 * slot, 16));
+  /// Takes every record whose phase bit is the expected one, checks it, and
+  /// gives the slots back, as a driver does.
+  Future<void> consumeRecords() async {
+    final start = records;
+    while (true) {
+      final r = DmaRecord(b.host.memory.read(cplBase + 16 * cplHead, 16));
+      if (r.phase != cplPhase) break;
+      final (cookie, bytes) = records == 0
+          ? (1, page)
+          : (descs[records - 1].cookie, descs[records - 1].length);
+      expect(r.cookie, cookie, reason: 'record $records');
+      expect(r.code, 0, reason: 'record $records');
+      expect(r.bytes, bytes, reason: 'record $records');
+      records++;
+      cplHead = (cplHead + 1) % ringSlots;
+      if (cplHead == 0) {
+        cplPhase = !cplPhase;
+        phaseFlips++;
+      }
+    }
+    if (records != start) {
+      await b.writeReg(HarborPcieDma.registerCplHead, cplHead);
+    }
+  }
 
-  /// Clears the causes and frees the record slots, as a driver does.
+  /// Clears the causes and takes the records, as a driver does.
   Future<void> serviceIrq() async {
     final cause = await b.readReg(HarborPcieDma.registerIrqCause);
     clearedAtPackets = b.sink.received.length;
     await b.writeReg(HarborPcieDma.registerIrqCause, cause);
-    final tail = await b.readReg(HarborPcieDma.registerCplTail);
-    await b.writeReg(HarborPcieDma.registerCplHead, tail);
     if (cause & HarborPcieDma.causeError != 0) {
       fail(
         'DMA error cause, STATUS 0x'
         '${(await b.readReg(HarborPcieDma.registerStatus)).toRadixString(16)}',
       );
     }
+    await consumeRecords();
   }
 
   /// Number of record writes with the IRQ flag in sink packets [from] to
@@ -598,23 +649,47 @@ class PcieGpuRun {
     for (var i = from; i < (to ?? received.length); i++) {
       final t = received[i];
       if (!t.kind.hasData || !t.kind.isRequest) continue;
-      final slot = (t.address - cplBase) ~/ 16;
-      if (t.address < cplBase || slot >= 1 << cplLog) continue;
-      final cookie = DmaRecord.le(t.data, 0);
-      if (slot == 0 && cookie == 1) {
-        n++;
-      } else if (slot >= 1 && descs[slot - 1].irq) {
-        n++;
+      if (t.address < cplBase || t.address >= cplBase + 16 * ringSlots) {
+        continue;
       }
+      if (irqOfCookie[DmaRecord.le(t.data, 0)] ?? false) n++;
     }
     return n;
   }
 
-  /// Random BAR2 writes and reads while [busy] holds.
+  /// Reads the expansion ROM and checks the data.
+  Future<void> romRead(int offset, int lengthDw) async {
+    final (request, c) = await b.read(
+      gpuRom + offset,
+      lengthDw,
+      user: HarborPcieStream.userRom,
+    );
+    final errors = pcieCheckReadCompletions(
+      request,
+      c,
+      rcb: 64,
+      maxPayload: 256,
+      completerId: dmaCompleterId,
+      read: (address, length) => Uint8List.fromList([
+        for (var i = 0; i < length; i++)
+          (gpuRomWord(((address + i) & 0xfff) ~/ 4) >>
+                  8 * ((address + i) & 3)) &
+              0xff,
+      ]),
+    );
+    if (errors.isNotEmpty) fail(errors.join('\n'));
+    romReads++;
+    if (!dmaDone) romReadsDuringDma++;
+  }
+
+  /// Random BAR2 writes and reads, and some ROM reads, while [busy] holds.
   Future<void> bar2Traffic(bool Function() busy) async {
-    while (busy() || bar2Reads < 8) {
+    for (var n = 0; busy() || bar2Reads < 8; n++) {
       final r = b.random;
-      if (r.nextBool()) {
+      if (n % 25 == 0) {
+        final dw = 1 + r.nextInt(24);
+        await romRead(r.nextInt(gpuRomBytes ~/ 4 - dw) * 4, dw);
+      } else if (r.nextBool()) {
         final dw = 1 + r.nextInt(64);
         final offset = bar2Window + r.nextInt(bar2WindowBytes ~/ 4 - dw) * 4;
         final data = [for (var i = 0; i < dw * 4; i++) r.nextInt(256)];
@@ -629,8 +704,9 @@ class PcieGpuRun {
         for (var d = 0; d < dw; d++) {
           final be = d == 0 ? firstBe : (d == dw - 1 ? lastBe : 0xf);
           for (var k = 0; k < 4; k++) {
-            if ((be >> k) & 1 == 1)
+            if ((be >> k) & 1 == 1) {
               shadow[offset + 4 * d + k] = data[4 * d + k];
+            }
           }
         }
         await b.send(tlp, user: HarborPcieStream.userBar2);
@@ -678,27 +754,7 @@ class PcieGpuRun {
     }
     expect(await b.readReg(0x100 + 4 * gpuInfoWords.length), 0);
 
-    if (b.withRom) {
-      final (request, c) = await b.read(
-        gpuRom + 0x40,
-        6,
-        user: HarborPcieStream.userRom,
-      );
-      final errors = pcieCheckReadCompletions(
-        request,
-        c,
-        rcb: 64,
-        maxPayload: 256,
-        completerId: dmaCompleterId,
-        read: (address, length) => Uint8List.fromList([
-          for (var i = 0; i < length; i++)
-            (gpuRomWord(((address + i) & 0xfff) ~/ 4) >>
-                    8 * ((address + i) & 3)) &
-                0xff,
-        ]),
-      );
-      if (errors.isNotEmpty) fail(errors.join('\n'));
-    }
+    await romRead(0x40, 6);
 
     buildSgList();
     await b.writeReg(HarborPcieDma.registerCplBaseLow, cplBase);
@@ -733,8 +789,7 @@ class PcieGpuRun {
     expect(b.host.msis.first, 0);
     expect(irqRecords(0, b.msiLog.first.$2), 1);
     await serviceIrq();
-    expect(record(0).cookie, 1);
-    expect(record(0).code, 0);
+    expect(records, 1);
 
     // Then the SG list through the host ring.
     await b.writeReg(
@@ -745,21 +800,13 @@ class PcieGpuRun {
             HarborPcieDma.statusRingSource) ==
         0) {}
 
-    var dmaDone = false;
     final traffic = bar2Traffic(() => !dmaDone);
     var handled = 1;
-    var tail = 0;
     var lineDone = false;
     final total = descs.length;
-    while (true) {
-      if (tail < total) {
-        final head = await b.readReg(HarborPcieDma.registerDescHead);
-        if (tail - head < 64) {
-          tail = min(total, tail + 128);
-          await b.writeReg(HarborPcieDma.registerDescTail, tail);
-        }
-      }
-      if (!lineDone && tail >= total ~/ 2) {
+    while (records < total + 1) {
+      if (descWritten < total) await feedRing();
+      if (!lineDone && descWritten >= total ~/ 2) {
         b.irqLine.inject(1);
         // An MSI waits while TX is busy, so this can wait for the queue.
         await b.waitUntil(
@@ -777,19 +824,16 @@ class PcieGpuRun {
         }
         handled++;
         await serviceIrq();
+      } else {
+        // Polling also takes records, so the ring never stays full.
+        await consumeRecords();
       }
-      final done = await b.readReg(HarborPcieDma.registerCplTail);
-      if (done == total + 1) break;
       for (var i = 0; i < 200; i++) {
         await b.clk.nextPosedge;
       }
     }
     dmaDone = true;
     await traffic;
-    await b.waitUntil(
-      () => record(total).cookie == descs.last.cookie,
-      what: 'last record',
-    );
     // A done event can fall between the cause read and its clear, so wait
     // for MSIs until none comes.
     while (true) {
@@ -801,15 +845,15 @@ class PcieGpuRun {
       await serviceIrq();
     }
 
-    // Records, data and counters.
-    for (var slot = 1; slot <= total; slot++) {
-      final r = record(slot);
-      final d = descs[slot - 1];
-      expect(r.cookie, d.cookie, reason: 'slot $slot');
-      expect(r.code, 0, reason: 'slot $slot');
-      expect(r.bytes, d.length, reason: 'slot $slot');
-      expect(r.phase, true, reason: 'slot $slot');
-    }
+    // Both rings wrapped, records came in order with the right phase.
+    expect(records, total + 1);
+    expect(phaseFlips, greaterThanOrEqualTo(2));
+    expect(descWritten ~/ ringSlots, greaterThanOrEqualTo(2));
+    expect(
+      await b.readReg(HarborPcieDma.registerCplTail),
+      (total + 1) % ringSlots,
+    );
+    expect(await b.readReg(HarborPcieDma.registerDescHead), total % ringSlots);
     for (var k = 0; k < page; k++) {
       expect(
         b.host.memory.read(0x70000000 + k, 1).single,
@@ -841,6 +885,7 @@ class PcieGpuRun {
     expect(b.host.msis.where((v) => v > 1), isEmpty);
     expect(bar2SourceReads, greaterThan(0));
     expect(bar2Writes, greaterThan(0));
+    expect(romReadsDuringDma, greaterThan(0));
     await b.finish();
   }
 }
