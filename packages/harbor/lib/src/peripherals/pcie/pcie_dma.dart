@@ -779,7 +779,11 @@ class HarborPcieDma extends BridgeModule {
       maxReadRequest,
     );
     final mrrBytes = Const(128, width: 13) << mrrCode;
-    reqBytes <= _min(_min(left13, mrrBytes), toPage);
+    // The read size is registered. A read does not start in the cycle after
+    // the one before it, when the register still holds the old size.
+    final reqNext = _min(_min(left13, mrrBytes), toPage).named('req_next');
+    final reqStale = Logic(name: 'req_stale');
+    Sequential(clk, [reqBytes < reqNext, reqStale < issueGo], reset: reset);
 
     // Fabric reads.
     Logic laneOf(Logic addr) => dpb == 1
@@ -998,11 +1002,15 @@ class HarborPcieDma extends BridgeModule {
     final wrespErr = inH2d & inD(dResp) & bFire & mem.wrespErr;
     final errNow = (inH2d & tags.err | wrespErr).named('err_now');
     final dSafe = (~iBusy & inD(dIdle)).named('d_safe');
+    // The tags give an error one cycle late, so no read starts in a cycle
+    // that can give one.
     issueGo <=
         inH2d &
             ~iBusy &
             code.eq(0) &
             ~errNow &
+            ~tags.errAhead &
+            ~reqStale &
             ~resetReq &
             ~left.eq(0) &
             tags.issueReady &
@@ -1694,7 +1702,11 @@ class HarborPcieDma extends BridgeModule {
               Case(dState, [
                 CaseItem(Const(dIdle, width: 3), [
                   If(
-                    code.eq(0) & ~errNow & ~resetReq & tags.headReady,
+                    code.eq(0) &
+                        ~errNow &
+                        ~tags.errAhead &
+                        ~resetReq &
+                        tags.headReady,
                     then: [
                       dSlot < tags.headSlot,
                       dLen < tags.headLen,

@@ -28,9 +28,9 @@ import 'pcie_stream.dart';
 ///
 /// A completion for a tag that is not in flight is dropped and counted in
 /// `stale_count`. A completion for a tag in flight with an error gives
-/// `err` with code 1 (status not SC), 3 (poisoned) or 6 (length, byte count
-/// or lower address does not fit). A tag that waits [timeoutCycles] gives
-/// code 2.
+/// `err` in the next cycle with code 1 (status not SC), 3 (poisoned) or 6
+/// (length, byte count or lower address does not fit). A tag that waits
+/// [timeoutCycles] gives code 2 one cycle later.
 class HarborPcieDmaTags extends Module {
   static const codeCompletion = 1;
   static const codeTimeout = 2;
@@ -66,6 +66,10 @@ class HarborPcieDmaTags extends Module {
   Logic get busy => output('busy');
   Logic get err => output('err');
   Logic get errCode => output('err_code');
+
+  /// High in a cycle that can give [err] in the next cycle: a completion
+  /// header for a tag in flight, or a timeout.
+  Logic get errAhead => output('err_ahead');
   Logic get staleCount => output('stale_count');
 
   /// DWs at `rd_index` and later of slot `rd_slot`, one cycle after them.
@@ -205,15 +209,25 @@ class HarborPcieDmaTags extends Module {
     final sRecv = [
       for (var i = 0; i < readTags; i++) Logic(name: 'recv_$i', width: 13),
     ];
-    final sHost = [
-      for (var i = 0; i < readTags; i++) Logic(name: 'host_$i', width: 7),
-    ];
     final sLocal = [
       for (var i = 0; i < readTags; i++)
         Logic(name: 'local_$i', width: addressWidth),
     ];
     final sTimer = [
       for (var i = 0; i < readTags; i++) Logic(name: 'timer_$i', width: tw),
+    ];
+    // Per slot values for the completion check, kept in registers so that
+    // the check has no adder: the tag value (base + i), the bytes still to
+    // come (len - recv) and the lower address of the next completion (host
+    // + recv, mod 128).
+    final sTag = [
+      for (var i = 0; i < readTags; i++) Logic(name: 'tag_$i', width: 5),
+    ];
+    final sRem = [
+      for (var i = 0; i < readTags; i++) Logic(name: 'rem_$i', width: 13),
+    ];
+    final sExp = [
+      for (var i = 0; i < readTags; i++) Logic(name: 'exp_$i', width: 7),
     ];
 
     Logic next(Logic p) => readTags == 1 << sw
@@ -236,23 +250,26 @@ class HarborPcieDmaTags extends Module {
 
     // Completion header.
     final tag = tlpCplTag(header);
-    final rel = (tag.slice(4, 0) - base).named('cpl_rel');
     final low = tag.slice(7, 5).eq(0);
-    final inRange = low & rel.lt(readTags);
-    final sel = rel.slice(sw - 1, 0).named('cpl_slot');
-    final hit = (inRange & sel.selectFrom(sBusy, defaultValue: Const(0))).named(
-      'cpl_hit',
-    );
+    final match = [
+      for (var i = 0; i < readTags; i++)
+        (low & sBusy[i] & tag.slice(4, 0).eq(sTag[i])).named('cpl_match_$i'),
+    ];
+    Logic pickSlot(List<Logic> values) => [
+      for (var i = 0; i < readTags; i++)
+        match[i].replicate(values[i].width) & values[i],
+    ].reduce((a, b) => a | b);
+    final sel = pickSlot([
+      for (var i = 0; i < readTags; i++) Const(i, width: sw),
+    ]).named('cpl_slot');
+    final hit = match.reduce((a, b) => a | b).named('cpl_hit');
     final rsvTag = Logic(name: 'rsv_tag', width: 5);
     final rsvHit = reservedTags == 0
         ? Const(0)
         : (low & reservedBusy & tag.slice(4, 0).eq(rsvTag)).named(
             'cpl_reserved',
           );
-    final selLen = sel.selectFrom(sLen, defaultValue: Const(0, width: 13));
-    final selRecv = sel.selectFrom(sRecv, defaultValue: Const(0, width: 13));
-    final selHost = sel.selectFrom(sHost, defaultValue: Const(0, width: 7));
-    final rem = (selLen - selRecv).named('cpl_rem');
+    final selRecv = pickSlot(sRecv).named('cpl_recv');
     final bc = tlpByteCount(header);
     final bc13 = mux(bc.eq(0), Const(4096, width: 13), bc.zeroExtend(13));
     final lenDw = tlpLength(header);
@@ -261,7 +278,8 @@ class HarborPcieDmaTags extends Module {
       Const(4096, width: 13),
       lenDw.zeroExtend(13) << 2,
     ).named('cpl_bytes');
-    final expLow = (selHost + selRecv.slice(6, 0)).named('cpl_exp_low');
+    final rem = pickSlot(sRem).named('cpl_rem');
+    final expLow = pickSlot(sExp).named('cpl_exp_low');
     final bad =
         ~tlpHasData(header) |
         len13.gt(rem) |
@@ -286,9 +304,23 @@ class HarborPcieDmaTags extends Module {
         sBusy[i] & ~sDone[i] & sTimer[i].eq(timeoutCycles - 1),
     ];
     final timeout = expired.reduce((a, b) => a | b).named('timeout');
-    addOutput('err') <= cplErr | timeout;
-    addOutput('err_code', width: 3) <=
-        mux(cplErr, cplCode, Const(codeTimeout, width: 3));
+    // The error is registered, so the abort it causes in the engine is not
+    // in the same cycle as the completion check.
+    final errReg = Logic(name: 'err_reg');
+    final errCodeReg = Logic(name: 'err_code_reg', width: 3);
+    Sequential(clk, [
+      If(
+        reset | abort,
+        then: [errReg < 0, errCodeReg < 0],
+        orElse: [
+          errReg < (cplErr | timeout),
+          errCodeReg < mux(cplErr, cplCode, Const(codeTimeout, width: 3)),
+        ],
+      ),
+    ]);
+    addOutput('err') <= errReg;
+    addOutput('err_code', width: 3) <= errCodeReg;
+    addOutput('err_ahead') <= cplHeader & hit | timeout;
     addOutput('reserved_cpl') <= cplHeader & rsvHit;
 
     // Payload writes. The header beat holds the first payload DW.
@@ -368,9 +400,16 @@ class HarborPcieDmaTags extends Module {
         then: [
           If(
             reset,
-            then: [base < 0],
+            then: [base < 0, for (var i = 0; i < readTags; i++) sTag[i] < i],
             orElse: [
-              If(inFlight, then: [base < base + slots]),
+              If(
+                inFlight,
+                then: [
+                  base < base + slots,
+                  for (var i = 0; i < readTags; i++)
+                    sTag[i] < sTag[i] + (slots & 31),
+                ],
+              ),
             ],
           ),
           allocPtr < 0,
@@ -408,7 +447,8 @@ class HarborPcieDmaTags extends Module {
                 sDone[i] < 0,
                 sLen[i] < issueLen,
                 sRecv[i] < 0,
-                sHost[i] < issueHostLow,
+                sRem[i] < issueLen,
+                sExp[i] < issueHostLow,
                 sLocal[i] < issueLocal,
                 sTimer[i] < 0,
               ]),
@@ -416,9 +456,11 @@ class HarborPcieDmaTags extends Module {
               Else([
                 If(sBusy[i] & ~sDone[i], then: [sTimer[i] < sTimer[i] + 1]),
                 If(
-                  cplGood & sel.eq(i),
+                  cplGood & match[i],
                   then: [
                     sRecv[i] < sRecv[i] + len13,
+                    sRem[i] < sRem[i] - len13,
+                    sExp[i] < sExp[i] + len13.slice(6, 0),
                     If(completes & rxLast, then: [sDone[i] < 1]),
                   ],
                 ),
