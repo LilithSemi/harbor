@@ -221,7 +221,17 @@ class HarborPcieDma extends BridgeModule {
     final lines = irqLines == 0
         ? null
         : addInput('irq_lines', irqInputs!, width: irqLines);
-    final rxs = HarborPcieStream.addSink(this, rx);
+    // A register stage on RX keeps the completion checks away from the
+    // endpoint and the router decode.
+    final rxIn = HarborPcieStream.addSink(this, rx);
+    final rxs = HarborPcieStream(width: width, name: 'rx_reg');
+    HarborPcieStreamRegister(
+      clk: clk,
+      reset: reset,
+      upstream: rxIn,
+      downstream: rxs,
+      name: 'rx_register',
+    );
     final txs = HarborPcieStream.addSource(this, tx);
 
     memory = HarborMemoryMasterPort.create(

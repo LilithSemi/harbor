@@ -578,4 +578,62 @@ void main() {
       });
     });
   }
+
+  for (final width in [64, 128]) {
+    test('register stage keeps every beat in order, W$width', () async {
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset');
+      final up = HarborPcieStream(width: width, name: 'up');
+      final down = HarborPcieStream(width: width, name: 'down');
+      final stage = HarborPcieStreamRegister(
+        clk: clk,
+        reset: reset,
+        upstream: up,
+        downstream: down,
+      );
+      await stage.build();
+      expect(stage.definitionName, 'HarborPcieStreamRegister_W$width');
+      final driver = PcieStreamDriver(
+        clk: clk,
+        stream: up,
+        seed: width,
+        gapChance: 0.2,
+      );
+      final sink = PcieStreamSink(
+        clk: clk,
+        stream: down,
+        seed: width + 1,
+        readyChance: 0.5,
+      );
+      reset.inject(1);
+      Simulator.setMaxSimTime(10000000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+      sink.start();
+      final random = Random(width);
+      final sent = <PcieTlp>[];
+      final users = <int>[];
+      for (var i = 0; i < 60; i++) {
+        final dw = 1 + random.nextInt(20);
+        final tlp = PcieTlp.memWrite(
+          address: 0x1000 * i,
+          data: [for (var b = 0; b < dw * 4; b++) random.nextInt(256)],
+        );
+        final user = random.nextInt(1 << HarborPcieStream.userWidth);
+        sent.add(tlp);
+        users.add(user);
+        await driver.send(tlp, user: user);
+      }
+      await sink.waitFor(sent.length);
+      sink.stop();
+      for (var i = 0; i < sent.length; i++) {
+        expect(sink.received[i].wireDwords(), sent[i].wireDwords());
+        expect(sink.receivedUsers[i], users[i]);
+      }
+      await Simulator.endSimulation();
+    });
+  }
 }

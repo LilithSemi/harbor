@@ -265,3 +265,81 @@ class HarborPcieHeaderCapture extends Module {
     addOutput('first_payload_dw', width: 32) <= payload;
   }
 }
+
+/// A register stage on a [HarborPcieStream] with full throughput.
+///
+/// It holds up to two beats. `upstream.ready` and the `downstream` signals
+/// come from flops, so the stage cuts the paths in both directions. It adds
+/// one cycle of latency.
+class HarborPcieStreamRegister extends Module {
+  /// Data width in bits.
+  final int width;
+
+  HarborPcieStreamRegister({
+    required Logic clk,
+    required Logic reset,
+    required HarborPcieStream upstream,
+    required HarborPcieStream downstream,
+    super.name = 'pcie_stream_register',
+  }) : width = upstream.width,
+       super(definitionName: 'HarborPcieStreamRegister_W${upstream.width}') {
+    if (downstream.width != width) {
+      throw ArgumentError('stream widths ${downstream.width} and $width');
+    }
+    clk = addInput('clk', clk);
+    reset = addInput('reset', reset);
+    final up = HarborPcieStream.addSink(this, upstream, prefix: 'up_');
+    final down = HarborPcieStream.addSource(this, downstream, prefix: 'down_');
+
+    List<Logic> fields(HarborPcieStream s) => [s.data, s.keep, s.last, s.user];
+    List<Logic> regs(String n) => [
+      for (final f in fields(up)) Logic(name: '${n}_${f.name}', width: f.width),
+    ];
+    final main = regs('main');
+    final skid = regs('skid');
+    final mainValid = Logic(name: 'main_valid');
+    final skidValid = Logic(name: 'skid_valid');
+
+    up.ready <= ~skidValid;
+    down.valid <= mainValid;
+    for (final (i, f) in fields(down).indexed) {
+      f <= main[i];
+    }
+
+    final upFire = up.valid & up.ready;
+    final take = down.ready | ~mainValid;
+    final upFields = fields(up);
+    Sequential(clk, [
+      If(
+        reset,
+        then: [
+          mainValid < 0,
+          skidValid < 0,
+          for (final r in [...main, ...skid]) r < 0,
+        ],
+        orElse: [
+          If.block([
+            Iff(take & skidValid, [
+              for (var i = 0; i < main.length; i++) main[i] < skid[i],
+              mainValid < 1,
+              skidValid < 0,
+            ]),
+            ElseIf(take, [
+              If(
+                upFire,
+                then: [
+                  for (var i = 0; i < main.length; i++) main[i] < upFields[i],
+                ],
+              ),
+              mainValid < upFire,
+            ]),
+            ElseIf(upFire, [
+              for (var i = 0; i < skid.length; i++) skid[i] < upFields[i],
+              skidValid < 1,
+            ]),
+          ]),
+        ],
+      ),
+    ]);
+  }
+}
