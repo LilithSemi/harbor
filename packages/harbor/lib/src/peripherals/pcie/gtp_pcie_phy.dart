@@ -492,7 +492,9 @@ class HarborGtpPciePhy extends Module {
     if (clocks == null) {
       clk = HarborPipeClock(
         txOutClk: gts[0].port('TXOUTCLK'),
-        reset: mmcmReset == null ? Const(0) : addInput('mmcm_reset', mmcmReset),
+        reset: mmcmReset == null
+            ? (~perstN).named('mmcm_rst')
+            : (~perstN | addInput('mmcm_reset', mmcmReset)).named('mmcm_rst'),
         userClkDivide: lanes == 1 ? 16 : 8,
         lockTimerBits: mmcmLockTimerBits,
       ).clocks;
@@ -510,22 +512,33 @@ class HarborGtpPciePhy extends Module {
     addOutput('userclk2') <= clk.userClk2;
     addOutput('mmcm_lock') <= clk.mmcmLock;
 
-    // Power-on reset. These flops have no reset because FPGA flops are zero
-    // after configuration. The reset holds until the MMCM locks, then for 64
-    // clean cycles. A later lock loss does not set it again.
+    // Power-on reset. FPGA flops are zero after configuration, so these flops
+    // need no reset at power-up. The reset holds until the MMCM locks, then
+    // for 64 clean cycles. A later lock loss does not set it again.
+    // PERST# resets the MMCM and pclk stops, so PERST# also clears these
+    // flops without a clock and the hold starts again after the relock.
     final porLock0 = Logic(name: 'por_lock_0');
     final porLock1 = Logic(name: 'por_lock_1');
     final porCount = Logic(name: 'por_count', width: 7);
-    Sequential(pclk, [
-      porLock0 < clk.mmcmLock,
-      porLock1 < porLock0,
-      If(
-        ~porCount[6],
-        then: [
-          If(porLock1, then: [porCount < porCount + 1], orElse: [porCount < 0]),
-        ],
-      ),
-    ]);
+    Sequential(
+      pclk,
+      [
+        porLock0 < clk.mmcmLock,
+        porLock1 < porLock0,
+        If(
+          ~porCount[6],
+          then: [
+            If(
+              porLock1,
+              then: [porCount < porCount + 1],
+              orElse: [porCount < 0],
+            ),
+          ],
+        ),
+      ],
+      reset: ~perstN,
+      asyncReset: true,
+    );
     final por = (~porCount[6]).named('por_reset');
     final rst = harborCdcJoinReset(pclk, ~perstN, por, name: 'perst_rst');
 

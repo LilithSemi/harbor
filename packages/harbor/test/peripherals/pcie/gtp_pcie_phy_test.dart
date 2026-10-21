@@ -79,7 +79,9 @@ class _Bench {
     void Function(Gtpe2StatusModel m)? setup,
   }) async {
     final pclk = SimpleClockGenerator(8).clk;
-    final perstN = Logic(name: 'perst_n');
+    // A valid PERST# before build keeps the async reset of the power-on
+    // reset flops away from an X edge at time 0.
+    final perstN = Logic(name: 'perst_n')..put(perstEdge ? 0 : 1);
     final common = HarborGtpCommonPorts();
     final channels = [for (var i = 0; i < lanes; i++) HarborGtpChannelPorts()];
     final pipes = [for (var i = 0; i < lanes; i++) HarborPciePipeLane()];
@@ -116,11 +118,10 @@ class _Bench {
       p.txSwing.inject(0);
       p.txDeemph.inject(0);
     }
-    // FPGA flops with no reset start at zero after configuration.
+    // FPGA flops start at zero after configuration.
     for (final l in phy.internalSignals) {
       if (_porFlops.contains(l.name)) l.inject(0);
     }
-    perstN.inject(perstEdge ? 0 : 1);
     final b = _Bench(phy, model, pipes, common, channels, perstN, pclk);
     Simulator.setMaxSimTime(10000000);
     unawaited(Simulator.run());
@@ -351,6 +352,25 @@ void main() {
       await b.finish();
     });
 
+    test('PERST# holds reset until the MMCM locks again', () async {
+      final b = await _Bench.start();
+      await b.waitFor(_S.idle);
+      // PERST# resets the MMCM, so the lock goes away and comes back later.
+      b.perstN.inject(0);
+      b.model.dropMmcmLock(120);
+      final low = b.cycle;
+      await b.cycles(20);
+      b.perstN.inject(1);
+      await b.waitFor(_S.idle, limit: 3000);
+      final lockBack = b.events['mmcm_lock_rise']!.last;
+      final gtReset = b.events['gt_reset_rise']!.firstWhere((c) => c > low);
+      expect(lockBack, greaterThan(low + 100));
+      expect(gtReset, greaterThan(lockBack + 64));
+      expect(b.traceFrom(_S.cfgWait), _goodOrder);
+      expect(b.retries, 0);
+      await b.finish();
+    });
+
     test('PERST# mid sequence restarts from the top', () async {
       final b = await _Bench.start();
       await b.waitFor(_S.txPhInit);
@@ -572,6 +592,44 @@ void main() {
         expect(phy.input('gt${lanes - 1}_TXRESETDONE').width, 1);
         expect(phy.output('gt${lanes - 1}_TXDATA').width, 32);
         expect(phy.output('pipe${lanes - 1}_rxdata').width, 16);
+      });
+    }
+
+    Module? mmcmOf(Module m) {
+      for (final sub in m.subModules) {
+        if (sub.definitionName == 'MMCME2_ADV') return sub;
+        final found = mmcmOf(sub);
+        if (found != null) return found;
+      }
+      return null;
+    }
+
+    for (final extra in [false, true]) {
+      test('PERST# low resets the MMCM, mmcm_reset $extra', () async {
+        final perstN = Logic(name: 'perst_n');
+        final mmcmReset = Logic(name: 'mmcm_reset');
+        final phy = HarborGtpPciePhy(
+          perstN: perstN,
+          common: HarborGtpCommonPorts(),
+          channels: [HarborGtpChannelPorts()],
+          pipes: [HarborPciePipeLane()],
+          mmcmReset: extra ? mmcmReset : null,
+        );
+        await phy.build();
+        final rst = mmcmOf(phy)!.input('RST');
+        final seen = <int>[];
+        void sample() => seen.add(rst.value.toInt());
+        Simulator.registerAction(1, () {
+          mmcmReset.put(0);
+          perstN.put(0);
+        });
+        Simulator.registerAction(2, sample);
+        Simulator.registerAction(3, () => perstN.put(1));
+        Simulator.registerAction(4, sample);
+        Simulator.registerAction(5, () => mmcmReset.put(1));
+        Simulator.registerAction(6, sample);
+        await Simulator.run();
+        expect(seen, [1, 0, if (extra) 1 else 0]);
       });
     }
 
