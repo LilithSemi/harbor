@@ -265,7 +265,13 @@ class PcieGpuBench {
     this.random,
   );
 
-  static Future<PcieGpuBench> create(int width, {int seed = 3}) async {
+  /// [granted] is the MSI Multiple Message Enable value (log2 of the
+  /// granted vector count).
+  static Future<PcieGpuBench> create(
+    int width, {
+    int seed = 3,
+    int granted = 3,
+  }) async {
     final clk = SimpleClockGenerator(10).clk;
     final reset = Logic(name: 'reset');
     final completerId = Logic(name: 'completer_id', width: 16);
@@ -273,7 +279,7 @@ class PcieGpuBench {
     final maxReadRequest = Logic(name: 'max_read_request', width: 3);
     final busMaster = Logic(name: 'bus_master');
     final msiEnable = Logic(name: 'msi_enable');
-    final granted = Logic(name: 'granted', width: 3);
+    final grantedLog = Logic(name: 'granted', width: 3);
     final intDisable = Logic(name: 'interrupt_disable');
     final rdyN = Logic(name: 'rdy_n');
     final irqLine = Logic(name: 'irq_line');
@@ -288,7 +294,7 @@ class PcieGpuBench {
       maxReadRequest: maxReadRequest,
       busMasterEnable: busMaster,
       msiEnable: msiEnable,
-      msiVectorsGranted: granted,
+      msiVectorsGranted: grantedLog,
       interruptDisable: intDisable,
       interruptRdyN: rdyN,
       irqLine: irqLine,
@@ -303,7 +309,7 @@ class PcieGpuBench {
     maxReadRequest.inject(2);
     busMaster.inject(1);
     msiEnable.inject(1);
-    granted.inject(3);
+    grantedLog.inject(granted);
     intDisable.inject(1);
     rdyN.inject(1);
     irqLine.inject(0);

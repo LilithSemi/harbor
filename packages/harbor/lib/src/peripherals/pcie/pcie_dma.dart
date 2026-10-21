@@ -1227,9 +1227,21 @@ class HarborPcieDma extends BridgeModule {
       errSet,
       doneSet,
     ].swizzle();
+    // A cause event after the last IRQ_CAUSE read is fresh. A W1C does not
+    // clear a fresh bit, so the handler cannot clear an event it has not
+    // read.
+    final fresh = Logic(name: 'irq_fresh', width: causeWidth);
+    final causeRead =
+        (cState.eq(cGather) & rAddr.eq(Const(registerIrqCause ~/ 4, width: 10)))
+            .named('irq_cause_read');
+    final freshNext = mux(
+      causeRead,
+      sets,
+      fresh | sets,
+    ).named('irq_fresh_next');
     final clears = mux(
       writes(registerIrqCause ~/ 4),
-      (wData & wMask).slice(causeWidth - 1, 0),
+      (wData & wMask).slice(causeWidth - 1, 0) & ~fresh,
       Const(0, width: causeWidth),
     );
     final causeNext = ((cause & ~clears) | sets).named('cause_next');
@@ -1238,13 +1250,28 @@ class HarborPcieDma extends BridgeModule {
     final split = (msiEnable & msiVectorsGranted.gte(needLog)).named(
       'irq_split',
     );
+    // irq_pending is low for one cycle after a write to IRQ_CAUSE or
+    // IRQ_MASK. A cause that is still set then rises again, and the
+    // endpoint sends a new MSI for it.
+    final irqGap = Logic(name: 'irq_gap');
+    Sequential(clk, [
+      If(
+        reset,
+        then: [irqGap < 0, fresh < 0],
+        orElse: [
+          irqGap < writes(registerIrqCause ~/ 4) | writes(registerIrqMask ~/ 4),
+          fresh < freshNext & Const(causeBits, width: causeWidth),
+        ],
+      ),
+    ]);
     addOutput('irq_pending', width: 8) <=
-        [
-          if (irqLines < 7) Const(0, width: 7 - irqLines),
-          for (var i = irqLines - 1; i >= 0; i--)
-            split & pend[causeLineShift + i],
-          mux(split, pend[0] | pend[1], pend.or()),
-        ].swizzle();
+        ~irqGap.replicate(8) &
+            [
+              if (irqLines < 7) Const(0, width: 7 - irqLines),
+              for (var i = irqLines - 1; i >= 0; i--)
+                split & pend[causeLineShift + i],
+              mux(split, pend[0] | pend[1], pend.or()),
+            ].swizzle();
 
     // Completion request capture.
     final aByte = [hdrDw.slice(4, 0), Const(0, width: 2)].swizzle();
