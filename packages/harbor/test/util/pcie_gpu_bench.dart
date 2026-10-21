@@ -635,8 +635,11 @@ class PcieGpuRun {
 
   /// Clears the causes and takes the records, as a driver does.
   Future<void> serviceIrq() async {
-    final cause = await b.readReg(HarborPcieDma.registerIrqCause);
+    // A record that comes after this read is sent can set a cause the read
+    // does not see. That cause stays set and sends a new MSI, so the window
+    // for the next MSI starts here.
     clearedAtPackets = b.sink.received.length;
+    final cause = await b.readReg(HarborPcieDma.registerIrqCause);
     await b.writeReg(HarborPcieDma.registerIrqCause, cause);
     if (cause & HarborPcieDma.causeError != 0) {
       fail(
