@@ -1038,8 +1038,20 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   static String _site(String value) => value.trim().split(RegExp(r'\s+')).first;
 
   /// The IO attributes of a pin map value (everything after the site).
-  static List<String> _ioAttrs(String value) =>
-      value.trim().split(RegExp(r'\s+')).skip(1).toList();
+  ///
+  /// Only the IO standard is a bare word. Every other attribute is KEY=VAL,
+  /// so a stray word such as `PULLUP TRUE` throws and is not dropped.
+  static List<String> _ioAttrs(String value) {
+    final attrs = value.trim().split(RegExp(r'\s+')).skip(1).toList();
+    if (attrs.where((a) => !a.contains('=')).length > 1) {
+      throw ArgumentError.value(
+        value,
+        'pin',
+        'has more than one attribute without "=", write KEY=VAL',
+      );
+    }
+    return attrs;
+  }
 
   /// Writes [extraConstraints] at the end of a constraint file, as a delimited
   /// block of lines that do not change.

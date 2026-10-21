@@ -662,20 +662,20 @@ const _artyS7_50 = HarborBoard(
   // Pmod headers as SPI connectors, wired to the Digilent Pmod-SPI (Type 2A)
   // convention: connector pin 1 = ~CS, 2 = MOSI, 3 = MISO, 4 = SCK. A device
   // with `iface=pmod@ja` (e.g. a PmodSD SD card in SPI mode) binds its pads
-  // here. MISO gets a PULLUP so an empty socket reads high, not floating.
+  // here. MISO gets a pull-up so an empty socket reads high, not floating.
   // Sites from the Digilent Arty-S7-50 master XDC (JA1=L17 JA2=L18 JA3=M14
   // JA4=N14; JB1=P17 JB2=P18 JB3=R18 JB4=T18), all bank 14 LVCMOS33.
   interfaces: {
     'pmod@ja': {
       'cs': 'L17 LVCMOS33',
       'mosi': 'L18 LVCMOS33',
-      'miso': 'M14 LVCMOS33 PULLUP TRUE',
+      'miso': 'M14 LVCMOS33 PULLTYPE=PULLUP',
       'sck': 'N14 LVCMOS33',
     },
     'pmod@jb': {
       'cs': 'P17 LVCMOS33',
       'mosi': 'P18 LVCMOS33',
-      'miso': 'R18 LVCMOS33 PULLUP TRUE',
+      'miso': 'R18 LVCMOS33 PULLTYPE=PULLUP',
       'sck': 'T18 LVCMOS33',
     },
   },
@@ -753,7 +753,7 @@ const _ax7203 = HarborBoard(
     // PCIe x4 (p.29-31). These are MGT pads except PERST#.
     'pcie_refclk_p': 'F10 MGT',
     'pcie_refclk_n': 'E10 MGT',
-    'pcie_perst_n': 'J20 LVCMOS33 PULLUP=TRUE',
+    'pcie_perst_n': 'J20 LVCMOS33 PULLTYPE=PULLUP',
     'pcie_rxp[0]': 'D11 MGT',
     'pcie_rxn[0]': 'C11 MGT',
     'pcie_txp[0]': 'D5 MGT',

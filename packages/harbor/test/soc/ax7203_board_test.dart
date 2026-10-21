@@ -411,7 +411,7 @@ void main() {
       'gtp_refclk_n': 'E6 MGT',
       'pcie_refclk_p': 'F10 MGT',
       'pcie_refclk_n': 'E10 MGT',
-      'pcie_perst_n': 'J20 LVCMOS33 PULLUP=TRUE',
+      'pcie_perst_n': 'J20 LVCMOS33 PULLTYPE=PULLUP',
       'pcie_rxp[0]': 'D11 MGT',
       'pcie_rxn[0]': 'C11 MGT',
       'pcie_txp[0]': 'D5 MGT',
@@ -451,7 +451,16 @@ void main() {
         .split('\n')
         .singleWhere((l) => l.endsWith('[get_ports pcie_perst_n]'));
     expect(perst, contains('IOSTANDARD LVCMOS33'));
-    expect(perst, contains('PULLUP TRUE'));
+    expect(perst, contains('PULLTYPE PULLUP'));
+  });
+
+  test('a pin with a stray bare attribute throws', () {
+    const target = HarborFpgaTarget.artix7(
+      device: 'xc7a200t',
+      package: 'fbg484',
+      pinMap: {'p': 'J20 LVCMOS33 PULLUP TRUE'},
+    );
+    expect(target.generateConstraints, throwsArgumentError);
   });
 
   test('configuration flash pads are mapped', () {
