@@ -181,6 +181,10 @@ class HarborSpiFlashController extends BridgeModule
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
         HarborSvdPeripheralProvider {
+  /// Full SCK cycles sent with CS# high after reset. The first STARTUPE2
+  /// USRCCLKO edges after configuration do not reach the pin (UG470).
+  static const startupClocks = 8;
+
   /// HarborFlash configuration.
   final HarborSpiFlashConfig config;
 
@@ -381,6 +385,7 @@ class HarborSpiFlashController extends BridgeModule
     const sDummy = 3;
     const sReadData = 4;
     const sDone = 5;
+    const sStartup = 6;
 
     // Read-ahead line: a miss streams `lineWords` sequential bus words in ONE
     // flash command (shared cmd+addr+dummy) into `lineBuf`, in-line words are
@@ -459,7 +464,8 @@ class HarborSpiFlashController extends BridgeModule
           spiClk < Const(0),
           shiftReg < Const(0, width: busWidth),
           bitCount < Const(0, width: 8),
-          spiState < Const(sIdle, width: 3),
+          spiState <
+              Const(startupClocks > 0 ? sStartup : sIdle, width: 3),
           ioDir < Const(0),
           ack < Const(0),
           datOut < Const(0, width: busWidth),
@@ -522,6 +528,25 @@ class HarborSpiFlashController extends BridgeModule
                           orphan < Const(0),
                           ioDir < Const(0), // output (drive DQ0)
                           spiState < Const(sSendCmd, width: 3),
+                        ],
+                      ),
+                    ],
+                  ),
+                ]),
+
+                // STARTUP: clock SCK with CS# high. After configuration, the
+                // first USRCCLKO edges of STARTUPE2 do not reach the pin.
+                CaseItem(Const(sStartup, width: 3), [
+                  spiClk < ~spiClk,
+                  If(
+                    spiClk,
+                    then: [
+                      bitCount < (bitCount + Const(1, width: 8)),
+                      If(
+                        bitCount.eq(Const(startupClocks - 1, width: 8)),
+                        then: [
+                          bitCount < Const(0, width: 8),
+                          spiState < Const(sIdle, width: 3),
                         ],
                       ),
                     ],

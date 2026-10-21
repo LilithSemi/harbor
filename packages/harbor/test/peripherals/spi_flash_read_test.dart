@@ -219,6 +219,10 @@ void main() {
     await clk.nextPosedge;
     reset.inject(0);
     await clk.nextPosedge;
+    // Let the startup clocks finish before the first request.
+    for (var i = 0; i < 2 * HarborSpiFlashController.startupClocks + 2; i++) {
+      await clk.nextPosedge;
+    }
 
     // Bits on each SCK rise, one list per CS-low frame.
     final frames = <List<int>>[];

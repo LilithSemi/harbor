@@ -220,6 +220,10 @@ class _Harness {
     await clk.nextPosedge;
     reset.inject(0);
     await clk.nextPosedge;
+    // Let the startup clocks finish before the first request.
+    for (var i = 0; i < 2 * HarborSpiFlashController.startupClocks + 2; i++) {
+      await clk.nextPosedge;
+    }
   }
 
   /// Background process: drive the behavioral model from the SPI pins.
