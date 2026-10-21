@@ -1241,15 +1241,25 @@ class HarborPcieDma extends BridgeModule {
     ].swizzle();
     // A cause event after the last IRQ_CAUSE read is fresh. A W1C does not
     // clear a fresh bit, so the handler cannot clear an event it has not
-    // read.
+    // read. For a line, the event is its rising edge.
     final fresh = Logic(name: 'irq_fresh', width: causeWidth);
+    final linesPrev = lines == null
+        ? null
+        : Logic(name: 'irq_lines_prev', width: irqLines);
+    final events = [
+      if (irqLines < 7) Const(0, width: causeWidth - causeLineShift - irqLines),
+      if (lines != null) lines & ~linesPrev!,
+      Const(0, width: causeLineShift - 2),
+      errSet,
+      doneSet,
+    ].swizzle();
     final causeRead =
         (cState.eq(cGather) & rAddr.eq(Const(registerIrqCause ~/ 4, width: 10)))
             .named('irq_cause_read');
     final freshNext = mux(
       causeRead,
-      sets,
-      fresh | sets,
+      events,
+      fresh | events,
     ).named('irq_fresh_next');
     final clears = mux(
       writes(registerIrqCause ~/ 4),
@@ -1269,10 +1279,11 @@ class HarborPcieDma extends BridgeModule {
     Sequential(clk, [
       If(
         reset,
-        then: [irqGap < 0, fresh < 0],
+        then: [irqGap < 0, fresh < 0, if (linesPrev != null) linesPrev < 0],
         orElse: [
           irqGap < writes(registerIrqCause ~/ 4) | writes(registerIrqMask ~/ 4),
           fresh < freshNext & Const(causeBits, width: causeWidth),
+          if (linesPrev != null) linesPrev < lines!,
         ],
       ),
     ]);
