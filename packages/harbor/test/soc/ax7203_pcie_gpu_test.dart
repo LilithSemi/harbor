@@ -27,7 +27,7 @@ void main() {
         'HarborPcieRouter_W64_dma_4c_mem_10n_rom_100n',
         'HarborPcieDma_W64_D64_A24_axi4_Sfr_',
         'HarborPcieMemoryCompleter_W64_D64_A24_axi4_S1000000_O0_B4_P256',
-        'HarborPcieOptionRom_S262144_O12582912_A24_wishbone',
+        'HarborPcieOptionRom_W64_S262144_O12582912_A24_wishbone',
         'HarborSpiFlashController_',
         'HarborSram_16384_d64_a24_axi4_',
       ]) {

@@ -5,10 +5,11 @@ import '../bus/bus_master_port.dart';
 import '../bus/port/fabric_kind.dart';
 import 'pcie/pcie_stream.dart';
 
-/// Serves a memory-backed PCI expansion ROM on a 64 bit [HarborPcieStream].
+/// Serves a memory-backed PCI expansion ROM on a [HarborPcieStream] of
+/// width 64 or 128.
 ///
 /// The block answers 3DW memory reads with the ROM hit bit in `rx_user`. It
-/// drops other packets.
+/// drops other packets. It reads one memory word for each payload DW.
 class HarborPcieOptionRom extends BridgeModule {
   late final BusMasterPort memory;
 
@@ -25,11 +26,11 @@ class HarborPcieOptionRom extends BridgeModule {
     this.fabricKind = HarborFabricKind.wishbone,
     String? name,
   }) : super(
-         'HarborPcieOptionRom_S${romSize}_O${memoryOffset}_A${memoryAddressWidth ?? (memoryOffset + romSize - 1).bitLength}_${fabricKind.name}',
+         'HarborPcieOptionRom_W${rx.width}_S${romSize}_O${memoryOffset}_A${memoryAddressWidth ?? (memoryOffset + romSize - 1).bitLength}_${fabricKind.name}',
          name: name ?? 'pcie_option_rom',
        ) {
-    if (rx.width != 64 || tx.width != 64) {
-      throw ArgumentError('the option ROM stream width must be 64');
+    if (tx.width != rx.width) {
+      throw ArgumentError('tx width ${tx.width} differs from rx ${rx.width}');
     }
     if (romSize < 512 || (romSize & (romSize - 1)) != 0) {
       throw ArgumentError.value(romSize, 'romSize', 'must be a power of 2');
@@ -82,9 +83,12 @@ class HarborPcieOptionRom extends BridgeModule {
     const fetchFirst = 3;
     const sendHeader = 4;
     const sendFirst = 5;
-    const fetchData0 = 6;
-    const fetchData1 = 7;
+    const fetchData = 6;
+    const startRead = 7;
     const sendData = 8;
+    final width = rx.width;
+    // Payload DWs in a data beat.
+    final n = width ~/ 32;
     const prepareCompletion = 9;
     final wordAddressWidth = (romSize ~/ 4 - 1).bitLength;
     final state = Logic(name: 'state', width: 4);
@@ -102,8 +106,11 @@ class HarborPcieOptionRom extends BridgeModule {
     final bytesRemaining = Logic(name: 'bytes_remaining', width: 13);
     final firstCompletion = Logic(name: 'first_completion');
     final wordAddress = Logic(name: 'word_address', width: wordAddressWidth);
-    final word0 = Logic(name: 'rom_word0', width: 32);
-    final word1 = Logic(name: 'rom_word1', width: 32);
+    final words = [
+      for (var i = 0; i < n; i++) Logic(name: 'rom_word$i', width: 32),
+    ];
+    final word0 = words[0];
+    final fetchIndex = Logic(name: 'fetch_index', width: 2);
     final requestOk = Logic(name: 'request_ok');
     final readCount = Logic(name: 'read_count', width: 16);
     final completionCount = Logic(name: 'completion_count', width: 16);
@@ -120,20 +127,33 @@ class HarborPcieOptionRom extends BridgeModule {
       return swapped;
     }
 
-    Logic popcount4(Logic value, String signalName) {
-      final count = Logic(name: signalName, width: 3);
-      count <=
-          value[0].zeroExtend(3) +
-              value[1].zeroExtend(3) +
-              value[2].zeroExtend(3) +
-              value[3].zeroExtend(3);
-      return count;
-    }
+    // Index of the highest enabled byte. Byte counts go from the first
+    // enabled byte to the last one, gaps included.
+    Logic highestByte(Logic be) => mux(
+      be[3],
+      Const(3, width: 3),
+      mux(
+        be[2],
+        Const(2, width: 3),
+        mux(be[1], Const(1, width: 3), Const(0, width: 3)),
+      ),
+    );
 
-    final wireWord0 = swapBytes(word0, 'wire_word0');
-    final wireWord1 = swapBytes(word1, 'wire_word1');
-    final firstByteCount = popcount4(firstBe, 'first_byte_count');
-    final lastByteCount = popcount4(lastBe, 'last_byte_count');
+    final wireWords = [
+      for (var i = 0; i < n; i++) swapBytes(words[i], 'wire_word$i'),
+    ];
+    final wireWord0 = wireWords[0];
+    final firstByteOffset = Logic(name: 'first_byte_offset', width: 2);
+    firstByteOffset <=
+        mux(
+          firstBe[0],
+          Const(0, width: 2),
+          mux(
+            firstBe[1],
+            Const(1, width: 2),
+            mux(firstBe[2], Const(2, width: 2), Const(3, width: 2)),
+          ),
+        );
     final requestWords = Logic(name: 'request_words', width: 11);
     requestWords <=
         mux(
@@ -146,25 +166,15 @@ class HarborPcieOptionRom extends BridgeModule {
         mux(
           requestWords.eq(Const(1, width: 11)),
           mux(
-            firstByteCount.eq(Const(0, width: 3)),
+            firstBe.eq(Const(0, width: 4)),
             Const(1, width: 13),
-            firstByteCount.zeroExtend(13),
+            (highestByte(firstBe) - firstByteOffset.zeroExtend(3) + 1)
+                .zeroExtend(13),
           ),
-          ((requestWords.zeroExtend(13) - Const(2, width: 13)) <<
-                  Const(2, width: 13)) +
-              firstByteCount.zeroExtend(13) +
-              lastByteCount.zeroExtend(13),
-        );
-    final firstByteOffset = Logic(name: 'first_byte_offset', width: 2);
-    firstByteOffset <=
-        mux(
-          firstBe[0],
-          Const(0, width: 2),
-          mux(
-            firstBe[1],
-            Const(1, width: 2),
-            mux(firstBe[2], Const(2, width: 2), Const(3, width: 2)),
-          ),
+          ((requestWords.zeroExtend(13) - Const(1, width: 13)) <<
+                  Const(2, width: 13)) -
+              firstByteOffset.zeroExtend(13) +
+              (highestByte(lastBe) + 1).zeroExtend(13),
         );
     final completionByteOffset = mux(
       firstCompletion,
@@ -201,18 +211,15 @@ class HarborPcieOptionRom extends BridgeModule {
       requestRemaining,
       wordsToBoundary,
     );
-    final firstResponseByteCount = mux(
-      firstByteCount.eq(Const(0, width: 3)),
-      Const(1, width: 13),
-      firstByteCount.zeroExtend(13),
-    );
-    final completionBytesReturned = mux(
-      firstCompletion,
-      ((completionWords - Const(1, width: 11)).zeroExtend(13) <<
-              Const(2, width: 13)) +
-          firstResponseByteCount,
-      completionWords.zeroExtend(13) << Const(2, width: 13),
-    );
+    // Only a completion that is not the last uses this, so its first DW
+    // counts from the first enabled byte to the DW end.
+    final completionBytesReturned =
+        (completionWords.zeroExtend(13) << Const(2, width: 13)) -
+        mux(
+          firstCompletion,
+          firstByteOffset.zeroExtend(13),
+          Const(0, width: 13),
+        );
 
     memory.addr <=
         Const(memoryOffset, width: addressWidth) +
@@ -224,13 +231,37 @@ class HarborPcieOptionRom extends BridgeModule {
     memory.lock <= Const(0);
     memory.stb <=
         state.eq(Const(fetchFirst, width: 4)) |
-            state.eq(Const(fetchData0, width: 4)) |
-            state.eq(Const(fetchData1, width: 4));
+            state.eq(Const(fetchData, width: 4));
+
+    // Data beat lanes. Lanes past the end of the completion are 0.
+    final laneLive = [
+      for (var i = 0; i < n; i++) Const(i, width: 11).lt(remaining),
+    ];
+    final dataBeat = [
+      for (var i = n - 1; i >= 0; i--) wireWords[i] & laneLive[i].replicate(32),
+    ].swizzle();
+    final dataKeep = [
+      for (var i = n - 1; i >= 0; i--) laneLive[i].replicate(4),
+    ].swizzle();
+    final dataEnds = ~Const(n, width: 11).lt(remaining);
+
+    // A 3DW read request at width 128 is one beat with DW2 in it.
+    final headerAddress = width == 128
+        ? rxData.slice(64 + wordAddressWidth + 1, 66)
+        : rxData.slice(wordAddressWidth + 1, 2);
+    final headerOk = rxData.slice(30, 24).eq(Const(0, width: 7)) & rxUser[8];
+
+    final w = width;
+    Logic beat(List<Logic> dws) => [
+      for (var i = n - 1; i >= 0; i--)
+        i < dws.length ? dws[i] : Const(0, width: 32),
+    ].swizzle();
+    final fullKeep = Const((1 << (w ~/ 8)) - 1, width: w ~/ 8);
 
     Combinational([
       rxReady < Const(0),
-      txData < Const(0, width: 64),
-      txKeep < Const(0, width: 8),
+      txData < Const(0, width: w),
+      txKeep < Const(0, width: w ~/ 8),
       txLast < Const(0),
       txValid < Const(0),
       Case(state, [
@@ -238,188 +269,201 @@ class HarborPcieOptionRom extends BridgeModule {
         CaseItem(Const(waitAddress, width: 4), [rxReady < Const(1)]),
         CaseItem(Const(drain, width: 4), [rxReady < Const(1)]),
         CaseItem(Const(sendHeader, width: 4), [
-          txData <
-              (cplDw1.zeroExtend(64) << Const(32, width: 64)) |
-                  cplDw0.zeroExtend(64),
-          txKeep < Const(0xff, width: 8),
+          txData < beat([cplDw0, cplDw1]),
+          txKeep < fullKeep,
           txValid < Const(1),
         ]),
         CaseItem(Const(sendFirst, width: 4), [
+          // Width 64: DW2 and the first payload DW. Width 128: the whole
+          // header and the first payload DW.
           txData <
-              (wireWord0.zeroExtend(64) << Const(32, width: 64)) |
-                  cplDw2.zeroExtend(64),
-          txKeep < Const(0xff, width: 8),
+              beat(
+                w == 64
+                    ? [cplDw2, wireWord0]
+                    : [cplDw0, cplDw1, cplDw2, wireWord0],
+              ),
+          txKeep < fullKeep,
           txLast < remaining.eq(Const(1, width: 11)),
           txValid < Const(1),
         ]),
         CaseItem(Const(sendData, width: 4), [
-          txData <
-              (wireWord1.zeroExtend(64) << Const(32, width: 64)) |
-                  wireWord0.zeroExtend(64),
-          txKeep <
-              mux(
-                remaining.eq(Const(1, width: 11)),
-                Const(0x0f, width: 8),
-                Const(0xff, width: 8),
-              ),
-          txLast < ~Const(2, width: 11).lt(remaining),
+          txData < dataBeat,
+          txKeep < dataKeep,
+          txLast < dataEnds,
           txValid < Const(1),
         ]),
       ]),
     ]);
 
+    // The end of a completion: the next one, or the next request.
+    List<Conditional> completionDone() => [
+      completionCount < completionCount + Const(1, width: 16),
+      If(
+        requestRemaining.eq(completionWords),
+        then: [state < Const(waitHeader, width: 4)],
+        orElse: [
+          requestRemaining < requestRemaining - completionWords,
+          bytesRemaining < bytesRemaining - completionBytesReturned,
+          wordAddress < wordAddress + Const(1, width: wordAddressWidth),
+          firstCompletion < Const(0),
+          state < Const(prepareCompletion, width: 4),
+        ],
+      ),
+    ];
+    List<Conditional> startRequest() => [
+      requestRemaining < requestWords,
+      bytesRemaining < requestByteCount,
+      firstCompletion < Const(1),
+      readCount < readCount + Const(1, width: 16),
+      state < Const(prepareCompletion, width: 4),
+    ];
+
     Sequential(clk, [
-      Case(state, [
-        CaseItem(Const(waitHeader, width: 4), [
-          If(
-            rxValid,
-            then: [
-              requester < rxData.slice(63, 48),
-              tag < rxData.slice(47, 40),
-              trafficClass < rxData.slice(22, 20),
-              attributes < rxData.slice(13, 12),
-              poisoned < rxData[14],
-              firstBe < rxData.slice(35, 32),
-              lastBe < rxData.slice(39, 36),
-              length < rxData.slice(9, 0),
-              requestOk <
-                  rxData.slice(30, 24).eq(Const(0, width: 7)) & rxUser[8],
-              state <
-                  mux(
-                    rxLast,
-                    Const(waitHeader, width: 4),
-                    Const(waitAddress, width: 4),
-                  ),
-            ],
-          ),
-        ]),
-        CaseItem(Const(waitAddress, width: 4), [
-          If(
-            rxValid,
-            then: [
+      If(
+        reset,
+        then: [
+          state < Const(waitHeader, width: 4),
+          for (final word in words) word < 0,
+          readCount < 0,
+          completionCount < 0,
+        ],
+        orElse: [
+          Case(state, [
+            CaseItem(Const(waitHeader, width: 4), [
               If(
-                requestOk,
+                rxValid,
                 then: [
-                  wordAddress < rxData.slice(wordAddressWidth + 1, 2),
-                  requestRemaining < requestWords,
-                  bytesRemaining < requestByteCount,
-                  firstCompletion < Const(1),
-                  readCount < readCount + Const(1, width: 16),
-                  state < Const(prepareCompletion, width: 4),
-                ],
-                orElse: [
-                  state <
-                      mux(
-                        rxLast,
-                        Const(waitHeader, width: 4),
-                        Const(drain, width: 4),
-                      ),
+                  requester < rxData.slice(63, 48),
+                  tag < rxData.slice(47, 40),
+                  trafficClass < rxData.slice(22, 20),
+                  attributes < rxData.slice(13, 12),
+                  poisoned < rxData[14],
+                  firstBe < rxData.slice(35, 32),
+                  lastBe < rxData.slice(39, 36),
+                  length < rxData.slice(9, 0),
+                  requestOk < headerOk,
+                  if (w == 64)
+                    state <
+                        mux(
+                          rxLast,
+                          Const(waitHeader, width: 4),
+                          Const(waitAddress, width: 4),
+                        )
+                  else ...[
+                    wordAddress < headerAddress,
+                    If.block([
+                      Iff(headerOk & rxLast, [
+                        state < Const(startRead, width: 4),
+                      ]),
+                      ElseIf(rxLast, [state < Const(waitHeader, width: 4)]),
+                      Else([state < Const(drain, width: 4)]),
+                    ]),
+                  ],
                 ],
               ),
-            ],
-          ),
-        ]),
-        CaseItem(Const(drain, width: 4), [
-          If(rxValid & rxLast, then: [state < Const(waitHeader, width: 4)]),
-        ]),
-        CaseItem(Const(prepareCompletion, width: 4), [
-          completionWords < nextCompletionWords,
-          remaining < nextCompletionWords,
-          state < Const(fetchFirst, width: 4),
-        ]),
-        CaseItem(Const(fetchFirst, width: 4), [
-          If(
-            memory.ack,
-            then: [word0 < memory.dataIn, state < Const(sendHeader, width: 4)],
-          ),
-        ]),
-        CaseItem(Const(sendHeader, width: 4), [
-          If(txReady, then: [state < Const(sendFirst, width: 4)]),
-        ]),
-        CaseItem(Const(sendFirst, width: 4), [
-          If(
-            txReady,
-            then: [
+            ]),
+            CaseItem(Const(waitAddress, width: 4), [
               If(
-                remaining.eq(Const(1, width: 11)),
+                rxValid,
                 then: [
-                  completionCount < completionCount + Const(1, width: 16),
                   If(
-                    requestRemaining.eq(completionWords),
-                    then: [state < Const(waitHeader, width: 4)],
+                    requestOk & rxLast,
+                    then: [wordAddress < headerAddress, ...startRequest()],
                     orElse: [
-                      requestRemaining < requestRemaining - completionWords,
-                      bytesRemaining < bytesRemaining - completionBytesReturned,
-                      wordAddress <
-                          wordAddress + Const(1, width: wordAddressWidth),
-                      firstCompletion < Const(0),
-                      state < Const(prepareCompletion, width: 4),
+                      state <
+                          mux(
+                            rxLast,
+                            Const(waitHeader, width: 4),
+                            Const(drain, width: 4),
+                          ),
                     ],
                   ),
                 ],
-                orElse: [
-                  remaining < remaining - Const(1, width: 11),
-                  wordAddress < wordAddress + Const(1, width: wordAddressWidth),
-                  state < Const(fetchData0, width: 4),
-                ],
               ),
-            ],
-          ),
-        ]),
-        CaseItem(Const(fetchData0, width: 4), [
-          If(
-            memory.ack,
-            then: [
-              word0 < memory.dataIn,
+            ]),
+            CaseItem(Const(startRead, width: 4), startRequest()),
+            CaseItem(Const(drain, width: 4), [
+              If(rxValid & rxLast, then: [state < Const(waitHeader, width: 4)]),
+            ]),
+            CaseItem(Const(prepareCompletion, width: 4), [
+              completionWords < nextCompletionWords,
+              remaining < nextCompletionWords,
+              state < Const(fetchFirst, width: 4),
+            ]),
+            CaseItem(Const(fetchFirst, width: 4), [
               If(
-                remaining.eq(Const(1, width: 11)),
-                then: [state < Const(sendData, width: 4)],
-                orElse: [
-                  wordAddress < wordAddress + Const(1, width: wordAddressWidth),
-                  state < Const(fetchData1, width: 4),
-                ],
-              ),
-            ],
-          ),
-        ]),
-        CaseItem(Const(fetchData1, width: 4), [
-          If(
-            memory.ack,
-            then: [word1 < memory.dataIn, state < Const(sendData, width: 4)],
-          ),
-        ]),
-        CaseItem(Const(sendData, width: 4), [
-          If(
-            txReady,
-            then: [
-              If(
-                ~Const(2, width: 11).lt(remaining),
+                memory.ack,
                 then: [
-                  completionCount < completionCount + Const(1, width: 16),
+                  word0 < memory.dataIn,
+                  state < Const(w == 64 ? sendHeader : sendFirst, width: 4),
+                ],
+              ),
+            ]),
+            CaseItem(Const(sendHeader, width: 4), [
+              If(txReady, then: [state < Const(sendFirst, width: 4)]),
+            ]),
+            CaseItem(Const(sendFirst, width: 4), [
+              If(
+                txReady,
+                then: [
                   If(
-                    requestRemaining.eq(completionWords),
-                    then: [state < Const(waitHeader, width: 4)],
+                    remaining.eq(Const(1, width: 11)),
+                    then: completionDone(),
                     orElse: [
-                      requestRemaining < requestRemaining - completionWords,
-                      bytesRemaining < bytesRemaining - completionBytesReturned,
+                      remaining < remaining - Const(1, width: 11),
                       wordAddress <
                           wordAddress + Const(1, width: wordAddressWidth),
-                      firstCompletion < Const(0),
-                      state < Const(prepareCompletion, width: 4),
+                      fetchIndex < 0,
+                      state < Const(fetchData, width: 4),
                     ],
                   ),
                 ],
-                orElse: [
-                  remaining < remaining - Const(2, width: 11),
-                  wordAddress < wordAddress + Const(1, width: wordAddressWidth),
-                  state < Const(fetchData0, width: 4),
+              ),
+            ]),
+            CaseItem(Const(fetchData, width: 4), [
+              If(
+                memory.ack,
+                then: [
+                  for (var i = 0; i < n; i++)
+                    If(
+                      fetchIndex.eq(Const(i, width: 2)),
+                      then: [words[i] < memory.dataIn],
+                    ),
+                  If(
+                    remaining.eq(fetchIndex.zeroExtend(11) + 1) |
+                        fetchIndex.eq(Const(n - 1, width: 2)),
+                    then: [state < Const(sendData, width: 4)],
+                    orElse: [
+                      fetchIndex < fetchIndex + 1,
+                      wordAddress <
+                          wordAddress + Const(1, width: wordAddressWidth),
+                    ],
+                  ),
                 ],
               ),
-            ],
-          ),
-        ]),
-      ]),
-    ], reset: reset);
+            ]),
+            CaseItem(Const(sendData, width: 4), [
+              If(
+                txReady,
+                then: [
+                  If(
+                    dataEnds,
+                    then: completionDone(),
+                    orElse: [
+                      remaining < remaining - Const(n, width: 11),
+                      wordAddress <
+                          wordAddress + Const(1, width: wordAddressWidth),
+                      fetchIndex < 0,
+                      state < Const(fetchData, width: 4),
+                    ],
+                  ),
+                ],
+              ),
+            ]),
+          ]),
+        ],
+      ),
+    ]);
   }
 
   final int romSize;
