@@ -147,7 +147,8 @@ class HarborPcieDma extends BridgeModule {
   /// Number of SoC interrupt lines, 0 to 7.
   final int irqLines;
 
-  /// Cycles before a host read times out.
+  /// Cycles before a host read times out. The default is 50 ms at a 62.5 MHz
+  /// user clock, and 25 ms at 125 MHz.
   final int timeoutCycles;
 
   /// Largest memory write payload the engine sends.
@@ -188,7 +189,7 @@ class HarborPcieDma extends BridgeModule {
     this.queueDepth = 64,
     this.readTags = 8,
     this.irqLines = 0,
-    this.timeoutCycles = 6250000,
+    this.timeoutCycles = 3125000,
     this.maxPayloadBytes = 256,
     this.maxReadRequestBytes = 512,
     this.infoWords = const [],
