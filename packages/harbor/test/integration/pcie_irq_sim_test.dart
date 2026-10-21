@@ -146,4 +146,48 @@ void main() {
     );
     await b.finish();
   });
+
+  test('option ROM counters stay over a user reset and BAR0 writes', () async {
+    final b = await _start(3);
+    expect(
+      await b.readReg(HarborPcieDma.registerCaps) & HarborPcieDma.capsRomStatus,
+      HarborPcieDma.capsRomStatus,
+    );
+    expect(await b.readReg(HarborPcieDma.registerRomStatus), 0);
+    var completions = 0;
+    for (final (offset, dw) in [(0x40, 6), (0x3c, 4), (0x0, 20)]) {
+      final (_, c) = await b.read(
+        gpuRom + offset,
+        dw,
+        user: HarborPcieStream.userRom,
+      );
+      completions += c.length;
+    }
+    final status = await b.readReg(HarborPcieDma.registerRomStatus);
+    expect(status & 0xffff, 3);
+    expect(status >> 16, completions);
+
+    // A BAR0 write and an engine reset do not clear them.
+    await b.writeReg(HarborPcieDma.registerRomStatus, 0xffffffff);
+    await b.writeReg(
+      HarborPcieDma.registerControl,
+      HarborPcieDma.controlEnable | HarborPcieDma.controlEngineReset,
+    );
+    await _idle(b, 50);
+    expect(await b.readReg(HarborPcieDma.registerRomStatus), status);
+
+    // A user (link) reset does not clear them either.
+    b.reset.inject(1);
+    await _idle(b, 10);
+    b.reset.inject(0);
+    await _idle(b, 10);
+    expect(await b.readReg(HarborPcieDma.registerRomStatus), status);
+
+    // The counter reset does.
+    b.romCounterReset.inject(1);
+    await _idle(b, 2);
+    b.romCounterReset.inject(0);
+    expect(await b.readReg(HarborPcieDma.registerRomStatus), 0);
+    await b.finish();
+  });
 }

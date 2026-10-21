@@ -34,6 +34,10 @@ void main() {
         expect(top, contains(module));
       }
       expect(rtl, contains('PCIE_2_1'));
+      // The option ROM counters reset only on the power on reset.
+      expect(top, contains('por_count'));
+      expect(top, contains('.counter_reset('));
+      expect(top, contains('.rom_status('));
       expect(rtl, contains(RegExp(r'HarborPcieInterrupt\s+pcie_interrupt')));
       expect(rtl, contains(".MSI_CAP_MULTIMSGCAP(1)"));
       expect(rtl, contains(".irq_pending(irq_pending)"));

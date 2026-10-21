@@ -55,6 +55,13 @@ class HarborPcieDma extends BridgeModule {
   /// Count of completions that match no read in flight. Read only.
   static const registerStaleCompletions = 0x018;
 
+  /// Option ROM counters, read only, when [romStatusBuilt]: [15:0] ROM read
+  /// requests, [31:16] ROM completions.
+  static const registerRomStatus = 0x01c;
+
+  /// CAPS bit: the ROM counter word at [registerRomStatus] is built.
+  static const capsRomStatus = 1 << 2;
+
   /// Bits 3:0 of the ring base are always 0.
   static const registerCplBaseLow = 0x020;
   static const registerCplBaseHigh = 0x024;
@@ -181,6 +188,7 @@ class HarborPcieDma extends BridgeModule {
     required HarborPcieStream rx,
     required HarborPcieStream tx,
     Logic? irqInputs,
+    Logic? romStatus,
     this.fabricKind = HarborFabricKind.axi4,
     this.dataWidth = 64,
     this.addressWidth = 32,
@@ -195,12 +203,13 @@ class HarborPcieDma extends BridgeModule {
     this.infoWords = const [],
     String? name,
   }) : width = rx.width,
+       romStatusBuilt = romStatus != null,
        super(
          'HarborPcieDma_W${rx.width}_D${dataWidth}_A${addressWidth}_'
          '${fabricKind.name}_S${fifoSource ? 'f' : ''}${ringSource ? 'r' : ''}'
          '_Q${queueDepth}_T${readTags}_L${irqLines}_O${timeoutCycles}'
          '_P${maxPayloadBytes}_R${maxReadRequestBytes}'
-         '_I${_infoTag(infoWords)}',
+         '_I${_infoTag(infoWords)}${romStatus == null ? '' : '_M'}',
          name: name ?? 'pcie_dma',
        ) {
     _validate(tx, irqInputs);
@@ -222,6 +231,9 @@ class HarborPcieDma extends BridgeModule {
     final lines = irqLines == 0
         ? null
         : addInput('irq_lines', irqInputs!, width: irqLines);
+    _romStatus = romStatus == null
+        ? null
+        : addInput('rom_status', romStatus, width: 32);
     // A register stage on RX keeps the completion checks away from the
     // endpoint and the router decode.
     final rxIn = HarborPcieStream.addSink(this, rx);
@@ -261,10 +273,16 @@ class HarborPcieDma extends BridgeModule {
     );
   }
 
+  /// True when the option ROM counter word is built.
+  final bool romStatusBuilt;
+
+  Logic? _romStatus;
+
   /// The CAPS register value for these build options.
   int get caps =>
       (fifoSource ? 1 : 0) |
       (ringSource ? 2 : 0) |
+      (romStatusBuilt ? capsRomStatus : 0) |
       _log2(queueDepth) << 4 |
       readTags << 8 |
       (width ~/ 32) << 16 |
@@ -701,6 +719,7 @@ class HarborPcieDma extends BridgeModule {
         reg(registerIrqCause, cause),
         reg(registerIrqMask, mask),
         reg(registerStaleCompletions, tags.staleCount),
+        if (_romStatus != null) reg(registerRomStatus, _romStatus!),
         reg(registerCplBaseLow, cplBase.slice(31, 0)),
         reg(registerCplBaseHigh, cplBase.slice(63, 32)),
         reg(registerCplSize, cplLog),

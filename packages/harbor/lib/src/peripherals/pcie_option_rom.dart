@@ -10,6 +10,11 @@ import 'pcie/pcie_stream.dart';
 ///
 /// The block answers 3DW memory reads with the ROM hit bit in `rx_user`. It
 /// drops other packets. It reads one memory word for each payload DW.
+///
+/// `rom_reads` counts the read requests it answers and `completions` the
+/// completions it sends. Both stop at 0xffff. They reset only on
+/// [counterReset] (`counter_reset`), or on `reset` when it is not given, so
+/// a top can keep them over link resets.
 class HarborPcieOptionRom extends BridgeModule {
   late final BusMasterPort memory;
 
@@ -23,10 +28,11 @@ class HarborPcieOptionRom extends BridgeModule {
     this.memoryOffset = 0,
     int? memoryAddressWidth,
     Logic? readCompletionBoundary128,
+    Logic? counterReset,
     this.fabricKind = HarborFabricKind.wishbone,
     String? name,
   }) : super(
-         'HarborPcieOptionRom_W${rx.width}_S${romSize}_O${memoryOffset}_A${memoryAddressWidth ?? (memoryOffset + romSize - 1).bitLength}_${fabricKind.name}',
+         'HarborPcieOptionRom_W${rx.width}_S${romSize}_O${memoryOffset}_A${memoryAddressWidth ?? (memoryOffset + romSize - 1).bitLength}_${fabricKind.name}${counterReset == null ? '' : '_C'}',
          name: name ?? 'pcie_option_rom',
        ) {
     if (tx.width != rx.width) {
@@ -53,6 +59,9 @@ class HarborPcieOptionRom extends BridgeModule {
     final rxLast = rxs.last;
     final rxUser = rxs.user;
     final txReady = txs.ready;
+    final countersReset = counterReset == null
+        ? reset
+        : addInput('counter_reset', counterReset);
     final rcb128 = addInput(
       'read_completion_boundary_128',
       readCompletionBoundary128 ?? Const(0),
@@ -252,6 +261,32 @@ class HarborPcieOptionRom extends BridgeModule {
     final headerOk = rxData.slice(30, 24).eq(Const(0, width: 7)) & rxUser[8];
 
     final w = width;
+
+    // Counter strobes: a request starts, a completion ends.
+    final readStart =
+        state.eq(Const(startRead, width: 4)) |
+        state.eq(Const(waitAddress, width: 4)) & rxValid & requestOk & rxLast;
+    final completionEnd =
+        txReady &
+        (state.eq(Const(sendFirst, width: 4)) &
+                remaining.eq(Const(1, width: 11)) |
+            state.eq(Const(sendData, width: 4)) & dataEnds);
+    Sequential(clk, [
+      If(
+        countersReset,
+        then: [readCount < 0, completionCount < 0],
+        orElse: [
+          If(
+            readStart & ~readCount.eq(0xffff),
+            then: [readCount < readCount + 1],
+          ),
+          If(
+            completionEnd & ~completionCount.eq(0xffff),
+            then: [completionCount < completionCount + 1],
+          ),
+        ],
+      ),
+    ]);
     Logic beat(List<Logic> dws) => [
       for (var i = n - 1; i >= 0; i--)
         i < dws.length ? dws[i] : Const(0, width: 32),
@@ -297,7 +332,6 @@ class HarborPcieOptionRom extends BridgeModule {
 
     // The end of a completion: the next one, or the next request.
     List<Conditional> completionDone() => [
-      completionCount < completionCount + Const(1, width: 16),
       If(
         requestRemaining.eq(completionWords),
         then: [state < Const(waitHeader, width: 4)],
@@ -314,7 +348,6 @@ class HarborPcieOptionRom extends BridgeModule {
       requestRemaining < requestWords,
       bytesRemaining < requestByteCount,
       firstCompletion < Const(1),
-      readCount < readCount + Const(1, width: 16),
       state < Const(prepareCompletion, width: 4),
     ];
 
@@ -324,8 +357,6 @@ class HarborPcieOptionRom extends BridgeModule {
         then: [
           state < Const(waitHeader, width: 4),
           for (final word in words) word < 0,
-          readCount < 0,
-          completionCount < 0,
         ],
         orElse: [
           Case(state, [

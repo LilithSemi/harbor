@@ -62,6 +62,7 @@ class PcieGpuTop extends BridgeModule {
     required Logic interruptDisable,
     required Logic interruptRdyN,
     required Logic irqLine,
+    required Logic romCounterReset,
     required bool withRom,
   }) : super('PcieGpuTop_W${width}_R${withRom ? 1 : 0}', name: 'top') {
     final clk = createPort('clk', PortDirection.input).port;
@@ -79,6 +80,8 @@ class PcieGpuTop extends BridgeModule {
     interruptDisable = addInput('interrupt_disable', interruptDisable);
     interruptRdyN = addInput('interrupt_rdy_n', interruptRdyN);
     irqLine = addInput('irq_line', irqLine);
+    romCounterReset = addInput('rom_counter_reset', romCounterReset);
+    final romStatus = Logic(name: 'rom_status', width: 32);
     final rx = HarborPcieStream.addSink(this, upRx, prefix: 'up_rx_');
     final tx = HarborPcieStream.addSource(this, upTx, prefix: 'up_tx_');
     final rcb128 = Const(0);
@@ -104,6 +107,7 @@ class PcieGpuTop extends BridgeModule {
       rx: dmaRx,
       tx: dmaTx,
       irqInputs: irqLine,
+      romStatus: withRom ? romStatus : null,
       dataWidth: width,
       addressWidth: gpuAddressWidth,
       ringSource: true,
@@ -134,8 +138,11 @@ class PcieGpuTop extends BridgeModule {
         romSize: gpuRomBytes,
         memoryAddressWidth: 12,
         readCompletionBoundary128: rcb128,
+        counterReset: romCounterReset,
       );
       addSubModule(rom!);
+      romStatus <=
+          [rom!.output('completions'), rom!.output('rom_reads')].swizzle();
     }
     HarborPcieRouter(
       clk: clk,
@@ -236,6 +243,9 @@ class PcieGpuBench {
   final Logic msiEnable;
   final Logic busMaster;
   final Logic irqLine;
+
+  /// Resets only the option ROM counters, like a power on reset.
+  final Logic romCounterReset;
   final Logic rdyN;
   final PcieHostModel host;
   final PcieStreamDriver driver;
@@ -258,6 +268,7 @@ class PcieGpuBench {
     this.msiEnable,
     this.busMaster,
     this.irqLine,
+    this.romCounterReset,
     this.rdyN,
     this.host,
     this.driver,
@@ -283,6 +294,7 @@ class PcieGpuBench {
     final intDisable = Logic(name: 'interrupt_disable');
     final rdyN = Logic(name: 'rdy_n');
     final irqLine = Logic(name: 'irq_line');
+    final romCounterReset = Logic(name: 'rom_counter_reset');
     final rx = HarborPcieStream(width: width, name: 'rx');
     final tx = HarborPcieStream(width: width, name: 'tx');
     final top = PcieGpuTop(
@@ -298,6 +310,7 @@ class PcieGpuBench {
       interruptDisable: intDisable,
       interruptRdyN: rdyN,
       irqLine: irqLine,
+      romCounterReset: romCounterReset,
       withRom: true,
     );
     await top.build();
@@ -313,6 +326,7 @@ class PcieGpuBench {
     intDisable.inject(1);
     rdyN.inject(1);
     irqLine.inject(0);
+    romCounterReset.inject(1);
     reset.inject(1);
 
     final host = PcieHostModel(seed: seed, maxPayload: 256);
@@ -324,6 +338,7 @@ class PcieGpuBench {
       msiEnable,
       busMaster,
       irqLine,
+      romCounterReset,
       rdyN,
       host,
       PcieStreamDriver(clk: clk, stream: rx, seed: seed, gapChance: 0.05),
@@ -376,6 +391,7 @@ class PcieGpuBench {
       await clk.nextPosedge;
     }
     reset.inject(0);
+    romCounterReset.inject(0);
     await clk.nextPosedge;
     sink.start();
     _running = true;
@@ -895,6 +911,9 @@ class PcieGpuRun {
     expect(bar2SourceReads, greaterThan(0));
     expect(bar2Writes, greaterThan(0));
     expect(romReadsDuringDma, greaterThan(0));
+    final romStatus = await b.readReg(HarborPcieDma.registerRomStatus);
+    expect(romStatus & 0xffff, romReads, reason: 'ROM reads in BAR0');
+    expect(romStatus >> 16, greaterThanOrEqualTo(romReads));
     await b.finish();
   }
 }

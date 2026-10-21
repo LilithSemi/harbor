@@ -98,6 +98,16 @@ class Ax7203PcieGpu extends BridgeModule {
     final keySync = [Logic(name: 'key_sync0'), Logic(name: 'key_sync1')];
     Sequential(clk, [keySync[0] < ~keyN[0], keySync[1] < keySync[0]]);
 
+    // Power on reset for the option ROM counters: the flops start at 0 from
+    // configuration and the counter stops at 15. Link and PERST# resets do
+    // not touch it, so the counts from firmware stay for the OS driver.
+    final porCount = Logic(name: 'por_count', width: 4);
+    Sequential(clk, [
+      If(~porCount.eq(15), then: [porCount < porCount + 1]),
+    ]);
+    final romCounterReset = ~porCount.eq(15);
+    final romStatus = Logic(name: 'rom_status', width: 32);
+
     HarborPcieStream s(String n) => HarborPcieStream(width: 64, name: n);
     final dmaRx = s('dma_rx');
     final dmaTx = s('dma_tx');
@@ -123,6 +133,7 @@ class Ax7203PcieGpu extends BridgeModule {
         addressWidth: ax7203LocalAddressWidth,
         ringSource: true,
         irqLines: ax7203IrqLines,
+        romStatus: romStatus,
         infoWords: ax7203InfoWords,
       ),
     );
@@ -150,8 +161,10 @@ class Ax7203PcieGpu extends BridgeModule {
         memoryOffset: ax7203OptionRomOffset,
         memoryAddressWidth: 24,
         readCompletionBoundary128: endpoint.rcb128,
+        counterReset: romCounterReset,
       ),
     );
+    romStatus <= [rom.output('completions'), rom.output('rom_reads')].swizzle();
     HarborPcieRouter(
       clk: clk,
       reset: reset,
