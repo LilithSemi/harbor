@@ -221,6 +221,37 @@ void main() {
     await b.finish();
   });
 
+  test('with MSI off, IRQ writes give irq_pending no gap', () async {
+    final b = await _start();
+    b.msiEnable.inject(0);
+    b.lines!.inject(1);
+    await b.cycles(4);
+    expect(b.irqPending & 1, 1);
+    final seen = <int>[];
+    var done = false;
+    Future<void> writes() async {
+      await b.writeReg(HarborPcieDma.registerIrqCause, _line);
+      await b.writeReg(HarborPcieDma.registerIrqMask, _line);
+      await b.cycles(4);
+    }
+
+    final write = writes().then((_) => done = true);
+    while (!done) {
+      await b.clk.nextNegedge;
+      seen.add(b.irqPending & 1);
+      await b.clk.nextPosedge;
+    }
+    await write;
+    for (var i = 0; i < 4; i++) {
+      await b.clk.nextNegedge;
+      seen.add(b.irqPending & 1);
+      await b.clk.nextPosedge;
+    }
+    expect(seen, everyElement(1), reason: 'INTx stays asserted');
+    b.lines!.inject(0);
+    await b.finish();
+  });
+
   test('CPL ring writes are dropped while the engine runs', () async {
     final b = await _start();
     b.seedHost(0x80001000, 0x100);

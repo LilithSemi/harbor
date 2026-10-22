@@ -1386,7 +1386,8 @@ class HarborPcieDma extends BridgeModule {
     // A vector of irq_pending is low for one cycle after a write to
     // IRQ_CAUSE or IRQ_MASK that touches a bit of its group. A cause that is
     // still set then rises again, and the endpoint sends a new MSI for it.
-    // Other vectors do not change.
+    // Other vectors do not change. With MSI off (INTx), there is no gap, so
+    // a write does not send a Deassert and Assert pair.
     final touched = mux(
       writes(registerIrqMask ~/ 4),
       wMask.slice(causeWidth - 1, 0),
@@ -1401,7 +1402,7 @@ class HarborPcieDma extends BridgeModule {
         then: [irqGapBits < 0, fresh < 0, if (linesPrev != null) linesPrev < 0],
         orElse: [
           irqGapBits <
-              mux(irqWrite, touched, Const(0, width: causeWidth)) &
+              mux(irqWrite & msiEnable, touched, Const(0, width: causeWidth)) &
                   Const(causeBits, width: causeWidth),
           // An engine reset starts the driver again, so it clears fresh.
           fresh <
