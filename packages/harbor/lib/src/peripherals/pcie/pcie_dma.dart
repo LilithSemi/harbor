@@ -1321,16 +1321,26 @@ class HarborPcieDma extends BridgeModule {
       cplBase,
       (Const(16, width: 20) << cplLog).zeroExtend(64),
     );
-    final cplSizeBad =
-        (inState(sIdle) & startWanted & (cplLog.eq(0) | cplWraps)).named(
-          'cpl_ring_bad',
-        );
+    // The ring check is registered. The engine does not start in the cycle
+    // after a CPL ring write, so the check always sees the new ring.
+    final cplBadReg = Logic(name: 'cpl_bad_reg');
+    final cplWrote = Logic(name: 'cpl_wrote');
+    final cplSizeBad = (inState(sIdle) & startWanted & ~cplWrote & cplBadReg)
+        .named('cpl_ring_bad');
     // CPL_BASE and CPL_SIZE writes take effect only in the reset state of
     // the ring: tail 0, head 0 and phase 1, with the engine idle and not
     // starting. A full wrap brings tail 0 back, but not phase 1.
     final cplWritable =
         (inState(sIdle) & ~startWanted & cplTail.eq(0) & cplHead.eq(0) & phase)
             .named('cpl_writable');
+    Sequential(clk, [
+      cplBadReg < cplLog.eq(0) | cplWraps,
+      cplWrote <
+          (writes(registerCplBaseLow ~/ 4) |
+                  writes(registerCplBaseHigh ~/ 4) |
+                  writes(registerCplSize ~/ 4)) &
+              cplWritable,
+    ], reset: reset);
     final doneSet = recDone & code.eq(0) & dFlags[1];
     final errSet = recDone & ~code.eq(0) | cplSizeBad;
     final sets = [
@@ -1756,10 +1766,12 @@ class HarborPcieDma extends BridgeModule {
                             )
                           : Const(errorCplRing, width: 8)),
                 ]),
-                ElseIf(enable & ~halted & ~qCount.eq(0), [state < sLoad]),
+                ElseIf(enable & ~halted & ~cplWrote & ~qCount.eq(0), [
+                  state < sLoad,
+                ]),
                 // A fetch error gets a record after the queue is empty.
                 if (ringSource)
-                  ElseIf(enable & ~halted & ~fErr.eq(0), [
+                  ElseIf(enable & ~halted & ~cplWrote & ~fErr.eq(0), [
                     dCookie < 0,
                     dFlags < 0,
                     done < 0,
