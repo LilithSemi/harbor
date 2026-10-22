@@ -360,15 +360,26 @@ class HarborPcieDmaTags extends Module {
       final cb = Const(b, width: bLog);
       final l = (cb - startLow).named('w_lane_$b');
       final data = _laneMux(cplHeader, firstMem, l, lanes);
+      // The write port is registered, so the slot registers do not have to
+      // be near the RAM. The drain reads a slot some cycles after it is
+      // done, so the late write is always in the RAM first.
+      final bankEn = Logic(name: 'w_en_$b');
+      final bankAddr = Logic(name: 'w_addr_$b', width: bankAw);
+      final bankData = Logic(name: 'w_data_$b', width: 32);
+      Sequential(clk, [
+        bankEn < ~reset & wEn & l.zeroExtend(3).lt(wCount),
+        bankAddr <
+            startHigh +
+                mux(cb.lt(startLow), Const(1), Const(0)).zeroExtend(bankAw),
+        bankData < data,
+      ]);
       final ram = _ReorderRam(
         clk,
         width: 32,
         depth: bankDepth,
-        wrEn: wEn & l.zeroExtend(3).lt(wCount),
-        wrAddr:
-            startHigh +
-            mux(cb.lt(startLow), Const(1), Const(0)).zeroExtend(bankAw),
-        wrData: data,
+        wrEn: bankEn,
+        wrAddr: bankAddr,
+        wrData: bankData,
         rdAddr:
             rdHigh + mux(cb.lt(rdLow), Const(1), Const(0)).zeroExtend(bankAw),
         name: 'reorder_$b',
