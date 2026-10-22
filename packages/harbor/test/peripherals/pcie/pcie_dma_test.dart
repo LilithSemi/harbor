@@ -19,7 +19,9 @@ HarborPcieDma _dma({
   int timeoutCycles = 6250000,
   int maxReadRequestBytes = 512,
   List<int> infoWords = const [],
-  HarborPcieEndpointConfig? endpointConfig,
+  HarborPcieEndpointConfig endpointConfig = const HarborPcieEndpointConfig(
+    msiVectors: 8,
+  ),
 }) => HarborPcieDma(
   clk: Logic(),
   reset: Logic(),
@@ -1354,6 +1356,7 @@ Future<void> _causeAfterLastBeat(int width) async {
     tx: HarborPcieStream(width: width, name: 'dut_tx'),
     dataWidth: width,
     addressWidth: dmaAddressWidth,
+    endpointConfig: const HarborPcieEndpointConfig(msiVectors: 8),
   );
   final top = MasterTop(
     dut,

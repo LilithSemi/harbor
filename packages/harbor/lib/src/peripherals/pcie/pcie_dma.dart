@@ -209,7 +209,7 @@ class HarborPcieDma extends BridgeModule {
     required HarborPcieStream tx,
     Logic? irqInputs,
     Logic? romStatus,
-    HarborPcieEndpointConfig? endpointConfig,
+    required HarborPcieEndpointConfig endpointConfig,
     this.fabricKind = HarborFabricKind.axi4,
     this.dataWidth = 64,
     this.addressWidth = 32,
@@ -236,7 +236,7 @@ class HarborPcieDma extends BridgeModule {
     _validate(tx, irqInputs);
     // Vector 0 is the DMA and vector 1 + i is line i. With fewer vectors
     // every group shares vector 0.
-    if (endpointConfig != null && endpointConfig.msiVectors < 1 + irqLines) {
+    if (endpointConfig.msiVectors < 1 + irqLines) {
       throw ArgumentError(
         'msiVectors ${endpointConfig.msiVectors} < 1 + irqLines $irqLines',
       );

@@ -164,6 +164,7 @@ class DmaBench {
       queueDepth: config.queueDepth,
       readTags: config.readTags,
       irqLines: config.irqLines,
+      endpointConfig: const HarborPcieEndpointConfig(msiVectors: 8),
       infoWords: config.infoWords,
       timeoutCycles: config.timeoutCycles,
       maxReadRequestBytes: config.maxReadRequestBytes,

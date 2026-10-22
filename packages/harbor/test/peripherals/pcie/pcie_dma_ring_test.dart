@@ -724,6 +724,7 @@ void main() {
         tx: HarborPcieStream(width: 128),
         fifoSource: fifo,
         ringSource: true,
+        endpointConfig: const HarborPcieEndpointConfig(msiVectors: 8),
       );
       await dma.build();
       final sv = dma.generateSynth();
