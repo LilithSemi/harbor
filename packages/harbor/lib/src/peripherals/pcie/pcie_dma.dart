@@ -1326,13 +1326,12 @@ class HarborPcieDma extends BridgeModule {
         (inState(sIdle) & startWanted & (cplLog.eq(0) | cplWraps)).named(
           'cpl_ring_bad',
         );
-    // CPL_BASE and CPL_SIZE writes are dropped while the engine runs or
-    // starts in this cycle, and while the ring is not empty at slot 0. So
-    // the ring cannot change under a record or a live slot.
+    // CPL_BASE and CPL_SIZE writes take effect only in the reset state of
+    // the ring: tail 0, head 0 and phase 1, with the engine idle and not
+    // starting. A full wrap brings tail 0 back, but not phase 1.
     final cplWritable =
-        (inState(sIdle) & ~startWanted & cplTail.eq(0) & cplHead.eq(0)).named(
-          'cpl_writable',
-        );
+        (inState(sIdle) & ~startWanted & cplTail.eq(0) & cplHead.eq(0) & phase)
+            .named('cpl_writable');
     final doneSet = recDone & code.eq(0) & dFlags[1];
     final errSet = recDone & ~code.eq(0) | cplSizeBad;
     final sets = [

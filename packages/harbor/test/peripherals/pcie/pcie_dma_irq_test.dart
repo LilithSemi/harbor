@@ -285,6 +285,32 @@ void main() {
     await b.finish();
   });
 
+  test('a CPL_SIZE write after a full ring wrap is dropped', () async {
+    final b = await DmaBench.create(const DmaConfig());
+    await b.start();
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable();
+    for (var i = 0; i < 16; i++) {
+      await b.push(
+        hostAddress: 0x80000000 + 0x100 * i,
+        localAddress: 0,
+        length: 4,
+        cookie: i + 1,
+      );
+      // The ring holds 15 records, so free the slots as they fill.
+      await b.waitRecordWrites(i, 1);
+      await b.writeReg(HarborPcieDma.registerCplHead, (i + 1) & 15);
+    }
+    await b.cycles(20);
+    expect(await b.readReg(HarborPcieDma.registerCplTail), 0);
+    expect(await b.readReg(HarborPcieDma.registerCplHead), 0);
+    // Tail and head are 0 again, but the phase is 0, so this is not the
+    // reset state of the ring.
+    await b.writeReg(HarborPcieDma.registerCplSize, 2);
+    expect(await b.readReg(HarborPcieDma.registerCplSize), 4);
+    await b.finish();
+  });
+
   test('a CPL_SIZE write to an idle engine with records does not move '
       'the ring', () async {
     final b = await DmaBench.create(const DmaConfig());
