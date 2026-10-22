@@ -442,6 +442,13 @@ class Ddr3Controller extends Module {
     final s2Col = reg('s2_col', colBits);
     final s2Bank = reg('s2_bank', baBits);
     final s2Row = reg('s2_row', rowBits);
+    // Set when the stage2 bank is open on the stage2 row. It is a register,
+    // so the row compare is not on the scheduler paths. Valid only while
+    // stage2 holds a request.
+    final s2RowOpen = reg('s2_row_open');
+    // Set when the write or the read timer of the stage2 bank is zero.
+    final s2WrReady = reg('s2_wr_ready');
+    final s2RdReady = reg('s2_rd_ready');
     final s2DataUnaligned = reg('s2_data_unaligned', wbDataBits);
     final s2DataUnalignedTemp = reg('s2_data_unaligned_temp', wbDataBits);
     final s2Data = [
@@ -466,6 +473,10 @@ class Ddr3Controller extends Module {
     ];
     final dPreQ = [for (var b = 0; b < nBanks; b++) reg('d_pre_q_$b', 4)];
     final dActQ = [for (var b = 0; b < nBanks; b++) reg('d_act_q_$b', 4)];
+    // Set when the precharge or the activate timer is zero. These are
+    // registers, so the bank select does not wait for a timer compare.
+    final preZeroQ = [for (var b = 0; b < nBanks; b++) reg('d_pre_zero_q_$b')];
+    final actZeroQ = [for (var b = 0; b < nBanks; b++) reg('d_act_zero_q_$b')];
     final dWrQ = [for (var b = 0; b < nBanks; b++) reg('d_wr_q_$b', 4)];
     final dRdQ = [for (var b = 0; b < nBanks; b++) reg('d_rd_q_$b', 4)];
     // read-ack pipe
@@ -495,8 +506,6 @@ class Ddr3Controller extends Module {
     final stage2Update = wire('stage2_update');
     final stage1Stall = wire('stage1_stall');
     final oWbStallD = wire('o_wb_stall_d');
-    final prechargeBusy = wire('precharge_slot_busy');
-    final activateBusy = wire('activate_slot_busy');
     final writeDqsSched = wire('write_dqs_sched');
     final cmdD = [for (var s = 0; s < 4; s++) wire('cmd_d_$s', cmdLen)];
     final bankStatusD = [
@@ -507,6 +516,8 @@ class Ddr3Controller extends Module {
     ];
     final dPreD = [for (var b = 0; b < nBanks; b++) wire('d_pre_d_$b', 4)];
     final dActD = [for (var b = 0; b < nBanks; b++) wire('d_act_d_$b', 4)];
+    final preZeroD = [for (var b = 0; b < nBanks; b++) wire('d_pre_zero_d_$b')];
+    final actZeroD = [for (var b = 0; b < nBanks; b++) wire('d_act_zero_d_$b')];
     final dWrD = [for (var b = 0; b < nBanks; b++) wire('d_wr_d_$b', 4)];
     final dRdD = [for (var b = 0; b < nBanks; b++) wire('d_rd_d_$b', 4)];
     final shiftRegD = [
@@ -540,14 +551,106 @@ class Ddr3Controller extends Module {
       defaultValue: regs[0],
       conditionalType: ConditionalType.unique,
     );
-    final s2RightRow =
-        s2Pending & pickBank(bankStatusQ) & pickBank(bankRowQ).eq(s2Row);
-    final s2LaunchWrite = s2RightRow & s2We & pickBank(dWrQ).eq(0);
-    final s2LaunchRead = s2RightRow & ~s2We & pickBank(dRdQ).eq(0);
-    final s2ReadyNext =
-        (s2RightRow &
-                mux(s2We, pickBank(dWrQ).lte(dc(1)), pickBank(dRdQ).lte(dc(1))))
-            .named('s2_ready_next');
+    // Per-bank flags from registers. The bank picks select one bit each.
+    final actReady = [
+      for (var b = 0; b < nBanks; b++) ~bankStatusQ[b] & actZeroQ[b],
+    ];
+    final preReady = [
+      for (var b = 0; b < nBanks; b++) bankStatusQ[b] & preZeroQ[b],
+    ];
+    // A timer of 0 or 1 is zero in the next cycle.
+    Logic soon(Logic timer) => timer.getRange(1).eq(0);
+    final wrSoon = [for (var b = 0; b < nBanks; b++) soon(dWrQ[b])];
+    final rdSoon = [for (var b = 0; b < nBanks; b++) soon(dRdQ[b])];
+    final s2RightRow = s2Pending & s2RowOpen;
+    final s2BankIs = [for (var b = 0; b < nBanks; b++) s2Bank.eq(b)];
+    final s2Activate = s2Pending & pickBank(actReady);
+    final s2Precharge = s2Pending & ~s2RowOpen & pickBank(preReady);
+    final s2LaunchWrite = s2RightRow & s2We & s2WrReady;
+    final s2LaunchRead = s2RightRow & ~s2We & s2RdReady;
+    final s2Launch = s2LaunchWrite | s2LaunchRead;
+    final s2Ack = [s2Aux, Const(1)].swizzle();
+    // The stage1 checks use registers only. When stage2 is empty or issues,
+    // they give the same result as a check of the next-state values.
+    Logic pickS1(List<Logic> regs) => cases(
+      s1Bank,
+      {for (var b = 0; b < nBanks; b++) Const(b, width: baBits): regs[b]},
+      defaultValue: regs[0],
+      conditionalType: ConditionalType.unique,
+    );
+    final s1RowOpen = pickS1([
+      for (var b = 0; b < nBanks; b++) bankStatusQ[b] & bankRowQ[b].eq(s1Row),
+    ]);
+    final s1NextRowSame = s1NextRow.eq(s1Row);
+    final lookAheadOnS1 =
+        s1Pending &
+        s1NextBank.eq(s1Bank) &
+        ~(s1NextBank.eq(s2Bank) & s2Pending);
+    final lookAheadAct = lookAheadOnS1 & pickS1(actReady);
+    final lookAheadPre = lookAheadOnS1 & ~s1NextRowSame & pickS1(preReady);
+    final s1RowReady =
+        (lookAheadAct & s1NextRowSame) | (s1RowOpen & ~lookAheadPre);
+    final s2SameBank = s2Bank.eq(s1Bank);
+    Logic setsTimer(Logic event, int value) => value == 0 ? Const(0) : event;
+    final s1ReadTimerZero =
+        pickS1(rdSoon) &
+        ~setsTimer(s2LaunchWrite, t.writeToReadDelay + 1) &
+        ~setsTimer(
+          s2LaunchRead & s2SameBank,
+          math.max(t.readToReadDelay, minReadGap),
+        ) &
+        ~setsTimer(s2LaunchRead & ~s2SameBank, minReadGap) &
+        ~setsTimer(lookAheadAct, t.activateToReadDelay);
+    final s1WriteTimerZero =
+        pickS1(wrSoon) &
+        ~setsTimer(s2LaunchWrite & s2SameBank, t.writeToWriteDelay) &
+        ~setsTimer(s2LaunchRead, t.writeToReadDelay + 1) &
+        ~setsTimer(lookAheadAct, t.activateToWriteDelay);
+    // The stage2 timer flags for the next cycle when stage2 does not advance.
+    final s2WrReadyHold =
+        pickBank(wrSoon) &
+        ~setsTimer(s2LaunchWrite, t.writeToWriteDelay) &
+        ~setsTimer(s2LaunchRead, t.writeToReadDelay + 1) &
+        ~setsTimer(s2Activate, t.activateToWriteDelay);
+    final s2RdReadyHold =
+        pickBank(rdSoon) &
+        ~setsTimer(s2LaunchWrite, t.writeToReadDelay + 1) &
+        ~setsTimer(s2LaunchRead, math.max(t.readToReadDelay, minReadGap)) &
+        ~setsTimer(s2Activate, t.activateToReadDelay);
+    // Stage2 issues its read or write in the next cycle if it does not
+    // advance in this cycle.
+    final s2LaunchNext =
+        (s2Pending &
+                ~_instructionAddress.eq(20) &
+                (s2RowOpen | s2Activate) &
+                mux(s2We, s2WrReadyHold, s2RdReadyHold))
+            .named('s2_launch_next');
+    // When stage2 holds its request in this cycle, stage1 also holds and the
+    // stall follows stage2.
+    final stage1StallVal =
+        s1Pending &
+        mux(
+          s2Pending & ~s2Launch,
+          ~s2LaunchNext,
+          ~(s1RowReady & mux(s1We, s1WriteTimerZero, s1ReadTimerZero)),
+        );
+    // Look-ahead precharge or activate of the next row in the s1NextBank bank.
+    final nextBankIs = [for (var b = 0; b < nBanks; b++) s1NextBank.eq(b)];
+    Logic pickNext(List<Logic> regs) => cases(
+      s1NextBank,
+      {for (var b = 0; b < nBanks; b++) Const(b, width: baBits): regs[b]},
+      defaultValue: regs[0],
+      conditionalType: ConditionalType.unique,
+    );
+    final lookAhead = s1Pending & ~(s1NextBank.eq(s2Bank) & s2Pending);
+    final lookAheadPrecharge =
+        lookAhead &
+        ~s2Precharge &
+        pickNext([
+          for (var b = 0; b < nBanks; b++)
+            ~bankRowQ[b].eq(s1NextRow) & preReady[b],
+        ]);
+    final lookAheadActivate = lookAhead & ~s2Activate & pickNext(actReady);
     final cmdOdtVal = mux(
       s2LaunchWrite,
       Const(1),
@@ -558,19 +661,18 @@ class Ddr3Controller extends Module {
       cmdOdt < cmdOdtVal, // scheduler-final ODT (write=1 / read=0 / else _q)
       cmdCkEn < _instruction[24],
       cmdResetN < _instruction[23],
-      stage1Stall < Const(0),
-      stage2Stall < Const(0),
-      stage2Update < Const(1),
+      stage2Stall < s2Pending & ~s2Launch & ~s2LaunchNext,
+      stage2Update < ~s2Pending | s2Launch,
       oWbStallD < Const(0),
-      prechargeBusy < Const(0),
-      activateBusy < Const(0),
-      writeDqsSched < Const(0),
+      writeDqsSched < s2LaunchWrite,
       // default bank / counter _d
       for (var b = 0; b < nBanks; b++) ...[
         bankStatusD[b] < bankStatusQ[b],
         bankRowD[b] < bankRowQ[b],
         dPreD[b] < mux(dPreQ[b].eq(0), dc(0), dPreQ[b] - 1),
         dActD[b] < mux(dActQ[b].eq(0), dc(0), dActQ[b] - 1),
+        preZeroD[b] < soon(dPreQ[b]),
+        actZeroD[b] < soon(dActQ[b]),
         dWrD[b] < mux(dWrQ[b].eq(0), dc(0), dWrQ[b] - 1),
         dRdD[b] < mux(dRdQ[b].eq(0), dc(0), dRdQ[b] - 1),
       ],
@@ -619,121 +721,109 @@ class Ddr3Controller extends Module {
             bank: zeroBank,
             addr: zeroAddr,
           ),
-      // --- stage2 command scheduling (per-bank, guarded by s2Bank) ---
-      // cmd_odt is already the scheduler-final value (cmdOdtVal), so every slot
-      // below embeds it directly; no post-hoc ODT fixup / reassignment needed.
+      // --- stage2 command scheduling ---
+      // The flags above give the command conditions. Only the s2Bank bank
+      // changes, so each slot has one source and no priority chain.
+      If(s2Launch, then: [shiftRegD[readAckPipeWidth - 1] < s2Ack]),
       If(
-        s2Pending,
+        s2LaunchWrite,
         then: [
-          stage2Stall < Const(1),
-          stage2Update < Const(0),
-          for (var b = 0; b < nBanks; b++)
-            If(
-              s2Bank.eq(b) & bankStatusQ[b] & bankRowQ[b].eq(s2Row),
-              then: [
-                // right row active -> read or write
-                If(
-                  s2We & dWrQ[b].eq(0),
-                  then: [
-                    stage2Stall < Const(0),
-                    stage2Update < Const(1),
-                    shiftRegD[readAckPipeWidth - 1] <
-                        [s2Aux, Const(1)].swizzle(),
-                    If(
-                      dPreQ[b].lte(dc(t.writeToPrechargeDelay)),
-                      then: [dPreD[b] < dc(t.writeToPrechargeDelay)],
-                    ),
-                    for (var k = 0; k < nBanks; k++)
-                      dRdD[k] < dc(t.writeToReadDelay + 1),
-                    dWrD[b] < dc(t.writeToWriteDelay),
-                    cmdD[timing.writeSlot] <
-                        _rwCmd(
-                          Ddr3Cmd.wr & 0x7,
-                          s2Bank,
-                          s2Col,
-                          cmdOdt,
-                          cmdCkEn,
-                          cmdResetN,
-                        ),
-                    writeDqsSched < Const(1),
-                  ],
-                  orElse: [
-                    If(
-                      ~s2We & dRdQ[b].eq(0),
-                      then: [
-                        stage2Stall < Const(0),
-                        stage2Update < Const(1),
-                        If(
-                          dPreQ[b].lte(dc(t.readToPrechargeDelay)),
-                          then: [dPreD[b] < dc(t.readToPrechargeDelay)],
-                        ),
-                        dRdD[b] < dc(math.max(t.readToReadDelay, minReadGap)),
-                        // Any next read waits [minReadGap] cycles.
-                        for (var k = 0; k < nBanks; k++)
-                          if (k != b && minReadGap > 0)
-                            If(
-                              dRdQ[k].lte(dc(minReadGap)),
-                              then: [dRdD[k] < dc(minReadGap)],
-                            ),
-                        for (var k = 0; k < nBanks; k++)
-                          dWrD[k] < dc(t.writeToReadDelay + 1),
-                        shiftRegD[readAckPipeWidth - 1] <
-                            [s2Aux, Const(1)].swizzle(),
-                        cmdD[timing.readSlot] <
-                            _rwCmd(
-                              Ddr3Cmd.rd & 0x7,
-                              s2Bank,
-                              s2Col,
-                              cmdOdt,
-                              cmdCkEn,
-                              cmdResetN,
-                            ),
-                      ],
-                    ),
-                  ],
-                ),
-              ],
-              orElse: [
-                If(
-                  s2Bank.eq(b) & ~bankStatusQ[b] & dActQ[b].eq(0),
-                  then: [
-                    // bank idle -> activate
-                    activateBusy < Const(1),
-                    dPreD[b] < dc(t.activateToPrechargeDelay),
-                    If(
-                      dRdQ[b].lte(dc(t.activateToReadDelay)),
-                      then: [dRdD[b] < dc(t.activateToReadDelay)],
-                    ),
-                    If(
-                      dWrQ[b].lte(dc(t.activateToWriteDelay)),
-                      then: [dWrD[b] < dc(t.activateToWriteDelay)],
-                    ),
-                    cmdD[timing.activateSlot] <
-                        _actCmd(s2Bank, s2Row, cmdOdt, cmdCkEn, cmdResetN),
-                    bankStatusD[b] < Const(1),
-                    bankRowD[b] < s2Row,
-                  ],
-                  orElse: [
-                    If(
-                      s2Bank.eq(b) &
-                          bankStatusQ[b] &
-                          ~bankRowQ[b].eq(s2Row) &
-                          dPreQ[b].eq(0),
-                      then: [
-                        // wrong row -> precharge
-                        prechargeBusy < Const(1),
-                        dActD[b] < dc(t.prechargeToActivateDelay),
-                        cmdD[timing.prechargeSlot] <
-                            _preCmd(s2Bank, s2Row, cmdOdt, cmdCkEn, cmdResetN),
-                        bankStatusD[b] < Const(0),
-                      ],
-                    ),
-                  ],
-                ),
-              ],
-            ),
+          for (var k = 0; k < nBanks; k++) dRdD[k] < dc(t.writeToReadDelay + 1),
+          cmdD[timing.writeSlot] <
+              _rwCmd(
+                Ddr3Cmd.wr & 0x7,
+                s2Bank,
+                s2Col,
+                cmdOdt,
+                cmdCkEn,
+                cmdResetN,
+              ),
         ],
       ),
+      If(
+        s2LaunchRead,
+        then: [
+          for (var k = 0; k < nBanks; k++) dWrD[k] < dc(t.writeToReadDelay + 1),
+          cmdD[timing.readSlot] <
+              _rwCmd(
+                Ddr3Cmd.rd & 0x7,
+                s2Bank,
+                s2Col,
+                cmdOdt,
+                cmdCkEn,
+                cmdResetN,
+              ),
+        ],
+      ),
+      If(
+        s2Activate,
+        then: [
+          cmdD[timing.activateSlot] <
+              _actCmd(s2Bank, s2Row, cmdOdt, cmdCkEn, cmdResetN),
+        ],
+      ),
+      If(
+        s2Precharge,
+        then: [
+          cmdD[timing.prechargeSlot] <
+              _preCmd(s2Bank, s2Row, cmdOdt, cmdCkEn, cmdResetN),
+        ],
+      ),
+      for (var b = 0; b < nBanks; b++) ...[
+        If(
+          s2BankIs[b] & s2LaunchWrite,
+          then: [
+            If(
+              dPreQ[b].lte(dc(t.writeToPrechargeDelay)),
+              then: [dPreD[b] < dc(t.writeToPrechargeDelay)],
+            ),
+            if (t.writeToPrechargeDelay > 0) preZeroD[b] < Const(0),
+            dWrD[b] < dc(t.writeToWriteDelay),
+          ],
+        ),
+        If(
+          s2BankIs[b] & s2LaunchRead,
+          then: [
+            If(
+              dPreQ[b].lte(dc(t.readToPrechargeDelay)),
+              then: [dPreD[b] < dc(t.readToPrechargeDelay)],
+            ),
+            if (t.readToPrechargeDelay > 0) preZeroD[b] < Const(0),
+            dRdD[b] < dc(math.max(t.readToReadDelay, minReadGap)),
+          ],
+        ),
+        // Any next read waits [minReadGap] cycles.
+        if (minReadGap > 0)
+          If(
+            ~s2BankIs[b] & s2LaunchRead & dRdQ[b].lte(dc(minReadGap)),
+            then: [dRdD[b] < dc(minReadGap)],
+          ),
+        If(
+          s2BankIs[b] & s2Activate,
+          then: [
+            dPreD[b] < dc(t.activateToPrechargeDelay),
+            preZeroD[b] < Const(t.activateToPrechargeDelay == 0 ? 1 : 0),
+            If(
+              dRdQ[b].lte(dc(t.activateToReadDelay)),
+              then: [dRdD[b] < dc(t.activateToReadDelay)],
+            ),
+            If(
+              dWrQ[b].lte(dc(t.activateToWriteDelay)),
+              then: [dWrD[b] < dc(t.activateToWriteDelay)],
+            ),
+            bankStatusD[b] < Const(1),
+            bankRowD[b] < s2Row,
+          ],
+        ),
+        If(
+          s2BankIs[b] & s2Precharge,
+          then: [
+            dActD[b] < dc(t.prechargeToActivateDelay),
+            actZeroD[b] < Const(t.prechargeToActivateDelay == 0 ? 1 : 0),
+            bankStatusD[b] < Const(0),
+          ],
+        ),
+      ],
       // --- stage1 anticipate (ddr3_controller.v:1069-1101) ---
       // While stage2 serves the current request, pre-precharge / pre-activate the
       // NEXT request's row (s1NextBank/s1NextRow) so it is open by the time it
@@ -741,81 +831,53 @@ class Ddr3Controller extends Module {
       // using this cycle. Without this the on-demand path desyncs bank_row on a
       // row change and a read can land on the wrong open row.
       If(
-        s1Pending & ~(s1NextBank.eq(s2Bank) & s2Pending),
+        lookAheadPrecharge,
         then: [
-          for (var b = 0; b < nBanks; b++)
-            If(
-              s1NextBank.eq(b) &
-                  bankStatusQ[b] &
-                  ~bankRowQ[b].eq(s1NextRow) &
-                  dPreQ[b].eq(0) &
-                  ~prechargeBusy,
-              then: [
-                // wrong row open in the anticipated bank -> precharge it.
-                dActD[b] < dc(t.prechargeToActivateDelay),
-                cmdD[timing.prechargeSlot] <
-                    _preCmd(s1NextBank, s1NextRow, cmdOdt, cmdCkEn, cmdResetN),
-                bankStatusD[b] < Const(0),
-              ],
-              orElse: [
-                If(
-                  s1NextBank.eq(b) &
-                      ~bankStatusQ[b] &
-                      dActQ[b].eq(0) &
-                      ~activateBusy,
-                  then: [
-                    // anticipated bank idle -> activate the next row early.
-                    dPreD[b] < dc(t.activateToPrechargeDelay),
-                    If(
-                      dRdD[b].lte(dc(t.activateToReadDelay)),
-                      then: [dRdD[b] < dc(t.activateToReadDelay)],
-                    ),
-                    If(
-                      dWrD[b].lte(dc(t.activateToWriteDelay)),
-                      then: [dWrD[b] < dc(t.activateToWriteDelay)],
-                    ),
-                    cmdD[timing.activateSlot] <
-                        _actCmd(
-                          s1NextBank,
-                          s1NextRow,
-                          cmdOdt,
-                          cmdCkEn,
-                          cmdResetN,
-                        ),
-                    bankStatusD[b] < Const(1),
-                    bankRowD[b] < s1NextRow,
-                  ],
-                ),
-              ],
-            ),
+          cmdD[timing.prechargeSlot] <
+              _preCmd(s1NextBank, s1NextRow, cmdOdt, cmdCkEn, cmdResetN),
         ],
       ),
-      // --- stage1 stall (ddr3_controller.v:1104-1123) ---
-      // Hold stage1 until its own bank/row is ready: bank idle, wrong row still
-      // open, or the read/write timer for that bank has not elapsed.
       If(
-        s1Pending,
+        lookAheadActivate,
         then: [
-          for (var b = 0; b < nBanks; b++)
-            If(
-              s1Bank.eq(b),
-              then: [
-                If(
-                  ~bankStatusD[b] |
-                      (bankStatusD[b] & ~bankRowD[b].eq(s1Row)) |
-                      (~s1We & ~dRdD[b].eq(0)) |
-                      (s1We & ~dWrD[b].eq(0)),
-                  then: [stage1Stall < Const(1)],
-                ),
-              ],
-            ),
+          cmdD[timing.activateSlot] <
+              _actCmd(s1NextBank, s1NextRow, cmdOdt, cmdCkEn, cmdResetN),
         ],
       ),
+      for (var b = 0; b < nBanks; b++) ...[
+        If(
+          nextBankIs[b] & lookAheadPrecharge,
+          then: [
+            dActD[b] < dc(t.prechargeToActivateDelay),
+            actZeroD[b] < Const(t.prechargeToActivateDelay == 0 ? 1 : 0),
+            bankStatusD[b] < Const(0),
+          ],
+        ),
+        If(
+          nextBankIs[b] & lookAheadActivate,
+          then: [
+            dPreD[b] < dc(t.activateToPrechargeDelay),
+            preZeroD[b] < Const(t.activateToPrechargeDelay == 0 ? 1 : 0),
+            If(
+              dRdD[b].lte(dc(t.activateToReadDelay)),
+              then: [dRdD[b] < dc(t.activateToReadDelay)],
+            ),
+            If(
+              dWrD[b].lte(dc(t.activateToWriteDelay)),
+              then: [dWrD[b] < dc(t.activateToWriteDelay)],
+            ),
+            bankStatusD[b] < Const(1),
+            bankRowD[b] < s1NextRow,
+          ],
+        ),
+      ],
+      // --- stage1 stall (ddr3_controller.v:1104-1123) ---
+      // Hold stage1 until its own bank and row are ready. While stage2 holds,
+      // the stall follows the next stage2 launch instead.
+      stage1Stall < stage1StallVal,
       // --- stall control ---
-      // Release the bus one cycle before a selected timer reaches zero. This
-      // preserves the scheduler look-ahead without putting bankStatusD,
-      // bankRowD and every timer-D update on the Wishbone-stall path.
-      If(s2ReadyNext, then: [stage2Stall < Const(0)]),
+      // Release the bus in the cycle before stage2 issues its read or write,
+      // so stage2 never issues while the pipeline is stalled.
       If(
         oWbStallQ,
         then: [oWbStallD < stage2Stall],
@@ -866,6 +928,9 @@ class Ddr3Controller extends Module {
           oWbStallCalib < Const(1),
           s1Pending < Const(0),
           s2Pending < Const(0),
+          s2RowOpen < Const(0),
+          s2WrReady < Const(0),
+          s2RdReady < Const(0),
           cmdOdtQ < Const(0),
           indexWbData < Const(0),
           indexReadPipe < Const(0),
@@ -876,6 +941,8 @@ class Ddr3Controller extends Module {
             bankRowQ[b] < Const(0, width: rowBits),
             dPreQ[b] < dc(0),
             dActQ[b] < dc(0),
+            preZeroQ[b] < Const(1),
+            actZeroQ[b] < Const(1),
             dWrQ[b] < dc(0),
             dRdQ[b] < dc(0),
           ],
@@ -922,6 +989,8 @@ class Ddr3Controller extends Module {
                 bankRowQ[b] < bankRowD[b],
                 dPreQ[b] < dPreD[b],
                 dActQ[b] < dActD[b],
+                preZeroQ[b] < preZeroD[b],
+                actZeroQ[b] < actZeroD[b],
                 dWrQ[b] < dWrD[b],
                 dRdQ[b] < dRdD[b],
               ],
@@ -937,6 +1006,27 @@ class Ddr3Controller extends Module {
                 ~_instruction[27],
                 then: [oWbStall < Const(1), oWbStallCalib < Const(1)],
               ),
+              // The next stage2 bank state. On an advance, it is the stage1
+              // bank state. If not, it follows the stage2 commands.
+              s2RowOpen <
+                  ~_instructionAddress.eq(20) &
+                      mux(
+                        ~oWbStallQ & stage2Update,
+                        s1RowReady,
+                        s2Pending & (s2RowOpen | s2Activate),
+                      ),
+              s2WrReady <
+                  mux(
+                    ~oWbStallQ & stage2Update,
+                    s1WriteTimerZero,
+                    s2WrReadyHold,
+                  ),
+              s2RdReady <
+                  mux(
+                    ~oWbStallQ & stage2Update,
+                    s1ReadTimerZero,
+                    s2RdReadyHold,
+                  ),
               // advance stage1 -> stage2.
               If(
                 ~oWbStallQ & stage2Update,
@@ -1512,11 +1602,36 @@ class Ddr3Controller extends Module {
       defaultValue: dataStartIndex[0],
       conditionalType: ConditionalType.unique,
     );
-    final writePatternWindow =
-        (writePattern.zeroExtend(128 + 64) >> dataStartIndexCur).getRange(
-          0,
-          64,
-        );
+    // The start index only moves in steps of 8, so the window is a byte
+    // select and not a full shifter.
+    final writePatternWide = writePattern.zeroExtend(128 + 64);
+    final writePatternWindow = cases(dataStartIndexCur.getRange(3), {
+      for (var k = 0; k < 16; k++)
+        Const(k, width: 4): writePatternWide.getRange(8 * k, 8 * k + 64),
+    }, conditionalType: ConditionalType.unique);
+    // ANALYZE_DATA compares registered copies of the window and the read
+    // data. The FSM acts on every second cycle, so the copies always hold the
+    // current lane and start index.
+    final analyzeWindow = Logic(name: 'analyze_window', width: 64);
+    final analyzeGather = Logic(name: 'analyze_gather', width: 64);
+    final analyzeArmed = Logic(name: 'analyze_armed');
+    Sequential(clk, [
+      If(
+        _syncRst,
+        then: [
+          analyzeWindow < Const(0, width: 64),
+          analyzeGather < Const(0, width: 64),
+          analyzeArmed < Const(0),
+        ],
+        orElse: [
+          analyzeWindow < writePatternWindow,
+          analyzeGather < readGather,
+          analyzeArmed <
+              state.eq(Const(_stAnalyzeData, width: 6)) & ~analyzeArmed,
+        ],
+      ),
+    ]);
+    final analyzeMatch = analyzeWindow.eq(analyzeGather);
     // aux=1 read-ack marker: {(auxWidth-2)*0, 2'd1, 1'b1}.
     final readAckMarker = Const((1 << 1) | 1, width: auxWidth + 1);
     final allSel = Const(
@@ -1979,7 +2094,7 @@ class Ddr3Controller extends Module {
             // robustness pass added later).
             CaseItem(Const(_stAnalyzeData, width: 6), [
               If(
-                writePatternWindow.eq(readGather),
+                analyzeArmed & analyzeMatch,
                 then: [
                   if (lanes > 1)
                     If(
@@ -1993,7 +2108,7 @@ class Ddr3Controller extends Module {
                 orElse: [
                   for (var l = 0; l < lanes; l++)
                     If(
-                      laneReg.eq(l),
+                      analyzeArmed & laneReg.eq(l),
                       then: [
                         dataStartIndex[l] < dataStartIndex[l] + 8,
                         If(
