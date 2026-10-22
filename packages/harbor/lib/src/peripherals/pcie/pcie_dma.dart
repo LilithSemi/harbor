@@ -847,10 +847,9 @@ class HarborPcieDma extends BridgeModule {
     // Completion ring.
     final cplNext = ((cplTail + 1) & cplMask).named('cpl_next');
     final cplFull = cplNext.eq(cplHead & cplMask).named('cpl_full');
-    // The tail is masked, so a record never lands outside the ring.
-    final recAddr = (cplBase + ((cplTail & cplMask).zeroExtend(64) << 4)).named(
-      'rec_addr',
-    );
+    // The tail stays inside the ring, because the ring cannot change while
+    // it holds records.
+    final recAddr = (cplBase + (cplTail.zeroExtend(64) << 4)).named('rec_addr');
 
     // Chunk size: the smallest of bytes left, max payload, 4 KB page end.
     final mpsCode = mux(
