@@ -533,6 +533,10 @@ class HarborPcieDma extends BridgeModule {
     final done = Logic(name: 'done', width: 32);
     final dFlags = Logic(name: 'd_flags', width: 2);
     final dCookie = Logic(name: 'd_cookie', width: 32);
+    // Where the descriptor came from: [16] ring, [15:0] ring slot or push
+    // sequence number.
+    final dSrc = Logic(name: 'd_src', width: 17);
+    final pushSeq = Logic(name: 'push_seq', width: 16);
     final dLocalBad = Logic(name: 'd_local_bad');
     final code = Logic(name: 'code', width: 8);
 
@@ -768,11 +772,12 @@ class HarborPcieDma extends BridgeModule {
         If(rAddr.gte(infoFirstWord), then: [regValue < infoWord]),
     ]);
 
-    // Queue storage. An entry is DWs 0 to 6 of a descriptor.
-    Logic pack(List<Logic> d) {
+    // Queue storage. An entry is DWs 0 to 6 of a descriptor and its source.
+    Logic pack(List<Logic> d, Logic src) {
       final local64 = [d[3], d[2]].swizzle();
       final localHigh = aw == 64 ? Const(0) : local64.slice(63, aw).or();
       return [
+        src,
         localHigh,
         d[6],
         d[5].slice(1, 0),
@@ -787,11 +792,17 @@ class HarborPcieDma extends BridgeModule {
     final fifoPush = (commit & fifoActive & ~qFull).named('fifo_push');
     final fPush = Logic(name: 'f_push');
     final push = (fifoPush | fPush).named('q_push');
-    Logic? fifoData = fifoSource ? pack(stage) : null;
+    Logic? fifoData = fifoSource
+        ? pack(stage, [Const(0), pushSeq].swizzle())
+        : null;
     Logic? fetchData;
     if (ringSource) {
       for (var k = 3; k >= 0; k--) {
-        final d = pack(fBuf.sublist(8 * k, 8 * k + 7));
+        // The slot of descriptor k is the head when it goes in.
+        final d = pack(
+          fBuf.sublist(8 * k, 8 * k + 7),
+          [Const(1), descHead].swizzle(),
+        );
         fetchData = fetchData == null
             ? d
             : harborBitMux(fPushed.eq(k), d, fetchData);
@@ -819,6 +830,7 @@ class HarborPcieDma extends BridgeModule {
     final rdFlags = rd.slice(97 + aw, 96 + aw);
     final rdCookie = rd.slice(129 + aw, 98 + aw);
     final rdLocalHigh = rd[130 + aw];
+    final rdSrc = rd.slice(147 + aw, 131 + aw);
     final pop = inState(sLoad);
 
     // The local range must fit in the fabric address space.
@@ -1190,8 +1202,11 @@ class HarborPcieDma extends BridgeModule {
     final fExpired = (fInWait & fGot.lt(fWant) & fTimer.eq(timeoutCycles - 1))
         .named('f_expired');
     if (ringSource) {
+      // After a halt no descriptor goes in, so DESC_HEAD stays at the
+      // failing slot.
       fPush <=
           fInWait &
+              ~halted &
               fPushed.lt(fCount) &
               fGot.gte([fPushed + 1, Const(0, width: 3)].swizzle());
     } else {
@@ -1402,7 +1417,7 @@ class HarborPcieDma extends BridgeModule {
       dCookie,
       [phase, Const(0, width: 23), code].swizzle(),
       done,
-      Const(0, width: 32),
+      [dSrc[16], Const(0, width: 15), dSrc.slice(15, 0)].swizzle(),
     ];
     final recLoad = (inState(sRecWait) & ~resetReq & ~cplFull & busMasterEnable)
         .named('rec_load');
@@ -1421,6 +1436,7 @@ class HarborPcieDma extends BridgeModule {
 
     List<Conditional> engineReset() => [
       state < sIdle,
+      pushSeq < 0,
       halted < 0,
       errCode < 0,
       overflow < 0,
@@ -1561,6 +1577,7 @@ class HarborPcieDma extends BridgeModule {
 
           // Queue.
           If(push, then: [qTail < qTail + 1]),
+          If(fifoPush, then: [pushSeq < pushSeq + 1]),
           // A commit is lost when the queue is full or the ring is the
           // source.
           If(commit & (qFull | ~fifoActive), then: [overflow < 1]),
@@ -1716,6 +1733,8 @@ class HarborPcieDma extends BridgeModule {
                     dCookie < 0,
                     dFlags < 0,
                     done < 0,
+                    // The slot where the fetch failed.
+                    dSrc < [Const(1), descHead].swizzle(),
                     code < fErr,
                     state < sRecWait,
                   ]),
@@ -1727,6 +1746,7 @@ class HarborPcieDma extends BridgeModule {
               left < rdLen,
               dFlags < rdFlags,
               dCookie < rdCookie,
+              dSrc < rdSrc,
               dLocalBad < rdLocalHigh,
               done < 0,
               code < 0,
@@ -1978,7 +1998,16 @@ class HarborPcieDma extends BridgeModule {
                     then: [
                       cplTail < cplNext,
                       If(cplNext.eq(0), then: [phase < ~phase]),
-                      If(~code.eq(0), then: [halted < 1, errCode < code]),
+                      If(
+                        ~code.eq(0),
+                        then: [
+                          halted < 1,
+                          errCode < code,
+                          // At a halt, DESC_HEAD is the failing slot.
+                          if (ringSource)
+                            If(dSrc[16], then: [descHead < dSrc.slice(15, 0)]),
+                        ],
+                      ),
                       state < sIdle,
                     ],
                     orElse: [txT < txT + n, txBase < txBase + n],

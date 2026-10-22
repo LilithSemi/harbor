@@ -57,11 +57,15 @@ class DmaRecord {
   final bool phase;
   final int bytes;
 
+  /// DW3: [31] from the ring, [15:0] ring slot or push sequence number.
+  final int src;
+
   DmaRecord(Uint8List b)
     : cookie = le(b, 0),
       code = le(b, 4) & 0xff,
       phase = (le(b, 4) >> 31) == 1,
-      bytes = le(b, 8);
+      bytes = le(b, 8),
+      src = le(b, 12);
 
   static int le(Uint8List b, int o) =>
       b[o] | b[o + 1] << 8 | b[o + 2] << 16 | b[o + 3] << 24;

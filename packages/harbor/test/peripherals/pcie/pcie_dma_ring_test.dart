@@ -459,8 +459,44 @@ void main() {
     expect(b.record(0).cookie, 0);
     expect(b.fetches, isEmpty);
     expect(b.reads, isEmpty);
+    expect(b.record(0).src, 0x80000000, reason: 'the head slot');
     expect(await _status(b) >> 8 & 0xff, HarborPcieDma.errorDescRing);
     expect(b.irqPending, 1);
+    await b.finish();
+  });
+
+  test('a bad third descriptor in a batch reports its slot', () async {
+    final b = await DmaBench.create(_ringOnly, seed: 65);
+    await b.start();
+    await b.setupDescRing(_ring, 4);
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable(mask: HarborPcieDma.causeError);
+    for (var i = 0; i < 4; i++) {
+      b.writeDesc(
+        i,
+        hostAddress: 0x80001000 + 0x100 * i,
+        localAddress: 0x100 * i + (i == 2 ? 2 : 0),
+        length: 0x40,
+        cookie: 0x70 + i,
+      );
+    }
+    await b.doorbell(4);
+    await b.waitRecordWrites(2, 1);
+    await b.cycles(200);
+    final records = [for (var i = 0; i < 3; i++) b.record(i)];
+    expect([for (final r in records) r.code], [0, 0, 7]);
+    expect([for (final r in records) r.cookie], [0x70, 0x71, 0x72]);
+    expect(
+      [for (final r in records) r.src],
+      [0x80000000, 0x80000001, 0x80000002],
+    );
+    // The fourth descriptor does not run.
+    expect(b.recordWrites(3), isEmpty);
+    expect(b.host.memory.read(0x80001300, 0x40), everyElement(0));
+    final status = await _status(b);
+    expect(status & HarborPcieDma.statusHalted, HarborPcieDma.statusHalted);
+    expect(status >> 8 & 0xff, HarborPcieDma.errorAlignment);
+    expect(await b.readReg(HarborPcieDma.registerDescHead), 2);
     await b.finish();
   });
 

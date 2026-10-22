@@ -756,6 +756,8 @@ void main() {
       await b.waitRecordWrites(0, i + 1);
       final r = b.record(0);
       expect(r.code, want, reason: 'case $i');
+      // Push 0 after the engine reset of the case before.
+      expect(r.src, 0, reason: 'case $i');
       // Nothing but the record goes out, and the fabric is not touched.
       expect(b.memory.writeBeats, writes, reason: 'case $i');
       expect(b.memory.readBeats, reads, reason: 'case $i');
