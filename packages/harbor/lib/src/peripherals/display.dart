@@ -121,6 +121,20 @@ class HarborDisplayTiming with HarborPrettyString {
       hSyncPositive = true,
       vSyncPositive = true;
 
+  /// XGA (1024x768 @ 60 Hz), VESA DMT.
+  const HarborDisplayTiming.xga1024x768()
+    : hActive = 1024,
+      hFrontPorch = 24,
+      hSyncWidth = 136,
+      hBackPorch = 160,
+      vActive = 768,
+      vFrontPorch = 3,
+      vSyncWidth = 6,
+      vBackPorch = 29,
+      pixelClock = 65000000,
+      hSyncPositive = false,
+      vSyncPositive = false;
+
   /// 720p (1280x720 @ 60 Hz).
   const HarborDisplayTiming.hd720()
     : hActive = 1280,
