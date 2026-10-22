@@ -1696,7 +1696,19 @@ class HarborPcieDma extends BridgeModule {
             CaseItem(Const(sIdle, width: 4), [
               If.block([
                 Iff(resetReq, [If(engReset, then: engineReset())]),
-                ElseIf(cplSizeBad, [halted < 1, errCode < errorCplRing]),
+                // A waiting fetch error is reported first, because its
+                // record cannot be written either.
+                ElseIf(cplSizeBad, [
+                  halted < 1,
+                  errCode <
+                      (ringSource
+                          ? mux(
+                              fErr.eq(0),
+                              Const(errorCplRing, width: 8),
+                              fErr.zeroExtend(8),
+                            )
+                          : Const(errorCplRing, width: 8)),
+                ]),
                 ElseIf(enable & ~halted & ~qCount.eq(0), [state < sLoad]),
                 // A fetch error gets a record after the queue is empty.
                 if (ringSource)

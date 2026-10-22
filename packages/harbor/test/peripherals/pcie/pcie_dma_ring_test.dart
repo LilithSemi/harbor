@@ -464,6 +464,25 @@ void main() {
     await b.finish();
   });
 
+  test('code 11 does not hide a waiting fetch error', () async {
+    final b = await DmaBench.create(_ringOnly, seed: 67);
+    await b.start();
+    await b.setupDescRing(_ring, 4);
+    await b.setupRing(dmaCplBase, 0);
+    await b.enable(mask: HarborPcieDma.causeError);
+    // A tail outside the ring: fetch error 10, and no record can go out.
+    await b.doorbell(16);
+    await b.waitUntil(() => b.irqPending & 1 == 1, what: 'error cause');
+    final status = await _status(b);
+    expect(status & HarborPcieDma.statusHalted, HarborPcieDma.statusHalted);
+    expect(status >> 8 & 0xff, HarborPcieDma.errorDescRing);
+    expect(
+      b.sink.received.where((t) => t.kind.hasData && t.kind.isRequest),
+      isEmpty,
+    );
+    await b.finish();
+  });
+
   test('no fetch read goes out without bus master enable', () async {
     final b = await DmaBench.create(_ringOnly, seed: 63);
     await b.start();
