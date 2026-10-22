@@ -517,12 +517,10 @@ void main() {
       await b.writeReg(HarborPcieDma.registerCplBaseLow, 0x11223344);
       await b.writeReg(HarborPcieDma.registerCplBaseHigh, 0x55667788);
       await b.writeReg(HarborPcieDma.registerCplSize, 0xfffffff5);
-      await b.writeReg(HarborPcieDma.registerCplHead, 0x00010003);
       // Bits 3:0 of the ring base read 0.
       expect(await b.readReg(HarborPcieDma.registerCplBaseLow), 0x11223340);
       expect(await b.readReg(HarborPcieDma.registerCplBaseHigh), 0x55667788);
       expect(await b.readReg(HarborPcieDma.registerCplSize), 5);
-      expect(await b.readReg(HarborPcieDma.registerCplHead), 3);
       expect(await b.readReg(HarborPcieDma.registerCplTail), 0);
 
       // Byte enables: only bytes 1 and 2 change.
@@ -542,6 +540,12 @@ void main() {
         0xcafef000,
         0x12,
       ]);
+
+      // With CPL_HEAD not 0, the ring registers do not change.
+      await b.writeReg(HarborPcieDma.registerCplHead, 0x00010003);
+      expect(await b.readReg(HarborPcieDma.registerCplHead), 3);
+      await b.writeReg(HarborPcieDma.registerCplSize, 2);
+      expect(await b.readReg(HarborPcieDma.registerCplSize), 5);
 
       for (var i = 0; i < 7; i++) {
         await b.writeReg(HarborPcieDma.registerPush + 4 * i, 0x100 + i);
