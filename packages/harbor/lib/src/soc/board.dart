@@ -162,6 +162,25 @@ class HarborBoard {
     return 'spartan7';
   }
 
+  /// Throws if a PERST# pin has no pull-up and no declared external one.
+  static void _checkPerstPull(String signal, String value) {
+    if (!signal.endsWith('perst_n')) return;
+    final pull = value
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((a) => a.startsWith('PULLTYPE='))
+        .map((a) => a.substring('PULLTYPE='.length))
+        .firstOrNull;
+    if (pull == 'PULLUP' || pull == 'NONE') return;
+    throw ArgumentError.value(
+      value,
+      signal,
+      'PCIe PERST# needs PULLTYPE=PULLUP, or PULLTYPE=NONE with an external '
+      'pull-up. A floating or low PERST# holds the PHY MMCM in reset, so the '
+      'link never comes up.',
+    );
+  }
+
   /// Builds a [HarborFpgaTarget] for this board.
   ///
   /// [pins] selects which catalog signals to constrain (defaults to all of
@@ -221,6 +240,9 @@ class HarborBoard {
       pinMap[signal] = site;
     }
     pinMap.addAll(extraPins);
+    for (final e in {...this.pins, ...extraPins}.entries) {
+      _checkPerstPull(e.key, e.value);
+    }
 
     return HarborFpgaTarget(
       name: '$_vendorPrefix-$device',
@@ -753,6 +775,8 @@ const _ax7203 = HarborBoard(
     // PCIe x4 (p.29-31). These are MGT pads except PERST#.
     'pcie_refclk_p': 'F10 MGT',
     'pcie_refclk_n': 'E10 MGT',
+    // The PCIe PHY resets its MMCM while PERST# is low, so this pin needs the
+    // pull-up.
     'pcie_perst_n': 'J20 LVCMOS33 PULLTYPE=PULLUP',
     'pcie_rxp[0]': 'D11 MGT',
     'pcie_rxn[0]': 'C11 MGT',

@@ -12,6 +12,60 @@ void main() {
       expect(board.oscillatorHz, equals(25000000));
     });
 
+    HarborBoard perstBoard(String value) => HarborBoard(
+      name: 'perst',
+      vendor: HarborFpgaVendor.openXc7,
+      device: 'xc7a200t',
+      package: 'fbg484',
+      oscillatorHz: 200000000,
+      pins: {'pcie_perst_n': value},
+    );
+
+    test('a perst_n pin without PULLTYPE throws', () {
+      expect(perstBoard('J20 LVCMOS33').fpgaTarget, throwsArgumentError);
+      expect(
+        () => HarborBoard.get('ax7203').fpgaTarget(
+          extraPins: {'x_perst_n': 'J20 LVCMOS33'},
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('a perst_n pin with PULLDOWN or KEEPER throws', () {
+      for (final pull in ['PULLDOWN', 'KEEPER']) {
+        expect(
+          perstBoard('J20 LVCMOS33 PULLTYPE=$pull').fpgaTarget,
+          throwsA(
+            isA<ArgumentError>().having(
+              (e) => e.message,
+              'message',
+              contains('link never comes up'),
+            ),
+          ),
+        );
+      }
+    });
+
+    test('a perst_n pin with PULLTYPE=NONE builds and emits NONE', () {
+      final target = perstBoard('J20 LVCMOS33 PULLTYPE=NONE').fpgaTarget();
+      final line = target
+          .generateConstraints()
+          .split('\n')
+          .singleWhere((l) => l.endsWith('[get_ports pcie_perst_n]'));
+      expect(line, contains('PULLTYPE NONE'));
+      expect(line, isNot(contains('PULLUP')));
+    });
+
+    test('every catalog board builds a target', () {
+      for (final board in HarborBoard.byName.values) {
+        expect(
+          () => board.fpgaTarget(ddrDllOn: true),
+          returnsNormally,
+          reason: board.name,
+        );
+      }
+    });
+
     test('get throws on an unknown board', () {
       expect(() => HarborBoard.get('nope-1'), throwsArgumentError);
     });
