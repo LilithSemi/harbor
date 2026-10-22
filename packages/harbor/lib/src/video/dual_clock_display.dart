@@ -143,6 +143,11 @@ class HarborDualClockDisplay extends Module {
         'rgb888 does not fit the 32-bit scanout word layout.',
       );
     }
+    if (pixelFormat.yuv) {
+      throw ArgumentError(
+        'The scanout does not support the ${pixelFormat.name} YUV format.',
+      );
+    }
     if (pixelFormat == HarborPixelFormat.rgb565 && timing.hActive.isOdd) {
       throw ArgumentError(
         'rgb565 needs an even hActive (got ${timing.hActive}).',
@@ -344,5 +349,5 @@ class HarborDualClockDisplay extends Module {
   }
 
   static int _lineBytes(HarborDisplayTiming t, HarborPixelFormat f) =>
-      t.hActive * (f == HarborPixelFormat.rgb565 ? 2 : 4);
+      f.lineBytes(0, t.hActive);
 }

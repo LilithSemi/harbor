@@ -1,12 +1,3 @@
-import 'package:rohd/rohd.dart';
-import 'package:rohd_bridge/rohd_bridge.dart';
-
-import '../arith/fpu_config.dart' show harborStableDefinitionName;
-import '../bus/bus.dart';
-import '../bus/bus_slave_port.dart';
-import '../soc/acpi.dart';
-import '../soc/device_tree.dart';
-import '../soc/svd.dart';
 import '../util/pretty_string.dart';
 
 /// Display output interface type.
@@ -33,16 +24,155 @@ enum HarborDisplayInterface {
   mipiDsi,
 }
 
+/// One memory plane of a pixel format.
+class HarborPixelPlane {
+  /// Bytes in one group of pixels.
+  final int bytesPerGroup;
+
+  /// Horizontal luma pixels that one group covers.
+  final int pixelsPerGroup;
+
+  /// Luma lines per plane line (1 = every line, 2 = every second line).
+  final int vSub;
+
+  const HarborPixelPlane(this.bytesPerGroup, this.pixelsPerGroup, this.vSub);
+}
+
 /// Display pixel format.
 enum HarborPixelFormat {
-  rgb565(16),
-  rgb888(24),
-  xrgb8888(32),
-  argb8888(32);
+  rgb565(
+    yuv: false,
+    bitDepth: 8,
+    hSub: 1,
+    vSub: 1,
+    planes: [HarborPixelPlane(2, 1, 1)],
+  ),
+  rgb888(
+    yuv: false,
+    bitDepth: 8,
+    hSub: 1,
+    vSub: 1,
+    planes: [HarborPixelPlane(3, 1, 1)],
+  ),
+  xrgb8888(
+    yuv: false,
+    bitDepth: 8,
+    hSub: 1,
+    vSub: 1,
+    planes: [HarborPixelPlane(4, 1, 1)],
+  ),
+  argb8888(
+    yuv: false,
+    bitDepth: 8,
+    hSub: 1,
+    vSub: 1,
+    planes: [HarborPixelPlane(4, 1, 1)],
+  ),
+  yuyv(
+    yuv: true,
+    bitDepth: 8,
+    hSub: 2,
+    vSub: 1,
+    planes: [HarborPixelPlane(4, 2, 1)],
+  ),
+  uyvy(
+    yuv: true,
+    bitDepth: 8,
+    hSub: 2,
+    vSub: 1,
+    planes: [HarborPixelPlane(4, 2, 1)],
+  ),
 
-  final int bitsPerPixel;
-  const HarborPixelFormat(this.bitsPerPixel);
+  /// Y plane, then interleaved CbCr plane.
+  nv12(
+    yuv: true,
+    bitDepth: 8,
+    hSub: 2,
+    vSub: 2,
+    planes: [HarborPixelPlane(1, 1, 1), HarborPixelPlane(2, 2, 2)],
+  ),
+
+  /// Like nv12 with 10-bit samples, MSB aligned in 16-bit containers.
+  p010(
+    yuv: true,
+    bitDepth: 10,
+    hSub: 2,
+    vSub: 2,
+    planes: [HarborPixelPlane(2, 1, 1), HarborPixelPlane(4, 2, 2)],
+  ),
+
+  /// Y plane, then Cb plane, then Cr plane.
+  i420(
+    yuv: true,
+    bitDepth: 8,
+    hSub: 2,
+    vSub: 2,
+    planes: [
+      HarborPixelPlane(1, 1, 1),
+      HarborPixelPlane(1, 2, 2),
+      HarborPixelPlane(1, 2, 2),
+    ],
+  );
+
+  /// True when the samples are Y, Cb and Cr.
+  final bool yuv;
+
+  /// Component depth in bits after unpack, before color conversion.
+  final int bitDepth;
+
+  /// Horizontal chroma subsampling factor.
+  final int hSub;
+
+  /// Vertical chroma subsampling factor.
+  final int vSub;
+
+  /// Memory planes in order.
+  final List<HarborPixelPlane> planes;
+
+  const HarborPixelFormat({
+    required this.yuv,
+    required this.bitDepth,
+    required this.hSub,
+    required this.vSub,
+    required this.planes,
+  });
+
+  /// True for one plane of 4 bytes per pixel.
+  bool get isPacked32 =>
+      planes.length == 1 &&
+      planes[0].bytesPerGroup == 4 &&
+      planes[0].pixelsPerGroup == 1;
+
+  /// Bytes in one line of [width] luma pixels in [plane].
+  ///
+  /// A partial group at the end of the line counts as a full group.
+  int lineBytes(int plane, int width) {
+    final p = planes[plane];
+    return (width + p.pixelsPerGroup - 1) ~/ p.pixelsPerGroup * p.bytesPerGroup;
+  }
+
+  /// Lines in [plane] for [height] luma lines.
+  int planeLines(int plane, int height) {
+    final v = planes[plane].vSub;
+    return (height + v - 1) ~/ v;
+  }
 }
+
+/// Fixed ABI order of the pixel formats for capability bits.
+///
+/// Bit N of a capability word stands for the format at index N. Add new
+/// formats at the end.
+const harborPixelFormatBitOrder = <HarborPixelFormat>[
+  HarborPixelFormat.rgb565,
+  HarborPixelFormat.rgb888,
+  HarborPixelFormat.xrgb8888,
+  HarborPixelFormat.argb8888,
+  HarborPixelFormat.yuyv,
+  HarborPixelFormat.uyvy,
+  HarborPixelFormat.nv12,
+  HarborPixelFormat.p010,
+  HarborPixelFormat.i420,
+];
 
 /// Display timing parameters.
 class HarborDisplayTiming with HarborPrettyString {
@@ -237,378 +367,4 @@ class HarborDisplayConfig with HarborPrettyString {
     buf.write('$p)');
     return buf.toString();
   }
-}
-
-/// Framebuffer display controller.
-///
-/// Reads pixel data from a framebuffer in memory via DMA and
-/// generates video timing signals. Supports multiple output
-/// interfaces and resolution modes.
-///
-/// Register map (each register in its own 64-bit-aligned slot, so a 32-bit
-/// access lands in the low word on both a 32-bit and a 64-bit fabric, and the
-/// byte-address decode needs no high/low-half selection):
-/// - 0x00: CTRL       (enable, interface, pixel format)
-/// - 0x08: STATUS     (vblank, underrun)
-/// - 0x10: FB_BASE    (framebuffer base address)
-/// - 0x18: FB_STRIDE  (bytes per line)
-/// - 0x20: H_ACTIVE   (horizontal active pixels)
-/// - 0x28: H_TIMING   (front porch, sync, back porch)
-/// - 0x30: V_ACTIVE   (vertical active lines)
-/// - 0x38: V_TIMING   (front porch, sync, back porch)
-/// - 0x40: INT_STATUS (W1C: vblank, underrun)
-/// - 0x48: INT_ENABLE
-class HarborDisplayController extends BridgeModule
-    with
-        HarborDeviceTreeNodeProvider,
-        HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
-  /// Display configuration.
-  final HarborDisplayConfig config;
-
-  /// Base address in the SoC memory map.
-  final int baseAddress;
-
-  /// Bus slave port (register access).
-  late final BusSlavePort bus;
-
-  /// Interrupt output (vsync/vblank).
-  Logic get interrupt => output('interrupt');
-
-  HarborDisplayController({
-    required this.config,
-    required this.baseAddress,
-    HarborFabricKind fabricKind = HarborFabricKind.wishbone,
-    bool crossFabricClock = false,
-    String? name,
-  }) : super(
-         harborStableDefinitionName('HarborDisplayController', [
-           ...BusSlavePort.definitionNameParts(
-             kind: fabricKind,
-             addressWidth: 12,
-             dataWidth: 32,
-             cross: crossFabricClock,
-           ),
-           'pf${config.pixelFormat.name}',
-           'h${config.timing.hActive}_${config.timing.hFrontPorch}_'
-               '${config.timing.hSyncWidth}_${config.timing.hBackPorch}',
-           'v${config.timing.vActive}_${config.timing.vFrontPorch}_'
-               '${config.timing.vSyncWidth}_${config.timing.vBackPorch}',
-         ]),
-         name: name ?? 'display',
-       ) {
-    createPort('clk', PortDirection.input);
-    createPort('reset', PortDirection.input);
-    createPort('pixel_clk', PortDirection.input);
-    addOutput('interrupt');
-
-    // Video output signals
-    addOutput('hsync');
-    addOutput('vsync');
-    addOutput('de'); // data enable
-    addOutput('pixel_r', width: 8);
-    addOutput('pixel_g', width: 8);
-    addOutput('pixel_b', width: 8);
-
-    // DMA master for framebuffer read
-    addOutput('fb_addr', width: 32);
-    createPort('fb_data', PortDirection.input, width: 32);
-    addOutput('fb_stb');
-    createPort('fb_ack', PortDirection.input);
-
-    bus = BusSlavePort.create(
-      module: this,
-      name: 'bus',
-      kind: fabricKind,
-      clk: input('clk'),
-      reset: input('reset'),
-      addressWidth: 12,
-      dataWidth: 32,
-      fabricClock: BusSlavePort.fabricClockInputs(
-        this,
-        cross: crossFabricClock,
-      ),
-    );
-
-    final clk = input('clk');
-    final reset = bus.reset;
-    final pixClk = input('pixel_clk');
-
-    // Registers
-    final enable = Logic(name: 'enable');
-    final fbBase = Logic(name: 'fb_base', width: 32);
-    final fbStride = Logic(name: 'fb_stride', width: 16);
-    final hActive = Logic(name: 'h_active', width: 12);
-    final hFp = Logic(name: 'h_fp', width: 8);
-    final hSync = Logic(name: 'h_sync', width: 8);
-    final hBp = Logic(name: 'h_bp', width: 8);
-    final vActive = Logic(name: 'v_active', width: 12);
-    final vFp = Logic(name: 'v_fp', width: 8);
-    final vSync = Logic(name: 'v_sync', width: 8);
-    final vBp = Logic(name: 'v_bp', width: 8);
-    final intStatus = Logic(name: 'int_status', width: 4);
-    final intEnable = Logic(name: 'int_enable', width: 4);
-
-    // Pixel counters (driven by pixel clock)
-    final hCount = Logic(name: 'h_count', width: 12);
-    final vCount = Logic(name: 'v_count', width: 12);
-
-    interrupt <= (intStatus & intEnable).or();
-
-    // Video timing generator (pixel clock domain)
-    final hTotal =
-        hActive +
-        hFp.zeroExtend(12) +
-        hSync.zeroExtend(12) +
-        hBp.zeroExtend(12);
-    final vTotal =
-        vActive +
-        vFp.zeroExtend(12) +
-        vSync.zeroExtend(12) +
-        vBp.zeroExtend(12);
-
-    final inHActive = hCount.lt(hActive);
-    final inVActive = vCount.lt(vActive);
-    final hSyncStart = hActive + hFp.zeroExtend(12);
-    final hSyncEnd = hSyncStart + hSync.zeroExtend(12);
-    final vSyncStart = vActive + vFp.zeroExtend(12);
-    final vSyncEnd = vSyncStart + vSync.zeroExtend(12);
-
-    final inActive = (enable & inHActive & inVActive).named('in_active');
-    output('de') <= inActive;
-    output('hsync') <= hCount.gte(hSyncStart) & hCount.lt(hSyncEnd);
-    output('vsync') <= vCount.gte(vSyncStart) & vCount.lt(vSyncEnd);
-
-    // Framebuffer fetch: during active video, read the current pixel's word
-    // and drive RGB. Address = base + row*stride + col*bytesPerPixel. This is a
-    // per-pixel combinational fetch in the pixel-clock domain (a real design
-    // prefetches a line into a buffer across the pixel/system clock crossing).
-    final bpp = config.pixelFormat.bitsPerPixel ~/ 8;
-    final fbData = input('fb_data');
-    final lineOff = (vCount.zeroExtend(32) * fbStride.zeroExtend(32)).getRange(
-      0,
-      32,
-    );
-    final colOff = (hCount.zeroExtend(32) * Const(bpp, width: 32)).getRange(
-      0,
-      32,
-    );
-    output('fb_addr') <= (fbBase + lineOff + colOff);
-    output('fb_stb') <= inActive;
-    // 0xXXRRGGBB byte order: R[23:16], G[15:8], B[7:0]. Blanked outside active.
-    output('pixel_r') <=
-        mux(inActive, fbData.getRange(16, 24), Const(0, width: 8));
-    output('pixel_g') <=
-        mux(inActive, fbData.getRange(8, 16), Const(0, width: 8));
-    output('pixel_b') <=
-        mux(inActive, fbData.getRange(0, 8), Const(0, width: 8));
-
-    Sequential(pixClk, [
-      If(
-        reset,
-        then: [hCount < Const(0, width: 12), vCount < Const(0, width: 12)],
-        orElse: [
-          If(
-            enable,
-            then: [
-              hCount < (hCount + Const(1, width: 12)),
-              If(
-                hCount.gte(hTotal),
-                then: [
-                  hCount < Const(0, width: 12),
-                  vCount < (vCount + Const(1, width: 12)),
-                  If(vCount.gte(vTotal), then: [vCount < Const(0, width: 12)]),
-                ],
-              ),
-            ],
-          ),
-        ],
-      ),
-    ]);
-
-    // Register access (system clock domain)
-    Sequential(clk, [
-      If(
-        reset,
-        then: [
-          enable < Const(0),
-          fbBase < Const(0, width: 32),
-          fbStride <
-              Const(
-                config.timing.hActive * config.pixelFormat.bitsPerPixel ~/ 8,
-                width: 16,
-              ),
-          hActive < Const(config.timing.hActive, width: 12),
-          hFp < Const(config.timing.hFrontPorch, width: 8),
-          hSync < Const(config.timing.hSyncWidth, width: 8),
-          hBp < Const(config.timing.hBackPorch, width: 8),
-          vActive < Const(config.timing.vActive, width: 12),
-          vFp < Const(config.timing.vFrontPorch, width: 8),
-          vSync < Const(config.timing.vSyncWidth, width: 8),
-          vBp < Const(config.timing.vBackPorch, width: 8),
-          intStatus < Const(0, width: 4),
-          intEnable < Const(0, width: 4),
-          bus.ack < Const(0),
-          bus.dataOut < Const(0, width: 32),
-        ],
-        orElse: [
-          bus.ack < Const(0),
-          bus.dataOut < Const(0, width: 32),
-
-          If(
-            bus.stb & ~bus.ack,
-            then: [
-              bus.ack < Const(1),
-
-              // Byte-address decode: registers sit 8 bytes apart (see the map
-              // above). Decode every address bit of the 0x1000 window and
-              // ignore the bits above it, so absolute and relative addresses
-              // both work. An unused offset reads 0 and ignores writes.
-              Case(bus.windowAddr(0x1000), [
-                CaseItem(Const(0x00, width: 12), [
-                  If(
-                    bus.we & bus.selAny(0x00, 1),
-                    then: [enable < bus.dataIn[0]],
-                    orElse: [bus.dataOut < enable.zeroExtend(32)],
-                  ),
-                ]),
-                CaseItem(Const(0x08, width: 12), [
-                  bus.dataOut < Const(0, width: 32), // STATUS
-                ]),
-                CaseItem(Const(0x10, width: 12), [
-                  If(
-                    bus.we,
-                    then: [fbBase < bus.selMerge(fbBase, 0x10)],
-                    orElse: [bus.dataOut < fbBase],
-                  ),
-                ]),
-                CaseItem(Const(0x18, width: 12), [
-                  If(
-                    bus.we,
-                    then: [fbStride < bus.selMerge(fbStride, 0x18)],
-                    orElse: [bus.dataOut < fbStride.zeroExtend(32)],
-                  ),
-                ]),
-                CaseItem(Const(0x20, width: 12), [
-                  If(
-                    bus.we,
-                    then: [hActive < bus.selMerge(hActive, 0x20)],
-                    orElse: [bus.dataOut < hActive.zeroExtend(32)],
-                  ),
-                ]),
-                CaseItem(Const(0x28, width: 12), [
-                  If(
-                    bus.we,
-                    then: [
-                      // hFp, hSync, and hBp each take one byte of this word,
-                      // so each updates only when its own byte is selected.
-                      If(
-                        bus.selAny(0x28, 1),
-                        then: [hFp < bus.dataIn.getRange(0, 8)],
-                      ),
-                      If(
-                        bus.selAny(0x29, 1),
-                        then: [hSync < bus.dataIn.getRange(8, 16)],
-                      ),
-                      If(
-                        bus.selAny(0x2A, 1),
-                        then: [hBp < bus.dataIn.getRange(16, 24)],
-                      ),
-                    ],
-                    orElse: [
-                      bus.dataOut <
-                          hFp.zeroExtend(32) |
-                              (hSync.zeroExtend(32) << Const(8, width: 32)) |
-                              (hBp.zeroExtend(32) << Const(16, width: 32)),
-                    ],
-                  ),
-                ]),
-                CaseItem(Const(0x30, width: 12), [
-                  If(
-                    bus.we,
-                    then: [vActive < bus.selMerge(vActive, 0x30)],
-                    orElse: [bus.dataOut < vActive.zeroExtend(32)],
-                  ),
-                ]),
-                CaseItem(Const(0x38, width: 12), [
-                  If(
-                    bus.we,
-                    then: [
-                      // vFp, vSync, and vBp each take one byte of this word,
-                      // so each updates only when its own byte is selected.
-                      If(
-                        bus.selAny(0x38, 1),
-                        then: [vFp < bus.dataIn.getRange(0, 8)],
-                      ),
-                      If(
-                        bus.selAny(0x39, 1),
-                        then: [vSync < bus.dataIn.getRange(8, 16)],
-                      ),
-                      If(
-                        bus.selAny(0x3A, 1),
-                        then: [vBp < bus.dataIn.getRange(16, 24)],
-                      ),
-                    ],
-                    orElse: [
-                      bus.dataOut <
-                          vFp.zeroExtend(32) |
-                              (vSync.zeroExtend(32) << Const(8, width: 32)) |
-                              (vBp.zeroExtend(32) << Const(16, width: 32)),
-                    ],
-                  ),
-                ]),
-                CaseItem(Const(0x40, width: 12), [
-                  If(
-                    bus.we,
-                    then: [intStatus < (intStatus & ~bus.selMasked(0x40, 4))],
-                    orElse: [bus.dataOut < intStatus.zeroExtend(32)],
-                  ),
-                ]),
-                CaseItem(Const(0x48, width: 12), [
-                  If(
-                    bus.we,
-                    then: [intEnable < bus.selMerge(intEnable, 0x48)],
-                    orElse: [bus.dataOut < intEnable.zeroExtend(32)],
-                  ),
-                ]),
-              ]),
-            ],
-          ),
-        ],
-      ),
-    ]);
-  }
-
-  @override
-  HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(
-    compatible: ['harbor,display'],
-    reg: BusAddressRange(baseAddress, 0x1000),
-    properties: {
-      'output-interface': config.interface_.name,
-      'max-width': config.maxWidth,
-      'max-height': config.maxHeight,
-    },
-  );
-
-  @override
-  HarborAcpiDevice get acpiDevice => HarborAcpiDevice(
-    hid: 'PRP0001',
-    uid: 0,
-    memory: [BusAddressRange(baseAddress, 0x1000)],
-    properties: {
-      'compatible': ['harbor,display'],
-      'output-interface': config.interface_.name,
-      'max-width': config.maxWidth,
-      'max-height': config.maxHeight,
-    },
-  );
-
-  @override
-  HarborSvdPeripheral get svdPeripheral => HarborSvdPeripheral(
-    name: 'DISPLAY',
-    groupName: 'DISPLAY',
-    description: 'Framebuffer display controller',
-    baseAddress: baseAddress,
-    size: 0x1000,
-  );
 }

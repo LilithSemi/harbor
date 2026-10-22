@@ -76,20 +76,6 @@ void main() {
       await _absoluteRoundTrip(sdio, 0x10010000, 0x10, 50);
     });
 
-    test('display', () async {
-      final display = HarborDisplayController(
-        config: const HarborDisplayConfig(
-          interface_: HarborDisplayInterface.vga,
-          timing: HarborDisplayTiming.vga640x480(),
-        ),
-        baseAddress: 0x1000C000,
-      );
-      display.port('pixel_clk').getsLogic(Const(0));
-      display.port('fb_data').getsLogic(Const(0, width: 32));
-      display.port('fb_ack').getsLogic(Const(0));
-      await _absoluteRoundTrip(display, 0x1000C000, 0x20, 640);
-    });
-
     test('efuse', () async {
       final efuse = HarborEfuseDevice(baseAddress: 0x1000A000);
       efuse.port('fuse_rdata').getsLogic(Const(0, width: 32));

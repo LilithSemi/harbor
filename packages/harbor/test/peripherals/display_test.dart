@@ -1,19 +1,84 @@
-import 'dart:async';
-
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-import '../util/reg_bus.dart';
+// Per format: yuv, bitDepth, hSub, vSub, planes (bytes, pixels, vSub),
+// isPacked32.
+typedef _Plane = (int bytes, int pixels, int vSub);
 
-// Register byte offsets: each register in its own 8-byte slot.
-const _ctrl = 0x00;
-const _fbBase = 0x10;
-const _fbStride = 0x18;
-const _hActive = 0x20;
-const _hTiming = 0x28;
-const _vActive = 0x30;
-const _vTiming = 0x38;
+const _expected =
+    <HarborPixelFormat, (bool, int, int, int, List<_Plane>, bool)>{
+      HarborPixelFormat.rgb565: (false, 8, 1, 1, [(2, 1, 1)], false),
+      HarborPixelFormat.rgb888: (false, 8, 1, 1, [(3, 1, 1)], false),
+      HarborPixelFormat.xrgb8888: (false, 8, 1, 1, [(4, 1, 1)], true),
+      HarborPixelFormat.argb8888: (false, 8, 1, 1, [(4, 1, 1)], true),
+      HarborPixelFormat.yuyv: (true, 8, 2, 1, [(4, 2, 1)], false),
+      HarborPixelFormat.uyvy: (true, 8, 2, 1, [(4, 2, 1)], false),
+      HarborPixelFormat.nv12: (true, 8, 2, 2, [(1, 1, 1), (2, 2, 2)], false),
+      HarborPixelFormat.p010: (true, 10, 2, 2, [(2, 1, 1), (4, 2, 2)], false),
+      HarborPixelFormat.i420: (
+        true,
+        8,
+        2,
+        2,
+        [(1, 1, 1), (1, 2, 2), (1, 2, 2)],
+        false,
+      ),
+    };
+
+// Hand computed bytes per line for widths 1920, 1919, 7 and 1, per plane.
+const _widths = [1920, 1919, 7, 1];
+const _lineBytes = <HarborPixelFormat, List<List<int>>>{
+  HarborPixelFormat.rgb565: [
+    [3840, 3838, 14, 2],
+  ],
+  HarborPixelFormat.rgb888: [
+    [5760, 5757, 21, 3],
+  ],
+  HarborPixelFormat.xrgb8888: [
+    [7680, 7676, 28, 4],
+  ],
+  HarborPixelFormat.argb8888: [
+    [7680, 7676, 28, 4],
+  ],
+  HarborPixelFormat.yuyv: [
+    [3840, 3840, 16, 4],
+  ],
+  HarborPixelFormat.uyvy: [
+    [3840, 3840, 16, 4],
+  ],
+  HarborPixelFormat.nv12: [
+    [1920, 1919, 7, 1],
+    [1920, 1920, 8, 2],
+  ],
+  HarborPixelFormat.p010: [
+    [3840, 3838, 14, 2],
+    [3840, 3840, 16, 4],
+  ],
+  HarborPixelFormat.i420: [
+    [1920, 1919, 7, 1],
+    [960, 960, 4, 1],
+    [960, 960, 4, 1],
+  ],
+};
+
+HarborDualClockDisplay _buildDisplay(HarborPixelFormat format) =>
+    HarborDualClockDisplay(
+      target: const HarborSimTarget(),
+      timing: const HarborDisplayTiming.vga640x480(),
+      pixelClk: Logic(name: 'pixel_clk'),
+      pixelReset: Logic(name: 'pixel_reset'),
+      shiftClk: Logic(name: 'shift_clk'),
+      shiftReset: Logic(name: 'shift_reset'),
+      sysClk: Logic(name: 'sys_clk'),
+      sysReset: Logic(name: 'sys_reset'),
+      enable: Logic(name: 'enable'),
+      fbBase: Logic(name: 'fb_base', width: 32),
+      memory: HarborMemoryWaist(
+        const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
+      ),
+      pixelFormat: format,
+    );
 
 void main() {
   group('HarborDisplayTiming', () {
@@ -96,195 +161,80 @@ void main() {
       expect(config.toPrettyString(), contains('640x480'));
     });
   });
-
-  group('HarborDisplayController', () {
-    test('creates with VGA config', () {
-      final display = HarborDisplayController(
-        config: const HarborDisplayConfig(
-          interface_: HarborDisplayInterface.vga,
-          timing: HarborDisplayTiming.vga640x480(),
-        ),
-        baseAddress: 0x70000000,
-      );
-      expect(display.bus, isNotNull);
-      expect(display.interrupt.width, equals(1));
-    });
-
-    test('has video output signals', () {
-      final display = HarborDisplayController(
-        config: const HarborDisplayConfig(
-          interface_: HarborDisplayInterface.hdmi,
-          timing: HarborDisplayTiming.hd720(),
-        ),
-        baseAddress: 0x70000000,
-      );
-      expect(display.output('hsync').width, equals(1));
-      expect(display.output('vsync').width, equals(1));
-      expect(display.output('de').width, equals(1));
-      expect(display.output('pixel_r').width, equals(8));
-      expect(display.output('pixel_g').width, equals(8));
-      expect(display.output('pixel_b').width, equals(8));
-    });
-
-    test('DT node', () {
-      final display = HarborDisplayController(
-        config: const HarborDisplayConfig(
-          interface_: HarborDisplayInterface.hdmi,
-          timing: HarborDisplayTiming.fhd1080(),
-          maxWidth: 3840,
-          maxHeight: 2160,
-        ),
-        baseAddress: 0x70000000,
-      );
-      final dt = display.dtNode;
-      expect(dt.compatible.first, equals('harbor,display'));
-      expect(dt.properties['output-interface'], equals('hdmi'));
-      expect(dt.properties['max-width'], equals(3840));
-    });
-
-    test('two different parameter sets get different definition names', () {
-      final a = HarborDisplayController(
-        config: const HarborDisplayConfig(
-          interface_: HarborDisplayInterface.vga,
-          timing: HarborDisplayTiming.vga640x480(),
-        ),
-        baseAddress: 0x70000000,
-      );
-      final b = HarborDisplayController(
-        config: const HarborDisplayConfig(
-          interface_: HarborDisplayInterface.hdmi,
-          timing: HarborDisplayTiming.hd720(),
-        ),
-        baseAddress: 0x70000000,
-      );
-      expect(a.definitionName, isNot(equals(b.definitionName)));
-    });
-  });
-
   group('HarborPixelFormat', () {
-    test('bits per pixel', () {
-      expect(HarborPixelFormat.rgb565.bitsPerPixel, equals(16));
-      expect(HarborPixelFormat.rgb888.bitsPerPixel, equals(24));
-      expect(HarborPixelFormat.xrgb8888.bitsPerPixel, equals(32));
-      expect(HarborPixelFormat.argb8888.bitsPerPixel, equals(32));
+    test('declaration order', () {
+      expect(HarborPixelFormat.values, [
+        HarborPixelFormat.rgb565,
+        HarborPixelFormat.rgb888,
+        HarborPixelFormat.xrgb8888,
+        HarborPixelFormat.argb8888,
+        HarborPixelFormat.yuyv,
+        HarborPixelFormat.uyvy,
+        HarborPixelFormat.nv12,
+        HarborPixelFormat.p010,
+        HarborPixelFormat.i420,
+      ]);
     });
-  });
 
-  for (final kind in HarborFabricKind.values) {
-    _registerTests(kind);
-  }
-}
+    for (final e in _expected.entries) {
+      final f = e.key;
+      final (yuv, depth, hSub, vSub, planes, packed32) = e.value;
+      test('${f.name} descriptor', () {
+        expect(f.yuv, yuv);
+        expect(f.bitDepth, depth);
+        expect(f.hSub, hSub);
+        expect(f.vSub, vSub);
+        expect(f.isPacked32, packed32);
+        expect(f.planes.length, planes.length);
+        for (var i = 0; i < planes.length; i++) {
+          expect(f.planes[i].bytesPerGroup, planes[i].$1, reason: 'plane $i');
+          expect(f.planes[i].pixelsPerGroup, planes[i].$2, reason: 'plane $i');
+          expect(f.planes[i].vSub, planes[i].$3, reason: 'plane $i');
+        }
+      });
 
-void _registerTests(HarborFabricKind kind) {
-  group('HarborDisplayController register access (${kind.name})', () {
-    late HarborDisplayController disp;
-    late RegBus bus;
-    late Logic clk;
+      test('${f.name} lineBytes', () {
+        final table = _lineBytes[f]!;
+        expect(table.length, f.planes.length);
+        for (var p = 0; p < table.length; p++) {
+          for (var w = 0; w < _widths.length; w++) {
+            expect(
+              f.lineBytes(p, _widths[w]),
+              table[p][w],
+              reason: 'plane $p width ${_widths[w]}',
+            );
+          }
+        }
+      });
 
-    Future<void> setUpDut({Logic Function(Logic fbAddr)? fbDataOf}) async {
-      disp = HarborDisplayController(
-        config: const HarborDisplayConfig(
-          interface_: HarborDisplayInterface.parallelRgb,
-          timing: HarborDisplayTiming.vga640x480(),
-        ),
-        baseAddress: 0x70000000,
-        fabricKind: kind,
-      );
-      clk = SimpleClockGenerator(10).clk;
-      final reset = Logic(name: 'reset');
-
-      disp.input('clk').srcConnection! <= clk;
-      disp.input('reset').srcConnection! <= reset;
-      disp.input('pixel_clk').srcConnection! <= clk; // single domain for sim
-      disp.input('fb_data').srcConnection! <=
-          (fbDataOf?.call(disp.output('fb_addr')) ?? Const(0, width: 32));
-      disp.input('fb_ack').srcConnection! <= disp.output('fb_stb');
-      bus = RegBus.attach(disp, clk);
-
-      await disp.build();
-      reset.inject(1);
-      bus.idle();
-      Simulator.setMaxSimTime(2000000);
-      unawaited(Simulator.run());
-      await clk.nextPosedge;
-      await clk.nextPosedge;
-      reset.inject(0);
-      await clk.nextPosedge;
+      test('${f.name} planeLines', () {
+        for (var p = 0; p < planes.length; p++) {
+          final sub = planes[p].$3;
+          expect(f.planeLines(p, 1080), sub == 1 ? 1080 : 540);
+          expect(f.planeLines(p, 1079), sub == 1 ? 1079 : 540);
+        }
+      });
     }
 
-    tearDown(() async {
-      await Simulator.reset();
-    });
-
-    test('streams framebuffer pixels during active video', () async {
-      // Framebuffer model: a 2x2 image at base 0, stride 8 bytes.
-      const fb = {0: 0x00112233, 4: 0x00445566, 8: 0x00778899, 12: 0x00AABBCC};
-      await setUpDut(
-        fbDataOf: (fbAddr) {
-          Logic fbData = Const(0, width: 32);
-          fb.forEach((a, v) {
-            fbData = mux(
-              fbAddr.eq(Const(a, width: 32)),
-              Const(v, width: 32),
-              fbData,
-            );
-          });
-          return fbData;
-        },
+    test('bit order lists every value once in declaration order', () {
+      expect(harborPixelFormatBitOrder, HarborPixelFormat.values);
+      expect(
+        harborPixelFormatBitOrder.toSet().length,
+        HarborPixelFormat.values.length,
       );
-
-      final de = disp.output('de');
-      final vsync = disp.output('vsync');
-      final pr = disp.output('pixel_r');
-      final pg = disp.output('pixel_g');
-      final pb = disp.output('pixel_b');
-
-      // Shrink to a 2x2 frame with 1-pixel porches.
-      await bus.write(_hActive, 2);
-      await bus.write(_hTiming, 1 | (1 << 8) | (1 << 16));
-      await bus.write(_vActive, 2);
-      await bus.write(_vTiming, 1 | (1 << 8) | (1 << 16));
-      await bus.write(_fbBase, 0);
-      await bus.write(_fbStride, 8);
-      await bus.write(_ctrl, 0x1); // enable
-
-      // Align to a frame boundary: wait through one vsync pulse so the next
-      // active region starts at pixel (0,0).
-      var sawVsync = false;
-      for (var i = 0; i < 200; i++) {
-        await clk.nextPosedge;
-        final v = vsync.value.toInt();
-        if (v == 1) sawVsync = true;
-        if (sawVsync && v == 0) break;
-      }
-
-      // Capture the next four active pixels (top-left of the frame, raster).
-      final pixels = <int>[];
-      for (var i = 0; i < 200 && pixels.length < 4; i++) {
-        await clk.nextPosedge;
-        if (de.value.toInt() == 1) {
-          pixels.add(
-            (pr.value.toInt() << 16) |
-                (pg.value.toInt() << 8) |
-                pb.value.toInt(),
-          );
-        }
-      }
-
-      expect(pixels, equals([0x112233, 0x445566, 0x778899, 0xAABBCC]));
-      await Simulator.endSimulation();
     });
 
-    test('a write with no byte selected changes nothing', () async {
-      await setUpDut();
-
-      await bus.write(_fbBase, 0x11223344);
-      await bus.write(_fbStride, 0x0000ffff);
-      await bus.write(_fbBase, 0xffffffff, sel: 0x0);
-      await bus.write(_fbStride, 0xffffffff, sel: 0x0);
-      expect(await bus.read(_fbBase), equals(0x11223344));
-      expect(await bus.read(_fbStride), equals(0x0000ffff));
-      await Simulator.endSimulation();
+    test('dual clock display rejects yuv formats and rgb888', () {
+      for (final f in [
+        HarborPixelFormat.rgb888,
+        HarborPixelFormat.yuyv,
+        HarborPixelFormat.uyvy,
+        HarborPixelFormat.nv12,
+        HarborPixelFormat.p010,
+        HarborPixelFormat.i420,
+      ]) {
+        expect(() => _buildDisplay(f), throwsArgumentError, reason: f.name);
+      }
     });
   });
 }
