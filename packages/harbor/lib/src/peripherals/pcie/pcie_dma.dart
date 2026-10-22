@@ -856,7 +856,14 @@ class HarborPcieDma extends BridgeModule {
     );
     final mpsBytes = Const(128, width: 13) << mpsCode;
     final toPage = Const(0x1000, width: 13) - hAddr.slice(11, 0).zeroExtend(13);
-    final chunk = _sizeOf(left, mpsBytes, toPage).named('chunk');
+    // The chunk size is registered. After a packet, the chunk state waits
+    // one cycle for the new size.
+    final chunk = Logic(name: 'chunk', width: 13);
+    final chunkStale = Logic(name: 'chunk_stale');
+    Sequential(clk, [
+      chunk < _sizeOf(left, mpsBytes, toPage),
+      chunkStale < inState(sTx),
+    ], reset: reset);
     final chunkDw = chunk.slice(12, 2).zeroExtend(11).named('chunk_dw');
 
     // Read size: the smallest of bytes left, max read request, 4 KB page end.
@@ -882,10 +889,18 @@ class HarborPcieDma extends BridgeModule {
         sizeLog;
     final beats13 = beatsLeft.zeroExtend(13);
     final cap = mux(to4k.lt(256), to4k, Const(256, width: 13));
-    final burst = mux(beats13.lt(cap), beats13, cap).named('burst');
-
+    // The burst length is registered. A request waits one cycle after a
+    // write to cur_addr or beats_left.
+    final burst = Logic(name: 'burst', width: 13);
+    final burstStale = Logic(name: 'burst_stale');
     final inH2d = inState(sH2d);
-    mem.reqValid <= inState(sReq) | inH2d & inD(dReq);
+    final reqFire = Logic(name: 'req_fire');
+    Sequential(clk, [
+      burst < mux(beats13.lt(cap), beats13, cap),
+      burstStale < inState(sChunk) | reqFire | inH2d & inD(dIdle),
+    ], reset: reset);
+
+    mem.reqValid <= (inState(sReq) | inH2d & inD(dReq)) & ~burstStale;
     mem.reqId <= Const(0, width: mem.config.idWidth);
     mem.reqWrite <= inH2d & inD(dReq);
     mem.reqAddr <= curAddr;
@@ -898,7 +913,7 @@ class HarborPcieDma extends BridgeModule {
         );
     mem.reqExclusive <= Const(0);
     mem.rdataReady <= inState(sRdata);
-    final reqFire = mem.reqValid & mem.reqReady;
+    reqFire <= mem.reqValid & mem.reqReady;
     final rFire = mem.rdataValid & mem.rdataReady;
 
     // Local writes from the reorder buffer. Lane l of beat w_beat holds DW
@@ -1774,20 +1789,26 @@ class HarborPcieDma extends BridgeModule {
               ]),
             ]),
             CaseItem(Const(sChunk, width: 4), [
-              pktAddr < hAddr,
-              pktDw < chunkDw,
-              pktRead < 0,
-              pktTag < 0,
-              lane0 < laneOf(lAddr),
-              curAddr < (lAddr & ~Const(beatBytes - 1, width: aw)),
-              beatsLeft <
-                  ((laneOf(lAddr).zeroExtend(12) +
-                          chunkDw.zeroExtend(12) +
-                          (dpb - 1)) >>
-                      dpbLog),
-              word < 0,
-              fabErr < 0,
-              state < sReq,
+              If(
+                chunkStale,
+                then: [],
+                orElse: [
+                  pktAddr < hAddr,
+                  pktDw < chunkDw,
+                  pktRead < 0,
+                  pktTag < 0,
+                  lane0 < laneOf(lAddr),
+                  curAddr < (lAddr & ~Const(beatBytes - 1, width: aw)),
+                  beatsLeft <
+                      ((laneOf(lAddr).zeroExtend(12) +
+                              chunkDw.zeroExtend(12) +
+                              (dpb - 1)) >>
+                          dpbLog),
+                  word < 0,
+                  fabErr < 0,
+                  state < sReq,
+                ],
+              ),
             ]),
             CaseItem(Const(sReq, width: 4), [
               If(
