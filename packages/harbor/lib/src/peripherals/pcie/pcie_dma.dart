@@ -1282,6 +1282,10 @@ class HarborPcieDma extends BridgeModule {
         (inState(sIdle) & startWanted & (cplLog.eq(0) | cplWraps)).named(
           'cpl_ring_bad',
         );
+    // CPL_BASE and CPL_SIZE writes are dropped while the engine runs or
+    // starts in this cycle, so the ring checked at the start stays valid
+    // until the record.
+    final cplWritable = (inState(sIdle) & ~startWanted).named('cpl_writable');
     final doneSet = recDone & code.eq(0) & dFlags[1];
     final errSet = recDone & ~code.eq(0) | cplSizeBad;
     final sets = [
@@ -1456,7 +1460,7 @@ class HarborPcieDma extends BridgeModule {
             then: [mask < merge(mask) & Const(causeBits, width: causeWidth)],
           ),
           If(
-            writes(registerCplBaseLow ~/ 4),
+            writes(registerCplBaseLow ~/ 4) & cplWritable,
             then: [
               cplBase <
                   [
@@ -1467,7 +1471,7 @@ class HarborPcieDma extends BridgeModule {
             ],
           ),
           If(
-            writes(registerCplBaseHigh ~/ 4),
+            writes(registerCplBaseHigh ~/ 4) & cplWritable,
             then: [
               cplBase <
                   [
@@ -1476,7 +1480,10 @@ class HarborPcieDma extends BridgeModule {
                   ].swizzle(),
             ],
           ),
-          If(writes(registerCplSize ~/ 4), then: [cplLog < merge(cplLog)]),
+          If(
+            writes(registerCplSize ~/ 4) & cplWritable,
+            then: [cplLog < merge(cplLog)],
+          ),
           // Ring pointer writes are dropped while an engine reset waits,
           // because the reset clears them.
           If(
