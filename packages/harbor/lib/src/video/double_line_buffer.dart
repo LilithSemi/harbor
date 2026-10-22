@@ -1,5 +1,6 @@
 import 'package:rohd/rohd.dart';
 
+import '../arith/fpu_config.dart';
 import '../peripherals/bram.dart';
 import '../soc/target.dart';
 
@@ -15,7 +16,8 @@ import '../soc/target.dart';
 ///
 /// [rdData] is registered on [rdClk], one cycle after [rdSel] and [rdCol]. With
 /// a [blockRam] the two buffers are one block RAM addressed by `{sel, col}`.
-/// Without one they are flops, with the same read latency.
+/// Without one they are flops, with the same read latency. Set
+/// [uniqueName] to put [maxWords] and [blockRam] in the definition name.
 class HarborDoubleLineBuffer extends Module {
   /// The selected buffer's word at [rdCol], one [rdClk] cycle later.
   Logic get rdData => output('rd_data');
@@ -37,8 +39,16 @@ class HarborDoubleLineBuffer extends Module {
     required Logic rdCol,
     this.maxWords = 1024,
     this.blockRam,
+    bool uniqueName = false,
     super.name = 'double_line_buffer',
-  }) : super(definitionName: 'HarborDoubleLineBuffer') {
+  }) : super(
+         definitionName: uniqueName
+             ? harborStableDefinitionName('HarborDoubleLineBuffer', [
+                 'w$maxWords',
+                 'ram${blockRam?.name ?? "flop"}',
+               ])
+             : 'HarborDoubleLineBuffer',
+       ) {
     final idxW = (maxWords - 1).bitLength < 1 ? 1 : (maxWords - 1).bitLength;
 
     wrClk = addInput('wr_clk', wrClk);
