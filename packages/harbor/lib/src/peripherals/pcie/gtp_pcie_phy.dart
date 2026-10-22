@@ -656,9 +656,12 @@ class HarborGtpPciePhy extends Module {
     // at the last edge, so the timer did not count up.
     final timerZero = Logic(name: 'timer_zero');
     final hits = <int, Logic>{};
-    Logic at(int cycles) =>
-        hits.putIfAbsent(cycles, () => Logic(name: 'timer_hit_$cycles')) &
-        ~timerZero;
+    Logic at(int cycles) {
+      assert(cycles >= 3, 'timer compare needs 3 or more cycles');
+      return hits.putIfAbsent(cycles, () => Logic(name: 'timer_hit_$cycles')) &
+          ~timerZero;
+    }
+
     Logic isState(List<HarborGtpResetState> l) =>
         l.map((v) => state.eq(s(v))).reduce((a, b) => a | b);
 

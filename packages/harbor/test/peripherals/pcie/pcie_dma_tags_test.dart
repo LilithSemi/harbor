@@ -109,6 +109,7 @@ void main() {
       final header = Logic(name: 'header', width: 128);
       final firstDw = Logic(name: 'first_dw', width: 32);
       final issue = Logic(name: 'issue');
+      final drain = Logic(name: 'drain');
       final tags = HarborPcieDmaTags(
         clk: clk,
         reset: reset,
@@ -125,7 +126,7 @@ void main() {
         issueLen: Const(4, width: 13),
         issueLocal: Const(0, width: 16),
         issueHostLow: Const(0, width: 7),
-        drainDone: Const(0),
+        drainDone: drain,
         reservedBusy: Const(0),
         rdSlot: Logic(width: 3)..put(0),
         rdIndex: Logic(width: 10)..put(0),
@@ -142,12 +143,38 @@ void main() {
       header.inject(0);
       firstDw.inject(0);
       issue.inject(0);
+      drain.inject(0);
       Simulator.setMaxSimTime(100000);
       unawaited(Simulator.run());
       await clk.nextPosedge;
       await clk.nextPosedge;
       reset.inject(0);
       await clk.nextPosedge;
+
+      // Fill and drain each slot once, so slot 0 holds a known old value.
+      for (var i = 0; i < 8; i++) {
+        final old = tags.issueTag.value.toInt();
+        issue.inject(1);
+        await clk.nextPosedge;
+        issue.inject(0);
+        await clk.nextPosedge;
+        header.inject(
+          BigInt.from(0x4a000001) |
+              BigInt.from(4) << 32 |
+              BigInt.from(old) << 72,
+        );
+        firstDw.inject(0xaabbccdd);
+        cplHeader.inject(1);
+        await clk.nextPosedge;
+        cplHeader.inject(0);
+        for (var c = 0; c < 3; c++) {
+          await clk.nextPosedge;
+        }
+        drain.inject(1);
+        await clk.nextPosedge;
+        drain.inject(0);
+        await clk.nextPosedge;
+      }
 
       final tag = tags.issueTag.value.toInt();
       issue.inject(1);
@@ -173,7 +200,7 @@ void main() {
 
       // T + 2: rd_data holds the read of T + 1, the old data.
       await clk.nextNegedge;
-      expect(tags.rdData.value.getRange(0, 32).isValid, isFalse);
+      expect(tags.rdData.value.getRange(0, 32).toInt(), 0xddccbbaa);
       await clk.nextPosedge;
 
       // T + 3: rd_data holds the read of T + 2, the new data.

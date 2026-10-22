@@ -323,6 +323,21 @@ void main() {
       await b.finish();
     });
 
+    test('TX sync timeout lasts exactly the timeout in cycles', () async {
+      final b = await _Bench.start(setup: (m) => m.phAlignStuck = true);
+      await b.waitFor(_S.txPhAlign);
+      // The state is seen at the first sample. It stays for txSync samples.
+      var samples = 1;
+      while (b.state == _S.txPhAlign) {
+        await b.pclk.nextNegedge;
+        if (b.state == _S.txPhAlign) samples++;
+        if (samples > 200) fail('no timeout');
+      }
+      expect(samples, _timeouts.txSync);
+      expect(b.state, _S.pllReset);
+      await b.finish();
+    });
+
     test('PERST# high from power-up with no edge reaches idle', () async {
       final b = await _Bench.start(perstEdge: false);
       await b.waitFor(_S.idle);
