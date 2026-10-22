@@ -59,6 +59,8 @@ class HarborPcieDmaTags extends Module {
   Logic get issueTag => output('issue_tag');
   Logic get reservedTag => output('reserved_tag');
   Logic get reservedCpl => output('reserved_cpl');
+  /// The head slot has all its data. Do not read the slot in the cycle
+  /// this rises: its last write reaches the RAM at the end of that cycle.
   Logic get headReady => output('head_ready');
   Logic get headSlot => output('head_slot');
   Logic get headLocal => output('head_local');
@@ -73,6 +75,7 @@ class HarborPcieDmaTags extends Module {
   Logic get staleCount => output('stale_count');
 
   /// DWs at `rd_index` and later of slot `rd_slot`, one cycle after them.
+  /// A read in the cycle [headReady] rises gets old data.
   Logic get rdData => output('rd_data');
 
   HarborPcieDmaTags({
@@ -361,8 +364,9 @@ class HarborPcieDmaTags extends Module {
       final l = (cb - startLow).named('w_lane_$b');
       final data = _laneMux(cplHeader, firstMem, l, lanes);
       // The write port is registered, so the slot registers do not have to
-      // be near the RAM. The drain reads a slot some cycles after it is
-      // done, so the late write is always in the RAM first.
+      // be near the RAM. The last write of a slot reaches the RAM at the end
+      // of the cycle where head_ready rises, so a read must start one cycle
+      // later.
       final bankEn = Logic(name: 'w_en_$b');
       final bankAddr = Logic(name: 'w_addr_$b', width: bankAw);
       final bankData = Logic(name: 'w_data_$b', width: 32);
