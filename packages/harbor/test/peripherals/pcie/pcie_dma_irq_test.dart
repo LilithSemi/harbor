@@ -119,6 +119,60 @@ void main() {
     await b.finish();
   });
 
+  test('a partial IRQ_CAUSE read clears fresh only in its bytes', () async {
+    final b = await _start();
+    Future<PcieTlp> read(
+      int address,
+      int lengthDw,
+      int firstBe,
+      int lastBe,
+    ) async {
+      final before = b.host.completions.length;
+      await b.send(
+        PcieTlp.memRead(
+          address: dmaBar0 + address,
+          lengthDw: lengthDw,
+          firstBe: firstBe,
+          lastBe: lastBe,
+          tag: 0x56,
+        ),
+      );
+      await b.waitUntil(
+        () => b.host.completions.length > before,
+        what: 'partial read',
+      );
+      return b.host.completions.last;
+    }
+
+    Future<int> clearLine() async {
+      await b.writeReg(HarborPcieDma.registerIrqCause, _line);
+      await b.cycles(4);
+      return b.readReg(HarborPcieDma.registerIrqCause);
+    }
+
+    await _pulse(b);
+    await b.cycles(4);
+    // The line bit is in byte 1. A read of byte 0 does not see it.
+    await read(HarborPcieDma.registerIrqCause, 1, 0x1, 0);
+    expect(await clearLine(), _line, reason: 'byte 1 was not read');
+    // The full read in clearLine read byte 1, so this W1C clears it.
+    expect(await clearLine(), 0);
+
+    // A 2 DW read from STATUS that reads only byte 0 of IRQ_CAUSE.
+    await _pulse(b);
+    await b.cycles(4);
+    await read(HarborPcieDma.registerStatus, 2, 0xf, 0x1);
+    await b.writeReg(HarborPcieDma.registerIrqCause, _line);
+    await b.cycles(4);
+    // Byte 1 was not read, so the W1C did not clear the line bit.
+    final c = await read(HarborPcieDma.registerIrqCause, 1, 0x2, 0);
+    expect(DmaRecord.le(c.data, 0) & _line, _line);
+    await b.writeReg(HarborPcieDma.registerIrqCause, _line);
+    await b.cycles(4);
+    expect(await b.readReg(HarborPcieDma.registerIrqCause), 0);
+    await b.finish();
+  });
+
   test('engine reset clears the fresh bits', () async {
     final b = await _start();
     await _pulse(b);

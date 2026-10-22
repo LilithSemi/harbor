@@ -587,7 +587,8 @@ class HarborPcieDma extends BridgeModule {
     final cLowAddr = Logic(name: 'c_low_addr', width: 7);
     final cDw = Logic(name: 'c_dw', width: 6);
     final cG = Logic(name: 'c_g', width: 5);
-    final cZeroLen = Logic(name: 'c_zero_len');
+    final cFirstBe = Logic(name: 'c_first_be', width: 4);
+    final cLastBe = Logic(name: 'c_last_be', width: 4);
     final cT = Logic(name: 'c_t', width: 6);
     final cData = [
       for (var i = 0; i < maxReadDw; i++) Logic(name: 'c_data_$i', width: 32),
@@ -1355,14 +1356,22 @@ class HarborPcieDma extends BridgeModule {
       errSet,
       doneSet,
     ].swizzle();
-    // A zero length read (first byte enable 0) reads nothing.
+    // A read clears the fresh bits only in the bytes it reads. A zero length
+    // read (first byte enable 0) reads nothing.
+    final rBe = mux(
+      cG.eq(0),
+      cFirstBe,
+      mux((cG.zeroExtend(6) + 1).eq(cDw), cLastBe, Const(0xf, width: 4)),
+    ).named('reg_r_be');
     final causeRead =
         (cState.eq(cGather) &
-                ~cZeroLen &
+                rBe.or() &
                 rAddr.eq(Const(registerIrqCause ~/ 4, width: 10)))
             .named('irq_cause_read');
-    final freshNext = ((fresh & ~causeRead.replicate(causeWidth)) | events)
-        .named('irq_fresh_next');
+    final readBits = [
+      for (var i = 3; i >= 0; i--) (causeRead & rBe[i]).replicate(8),
+    ].swizzle().slice(causeWidth - 1, 0).named('irq_cause_read_bits');
+    final freshNext = ((fresh & ~readBits) | events).named('irq_fresh_next');
     final clears = mux(
       writes(registerIrqCause ~/ 4),
       (wData & wMask).slice(causeWidth - 1, 0) & ~fresh,
@@ -1652,7 +1661,8 @@ class HarborPcieDma extends BridgeModule {
                   cT < 0,
                   If.block([
                     Iff(isMRd & readOk, [
-                      cZeroLen < zeroLen,
+                      cFirstBe < hdrFirstBe,
+                      cLastBe < hdrLastBe,
                       cStatus < 0,
                       cDw < hdrLen.slice(5, 0),
                       cByteCount < byteCount.slice(11, 0),
