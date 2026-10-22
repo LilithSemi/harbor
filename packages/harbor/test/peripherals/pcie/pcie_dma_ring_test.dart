@@ -500,6 +500,58 @@ void main() {
     await b.finish();
   });
 
+  test('rings and host ranges that end at 2^64 are accepted', () async {
+    final b = await DmaBench.create(_ringOnly, seed: 66);
+    await b.start();
+    // 16 descriptors and 16 records end exactly at 2^64.
+    await b.setupDescRing(0xfffffffffffffe00, 4);
+    await b.setupRing(0xffffffffffffff00, 4);
+    await b.enable(mask: HarborPcieDma.causeError);
+    b.writeDesc(
+      0,
+      hostAddress: 0x80001000,
+      localAddress: 0x1000,
+      length: 0x100,
+      cookie: 1,
+    );
+    await b.doorbell(1);
+    await b.waitRecordWrites(0, 1);
+    expect(b.record(0).code, 0);
+    expect(b.record(0).cookie, 1);
+    expect(b.fetches, isNotEmpty);
+    b.checkCopy(0x80001000, 0x1000, 0x100);
+
+    // Then host ranges that end at 2^64, with the rings back in low memory.
+    await b.engineReset();
+    await b.cycles(20);
+    await b.setupDescRing(_ring, 4);
+    await b.setupRing(dmaCplBase, 4);
+    b.seedHost(0xffffffffffffe000, 0x1000);
+    b.writeDesc(
+      0,
+      hostAddress: 0xfffffffffffff000,
+      localAddress: 0x2000,
+      length: 0x1000,
+      cookie: 2,
+    );
+    b.writeDesc(
+      1,
+      hostAddress: 0xffffffffffffe000,
+      localAddress: 0x4000,
+      length: 0x1000,
+      deviceToHost: false,
+      cookie: 3,
+    );
+    await b.doorbell(2);
+    await b.waitRecordWrites(1, 1);
+    expect([b.record(0).code, b.record(1).code], [0, 0]);
+    expect([b.record(0).cookie, b.record(1).cookie], [2, 3]);
+    b.checkCopy(0xfffffffffffff000, 0x2000, 0x1000);
+    b.checkLocal(0xffffffffffffe000, 0x4000, 0x1000);
+    expect(b.host.violations, isEmpty);
+    await b.finish();
+  });
+
   test('code 11 does not hide a waiting fetch error', () async {
     final b = await DmaBench.create(_ringOnly, seed: 67);
     await b.start();
