@@ -583,6 +583,7 @@ class HarborPcieDma extends BridgeModule {
     final cLowAddr = Logic(name: 'c_low_addr', width: 7);
     final cDw = Logic(name: 'c_dw', width: 6);
     final cG = Logic(name: 'c_g', width: 5);
+    final cZeroLen = Logic(name: 'c_zero_len');
     final cT = Logic(name: 'c_t', width: 6);
     final cData = [
       for (var i = 0; i < maxReadDw; i++) Logic(name: 'c_data_$i', width: 32),
@@ -1318,14 +1319,14 @@ class HarborPcieDma extends BridgeModule {
       errSet,
       doneSet,
     ].swizzle();
+    // A zero length read (first byte enable 0) reads nothing.
     final causeRead =
-        (cState.eq(cGather) & rAddr.eq(Const(registerIrqCause ~/ 4, width: 10)))
+        (cState.eq(cGather) &
+                ~cZeroLen &
+                rAddr.eq(Const(registerIrqCause ~/ 4, width: 10)))
             .named('irq_cause_read');
-    final freshNext = mux(
-      causeRead,
-      events,
-      fresh | events,
-    ).named('irq_fresh_next');
+    final freshNext = ((fresh & ~causeRead.replicate(causeWidth)) | events)
+        .named('irq_fresh_next');
     final clears = mux(
       writes(registerIrqCause ~/ 4),
       (wData & wMask).slice(causeWidth - 1, 0) & ~fresh,
@@ -1337,29 +1338,45 @@ class HarborPcieDma extends BridgeModule {
     final split = (msiEnable & msiVectorsGranted.gte(needLog)).named(
       'irq_split',
     );
-    // irq_pending is low for one cycle after a write to IRQ_CAUSE or
-    // IRQ_MASK. A cause that is still set then rises again, and the
-    // endpoint sends a new MSI for it.
-    final irqGap = Logic(name: 'irq_gap');
+    // A vector of irq_pending is low for one cycle after a write to
+    // IRQ_CAUSE or IRQ_MASK that touches a bit of its group. A cause that is
+    // still set then rises again, and the endpoint sends a new MSI for it.
+    // Other vectors do not change.
+    final touched = mux(
+      writes(registerIrqMask ~/ 4),
+      wMask.slice(causeWidth - 1, 0),
+      (wData & wMask).slice(causeWidth - 1, 0),
+    ).named('irq_touched');
+    final irqWrite =
+        writes(registerIrqCause ~/ 4) | writes(registerIrqMask ~/ 4);
+    final irqGapBits = Logic(name: 'irq_gap_bits', width: causeWidth);
     Sequential(clk, [
       If(
         reset,
-        then: [irqGap < 0, fresh < 0, if (linesPrev != null) linesPrev < 0],
+        then: [irqGapBits < 0, fresh < 0, if (linesPrev != null) linesPrev < 0],
         orElse: [
-          irqGap < writes(registerIrqCause ~/ 4) | writes(registerIrqMask ~/ 4),
-          fresh < freshNext & Const(causeBits, width: causeWidth),
+          irqGapBits <
+              mux(irqWrite, touched, Const(0, width: causeWidth)) &
+                  Const(causeBits, width: causeWidth),
+          // An engine reset starts the driver again, so it clears fresh.
+          fresh <
+              mux(
+                engReset,
+                Const(0, width: causeWidth),
+                freshNext & Const(causeBits, width: causeWidth),
+              ),
           if (linesPrev != null) linesPrev < lines!,
         ],
       ),
     ]);
+    final gap0 = mux(split, irqGapBits[0] | irqGapBits[1], irqGapBits.or());
     addOutput('irq_pending', width: 8) <=
-        ~irqGap.replicate(8) &
-            [
-              if (irqLines < 7) Const(0, width: 7 - irqLines),
-              for (var i = irqLines - 1; i >= 0; i--)
-                split & pend[causeLineShift + i],
-              mux(split, pend[0] | pend[1], pend.or()),
-            ].swizzle();
+        [
+          if (irqLines < 7) Const(0, width: 7 - irqLines),
+          for (var i = irqLines - 1; i >= 0; i--)
+            split & pend[causeLineShift + i] & ~irqGapBits[causeLineShift + i],
+          mux(split, pend[0] | pend[1], pend.or()) & ~gap0,
+        ].swizzle();
 
     // Completion request capture.
     final aByte = [hdrDw.slice(4, 0), Const(0, width: 2)].swizzle();
@@ -1597,6 +1614,7 @@ class HarborPcieDma extends BridgeModule {
                   cT < 0,
                   If.block([
                     Iff(isMRd & readOk, [
+                      cZeroLen < zeroLen,
                       cStatus < 0,
                       cDw < hdrLen.slice(5, 0),
                       cByteCount < byteCount.slice(11, 0),
