@@ -374,25 +374,41 @@ class HarborPcieDmaTags extends Module {
     final rdLow = rdStart.slice(bLog - 1, 0);
     final rdHigh = (rdStart >> bLog).slice(bankAw - 1, 0);
     final rot = Logic(name: 'rd_rot', width: bLog);
+    // The write port is registered, so the slot registers do not have to
+    // be near the RAM. The last write of a slot reaches the RAM at the end
+    // of the cycle where head_ready rises, so a read must start one cycle
+    // later. The lane mux is after the registers, so the RAM data input has
+    // logic before it for the hold time.
+    final hdrReg = Logic(name: 'w_hdr_reg');
+    final firstReg = Logic(name: 'w_first_reg', width: 32);
+    final lanesReg = [
+      for (var i = 0; i < n; i++) Logic(name: 'w_lane_reg_$i', width: 32),
+    ];
+    Sequential(clk, [
+      hdrReg < cplHeader,
+      firstReg < firstMem,
+      for (var i = 0; i < n; i++) lanesReg[i] < lanes[i],
+    ]);
     final bankOut = <Logic>[];
     for (var b = 0; b < banks; b++) {
       final cb = Const(b, width: bLog);
       final l = (cb - startLow).named('w_lane_$b');
-      final data = _laneMux(cplHeader, firstMem, l, lanes);
-      // The write port is registered, so the slot registers do not have to
-      // be near the RAM. The last write of a slot reaches the RAM at the end
-      // of the cycle where head_ready rises, so a read must start one cycle
-      // later.
       final bankEn = Logic(name: 'w_en_$b');
       final bankAddr = Logic(name: 'w_addr_$b', width: bankAw);
-      final bankData = Logic(name: 'w_data_$b', width: 32);
+      final bankLane = Logic(name: 'w_sel_$b', width: bLog);
       Sequential(clk, [
         bankEn < ~reset & wEn & l.zeroExtend(3).lt(wCount),
         bankAddr <
             startHigh +
                 mux(cb.lt(startLow), Const(1), Const(0)).zeroExtend(bankAw),
-        bankData < data,
+        bankLane < l,
       ]);
+      final bankData = _laneMux(
+        hdrReg,
+        firstReg,
+        bankLane,
+        lanesReg,
+      ).named('w_data_$b');
       final ram = _ReorderRam(
         clk,
         width: 32,
