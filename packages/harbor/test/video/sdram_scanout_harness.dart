@@ -39,8 +39,13 @@ class _BenchMaster extends BridgeModule {
 
 /// [HarborDualClockDisplay] on a [HarborSdram] scanout port.
 class BenchScanDisplay extends BridgeModule {
-  BenchScanDisplay({required HarborDisplayTiming timing, required int stride})
-    : super('BenchScanDisplay', name: 'display') {
+  BenchScanDisplay({
+    required HarborDisplayTiming timing,
+    required int stride,
+    List<HarborPixelFormat>? formats,
+    List<int> planeBases = const [],
+    List<int> planePitches = const [],
+  }) : super('BenchScanDisplay', name: 'display') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     createPort('pixel_clk', PortDirection.input);
@@ -66,6 +71,9 @@ class BenchScanDisplay extends BridgeModule {
       rdValid: input('rd_valid'),
       rdData: input('rd_data'),
       lineStride: stride,
+      formats: formats,
+      planeBase: [for (final b in planeBases) Const(b, width: 32)],
+      planePitch: [for (final p in planePitches) Const(p, width: 32)],
     );
     addOutput('rq_valid') <= d.rqValid;
     addOutput('rq_addr', width: 32) <= d.rqAddr;
@@ -94,6 +102,13 @@ class SdramScanoutBench {
   /// [HarborSdram.readPortStages] of the scanout port.
   final int readPortStages;
   late final int stride;
+
+  /// Pixel formats of a planar display, null for xrgb8888.
+  final List<HarborPixelFormat>? formats;
+
+  /// Base and pitch of each plane after plane 0.
+  final List<int> planeBases;
+  final List<int> planePitches;
 
   late final HarborSoC soc;
   late final HarborSdram sdram;
@@ -160,6 +175,9 @@ class SdramScanoutBench {
     this.maxInFlight = 3,
     this.readPortStages = 0,
     int? stride,
+    this.formats,
+    this.planeBases = const [],
+    this.planePitches = const [],
   }) {
     this.stride = stride ?? timing.hActive * 4;
   }
@@ -200,7 +218,13 @@ class SdramScanoutBench {
 
     soc = HarborSoC(name: 'ScanPortSoC', compatible: 'test,scanport');
     bench = soc.addMaster(_BenchMaster(cfg), busInterfaceName: 'bus');
-    display = BenchScanDisplay(timing: timing, stride: stride);
+    display = BenchScanDisplay(
+      timing: timing,
+      stride: stride,
+      formats: formats,
+      planeBases: planeBases,
+      planePitches: planePitches,
+    );
     soc.addSubModule(display);
     sdram = soc.addPeripheral(
       HarborSdram(
