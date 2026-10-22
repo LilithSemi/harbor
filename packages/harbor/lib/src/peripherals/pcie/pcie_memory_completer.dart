@@ -461,10 +461,9 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       Const(0, width: 1),
       rdStart.slice(6, 0),
     ].swizzle();
-    final totalDw =
-        (Const(3, width: 12) +
-                mux(cplData, cDw.zeroExtend(12), Const(0, width: 12)))
-            .named('tx_total');
+    // The packet length in DWs is a register, loaded when the engine goes
+    // to the TX state.
+    final totalDw = Logic(name: 'tx_total', width: 12);
     final txLanes = <Logic>[];
     final txKeep = <Logic>[];
     for (var i = 0; i < n; i++) {
@@ -549,6 +548,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
           opWrite < 0,
           cplStatus < 0,
           txT < 0,
+          totalDw < 3,
         ],
         orElse: [
           Case(state, [
@@ -617,6 +617,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                   rdStart < 0,
                   cDw < 0,
                   txT < 0,
+                  totalDw < 3,
                   state < sTx,
                 ]),
                 Else([state < sRx]),
@@ -685,6 +686,12 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                                 Const(0, width: 3),
                               ),
                           txT < 0,
+                          totalDw <
+                              mux(
+                                fabErr | mem.rdataErr,
+                                Const(3, width: 12),
+                                cDw.zeroExtend(12) + 3,
+                              ),
                           txBase < lane0.zeroExtend(idxW) - 3,
                           state < sTx,
                         ],
