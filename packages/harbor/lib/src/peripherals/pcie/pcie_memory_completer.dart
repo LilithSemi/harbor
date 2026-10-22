@@ -150,9 +150,9 @@ class HarborPcieMemoryCompleter extends BridgeModule {
   }
 
   /// The BAR hit bit: the BAR2 bit when [endpoint] is given, else
-  /// [barHitBit], else 4. With both, they must be equal.
+  /// [barHitBit], else the BAR2 bit. With both, they must be equal.
   static int _hitBit(HarborPcieEndpointConfig? endpoint, int? barHitBit) {
-    const bar2 = 4;
+    final bar2 = HarborPcieStream.userBar2.bitLength - 1;
     if (endpoint == null) return barHitBit ?? bar2;
     if (barHitBit != null && barHitBit != bar2) {
       throw ArgumentError.value(
