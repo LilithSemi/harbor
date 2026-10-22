@@ -651,7 +651,14 @@ class HarborGtpPciePhy extends Module {
     final rateFail = Logic(name: 'rate_fail');
 
     Const s(HarborGtpResetState v) => Const(v.code, width: 4);
-    Logic at(int cycles) => timer.eq(Const(cycles - 1, width: tw));
+    // The timer compares are registered: hit_n is high when the timer was
+    // n - 2 in the last cycle. timer_zero is high when the timer was cleared
+    // at the last edge, so the timer did not count up.
+    final timerZero = Logic(name: 'timer_zero');
+    final hits = <int, Logic>{};
+    Logic at(int cycles) =>
+        hits.putIfAbsent(cycles, () => Logic(name: 'timer_hit_$cycles')) &
+        ~timerZero;
     Logic isState(List<HarborGtpResetState> l) =>
         l.map((v) => state.eq(s(v))).reduce((a, b) => a | b);
 
@@ -742,6 +749,9 @@ class HarborGtpPciePhy extends Module {
       pclk,
       [
         state < next,
+        timerZero < fail | ~next.eq(state),
+        for (final MapEntry(key: n, value: hit) in hits.entries)
+          hit < timer.eq(Const(n - 2, width: tw)),
         If(
           fail | ~next.eq(state),
           then: [timer < 0],
@@ -783,7 +793,11 @@ class HarborGtpPciePhy extends Module {
         dlyEn < nextIs([_S.txDlyEn, _S.idle]),
       ],
       reset: rst,
-      resetValues: {state: s(_S.cfgWait), failState: s(_S.none)},
+      resetValues: {
+        state: s(_S.cfgWait),
+        failState: s(_S.none),
+        timerZero: Const(1),
+      },
     );
 
     // Rate change, on the rate of lane 0. The hard block drives one rate for
