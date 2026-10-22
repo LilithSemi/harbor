@@ -188,10 +188,49 @@ void main() {
     expect(b.record(0).cookie, 9);
     expect(b.record(0).code, 0);
     b.checkLocal(0x80001000, 0x200, 0x100);
-    // When the engine is idle, the writes take effect.
+    // The ring holds a record, so an idle engine still drops the writes.
     await b.cycles(20);
     await b.writeReg(HarborPcieDma.registerCplSize, 5);
+    expect(await b.readReg(HarborPcieDma.registerCplSize), 4);
+    // After an engine reset, the writes take effect.
+    await b.engineReset();
+    await b.cycles(10);
+    await b.writeReg(HarborPcieDma.registerCplSize, 5);
     expect(await b.readReg(HarborPcieDma.registerCplSize), 5);
+    await b.finish();
+  });
+
+  test('a CPL_SIZE write to an idle engine with records does not move '
+      'the ring', () async {
+    final b = await DmaBench.create(const DmaConfig());
+    await b.start();
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable();
+    for (var i = 0; i < 6; i++) {
+      await b.push(
+        hostAddress: 0x80000000 + 0x100 * i,
+        localAddress: 0,
+        length: 4,
+        cookie: i + 1,
+      );
+    }
+    await b.waitRecordWrites(5, 1);
+    await b.writeReg(HarborPcieDma.registerCplHead, 6);
+    await b.cycles(20);
+    // A 4 slot ring would put the next record at slot 6, past its end.
+    await b.writeReg(HarborPcieDma.registerCplSize, 2);
+    await b.writeReg(HarborPcieDma.registerCplBaseLow, dmaCplBase + 0x1000);
+    expect(await b.readReg(HarborPcieDma.registerCplSize), 4);
+    expect(await b.readReg(HarborPcieDma.registerCplBaseLow), dmaCplBase);
+    await b.push(
+      hostAddress: 0x80001000,
+      localAddress: 0,
+      length: 4,
+      cookie: 7,
+    );
+    await b.waitRecordWrites(6, 1);
+    expect(b.record(6).cookie, 7);
+    expect(await b.readReg(HarborPcieDma.registerCplTail), 7);
     await b.finish();
   });
 }

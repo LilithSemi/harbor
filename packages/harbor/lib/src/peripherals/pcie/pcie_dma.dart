@@ -846,7 +846,10 @@ class HarborPcieDma extends BridgeModule {
     // Completion ring.
     final cplNext = ((cplTail + 1) & cplMask).named('cpl_next');
     final cplFull = cplNext.eq(cplHead & cplMask).named('cpl_full');
-    final recAddr = (cplBase + (cplTail.zeroExtend(64) << 4)).named('rec_addr');
+    // The tail is masked, so a record never lands outside the ring.
+    final recAddr = (cplBase + ((cplTail & cplMask).zeroExtend(64) << 4)).named(
+      'rec_addr',
+    );
 
     // Chunk size: the smallest of bytes left, max payload, 4 KB page end.
     final mpsCode = mux(
@@ -1323,9 +1326,12 @@ class HarborPcieDma extends BridgeModule {
           'cpl_ring_bad',
         );
     // CPL_BASE and CPL_SIZE writes are dropped while the engine runs or
-    // starts in this cycle, so the ring checked at the start stays valid
-    // until the record.
-    final cplWritable = (inState(sIdle) & ~startWanted).named('cpl_writable');
+    // starts in this cycle, and while the ring is not empty at slot 0. So
+    // the ring cannot change under a record or a live slot.
+    final cplWritable =
+        (inState(sIdle) & ~startWanted & cplTail.eq(0) & cplHead.eq(0)).named(
+          'cpl_writable',
+        );
     final doneSet = recDone & code.eq(0) & dFlags[1];
     final errSet = recDone & ~code.eq(0) | cplSizeBad;
     final sets = [
