@@ -384,6 +384,22 @@ void main() {
       reason: 'no BAR2',
     );
     expect(make(barBytes: 1 << 16).barBytes, 1 << 16);
+    // The BAR2 hit bit comes from the endpoint too.
+    expect(make(endpoint: bar2).barHitBit, 4);
+    expect(
+      () => HarborPcieMemoryCompleter(
+        clk: Logic(),
+        reset: Logic(),
+        maxPayload: Logic(width: 3),
+        rcb128: Logic(),
+        completerId: Logic(width: 16),
+        rx: HarborPcieStream(width: 64),
+        tx: HarborPcieStream(width: 64),
+        endpointConfig: bar2,
+        barHitBit: 2,
+      ),
+      throwsArgumentError,
+    );
     expect(make().barBytes, 16 << 20);
   });
 

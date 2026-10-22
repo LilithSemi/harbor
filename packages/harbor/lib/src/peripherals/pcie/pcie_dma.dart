@@ -9,6 +9,7 @@ import '../../bus/port/memory_waist.dart';
 import '../../bus/port/reg_fifo.dart';
 import '../bram.dart';
 import 'pcie_dma_tags.dart';
+import 'pcie_endpoint.dart';
 import 'pcie_stream.dart';
 
 /// A PCIe DMA engine with a descriptor queue and a completion record ring.
@@ -208,6 +209,7 @@ class HarborPcieDma extends BridgeModule {
     required HarborPcieStream tx,
     Logic? irqInputs,
     Logic? romStatus,
+    HarborPcieEndpointConfig? endpointConfig,
     this.fabricKind = HarborFabricKind.axi4,
     this.dataWidth = 64,
     this.addressWidth = 32,
@@ -232,6 +234,13 @@ class HarborPcieDma extends BridgeModule {
          name: name ?? 'pcie_dma',
        ) {
     _validate(tx, irqInputs);
+    // Vector 0 is the DMA and vector 1 + i is line i. With fewer vectors
+    // every group shares vector 0.
+    if (endpointConfig != null && endpointConfig.msiVectors < 1 + irqLines) {
+      throw ArgumentError(
+        'msiVectors ${endpointConfig.msiVectors} < 1 + irqLines $irqLines',
+      );
+    }
 
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);

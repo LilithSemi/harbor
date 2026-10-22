@@ -114,6 +114,7 @@ class PcieGpuTop extends BridgeModule {
       tx: dmaTx,
       irqInputs: irqLine,
       romStatus: withRom ? romStatus : null,
+      endpointConfig: gpuEndpointConfig,
       dataWidth: width,
       addressWidth: gpuAddressWidth,
       ringSource: true,

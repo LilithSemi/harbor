@@ -55,11 +55,6 @@ class Ax7203PcieGpu extends BridgeModule {
 
   Ax7203PcieGpu(HarborFpgaTarget target)
     : super('Ax7203PcieGpu', name: 'ax7203_pcie_gpu') {
-    // Vector 0 is the DMA and vector 1 + i is line i. With fewer vectors,
-    // every group falls back to vector 0.
-    if (ax7203MsiVectors < 1 + ax7203IrqLines) {
-      throw ArgumentError('msiVectors must be at least 1 + irqLines');
-    }
     final refClkP = createPort('pcie_refclk_p', PortDirection.input).port;
     final refClkN = createPort('pcie_refclk_n', PortDirection.input).port;
     final perstN = createPort('pcie_perst_n', PortDirection.input).port;
@@ -137,6 +132,8 @@ class Ax7203PcieGpu extends BridgeModule {
         ringSource: true,
         irqLines: ax7203IrqLines,
         romStatus: romStatus,
+        // Checks that msiVectors covers 1 + irqLines.
+        endpointConfig: ax7203EndpointConfig,
         infoWords: ax7203InfoWords,
       ),
     );

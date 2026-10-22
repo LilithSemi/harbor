@@ -74,16 +74,18 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     HarborPcieEndpointConfig? endpointConfig,
     int? barBytes,
     this.memoryOffset = 0,
-    this.barHitBit = 4,
+    int? barHitBit,
     this.maxPayloadBytes = 256,
     String? name,
   }) : width = rx.width,
        barBytes = _barSize(endpointConfig, barBytes),
+       barHitBit = _hitBit(endpointConfig, barHitBit),
        super(
          'HarborPcieMemoryCompleter_W${rx.width}_D${dataWidth}_A$addressWidth'
          '_${fabricKind.name}'
          '_S${_barSize(endpointConfig, barBytes).toRadixString(16)}'
-         '_O${memoryOffset.toRadixString(16)}_B${barHitBit}_P$maxPayloadBytes',
+         '_O${memoryOffset.toRadixString(16)}'
+         '_B${_hitBit(endpointConfig, barHitBit)}_P$maxPayloadBytes',
          name: name ?? 'pcie_memory_completer',
        ) {
     _validate(tx);
@@ -145,6 +147,21 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       );
     }
     return endpoint.bar2Bytes;
+  }
+
+  /// The BAR hit bit: the BAR2 bit when [endpoint] is given, else
+  /// [barHitBit], else 4. With both, they must be equal.
+  static int _hitBit(HarborPcieEndpointConfig? endpoint, int? barHitBit) {
+    const bar2 = 4;
+    if (endpoint == null) return barHitBit ?? bar2;
+    if (barHitBit != null && barHitBit != bar2) {
+      throw ArgumentError.value(
+        barHitBit,
+        'barHitBit',
+        'the endpoint BAR2 hit bit is $bar2',
+      );
+    }
+    return bar2;
   }
 
   static int _log2(int v) => v.bitLength - 1;

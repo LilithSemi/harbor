@@ -19,6 +19,7 @@ HarborPcieDma _dma({
   int timeoutCycles = 6250000,
   int maxReadRequestBytes = 512,
   List<int> infoWords = const [],
+  HarborPcieEndpointConfig? endpointConfig,
 }) => HarborPcieDma(
   clk: Logic(),
   reset: Logic(),
@@ -40,6 +41,7 @@ HarborPcieDma _dma({
   timeoutCycles: timeoutCycles,
   maxReadRequestBytes: maxReadRequestBytes,
   infoWords: infoWords,
+  endpointConfig: endpointConfig,
 );
 
 void main() {
@@ -1269,6 +1271,36 @@ void main() {
         _dma(fifoSource: false, ringSource: true).definitionName,
       };
       expect(names, hasLength(11));
+    });
+
+    test('msiVectors must cover 1 + irqLines', () {
+      expect(
+        () => _dma(
+          irqLines: 7,
+          endpointConfig: const HarborPcieEndpointConfig(msiVectors: 2),
+        ),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.message,
+            'message',
+            'msiVectors 2 < 1 + irqLines 7',
+          ),
+        ),
+      );
+      expect(
+        () => _dma(
+          irqLines: 7,
+          endpointConfig: const HarborPcieEndpointConfig(msiVectors: 8),
+        ),
+        returnsNormally,
+      );
+      expect(
+        () => _dma(
+          irqLines: 1,
+          endpointConfig: const HarborPcieEndpointConfig(msiVectors: 1),
+        ),
+        throwsArgumentError,
+      );
     });
 
     test('bad parameters are refused', () {
