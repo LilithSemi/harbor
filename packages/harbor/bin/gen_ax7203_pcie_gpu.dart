@@ -99,6 +99,8 @@ class Ax7203PcieGpu extends BridgeModule {
     // Power on reset for the option ROM counters: the flops start at 0 from
     // configuration and the counter stops at 15. Link and PERST# resets do
     // not touch it, so the counts from firmware stay for the OS driver.
+    // As the Harbor SoC power on reset does, it uses the FPGA INIT value 0.
+    // A simulation of this top must inject 0 into por_count.
     final porCount = Logic(name: 'por_count', width: 4);
     Sequential(clk, [
       If(~porCount.eq(15), then: [porCount < porCount + 1]),
