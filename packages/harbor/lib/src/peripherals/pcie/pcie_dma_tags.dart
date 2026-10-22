@@ -59,6 +59,7 @@ class HarborPcieDmaTags extends Module {
   Logic get issueTag => output('issue_tag');
   Logic get reservedTag => output('reserved_tag');
   Logic get reservedCpl => output('reserved_cpl');
+
   /// The head slot has all its data. Do not read the slot in the cycle
   /// this rises: its last write reaches the RAM at the end of that cycle.
   Logic get headReady => output('head_ready');
@@ -283,13 +284,20 @@ class HarborPcieDmaTags extends Module {
       Const(4096, width: 13),
       lenDw.zeroExtend(13) << 2,
     ).named('cpl_bytes');
-    final rem = pickSlot(sRem).named('cpl_rem');
-    final expLow = pickSlot(sExp).named('cpl_exp_low');
+    // The length checks run per slot, so a slot update does not wait for
+    // the slot select.
+    final lowAddr = tlpLowerAddress(header);
+    final slotBad = [
+      for (var i = 0; i < readTags; i++)
+        (len13.gt(sRem[i]) | ~bc13.eq(sRem[i]) | ~lowAddr.eq(sExp[i])).named(
+          'cpl_bad_$i',
+        ),
+    ];
     final bad =
         ~tlpHasData(header) |
-        len13.gt(rem) |
-        ~bc13.eq(rem) |
-        ~tlpLowerAddress(header).eq(expLow);
+        [
+          for (var i = 0; i < readTags; i++) match[i] & slotBad[i],
+        ].reduce((a, b) => a | b);
     final cplCode = mux(
       ~tlpCplStatus(header).eq(0),
       Const(codeCompletion, width: 3),
@@ -300,9 +308,17 @@ class HarborPcieDmaTags extends Module {
       ),
     ).named('cpl_code');
     final cplErr = cplHeader & hit & ~cplCode.eq(0);
-    final cplGood = (cplHeader & hit & cplCode.eq(0) & ~abort).named(
-      'cpl_good',
-    );
+    final statusOk =
+        tlpHasData(header) &
+        tlpCplStatus(header).eq(0) &
+        ~tlpPoisoned(header) &
+        cplHeader &
+        ~abort;
+    final slotGood = [
+      for (var i = 0; i < readTags; i++)
+        (statusOk & match[i] & ~slotBad[i]).named('cpl_good_$i'),
+    ];
+    final cplGood = slotGood.reduce((a, b) => a | b).named('cpl_good');
 
     final expired = [
       for (var i = 0; i < readTags; i++)
@@ -477,12 +493,12 @@ class HarborPcieDmaTags extends Module {
               Else([
                 If(sBusy[i] & ~sDone[i], then: [sTimer[i] < sTimer[i] + 1]),
                 If(
-                  cplGood & match[i],
+                  slotGood[i],
                   then: [
                     sRecv[i] < sRecv[i] + len13,
                     sRem[i] < sRem[i] - len13,
                     sExp[i] < sExp[i] + len13.slice(6, 0),
-                    If(completes & rxLast, then: [sDone[i] < 1]),
+                    If(bc13.eq(len13) & rxLast, then: [sDone[i] < 1]),
                   ],
                 ),
                 If(
