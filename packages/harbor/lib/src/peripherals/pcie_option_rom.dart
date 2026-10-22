@@ -263,10 +263,16 @@ class HarborPcieOptionRom extends BridgeModule {
     final w = width;
 
     // Counter strobes: a request starts, a completion ends.
+    // No count while the block is in reset, when the state means nothing.
     final readStart =
-        state.eq(Const(startRead, width: 4)) |
-        state.eq(Const(waitAddress, width: 4)) & rxValid & requestOk & rxLast;
+        ~reset &
+        (state.eq(Const(startRead, width: 4)) |
+            state.eq(Const(waitAddress, width: 4)) &
+                rxValid &
+                requestOk &
+                rxLast);
     final completionEnd =
+        ~reset &
         txReady &
         (state.eq(Const(sendFirst, width: 4)) &
                 remaining.eq(Const(1, width: 11)) |
