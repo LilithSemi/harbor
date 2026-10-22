@@ -224,17 +224,23 @@ void main() {
       );
     });
 
-    test('dual clock display rejects yuv formats and rgb888', () {
+    test('dual clock display rejects rgb888, and planar formats without '
+        'plane inputs', () {
       for (final f in [
         HarborPixelFormat.rgb888,
-        HarborPixelFormat.yuyv,
-        HarborPixelFormat.uyvy,
         HarborPixelFormat.nv12,
         HarborPixelFormat.p010,
         HarborPixelFormat.i420,
       ]) {
         expect(() => _buildDisplay(f), throwsArgumentError, reason: f.name);
       }
+    });
+
+    test('dual clock display takes the one plane yuv formats', () {
+      final yuyv = _buildDisplay(HarborPixelFormat.yuyv);
+      final uyvy = _buildDisplay(HarborPixelFormat.uyvy);
+      expect(yuyv.definitionName, endsWith('_yuyv'));
+      expect(uyvy.definitionName, endsWith('_uyvy'));
     });
   });
 }

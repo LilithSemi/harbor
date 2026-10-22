@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:rohd/rohd.dart';
 
 import '../arith/fpu_config.dart';
@@ -40,6 +42,15 @@ import 'video_timing.dart';
 /// timing generator. The TMDS lanes add the [TmdsEncoder.latency] of the
 /// encoders on top of that; parallelRgb adds none, since [rgb]/[pclk] are the
 /// same registers as [red]/[green]/[blue]/[hsync]/[vsync]/[de].
+///
+/// [formats] is the set of pixel formats the build can scan, [pixelFormat]
+/// alone by default. A set of more than one format, or a format of more
+/// than one plane, makes a planar build (see [HarborDualClockScanout]).
+/// It adds `format_sel` (only for more than one format), and
+/// `plane_base_<n>` and `plane_pitch_<n>` for each plane n after plane 0.
+/// Plane 0 uses [fbBase] and [lineStride]. A plane pitch must be a multiple
+/// of 4 and at least [HarborPixelFormat.lineBytes] of its plane. A planar
+/// build has a [planeUnderrun] output with one bit for each plane.
 class HarborDualClockDisplay extends Module {
   /// Pixel cycles from the timing generator to the parallel outputs: one for
   /// the line buffer read and one for the output register.
@@ -68,6 +79,9 @@ class HarborDualClockDisplay extends Module {
   Logic get pixelWord => output('pixel_word');
   Logic get underrun => output('underrun');
 
+  /// One underrun bit for each plane, present only on a planar build.
+  Logic get planeUnderrun => output('plane_underrun');
+
   /// Scanout port requests (system domain).
   Logic get rqValid => output('rq_valid');
   Logic get rqAddr => output('rq_addr');
@@ -76,8 +90,11 @@ class HarborDualClockDisplay extends Module {
   final HarborDisplayTiming timing;
   final HarborDisplayInterface outputType;
 
-  /// Pixel format read from the framebuffer.
+  /// Pixel format read from the framebuffer, the first of [formats].
   final HarborPixelFormat pixelFormat;
+
+  /// The pixel formats of the build, in `format_sel` order.
+  final List<HarborPixelFormat> formats;
 
   /// Bytes from the start of one line to the start of the next.
   final int lineStride;
@@ -99,28 +116,30 @@ class HarborDualClockDisplay extends Module {
     int? lineStride,
     int burstWords = 16,
     this.outputType = HarborDisplayInterface.hdmi,
-    this.pixelFormat = HarborPixelFormat.xrgb8888,
+    HarborPixelFormat pixelFormat = HarborPixelFormat.xrgb8888,
+    List<HarborPixelFormat>? formats,
+    Logic? formatSel,
+    List<Logic> planeBase = const [],
+    List<Logic> planePitch = const [],
     HarborParallelRgbLatchEdge parallelRgbLatchEdge =
         HarborParallelRgbLatchEdge.falling,
     required HarborDeviceTarget target,
     super.name = 'dual_clock_display',
-  }) : lineStride = lineStride ?? _lineBytes(timing, pixelFormat),
+  }) : formats = List.unmodifiable(formats ?? [pixelFormat]),
+       pixelFormat = (formats ?? [pixelFormat]).first,
+       lineStride = lineStride ?? _lineBytes(timing, formats ?? [pixelFormat]),
        super(
          definitionName:
-             (rqReady != null
-                 ? 'HarborDualClockDisplayPort'
-                       '_s${lineStride ?? _lineBytes(timing, pixelFormat)}'
-                       '_w${_lineBytes(timing, pixelFormat) ~/ 4}'
-                 : harborStableDefinitionName('HarborDualClockDisplay', [
-                     's${lineStride ?? _lineBytes(timing, pixelFormat)}',
-                     'w${_lineBytes(timing, pixelFormat) ~/ 4}',
-                     'ram${target.blockRam?.name ?? "flop"}',
-                     if (memory != null) ...[
-                       'b$burstWords',
-                       'i${memory.config.idWidth}',
-                       'n${memory.config.outstanding}',
-                     ],
-                   ])) +
+             _name(
+               timing: timing,
+               formats: formats ?? [pixelFormat],
+               stride:
+                   lineStride ?? _lineBytes(timing, formats ?? [pixelFormat]),
+               port: rqReady != null,
+               target: target,
+               memory: memory,
+               burstWords: burstWords,
+             ) +
              (outputType == HarborDisplayInterface.parallelRgb
                  ? '_parallelRgb'
                  : ''),
@@ -130,7 +149,7 @@ class HarborDualClockDisplay extends Module {
         (shiftClk == null || shiftReset == null)) {
       throw ArgumentError('a TMDS output needs shiftClk and shiftReset');
     }
-    final lineBytes = _lineBytes(timing, pixelFormat);
+    final lineBytes = _lineBytes(timing, this.formats);
     if (this.lineStride < lineBytes || this.lineStride % 4 != 0) {
       throw ArgumentError.value(
         this.lineStride,
@@ -138,22 +157,19 @@ class HarborDualClockDisplay extends Module {
         'must be a multiple of 4 and at least the line size $lineBytes',
       );
     }
-    if (pixelFormat == HarborPixelFormat.rgb888) {
+    if (this.formats.contains(HarborPixelFormat.rgb888)) {
       throw ArgumentError(
         'rgb888 does not fit the 32-bit scanout word layout.',
       );
     }
-    if (pixelFormat.yuv) {
-      throw ArgumentError(
-        'The scanout does not support the ${pixelFormat.name} YUV format.',
-      );
-    }
-    if (pixelFormat == HarborPixelFormat.rgb565 && timing.hActive.isOdd) {
+    if (this.formats.contains(HarborPixelFormat.rgb565) &&
+        timing.hActive.isOdd) {
       throw ArgumentError(
         'rgb565 needs an even hActive (got ${timing.hActive}).',
       );
     }
-    final rgb565 = pixelFormat == HarborPixelFormat.rgb565;
+    final planar = HarborDualClockScanout.isPlanar(this.formats);
+    final rgb565 = this.pixelFormat == HarborPixelFormat.rgb565;
 
     pixelClk = addInput('pixel_clk', pixelClk);
     pixelReset = addInput('pixel_reset', pixelReset);
@@ -163,6 +179,36 @@ class HarborDualClockDisplay extends Module {
     sysReset = addInput('sys_reset', sysReset);
     enable = addInput('enable', enable);
     fbBase = addInput('fb_base', fbBase, width: 32);
+    final planes = planar
+        ? this.formats.map((f) => f.planes.length).reduce(max)
+        : 1;
+    if (planar) {
+      if ((this.formats.length > 1) != (formatSel != null)) {
+        throw ArgumentError(
+          'give formatSel only when there is more than one format',
+        );
+      }
+      if (planeBase.length != planes - 1 || planePitch.length != planes - 1) {
+        throw ArgumentError(
+          'give planeBase and planePitch for planes 1 to ${planes - 1}',
+        );
+      }
+      if (formatSel != null) {
+        formatSel = addInput(
+          'format_sel',
+          formatSel,
+          width: (this.formats.length - 1).bitLength,
+        );
+      }
+      planeBase = [
+        for (var k = 1; k < planes; k++)
+          addInput('plane_base_$k', planeBase[k - 1], width: 32),
+      ];
+      planePitch = [
+        for (var k = 1; k < planes; k++)
+          addInput('plane_pitch_$k', planePitch[k - 1], width: 32),
+      ];
+    }
     HarborMemoryWaist? localMemory;
     if (memory != null) {
       localMemory = memory.clone()
@@ -227,28 +273,93 @@ class HarborDualClockDisplay extends Module {
 
     // rgb565 packs two pixels in each word. The word is tx >> 1 and the half
     // is tx bit 0.
-    final wordsPerLine = rgb565 ? timing.hActive ~/ 2 : timing.hActive;
-    final scanoutCol = rgb565 ? tx.getRange(1, tx.width) : tx;
+    Logic wordCol(HarborPixelFormat f, int plane) {
+      final shift = _wordShift(f, plane);
+      return shift == 0
+          ? tx
+          : tx.getRange(shift, tx.width).zeroExtend(tx.width);
+    }
 
-    final scanout = HarborDualClockScanout(
-      pixelClk: pixelClk,
-      pixelReset: pixelReset,
-      sysClk: sysClk,
-      sysReset: sysReset,
-      frameStart: frameStart,
-      lineStart: lineStart,
-      col: scanoutCol,
-      fbBase: fbBase,
-      stride: Const(this.lineStride, width: 32),
-      wordsPerLine: Const(wordsPerLine, width: 16),
-      memory: localMemory,
-      rqReady: rqReady,
-      rdValid: rdValid,
-      rdData: rdData,
-      maxWords: wordsPerLine,
-      burstWords: burstWords,
-      blockRam: target.blockRam,
-    );
+    final HarborDualClockScanout scanout;
+    Logic? frameFormat;
+    if (!planar) {
+      final wordsPerLine = HarborDualClockScanout.planeWords(
+        this.pixelFormat,
+        0,
+        timing.hActive,
+      );
+      final shift = _wordShift(this.pixelFormat, 0);
+      final scanoutCol = shift == 0 ? tx : tx.getRange(shift, tx.width);
+      scanout = HarborDualClockScanout(
+        pixelClk: pixelClk,
+        pixelReset: pixelReset,
+        sysClk: sysClk,
+        sysReset: sysReset,
+        frameStart: frameStart,
+        lineStart: lineStart,
+        col: scanoutCol,
+        fbBase: fbBase,
+        stride: Const(this.lineStride, width: 32),
+        wordsPerLine: Const(wordsPerLine, width: 16),
+        memory: localMemory,
+        rqReady: rqReady,
+        rdValid: rdValid,
+        rdData: rdData,
+        maxWords: wordsPerLine,
+        burstWords: burstWords,
+        blockRam: target.blockRam,
+      );
+    } else {
+      // The format of the frame comes from the scanout, so the columns
+      // change with the fetch at frame start.
+      final fmt = this.formats.length > 1
+          ? Logic(name: 'frame_format', width: formatSel!.width)
+          : null;
+      Logic pick(List<Logic> values) {
+        var out = values.last;
+        for (var i = values.length - 2; i >= 0; i--) {
+          out = mux(fmt!.eq(i), values[i], out);
+        }
+        return out;
+      }
+
+      final cols = [
+        for (var k = 0; k < planes; k++)
+          pick([
+            for (final f in this.formats)
+              k < f.planes.length ? wordCol(f, k) : Const(0, width: tx.width),
+          ]).named('plane${k}_col'),
+      ];
+      scanout = HarborDualClockScanout(
+        pixelClk: pixelClk,
+        pixelReset: pixelReset,
+        sysClk: sysClk,
+        sysReset: sysReset,
+        frameStart: frameStart,
+        lineStart: lineStart,
+        col: cols[0],
+        fbBase: fbBase,
+        stride: Const(this.lineStride, width: 32),
+        memory: localMemory,
+        rqReady: rqReady,
+        rdValid: rdValid,
+        rdData: rdData,
+        burstWords: burstWords,
+        blockRam: target.blockRam,
+        formats: this.formats,
+        hActive: timing.hActive,
+        vActive: timing.vActive,
+        formatSel: formatSel,
+        planeBase: planeBase,
+        planePitch: planePitch,
+        planeCol: cols.sublist(1),
+      );
+      if (fmt != null) {
+        fmt <= scanout.format;
+        frameFormat = fmt;
+      }
+      addOutput('plane_underrun', width: planes) <= scanout.planeUnderrun;
+    }
 
     if (scanout.scanoutPort) {
       addOutput('rq_valid') <= scanout.rqValid;
@@ -265,7 +376,20 @@ class HarborDualClockDisplay extends Module {
     Logic r;
     Logic g;
     Logic b;
-    if (rgb565) {
+    final i565 = this.formats.indexOf(HarborPixelFormat.rgb565);
+    if (planar && i565 >= 0) {
+      final halfSel = delay(tx[0], 'half_s1');
+      final half = mux(halfSel, word.getRange(16, 32), word.getRange(0, 16));
+      final r5 = half.getRange(11, 16);
+      final g6 = half.getRange(5, 11);
+      final b5 = half.getRange(0, 5);
+      final is565 = frameFormat == null
+          ? Const(1)
+          : frameFormat.eq(i565).named('is_rgb565');
+      r = mux(is565, [r5, r5.getRange(2, 5)].swizzle(), word.getRange(16, 24));
+      g = mux(is565, [g6, g6.getRange(4, 6)].swizzle(), word.getRange(8, 16));
+      b = mux(is565, [b5, b5.getRange(2, 5)].swizzle(), word.getRange(0, 8));
+    } else if (rgb565) {
       // Column 0 is the low half (bits 15..0), column 1 the high half
       // (bits 31..16): little-endian memory order.
       final halfSel = delay(tx[0], 'half_s1');
@@ -348,6 +472,61 @@ class HarborDualClockDisplay extends Module {
     }
   }
 
-  static int _lineBytes(HarborDisplayTiming t, HarborPixelFormat f) =>
-      f.lineBytes(0, t.hActive);
+  /// The largest plane 0 line in bytes over [formats].
+  static int _lineBytes(HarborDisplayTiming t, List<HarborPixelFormat> fs) =>
+      fs.map((f) => f.lineBytes(0, t.hActive)).reduce(max);
+
+  /// The right shift from a pixel x to its word in [plane] of [f].
+  static int _wordShift(HarborPixelFormat f, int plane) {
+    final p = f.planes[plane];
+    return p.pixelsPerGroup.bitLength - 1 + 2 - (p.bytesPerGroup.bitLength - 1);
+  }
+
+  static String _name({
+    required HarborDisplayTiming timing,
+    required List<HarborPixelFormat> formats,
+    required int stride,
+    required bool port,
+    required HarborDeviceTarget target,
+    required HarborMemoryWaist? memory,
+    required int burstWords,
+  }) {
+    final lineBytes = _lineBytes(timing, formats);
+    final mem = [
+      if (memory != null) ...[
+        'b$burstWords',
+        'i${memory.config.idWidth}',
+        'n${memory.config.outstanding}',
+      ],
+    ];
+    if (HarborDualClockScanout.isPlanar(formats)) {
+      final t = timing;
+      return harborStableDefinitionName(
+        port
+            ? 'HarborDualClockDisplayPlanesPort'
+            : 'HarborDualClockDisplayPlanes',
+        [
+          'f${formats.map(harborPixelFormatBitOrder.indexOf).join('x')}',
+          's$stride',
+          't${t.hActive}_${t.hFrontPorch}_${t.hSyncWidth}_${t.hBackPorch}'
+              '_${t.vActive}_${t.vFrontPorch}_${t.vSyncWidth}_${t.vBackPorch}'
+              '_${t.hSyncPositive ? 1 : 0}${t.vSyncPositive ? 1 : 0}',
+          'ram${target.blockRam?.name ?? "flop"}',
+          ...mem,
+        ],
+      );
+    }
+    // A one plane YUV format reads words like rgb565, so its name has the
+    // format to keep the two apart.
+    final yuv = formats.single.yuv ? '_${formats.single.name}' : '';
+    return (port
+            ? 'HarborDualClockDisplayPort_s${stride}_w${lineBytes ~/ 4}'
+            : harborStableDefinitionName('HarborDualClockDisplay', [
+                's$stride',
+                'w${lineBytes ~/ 4}',
+                'ram${target.blockRam?.name ?? "flop"}',
+                ...mem,
+              ])) +
+        yuv;
+  }
 }
