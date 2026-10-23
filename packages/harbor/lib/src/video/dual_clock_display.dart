@@ -12,6 +12,7 @@ import 'display_output.dart';
 import 'dual_clock_scanout.dart';
 import 'dvi_transmitter.dart';
 import 'parallel_rgb_output.dart';
+import 'pixel_unpack.dart';
 import 'tmds_encoder.dart';
 import 'video_timing.dart';
 
@@ -55,10 +56,17 @@ import 'video_timing.dart';
 /// [planeUnderrun] output with one bit for each plane and a
 /// `plane_underrun_count_<n>` output for each plane, see
 /// [HarborDualClockScanout.planeUnderrunCount].
+///
+/// A build with a YUV format unpacks the plane words with [unpack]. For a
+/// YUV frame, [red], [green] and [blue] show Y as grey.
 class HarborDualClockDisplay extends Module {
   /// Pixel cycles from the timing generator to the parallel outputs: one for
-  /// the line buffer read and one for the output register.
-  static const pipelineDelay = 2;
+  /// the line buffer read and one for the output register. A build with a
+  /// YUV format adds the stages of [HarborPixelUnpack] after the read.
+  final int pipelineDelay;
+
+  /// The unpack of a build with a YUV format, null for an RGB build.
+  late final HarborPixelUnpack? unpack;
 
   /// Four serialized TMDS lanes, present only for dvi/hdmi.
   Logic get gpdi => output('gpdi');
@@ -80,6 +88,9 @@ class HarborDualClockDisplay extends Module {
   Logic get blue => output('blue');
   Logic get x => output('x');
   Logic get y => output('y');
+
+  /// The plane 0 word read for the pixel. On a yuyv or uyvy frame, an odd
+  /// pixel shows the word of the next pixel.
   Logic get pixelWord => output('pixel_word');
   Logic get underrun => output('underrun');
 
@@ -133,6 +144,9 @@ class HarborDualClockDisplay extends Module {
     super.name = 'dual_clock_display',
   }) : formats = List.unmodifiable(formats ?? [pixelFormat]),
        pixelFormat = (formats ?? [pixelFormat]).first,
+       pipelineDelay = (formats ?? [pixelFormat]).any((f) => f.yuv)
+           ? HarborPixelUnpack.latency + 1
+           : 2,
        lineStride = lineStride ?? _lineBytes(timing, formats ?? [pixelFormat]),
        super(
          definitionName:
@@ -293,6 +307,27 @@ class HarborDualClockDisplay extends Module {
           : tx.getRange(shift, tx.width).zeroExtend(tx.width);
     }
 
+    // The format of the frame comes from the scanout, so the columns
+    // change with the fetch at frame start.
+    final fmt = planar && this.formats.length > 1
+        ? Logic(name: 'frame_format', width: formatSel!.width)
+        : null;
+    final planeWord = [
+      for (var k = 0; k < planes; k++) Logic(name: 'plane${k}_word', width: 32),
+    ];
+    final unpack = this.formats.any((f) => f.yuv)
+        ? HarborPixelUnpack(
+            clk: pixelClk,
+            reset: pixelReset,
+            x: tx,
+            format: fmt,
+            planeData: planeWord,
+            formats: this.formats,
+            hActive: timing.hActive,
+          )
+        : null;
+    this.unpack = unpack;
+
     final HarborDualClockScanout scanout;
     Logic? frameFormat;
     if (!planar) {
@@ -302,7 +337,11 @@ class HarborDualClockDisplay extends Module {
         timing.hActive,
       );
       final shift = _wordShift(this.pixelFormat, 0);
-      final scanoutCol = shift == 0 ? tx : tx.getRange(shift, tx.width);
+      final scanoutCol = unpack != null
+          ? unpack.planeCol(0).getRange(0, tx.width - shift)
+          : shift == 0
+          ? tx
+          : tx.getRange(shift, tx.width);
       scanout = HarborDualClockScanout(
         pixelClk: pixelClk,
         pixelReset: pixelReset,
@@ -323,11 +362,6 @@ class HarborDualClockDisplay extends Module {
         blockRam: target.blockRam,
       );
     } else {
-      // The format of the frame comes from the scanout, so the columns
-      // change with the fetch at frame start.
-      final fmt = this.formats.length > 1
-          ? Logic(name: 'frame_format', width: formatSel!.width)
-          : null;
       Logic pick(List<Logic> values) {
         var out = values.last;
         for (var i = values.length - 2; i >= 0; i--) {
@@ -338,10 +372,15 @@ class HarborDualClockDisplay extends Module {
 
       final cols = [
         for (var k = 0; k < planes; k++)
-          pick([
-            for (final f in this.formats)
-              k < f.planes.length ? wordCol(f, k) : Const(0, width: tx.width),
-          ]).named('plane${k}_col'),
+          (unpack != null
+                  ? unpack.planeCol(k)
+                  : pick([
+                      for (final f in this.formats)
+                        k < f.planes.length
+                            ? wordCol(f, k)
+                            : Const(0, width: tx.width),
+                    ]))
+              .named('plane${k}_col'),
       ];
       scanout = HarborDualClockScanout(
         pixelClk: pixelClk,
@@ -384,17 +423,37 @@ class HarborDualClockDisplay extends Module {
       addOutput('rq_words', width: scanout.rqWords.width) <= scanout.rqWords;
     }
     underrun <= scanout.underrun;
+    if (unpack != null) {
+      for (var k = 0; k < planes; k++) {
+        planeWord[k] <= scanout.planeData(k);
+      }
+    }
 
     // The line buffer read is registered, so the word comes one cycle after
     // tx. Stage 1 delays the timing signals to match it.
     final word = scanout.pixel;
     final de1 = delay(deActive, 'de_s1');
+    final last = pipelineDelay;
+    var deLast = de1;
 
     Logic r;
     Logic g;
     Logic b;
     final i565 = this.formats.indexOf(HarborPixelFormat.rgb565);
-    if (planar && i565 >= 0) {
+    if (unpack != null) {
+      for (var s = 2; s < last; s++) {
+        deLast = delay(deLast, 'de_s$s');
+      }
+      // Grey from Y until a color conversion takes Y, Cb and Cr.
+      final grey = unpack.y.getRange(2, 10);
+      if (this.formats.every((f) => f.yuv)) {
+        r = g = b = grey;
+      } else {
+        r = mux(unpack.yuv, grey, unpack.red);
+        g = mux(unpack.yuv, grey, unpack.green);
+        b = mux(unpack.yuv, grey, unpack.blue);
+      }
+    } else if (planar && i565 >= 0) {
       final halfSel = delay(tx[0], 'half_s1');
       final half = mux(halfSel, word.getRange(16, 32), word.getRange(0, 16));
       final r5 = half.getRange(11, 16);
@@ -425,8 +484,8 @@ class HarborDualClockDisplay extends Module {
     }
     final zero = Const(0, width: 8);
 
-    // Stage 2 registers every parallel output.
-    final de2 = delay(de1, 'de_s2');
+    // The last stage registers every parallel output.
+    final de2 = delay(deLast, 'de_s$last');
     // On a parallelRgb pin the sync flops reset to the idle level of the
     // mode's polarity. The TMDS path keeps its reset at 0.
     Logic syncDelay(Logic v, String name, bool positive) =>
@@ -434,28 +493,39 @@ class HarborDualClockDisplay extends Module {
         ? flop(pixelClk, v, reset: pixelReset, resetValue: 1).named(name)
         : delay(v, name);
     final hp = timing.hSyncPositive, vp = timing.vSyncPositive;
-    final hsync2 = syncDelay(
-      syncDelay(timingGen.hsync, 'hsync_s1', hp),
-      'hsync_s2',
-      hp,
+    Logic chain(Logic v, String name, Logic Function(Logic, String) step) {
+      for (var s = 1; s <= last; s++) {
+        v = step(v, '${name}_s$s');
+      }
+      return v;
+    }
+
+    final hsync2 = chain(
+      timingGen.hsync,
+      'hsync',
+      (v, n) => syncDelay(v, n, hp),
     );
-    final vsync2 = syncDelay(
-      syncDelay(timingGen.vsync, 'vsync_s1', vp),
-      'vsync_s2',
-      vp,
+    final vsync2 = chain(
+      timingGen.vsync,
+      'vsync',
+      (v, n) => syncDelay(v, n, vp),
     );
-    final r2 = delay(mux(de1, r, zero), 'red_s2');
-    final g2 = delay(mux(de1, g, zero), 'green_s2');
-    final b2 = delay(mux(de1, b, zero), 'blue_s2');
+    final r2 = delay(mux(deLast, r, zero), 'red_s$last');
+    final g2 = delay(mux(deLast, g, zero), 'green_s$last');
+    final b2 = delay(mux(deLast, b, zero), 'blue_s$last');
     red <= r2;
     green <= g2;
     blue <= b2;
     de <= de2;
     hsync <= hsync2;
     vsync <= vsync2;
-    x <= delay(delay(tx, 'x_s1'), 'x_s2');
-    y <= delay(delay(ty, 'y_s1'), 'y_s2');
-    pixelWord <= delay(word, 'pixel_word_s2');
+    x <= chain(tx, 'x', delay);
+    y <= chain(ty, 'y', delay);
+    var wordLast = word;
+    for (var s = 2; s <= last; s++) {
+      wordLast = delay(wordLast, 'pixel_word_s$s');
+    }
+    pixelWord <= wordLast;
 
     if (parallelRgb) {
       // No TMDS encoder or serializer, and no shift clock: rgb/hsync/vsync/de
