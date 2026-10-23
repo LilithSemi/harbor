@@ -1816,3 +1816,66 @@ CLKDIVF #(.DIV("2.0")) ${instanceName}_clkdiv (
 $dllaBlock''';
   }
 }
+
+/// ECP5 MULT18X18D: 18x18 multiplier with input and output registers.
+///
+/// The A, B and output registers use CLK0, CE0 and RST0, so the product of
+/// the A and B of one edge comes 2 edges later. Yosys does not move fabric
+/// registers into this cell, so a design that wants the registers in the
+/// DSP uses this cell. [signedA] and [signedB] select a two's complement
+/// operand. The sim body follows the cell with REG_PIPELINE off.
+class Ecp5Mult18x18d extends BridgeModule {
+  /// The 36-bit product.
+  Logic get p => [for (var i = 35; i >= 0; i--) output('P$i')].swizzle();
+
+  Ecp5Mult18x18d({
+    required Logic clk,
+    required Logic a,
+    required Logic b,
+    Logic? ce,
+    Logic? rst,
+    bool signedA = true,
+    bool signedB = true,
+    super.name = 'mult18x18d',
+  }) : super('MULT18X18D', isSystemVerilogLeaf: true) {
+    if (a.width > 18 || b.width > 18) {
+      throw ArgumentError('MULT18X18D operands are at most 18 bits');
+    }
+    for (final key in ['REG_INPUTA_CLK', 'REG_INPUTB_CLK', 'REG_OUTPUT_CLK']) {
+      createParameter(key, '"CLK0"');
+    }
+    Logic ext(Logic v, bool signed, [int width = 18]) =>
+        signed ? v.signExtend(width) : v.zeroExtend(width);
+    final aw = ext(a, signedA);
+    final bw = ext(b, signedB);
+    for (var i = 0; i < 18; i++) {
+      addInput('A$i', aw[i]);
+    }
+    for (var i = 0; i < 18; i++) {
+      addInput('B$i', bw[i]);
+    }
+    for (var i = 0; i < 18; i++) {
+      addInput('C$i', Const(0));
+    }
+    addInput('SIGNEDA', Const(signedA ? 1 : 0));
+    addInput('SIGNEDB', Const(signedB ? 1 : 0));
+    addInput('SOURCEA', Const(0));
+    addInput('SOURCEB', Const(0));
+    addInput('CLK0', clk);
+    addInput('CE0', ce ?? Const(1));
+    addInput('RST0', rst ?? Const(0));
+    for (var i = 0; i < 36; i++) {
+      addOutput('P$i');
+    }
+
+    // sim-only: the emitted SV has only the ports.
+    final clk0 = input('CLK0');
+    Logic reg(Logic v) => flop(clk0, v, en: input('CE0'), reset: input('RST0'));
+    final ar = reg([for (var i = 17; i >= 0; i--) input('A$i')].swizzle());
+    final br = reg([for (var i = 17; i >= 0; i--) input('B$i')].swizzle());
+    final pr = reg(ext(ar, signedA, 36) * ext(br, signedB, 36));
+    for (var i = 0; i < 36; i++) {
+      output('P$i') <= pr[i];
+    }
+  }
+}
