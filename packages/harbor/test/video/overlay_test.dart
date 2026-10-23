@@ -49,7 +49,8 @@ int _byte(int a) => (_word(a & ~3) >> (8 * (a & 3))) & 0xff;
 /// its frame start has latency l when `slow[i]` is (n, l). Then the first
 /// [lateRows] rows of that frame are not checked, and neither are its
 /// requests. The underrun counts named in [late] must be more than 0, and
-/// the others 0.
+/// the others 0. With [surfaceWidth], no overlay request may go past the
+/// end of a surface line of that many pixels.
 Future<void> _run({
   required HarborPixelFormat primary,
   required List<HarborPixelFormat> overlay,
@@ -59,6 +60,7 @@ Future<void> _run({
   Map<int, (int, int)> slow = const {},
   int lateRows = 2,
   Set<String> late = const {},
+  int? surfaceWidth,
 }) async {
   final ovCsc = csc ?? HarborCscCoefficients.bt601Limited;
   final pixelClk = SimpleClockGenerator(20).clk;
@@ -264,6 +266,22 @@ Future<void> _run({
       }
     }
     final s = stateOf(f);
+    if (surfaceWidth != null) {
+      final format = overlay[s.format];
+      for (final (a, beats) in mem.requests.sublist(
+        firstRequest[f]!,
+        firstRequest[f + 1]!,
+      )) {
+        if (a < _overlay.base[0]) continue;
+        final k = _overlay.base.lastIndexWhere((b) => b <= a);
+        final end = (a - _overlay.base[k]) % _overlay.pitch[k] + 4 * beats;
+        expect(
+          end,
+          lessThanOrEqualTo(format.lineBytes(k, surfaceWidth)),
+          reason: 'frame $f plane $k request at $a $s',
+        );
+      }
+    }
     final fetches = overlayFetches(
       hActive: _timing.hActive,
       vActive: _timing.vActive,
@@ -469,6 +487,51 @@ void main() {
           width: 16,
           height: 8,
           alpha: 254,
+        ),
+      ],
+    );
+  });
+
+  // The crop ends at the right edge of a surface of 16 pixels, on the
+  // screen, so no plane fetches the word after the line.
+  test('a crop to the full surface width fetches no word past the line', () {
+    return _run(
+      primary: HarborPixelFormat.xrgb8888,
+      overlay: const [
+        HarborPixelFormat.nv12,
+        HarborPixelFormat.yuyv,
+        HarborPixelFormat.i420,
+        HarborPixelFormat.p010,
+      ],
+      surfaceWidth: 16,
+      states: const [
+        OverlayFrame(dstX: 0, dstY: 0, width: 16, height: 8),
+        OverlayFrame(
+          format: 1,
+          dstX: 0,
+          dstY: 0,
+          width: 16,
+          height: 8,
+          alpha: 128,
+        ),
+        OverlayFrame(
+          format: 2,
+          srcX: 6,
+          srcY: 2,
+          dstX: 0,
+          dstY: 1,
+          width: 10,
+          height: 5,
+        ),
+        OverlayFrame(format: 3, dstX: 0, dstY: 2, width: 16, height: 4),
+        OverlayFrame(
+          format: 1,
+          srcX: 4,
+          dstX: 4,
+          dstY: 2,
+          width: 12,
+          height: 3,
+          alpha: 200,
         ),
       ],
     );

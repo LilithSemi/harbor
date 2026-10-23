@@ -174,8 +174,14 @@ List<(int, int)> overlayFetches({
   final visible = s.width < hActive - s.dstX ? s.width : hActive - s.dstX;
   final out = <(int, int)>[];
   for (var k = 0; k < format.planes.length; k++) {
-    final sh = HarborScanoutOverlay.wordShift(format, k);
-    final ahead = HarborScanoutOverlay.lookahead(format, k) ? 1 : 0;
+    final p = format.planes[k];
+    // Pixels in a 32-bit word, as a shift.
+    final sh = (4 * p.pixelsPerGroup ~/ p.bytesPerGroup).bitLength - 1;
+    // A plane with a chroma sample for two pixels gives an odd pixel the
+    // mean with the next sample. If the screen edge clips the crop, the
+    // fetch takes one more pixel for it. At the right edge of the crop the
+    // unpack does not use the next sample.
+    final ahead = p.pixelsPerGroup > 1 && visible < s.width ? 1 : 0;
     final first = sx0 >> sh;
     final words = ((sx0 + visible - 1 + ahead) >> sh) - first + 1;
     final step = k == 0 ? 1 : 2;

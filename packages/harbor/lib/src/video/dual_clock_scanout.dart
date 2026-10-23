@@ -136,7 +136,7 @@ class HarborScanoutOverlay {
 /// planes, because they have two line times. An overlay
 /// plane line holds only the words from the word of the first source pixel
 /// to the word of the last visible source pixel, plus one word when the
-/// plane reads one pixel ahead. The scanout fetches overlay lines only for
+/// plane reads one pixel ahead and the screen edge clips the crop. The scanout fetches overlay lines only for
 /// the screen lines in the overlay. Overlay line r (source line
 /// `src_y + r`) is in buffer `r & 1`, and overlay chroma line c in buffer
 /// `c & 1`. Overlay line 0 goes with primary line 1 at frame start, when
@@ -1489,23 +1489,24 @@ class HarborDualClockScanout extends Module {
           reset: pixelReset,
         );
     final srcXe = srcX.zeroExtend(ew);
+    final clipped = wVis.lt(w1);
     final startByte = <Logic>[];
     for (var j = 0; j < n; j++) {
       // The last source pixel to fetch: the last visible one, or the one
-      // after it for a plane that reads one pixel ahead.
+      // after it for a plane that reads one pixel ahead when the screen
+      // clips the crop. At the right edge of the crop, the unpack uses the
+      // word before for an odd pixel.
+      final ahead =
+          flag(
+            fmt,
+            (f) => j < f.planes.length && HarborScanoutOverlay.lookahead(f, j),
+          ) &
+          clipped;
       final last = flop(
         pixelClk,
         srcXe +
             wVis.zeroExtend(ew) -
-            pick(
-              fmt,
-              (f) => Const(
-                j < f.planes.length && HarborScanoutOverlay.lookahead(f, j)
-                    ? 0
-                    : 1,
-                width: ew,
-              ),
-            ),
+            mux(ahead, Const(0, width: ew), Const(1, width: ew)),
         reset: pixelReset,
       ).named('ov${j}_last_pixel');
       final count = pick(fmt, (f) {
