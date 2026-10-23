@@ -46,11 +46,15 @@ import 'video_timing.dart';
 /// [formats] is the set of pixel formats the build can scan, [pixelFormat]
 /// alone by default. A set of more than one format, or a format of more
 /// than one plane, makes a planar build (see [HarborDualClockScanout]).
-/// It adds `format_sel` (only for more than one format), and
-/// `plane_base_<n>` and `plane_pitch_<n>` for each plane n after plane 0.
-/// Plane 0 uses [fbBase] and [lineStride]. A plane pitch must be a multiple
-/// of 4 and at least [HarborPixelFormat.lineBytes] of its plane. A planar
-/// build has a [planeUnderrun] output with one bit for each plane.
+/// It adds `format_sel` (only for more than one format), `plane_pitch_<n>`
+/// ([planePitch]) for each plane, and `plane_base_<n>` ([planeBase]) for
+/// each plane after plane 0. Plane 0 starts at [fbBase]. A plane pitch
+/// must be a multiple of 4 and at least [HarborPixelFormat.lineBytes] of
+/// its plane. A scanout port ignores the low 2 bits of each base and
+/// pitch. A planar build has no [lineStride] input. It has a
+/// [planeUnderrun] output with one bit for each plane and a
+/// `plane_underrun_count_<n>` output for each plane, see
+/// [HarborDualClockScanout.planeUnderrunCount].
 class HarborDualClockDisplay extends Module {
   /// Pixel cycles from the timing generator to the parallel outputs: one for
   /// the line buffer read and one for the output register.
@@ -96,7 +100,9 @@ class HarborDualClockDisplay extends Module {
   /// The pixel formats of the build, in `format_sel` order.
   final List<HarborPixelFormat> formats;
 
-  /// Bytes from the start of one line to the start of the next.
+  /// Bytes from the start of one line to the start of the next. On a
+  /// planar build, where `plane_pitch_0` gives the pitch, the largest plane
+  /// 0 line.
   final int lineStride;
 
   HarborDualClockDisplay({
@@ -150,6 +156,13 @@ class HarborDualClockDisplay extends Module {
       throw ArgumentError('a TMDS output needs shiftClk and shiftReset');
     }
     final lineBytes = _lineBytes(timing, this.formats);
+    final planar = HarborDualClockScanout.isPlanar(this.formats);
+    if (planar && lineStride != null) {
+      throw ArgumentError(
+        'a planar build takes the plane 0 pitch from plane_pitch_0, '
+        'not lineStride',
+      );
+    }
     if (this.lineStride < lineBytes || this.lineStride % 4 != 0) {
       throw ArgumentError.value(
         this.lineStride,
@@ -168,7 +181,6 @@ class HarborDualClockDisplay extends Module {
         'rgb565 needs an even hActive (got ${timing.hActive}).',
       );
     }
-    final planar = HarborDualClockScanout.isPlanar(this.formats);
     final rgb565 = this.pixelFormat == HarborPixelFormat.rgb565;
 
     pixelClk = addInput('pixel_clk', pixelClk);
@@ -188,9 +200,10 @@ class HarborDualClockDisplay extends Module {
           'give formatSel only when there is more than one format',
         );
       }
-      if (planeBase.length != planes - 1 || planePitch.length != planes - 1) {
+      if (planeBase.length != planes - 1 || planePitch.length != planes) {
         throw ArgumentError(
-          'give planeBase and planePitch for planes 1 to ${planes - 1}',
+          'give planeBase for planes 1 to ${planes - 1} and planePitch for '
+          'planes 0 to ${planes - 1}',
         );
       }
       if (formatSel != null) {
@@ -205,8 +218,8 @@ class HarborDualClockDisplay extends Module {
           addInput('plane_base_$k', planeBase[k - 1], width: 32),
       ];
       planePitch = [
-        for (var k = 1; k < planes; k++)
-          addInput('plane_pitch_$k', planePitch[k - 1], width: 32),
+        for (var k = 0; k < planes; k++)
+          addInput('plane_pitch_$k', planePitch[k], width: 32),
       ];
     }
     HarborMemoryWaist? localMemory;
@@ -339,7 +352,7 @@ class HarborDualClockDisplay extends Module {
         lineStart: lineStart,
         col: cols[0],
         fbBase: fbBase,
-        stride: Const(this.lineStride, width: 32),
+        stride: planePitch[0],
         memory: localMemory,
         rqReady: rqReady,
         rdValid: rdValid,
@@ -351,7 +364,7 @@ class HarborDualClockDisplay extends Module {
         vActive: timing.vActive,
         formatSel: formatSel,
         planeBase: planeBase,
-        planePitch: planePitch,
+        planePitch: planePitch.sublist(1),
         planeCol: cols.sublist(1),
       );
       if (fmt != null) {
@@ -359,6 +372,10 @@ class HarborDualClockDisplay extends Module {
         frameFormat = fmt;
       }
       addOutput('plane_underrun', width: planes) <= scanout.planeUnderrun;
+      for (var k = 0; k < planes; k++) {
+        addOutput('plane_underrun_count_$k', width: 16) <=
+            scanout.planeUnderrunCount(k);
+      }
     }
 
     if (scanout.scanoutPort) {
@@ -507,7 +524,6 @@ class HarborDualClockDisplay extends Module {
             : 'HarborDualClockDisplayPlanes',
         [
           'f${formats.map(harborPixelFormatBitOrder.indexOf).join('x')}',
-          's$stride',
           't${t.hActive}_${t.hFrontPorch}_${t.hSyncWidth}_${t.hBackPorch}'
               '_${t.vActive}_${t.vFrontPorch}_${t.vSyncWidth}_${t.vBackPorch}'
               '_${t.hSyncPositive ? 1 : 0}${t.vSyncPositive ? 1 : 0}',
