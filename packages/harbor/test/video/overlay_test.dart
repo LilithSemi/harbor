@@ -42,13 +42,14 @@ int _byte(int a) => (_word(a & ~3) >> (8 * (a & 3))) & 0xff;
 /// Runs one frame for each of [states] on a display with the primary
 /// format [primary] and the overlay set [overlay], after two frames that
 /// prime it. The test sets the overlay inputs for frame f + 1 at pixel
-/// (1, 0) of frame f. Every active pixel must match [overlayFrame], and
+/// [setAt] of frame f. Every active pixel must match [overlayFrame], and
 /// the overlay requests of each frame must be [overlayFetches].
 Future<void> _run({
   required HarborPixelFormat primary,
   required List<HarborPixelFormat> overlay,
   required List<OverlayFrame> states,
   HarborCscCoefficients? csc,
+  (int, int) setAt = (1, 0),
 }) async {
   final ovCsc = csc ?? HarborCscCoefficients.bt601Limited;
   final pixelClk = SimpleClockGenerator(20).clk;
@@ -197,7 +198,7 @@ Future<void> _run({
       firstRequest[frame + 1] = mem.requests.length;
     }
     history.add(frame);
-    if (gx == 1 && gy == 0 && frame >= 0) set(stateOf(frame + 1));
+    if ((gx, gy) == setAt && frame >= 0) set(stateOf(frame + 1));
     if (history.length <= delay) continue;
     final f = history[history.length - 1 - delay];
     if (f < 2 || f >= frames || disp.de.value.toInt() != 1) continue;
@@ -427,6 +428,157 @@ void main() {
           alpha: 254,
         ),
       ],
+    );
+  });
+
+  // Each state changes in the middle of the frame before it.
+  test('an overlay change takes effect at the next frame start', () {
+    return _run(
+      primary: HarborPixelFormat.xrgb8888,
+      overlay: const [HarborPixelFormat.nv12, HarborPixelFormat.rgb565],
+      setAt: (9, 4),
+      states: const [
+        OverlayFrame(srcX: 2, dstX: 1, dstY: 1, width: 9, height: 6),
+        OverlayFrame(
+          format: 1,
+          srcX: 5,
+          srcY: 3,
+          dstX: 6,
+          dstY: 3,
+          width: 7,
+          height: 4,
+          alpha: 99,
+        ),
+        OverlayFrame(enable: false, dstX: 0, dstY: 0, width: 16, height: 8),
+        OverlayFrame(
+          srcX: 4,
+          srcY: 4,
+          dstX: 0,
+          dstY: 0,
+          width: 16,
+          height: 8,
+          alpha: 180,
+        ),
+      ],
+    );
+  });
+
+  HarborDualClockDisplay build(
+    HarborPixelFormat primary, {
+    List<HarborPixelFormat>? overlay,
+    HarborDisplayTiming timing = _timing,
+  }) {
+    final n = overlay
+        ?.map((f) => f.planes.length)
+        .reduce((a, b) => a > b ? a : b);
+    final planar = primary.planes.length > 1;
+    return HarborDualClockDisplay(
+      target: const HarborSimTarget(),
+      timing: timing,
+      pixelClk: Logic(),
+      pixelReset: Logic(),
+      sysClk: Logic(),
+      sysReset: Logic(),
+      enable: Logic(),
+      fbBase: Logic(width: 32),
+      memory: HarborMemoryWaist(_memConfig),
+      outputType: HarborDisplayInterface.parallelRgb,
+      pixelFormat: primary,
+      planeBase: planar ? [Logic(width: 32)] : const [],
+      planePitch: planar ? [Logic(width: 32), Logic(width: 32)] : const [],
+      overlayFormats: overlay,
+      overlayEnable: overlay == null ? null : Logic(),
+      overlayFormatSel: (overlay?.length ?? 0) > 1 ? Logic(width: 1) : null,
+      overlayBase: [for (var j = 0; j < (n ?? 0); j++) Logic(width: 32)],
+      overlayPitch: [for (var j = 0; j < (n ?? 0); j++) Logic(width: 32)],
+      overlaySrcX: overlay == null ? null : Logic(width: 5),
+      overlaySrcY: overlay == null ? null : Logic(width: 4),
+      overlayDstX: overlay == null ? null : Logic(width: 5),
+      overlayDstY: overlay == null ? null : Logic(width: 4),
+      overlayWidth: overlay == null ? null : Logic(width: 5),
+      overlayHeight: overlay == null ? null : Logic(width: 4),
+      overlayAlpha: overlay == null ? null : Logic(width: 8),
+    );
+  }
+
+  test('a build without an overlay has no overlay ports or logic', () async {
+    for (final f in [HarborPixelFormat.xrgb8888, HarborPixelFormat.nv12]) {
+      final d = build(f);
+      await d.build();
+      final ports = [...d.inputs.keys, ...d.outputs.keys];
+      expect(ports.where((p) => p.contains('overlay')), isEmpty);
+      expect(d.blend, isNull);
+      expect(d.overlayUnpack, isNull);
+      expect(d.pipelineDelay, f.yuv ? 9 : 2);
+      expect(d.generateSynth(), isNot(contains('overlay')));
+    }
+  });
+
+  test('an overlay build has the overlay ports and its own name', () async {
+    const nv12 = HarborPixelFormat.nv12;
+    const xrgb = HarborPixelFormat.xrgb8888;
+    final cases = [
+      (xrgb, [xrgb], 7),
+      (xrgb, [nv12], 12),
+      (nv12, [xrgb], 12),
+      (nv12, [nv12, xrgb], 12),
+    ];
+    final names = <String>{};
+    for (final (p, o, delay) in cases) {
+      final d = build(p, overlay: o);
+      await d.build();
+      expect(d.pipelineDelay, delay, reason: '${p.name} $o');
+      names.add(d.definitionName);
+      final n = o.map((f) => f.planes.length).reduce((a, b) => a > b ? a : b);
+      final ins = {for (final e in d.inputs.entries) e.key: e.value.width};
+      final outs = {for (final e in d.outputs.entries) e.key: e.value.width};
+      expect(ins, containsPair('overlay_enable', 1));
+      expect(ins, containsPair('overlay_alpha', 8));
+      for (final x in ['src_x', 'dst_x', 'width']) {
+        expect(ins, containsPair('overlay_$x', 5));
+      }
+      for (final y in ['src_y', 'dst_y', 'height']) {
+        expect(ins, containsPair('overlay_$y', 4));
+      }
+      for (var j = 0; j < n; j++) {
+        expect(ins, containsPair('overlay_base_$j', 32));
+        expect(ins, containsPair('overlay_pitch_$j', 32));
+        expect(outs, containsPair('overlay_underrun_count_$j', 16));
+      }
+      expect(outs, containsPair('overlay_underrun', n));
+      expect(outs, containsPair('plane_underrun_count_0', 16));
+      expect(ins.containsKey('overlay_format_sel'), o.length > 1);
+      expect(ins.containsKey('overlay_csc_coeff_8'), o.any((f) => f.yuv));
+      expect(d.overlayCsc == null, !o.any((f) => f.yuv));
+    }
+    expect(names, hasLength(cases.length));
+  });
+
+  test('a YUV overlay needs 2 clocks of horizontal blank', () {
+    HarborDisplayTiming blank(int n) => HarborDisplayTiming(
+      hActive: 16,
+      hFrontPorch: n,
+      hSyncWidth: 0,
+      hBackPorch: 0,
+      vActive: 8,
+      vFrontPorch: 1,
+      vSyncWidth: 1,
+      vBackPorch: 1,
+      pixelClock: 1000000,
+    );
+    const nv12 = HarborPixelFormat.nv12;
+    const xrgb = HarborPixelFormat.xrgb8888;
+    expect(
+      () => build(xrgb, overlay: [nv12], timing: blank(1)),
+      throwsArgumentError,
+    );
+    expect(
+      () => build(xrgb, overlay: [nv12], timing: blank(2)),
+      returnsNormally,
+    );
+    expect(
+      () => build(xrgb, overlay: [xrgb], timing: blank(0)),
+      returnsNormally,
     );
   });
 }
