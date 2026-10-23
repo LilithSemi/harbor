@@ -190,6 +190,24 @@ class HarborGtpPcieTimeouts {
   ];
 }
 
+/// Checks a PIPE pipeline stage count.
+void harborCheckPipeStages(int pipeStages) {
+  if (pipeStages < 0 || pipeStages > 2) {
+    throw ArgumentError.value(pipeStages, 'pipeStages', 'must be 0, 1 or 2');
+  }
+}
+
+/// Puts [stages] registers on [d], with no reset.
+Logic _pipeDelay(Logic clk, Logic d, int stages, String name) {
+  var q = d;
+  for (var i = 0; i < stages; i++) {
+    final r = Logic(name: '${name}_stage$i', width: d.width);
+    Sequential(clk, [r < q]);
+    q = r;
+  }
+  return q;
+}
+
 /// The GTP side and the PIPE side of one PCIe lane.
 ///
 /// All GT status signals go through two flop synchronisers to `pclk`. The
@@ -198,7 +216,13 @@ class HarborGtpPcieTimeouts {
 /// for 16 cycles, and only while [linkUp] is high. PHYSTATUS is high while
 /// [linkUp] is low. During a rate change [rateIdle] is low and only the
 /// [rateDone] pulse goes out as PHYSTATUS.
+///
+/// Each PIPE signal gets [pipeStages] registers between the GT and the PIPE
+/// side, in the two directions. The lane logic sees the GT side.
 class HarborGtpPcieLane extends Module {
+  /// Registers on each PIPE signal, 0 to 2.
+  final int pipeStages;
+
   /// Synchronised TXRESETDONE.
   Logic get txResetDone => output('tx_resetdone');
 
@@ -250,8 +274,14 @@ class HarborGtpPcieLane extends Module {
     required Logic drpDataIn,
     required Logic drpEnable,
     required Logic drpWrite,
+    this.pipeStages = 0,
     super.name = 'gtp_pcie_lane',
-  }) : super(definitionName: 'HarborGtpPcieLane') {
+  }) : super(
+         definitionName: pipeStages == 0
+             ? 'HarborGtpPcieLane'
+             : 'HarborGtpPcieLane_Pipe$pipeStages',
+       ) {
+    harborCheckPipeStages(pipeStages);
     final g = HarborGtpChannelPorts()
       ..pairConnectIO(this, gt, PairRole.consumer);
     final p = HarborPciePipeLane()
@@ -273,6 +303,7 @@ class HarborGtpPcieLane extends Module {
     drpDataIn = addInput('drp_data_in', drpDataIn, width: 16);
     drpEnable = addInput('drp_enable', drpEnable);
     drpWrite = addInput('drp_write', drpWrite);
+    Logic stage(Logic d, String name) => _pipeDelay(pclk, d, pipeStages, name);
 
     Logic sync(String port, String name) {
       final s = HarborCdcSync(name: '${name}_sync');
@@ -312,19 +343,21 @@ class HarborGtpPcieLane extends Module {
     g.port('TXDLYEN') <= txDlyEn;
     g.port('RXSYNCIN') <= g.port('RXSYNCOUT');
 
-    g.port('TXDATA') <= p.txData.zeroExtend(32);
-    g.port('TXCHARISK') <= p.txDataK.zeroExtend(4);
-    g.port('TXCHARDISPMODE') <= p.txCompliance.zeroExtend(4);
-    g.port('TXDETECTRX') <= p.txDetectRx;
-    g.port('TXELECIDLE') <= p.txElecIdle;
-    g.port('RXPOLARITY') <= p.rxPolarity;
-    g.port('TXPD') <= p.powerDown;
-    g.port('RXPD') <= p.powerDown;
+    g.port('TXDATA') <= stage(p.txData, 'txdata').zeroExtend(32);
+    g.port('TXCHARISK') <= stage(p.txDataK, 'txdatak').zeroExtend(4);
+    g.port('TXCHARDISPMODE') <=
+        stage(p.txCompliance, 'txcompliance').zeroExtend(4);
+    g.port('TXDETECTRX') <= stage(p.txDetectRx, 'txdetectrx');
+    g.port('TXELECIDLE') <= stage(p.txElecIdle, 'txelecidle');
+    g.port('RXPOLARITY') <= stage(p.rxPolarity, 'rxpolarity');
+    final powerDown = stage(p.powerDown, 'powerdown');
+    g.port('TXPD') <= powerDown;
+    g.port('RXPD') <= powerDown;
     g.port('TXRATE') <= rate.zeroExtend(3);
     g.port('RXRATE') <= rate.zeroExtend(3);
-    g.port('TXMARGIN') <= p.txMargin;
-    g.port('TXSWING') <= p.txSwing;
-    g.port('TXDEEMPH') <= p.txDeemph;
+    g.port('TXMARGIN') <= stage(p.txMargin, 'txmargin');
+    g.port('TXSWING') <= stage(p.txSwing, 'txswing');
+    g.port('TXDEEMPH') <= stage(p.txDeemph, 'txdeemph');
     g.port('DRPCLK') <= pclk;
     g.port('DRPADDR') <= drpAddr;
     g.port('DRPDI') <= drpDataIn;
@@ -333,11 +366,11 @@ class HarborGtpPcieLane extends Module {
     addOutput('drp_data_out', width: 16) <= g.port('DRPDO');
     addOutput('drp_ready') <= g.port('DRPRDY');
 
-    p.rxData <= g.port('RXDATA').slice(15, 0);
-    p.rxDataK <= g.port('RXCHARISK').slice(1, 0);
-    p.rxStatus <= g.port('RXSTATUS');
-    p.rxElecIdle <= elecIdle;
-    p.rxChanIsAligned <= chanAligned;
+    p.rxData <= stage(g.port('RXDATA').slice(15, 0), 'rxdata');
+    p.rxDataK <= stage(g.port('RXCHARISK').slice(1, 0), 'rxdatak');
+    p.rxStatus <= stage(g.port('RXSTATUS'), 'rxstatus');
+    p.rxElecIdle <= stage(elecIdle, 'rxelecidle');
+    p.rxChanIsAligned <= stage(chanAligned, 'rxchanisaligned');
 
     final gtValid = g.port('RXVALID');
     final validCount = Logic(name: 'rxvalid_count', width: 5);
@@ -350,9 +383,13 @@ class HarborGtpPcieLane extends Module {
         orElse: [validCount < 0],
       ),
     ], reset: reset);
-    p.rxValid <= linkUp & validCount[4] & gtValid;
+    p.rxValid <= stage(linkUp & validCount[4] & gtValid, 'rxvalid');
 
-    p.phyStatus <= ~linkUp | (rateIdle & g.port('PHYSTATUS')) | rateDone;
+    p.phyStatus <=
+        stage(
+          ~linkUp | (rateIdle & g.port('PHYSTATUS')) | rateDone,
+          'phystatus',
+        );
   }
 }
 
@@ -393,9 +430,16 @@ class HarborGtpPcieLane extends Module {
 /// With [clocks] null, the PHY makes [HarborPipeClock] from the TXOUTCLK of
 /// lane 0. With [clocks] set, the PHY uses those clocks, and the TXOUTCLK
 /// ports are not used.
+///
+/// [pipeStages] registers go on each PIPE signal between the GT and the hard
+/// block, in the two directions, as PIPE_PIPELINE_STAGES does in the AMD
+/// core. The reset and rate logic see the GT side.
 class HarborGtpPciePhy extends Module {
   /// Number of lanes, 1 or 4.
   final int lanes;
+
+  /// Registers on each PIPE signal, 0 to 2.
+  final int pipeStages;
 
   /// Bounds of the waits.
   final HarborGtpPcieTimeouts timeouts;
@@ -446,8 +490,14 @@ class HarborGtpPciePhy extends Module {
     this.drivePllReset = false,
     this.waitRxPmaResetDone = true,
     this.waitForRxResetStatus = true,
+    this.pipeStages = 1,
     super.name = 'gtp_pcie_phy',
-  }) : super(definitionName: 'HarborGtpPciePhy_X$lanes') {
+  }) : super(
+         definitionName: pipeStages == 0
+             ? 'HarborGtpPciePhy_X$lanes'
+             : 'HarborGtpPciePhy_X${lanes}_Pipe$pipeStages',
+       ) {
+    harborCheckPipeStages(pipeStages);
     if (lanes != 1 && lanes != 4) {
       throw ArgumentError.value(lanes, 'lanes', 'must be 1 or 4');
     }
@@ -600,6 +650,7 @@ class HarborGtpPciePhy extends Module {
           drpDataIn: drpDataIn,
           drpEnable: drpEnable,
           drpWrite: drpWrite,
+          pipeStages: pipeStages,
           name: 'lane$i',
         ),
     ];
@@ -818,7 +869,7 @@ class HarborGtpPciePhy extends Module {
               Const(timeouts.rate - 1, width: timeouts.rate.bitLength),
             );
     Sequential(pclk, [
-      rateQ < pps[0].pipeRate,
+      rateQ < _pipeDelay(pclk, pps[0].pipeRate, pipeStages, 'rate'),
       rateQ2 < rateQ,
       If(
         fail,

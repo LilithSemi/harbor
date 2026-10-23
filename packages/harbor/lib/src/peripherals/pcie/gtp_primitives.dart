@@ -110,8 +110,14 @@ class HarborArtix7PciePhy extends Module {
     required Logic rxN,
     required HarborPciePipeLane pipe,
     this.waitForRxResetStatus = true,
+    this.pipeStages = 1,
     super.name = 'pcie_phy',
-  }) : super(definitionName: 'HarborArtix7PciePhy_X1') {
+  }) : super(
+         definitionName: pipeStages == 0
+             ? 'HarborArtix7PciePhy_X1'
+             : 'HarborArtix7PciePhy_X1_Pipe$pipeStages',
+       ) {
+    harborCheckPipeStages(pipeStages);
     refClkP = addInput('refclk_p', refClkP);
     refClkN = addInput('refclk_n', refClkN);
     perstN = addInput('perst_n', perstN);
@@ -141,6 +147,7 @@ class HarborArtix7PciePhy extends Module {
       pipes: [localPipe],
       drivePllReset: false,
       waitForRxResetStatus: waitForRxResetStatus,
+      pipeStages: pipeStages,
     );
 
     addOutput('tx_p') <= channel.txP;
@@ -157,4 +164,7 @@ class HarborArtix7PciePhy extends Module {
 
   /// Wait for RXRESETDONE and startup PHYSTATUS before TX buffer alignment.
   final bool waitForRxResetStatus;
+
+  /// Registers on each PIPE signal, 0 to 2.
+  final int pipeStages;
 }

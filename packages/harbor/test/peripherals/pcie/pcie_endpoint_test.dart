@@ -8,6 +8,7 @@ void main() {
   HarborPcieEndpoint endpoint(
     HarborDeviceTarget target, {
     HarborPcieEndpointConfig config = const HarborPcieEndpointConfig(),
+    int pipeStages = 1,
   }) => HarborPcieEndpoint(
     target: target,
     refClkP: bit(),
@@ -21,6 +22,7 @@ void main() {
     txLast: bit(),
     txValid: bit(),
     config: config,
+    pipeStages: pipeStages,
   );
 
   test('rejects targets without an Artix-7 PCIe hard block', () {
@@ -50,6 +52,8 @@ void main() {
       expect(sv, contains('IBUFDS_GTE2'));
       expect(sv, isNot(contains('GTWESTREFCLK')));
       expect(sv, contains('HarborBram_68x2048'));
+      expect(sv, contains('HarborGtpPciePhy_X1_Pipe1'));
+      expect(dut.pipeStages, 1);
       expect(sv, contains('HarborBram_69x2048'));
       expect(sv, contains(".VC0_RX_RAM_LIMIT(13'h7FF)"));
       expect(dut.rxData.width, 64);
@@ -107,9 +111,9 @@ void main() {
       for (final e in widths.entries) {
         final out = dut.output(e.key);
         expect(out.width, e.value, reason: e.key);
-        final phyOut = path(out).where(
-          (l) => l.parentModule is HarborGtpPciePhy && l.isOutput,
-        );
+        final phyOut = path(
+          out,
+        ).where((l) => l.parentModule is HarborGtpPciePhy && l.isOutput);
         expect(phyOut.map((l) => l.name), [e.key], reason: e.key);
       }
     },
@@ -138,7 +142,7 @@ void main() {
       expect(sv, contains('HarborPcieInterrupt'));
       expect(
         dut.definitionName,
-        'HarborPcieEndpoint_Xilinx7_X1_Bar2x1000000_Msi8',
+        'HarborPcieEndpoint_Xilinx7_X1_Bar2x1000000_Msi8_Pipe1',
       );
       expect(dut.input('irq_pending').width, 8);
       expect(dut.maxPayload.width, 3);
@@ -186,6 +190,38 @@ void main() {
       ),
       throwsArgumentError,
     );
+  });
+
+  test('passes pipeStages to the PHY', () async {
+    final dut = endpoint(
+      const HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+        useOpenXc7: true,
+      ),
+      pipeStages: 2,
+    );
+    await dut.build();
+    final sv = dut.generateSynth();
+    expect(dut.pipeStages, 2);
+    expect(dut.definitionName, 'HarborPcieEndpoint_Xilinx7_X1_Pipe2');
+    expect(sv, contains('HarborGtpPciePhy_X1_Pipe2'));
+    expect(sv, contains('HarborGtpPcieLane_Pipe2'));
+  }, timeout: const Timeout(Duration(minutes: 3)));
+
+  test('rejects pipeStages other than 0, 1 and 2', () {
+    const target = HarborFpgaTarget.artix7(
+      device: 'xc7a200t',
+      package: 'fbg484',
+      useOpenXc7: true,
+    );
+    for (final n in [-1, 3]) {
+      expect(
+        () => endpoint(target, pipeStages: n),
+        throwsArgumentError,
+        reason: '$n',
+      );
+    }
   });
 
   test('rejects unsupported packet SRAM depths', () {

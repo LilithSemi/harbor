@@ -2,6 +2,7 @@ import 'package:rohd/rohd.dart';
 
 import '../../soc/target.dart';
 import '../bram.dart';
+import 'gtp_pcie_phy.dart';
 import 'gtp_primitives.dart';
 import 'pcie_2_1.dart';
 import 'pcie_interrupt.dart';
@@ -92,8 +93,10 @@ class HarborPcieEndpoint extends Module {
     Logic? txUser,
     Logic? irqPending,
     this.config = const HarborPcieEndpointConfig(),
+    this.pipeStages = 1,
     super.name = 'pcie_endpoint',
-  }) : super(definitionName: _definitionName(config)) {
+  }) : super(definitionName: _definitionName(config, pipeStages)) {
+    harborCheckPipeStages(pipeStages);
     _checkTarget(target);
     _checkConfig(config);
     refClkP = addInput('refclk_p', refClkP);
@@ -127,6 +130,7 @@ class HarborPcieEndpoint extends Module {
       pipe: pipe,
       waitForRxResetStatus:
           (target as HarborFpgaTarget).vendor != HarborFpgaVendor.openXc7,
+      pipeStages: pipeStages,
     );
     final hardInputs = harborPcie21TiedInputs();
     hardInputs['PIPECLK'] = phy.pclk;
@@ -345,6 +349,9 @@ class HarborPcieEndpoint extends Module {
 
   final HarborPcieEndpointConfig config;
 
+  /// Registers on each PIPE signal between the GTP and the hard block.
+  final int pipeStages;
+
   static void _checkTarget(HarborDeviceTarget target) {
     if (target is! HarborFpgaTarget ||
         (target.vendor != HarborFpgaVendor.vivado &&
@@ -389,11 +396,15 @@ class HarborPcieEndpoint extends Module {
     }
   }
 
-  static String _definitionName(HarborPcieEndpointConfig config) => [
+  static String _definitionName(
+    HarborPcieEndpointConfig config,
+    int pipeStages,
+  ) => [
     'HarborPcieEndpoint_Xilinx7_X1',
     if (config.packetMemoryEntries != 2048) 'Pm${config.packetMemoryEntries}',
     if (config.bar2Bytes != 0) 'Bar2x${config.bar2Bytes.toRadixString(16)}',
     if (config.msiVectors != 1) 'Msi${config.msiVectors}',
+    if (pipeStages != 0) 'Pipe$pipeStages',
   ].join('_');
 
   static Map<String, String> _packetMemoryParameters(int entries) =>

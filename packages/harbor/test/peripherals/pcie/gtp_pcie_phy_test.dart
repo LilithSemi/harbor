@@ -76,6 +76,7 @@ class _Bench {
     bool waitRxPmaResetDone = true,
     bool waitForRxResetStatus = true,
     bool perstEdge = true,
+    int pipeStages = 1,
     void Function(Gtpe2StatusModel m)? setup,
   }) async {
     final pclk = SimpleClockGenerator(8).clk;
@@ -103,6 +104,7 @@ class _Bench {
       drivePllReset: drivePllReset,
       waitRxPmaResetDone: waitRxPmaResetDone,
       waitForRxResetStatus: waitForRxResetStatus,
+      pipeStages: pipeStages,
     );
     await phy.build();
     for (final p in pipes) {
@@ -178,6 +180,15 @@ class _Bench {
       if (phy.resetState.value.isValid && state == s) return;
     }
     fail('state $s not reached in $limit cycles, now $state, trace $trace');
+  }
+
+  /// Clock edges until [f] is true, 0 when it is true now.
+  Future<int> until(bool Function() f, {int limit = 100}) async {
+    for (var i = 0; i <= limit; i++) {
+      if (i > 0) await pclk.nextNegedge;
+      if (f()) return i;
+    }
+    fail('condition not met in $limit cycles');
   }
 
   /// The trace from the last time it entered [from].
@@ -461,115 +472,275 @@ void main() {
   });
 
   group('HarborGtpPciePhy PIPE shaping', () {
-    test('a rate change reruns TX sync and gives one PHYSTATUS', () async {
-      final b = await _Bench.start();
-      await b.waitFor(_S.idle);
-      await b.cycles(10);
-      final before = b.phyStatusHighAfterIdle;
-      final traceLen = b.trace.length;
-      b.pipes[0].pipeRate.inject(1);
-      await b.cycles(3);
-      expect(b.channels[0].port('TXRATE').value.toInt(), 1);
-      expect(b.channels[0].port('RXRATE').value.toInt(), 1);
-      await b.waitFor(_S.txDlySReset, limit: 100);
-      await b.waitFor(_S.idle, limit: 300);
-      await b.cycles(10);
-      expect(b.trace.sublist(traceLen - 1), [
-        _S.idle,
-        _S.txDlySReset,
-        _S.txPhInit,
-        _S.txPhAlign,
-        _S.txDlyEn,
-        _S.idle,
-      ]);
-      expect(b.model.txSyncRuns, 2);
-      expect(b.phyStatusHighAfterIdle - before, 1);
-      expect(b.hi(b.phy.phyReady), isTrue);
-      expect(b.retries, 0);
-      await b.finish();
-    });
+    for (final n in [0, 1, 2]) {
+      test('pipeStages $n: a rate change reruns TX sync and gives one '
+          'PHYSTATUS', () async {
+        final b = await _Bench.start(pipeStages: n);
+        await b.waitFor(_S.idle);
+        await b.cycles(10);
+        final before = b.phyStatusHighAfterIdle;
+        final traceLen = b.trace.length;
+        b.pipes[0].pipeRate.inject(1);
+        final rateLate = await b.until(
+          () => b.channels[0].port('TXRATE').value.toInt() == 1,
+        );
+        // The rate has one register on the GT side before the stages.
+        expect(rateLate, 1 + n);
+        expect(b.channels[0].port('RXRATE').value.toInt(), 1);
+        await b.waitFor(_S.txDlySReset, limit: 100);
+        await b.waitFor(_S.idle, limit: 300);
+        await b.cycles(10);
+        expect(b.trace.sublist(traceLen - 1), [
+          _S.idle,
+          _S.txDlySReset,
+          _S.txPhInit,
+          _S.txPhAlign,
+          _S.txDlyEn,
+          _S.idle,
+        ]);
+        expect(b.model.txSyncRuns, 2);
+        expect(b.phyStatusHighAfterIdle - before, 1);
+        expect(b.hi(b.phy.phyReady), isTrue);
+        expect(b.retries, 0);
+        await b.finish();
+      });
 
-    test('a rate change with no answer restarts the sequence', () async {
-      final b = await _Bench.start(setup: (m) => m.rateStuck = true);
-      await b.waitFor(_S.idle);
-      b.pipes[0].pipeRate.inject(1);
-      await b.waitFor(_S.pllReset, limit: 200);
-      expect(b.failState, _S.rateChange);
-      expect(b.retries, 1);
-      await b.finish();
-    });
+      test('pipeStages $n: a rate change with no answer restarts the '
+          'sequence', () async {
+        final b = await _Bench.start(
+          pipeStages: n,
+          setup: (m) => m.rateStuck = true,
+        );
+        await b.waitFor(_S.idle);
+        b.pipes[0].pipeRate.inject(1);
+        await b.waitFor(_S.pllReset, limit: 200);
+        expect(b.failState, _S.rateChange);
+        expect(b.retries, 1);
+        await b.finish();
+      });
 
-    test('RXVALID passes only in idle after 16 clean cycles', () async {
-      final b = await _Bench.start();
-      final pipe = b.pipes[0];
-      final gtValid = b.channels[0].port('RXVALID');
-      // GT RXVALID is high from reset done, before idle.
-      await b.waitFor(_S.txDlySReset);
-      expect(b.hi(gtValid), isTrue);
-      expect(b.hi(pipe.rxValid), isFalse);
-      await b.waitFor(_S.idle);
-      await b.cycles(2);
-      expect(b.hi(pipe.rxValid), isTrue);
+      test('pipeStages $n: RXVALID passes only in idle after 16 clean '
+          'cycles', () async {
+        final b = await _Bench.start(pipeStages: n);
+        final pipe = b.pipes[0];
+        final gtValid = b.channels[0].port('RXVALID');
+        // GT RXVALID is high from reset done, before idle.
+        await b.waitFor(_S.txDlySReset);
+        expect(b.hi(gtValid), isTrue);
+        expect(b.hi(pipe.rxValid), isFalse);
+        await b.waitFor(_S.idle);
+        final up = await b.until(() => b.hi(pipe.rxValid));
+        expect(up, n);
 
-      b.model.rxValidOn = false;
-      await b.cycles(2);
-      expect(b.hi(gtValid), isFalse);
-      expect(b.hi(pipe.rxValid), isFalse);
-      b.model.rxValidOn = true;
-      var n = 0;
-      while (!b.hi(pipe.rxValid)) {
+        b.model.rxValidOn = false;
         await b.cycles(1);
-        n++;
-        expect(n, lessThan(40));
+        expect(b.hi(gtValid), isFalse);
+        final down = await b.until(() => !b.hi(pipe.rxValid));
+        expect(down, n);
+        b.model.rxValidOn = true;
+        final count = await b.until(() => b.hi(pipe.rxValid), limit: 40);
+        expect(count, 17 + n);
+
+        // A one cycle drop starts the count again.
+        b.model.rxValidOn = false;
+        await b.cycles(2);
+        b.model.rxValidOn = true;
+        await b.cycles(8 + n);
+        expect(b.hi(pipe.rxValid), isFalse);
+        await b.cycles(12);
+        expect(b.hi(pipe.rxValid), isTrue);
+        await b.finish();
+      });
+
+      test('pipeStages $n: PHYSTATUS is high until idle, then follows power '
+          'changes', () async {
+        final b = await _Bench.start(pipeStages: n);
+        final pipe = b.pipes[0];
+        // The GT drops PHYSTATUS at reset done, the PIPE side stays high.
+        await b.waitFor(_S.txPhInit);
+        expect(b.hi(b.channels[0].port('PHYSTATUS')), isFalse);
+        expect(b.hi(pipe.phyStatus), isTrue);
+        await b.waitFor(_S.idle);
+        final low = await b.until(() => !b.hi(pipe.phyStatus));
+        expect(low, n);
+        final before = b.phyStatusHighAfterIdle;
+        pipe.powerDown.inject(2);
+        await b.cycles(20);
+        expect(b.phyStatusHighAfterIdle - before, 1);
+        expect(b.channels[0].port('TXPD').value.toInt(), 2);
+        expect(b.channels[0].port('RXPD').value.toInt(), 2);
+        await b.finish();
+      });
+
+      test('pipeStages $n: TX and RX data map to the low half of the GT '
+          'data', () async {
+        final b = await _Bench.start(pipeStages: n);
+        final pipe = b.pipes[0];
+        final ch = b.channels[0];
+        pipe.txData.inject(0xBCBC);
+        pipe.txDataK.inject(3);
+        pipe.txCompliance.inject(1);
+        ch.port('RXDATA').inject(0xFFFF1C1C);
+        ch.port('RXCHARISK').inject(0xF);
+        await b.cycles(1 + n);
+        expect(ch.port('TXDATA').value.toInt(), 0xBCBC);
+        expect(ch.port('TXCHARISK').value.toInt(), 3);
+        expect(ch.port('TXCHARDISPMODE').value.toInt(), 1);
+        expect(pipe.rxData.value.toInt(), 0x1C1C);
+        expect(pipe.rxDataK.value.toInt(), 3);
+        await b.finish();
+      });
+
+      test('pipeStages $n: each PIPE signal is $n cycles late in both '
+          'directions', () async {
+        final b = await _Bench.start(pipeStages: n);
+        await b.waitFor(_S.idle);
+        await b.cycles(5);
+        final lane = b.phy.subModules.firstWhere((m) => m.name == 'lane0');
+        Module sub(String name) =>
+            lane.subModules.firstWhere((m) => m.name == name);
+        final count = lane.internalSignals.firstWhere(
+          (l) => l.name == 'rxvalid_count',
+        );
+        final ch = b.channels[0];
+        final pipe = b.pipes[0];
+        final linkUp = lane.input('link_up');
+        final rateIdle = lane.input('rate_idle');
+        final rateDone = lane.input('rate_done');
+
+        // Each entry: the source on one side, the PIPE or GT end, the delay.
+        final rx = <String, (LogicValue Function(), Logic)>{
+          'rxdata': (() => ch.port('RXDATA').value.slice(15, 0), pipe.rxData),
+          'rxdatak': (
+            () => ch.port('RXCHARISK').value.slice(1, 0),
+            pipe.rxDataK,
+          ),
+          'rxstatus': (() => ch.port('RXSTATUS').value, pipe.rxStatus),
+          'rxvalid': (
+            () => linkUp.value & count.value[4] & ch.port('RXVALID').value,
+            pipe.rxValid,
+          ),
+          'phystatus': (
+            () =>
+                ~linkUp.value |
+                (rateIdle.value & ch.port('PHYSTATUS').value) |
+                rateDone.value,
+            pipe.phyStatus,
+          ),
+          'rxelecidle': (
+            () => sub('rx_elecidle_sync').output('sync_out').value,
+            pipe.rxElecIdle,
+          ),
+          'rxchanisaligned': (
+            () => sub('rx_chanisaligned_sync').output('sync_out').value,
+            pipe.rxChanIsAligned,
+          ),
+        };
+        final tx = <String, (LogicValue Function(), Logic)>{
+          'txdata': (() => pipe.txData.value, ch.port('TXDATA')),
+          'txdatak': (() => pipe.txDataK.value, ch.port('TXCHARISK')),
+          'txcompliance': (
+            () => pipe.txCompliance.value,
+            ch.port('TXCHARDISPMODE'),
+          ),
+          'txdetectrx': (() => pipe.txDetectRx.value, ch.port('TXDETECTRX')),
+          'txelecidle': (() => pipe.txElecIdle.value, ch.port('TXELECIDLE')),
+          'rxpolarity': (() => pipe.rxPolarity.value, ch.port('RXPOLARITY')),
+          'txpd': (() => pipe.powerDown.value, ch.port('TXPD')),
+          'rxpd': (() => pipe.powerDown.value, ch.port('RXPD')),
+          'txmargin': (() => pipe.txMargin.value, ch.port('TXMARGIN')),
+          'txswing': (() => pipe.txSwing.value, ch.port('TXSWING')),
+          'txdeemph': (() => pipe.txDeemph.value, ch.port('TXDEEMPH')),
+          'txrate': (() => pipe.pipeRate.value, ch.port('TXRATE')),
+          'rxrate': (() => pipe.pipeRate.value, ch.port('RXRATE')),
+        };
+        final all = {...rx, ...tx};
+        final src = {for (final k in all.keys) k: <LogicValue>[]};
+        final dst = {for (final k in all.keys) k: <LogicValue>[]};
+
+        var seed = 0x1234 + n;
+        int rand(int bits) {
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          return (seed >> 8) & ((1 << bits) - 1);
+        }
+
+        const window = 400;
+        for (var c = 0; c < window; c++) {
+          await b.pclk.nextNegedge;
+          ch.port('RXDATA').inject(rand(23) << 9 | rand(9));
+          ch.port('RXCHARISK').inject(rand(4));
+          ch.port('RXSTATUS').inject(rand(3));
+          ch.port('RXELECIDLE').inject(rand(1));
+          pipe.txData.inject(rand(16));
+          pipe.txDataK.inject(rand(2));
+          pipe.txCompliance.inject(rand(1));
+          pipe.txDetectRx.inject(rand(1));
+          pipe.txElecIdle.inject(rand(1));
+          pipe.rxPolarity.inject(rand(1));
+          pipe.txMargin.inject(rand(3));
+          pipe.txSwing.inject(rand(1));
+          pipe.txDeemph.inject(rand(1));
+          // A rate change, then power changes, then RXVALID and alignment
+          // drops. Each one changes PHYSTATUS or RXVALID on the GT side.
+          if (c == 10) pipe.pipeRate.inject(1);
+          if (c == 150) pipe.powerDown.inject(2);
+          if (c == 180) pipe.powerDown.inject(0);
+          b.model.rxValidOn = c < 220 || c >= 240;
+          b.model.chanAlignedOn = c < 260 || c >= 275;
+          await Simulator.clkStable.first;
+          for (final e in all.entries) {
+            src[e.key]!.add(e.value.$1());
+            dst[e.key]!.add(e.value.$2.value);
+          }
+        }
+
+        for (final e in all.entries) {
+          final delay = e.key.endsWith('rate') ? n + 1 : n;
+          final s = src[e.key]!;
+          final d = dst[e.key]!;
+          final width = s.first.width;
+          expect(s.toSet(), hasLength(greaterThan(1)), reason: e.key);
+          for (var c = delay; c < window; c++) {
+            expect(
+              d[c].getRange(0, width),
+              s[c - delay],
+              reason: '${e.key} at $c',
+            );
+          }
+        }
+        expect(b.retries, 0);
+        await b.finish();
+      });
+    }
+
+    test('pipeStages other than 0, 1 and 2 throw', () {
+      for (final n in [-1, 3]) {
+        expect(
+          () => HarborGtpPciePhy(
+            perstN: Logic(),
+            common: HarborGtpCommonPorts(),
+            channels: [HarborGtpChannelPorts()],
+            pipes: [HarborPciePipeLane()],
+            pipeStages: n,
+          ),
+          throwsArgumentError,
+          reason: '$n',
+        );
       }
-      expect(n, inInclusiveRange(15, 19));
-
-      // A one cycle drop starts the count again.
-      b.model.rxValidOn = false;
-      await b.cycles(2);
-      b.model.rxValidOn = true;
-      await b.cycles(8);
-      expect(b.hi(pipe.rxValid), isFalse);
-      await b.cycles(12);
-      expect(b.hi(pipe.rxValid), isTrue);
-      await b.finish();
     });
 
-    test('PHYSTATUS is high until idle, then follows power changes', () async {
-      final b = await _Bench.start();
-      final pipe = b.pipes[0];
-      // The GT drops PHYSTATUS at reset done, the PIPE side stays high.
-      await b.waitFor(_S.txPhInit);
-      expect(b.hi(b.channels[0].port('PHYSTATUS')), isFalse);
-      expect(b.hi(pipe.phyStatus), isTrue);
-      await b.waitFor(_S.idle);
-      await b.cycles(2);
-      expect(b.hi(pipe.phyStatus), isFalse);
-      final before = b.phyStatusHighAfterIdle;
-      pipe.powerDown.inject(2);
-      await b.cycles(20);
-      expect(b.phyStatusHighAfterIdle - before, 1);
-      expect(b.channels[0].port('TXPD').value.toInt(), 2);
-      expect(b.channels[0].port('RXPD').value.toInt(), 2);
-      await b.finish();
-    });
-
-    test('TX and RX data map to the low half of the GT data', () async {
-      final b = await _Bench.start();
-      final pipe = b.pipes[0];
-      final ch = b.channels[0];
-      pipe.txData.inject(0xBCBC);
-      pipe.txDataK.inject(3);
-      pipe.txCompliance.inject(1);
-      ch.port('RXDATA').inject(0xFFFF1C1C);
-      ch.port('RXCHARISK').inject(0xF);
-      await b.cycles(1);
-      expect(ch.port('TXDATA').value.toInt(), 0xBCBC);
-      expect(ch.port('TXCHARISK').value.toInt(), 3);
-      expect(ch.port('TXCHARDISPMODE').value.toInt(), 1);
-      expect(pipe.rxData.value.toInt(), 0x1C1C);
-      expect(pipe.rxDataK.value.toInt(), 3);
-      await b.finish();
+    test('each pipeStages value has its own module names', () {
+      String name(int n) => HarborGtpPciePhy(
+        perstN: Logic(),
+        common: HarborGtpCommonPorts(),
+        channels: [HarborGtpChannelPorts()],
+        pipes: [HarborPciePipeLane()],
+        pipeStages: n,
+      ).definitionName;
+      expect({
+        for (final n in [0, 1, 2]) name(n),
+      }, hasLength(3));
+      expect(name(0), 'HarborGtpPciePhy_X1');
     });
   });
 

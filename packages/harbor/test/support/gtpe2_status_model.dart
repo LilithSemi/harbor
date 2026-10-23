@@ -50,6 +50,9 @@ class Gtpe2StatusModel {
   /// RXVALID while the GT is out of reset.
   bool rxValidOn = true;
 
+  /// RXCHANISALIGNED while the GT is out of reset.
+  bool chanAlignedOn = true;
+
   /// RXRESETDONE follows the modelled reset sequence.
   bool rxResetDoneOn = true;
 
@@ -255,7 +258,7 @@ class Gtpe2StatusModel {
       ch.port('TXRATEDONE').put(ratePulse ? 1 : 0);
       ch.port('RXRATEDONE').put(ratePulse ? 1 : 0);
       ch.port('RXVALID').put(rxValidOn && resetDone ? 1 : 0);
-      ch.port('RXCHANISALIGNED').put(resetDone ? 1 : 0);
+      ch.port('RXCHANISALIGNED').put(resetDone && chanAlignedOn ? 1 : 0);
     }
   }
 }
