@@ -48,8 +48,10 @@ import 'line_fetcher.dart';
 /// above. A plane with a vertical subsampling of 2 has one line for two
 /// luma lines. Its next line is fetched at the start of each even luma
 /// line, after the plane 0 line, so it has two line times to complete.
-/// When more than one plane waits, the lowest plane goes first. No line
-/// past the frame is fetched.
+/// The lines of one line start cross to the system side as one request,
+/// and the system side fetches them in plane order. When more than one
+/// plane waits, the lowest plane goes first. No line past the frame is
+/// fetched.
 ///
 /// The pixel domain reads plane n with `plane_col_<n>` ([planeCol]), the
 /// word index in the line, and gets [planeData] one [pixelClk] cycle later.
@@ -605,7 +607,9 @@ class HarborDualClockScanout extends Module {
     List<Logic> regs(String n, [int w = 1]) => [
       for (var k = 0; k < planes; k++) Logic(name: 'p${k}_$n', width: w),
     ];
-    final reqToggle = regs('req_toggle');
+    final reqToggle = Logic(name: 'req_toggle');
+    final reqMask = Logic(name: 'req_mask', width: planes);
+    final want = regs('want');
     final reqAddr = regs('req_addr', 32);
     final reqFill = regs('req_fill');
     final nextAddr = regs('next_addr', 32);
@@ -620,7 +624,7 @@ class HarborDualClockScanout extends Module {
     ];
     final outstanding = [
       for (var k = 0; k < planes; k++)
-        (reqToggle[k] ^ dSync1[k]).named('p${k}_outstanding'),
+        (want[k] ^ dSync1[k]).named('p${k}_outstanding'),
     ];
     final allIdle = outstanding
         .map((o) => ~o)
@@ -637,17 +641,38 @@ class HarborDualClockScanout extends Module {
     final chromaNo = Logic(name: 'chroma_no', width: 16);
     final fmt = multi ? Logic(name: 'format_reg', width: selW) : null;
 
-    List<Conditional> issue(int k, Logic addr, Logic fill, Logic step) => [
-      reqAddr[k] < addr,
-      reqFill[k] < fill,
-      reqToggle[k] < ~reqToggle[k],
-      nextAddr[k] < (addr + step),
+    // One request carries the lines of all planes for a line start. The
+    // system side takes them together, so it fetches them in plane order.
+    // Each entry is (fetch, address, fill, pitch), null for no fetch.
+    List<Conditional> issue(List<(Logic, Logic, Logic, Logic)?> lines) {
+      if (lines.every((l) => l == null)) return [];
+      final fetch = [for (final l in lines) l?.$1 ?? Const(0)];
+      return [
+        If(
+          fetch.reduce((a, b) => a | b),
+          then: [
+            reqToggle < ~reqToggle,
+            reqMask < fetch.rswizzle(),
+            for (var k = 0; k < planes; k++)
+              if (lines[k] case (final f, final addr, final fill, final step))
+                If(
+                  f,
+                  then: [
+                    reqAddr[k] < addr,
+                    reqFill[k] < fill,
+                    want[k] < ~want[k],
+                    nextAddr[k] < (addr + step),
+                  ],
+                ),
+          ],
+        ),
+      ];
+    }
+
+    // A line that is not ready when its read starts.
+    List<Conditional> late(int k) => [
+      If(outstanding[k], then: [underrunReg[k] < Const(1)]),
     ];
-    // An inactive plane issues nothing.
-    List<Conditional> issueIf(int k, Logic addr, Logic fill, Logic step) =>
-        k == 0
-        ? issue(k, addr, fill, step)
-        : [If(active[k], then: issue(k, addr, fill, step))];
 
     Sequential(pixelClk, reset: pixelReset, [
       for (var k = 0; k < planes; k++) ...[
@@ -669,14 +694,15 @@ class HarborDualClockScanout extends Module {
             pitch[k] < pitchIn[k],
             active[k] < wordsSel[k].neq(0),
           ],
-          for (var k = 0; k < planes; k++)
-            if (k == 0)
-              ...issue(0, base[0], Const(0), pitchIn[0])
-            else
-              If(
-                wordsSel[k].neq(0),
-                then: issue(k, base[k], Const(0), pitchIn[k]),
+          ...issue([
+            for (var k = 0; k < planes; k++)
+              (
+                k == 0 ? Const(1) : wordsSel[k].neq(0),
+                base[k],
+                Const(0),
+                pitchIn[k],
               ),
+          ]),
         ],
         orElse: [
           Case(phase, [
@@ -684,15 +710,20 @@ class HarborDualClockScanout extends Module {
               If(
                 allIdle,
                 then: [
-                  if (vActive > 1) ...[
-                    ...issue(0, nextAddr[0], Const(1), pitch[0]),
-                    lineNo < Const(2, width: 16),
-                  ],
-                  if (chromaLines > 1) ...[
-                    for (var k = 1; k < planes; k++)
-                      ...issueIf(k, nextAddr[k], Const(1), pitch[k]),
-                    chromaNo < Const(2, width: 16),
-                  ],
+                  ...issue([
+                    for (var k = 0; k < planes; k++)
+                      if (k == 0 ? vActive > 1 : chromaLines > 1)
+                        (
+                          k == 0 ? Const(1) : active[k],
+                          nextAddr[k],
+                          Const(1),
+                          pitch[k],
+                        )
+                      else
+                        null,
+                  ]),
+                  if (vActive > 1) lineNo < Const(2, width: 16),
+                  if (chromaLines > 1) chromaNo < Const(2, width: 16),
                   phase < Const(2, width: 2),
                 ],
               ),
@@ -705,30 +736,30 @@ class HarborDualClockScanout extends Module {
                 lineStart,
                 then: [
                   readSel < ~readSel,
-                  If(outstanding[0], then: [underrunReg[0] < Const(1)]),
-                  If(
-                    lineNo.lt(vActive),
-                    then: [
-                      ...issue(0, nextAddr[0], readSel, pitch[0]),
-                      lineNo < lineNo + 1,
-                    ],
-                  ),
+                  ...late(0),
+                  If(lineNo.lt(vActive), then: [lineNo < lineNo + 1]),
                   // The line after an odd line is even: swap the chroma
-                  // lines and fetch the next one.
+                  // lines and fetch the next one after the luma line.
+                  ...issue([
+                    for (var k = 0; k < planes; k++)
+                      (
+                        k == 0
+                            ? lineNo.lt(vActive)
+                            : readSel & chromaNo.lt(chromaLines) & active[k],
+                        nextAddr[k],
+                        k == 0 ? readSel : chromaSel,
+                        pitch[k],
+                      ),
+                  ]),
                   if (planes > 1)
                     If(
                       readSel,
                       then: [
                         chromaSel < ~chromaSel,
-                        for (var k = 1; k < planes; k++)
-                          If(outstanding[k], then: [underrunReg[k] < Const(1)]),
+                        for (var k = 1; k < planes; k++) ...late(k),
                         If(
                           chromaNo.lt(chromaLines),
-                          then: [
-                            for (var k = 1; k < planes; k++)
-                              ...issueIf(k, nextAddr[k], chromaSel, pitch[k]),
-                            chromaNo < chromaNo + 1,
-                          ],
+                          then: [chromaNo < chromaNo + 1],
                         ),
                       ],
                     ),
@@ -745,9 +776,9 @@ class HarborDualClockScanout extends Module {
     List<Logic> sregs(String n, [int w = 1]) => [
       for (var k = 0; k < planes; k++) Logic(name: 's${k}_$n', width: w),
     ];
-    final rSync0 = sregs('r_sync0');
-    final rSync1 = sregs('r_sync1');
-    final reqEdge = sregs('req_edge');
+    final rSync0 = Logic(name: 'r_sync0');
+    final rSync1 = Logic(name: 'r_sync1');
+    final reqEdge = Logic(name: 'req_edge');
     final pending = sregs('pending');
     final pendAddr = sregs('pend_addr', 32);
     final pendWords = sregs('pend_words', 16);
@@ -861,11 +892,9 @@ class HarborDualClockScanout extends Module {
     );
 
     Sequential(sysClk, reset: sysReset, [
-      for (var k = 0; k < planes; k++) ...[
-        rSync0[k] < reqToggle[k],
-        rSync1[k] < rSync0[k],
-        reqEdge[k] < rSync0[k] ^ rSync1[k],
-      ],
+      rSync0 < reqToggle,
+      rSync1 < rSync0,
+      reqEdge < rSync0 ^ rSync1,
       fetchStartReg < Const(0),
       If(
         ~sysBusy,
@@ -881,19 +910,24 @@ class HarborDualClockScanout extends Module {
           ),
         ],
       ),
-      // The toggle value is the request it serves, so a done for an older
+      // The want value is the request it serves, so a done for an older
       // request leaves a newer one outstanding.
-      for (var k = 0; k < planes; k++)
-        If(
-          reqEdge[k],
-          then: [
-            pending[k] < Const(1),
-            pendAddr[k] < reqAddr[k],
-            pendWords[k] < words[k],
-            pendFill[k] < reqFill[k],
-            pendTog[k] < rSync1[k],
-          ],
-        ),
+      If(
+        reqEdge,
+        then: [
+          for (var k = 0; k < planes; k++)
+            If(
+              reqMask[k],
+              then: [
+                pending[k] < Const(1),
+                pendAddr[k] < reqAddr[k],
+                pendWords[k] < words[k],
+                pendFill[k] < reqFill[k],
+                pendTog[k] < want[k],
+              ],
+            ),
+        ],
+      ),
     ]);
   }
 }
