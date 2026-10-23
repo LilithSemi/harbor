@@ -327,6 +327,17 @@ class HarborDualClockDisplay extends Module {
           'for more than one overlay format',
         );
       }
+      // The scanout needs the overlay row address before the first line
+      // start.
+      final rowClocks =
+          max((timing.vTotal - 1).bitLength, timing.vActive.bitLength) + 5;
+      if ((timing.vTotal - timing.vActive) * timing.hTotal + timing.hActive <=
+          rowClocks) {
+        throw ArgumentError(
+          'an overlay build needs more than $rowClocks clocks from the frame '
+          'start to the first line start',
+        );
+      }
     } else if (overlayEnable != null) {
       throw ArgumentError('give overlayFormats for an overlay');
     }

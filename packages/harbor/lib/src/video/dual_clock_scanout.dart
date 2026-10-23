@@ -121,7 +121,9 @@ class HarborScanoutOverlay {
 /// The lines of one line start cross to the system side as one request,
 /// and the system side fetches them in plane order. When more than one
 /// plane waits, the lowest plane goes first. No line past the frame is
-/// fetched.
+/// fetched. If the first line start comes before the prime ends, the prime
+/// stops there. A line that was not requested in time counts as an
+/// underrun, and the lines after it go to the correct buffers.
 ///
 /// The pixel domain reads plane n with `plane_col_<n>` ([planeCol]), the
 /// word index in the line, and gets [planeData] one [pixelClk] cycle later.
@@ -868,6 +870,193 @@ class HarborDualClockScanout extends Module {
       ),
     ];
 
+    // A line that was not requested before its read starts.
+    List<Conditional> miss(int k) => [
+      underrunReg[k] < Const(1),
+      underrunTog[k] < ~underrunTog[k],
+    ];
+
+    // The primary planes at a line start. The line after an odd line is
+    // even: swap the chroma lines and fetch the next one after the luma
+    // line.
+    List<Conditional> primaryState() => [
+      readSel < ~readSel,
+      ...late(0),
+      If(lineNo.lt(vActive), then: [lineNo < lineNo + 1]),
+      if (planes > 1)
+        If(
+          readSel,
+          then: [
+            chromaSel < ~chromaSel,
+            for (var k = 1; k < planes; k++) ...late(k),
+            If(chromaNo.lt(chromaLines), then: [chromaNo < chromaNo + 1]),
+          ],
+        ),
+    ];
+    List<(Logic, Logic, Logic, Logic)?> primaryLines() => [
+      for (var k = 0; k < planes; k++)
+        (
+          k == 0
+              ? lineNo.lt(vActive)
+              : readSel & chromaNo.lt(chromaLines) & active[k],
+          nextAddr[k],
+          k == 0 ? readSel : chromaSel,
+          pitch[k],
+        ),
+    ];
+
+    // The overlay planes at a line start in the run phase.
+    List<Conditional> overlayState() => [
+      // Source line rEnter of the overlay starts.
+      If(
+        ov!.on & rEnter.gte(1) & r17(rEnter).lt(r17(ov.height)),
+        then: late(planes),
+      ),
+      for (var j = 1; j < ovPlanes; j++)
+        If(
+          ov.on &
+              active[planes + j] &
+              ~rEnter[0] &
+              rEnter.gte(2) &
+              r17(rEnter).lt(r17(ov.height)),
+          then: late(planes + j),
+        ),
+      ovRow < rEnter,
+    ];
+    // The next source line, and at an even source line the chroma line
+    // after the one that starts.
+    List<(Logic, Logic, Logic, Logic)?> overlayLines() => [
+      for (var j = 0; j < ovPlanes; j++)
+        (
+          j == 0
+              ? ov!.on &
+                    rEnter.gte(1) &
+                    (r17(rEnter) + 1).lt(r17(ov.height)) &
+                    lineNo.lt(vActive)
+              : ov!.on &
+                    active[planes + j] &
+                    ~rEnter[0] &
+                    rEnter.gte(2) &
+                    (r17(rEnter) + 2).lt(r17(ov.height)) &
+                    lineNo.lt(max(vActive - 1, 0)),
+          nextAddr[planes + j],
+          j == 0 ? ~rEnter[0] : ~rEnter[1],
+          pitch[planes + j],
+        ),
+    ];
+    // Overlay line 1 and overlay chroma line 1, if they are on the screen.
+    Logic ovSecond(int j) => j == 0
+        ? ov!.on & ov.height.gt(1) & ov.dstY.lt(max(vActive - 1, 0))
+        : ov!.on &
+              active[planes + j] &
+              ov.height.gt(2) &
+              ov.dstY.lt(max(vActive - 2, 0));
+
+    // A line start before the request of prime phase 1 goes. Line 1 of
+    // plane 0 was not requested, so it is late and the line start requests
+    // line 2. Primary chroma line 1 has one more line time, so it goes now.
+    // Overlay line 0 goes now if it starts at screen line 2 or lower.
+    // Otherwise the overlay lines that start before the next line start are
+    // late, and the next overlay lines go now.
+    List<Conditional> primeLine1() {
+      final early = ov?.dstY.gte(2);
+      final y0 = ov?.dstY.eq(0);
+      final y1 = ov?.dstY.eq(1);
+      return [
+        readSel < Const(1),
+        ...miss(0),
+        for (var k = 1; k < planes; k++) ...late(k),
+        lineNo < Const(min(3, vActive), width: 16),
+        if (chromaLines > 1) chromaNo < Const(2, width: 16),
+        if (ov != null) ...[
+          If(ov.on & ~early!, then: miss(planes)),
+          for (var j = 1; j < ovPlanes; j++)
+            If(ov.on & active[planes + j] & ~early, then: miss(planes + j)),
+          ovRow < rEnter,
+        ],
+        ...issue([
+          for (var k = 0; k < planes; k++)
+            if (k == 0 && vActive > 2)
+              (Const(1), nextAddr[0] + pitch[0], Const(0), pitch[0])
+            else if (k > 0 && chromaLines > 1)
+              (active[k], nextAddr[k], Const(1), pitch[k])
+            else
+              null,
+          if (ov != null)
+            for (var j = 0; j < ovPlanes; j++)
+              j == 0
+                  ? (
+                      ov.on &
+                          (vActive > 2
+                              ? early! |
+                                    (y0! & ov.height.gt(2)) |
+                                    (y1! & ov.height.gt(1))
+                              : early!),
+                      ov.rowAddr[0] +
+                          mux(
+                            y0!,
+                            pitch[planes] << 1,
+                            mux(y1!, pitch[planes], Const(0, width: 32)),
+                          ),
+                      y1,
+                      pitch[planes],
+                    )
+                  : (
+                      ov.on &
+                          active[planes + j] &
+                          (early! | ov.height.gt(2)) &
+                          (early | ov.dstY.lt(max(vActive - 2, 0))),
+                      ov.rowAddr[j] +
+                          mux(early, Const(0, width: 32), pitch[planes + j]),
+                      ~early,
+                      pitch[planes + j],
+                    ),
+        ]),
+        phase <
+            (early == null
+                ? Const(3, width: 2)
+                : mux(early, Const(2, width: 2), Const(3, width: 2))),
+      ];
+    }
+
+    // A line start before the request of prime phase 2 goes. The primary
+    // planes go on as in the run phase. Overlay line 1 goes now, or if it
+    // starts now, it is late and line 2 goes.
+    List<Conditional> primeLine2() {
+      final e0 = ov == null ? null : rEnter.eq(0);
+      final e1 = ov == null ? null : rEnter.eq(1);
+      return [
+        ...primaryState(),
+        if (ov != null) ...[
+          If(ov.on & e1! & ov.height.gt(1), then: miss(planes)),
+          If(ov.on & e0!, then: late(planes)),
+          for (var j = 1; j < ovPlanes; j++)
+            If(ov.on & active[planes + j] & (e0 | e1), then: late(planes + j)),
+          ovRow < rEnter,
+        ],
+        ...issue([
+          ...primaryLines(),
+          if (ov != null)
+            for (var j = 0; j < ovPlanes; j++)
+              j == 0
+                  ? (
+                      mux(e1!, overlayLines()[0]!.$1, ovSecond(0)),
+                      nextAddr[planes] +
+                          mux(e1, pitch[planes], Const(0, width: 32)),
+                      ~e1,
+                      pitch[planes],
+                    )
+                  : (
+                      ovSecond(j),
+                      nextAddr[planes + j],
+                      Const(1),
+                      pitch[planes + j],
+                    ),
+        ]),
+        phase < Const(3, width: 2),
+      ];
+    }
+
     Sequential(pixelClk, reset: pixelReset, [
       for (var k = 0; k < all; k++) ...[
         dSync0[k] < doneToggle[k],
@@ -903,61 +1092,68 @@ class HarborDualClockScanout extends Module {
         ],
         orElse: [
           Case(phase, [
+            // A line start ends the prime, so the line state does not
+            // fall behind and no prime request uses a buffer that is in
+            // use.
             CaseItem(Const(1, width: 2), [
               If(
-                ov == null ? allIdle : allIdle & ov.ready,
-                then: [
-                  ...issue([
-                    for (var k = 0; k < planes; k++)
-                      if (k == 0 ? vActive > 1 : chromaLines > 1)
-                        (
-                          k == 0 ? Const(1) : active[k],
-                          nextAddr[k],
-                          Const(1),
-                          pitch[k],
-                        )
-                      else
-                        null,
-                    // Overlay line 0.
-                    if (ov != null)
-                      for (var j = 0; j < ovPlanes; j++)
-                        (
-                          ov.on & active[planes + j],
-                          ov.rowAddr[j],
-                          Const(0),
-                          pitch[planes + j],
-                        ),
-                  ]),
-                  if (vActive > 1) lineNo < Const(2, width: 16),
-                  if (chromaLines > 1) chromaNo < Const(2, width: 16),
-                  phase < Const(2, width: 2),
+                lineStart,
+                then: primeLine1(),
+                orElse: [
+                  If(
+                    ov == null ? allIdle : allIdle & ov.ready,
+                    then: [
+                      ...issue([
+                        for (var k = 0; k < planes; k++)
+                          if (k == 0 ? vActive > 1 : chromaLines > 1)
+                            (
+                              k == 0 ? Const(1) : active[k],
+                              nextAddr[k],
+                              Const(1),
+                              pitch[k],
+                            )
+                          else
+                            null,
+                        // Overlay line 0.
+                        if (ov != null)
+                          for (var j = 0; j < ovPlanes; j++)
+                            (
+                              ov.on & active[planes + j],
+                              ov.rowAddr[j],
+                              Const(0),
+                              pitch[planes + j],
+                            ),
+                      ]),
+                      if (vActive > 1) lineNo < Const(2, width: 16),
+                      if (chromaLines > 1) chromaNo < Const(2, width: 16),
+                      phase < Const(2, width: 2),
+                    ],
+                  ),
                 ],
               ),
             ]),
             CaseItem(Const(2, width: 2), [
               If(
-                allIdle,
-                then: [
-                  // Overlay line 1, if it is on the screen.
-                  if (ov != null)
-                    ...issue([
-                      for (var k = 0; k < planes; k++) null,
-                      for (var j = 0; j < ovPlanes; j++)
-                        (
-                          j == 0
-                              ? ov.on &
-                                    ov.height.gt(1) &
-                                    ov.dstY.lt(max(vActive - 1, 0))
-                              : ov.on &
-                                    active[planes + j] &
-                                    ov.height.gt(2) &
-                                    ov.dstY.lt(max(vActive - 2, 0)),
-                          nextAddr[planes + j],
-                          Const(1),
-                          pitch[planes + j],
-                        ),
-                    ]),
-                  phase < Const(3, width: 2),
+                lineStart,
+                then: primeLine2(),
+                orElse: [
+                  If(
+                    allIdle,
+                    then: [
+                      if (ov != null)
+                        ...issue([
+                          for (var k = 0; k < planes; k++) null,
+                          for (var j = 0; j < ovPlanes; j++)
+                            (
+                              ovSecond(j),
+                              nextAddr[planes + j],
+                              Const(1),
+                              pitch[planes + j],
+                            ),
+                        ]),
+                      phase < Const(3, width: 2),
+                    ],
+                  ),
                 ],
               ),
             ]),
@@ -965,71 +1161,12 @@ class HarborDualClockScanout extends Module {
               If(
                 lineStart,
                 then: [
-                  readSel < ~readSel,
-                  ...late(0),
-                  If(lineNo.lt(vActive), then: [lineNo < lineNo + 1]),
-                  // The line after an odd line is even: swap the chroma
-                  // lines and fetch the next one after the luma line.
-                  if (ov != null) ...[
-                    // Source line rEnter of the overlay starts.
-                    If(
-                      ov.on & rEnter.gte(1) & r17(rEnter).lt(r17(ov.height)),
-                      then: late(planes),
-                    ),
-                    for (var j = 1; j < ovPlanes; j++)
-                      If(
-                        ov.on &
-                            active[planes + j] &
-                            ~rEnter[0] &
-                            rEnter.gte(2) &
-                            r17(rEnter).lt(r17(ov.height)),
-                        then: late(planes + j),
-                      ),
-                    ovRow < rEnter,
-                  ],
+                  ...primaryState(),
+                  if (ov != null) ...overlayState(),
                   ...issue([
-                    for (var k = 0; k < planes; k++)
-                      (
-                        k == 0
-                            ? lineNo.lt(vActive)
-                            : readSel & chromaNo.lt(chromaLines) & active[k],
-                        nextAddr[k],
-                        k == 0 ? readSel : chromaSel,
-                        pitch[k],
-                      ),
-                    // The next source line, and at an even source line
-                    // the chroma line after the one that starts.
-                    if (ov != null)
-                      for (var j = 0; j < ovPlanes; j++)
-                        (
-                          j == 0
-                              ? ov.on &
-                                    rEnter.gte(1) &
-                                    (r17(rEnter) + 1).lt(r17(ov.height)) &
-                                    lineNo.lt(vActive)
-                              : ov.on &
-                                    active[planes + j] &
-                                    ~rEnter[0] &
-                                    rEnter.gte(2) &
-                                    (r17(rEnter) + 2).lt(r17(ov.height)) &
-                                    lineNo.lt(max(vActive - 1, 0)),
-                          nextAddr[planes + j],
-                          j == 0 ? ~rEnter[0] : ~rEnter[1],
-                          pitch[planes + j],
-                        ),
+                    ...primaryLines(),
+                    if (ov != null) ...overlayLines(),
                   ]),
-                  if (planes > 1)
-                    If(
-                      readSel,
-                      then: [
-                        chromaSel < ~chromaSel,
-                        for (var k = 1; k < planes; k++) ...late(k),
-                        If(
-                          chromaNo.lt(chromaLines),
-                          then: [chromaNo < chromaNo + 1],
-                        ),
-                      ],
-                    ),
                 ],
               ),
             ]),

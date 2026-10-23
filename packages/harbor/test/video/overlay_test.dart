@@ -44,12 +44,21 @@ int _byte(int a) => (_word(a & ~3) >> (8 * (a & 3))) & 0xff;
 /// prime it. The test sets the overlay inputs for frame f + 1 at pixel
 /// [setAt] of frame f. Every active pixel must match [overlayFrame], and
 /// the overlay requests of each frame must be [overlayFetches].
+///
+/// [slow] makes the prime of a state slow: for state i, request n after
+/// its frame start has latency l when `slow[i]` is (n, l). Then the first
+/// [lateRows] rows of that frame are not checked, and neither are its
+/// requests. The underrun counts named in [late] must be more than 0, and
+/// the others 0.
 Future<void> _run({
   required HarborPixelFormat primary,
   required List<HarborPixelFormat> overlay,
   required List<OverlayFrame> states,
   HarborCscCoefficients? csc,
   (int, int) setAt = (1, 0),
+  Map<int, (int, int)> slow = const {},
+  int lateRows = 2,
+  Set<String> late = const {},
 }) async {
   final ovCsc = csc ?? HarborCscCoefficients.bt601Limited;
   final pixelClk = SimpleClockGenerator(20).clk;
@@ -190,12 +199,30 @@ Future<void> _run({
   final firstRequest = <int, int>{};
   var frame = -1;
   var checked = 0;
+  // The request index and latency of the slow request of the next frame.
+  (int, int)? slowAt;
+  final slowSeen = <int>{};
+  bool isSlow(int f) => slow.containsKey(f - 2);
   while (frame < frames) {
     await pixelClk.nextNegedge;
     final (gx, gy) = (gen.x.value.toInt(), gen.y.value.toInt());
     if (gx == 0 && gy == 0) frame++;
     if (gx == 0 && gy == _timing.vActive) {
       firstRequest[frame + 1] = mem.requests.length;
+      if (slow[frame + 1 - 2] case (final n, final l)) {
+        slowAt = (mem.requests.length + n, l);
+      }
+    }
+    if (slowAt case (final at, final l)) {
+      if (mem.requests.length == at) {
+        mem.latency = l;
+      } else if (mem.requests.length > at) {
+        mem.latency = 4;
+        slowAt = null;
+      }
+    }
+    if (isSlow(frame) && gy == 4 && disp.underrun.value.toInt() == 1) {
+      slowSeen.add(frame);
     }
     history.add(frame);
     if ((gx, gy) == setAt && frame >= 0) set(stateOf(frame + 1));
@@ -203,6 +230,7 @@ Future<void> _run({
     final f = history[history.length - 1 - delay];
     if (f < 2 || f >= frames || disp.de.value.toInt() != 1) continue;
     final (px, py) = (disp.x.value.toInt(), disp.y.value.toInt());
+    if (isSlow(f) && py < lateRows) continue;
     expect(
       [
         disp.red.value.toInt(),
@@ -214,10 +242,15 @@ Future<void> _run({
     );
     checked++;
   }
-  expect(checked, states.length * _timing.hActive * _timing.vActive);
+  expect(
+    checked,
+    (states.length * _timing.vActive - slow.length * lateRows) *
+        _timing.hActive,
+  );
 
   // The overlay requests of each frame, joined into lines.
   for (var f = 2; f < frames; f++) {
+    if (isSlow(f)) continue;
     final lines = <(int, int)>[];
     for (final (a, beats) in mem.requests.sublist(
       firstRequest[f]!,
@@ -245,9 +278,19 @@ Future<void> _run({
     );
     expect(lines, hasLength(fetches.length), reason: 'frame $f twice');
   }
-  for (var j = 0; j < n; j++) {
-    expect(disp.output('overlay_underrun_count_$j').value.toInt(), 0);
+  final counts = [
+    for (final name in disp.outputs.keys)
+      if (name.contains('underrun_count')) name,
+  ];
+  for (final name in counts) {
+    expect(
+      disp.output(name).value.toInt(),
+      late.contains(name) ? greaterThan(0) : 0,
+      reason: name,
+    );
   }
+  expect(late.difference(counts.toSet()), isEmpty);
+  expect(slowSeen, {for (final i in slow.keys) i + 2});
   expect(disp.underrun.value.toInt(), 0);
 }
 
@@ -460,6 +503,58 @@ void main() {
           alpha: 180,
         ),
       ],
+    );
+  });
+
+  // Line 0 comes so late that the first line start comes before the
+  // prime ends. Rows 0 and 1 are late, and the rows after them must be the
+  // correct rows.
+  test('a line start in the prime counts the late lines', () {
+    const full = OverlayFrame(
+      dstX: 0,
+      dstY: 0,
+      width: 16,
+      height: 8,
+      alpha: 128,
+    );
+    const low = OverlayFrame(
+      srcX: 2,
+      srcY: 2,
+      dstX: 2,
+      dstY: 3,
+      width: 10,
+      height: 4,
+    );
+    return _run(
+      primary: HarborPixelFormat.xrgb8888,
+      overlay: const [HarborPixelFormat.nv12],
+      states: const [full, full, low, low],
+      slow: const {0: (0, 620), 2: (0, 620)},
+      late: const {
+        'plane_underrun_count_0',
+        'overlay_underrun_count_0',
+        'overlay_underrun_count_1',
+      },
+    );
+  });
+
+  // Primary line 1 comes so late that the first line start comes in the
+  // second prime step, before overlay line 1 goes.
+  test('a line start in the second prime step counts the late lines', () {
+    const top = OverlayFrame(dstX: 0, dstY: 0, width: 16, height: 8);
+    const inside = OverlayFrame(
+      dstX: 1,
+      dstY: 1,
+      width: 12,
+      height: 6,
+      alpha: 99,
+    );
+    return _run(
+      primary: HarborPixelFormat.nv12,
+      overlay: const [HarborPixelFormat.xrgb8888],
+      states: const [top, top, inside, inside],
+      slow: const {0: (2, 580), 2: (2, 580)},
+      late: const {'plane_underrun_count_0', 'overlay_underrun_count_0'},
     );
   });
 
