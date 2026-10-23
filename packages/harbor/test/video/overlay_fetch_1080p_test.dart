@@ -170,16 +170,116 @@ void main() {
     ]);
   }, timeout: const Timeout(Duration(minutes: 150)));
 
-  // An even line fetches a luma line, a chroma line and an overlay line
-  // in plane order: 2880 words, 713 MB/s over a 14.8 us line. 150 MHz
-  // (600 MB/s) is not enough, and at 200 MHz the overlay line still ends
-  // after the next line start. 250 MHz gives 3703 cycles a line.
-  test('nv12 with a full screen xrgb8888 overlay on a 1000 MB/s memory never '
+  // An even line fetches a luma line, a chroma line and an overlay line:
+  // 2880 words, 713 MB/s over a 14.8 us line. The luma and overlay lines
+  // go first, and the chroma line has two line times. 200 MHz gives 2962
+  // cycles a line.
+  test('nv12 with a full screen xrgb8888 overlay on an 800 MB/s memory never '
       'underruns', () async {
-    expect(await _scan(width: 1920, height: 1080, dstX: 0, sysPs: 4000), [
+    expect(await _scan(width: 1920, height: 1080, dstX: 0, sysPs: 5000), [
       0,
       0,
       0,
     ]);
   }, timeout: const Timeout(Duration(minutes: 150)));
+
+  // 150 MHz (600 MB/s) cannot fetch 2400 words of luma and overlay in the
+  // 2222 cycles of a line.
+  test('a full screen xrgb8888 overlay on a 600 MB/s memory shows an '
+      'underrun on the display ports', () async {
+    final (count, flag) = await _display(sysPs: 6667);
+    expect(count, greaterThan(0));
+    expect(flag, isTrue);
+  }, timeout: const Timeout(Duration(minutes: 150)));
+}
+
+/// A display with 1080p60 line timing and 4 active lines, an nv12 primary
+/// and a full screen xrgb8888 overlay at alpha 128, with a memory clock of
+/// [sysPs]. The frame start comes after the active lines from reset, so
+/// fewer lines keep the simulation short. Returns the overlay underrun
+/// count and whether `underrun` was high in the last active line, both
+/// from the display ports.
+Future<(int, bool)> _display({required int sysPs}) async {
+  const timing = HarborDisplayTiming(
+    hActive: _hActive,
+    hFrontPorch: 88,
+    hSyncWidth: 44,
+    hBackPorch: 148,
+    vActive: 4,
+    vFrontPorch: 1,
+    vSyncWidth: 1,
+    vBackPorch: 1,
+    pixelClock: 148500000,
+  );
+  const pitch = 2048;
+  final pixelClk = SimpleClockGenerator(_pixelPs).clk;
+  final sysClk = SimpleClockGenerator(sysPs).clk;
+  final pixelReset = Logic(name: 'pixel_reset');
+  final sysReset = Logic(name: 'sys_reset');
+  final memory = HarborMemoryWaist(
+    const HarborMemoryWaistConfig(
+      addressWidth: 32,
+      dataWidth: 32,
+      outstanding: 4,
+    ),
+  );
+  final disp = HarborDualClockDisplay(
+    target: const HarborSimTarget(),
+    timing: timing,
+    pixelClk: pixelClk,
+    pixelReset: pixelReset,
+    sysClk: sysClk,
+    sysReset: sysReset,
+    enable: Const(1),
+    fbBase: Const(_y, width: 32),
+    memory: memory,
+    outputType: HarborDisplayInterface.parallelRgb,
+    pixelFormat: HarborPixelFormat.nv12,
+    planeBase: [Const(_c, width: 32)],
+    planePitch: [Const(pitch, width: 32), Const(pitch, width: 32)],
+    overlayFormats: const [HarborPixelFormat.xrgb8888],
+    overlayEnable: Const(1),
+    overlayBase: [Const(_ov, width: 32)],
+    overlayPitch: [Const(_ovPitch, width: 32)],
+    overlaySrcX: Const(0, width: 12),
+    overlaySrcY: Const(0, width: 3),
+    overlayDstX: Const(0, width: 12),
+    overlayDstY: Const(0, width: 3),
+    overlayWidth: Const(_hActive, width: 12),
+    overlayHeight: Const(timing.vActive, width: 3),
+    overlayAlpha: Const(128, width: 8),
+  );
+  await disp.build();
+  WaistMemory(memory, sysClk, latency: _latency, depth: 4);
+  final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
+
+  pixelReset.inject(1);
+  sysReset.inject(1);
+  Simulator.setMaxSimTime(1 << 40);
+  unawaited(Simulator.run());
+  await pixelClk.nextPosedge;
+  await pixelClk.nextPosedge;
+  pixelReset.inject(0);
+  sysReset.inject(0);
+
+  // The first frame start, then the frame it primes.
+  var frame = 0;
+  var flag = false;
+  while (true) {
+    await pixelClk.nextNegedge;
+    final (x, y) = (gen.x.value.toInt(), gen.y.value.toInt());
+    if (x == 0 && y == timing.vActive) frame++;
+    if (frame == 2) break;
+    if (frame == 1 && y == timing.vActive - 1 && x == _hActive) {
+      flag = disp.underrun.value.toInt() == 1;
+    }
+  }
+  final count = disp.output('overlay_underrun_count_0').value.toInt();
+  print(
+    'nv12 + full screen xrgb8888 overlay on the display, 1080p60 lines, '
+    'memory ${(1e6 / sysPs).toStringAsFixed(0)} MHz: overlay underrun '
+    'count $count, underrun $flag, plane underrun counts '
+    '${[for (var k = 0; k < 2; k++) disp.output('plane_underrun_count_$k').value.toInt()]}',
+  );
+  return (count, flag);
 }
