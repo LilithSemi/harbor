@@ -118,9 +118,9 @@ class HarborScanoutOverlay {
 /// above. A plane with a vertical subsampling of 2 has one line for two
 /// luma lines. Its next line is fetched at the start of each even luma
 /// line, after the plane 0 line, so it has two line times to complete.
-/// The lines of one line start cross to the system side as one request,
-/// and the system side fetches them in plane order. When more than one
-/// plane waits, the lowest plane goes first. No line past the frame is
+/// The lines of one line start cross to the system side as one request.
+/// When more than one plane waits, plane 0 goes first, then overlay plane
+/// 0, then the other planes in plane order. No line past the frame is
 /// fetched. If the first line start comes before the prime ends, the prime
 /// stops there. A line that was not requested in time counts as an
 /// underrun, and the lines after it go to the correct buffers.
@@ -132,7 +132,8 @@ class HarborScanoutOverlay {
 ///
 /// Give [overlay] to fetch an overlay plane on the same memory port. It
 /// makes a planar build. The overlay planes come after the primary planes
-/// in the request mask, so the system side fetches them last. An overlay
+/// in the request mask. Overlay plane 0 goes before the primary chroma
+/// planes, because they have two line times. An overlay
 /// plane line holds only the words from the word of the first source pixel
 /// to the word of the last visible source pixel, plus one word when the
 /// plane reads one pixel ahead. The scanout fetches overlay lines only for
@@ -834,7 +835,7 @@ class HarborDualClockScanout extends Module {
     Logic r17(Logic v) => v.zeroExtend(17);
 
     // One request carries the lines of all planes for a line start. The
-    // system side takes them together, so it fetches them in plane order.
+    // system side takes them together.
     // Each entry is (fetch, address, fill, pitch), null for no fetch.
     List<Conditional> issue(List<(Logic, Logic, Logic, Logic)?> lines) {
       lines = [...lines, for (var k = lines.length; k < all; k++) null];
@@ -1175,8 +1176,7 @@ class HarborDualClockScanout extends Module {
       ),
     ]);
 
-    // System domain: one pending request for each plane, the lowest plane
-    // goes first.
+    // System domain: one pending request for each plane.
     List<Logic> sregs(String n, [int w = 1]) => [
       for (var k = 0; k < all; k++) Logic(name: 's${k}_$n', width: w),
     ];
@@ -1314,20 +1314,31 @@ class HarborDualClockScanout extends Module {
       }
     }
 
-    Conditional pickNext(int k) => If(
-      pending[k],
-      then: [
-        curAddr < pendAddr[k],
-        curWords < pendWords[k],
-        curFill < pendFill[k],
-        curTog < pendTog[k],
-        curPlane < Const(k, width: planeW),
-        pending[k] < Const(0),
-        fetchStartReg < Const(1),
-        sysBusy < Const(1),
-      ],
-      orElse: [if (k + 1 < all) pickNext(k + 1)],
-    );
+    // The planes that the next line needs go first: primary plane 0, then
+    // overlay plane 0. The chroma planes have two line times.
+    final order = [
+      0,
+      if (ovPlanes > 0) planes,
+      for (var k = 1; k < planes; k++) k,
+      for (var j = 1; j < ovPlanes; j++) planes + j,
+    ];
+    Conditional pickNext(int i) {
+      final k = order[i];
+      return If(
+        pending[k],
+        then: [
+          curAddr < pendAddr[k],
+          curWords < pendWords[k],
+          curFill < pendFill[k],
+          curTog < pendTog[k],
+          curPlane < Const(k, width: planeW),
+          pending[k] < Const(0),
+          fetchStartReg < Const(1),
+          sysBusy < Const(1),
+        ],
+        orElse: [if (i + 1 < all) pickNext(i + 1)],
+      );
+    }
 
     Sequential(sysClk, reset: sysReset, [
       rSync0 < reqToggle,
