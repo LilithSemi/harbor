@@ -134,10 +134,12 @@ class HarborScanoutOverlay {
 /// plane line holds only the words from the word of the first source pixel
 /// to the word of the last visible source pixel, plus one word when the
 /// plane reads one pixel ahead. The scanout fetches overlay lines only for
-/// the screen lines in the overlay. Source line r is in buffer `r & 1` and
-/// chroma line c in buffer `c & 1`. The two first lines are fetched after
-/// the first two primary lines at frame start. After that each line start
-/// fetches the next line, as for the primary planes.
+/// the screen lines in the overlay. Overlay line r (source line
+/// `src_y + r`) is in buffer `r & 1`, and overlay chroma line c in buffer
+/// `c & 1`. Overlay line 0 goes with primary line 1 at frame start, when
+/// the address of the first source line is ready. Overlay line 1 goes when
+/// that request is done. After that each line start fetches the next
+/// line, as for the primary planes.
 ///
 /// The scanout aligns the source origin to the chroma samples: it clears
 /// bit 0 of `src_x` for a 4:2:2 or 4:2:0 format and bit 0 of `src_y` for
@@ -1161,7 +1163,8 @@ class HarborDualClockScanout extends Module {
           underrunReg.sublist(planes).rswizzle();
       addOutput('overlay_on') <= ov.on;
       if (ov.format != null) {
-        addOutput('overlay_frame_format', width: ov.format!.width) <= ov.format!;
+        addOutput('overlay_frame_format', width: ov.format!.width) <=
+            ov.format!;
       }
       for (final (name, v) in [
         ('overlay_frame_src_x', ov.srcX),

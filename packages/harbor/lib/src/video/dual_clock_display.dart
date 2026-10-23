@@ -88,9 +88,10 @@ import 'video_timing.dart';
 /// the right edge of the crop repeats its last chroma sample. src_x must
 /// be even for a 4:2:2 or 4:2:0 format and src_y even for 4:2:0. If not,
 /// the scanout clears bit 0 and the crop moves one pixel left or up. The
-/// overlay and the primary go through [HarborAlphaBlend]. A build has the
-/// `overlay_underrun` and `overlay_underrun_count_<n>` outputs, and the
-/// `plane_underrun` outputs also for one primary plane.
+/// overlay and the primary go through [HarborAlphaBlend]. An overlay build
+/// has the `overlay_underrun` and `overlay_underrun_count_<n>` outputs,
+/// and the `plane_underrun` outputs also for one primary plane. Its
+/// [underrun] includes the overlay planes.
 class HarborDualClockDisplay extends Module {
   /// Pixel cycles from the timing generator to the parallel outputs: one for
   /// the line buffer read and one for the output register. A build with a
@@ -1006,18 +1007,19 @@ class HarborDualClockDisplay extends Module {
       overlayCsc = csc;
       ov = [csc.red, csc.green, csc.blue];
       if (rgbSet) {
-        Logic late(Logic v, String name) {
+        // An RGB frame skips the conversion, with the same delay.
+        Logic skip(Logic v, String name) {
           for (var s = s0 + 1; s <= ovStage; s++) {
             v = delay(v, '${name}_s$s');
           }
           return v;
         }
 
-        final isYuv = late(unpack.yuv, 'overlay_yuv');
+        final isYuv = skip(unpack.yuv, 'overlay_yuv');
         ov = [
-          mux(isYuv, csc.red, late(unpack.red, 'overlay_rgb_red')),
-          mux(isYuv, csc.green, late(unpack.green, 'overlay_rgb_green')),
-          mux(isYuv, csc.blue, late(unpack.blue, 'overlay_rgb_blue')),
+          mux(isYuv, csc.red, skip(unpack.red, 'overlay_rgb_red')),
+          mux(isYuv, csc.green, skip(unpack.green, 'overlay_rgb_green')),
+          mux(isYuv, csc.blue, skip(unpack.blue, 'overlay_rgb_blue')),
         ];
       }
     } else {
