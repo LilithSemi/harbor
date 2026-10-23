@@ -23,6 +23,9 @@ class Gtpe2StatusModel {
   /// When true, PLL0LOCK stays low.
   bool pllStuck = false;
 
+  /// When true, DRPRDY stays low.
+  bool drpStuck = false;
+
   /// Cycles from the start to the MMCM lock.
   int mmcmLockDelay;
 
@@ -164,7 +167,7 @@ class Gtpe2StatusModel {
   void _step() {
     final ch0 = channels[0];
 
-    ch0.port('DRPRDY').put(_drpPending ? 1 : 0);
+    ch0.port('DRPRDY').put(_drpPending && !drpStuck ? 1 : 0);
     ch0.port('DRPDO').put(_drp011);
     if (_drpPending && _drpPendingWrite) _drp011 = _drpPendingData;
     _drpPending = _hi(ch0.port('DRPEN'));

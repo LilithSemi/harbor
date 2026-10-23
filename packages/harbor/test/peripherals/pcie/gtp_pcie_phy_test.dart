@@ -15,6 +15,7 @@ const _timeouts = HarborGtpPcieTimeouts(
   mmcmLock: 100,
   txSync: 40,
   rate: 60,
+  drp: 20,
 );
 
 const _porFlops = {'por_lock_0', 'por_lock_1', 'por_count'};
@@ -439,6 +440,31 @@ void main() {
       expect(b.failState, _S.idle);
       await b.waitFor(_S.idle);
       expect(b.retries, 1);
+      await b.finish();
+    });
+
+    test('a DRP timeout retries once per attempt with its own code', () async {
+      final b = await _Bench.start(setup: (m) => m.drpStuck = true);
+      await b.waitFor(_S.gtReset);
+      await b.until(() => b.retries == 1, limit: 200);
+      expect(b.failState, _S.drpReset);
+      b.model.drpStuck = false;
+      await b.waitFor(_S.idle);
+      expect(b.retries, 1);
+      expect(b.failState, _S.drpReset);
+      await b.finish();
+    });
+
+    test('a DRP timeout on every attempt counts each attempt once', () async {
+      final b = await _Bench.start(setup: (m) => m.drpStuck = true);
+      await b.waitFor(_S.gtReset);
+      await b.until(() => b.retries == 1, limit: 200);
+      // One attempt takes well over 20 cycles. Counting once per cycle
+      // would be far above this bound.
+      await b.cycles(1000);
+      expect(b.failState, _S.drpReset);
+      expect(b.retries, inInclusiveRange(2, 1000 ~/ 20));
+      expect(b.trace, isNot(contains(_S.idle)));
       await b.finish();
     });
 

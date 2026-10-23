@@ -50,6 +50,9 @@ class HarborGtpDrpReset extends Module {
     final timeout = timeoutHit & ~timerCleared;
     final completed = state.eq(Const(restoreWait, width: 3)) & drpReady;
     final doneQ = Logic(name: 'done_q');
+    // failed_q blocks a new transaction until start falls. failed is a pulse.
+    final failedQ = Logic(name: 'failed_q');
+    final failedPulse = Logic(name: 'failed_pulse');
     final waiting =
         state.eq(Const(readWait, width: 3)) |
         state.eq(Const(writeMaskedWait, width: 3)) |
@@ -63,7 +66,7 @@ class HarborGtpDrpReset extends Module {
         state,
         [
           CaseItem(Const(idle, width: 3), [
-            If(start & ~doneQ, then: [next < Const(read, width: 3)]),
+            If(start & ~doneQ & ~failedQ, then: [next < Const(read, width: 3)]),
           ]),
           CaseItem(Const(read, width: 3), [next < Const(readWait, width: 3)]),
           CaseItem(Const(readWait, width: 3), [
@@ -90,7 +93,6 @@ class HarborGtpDrpReset extends Module {
       If(waiting & timeout, then: [next < Const(idle, width: 3)]),
     ]);
 
-    final failedQ = Logic(name: 'failed_q');
     Sequential(
       clk,
       [
@@ -109,7 +111,14 @@ class HarborGtpDrpReset extends Module {
           state.eq(Const(readWait, width: 3)) & drpReady,
           then: [saved < drpDataOut],
         ),
-        If(waiting & timeout, then: [failedQ < 1]),
+        failedPulse < (waiting & timeout),
+        If(
+          ~start,
+          then: [failedQ < 0],
+          orElse: [
+            If(waiting & timeout, then: [failedQ < 1]),
+          ],
+        ),
         If(
           ~start,
           then: [doneQ < 0],
@@ -123,13 +132,13 @@ class HarborGtpDrpReset extends Module {
     );
 
     addOutput('gt_reset') <=
-        (state.eq(Const(idle, width: 3)) & start & ~doneQ) |
+        (state.eq(Const(idle, width: 3)) & start & ~doneQ & ~failedQ) |
             state.eq(Const(read, width: 3)) |
             state.eq(Const(readWait, width: 3)) |
             state.eq(Const(writeMasked, width: 3)) |
             state.eq(Const(writeMaskedWait, width: 3));
     addOutput('done') <= doneQ;
-    addOutput('failed') <= failedQ;
+    addOutput('failed') <= failedPulse;
     addOutput('drp_addr', width: 9) <= Const(0x011, width: 9);
     addOutput('drp_data_in', width: 16) <=
         mux(

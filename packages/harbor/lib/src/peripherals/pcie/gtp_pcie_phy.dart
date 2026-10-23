@@ -135,6 +135,9 @@ enum HarborGtpResetState {
   /// Only in `reset_fail_state`: a rate change did not complete.
   rateChange(13),
 
+  /// Only in `reset_fail_state`: the receive reset DRP transaction timed out.
+  drpReset(14),
+
   /// Only in `reset_fail_state`: no failure since PERST#.
   none(15);
 
@@ -171,6 +174,9 @@ class HarborGtpPcieTimeouts {
   /// Wait for TXRATEDONE, RXRATEDONE and PHYSTATUS after a rate change.
   final int rate;
 
+  /// Each wait for DRPRDY in the receive reset DRP transaction.
+  final int drp;
+
   const HarborGtpPcieTimeouts({
     this.pllLock = 1 << 18,
     this.resetDone = 1 << 17,
@@ -178,6 +184,7 @@ class HarborGtpPcieTimeouts {
     this.mmcmLock = 1 << 17,
     this.txSync = 1 << 12,
     this.rate = 1 << 14,
+    this.drp = 1 << 12,
   });
 
   List<int> get all => [
@@ -187,6 +194,7 @@ class HarborGtpPcieTimeouts {
     mmcmLock,
     txSync,
     rate,
+    drp,
   ];
 }
 
@@ -274,7 +282,7 @@ class HarborGtpPcieLane extends Module {
     required Logic drpDataIn,
     required Logic drpEnable,
     required Logic drpWrite,
-    this.pipeStages = 0,
+    required this.pipeStages,
     super.name = 'gtp_pcie_lane',
   }) : super(
          definitionName: pipeStages == 0
@@ -673,6 +681,7 @@ class HarborGtpPciePhy extends Module {
       rxPmaResetDone: pma,
       drpReady: lane0.drpReady,
       drpDataOut: lane0.drpDataOut,
+      timeoutCycles: timeouts.drp,
     );
     laneGtReset <= gtRst | drpReset.gtReset;
     drpAddr <= drpReset.drpAddr;
@@ -791,7 +800,7 @@ class HarborGtpPciePhy extends Module {
     ]);
     // A failure is registered, so it starts the retry one cycle after the
     // cause. The cycle after a failure cannot fail again, so a lock loss
-    // counts once. A DRP failure stays until reset.
+    // counts once. A DRP failure is a one cycle pulse and takes the same path.
     final failNow = (timedOut | lostLock | rateFail).named('fail_now');
     final fail = Logic(name: 'fail');
     final failCause = Logic(name: 'fail_cause', width: 4);
@@ -807,7 +816,12 @@ class HarborGtpPciePhy extends Module {
       [
         state < next,
         fail < drpReset.failed | (failNow & ~fail),
-        failCause < mux(rateFail, s(_S.rateChange), state),
+        failCause <
+            mux(
+              drpReset.failed,
+              s(_S.drpReset),
+              mux(rateFail, s(_S.rateChange), state),
+            ),
         timerZero < fail | ~next.eq(state),
         for (final MapEntry(key: n, value: hit) in hits.entries)
           hit < timer.eq(Const(n - 2, width: tw)),

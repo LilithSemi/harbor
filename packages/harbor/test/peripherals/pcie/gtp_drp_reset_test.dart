@@ -79,10 +79,12 @@ void main() {
     await clk.nextPosedge;
     reset.inject(0);
     start.inject(1);
-    for (var i = 0; i < 10; i++) {
-      await clk.nextPosedge;
+    var pulses = 0;
+    for (var i = 0; i < 30; i++) {
+      await clk.nextNegedge;
+      if (dut.failed.value.toBool()) pulses++;
     }
-    expect(dut.failed.value.toBool(), isTrue);
+    expect(pulses, 1);
     await Simulator.endSimulation();
   });
   test('fails after timeoutCycles cycles in a wait', () async {
