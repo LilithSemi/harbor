@@ -74,6 +74,7 @@ export 'src/soc/svd.dart';
 export 'src/soc/target.dart';
 
 // Video
+export 'src/video/csc.dart';
 export 'src/video/display_output.dart';
 export 'src/video/double_buffer_scanout.dart';
 export 'src/video/double_line_buffer.dart';
