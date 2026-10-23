@@ -90,8 +90,31 @@ Future<Directory> _synth(String flow, HarborDeviceTarget? target) async {
   return dir;
 }
 
-/// Runs nextpnr with a 45 minute limit, then checks the exit code, Fmax
-/// and hold.
+/// The parameters of every cell of [type] in the netlist of the bench.
+/// Parameters that are bit strings become integers.
+List<Map<String, Object?>> _cells(Directory dir, String type) {
+  final json =
+      jsonDecode(File('${dir.path}/bench.json').readAsStringSync())
+          as Map<String, dynamic>;
+  final out = <Map<String, Object?>>[];
+  for (final m in (json['modules'] as Map<String, dynamic>).values) {
+    final cells = (m as Map<String, dynamic>)['cells'] as Map<String, dynamic>;
+    for (final c in cells.values) {
+      if ((c as Map<String, dynamic>)['type'] != type) continue;
+      final params = c['parameters'] as Map<String, dynamic>;
+      out.add({
+        for (final e in params.entries)
+          e.key: e.value is String && RegExp(r'^[01]+$').hasMatch(e.value)
+              ? int.parse(e.value as String, radix: 2)
+              : e.value,
+      });
+    }
+  }
+  return out;
+}
+
+/// Runs nextpnr with a 45 minute limit, then checks the exit code and Fmax.
+/// These nextpnr versions print no hold analysis, so hold is not checked.
 Future<void> _route(Directory dir, List<String> nextpnr) async {
   final d = dir.path;
   final pnr = await Process.run('timeout', [
@@ -112,12 +135,6 @@ Future<void> _route(Directory dir, List<String> nextpnr) async {
     'pnr.log',
   ], workingDirectory: d);
   expect(pnr.exitCode, 0, reason: 'did not route: ${pnr.stderr}');
-  final log = File('$d/pnr.log').readAsStringSync();
-  expect(
-    RegExp(r'hold (time )?violation', caseSensitive: false).hasMatch(log),
-    isFalse,
-    reason: 'hold',
-  );
   final report =
       jsonDecode(File('$d/report.json').readAsStringSync())
           as Map<String, dynamic>;
@@ -133,6 +150,15 @@ void main() {
     'the color conversion meets 148.5 MHz on an ECP5 85F',
     () async {
       final dir = await _synth('synth_ecp5', _ecp5);
+      final mults = _cells(dir, 'MULT18X18D');
+      printOnFailure('$mults');
+      expect(mults, hasLength(9));
+      for (final m in mults) {
+        expect(m['REG_INPUTA_CLK'], 'CLK0');
+        expect(m['REG_INPUTB_CLK'], 'CLK0');
+        expect(m['REG_OUTPUT_CLK'], 'CLK0');
+        expect(m['REG_PIPELINE_CLK'] ?? 'NONE', 'NONE');
+      }
       await _route(dir, ['nextpnr-ecp5', '--85k', '--package', 'CABGA381']);
     },
     timeout: const Timeout(Duration(minutes: 50)),
@@ -143,6 +169,16 @@ void main() {
     'the color conversion meets 148.5 MHz on an Artix-7 200T',
     () async {
       final dir = await _synth('synth_xilinx -flatten', null);
+      // Himbaechel may not time the DSP48E1 arcs, so the registers of the
+      // multipliers are checked in the netlist.
+      final dsps = _cells(dir, 'DSP48E1');
+      printOnFailure('$dsps');
+      expect(dsps, hasLength(9));
+      for (final d in dsps) {
+        expect(d['AREG'], isNot(0));
+        expect(d['BREG'], isNot(0));
+        expect(d['MREG'], 1);
+      }
       // The AX7203 clock, LED1 and LED2 pins.
       File('${dir.path}/top.xdc').writeAsStringSync('''
 set_property -dict {PACKAGE_PIN R4 IOSTANDARD LVCMOS15} [get_ports clk]
