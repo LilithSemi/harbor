@@ -8,6 +8,7 @@ import '../soc/target.dart';
 import 'tmds_serializer.dart';
 
 import '../peripherals/display.dart';
+import 'csc.dart';
 import 'display_output.dart';
 import 'dual_clock_scanout.dart';
 import 'dvi_transmitter.dart';
@@ -57,16 +58,28 @@ import 'video_timing.dart';
 /// `plane_underrun_count_<n>` output for each plane, see
 /// [HarborDualClockScanout.planeUnderrunCount].
 ///
-/// A build with a YUV format unpacks the plane words with [unpack]. For a
-/// YUV frame, [red], [green] and [blue] show Y as grey.
+/// A build with a YUV format unpacks the plane words with [unpack] and
+/// converts a YUV frame to RGB with [csc]. It has the inputs
+/// `csc_coeff_0` to `csc_coeff_8`, `csc_in_offset_0` to `_2` and
+/// `csc_out_offset_0` to `_2` in the pixel domain, see
+/// [HarborCscCoefficients]. The display latches them at frame start, so a
+/// change takes effect at the next frame. The latches reset to
+/// [HarborCscCoefficients.bt709Limited], and an input that is not given is
+/// tied to that value. An RGB frame does not go through [csc].
 class HarborDualClockDisplay extends Module {
   /// Pixel cycles from the timing generator to the parallel outputs: one for
   /// the line buffer read and one for the output register. A build with a
-  /// YUV format adds the stages of [HarborPixelUnpack] after the read.
+  /// YUV format adds the stages of [HarborPixelUnpack] after the read and
+  /// the stages of [HarborCsc].
   final int pipelineDelay;
 
   /// The unpack of a build with a YUV format, null for an RGB build.
   late final HarborPixelUnpack? unpack;
+
+  /// The color conversion of a build with a YUV format, null for an RGB
+  /// build.
+  HarborCsc? get csc => _csc;
+  HarborCsc? _csc;
 
   /// Four serialized TMDS lanes, present only for dvi/hdmi.
   Logic get gpdi => output('gpdi');
@@ -138,6 +151,9 @@ class HarborDualClockDisplay extends Module {
     Logic? formatSel,
     List<Logic> planeBase = const [],
     List<Logic> planePitch = const [],
+    List<Logic>? cscCoeff,
+    List<Logic>? cscInOffset,
+    List<Logic>? cscOutOffset,
     HarborParallelRgbLatchEdge parallelRgbLatchEdge =
         HarborParallelRgbLatchEdge.falling,
     required HarborDeviceTarget target,
@@ -145,7 +161,7 @@ class HarborDualClockDisplay extends Module {
   }) : formats = List.unmodifiable(formats ?? [pixelFormat]),
        pixelFormat = (formats ?? [pixelFormat]).first,
        pipelineDelay = (formats ?? [pixelFormat]).any((f) => f.yuv)
-           ? HarborPixelUnpack.latency + 1
+           ? HarborPixelUnpack.latency + HarborCsc.stages + 1
            : 2,
        lineStride = lineStride ?? _lineBytes(timing, formats ?? [pixelFormat]),
        super(
@@ -196,6 +212,16 @@ class HarborDualClockDisplay extends Module {
       );
     }
     final rgb565 = this.pixelFormat == HarborPixelFormat.rgb565;
+    final hasYuv = this.formats.any((f) => f.yuv);
+    if (!hasYuv &&
+        (cscCoeff != null || cscInOffset != null || cscOutOffset != null)) {
+      throw ArgumentError('an RGB build has no color conversion inputs');
+    }
+    if ((cscCoeff != null && cscCoeff.length != 9) ||
+        (cscInOffset != null && cscInOffset.length != 3) ||
+        (cscOutOffset != null && cscOutOffset.length != 3)) {
+      throw ArgumentError('give 9 cscCoeff, 3 cscInOffset and 3 cscOutOffset');
+    }
 
     pixelClk = addInput('pixel_clk', pixelClk);
     pixelReset = addInput('pixel_reset', pixelReset);
@@ -315,7 +341,7 @@ class HarborDualClockDisplay extends Module {
     final planeWord = [
       for (var k = 0; k < planes; k++) Logic(name: 'plane${k}_word', width: 32),
     ];
-    final unpack = this.formats.any((f) => f.yuv)
+    final unpack = hasYuv
         ? HarborPixelUnpack(
             clk: pixelClk,
             reset: pixelReset,
@@ -444,14 +470,60 @@ class HarborDualClockDisplay extends Module {
       for (var s = 2; s < last; s++) {
         deLast = delay(deLast, 'de_s$s');
       }
-      // Grey from Y until a color conversion takes Y, Cb and Cr.
-      final grey = unpack.y.getRange(2, 10);
+      final reset = HarborCscCoefficients.bt709Limited.registers();
+      Logic setting(String name, Logic? v, int width, int resetValue) {
+        final port = addInput(
+          name,
+          v ?? Const(resetValue, width: width),
+          width: width,
+        );
+        return flop(
+          pixelClk,
+          port,
+          en: frameStart,
+          reset: pixelReset,
+          resetValue: resetValue,
+        ).named('${name}_frame');
+      }
+
+      final csc = HarborCsc(
+        clk: pixelClk,
+        target: target,
+        y: unpack.y,
+        cb: unpack.cb,
+        cr: unpack.cr,
+        coeff: [
+          for (var k = 0; k < 9; k++)
+            setting('csc_coeff_$k', cscCoeff?[k], 16, reset[k]),
+        ],
+        inOffset: [
+          for (var j = 0; j < 3; j++)
+            setting('csc_in_offset_$j', cscInOffset?[j], 10, reset[9 + j]),
+        ],
+        outOffset: [
+          for (var i = 0; i < 3; i++)
+            setting('csc_out_offset_$i', cscOutOffset?[i], 8, reset[12 + i]),
+        ],
+      );
+      _csc = csc;
       if (this.formats.every((f) => f.yuv)) {
-        r = g = b = grey;
+        r = csc.red;
+        g = csc.green;
+        b = csc.blue;
       } else {
-        r = mux(unpack.yuv, grey, unpack.red);
-        g = mux(unpack.yuv, grey, unpack.green);
-        b = mux(unpack.yuv, grey, unpack.blue);
+        // An RGB frame skips the conversion, with the same delay.
+        final s0 = HarborPixelUnpack.latency;
+        Logic match(Logic v, String name) {
+          for (var s = s0 + 1; s <= s0 + HarborCsc.stages; s++) {
+            v = delay(v, '${name}_s$s');
+          }
+          return v;
+        }
+
+        final isYuv = match(unpack.yuv, 'yuv');
+        r = mux(isYuv, csc.red, match(unpack.red, 'rgb_red'));
+        g = mux(isYuv, csc.green, match(unpack.green, 'rgb_green'));
+        b = mux(isYuv, csc.blue, match(unpack.blue, 'rgb_blue'));
       }
     } else if (planar && i565 >= 0) {
       final halfSel = delay(tx[0], 'half_s1');
@@ -529,8 +601,8 @@ class HarborDualClockDisplay extends Module {
 
     if (parallelRgb) {
       // No TMDS encoder or serializer, and no shift clock: rgb/hsync/vsync/de
-      // are already the registered, pixel-aligned stage-2 values above, and
-      // pclk is the pixel clock forwarded through the same edge.
+      // are already the registered, pixel-aligned values of the last stage
+      // above, and pclk is the pixel clock forwarded through the same edge.
       rgb <= [r2, g2, b2].swizzle();
       pclk <=
           HarborPixelClockForward(

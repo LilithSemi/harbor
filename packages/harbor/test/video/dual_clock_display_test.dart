@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import 'csc_reference.dart';
 import 'echo_memory.dart';
+import 'pixel_unpack_reference.dart';
 
 const _memConfig = HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32);
 
@@ -294,13 +297,235 @@ void main() {
     await _alignment(HarborPixelFormat.xrgb8888);
   });
 
-  // A YUV build shows Y as grey. The memory answers each word with its
-  // address, so Y is a byte of the address.
+  // A YUV build converts with BT.709 limited after reset. The memory
+  // answers each word with its address.
   for (final f in [HarborPixelFormat.nv12, HarborPixelFormat.yuyv]) {
     test('a ${f.name} frame leaves the pipeline with its sync', () async {
       await _alignment(f);
     });
   }
+
+  test('a yuyv display without csc inputs converts with BT.709 limited', () {
+    return _convert(
+      formats: [HarborPixelFormat.yuyv],
+      formatOf: (_) => 0,
+      setOf: (_) => HarborCscCoefficients.bt709Limited,
+      wired: false,
+    );
+  });
+
+  // The inputs change in the active part of each frame. The display must
+  // use them only from the next frame.
+  test('a new conversion set takes effect at the next frame start', () {
+    final sets = [
+      HarborCscCoefficients.bt601Full,
+      HarborCscCoefficients.bt2020Limited,
+      HarborCscCoefficients.bt709Full,
+    ];
+    return _convert(
+      formats: [HarborPixelFormat.yuyv],
+      formatOf: (_) => 0,
+      setOf: (f) => sets[f % 3],
+    );
+  });
+
+  // An xrgb8888 frame skips the conversion, a yuyv frame goes through it.
+  test('a mixed set converts a yuv frame and passes an rgb frame', () {
+    return _convert(
+      formats: [HarborPixelFormat.xrgb8888, HarborPixelFormat.yuyv],
+      formatOf: (f) => f % 2,
+      setOf: (f) => f.isEven
+          ? HarborCscCoefficients.bt601Limited
+          : HarborCscCoefficients.bt2020Full,
+    );
+  });
+
+  // The inputs hold another set and enable is low, so no frame start
+  // loads them.
+  test('the conversion latches reset to BT.709 limited', () async {
+    final clk = SimpleClockGenerator(10).clk;
+    final reset = Logic();
+    final other = HarborCscCoefficients.bt2020Full.registers();
+    final d = HarborDualClockDisplay(
+      target: const HarborSimTarget(),
+      timing: const HarborDisplayTiming.vga640x480(),
+      pixelClk: clk,
+      pixelReset: reset,
+      sysClk: clk,
+      sysReset: reset,
+      enable: Const(0),
+      fbBase: Const(0, width: 32),
+      memory: HarborMemoryWaist(_memConfig),
+      outputType: HarborDisplayInterface.parallelRgb,
+      pixelFormat: HarborPixelFormat.yuyv,
+      cscCoeff: [for (var k = 0; k < 9; k++) Const(other[k], width: 16)],
+      cscInOffset: [for (var j = 0; j < 3; j++) Const(other[9 + j], width: 10)],
+      cscOutOffset: [
+        for (var i = 0; i < 3; i++) Const(other[12 + i], width: 8),
+      ],
+    );
+    await d.build();
+    reset.inject(1);
+    unawaited(Simulator.run());
+    await clk.nextPosedge;
+    await clk.nextPosedge;
+    reset.inject(0);
+    for (var c = 0; c < 4; c++) {
+      await clk.nextPosedge;
+    }
+    final want = HarborCscCoefficients.bt709Limited.registers();
+    final names = [
+      for (var k = 0; k < 9; k++) 'csc_coeff_$k',
+      for (var j = 0; j < 3; j++) 'csc_in_offset_$j',
+      for (var i = 0; i < 3; i++) 'csc_out_offset_$i',
+    ];
+    for (final (k, name) in names.indexed) {
+      final latch = d.internalSignals.singleWhere(
+        (s) => s.name == '${name}_frame',
+      );
+      expect(latch.value.toInt(), want[k], reason: name);
+    }
+    await Simulator.endSimulation();
+    Simulator.reset();
+  });
+
+  test('an rgb build has no conversion inputs', () async {
+    final d = _buildDisplay(
+      timing: const HarborDisplayTiming.vga640x480(),
+      pixelFormat: HarborPixelFormat.xrgb8888,
+    );
+    await d.build();
+    expect(d.csc, isNull);
+    expect(d.inputs.keys.where((k) => k.startsWith('csc_')), isEmpty);
+  });
+}
+
+/// Runs [frames] frames of a 4x2 mode from a table memory. At pixel (1, 0)
+/// of frame f the test sets `format_sel` to `formatOf(f + 1)` and the
+/// conversion inputs to `setOf(f + 1)`. Every active pixel of frame 2 and
+/// up must match the unpack and conversion models.
+Future<void> _convert({
+  required List<HarborPixelFormat> formats,
+  required int Function(int frame) formatOf,
+  required HarborCscCoefficients Function(int frame) setOf,
+  bool wired = true,
+  int frames = 6,
+}) async {
+  const timing = HarborDisplayTiming(
+    hActive: 4,
+    hFrontPorch: 1,
+    hSyncWidth: 2,
+    hBackPorch: 1,
+    vActive: 2,
+    vFrontPorch: 1,
+    vSyncWidth: 1,
+    vBackPorch: 1,
+    pixelClock: 1000000,
+  );
+  const stride = 16;
+  const fbBase = 0x100;
+  final rng = Random(formats.length);
+  final table = {
+    for (var a = 0; a < 2 * stride; a += 4) fbBase + a: rng.nextInt(1 << 32),
+  };
+  List<int> line(int y) => [
+    for (var b = 0; b < stride; b++)
+      (table[fbBase + y * stride + (b & ~3)]! >> (8 * (b & 3))) & 0xff,
+  ];
+
+  final pixelClk = SimpleClockGenerator(14).clk;
+  final sysClk = SimpleClockGenerator(6).clk;
+  final pixelReset = Logic(name: 'pixel_reset');
+  final sysReset = Logic(name: 'sys_reset');
+  final memory = HarborMemoryWaist(_memConfig);
+  final multi = formats.length > 1;
+  final formatSel = multi ? Logic(name: 'format_sel') : null;
+  final coeff = [for (var k = 0; k < 9; k++) Logic(width: 16)];
+  final inOff = [for (var j = 0; j < 3; j++) Logic(width: 10)];
+  final outOff = [for (var i = 0; i < 3; i++) Logic(width: 8)];
+  final disp = HarborDualClockDisplay(
+    target: const HarborSimTarget(),
+    timing: timing,
+    pixelClk: pixelClk,
+    pixelReset: pixelReset,
+    shiftClk: sysClk,
+    shiftReset: sysReset,
+    sysClk: sysClk,
+    sysReset: sysReset,
+    enable: Const(1),
+    fbBase: Const(fbBase, width: 32),
+    memory: memory,
+    formats: formats,
+    formatSel: formatSel,
+    lineStride: multi ? null : stride,
+    planePitch: multi ? [Const(stride, width: 32)] : const [],
+    cscCoeff: wired ? coeff : null,
+    cscInOffset: wired ? inOff : null,
+    cscOutOffset: wired ? outOff : null,
+  );
+  final echo = EchoMemory(memory, sysClk, sysReset, table: table);
+  await disp.build();
+  await echo.build();
+  final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
+  final delay = disp.pipelineDelay;
+
+  void set(int frame) {
+    formatSel?.inject(formatOf(frame));
+    final regs = setOf(frame).registers();
+    for (var k = 0; k < 9; k++) {
+      coeff[k].inject(regs[k]);
+    }
+    for (var j = 0; j < 3; j++) {
+      inOff[j].inject(regs[9 + j]);
+      outOff[j].inject(regs[12 + j]);
+    }
+  }
+
+  pixelReset.inject(1);
+  sysReset.inject(1);
+  set(0);
+  Simulator.setMaxSimTime(50000000);
+  unawaited(Simulator.run());
+  addTearDown(() async {
+    if (!Simulator.simulationHasEnded) {
+      await Simulator.endSimulation();
+    }
+    Simulator.reset();
+  });
+  await pixelClk.nextPosedge;
+  await pixelClk.nextPosedge;
+  pixelReset.inject(0);
+  sysReset.inject(0);
+
+  // The frame of the timing generator on each cycle.
+  final history = <int>[];
+  var frame = -1;
+  var checked = 0;
+  while (frame < frames) {
+    await pixelClk.nextNegedge;
+    final (gx, gy) = (gen.x.value.toInt(), gen.y.value.toInt());
+    if (gx == 0 && gy == 0) frame++;
+    history.add(frame);
+    if (gx == 1 && gy == 0 && frame >= 0) set(frame + 1);
+    if (history.length <= delay) continue;
+    final f = history[history.length - 1 - delay];
+    if (f < 2 || disp.de.value.toInt() != 1) continue;
+    final (px, py) = (disp.x.value.toInt(), disp.y.value.toInt());
+    final fmt = formats[formatOf(f)];
+    final p = unpackLine(fmt, timing.hActive, [line(py)])[px];
+    final want = fmt.yuv ? cscFixed(setOf(f), p.a, p.b, p.c) : [p.a, p.b, p.c];
+    expect(
+      [
+        disp.red.value.toInt(),
+        disp.green.value.toInt(),
+        disp.blue.value.toInt(),
+      ],
+      equals(want),
+      reason: 'frame $f ($px,$py) ${fmt.name}',
+    );
+    checked++;
+  }
+  expect(checked, (frames - 2) * timing.hActive * timing.vActive);
 }
 
 Future<void> _alignment(HarborPixelFormat format) async {
@@ -354,7 +579,10 @@ Future<void> _alignment(HarborPixelFormat format) async {
   await echo.build();
   final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
   final delay = disp.pipelineDelay;
-  expect(delay, format.yuv ? HarborPixelUnpack.latency + 1 : 2);
+  expect(
+    delay,
+    format.yuv ? HarborPixelUnpack.latency + HarborCsc.stages + 1 : 2,
+  );
 
   pixelReset.inject(1);
   sysReset.inject(1);
@@ -395,11 +623,19 @@ Future<void> _alignment(HarborPixelFormat format) async {
         final (px, py) = (got[3], got[4]);
         final rgb = sample([disp.red, disp.green, disp.blue]);
         if (format.yuv) {
-          // Y byte: nv12 has 4 per word, yuyv has Y0 at byte 0, Y1 at 2.
-          final word = fbBase + py * stride + (planar ? px ~/ 4 : px ~/ 2) * 4;
-          final at = planar ? px % 4 : 2 * (px % 2);
-          final yByte = (word >> (8 * at)) & 0xff;
-          expect(rgb, equals([yByte, yByte, yByte]), reason: 'cycle $i');
+          List<int> line(int base) => [
+            for (var b = 0; b < stride; b++)
+              ((base + (b & ~3)) >> (8 * (b & 3))) & 0xff,
+          ];
+          final p = unpackLine(format, timing.hActive, [
+            line(fbBase + py * stride),
+            if (planar) line(chromaBase + (py >> 1) * stride),
+          ])[px];
+          expect(
+            rgb,
+            equals(cscFixed(HarborCscCoefficients.bt709Limited, p.a, p.b, p.c)),
+            reason: 'cycle $i',
+          );
         } else {
           expect(
             disp.pixelWord.value.toInt(),
