@@ -644,6 +644,15 @@ class HarborDualClockScanout extends Module {
     final planes = planeMaxWords.length;
     final ovFormats = overlay?.formats ?? const <HarborPixelFormat>[];
     if (overlay != null) checkFormats(ovFormats, 'overlay.formats');
+    // The overlay chroma row math is for 4:2:0.
+    for (final f in ovFormats) {
+      if (f.planes.length > 1 && f.vSub != 2) {
+        throw ArgumentError(
+          'the overlay supports a format of more than one plane only with a '
+          'vertical subsampling of 2, ${f.name} has ${f.vSub}',
+        );
+      }
+    }
     for (final f in {...formats, ...ovFormats}) {
       for (var k = 0; k < f.planes.length; k++) {
         final p = f.planes[k];
