@@ -37,6 +37,33 @@ class _BenchMaster extends BridgeModule {
   }
 }
 
+/// Fixed overlay inputs of a [BenchScanDisplay].
+class BenchOverlay {
+  final HarborPixelFormat format;
+  final List<int> base;
+  final List<int> pitch;
+  final int srcX;
+  final int srcY;
+  final int dstX;
+  final int dstY;
+  final int width;
+  final int height;
+  final int alpha;
+
+  const BenchOverlay({
+    required this.format,
+    required this.base,
+    required this.pitch,
+    this.srcX = 0,
+    this.srcY = 0,
+    this.dstX = 0,
+    this.dstY = 0,
+    required this.width,
+    required this.height,
+    this.alpha = 128,
+  });
+}
+
 /// [HarborDualClockDisplay] on a [HarborSdram] scanout port.
 class BenchScanDisplay extends BridgeModule {
   BenchScanDisplay({
@@ -45,6 +72,7 @@ class BenchScanDisplay extends BridgeModule {
     List<HarborPixelFormat>? formats,
     List<int> planeBases = const [],
     List<int> planePitches = const [],
+    BenchOverlay? overlay,
   }) : super('BenchScanDisplay', name: 'display') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -56,6 +84,8 @@ class BenchScanDisplay extends BridgeModule {
     createPort('rd_valid', PortDirection.input);
     createPort('rd_data', PortDirection.input, width: 16);
     final shift = Const(0);
+    final xw = max((timing.hTotal - 1).bitLength, timing.hActive.bitLength);
+    final yw = max((timing.vTotal - 1).bitLength, timing.vActive.bitLength);
     final d = HarborDualClockDisplay(
       target: const HarborSimTarget(),
       timing: timing,
@@ -77,7 +107,26 @@ class BenchScanDisplay extends BridgeModule {
         if (formats != null) Const(stride, width: 32),
         for (final p in planePitches) Const(p, width: 32),
       ],
+      overlayFormats: overlay == null ? null : [overlay.format],
+      overlayEnable: overlay == null ? null : Const(1),
+      overlayBase: [
+        for (final b in overlay?.base ?? <int>[]) Const(b, width: 32),
+      ],
+      overlayPitch: [
+        for (final p in overlay?.pitch ?? <int>[]) Const(p, width: 32),
+      ],
+      overlaySrcX: overlay == null ? null : Const(overlay.srcX, width: xw),
+      overlaySrcY: overlay == null ? null : Const(overlay.srcY, width: yw),
+      overlayDstX: overlay == null ? null : Const(overlay.dstX, width: xw),
+      overlayDstY: overlay == null ? null : Const(overlay.dstY, width: yw),
+      overlayWidth: overlay == null ? null : Const(overlay.width, width: xw),
+      overlayHeight: overlay == null ? null : Const(overlay.height, width: yw),
+      overlayAlpha: overlay == null ? null : Const(overlay.alpha, width: 8),
     );
+    if (overlay != null) {
+      addOutput('overlay_underrun_count', width: 16) <=
+          d.output('overlay_underrun_count_0');
+    }
     addOutput('rq_valid') <= d.rqValid;
     addOutput('rq_addr', width: 32) <= d.rqAddr;
     addOutput('rq_words', width: d.rqWords.width) <= d.rqWords;
@@ -112,6 +161,9 @@ class SdramScanoutBench {
   /// Base and pitch of each plane after plane 0.
   final List<int> planeBases;
   final List<int> planePitches;
+
+  /// The overlay of the display, or null.
+  final BenchOverlay? overlay;
 
   late final HarborSoC soc;
   late final HarborSdram sdram;
@@ -181,6 +233,7 @@ class SdramScanoutBench {
     this.formats,
     this.planeBases = const [],
     this.planePitches = const [],
+    this.overlay,
   }) {
     this.stride = stride ?? timing.hActive * 4;
   }
@@ -227,6 +280,7 @@ class SdramScanoutBench {
       formats: formats,
       planeBases: planeBases,
       planePitches: planePitches,
+      overlay: overlay,
     );
     soc.addSubModule(display);
     sdram = soc.addPeripheral(
