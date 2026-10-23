@@ -21,6 +21,9 @@ import '../peripherals/display.dart';
 /// The chroma columns read one pixel ahead, `(x + 1) >> shift`, so C[k + 1]
 /// is in the word that comes in and C[k] is in the word before it.
 /// A packed 4:2:2 format reads plane 0 the same way.
+///
+/// The right edge is pixel `hActive - 1`. Give [lastX] to set it at run
+/// time, for a line that starts at a pixel other than 0.
 class HarborPixelUnpack extends Module {
   /// Clocks from [x] to the outputs.
   static const latency = 3;
@@ -49,13 +52,14 @@ class HarborPixelUnpack extends Module {
     required List<Logic> planeData,
     required List<HarborPixelFormat> formats,
     required this.hActive,
+    Logic? lastX,
     super.name = 'pixel_unpack',
   }) : formats = List.unmodifiable(formats),
        super(
          definitionName:
              'HarborPixelUnpack'
              '_f${formats.map(harborPixelFormatBitOrder.indexOf).join('x')}'
-             '_w${hActive}_x${x.width}',
+             '_w${hActive}_x${x.width}${lastX != null ? '_e' : ''}',
        ) {
     if (formats.isEmpty || formats.contains(HarborPixelFormat.rgb888)) {
       throw ArgumentError('formats must not be empty or hold rgb888');
@@ -73,6 +77,7 @@ class HarborPixelUnpack extends Module {
     if (format != null) {
       format = addInput('format', format, width: format.width);
     }
+    if (lastX != null) lastX = addInput('last_x', lastX, width: x.width);
     final cur = [
       for (var k = 0; k < planes; k++)
         addInput('plane_data_$k', planeData[k], width: 32),
@@ -255,7 +260,11 @@ class HarborPixelUnpack extends Module {
       ];
       // An odd pixel takes the mean, but not at the right edge of an even
       // line, where C[k + 1] is not in the line.
-      final edge = hActive.isEven ? x1.eq(hActive - 1) : Const(0);
+      final edge = lastX != null
+          ? x1.eq(lastX.zeroExtend(x1.width))
+          : hActive.isEven
+          ? x1.eq(hActive - 1)
+          : Const(0);
       final mean = delay(odd & ~edge, 'mean_s2');
 
       // Stage 2: the mean of the two chroma samples.
