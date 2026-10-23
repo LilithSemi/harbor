@@ -70,6 +70,11 @@ class HarborDualClockScanout extends Module {
   /// One underrun bit for each plane, present only on a planar build.
   Logic get planeUnderrun => output('plane_underrun');
 
+  /// Lines of plane [n] that were not ready when their read started, on
+  /// [sysClk]. It stops at 0xffff and only the system reset clears it.
+  /// Present only on a planar build.
+  Logic planeUnderrunCount(int n) => output('plane_underrun_count_$n');
+
   /// The format index of the frame, present only on a planar build with
   /// more than one format.
   Logic get format => output('format');
@@ -610,6 +615,7 @@ class HarborDualClockScanout extends Module {
     final reqToggle = Logic(name: 'req_toggle');
     final reqMask = Logic(name: 'req_mask', width: planes);
     final want = regs('want');
+    final underrunTog = regs('underrun_toggle');
     final reqAddr = regs('req_addr', 32);
     final reqFill = regs('req_fill');
     final nextAddr = regs('next_addr', 32);
@@ -671,7 +677,10 @@ class HarborDualClockScanout extends Module {
 
     // A line that is not ready when its read starts.
     List<Conditional> late(int k) => [
-      If(outstanding[k], then: [underrunReg[k] < Const(1)]),
+      If(
+        outstanding[k],
+        then: [underrunReg[k] < Const(1), underrunTog[k] < ~underrunTog[k]],
+      ),
     ];
 
     Sequential(pixelClk, reset: pixelReset, [
@@ -779,6 +788,10 @@ class HarborDualClockScanout extends Module {
     final rSync0 = Logic(name: 'r_sync0');
     final rSync1 = Logic(name: 'r_sync1');
     final reqEdge = Logic(name: 'req_edge');
+    final uSync0 = sregs('u_sync0');
+    final uSync1 = sregs('u_sync1');
+    final uPrev = sregs('u_prev');
+    final uCount = sregs('underrun_count', 16);
     final pending = sregs('pending');
     final pendAddr = sregs('pend_addr', 32);
     final pendWords = sregs('pend_words', 16);
@@ -875,6 +888,9 @@ class HarborDualClockScanout extends Module {
     planeUnderrun <= underrunReg.rswizzle();
     underrun <= underrunReg.reduce((a, b) => a | b);
     if (fmt != null) addOutput('format', width: selW) <= fmt;
+    for (var k = 0; k < planes; k++) {
+      addOutput('plane_underrun_count_$k', width: 16) <= uCount[k];
+    }
 
     Conditional pickNext(int k) => If(
       pending[k],
@@ -895,6 +911,15 @@ class HarborDualClockScanout extends Module {
       rSync0 < reqToggle,
       rSync1 < rSync0,
       reqEdge < rSync0 ^ rSync1,
+      for (var k = 0; k < planes; k++) ...[
+        uSync0[k] < underrunTog[k],
+        uSync1[k] < uSync0[k],
+        uPrev[k] < uSync1[k],
+        If(
+          (uSync1[k] ^ uPrev[k]) & ~uCount[k].and(),
+          then: [uCount[k] < uCount[k] + 1],
+        ),
+      ],
       fetchStartReg < Const(0),
       If(
         ~sysBusy,
