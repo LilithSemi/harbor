@@ -79,12 +79,13 @@ class HarborPixelUnpack extends Module {
     ];
 
     Logic pick(
+      Logic sel,
       List<HarborPixelFormat> set,
       Logic Function(HarborPixelFormat) v,
     ) {
       var out = v(set.last);
       for (var i = set.length - 2; i >= 0; i--) {
-        out = mux(format!.eq(formats.indexOf(set[i])), v(set[i]), out);
+        out = mux(sel.eq(formats.indexOf(set[i])), v(set[i]), out);
       }
       return out;
     }
@@ -109,7 +110,7 @@ class HarborPixelUnpack extends Module {
       addOutput('plane_col_$k', width: xw) <=
           (formats.length == 1
               ? col(users.single, k)
-              : pick(formats, (f) {
+              : pick(format!, formats, (f) {
                   return k < f.planes.length ? col(f, k) : Const(0, width: xw);
                 }));
     }
@@ -118,6 +119,8 @@ class HarborPixelUnpack extends Module {
     // in a register.
     Logic delay(Logic v, String name) => flop(clk, v, reset: reset).named(name);
     final x1 = delay(x, 'x_s1').zeroExtend(max(xw, 3));
+    // Stage 1 uses the format of the columns at stage 0.
+    final format1 = format == null ? null : delay(format, 'format_s1');
     final prevs = <int, Logic>{};
     Logic prev(int k) =>
         prevs.putIfAbsent(k, () => delay(cur[k], 'plane${k}_prev'));
@@ -209,7 +212,7 @@ class HarborPixelUnpack extends Module {
       final values = {for (final f in set) f: of(f)[i]};
       return set.length == 1
           ? values[set.single]!
-          : pick(set, (f) => values[f]!);
+          : pick(format1!, set, (f) => values[f]!);
     }
 
     final yuvSet = [
@@ -224,7 +227,7 @@ class HarborPixelUnpack extends Module {
         ? Const(1)
         : yuvSet.isEmpty
         ? Const(0)
-        : pick(formats, (f) => Const(f.yuv ? 1 : 0));
+        : pick(format1!, formats, (f) => Const(f.yuv ? 1 : 0));
     addOutput('yuv') <= delay(delay(yuv1, 'yuv_s2'), 'yuv_s3');
 
     if (rgbSet.isNotEmpty) {
