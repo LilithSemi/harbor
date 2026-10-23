@@ -8,6 +8,7 @@ import '../soc/target.dart';
 import 'tmds_serializer.dart';
 
 import '../peripherals/display.dart';
+import 'alpha_blend.dart';
 import 'csc.dart';
 import 'display_output.dart';
 import 'dual_clock_scanout.dart';
@@ -66,6 +67,30 @@ import 'video_timing.dart';
 /// change takes effect at the next frame. The latches reset to
 /// [HarborCscCoefficients.bt709Limited], and an input that is not given is
 /// tied to that value. An RGB frame does not go through [csc].
+///
+/// [overlayFormats] adds an overlay plane, see [HarborDualClockScanout].
+/// Without it the build has no overlay logic or ports. The overlay inputs
+/// are in the pixel domain and the display latches them at frame start:
+/// - `overlay_enable`, and `overlay_format_sel` for more than one format.
+/// - `overlay_base_<n>` and `overlay_pitch_<n>` for each overlay plane,
+///   with the rules of the primary planes.
+/// - `overlay_src_x`, `overlay_src_y`: the source crop origin.
+/// - `overlay_dst_x`, `overlay_dst_y`: the screen origin.
+/// - `overlay_width`, `overlay_height`: the size of the crop and of the
+///   overlay on the screen.
+/// - `overlay_alpha`: 255 shows the overlay, 0 the primary.
+/// - `overlay_csc_*` like `csc_*`, only with a YUV overlay format.
+///
+/// The overlay covers screen pixels x from dst_x to dst_x + width - 1 and
+/// lines from dst_y to dst_y + height - 1 in the active area. Screen pixel
+/// (x, y) shows source pixel (src_x + x - dst_x, src_y + y - dst_y). The
+/// chroma rule of [HarborPixelUnpack] applies to the source columns, and
+/// the right edge of the crop repeats its last chroma sample. src_x must
+/// be even for a 4:2:2 or 4:2:0 format and src_y even for 4:2:0. If not,
+/// the scanout clears bit 0 and the crop moves one pixel left or up. The
+/// overlay and the primary go through [HarborAlphaBlend]. A build has the
+/// `overlay_underrun` and `overlay_underrun_count_<n>` outputs, and the
+/// `plane_underrun` outputs also for one primary plane.
 class HarborDualClockDisplay extends Module {
   /// Pixel cycles from the timing generator to the parallel outputs: one for
   /// the line buffer read and one for the output register. A build with a
@@ -75,6 +100,15 @@ class HarborDualClockDisplay extends Module {
 
   /// The unpack of a build with a YUV format, null for an RGB build.
   late final HarborPixelUnpack? unpack;
+
+  /// The overlay unpack, color conversion and blend, null without an
+  /// overlay. The conversion is null for an RGB overlay set.
+  HarborPixelUnpack? overlayUnpack;
+  HarborCsc? overlayCsc;
+  HarborAlphaBlend? blend;
+
+  /// The overlay formats, or null.
+  final List<HarborPixelFormat>? overlayFormats;
 
   /// The color conversion of a build with a YUV format, null for an RGB
   /// build.
@@ -154,27 +188,48 @@ class HarborDualClockDisplay extends Module {
     List<Logic>? cscCoeff,
     List<Logic>? cscInOffset,
     List<Logic>? cscOutOffset,
+    List<HarborPixelFormat>? overlayFormats,
+    Logic? overlayEnable,
+    Logic? overlayFormatSel,
+    List<Logic> overlayBase = const [],
+    List<Logic> overlayPitch = const [],
+    Logic? overlaySrcX,
+    Logic? overlaySrcY,
+    Logic? overlayDstX,
+    Logic? overlayDstY,
+    Logic? overlayWidth,
+    Logic? overlayHeight,
+    Logic? overlayAlpha,
+    List<Logic>? overlayCscCoeff,
+    List<Logic>? overlayCscInOffset,
+    List<Logic>? overlayCscOutOffset,
     HarborParallelRgbLatchEdge parallelRgbLatchEdge =
         HarborParallelRgbLatchEdge.falling,
     required HarborDeviceTarget target,
     super.name = 'dual_clock_display',
   }) : formats = List.unmodifiable(formats ?? [pixelFormat]),
        pixelFormat = (formats ?? [pixelFormat]).first,
-       pipelineDelay = (formats ?? [pixelFormat]).any((f) => f.yuv)
-           ? HarborPixelUnpack.latency + HarborCsc.stages + 1
-           : 2,
+       pipelineDelay = _delay(formats ?? [pixelFormat], overlayFormats),
+       overlayFormats = overlayFormats == null
+           ? null
+           : List.unmodifiable(overlayFormats),
        lineStride = lineStride ?? _lineBytes(timing, formats ?? [pixelFormat]),
        super(
          definitionName:
-             _name(
-               timing: timing,
-               formats: formats ?? [pixelFormat],
-               stride:
-                   lineStride ?? _lineBytes(timing, formats ?? [pixelFormat]),
-               port: rqReady != null,
-               target: target,
-               memory: memory,
-               burstWords: burstWords,
+             _overlayName(
+               _name(
+                 timing: timing,
+                 formats: formats ?? [pixelFormat],
+                 stride:
+                     lineStride ?? _lineBytes(timing, formats ?? [pixelFormat]),
+                 port: rqReady != null,
+                 target: target,
+                 memory: memory,
+                 burstWords: burstWords,
+               ),
+               timing,
+               overlayFormats,
+               target,
              ) +
              (outputType == HarborDisplayInterface.parallelRgb
                  ? '_parallelRgb'
@@ -213,24 +268,66 @@ class HarborDualClockDisplay extends Module {
     }
     final rgb565 = this.pixelFormat == HarborPixelFormat.rgb565;
     final hasYuv = this.formats.any((f) => f.yuv);
+    final ovFormats = this.overlayFormats;
+    final ovYuv = ovFormats != null && ovFormats.any((f) => f.yuv);
     if (!hasYuv &&
         (cscCoeff != null || cscInOffset != null || cscOutOffset != null)) {
       throw ArgumentError('an RGB build has no color conversion inputs');
     }
-    // The CSC reads its settings in the clock of the pixel input, and the
-    // frame latch changes one clock after the first blank line starts.
+    if (!ovYuv &&
+        (overlayCscCoeff != null ||
+            overlayCscInOffset != null ||
+            overlayCscOutOffset != null)) {
+      throw ArgumentError(
+        'a build without a YUV overlay format has no overlay color '
+        'conversion inputs',
+      );
+    }
+    // A CSC reads its settings in the clock of the pixel input, and the
+    // frame latch changes one clock after the first blank line starts. The
+    // other overlay settings are read with the pixel column.
     final minBlank = HarborPixelUnpack.latency - 1;
-    if (hasYuv && timing.hTotal - timing.hActive < minBlank) {
+    if ((hasYuv || ovYuv) && timing.hTotal - timing.hActive < minBlank) {
       throw ArgumentError(
         'a YUV build needs at least $minBlank clocks of horizontal blank '
         '(hFrontPorch + hSyncWidth + hBackPorch), got '
         '${timing.hTotal - timing.hActive}',
       );
     }
-    if ((cscCoeff != null && cscCoeff.length != 9) ||
-        (cscInOffset != null && cscInOffset.length != 3) ||
-        (cscOutOffset != null && cscOutOffset.length != 3)) {
-      throw ArgumentError('give 9 cscCoeff, 3 cscInOffset and 3 cscOutOffset');
+    for (final (c, i, o) in [
+      (cscCoeff, cscInOffset, cscOutOffset),
+      (overlayCscCoeff, overlayCscInOffset, overlayCscOutOffset),
+    ]) {
+      if ((c != null && c.length != 9) ||
+          (i != null && i.length != 3) ||
+          (o != null && o.length != 3)) {
+        throw ArgumentError('give 9 coefficients and 3 offsets of each kind');
+      }
+    }
+    if (ovFormats != null) {
+      if (ovFormats.isEmpty || ovFormats.contains(HarborPixelFormat.rgb888)) {
+        throw ArgumentError('overlayFormats must not be empty or hold rgb888');
+      }
+      final n = ovFormats.map((f) => f.planes.length).reduce(max);
+      if (overlayEnable == null ||
+          overlaySrcX == null ||
+          overlaySrcY == null ||
+          overlayDstX == null ||
+          overlayDstY == null ||
+          overlayWidth == null ||
+          overlayHeight == null ||
+          overlayAlpha == null ||
+          overlayBase.length != n ||
+          overlayPitch.length != n ||
+          (ovFormats.length > 1) != (overlayFormatSel != null)) {
+        throw ArgumentError(
+          'an overlay build needs every overlay input, overlayBase and '
+          'overlayPitch for planes 0 to ${n - 1}, and overlayFormatSel only '
+          'for more than one overlay format',
+        );
+      }
+    } else if (overlayEnable != null) {
+      throw ArgumentError('give overlayFormats for an overlay');
     }
 
     pixelClk = addInput('pixel_clk', pixelClk);
@@ -364,9 +461,90 @@ class HarborDualClockDisplay extends Module {
         : null;
     this.unpack = unpack;
 
+    // Overlay inputs. The x inputs hold hActive and the y inputs vActive.
+    final xw = max(hbits, timing.hActive.bitLength);
+    final yw = max(vbits, timing.vActive.bitLength);
+    final ovPlanes = ovFormats == null
+        ? 0
+        : ovFormats.map((f) => f.planes.length).reduce(max);
+    final ovCol = [
+      for (var j = 0; j < ovPlanes; j++)
+        Logic(name: 'overlay${j}_col', width: xw + 2),
+    ];
+    HarborScanoutOverlay? so;
+    Logic? ovAlpha;
+    if (ovFormats != null) {
+      Logic inX(String n, Logic v) => addInput(n, v, width: xw);
+      Logic inY(String n, Logic v) => addInput(n, v, width: yw);
+      so = HarborScanoutOverlay(
+        formats: ovFormats,
+        enable: addInput('overlay_enable', overlayEnable!),
+        formatSel: overlayFormatSel == null
+            ? null
+            : addInput(
+                'overlay_format_sel',
+                overlayFormatSel,
+                width: (ovFormats.length - 1).bitLength,
+              ),
+        base: [
+          for (var j = 0; j < ovPlanes; j++)
+            addInput('overlay_base_$j', overlayBase[j], width: 32),
+        ],
+        pitch: [
+          for (var j = 0; j < ovPlanes; j++)
+            addInput('overlay_pitch_$j', overlayPitch[j], width: 32),
+        ],
+        srcX: inX('overlay_src_x', overlaySrcX!),
+        srcY: inY('overlay_src_y', overlaySrcY!),
+        dstX: inX('overlay_dst_x', overlayDstX!),
+        dstY: inY('overlay_dst_y', overlayDstY!),
+        width: inX('overlay_width', overlayWidth!),
+        height: inY('overlay_height', overlayHeight!),
+        col: ovCol,
+      );
+      ovAlpha = flop(
+        pixelClk,
+        addInput('overlay_alpha', overlayAlpha!, width: 8),
+        en: frameStart,
+        reset: pixelReset,
+      ).named('overlay_alpha_frame');
+    }
+
     final HarborDualClockScanout scanout;
     Logic? frameFormat;
-    if (!planar) {
+    if (!planar && so != null) {
+      // One primary plane with an overlay: the scanout is planar, the
+      // primary keeps its stride.
+      final shift = _wordShift(this.pixelFormat, 0);
+      scanout = HarborDualClockScanout(
+        pixelClk: pixelClk,
+        pixelReset: pixelReset,
+        sysClk: sysClk,
+        sysReset: sysReset,
+        frameStart: frameStart,
+        lineStart: lineStart,
+        col: unpack != null
+            ? unpack.planeCol(0)
+            : shift == 0
+            ? tx
+            : tx.getRange(shift, tx.width).zeroExtend(tx.width),
+        fbBase: fbBase,
+        stride: Const(this.lineStride, width: 32),
+        memory: localMemory,
+        rqReady: rqReady,
+        rdValid: rdValid,
+        rdData: rdData,
+        burstWords: burstWords,
+        blockRam: target.blockRam,
+        formats: this.formats,
+        hActive: timing.hActive,
+        vActive: timing.vActive,
+        overlay: so,
+      );
+      addOutput('plane_underrun') <= scanout.planeUnderrun;
+      addOutput('plane_underrun_count_0', width: 16) <=
+          scanout.planeUnderrunCount(0);
+    } else if (!planar) {
       final wordsPerLine = HarborDualClockScanout.planeWords(
         this.pixelFormat,
         0,
@@ -441,6 +619,7 @@ class HarborDualClockDisplay extends Module {
         planeBase: planeBase,
         planePitch: planePitch.sublist(1),
         planeCol: cols.sublist(1),
+        overlay: so,
       );
       if (fmt != null) {
         fmt <= scanout.format;
@@ -453,6 +632,13 @@ class HarborDualClockDisplay extends Module {
       }
     }
 
+    if (so != null) {
+      addOutput('overlay_underrun', width: ovPlanes) <= scanout.overlayUnderrun;
+      for (var j = 0; j < ovPlanes; j++) {
+        addOutput('overlay_underrun_count_$j', width: 16) <=
+            scanout.overlayUnderrunCount(j);
+      }
+    }
     if (scanout.scanoutPort) {
       addOutput('rq_valid') <= scanout.rqValid;
       addOutput('rq_addr', width: 32) <= scanout.rqAddr;
@@ -480,40 +666,16 @@ class HarborDualClockDisplay extends Module {
       for (var s = 2; s < last; s++) {
         deLast = delay(deLast, 'de_s$s');
       }
-      final reset = HarborCscCoefficients.bt709Limited.registers();
-      Logic setting(String name, Logic? v, int width, int resetValue) {
-        final port = addInput(
-          name,
-          v ?? Const(resetValue, width: width),
-          width: width,
-        );
-        return flop(
-          pixelClk,
-          port,
-          en: frameStart,
-          reset: pixelReset,
-          resetValue: resetValue,
-        ).named('${name}_frame');
-      }
-
-      final csc = HarborCsc(
+      final csc = _conversion(
+        prefix: 'csc',
         clk: pixelClk,
+        reset: pixelReset,
+        frameStart: frameStart,
         target: target,
-        y: unpack.y,
-        cb: unpack.cb,
-        cr: unpack.cr,
-        coeff: [
-          for (var k = 0; k < 9; k++)
-            setting('csc_coeff_$k', cscCoeff?[k], 16, reset[k]),
-        ],
-        inOffset: [
-          for (var j = 0; j < 3; j++)
-            setting('csc_in_offset_$j', cscInOffset?[j], 10, reset[9 + j]),
-        ],
-        outOffset: [
-          for (var i = 0; i < 3; i++)
-            setting('csc_out_offset_$i', cscOutOffset?[i], 8, reset[12 + i]),
-        ],
+        unpack: unpack,
+        coeff: cscCoeff,
+        inOffset: cscInOffset,
+        outOffset: cscOutOffset,
       );
       _csc = csc;
       if (this.formats.every((f) => f.yuv)) {
@@ -563,6 +725,33 @@ class HarborDualClockDisplay extends Module {
       r = word.getRange(16, 24);
       g = word.getRange(8, 16);
       b = word.getRange(0, 8);
+    }
+
+    if (so != null) {
+      if (unpack == null) {
+        for (var s = 2; s < last; s++) {
+          deLast = delay(deLast, 'de_s$s');
+        }
+      }
+      (r, g, b) = _overlay(
+        pixelClk: pixelClk,
+        pixelReset: pixelReset,
+        frameStart: frameStart,
+        target: target,
+        scanout: scanout,
+        formats: ovFormats!,
+        tx: tx,
+        ty: ty,
+        xw: xw,
+        yw: yw,
+        col: ovCol,
+        alpha: ovAlpha!,
+        primary: [r, g, b],
+        primaryStage: hasYuv ? HarborPixelUnpack.latency + HarborCsc.stages : 1,
+        cscCoeff: overlayCscCoeff,
+        cscInOffset: overlayCscInOffset,
+        cscOutOffset: overlayCscOutOffset,
+      );
     }
     final zero = Const(0, width: 8);
 
@@ -640,6 +829,255 @@ class HarborDualClockDisplay extends Module {
       }
     }
   }
+
+  /// A color conversion with its settings latched at [frameStart]. The
+  /// inputs are `<prefix>_coeff_<k>`, `<prefix>_in_offset_<j>` and
+  /// `<prefix>_out_offset_<i>`, tied to BT.709 limited when not given.
+  HarborCsc _conversion({
+    required String prefix,
+    required Logic clk,
+    required Logic reset,
+    required Logic frameStart,
+    required HarborDeviceTarget target,
+    required HarborPixelUnpack unpack,
+    required List<Logic>? coeff,
+    required List<Logic>? inOffset,
+    required List<Logic>? outOffset,
+    String name = 'csc',
+  }) {
+    final values = HarborCscCoefficients.bt709Limited.registers();
+    Logic setting(String name, Logic? v, int width, int resetValue) {
+      final port = addInput(
+        name,
+        v ?? Const(resetValue, width: width),
+        width: width,
+      );
+      return flop(
+        clk,
+        port,
+        en: frameStart,
+        reset: reset,
+        resetValue: resetValue,
+      ).named('${name}_frame');
+    }
+
+    return HarborCsc(
+      clk: clk,
+      target: target,
+      y: unpack.y,
+      cb: unpack.cb,
+      cr: unpack.cr,
+      coeff: [
+        for (var k = 0; k < 9; k++)
+          setting('${prefix}_coeff_$k', coeff?[k], 16, values[k]),
+      ],
+      inOffset: [
+        for (var j = 0; j < 3; j++)
+          setting('${prefix}_in_offset_$j', inOffset?[j], 10, values[9 + j]),
+      ],
+      outOffset: [
+        for (var i = 0; i < 3; i++)
+          setting('${prefix}_out_offset_$i', outOffset?[i], 8, values[12 + i]),
+      ],
+      name: name,
+    );
+  }
+
+  /// The overlay pixel path: column math, unpack, conversion and blend
+  /// with the [primary] R, G and B of stage [primaryStage]. It gives R, G
+  /// and B at stage `pipelineDelay - 1`.
+  (Logic, Logic, Logic) _overlay({
+    required Logic pixelClk,
+    required Logic pixelReset,
+    required Logic frameStart,
+    required HarborDeviceTarget target,
+    required HarborDualClockScanout scanout,
+    required List<HarborPixelFormat> formats,
+    required Logic tx,
+    required Logic ty,
+    required int xw,
+    required int yw,
+    required List<Logic> col,
+    required Logic alpha,
+    required List<Logic> primary,
+    required int primaryStage,
+    required List<Logic>? cscCoeff,
+    required List<Logic>? cscInOffset,
+    required List<Logic>? cscOutOffset,
+  }) {
+    Logic delay(Logic v, String name) =>
+        flop(pixelClk, v, reset: pixelReset).named(name);
+    Logic reg(Logic v, String name) =>
+        flop(pixelClk, v, reset: pixelReset).named(name);
+    final fmt = formats.length > 1 ? scanout.overlayFormat : null;
+    Logic pick(Logic Function(HarborPixelFormat) v) {
+      var out = v(formats.last);
+      for (var i = formats.length - 2; i >= 0; i--) {
+        out = mux(fmt!.eq(i), v(formats[i]), out);
+      }
+      return out;
+    }
+
+    final srcX = scanout.overlaySrcX;
+    final dstX = scanout.overlayDstX;
+    final ew = xw + 2;
+    // Values of the frame. Source pixel sx = x + (src_x - dst_x), and the
+    // word of sx in plane j is (x + rem_j + ahead_j - dst_x) >> shift_j,
+    // with rem_j the bits of src_x below the shift.
+    final xOffset = reg(
+      srcX.zeroExtend(ew) - dstX.zeroExtend(ew),
+      'overlay_x_offset',
+    );
+    final lastX = reg(
+      srcX.zeroExtend(xw + 1) + scanout.overlayWidth.zeroExtend(xw + 1) - 1,
+      'overlay_last_x',
+    );
+    final x = tx.zeroExtend(ew);
+    final sx = (x + xOffset).getRange(0, xw + 1).named('overlay_sx');
+    for (var j = 0; j < col.length; j++) {
+      final offset = reg(
+        pick((f) {
+              if (j >= f.planes.length) return Const(0, width: ew);
+              final sh = HarborScanoutOverlay.wordShift(f, j);
+              final ahead = HarborScanoutOverlay.lookahead(f, j) ? 1 : 0;
+              final rem = sh == 0
+                  ? Const(0, width: ew)
+                  : srcX.getRange(0, sh).zeroExtend(ew);
+              return rem + ahead;
+            }) -
+            dstX.zeroExtend(ew),
+        'overlay${j}_col_offset',
+      );
+      final at = (x + offset).named('overlay${j}_col_sum');
+      col[j] <=
+          pick((f) {
+            if (j >= f.planes.length) return Const(0, width: ew);
+            return at >>> HarborScanoutOverlay.wordShift(f, j);
+          });
+    }
+
+    // Inside the overlay: alpha, else 0, which gives the primary.
+    final relX = tx.zeroExtend(xw + 1) - dstX.zeroExtend(xw + 1);
+    final relY = ty.zeroExtend(yw + 1) - scanout.overlayDstY.zeroExtend(yw + 1);
+    final inside =
+        scanout.overlayOn &
+        relX.lt(scanout.overlayWidth.zeroExtend(xw + 1)) &
+        relY.lt(scanout.overlayHeight.zeroExtend(yw + 1));
+    var a = mux(inside, alpha, Const(0, width: 8)).named('overlay_alpha_s0');
+
+    final unpack = HarborPixelUnpack(
+      clk: pixelClk,
+      reset: pixelReset,
+      x: sx,
+      format: fmt,
+      planeData: [for (var j = 0; j < col.length; j++) scanout.overlayData(j)],
+      formats: formats,
+      hActive: timing.hActive,
+      lastX: lastX,
+      name: 'overlay_unpack',
+    );
+    overlayUnpack = unpack;
+    final yuvSet = formats.any((f) => f.yuv);
+    final rgbSet = formats.any((f) => !f.yuv);
+    const s0 = HarborPixelUnpack.latency;
+    final ovStage = yuvSet ? s0 + HarborCsc.stages : s0;
+    final stage = max(ovStage, primaryStage);
+    Logic match(Logic v, int from, String name) {
+      for (var s = from + 1; s <= stage; s++) {
+        v = delay(v, '${name}_s$s');
+      }
+      return v;
+    }
+
+    List<Logic> ov;
+    if (yuvSet) {
+      final csc = _conversion(
+        prefix: 'overlay_csc',
+        clk: pixelClk,
+        reset: pixelReset,
+        frameStart: frameStart,
+        target: target,
+        unpack: unpack,
+        coeff: cscCoeff,
+        inOffset: cscInOffset,
+        outOffset: cscOutOffset,
+        name: 'overlay_csc',
+      );
+      overlayCsc = csc;
+      ov = [csc.red, csc.green, csc.blue];
+      if (rgbSet) {
+        Logic late(Logic v, String name) {
+          for (var s = s0 + 1; s <= ovStage; s++) {
+            v = delay(v, '${name}_s$s');
+          }
+          return v;
+        }
+
+        final isYuv = late(unpack.yuv, 'overlay_yuv');
+        ov = [
+          mux(isYuv, csc.red, late(unpack.red, 'overlay_rgb_red')),
+          mux(isYuv, csc.green, late(unpack.green, 'overlay_rgb_green')),
+          mux(isYuv, csc.blue, late(unpack.blue, 'overlay_rgb_blue')),
+        ];
+      }
+    } else {
+      ov = [unpack.red, unpack.green, unpack.blue];
+    }
+    const names = ['red', 'green', 'blue'];
+    a = match(a, 0, 'overlay_alpha');
+    // Alpha 0 takes no overlay data, so a line that was not fetched does
+    // not reach the blend.
+    final use = a.neq(0).named('overlay_use');
+    final blend = HarborAlphaBlend(
+      clk: pixelClk,
+      overlay: [
+        for (var i = 0; i < 3; i++)
+          mux(
+            use,
+            match(ov[i], ovStage, 'overlay_${names[i]}'),
+            Const(0, width: 8),
+          ),
+      ],
+      primary: [
+        for (var i = 0; i < 3; i++)
+          match(primary[i], primaryStage, 'primary_${names[i]}'),
+      ],
+      alpha: a,
+      target: target,
+    );
+    this.blend = blend;
+    return (blend.red, blend.green, blend.blue);
+  }
+
+  /// Pixel cycles from the timing generator to the outputs.
+  static int _delay(
+    List<HarborPixelFormat> formats,
+    List<HarborPixelFormat>? overlay,
+  ) {
+    const unpacked = HarborPixelUnpack.latency;
+    const converted = unpacked + HarborCsc.stages;
+    final primary = formats.any((f) => f.yuv) ? converted : 1;
+    if (overlay == null) return primary + 1;
+    final ov = overlay.any((f) => f.yuv) ? converted : unpacked;
+    return max(primary, ov) + HarborAlphaBlend.latency + 1;
+  }
+
+  /// [name] with the overlay parameters, or [name] without an overlay.
+  static String _overlayName(
+    String name,
+    HarborDisplayTiming t,
+    List<HarborPixelFormat>? overlay,
+    HarborDeviceTarget target,
+  ) => overlay == null
+      ? name
+      : harborStableDefinitionName('HarborDualClockDisplayOverlay', [
+          name,
+          'o${overlay.map(harborPixelFormatBitOrder.indexOf).join('x')}',
+          't${t.hActive}_${t.hFrontPorch}_${t.hSyncWidth}_${t.hBackPorch}'
+              '_${t.vActive}_${t.vFrontPorch}_${t.vSyncWidth}_${t.vBackPorch}'
+              '_${t.hSyncPositive ? 1 : 0}${t.vSyncPositive ? 1 : 0}',
+          target is HarborFpgaTarget ? target.vendor.name : 'generic',
+        ]);
 
   /// The largest plane 0 line in bytes over [formats].
   static int _lineBytes(HarborDisplayTiming t, List<HarborPixelFormat> fs) =>
