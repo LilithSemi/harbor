@@ -49,6 +49,8 @@ class HarborCscCoefficients {
 
   /// The standard set for luma weights [kr] and [kb], to full-range RGB.
   /// A limited input has Y from 64 to 940 and Cb, Cr from 64 to 960.
+  /// A full input has a 10-bit code of 4 times the 8-bit code, so white Y
+  /// is 1020 and not the 1023 scale of H.273.
   factory HarborCscCoefficients.standard(
     double kr,
     double kb, {
@@ -119,7 +121,9 @@ class HarborCscCoefficients {
 /// later. The input to each multiplier and its product are registers, so
 /// a DSP block can hold them. The data registers have no reset. Yosys does
 /// not move registers into an ECP5 MULT18X18D, so on an ECP5 [target] the
-/// multipliers are MULT18X18D cells with their own registers.
+/// multipliers are MULT18X18D cells with their own registers. Both variants
+/// sample the coefficients and offsets in the clock of the pixel input. They
+/// must change only in vertical blanking.
 class HarborCsc extends Module {
   static const fractionBits = 12;
 
@@ -200,6 +204,16 @@ class HarborCsc extends Module {
 
     Logic reg(Logic v, String name) => flop(clk, v).named(name);
 
+    // The ECP5 multiplier registers its own coefficient input. The output
+    // offset is delayed to the stage of the bias add.
+    final c = ecp5
+        ? coeff
+        : [for (var k = 0; k < 9; k++) reg(coeff[k], 'coeff${k}_s1')];
+    final o = [
+      for (var i = 0; i < 3; i++)
+        reg(reg(outOffset[i], 'out_offset${i}_s1'), 'out_offset${i}_s2'),
+    ];
+
     // Stage 1: the signed difference, 11 bits.
     final d = [
       for (var j = 0; j < 3; j++)
@@ -214,12 +228,12 @@ class HarborCsc extends Module {
         return Ecp5Mult18x18d(
           clk: clk,
           a: t[j],
-          b: coeff[3 * i + j],
+          b: c[3 * i + j],
           name: 'mult$i$j',
         ).p.getRange(0, _prodW).named('p$i${j}_s2');
       }
       return reg(
-        coeff[3 * i + j].signExtend(_prodW) * t[j].signExtend(_prodW),
+        c[3 * i + j].signExtend(_prodW) * t[j].signExtend(_prodW),
         'p$i${j}_s2',
       );
     }
@@ -231,7 +245,7 @@ class HarborCsc extends Module {
     for (final (i, name) in [(0, 'red'), (1, 'green'), (2, 'blue')]) {
       // Stage 3: two sums. The bias adds the output offset and one half.
       final bias = [
-        outOffset[i],
+        o[i],
         Const(1 << (shift - 1), width: shift),
       ].swizzle().zeroExtend(_sumW);
       final a = reg(

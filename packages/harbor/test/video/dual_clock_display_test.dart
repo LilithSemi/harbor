@@ -48,7 +48,49 @@ HarborDualClockDisplay _buildDisplay({
   );
 }
 
+HarborDisplayTiming _blank(int blank) => HarborDisplayTiming(
+  hActive: 4,
+  hFrontPorch: blank,
+  hSyncWidth: 0,
+  hBackPorch: 0,
+  vActive: 2,
+  vFrontPorch: 1,
+  vSyncWidth: 1,
+  vBackPorch: 1,
+  pixelClock: 1000000,
+);
+
 void main() {
+  test('a YUV build with too short a horizontal blank throws', () {
+    expect(
+      () => _buildDisplay(
+        timing: _blank(HarborPixelUnpack.latency - 2),
+        pixelFormat: HarborPixelFormat.yuyv,
+      ),
+      throwsA(
+        isA<ArgumentError>().having(
+          (e) => e.message,
+          'message',
+          contains('hFrontPorch + hSyncWidth + hBackPorch'),
+        ),
+      ),
+    );
+    expect(
+      () => _buildDisplay(
+        timing: _blank(HarborPixelUnpack.latency - 1),
+        pixelFormat: HarborPixelFormat.yuyv,
+      ),
+      returnsNormally,
+    );
+    expect(
+      () => _buildDisplay(
+        timing: _blank(0),
+        pixelFormat: HarborPixelFormat.xrgb8888,
+      ),
+      returnsNormally,
+    );
+  });
+
   test('rgb888 pixel format throws', () {
     expect(
       () => _buildDisplay(

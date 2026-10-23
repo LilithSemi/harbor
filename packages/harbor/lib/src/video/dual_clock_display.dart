@@ -217,6 +217,16 @@ class HarborDualClockDisplay extends Module {
         (cscCoeff != null || cscInOffset != null || cscOutOffset != null)) {
       throw ArgumentError('an RGB build has no color conversion inputs');
     }
+    // The CSC reads its settings in the clock of the pixel input, and the
+    // frame latch changes one clock after the first blank line starts.
+    final minBlank = HarborPixelUnpack.latency - 1;
+    if (hasYuv && timing.hTotal - timing.hActive < minBlank) {
+      throw ArgumentError(
+        'a YUV build needs at least $minBlank clocks of horizontal blank '
+        '(hFrontPorch + hSyncWidth + hBackPorch), got '
+        '${timing.hTotal - timing.hActive}',
+      );
+    }
     if ((cscCoeff != null && cscCoeff.length != 9) ||
         (cscInOffset != null && cscInOffset.length != 3) ||
         (cscOutOffset != null && cscOutOffset.length != 3)) {
