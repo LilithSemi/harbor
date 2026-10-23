@@ -98,7 +98,9 @@ class PortMemory {
   final Logic rqReady;
   final Logic rdValid;
   final Logic rdData;
-  final int latency;
+
+  /// Cycles from a take to the first word, for requests taken from now on.
+  int latency;
   final int Function(int addr) data;
 
   /// Every request taken as (byte address, 16-bit words).

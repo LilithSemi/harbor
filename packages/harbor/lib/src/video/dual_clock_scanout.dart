@@ -90,7 +90,9 @@ class HarborScanoutOverlay {
 /// A [frameStart] pulse primes both buffers (row 0 then row 1). Each
 /// [lineStart] swaps to the prefetched buffer and requests the next line into
 /// the freed one. [pixel] is `buffer[col]`, [underrun] latches if a requested
-/// line had not completed by the swap.
+/// line had not completed by the swap. A line start before the prime ends
+/// also latches [underrun], and the lines after it go to the correct
+/// buffers.
 ///
 /// [pixel] is registered: it is the word at the [col] of the cycle before.
 /// The system side reads memory through one of two ports. Give [memory] for
@@ -551,17 +553,34 @@ class HarborDualClockScanout extends Module {
         ],
         orElse: [
           Case(phase, [
+            // Phase 1 sends the next line when no line is in flight. A
+            // line start here skips the line that was not requested, so it
+            // is an underrun.
             CaseItem(Const(1, width: 2), [
-              If(
-                doneEdge,
-                then: [
-                  ...issue(fetchAddr, Const(1)),
+              If.block([
+                Iff(lineStart, [
+                  readSel < ~readSel,
+                  underrunReg < Const(1),
+                  fetchAddr < (fetchAddr + stride),
+                ]),
+                ElseIf(~outstanding, [
+                  ...issue(fetchAddr, ~readSel),
                   phase < Const(2, width: 2),
-                ],
-              ),
+                ]),
+              ]),
             ]),
+            // A line start before the line in flight is done makes it
+            // late. The next line goes from phase 1, because the system
+            // side takes one request at a time.
             CaseItem(Const(2, width: 2), [
-              If(doneEdge, then: [phase < Const(3, width: 2)]),
+              If.block([
+                Iff(lineStart, [
+                  readSel < ~readSel,
+                  If(outstanding & ~doneEdge, then: [underrunReg < Const(1)]),
+                  phase < Const(1, width: 2),
+                ]),
+                ElseIf(doneEdge, [phase < Const(3, width: 2)]),
+              ]),
             ]),
             CaseItem(Const(3, width: 2), [
               If(
