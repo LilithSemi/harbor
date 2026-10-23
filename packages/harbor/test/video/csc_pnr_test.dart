@@ -71,9 +71,16 @@ HarborCsc _csc(HarborDeviceTarget? target) => HarborCsc(
   target: target,
 );
 
-Future<Directory> _synth(String flow, HarborDeviceTarget? target) async {
+/// Synthesizes [flow] on the bench, or on the conversion alone when
+/// [bench] is false.
+Future<Directory> _synth(
+  String flow,
+  HarborDeviceTarget? target, {
+  bool bench = true,
+}) async {
   final dut = _csc(target);
   await dut.build();
+  final top = bench ? 'bench_top' : dut.definitionName;
   final dir = Directory.systemTemp.createTempSync('harbor_csc_pnr_');
   addTearDown(() => dir.deleteSync(recursive: true));
   final d = dir.path;
@@ -84,7 +91,8 @@ Future<Directory> _synth(String flow, HarborDeviceTarget? target) async {
     '-l',
     'yosys.log',
     '-p',
-    'read_verilog -sv dut.sv top.sv; $flow -top bench_top -json bench.json',
+    'read_verilog -sv dut.sv${bench ? ' top.sv' : ''}; '
+        '$flow -top $top -json bench.json',
   ], workingDirectory: d);
   expect(yosys.exitCode, 0, reason: '${yosys.stdout}${yosys.stderr}');
   return dir;
@@ -146,6 +154,25 @@ Future<void> _route(Directory dir, List<String> nextpnr) async {
 }
 
 void main() {
+  // Without the bench, the module ports drive the multipliers, so each
+  // register in a DSP48E1 comes from the conversion.
+  test(
+    'the color conversion registers each DSP48E1 input on its own',
+    () async {
+      final dir = await _synth('synth_xilinx -flatten', null, bench: false);
+      final dsps = _cells(dir, 'DSP48E1');
+      printOnFailure('$dsps');
+      expect(dsps, hasLength(9));
+      for (final d in dsps) {
+        expect(d['AREG'], 1);
+        expect(d['BREG'], 1);
+        expect(d['MREG'], 1);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 10)),
+    skip: _skip([]),
+  );
+
   test(
     'the color conversion meets 148.5 MHz on an ECP5 85F',
     () async {

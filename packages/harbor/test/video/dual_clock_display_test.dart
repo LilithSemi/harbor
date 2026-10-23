@@ -358,18 +358,26 @@ void main() {
 
   // The inputs change in the active part of each frame. The display must
   // use them only from the next frame.
-  test('a new conversion set takes effect at the next frame start', () {
-    final sets = [
-      HarborCscCoefficients.bt601Full,
-      HarborCscCoefficients.bt2020Limited,
-      HarborCscCoefficients.bt709Full,
-    ];
-    return _convert(
-      formats: [HarborPixelFormat.yuyv],
-      formatOf: (_) => 0,
-      setOf: (f) => sets[f % 3],
+  // The blank of 2 is the least a YUV build takes.
+  for (final blank in [4, HarborPixelUnpack.latency - 1]) {
+    test(
+      'a new conversion set takes effect at the next frame start '
+      '(blank $blank)',
+      () {
+        final sets = [
+          HarborCscCoefficients.bt601Full,
+          HarborCscCoefficients.bt2020Limited,
+          HarborCscCoefficients.bt709Full,
+        ];
+        return _convert(
+          formats: [HarborPixelFormat.yuyv],
+          formatOf: (_) => 0,
+          setOf: (f) => sets[f % 3],
+          blank: blank,
+        );
+      },
     );
-  });
+  }
 
   // An xrgb8888 frame skips the conversion, a yuyv frame goes through it.
   test('a mixed set converts a yuv frame and passes an rgb frame', () {
@@ -442,9 +450,10 @@ void main() {
   });
 }
 
-/// Runs [frames] frames of a 4x2 mode from a table memory. At pixel (1, 0)
-/// of frame f the test sets `format_sel` to `formatOf(f + 1)` and the
-/// conversion inputs to `setOf(f + 1)`. Every active pixel of frame 2 and
+/// Runs [frames] frames of a 4x2 mode with [blank] clocks of horizontal
+/// blank from a table memory. At pixel (1, 0) of frame f the test sets
+/// `format_sel` to `formatOf(f + 1)` and the conversion inputs to
+/// `setOf(f + 1)`. Every active pixel of frame 2 and
 /// up must match the unpack and conversion models.
 Future<void> _convert({
   required List<HarborPixelFormat> formats,
@@ -452,12 +461,13 @@ Future<void> _convert({
   required HarborCscCoefficients Function(int frame) setOf,
   bool wired = true,
   int frames = 6,
+  int blank = 4,
 }) async {
-  const timing = HarborDisplayTiming(
+  final timing = HarborDisplayTiming(
     hActive: 4,
     hFrontPorch: 1,
-    hSyncWidth: 2,
-    hBackPorch: 1,
+    hSyncWidth: 1,
+    hBackPorch: blank - 2,
     vActive: 2,
     vFrontPorch: 1,
     vSyncWidth: 1,
