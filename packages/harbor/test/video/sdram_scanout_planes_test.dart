@@ -2,6 +2,7 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import 'plane_memory.dart';
 import 'sdram_scanout_harness.dart';
 
 /// [hActive]-pixel lines of 4 active lines with the horizontal timing of
@@ -56,6 +57,15 @@ Future<void> _nv12(int hActive, int pixelPeriodPs) async {
     expect(a >> 10, (a + 2 * n - 1) >> 10, reason: 'crosses a page');
     words += n;
   }
+  // The luma line of a line start goes before its chroma line.
+  expectLumaFirst(
+    [for (final (a, n) in b.requests) (a, 2 * n)],
+    luma: fb,
+    chroma: chroma,
+    pitch0: stride,
+    pitch1: stride,
+    lineBytes0: hActive,
+  );
   // Four luma lines and two chroma lines of hActive / 2 words a frame.
   expect(words ~/ (3 * hActive), greaterThanOrEqualTo(3));
   final worst = b.lineCycles.reduce((a, c) => a > c ? a : c);

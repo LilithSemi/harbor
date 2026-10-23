@@ -1,5 +1,6 @@
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
+import 'package:test/test.dart';
 
 bool _high(Logic s) {
   final v = s.previousValue ?? s.value;
@@ -16,7 +17,9 @@ int _prev(Logic s) => (s.previousValue ?? s.value).toInt();
 /// default. Peak bandwidth is one 32-bit beat each cycle.
 class WaistMemory {
   final HarborMemoryWaist waist;
-  final int latency;
+
+  /// Cycles from a take to the first beat, for requests taken from now on.
+  int latency;
   final int depth;
   final int Function(int addr) data;
 
@@ -146,4 +149,34 @@ class PortMemory {
       _word = 0;
     }
   }
+}
+
+/// Checks that chroma line n starts only after all of luma line 2n - 1,
+/// the luma line fetched at the same line start, was requested.
+///
+/// Each request is (byte address, bytes). A luma line is [lineBytes0]
+/// bytes. A request at [luma] starts a new frame.
+void expectLumaFirst(
+  Iterable<(int, int)> requests, {
+  required int luma,
+  required int chroma,
+  required int pitch0,
+  required int pitch1,
+  required int lineBytes0,
+}) {
+  final got = <int, int>{};
+  var chromaLines = 0;
+  for (final (a, n) in requests) {
+    if (a == luma) got.clear();
+    if (a >= chroma) {
+      final c = (a - chroma) ~/ pitch1;
+      if (c == 0) continue;
+      expect(got[2 * c - 1], lineBytes0, reason: 'chroma line $c before luma');
+      chromaLines++;
+    } else {
+      final y = (a - luma) ~/ pitch0;
+      got[y] = (got[y] ?? 0) + n;
+    }
+  }
+  expect(chromaLines, greaterThan(0));
 }

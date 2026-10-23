@@ -70,10 +70,13 @@ class BenchScanDisplay extends BridgeModule {
       rqReady: input('rq_ready'),
       rdValid: input('rd_valid'),
       rdData: input('rd_data'),
-      lineStride: stride,
+      lineStride: formats == null ? stride : null,
       formats: formats,
       planeBase: [for (final b in planeBases) Const(b, width: 32)],
-      planePitch: [for (final p in planePitches) Const(p, width: 32)],
+      planePitch: [
+        if (formats != null) Const(stride, width: 32),
+        for (final p in planePitches) Const(p, width: 32),
+      ],
     );
     addOutput('rq_valid') <= d.rqValid;
     addOutput('rq_addr', width: 32) <= d.rqAddr;

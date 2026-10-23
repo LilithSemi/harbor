@@ -95,7 +95,10 @@ class _Run {
   final List<(int, int)> requests;
   final int underrun;
   final int planeUnderrun;
-  _Run(this.requests, this.underrun, this.planeUnderrun);
+
+  /// The underrun count of each plane, empty on a one plane build.
+  final List<int> counts;
+  _Run(this.requests, this.underrun, this.planeUnderrun, this.counts);
 }
 
 var _ran = false;
@@ -114,9 +117,14 @@ Future<_Run> _display(
   List<HarborPixelFormat> formats, {
   bool port = false,
   int fb = _fb,
+  int stride = _stride,
   List<int> bases = const [_base1, _base2],
   List<int> pitches = const [_pitch1, _pitch2],
-  void Function(int cycle, Logic? formatSel)? onCycle,
+  HarborDisplayTiming timing = _timing,
+  int runCycles = _runCycles,
+  int latency = 3,
+  int Function(int cycle)? latencyAt,
+  void Function(int cycle, Logic? formatSel, Module display)? onCycle,
 }) async {
   final pixelClk = SimpleClockGenerator(14).clk;
   final sysClk = SimpleClockGenerator(6).clk;
@@ -134,6 +142,7 @@ Future<_Run> _display(
     for (var k = 1; k < planes; k++) Const(bases[k - 1], width: 32),
   ];
   final pitchIn = [
+    Const(stride, width: 32),
     for (var k = 1; k < planes; k++) Const(pitches[k - 1], width: 32),
   ];
   final memory = port
@@ -150,7 +159,7 @@ Future<_Run> _display(
   final rdData = port ? Logic(name: 'rd_data', width: 16) : null;
   final d = HarborDualClockDisplay(
     target: const HarborSimTarget(),
-    timing: _timing,
+    timing: timing,
     pixelClk: pixelClk,
     pixelReset: pixelReset,
     sysClk: sysClk,
@@ -161,7 +170,7 @@ Future<_Run> _display(
     rqReady: rqReady,
     rdValid: rdValid,
     rdData: rdData,
-    lineStride: _stride,
+    lineStride: planar ? null : stride,
     outputType: HarborDisplayInterface.parallelRgb,
     formats: formats,
     formatSel: formatSel,
@@ -170,6 +179,7 @@ Future<_Run> _display(
   );
   await d.build();
   final List<(int, int)> requests;
+  WaistMemory? waistMemory;
   if (port) {
     requests = PortMemory(
       rqValid: d.rqValid,
@@ -181,7 +191,8 @@ Future<_Run> _display(
       clk: sysClk,
     ).requests;
   } else {
-    requests = WaistMemory(memory!, sysClk, latency: 3).requests;
+    waistMemory = WaistMemory(memory!, sysClk, latency: latency);
+    requests = waistMemory.requests;
   }
   pixelReset.inject(1);
   sysReset.inject(1);
@@ -194,14 +205,20 @@ Future<_Run> _display(
   await pixelClk.nextPosedge;
   pixelReset.inject(0);
   sysReset.inject(0);
-  for (var c = 0; c < _runCycles; c++) {
+  for (var c = 0; c < runCycles; c++) {
     await pixelClk.nextNegedge;
-    onCycle?.call(c, formatSel);
+    if (latencyAt != null) waistMemory!.latency = latencyAt(c);
+    onCycle?.call(c, formatSel, d);
   }
   return _Run(
     List.of(requests),
     d.underrun.value.toInt(),
     planar ? d.planeUnderrun.value.toInt() : 0,
+    [
+      if (planar)
+        for (var k = 0; k < planes; k++)
+          d.output('plane_underrun_count_$k').value.toInt(),
+    ],
   );
 }
 
@@ -221,8 +238,82 @@ void main() {
       expect(r.requests, [...want, ...want]);
       expect(r.underrun, 0);
       expect(r.planeUnderrun, 0);
+      expect(r.counts.every((c) => c == 0), isTrue);
     });
   }
+
+  // vActive 5: three chroma lines, the last one for luma line 4 only.
+  const odd = HarborDisplayTiming(
+    hActive: 8,
+    hFrontPorch: 1,
+    hSyncWidth: 1,
+    hBackPorch: 40,
+    vActive: 5,
+    vFrontPorch: 1,
+    vSyncWidth: 1,
+    vBackPorch: 1,
+    pixelClock: 1000000,
+  );
+  // 50 x 8 cycles a frame. Frame starts at 250 and 650, the third at 1050.
+  const oddFrames = <HarborPixelFormat, List<(int, int)>>{
+    HarborPixelFormat.nv12: [
+      (0x1000, 2),
+      (0x8000, 2),
+      (0x1020, 2),
+      (0x8030, 2),
+      (0x1040, 2),
+      (0x1060, 2),
+      (0x8060, 2),
+      (0x1080, 2),
+    ],
+    HarborPixelFormat.i420: [
+      (0x1000, 2),
+      (0x8000, 1),
+      (0xC000, 1),
+      (0x1020, 2),
+      (0x8030, 1),
+      (0xC040, 1),
+      (0x1040, 2),
+      (0x1060, 2),
+      (0x8060, 1),
+      (0xC080, 1),
+      (0x1080, 2),
+    ],
+  };
+  for (final f in oddFrames.keys) {
+    test('${f.name}: an odd vActive fetches every line once', () async {
+      final r = await _display([f], timing: odd, runCycles: 1040);
+      final want = oddFrames[f]!;
+      expect(r.requests, [...want, ...want]);
+      expect(r.underrun, 0);
+    });
+  }
+
+  test('a slow memory counts underruns and still fetches', () async {
+    var mid = <int>[];
+    final r = await _display(
+      [HarborPixelFormat.nv12],
+      // Slow only in the active lines, so each frame start primes in time.
+      latencyAt: (c) => (c >= 445 && c < 745) || c >= 895 ? 300 : 3,
+      onCycle: (c, _, d) {
+        // After the first frame, before the second frame start.
+        if (c == 740) {
+          mid = [
+            for (var k = 0; k < 2; k++)
+              d.output('plane_underrun_count_$k').value.toInt(),
+          ];
+        }
+      },
+    );
+    expect(r.underrun, 1);
+    expect(r.planeUnderrun, 3);
+    expect(mid[0], greaterThan(0));
+    expect(mid[1], greaterThan(0));
+    // A frame start clears the flag, not the count.
+    expect(r.counts[0], greaterThan(mid[0]));
+    expect(r.counts[1], greaterThan(mid[1]));
+    expect(r.requests.length, greaterThan(9));
+  });
 
   test('format_sel picks the format at frame start', () async {
     final r = await _display(
@@ -231,7 +322,7 @@ void main() {
         HarborPixelFormat.nv12,
         HarborPixelFormat.i420,
       ],
-      onCycle: (c, sel) {
+      onCycle: (c, sel, _) {
         // Before the first frame start and again between the two.
         if (c == 10) sel!.inject(1);
         if (c == 500) sel!.inject(2);
@@ -244,24 +335,23 @@ void main() {
     expect(r.underrun, 0);
   });
 
-  test(
-    'a scanout port ignores the low 2 bits of each base and pitch',
-    () async {
-      final r = await _display(
-        [HarborPixelFormat.nv12],
-        port: true,
-        fb: _fb + 2,
-        bases: [_base1 + 3],
-        pitches: [_pitch1 + 2],
-      );
-      // 16-bit words: two for each 32-bit word.
-      final want = [
-        for (final (a, n) in _frames[HarborPixelFormat.nv12]!) (a, 2 * n),
-      ];
-      expect(r.requests, [...want, ...want]);
-      expect(r.underrun, 0);
-    },
-  );
+  test('a scanout port ignores the low 2 bits of each base and pitch, plane 0 '
+      'too', () async {
+    final r = await _display(
+      [HarborPixelFormat.nv12],
+      port: true,
+      fb: _fb + 3,
+      stride: _stride + 3,
+      bases: [_base1 + 3],
+      pitches: [_pitch1 + 3],
+    );
+    // 16-bit words: two for each 32-bit word.
+    final want = [
+      for (final (a, n) in _frames[HarborPixelFormat.nv12]!) (a, 2 * n),
+    ];
+    expect(r.requests, [...want, ...want]);
+    expect(r.underrun, 0);
+  });
 
   test('i420 on a scanout port fetches every plane line', () async {
     final r = await _display([HarborPixelFormat.i420], port: true);
@@ -288,6 +378,7 @@ void main() {
       List<HarborPixelFormat> formats, {
       Logic? sel,
       int bases = 1,
+      int? stride,
     }) => HarborDualClockDisplay(
       target: const HarborSimTarget(),
       timing: _timing,
@@ -304,10 +395,16 @@ void main() {
       formats: formats,
       formatSel: sel,
       planeBase: [for (var i = 0; i < bases; i++) Logic(width: 32)],
-      planePitch: [for (var i = 0; i < bases; i++) Logic(width: 32)],
+      planePitch: [for (var i = 0; i <= bases; i++) Logic(width: 32)],
+      lineStride: stride,
     );
     expect(make([HarborPixelFormat.nv12]).planeUnderrun.width, 2);
     expect(() => make([HarborPixelFormat.nv12], bases: 0), throwsArgumentError);
+    expect(
+      () => make([HarborPixelFormat.nv12], stride: 64),
+      throwsArgumentError,
+    );
+    expect(make([HarborPixelFormat.nv12]).input('plane_pitch_0').width, 32);
     expect(
       () => make([HarborPixelFormat.nv12, HarborPixelFormat.xrgb8888]),
       throwsArgumentError,
@@ -528,11 +625,10 @@ class _KindRig extends BridgeModule {
       enable: input('enable'),
       fbBase: Const(_fb, width: 32),
       memory: mem.waist,
-      lineStride: _stride,
       outputType: HarborDisplayInterface.parallelRgb,
       formats: const [HarborPixelFormat.nv12],
       planeBase: [Const(_base1, width: 32)],
-      planePitch: [Const(_pitch1, width: 32)],
+      planePitch: [Const(_stride, width: 32), Const(_pitch1, width: 32)],
     );
     addOutput('underrun') <= d.underrun;
   }

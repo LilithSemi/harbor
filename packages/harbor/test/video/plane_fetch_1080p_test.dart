@@ -116,7 +116,17 @@ Future<void> _scan(HarborPixelFormat format, {int lines = 6}) async {
     '${(100 * busy / cycles).toStringAsFixed(1)}% of $cycles cycles, '
     '$checked words checked, underrun ${so.underrun.value.toInt()}',
   );
+  expectLumaFirst(
+    mem.requests.map((r) => (r.$1, 4 * r.$2)),
+    luma: _y,
+    chroma: _c,
+    pitch0: pitch0,
+    pitch1: pitch1,
+    lineBytes0: pitch0,
+  );
   expect(so.underrun.value.toInt(), 0);
+  expect(so.planeUnderrunCount(0).value.toInt(), 0);
+  expect(so.planeUnderrunCount(1).value.toInt(), 0);
   expect(so.planeUnderrun.value.toInt(), 0);
   expect(checked, lines * _hActive);
 }
