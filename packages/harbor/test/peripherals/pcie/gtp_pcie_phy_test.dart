@@ -344,7 +344,8 @@ void main() {
         if (b.state == _S.txPhAlign) samples++;
         if (samples > 200) fail('no timeout');
       }
-      expect(samples, _timeouts.txSync);
+      // The failure is registered, so the state stays one more cycle.
+      expect(samples, _timeouts.txSync + 1);
       expect(b.state, _S.pllReset);
       await b.finish();
     });
@@ -512,7 +513,15 @@ void main() {
           setup: (m) => m.rateStuck = true,
         );
         await b.waitFor(_S.idle);
+        Logic sig(String name) =>
+            b.phy.internalSignals.firstWhere((l) => l.name == name);
+        final rateState = sig('rate_state');
+        final rateFail = sig('rate_fail');
         b.pipes[0].pipeRate.inject(1);
+        await b.until(() => rateState.value.toInt() == 1);
+        // The wait lasts the rate bound, then rate_fail is high.
+        final waited = await b.until(() => b.hi(rateFail));
+        expect(waited, _timeouts.rate - 1);
         await b.waitFor(_S.pllReset, limit: 200);
         expect(b.failState, _S.rateChange);
         expect(b.retries, 1);

@@ -42,9 +42,12 @@ class HarborGtpDrpReset extends Module {
     final state = Logic(name: 'state', width: 3);
     final saved = Logic(name: 'saved_drp_011', width: 16);
     final timer = Logic(name: 'timer', width: timeoutCycles.bitLength);
-    final timeout = timer.eq(
-      Const(timeoutCycles - 1, width: timeoutCycles.bitLength),
-    );
+    // The compare is registered: timeout_hit is high when the timer was
+    // timeoutCycles - 2 in the last cycle. timer_cleared is high when the
+    // timer was cleared at the last edge.
+    final timeoutHit = Logic(name: 'timeout_hit');
+    final timerCleared = Logic(name: 'timer_cleared');
+    final timeout = timeoutHit & ~timerCleared;
     final completed = state.eq(Const(restoreWait, width: 3)) & drpReady;
     final doneQ = Logic(name: 'done_q');
     final waiting =
@@ -88,28 +91,36 @@ class HarborGtpDrpReset extends Module {
     ]);
 
     final failedQ = Logic(name: 'failed_q');
-    Sequential(clk, [
-      state < next,
-      If(
-        ~next.eq(state),
-        then: [timer < 0],
-        orElse: [
-          If(waiting, then: [timer < timer + 1]),
-        ],
-      ),
-      If(
-        state.eq(Const(readWait, width: 3)) & drpReady,
-        then: [saved < drpDataOut],
-      ),
-      If(waiting & timeout, then: [failedQ < 1]),
-      If(
-        ~start,
-        then: [doneQ < 0],
-        orElse: [
-          If(completed, then: [doneQ < 1]),
-        ],
-      ),
-    ], reset: reset);
+    Sequential(
+      clk,
+      [
+        state < next,
+        timeoutHit <
+            timer.eq(Const(timeoutCycles - 2, width: timeoutCycles.bitLength)),
+        timerCleared < ~next.eq(state),
+        If(
+          ~next.eq(state),
+          then: [timer < 0],
+          orElse: [
+            If(waiting, then: [timer < timer + 1]),
+          ],
+        ),
+        If(
+          state.eq(Const(readWait, width: 3)) & drpReady,
+          then: [saved < drpDataOut],
+        ),
+        If(waiting & timeout, then: [failedQ < 1]),
+        If(
+          ~start,
+          then: [doneQ < 0],
+          orElse: [
+            If(completed, then: [doneQ < 1]),
+          ],
+        ),
+      ],
+      reset: reset,
+      resetValues: {timerCleared: Const(1)},
+    );
 
     addOutput('gt_reset') <=
         (state.eq(Const(idle, width: 3)) & start & ~doneQ) |

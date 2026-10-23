@@ -85,4 +85,32 @@ void main() {
     expect(dut.failed.value.toBool(), isTrue);
     await Simulator.endSimulation();
   });
+  test('fails after timeoutCycles cycles in a wait', () async {
+    final clk = SimpleClockGenerator(10).clk;
+    final reset = Logic()..inject(1);
+    final start = Logic()..inject(0);
+    final dut = HarborGtpDrpReset(
+      clk: clk,
+      reset: reset,
+      start: start,
+      rxPmaResetDone: Logic()..inject(0),
+      drpReady: Logic()..inject(0),
+      drpDataOut: Logic(width: 16)..inject(0),
+      timeoutCycles: 6,
+    );
+    await dut.build();
+    unawaited(Simulator.run());
+    await clk.nextPosedge;
+    reset.inject(0);
+    start.inject(1);
+    // The read strobe is one cycle, then the read wait starts.
+    var read = -1;
+    for (var i = 0; i < 40 && !dut.failed.value.toBool(); i++) {
+      await clk.nextNegedge;
+      if (read >= 0) read++;
+      if (read < 0 && dut.drpEnable.value.toBool()) read = 0;
+    }
+    expect(read, 7);
+    await Simulator.endSimulation();
+  });
 }

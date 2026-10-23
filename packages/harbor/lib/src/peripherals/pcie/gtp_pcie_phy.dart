@@ -789,9 +789,12 @@ class HarborGtpPciePhy extends Module {
         defaultItem: [timedOut < 1],
       ),
     ]);
-    final fail = (timedOut | lostLock | rateFail | drpReset.failed).named(
-      'fail',
-    );
+    // A failure is registered, so it starts the retry one cycle after the
+    // cause. The cycle after a failure cannot fail again, so a lock loss
+    // counts once. A DRP failure stays until reset.
+    final failNow = (timedOut | lostLock | rateFail).named('fail_now');
+    final fail = Logic(name: 'fail');
+    final failCause = Logic(name: 'fail_cause', width: 4);
     next <= mux(fail, s(_S.pllReset), stepNext);
 
     Logic nextIs(List<HarborGtpResetState> l) =>
@@ -803,6 +806,8 @@ class HarborGtpPciePhy extends Module {
       pclk,
       [
         state < next,
+        fail < drpReset.failed | (failNow & ~fail),
+        failCause < mux(rateFail, s(_S.rateChange), state),
         timerZero < fail | ~next.eq(state),
         for (final MapEntry(key: n, value: hit) in hits.entries)
           hit < timer.eq(Const(n - 2, width: tw)),
@@ -826,7 +831,7 @@ class HarborGtpPciePhy extends Module {
         If(
           fail,
           then: [
-            failState < mux(rateFail, s(_S.rateChange), state),
+            failState < failCause,
             If(~retries.and(), then: [retries < retries + 1]),
           ],
         ),
@@ -863,14 +868,19 @@ class HarborGtpPciePhy extends Module {
     final phySeen = Logic(name: 'phy_seen');
     final rateChange = (rateQ ^ rateQ2).named('rate_change');
     final idleNow = state.eq(s(_S.idle));
-    rateFail <=
-        rateState.eq(_r(_rWait)) &
-            rateTimer.eq(
-              Const(timeouts.rate - 1, width: timeouts.rate.bitLength),
-            );
+    // rate_hit is high when the timer was rate - 2 in wait in the last
+    // cycle. In wait the timer counts up on each cycle.
+    final rateHit = Logic(name: 'rate_hit');
+    final rateWait = rateState.eq(_r(_rWait));
+    rateFail <= rateWait & rateHit;
     Sequential(pclk, [
       rateQ < _pipeDelay(pclk, pps[0].pipeRate, pipeStages, 'rate'),
       rateQ2 < rateQ,
+      rateHit <
+          rateWait &
+              rateTimer.eq(
+                Const(timeouts.rate - 2, width: timeouts.rate.bitLength),
+              ),
       If(
         fail,
         then: [rateState < _r(_rIdle), rateTimer < 0],
@@ -912,7 +922,11 @@ class HarborGtpPciePhy extends Module {
           ),
         ],
       ),
-      linkUp < (nextIs([_S.idle]) | ~rateState.eq(_r(_rIdle))) & ~fail,
+      linkUp <
+          (nextIs([_S.idle]) | ~rateState.eq(_r(_rIdle))) &
+              ~fail &
+              ~failNow &
+              ~drpReset.failed,
     ], reset: rst);
 
     addOutput('reset_state', width: 4) <= state;
