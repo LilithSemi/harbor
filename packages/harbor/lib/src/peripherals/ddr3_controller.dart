@@ -248,6 +248,9 @@ class Ddr3Controller extends Module {
       addOutput('o_cal_failed');
     }
 
+    addOutput('o_init_done');
+    addOutput('o_cal_state', width: 6);
+
     // --- debug ---
     addOutput('o_debug1', width: 32);
     addOutput('o_debug2', width: 32);
@@ -1417,6 +1420,19 @@ class Ddr3Controller extends Module {
   /// Default for [maxCalAttempts].
   static const int defaultMaxCalAttempts = 4;
 
+  /// [calState] when calibration is complete and the bus is open.
+  static const int calStateDone = _stDoneCalibrate;
+
+  /// [calState] when a self-trained calibration gave up.
+  static const int calStateFailed = _stCalFailed;
+
+  /// High when the reset ROM has run the power-up and mode register sequence.
+  /// A calibration restart clears it until the sequence runs again.
+  Logic get initDone => output('o_init_done');
+
+  /// The calibration FSM state. See [calStateDone] and [calStateFailed].
+  Logic get calState => output('o_cal_state');
+
   /// High when a self-trained calibration failed [maxCalAttempts] times. Null
   /// unless [phySelfTrainsRead].
   Logic? get calFailed => phySelfTrainsRead ? output('o_cal_failed') : null;
@@ -2315,6 +2331,8 @@ class Ddr3Controller extends Module {
       _addedReadPipeLane[l] <= addedReadPipe[l];
     }
     _stateCalibrate <= state;
+    output('o_init_done') <= _resetDone;
+    output('o_cal_state') <= state;
     _calibStb <= calibStb;
     _calibWe <= calibWe;
     _calibAux <= calibAux;

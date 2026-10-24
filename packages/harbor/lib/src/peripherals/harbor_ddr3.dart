@@ -10,6 +10,7 @@ import '../bus/fabric_util.dart';
 import '../bus/port/memory_port.dart';
 import '../bus/port/memory_waist.dart';
 import '../bus/port/port_cdc.dart';
+import '../clock/cdc.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -56,6 +57,28 @@ import 'sim_dram.dart';
 /// rising edges. If its read leveling fails [Ddr3Controller.defaultMaxCalAttempts]
 /// times, the controller stops in a failed state, opens the bus, and raises
 /// [Ddr3Controller.calFailed] (STATUS bit 1 in the knob window).
+///
+/// Status outputs, all on `clk`:
+///
+/// - `init_done`: the power-up and mode register sequence is complete. The
+///   sequence pauses while the calibration FSM runs, so `init_done` rises
+///   after calibration ends. A calibration restart clears it.
+/// - `cal_done`: calibration is complete and the controller accepts traffic.
+///   It is DONE_CALIBRATE and `init_done` together.
+/// - `cal_failed`: calibration gave up. It stays high until `reset`. Only
+///   the ECP5 PHY can detect a failure. On Xilinx the controller restarts
+///   calibration with no limit, so `cal_failed` is 0.
+/// - `cal_state`: the 6-bit calibration FSM state. 0 IDLE,
+///   1 BITSLIP_DQS_TRAIN_1, 2 MPR_READ, 3 COLLECT_DQS, 4 ANALYZE_DQS,
+///   5 CALIBRATE_DQS, 6 BITSLIP_DQS_TRAIN_2, 7 START_WRITE_LEVEL,
+///   9 ISSUE_WRITE_1, 10 ISSUE_WRITE_2, 11 ISSUE_READ, 12 READ_DATA,
+///   13 ANALYZE_DATA, 23 DONE_CALIBRATE, and on ECP5 also 24 READ_LEVEL,
+///   25 READ_LEVEL_WAIT and 26 CAL_FAILED.
+///
+/// `init_done`, `cal_done` and `cal_failed` cross from `ddr_clk` through a
+/// two-flop synchronizer, and `cal_state` through a handshake that samples a
+/// stable value. A sim target has no controller: `init_done` and `cal_done`
+/// are 1, `cal_failed` is 0 and `cal_state` is 23.
 class HarborDdr3 extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -426,12 +449,20 @@ class HarborDdr3 extends BridgeModule
       ),
     ]);
     addOutput('bus_error') <= busErr;
+    addOutput('init_done');
+    addOutput('cal_done');
+    addOutput('cal_failed');
+    addOutput('cal_state', width: 6);
 
     // Under Verilator there is no PHY, so there are no pads to expose and
     // nothing to drive them. Creating them anyway would leave the bidirectional
     // dq/dqs nets undriven, which is exactly the tristate shape Verilator
     // handles worst.
     if (target is HarborSimTarget) {
+      output('init_done') <= Const(1);
+      output('cal_done') <= Const(1);
+      output('cal_failed') <= Const(0);
+      output('cal_state') <= Const(Ddr3Controller.calStateDone, width: 6);
       if (simExternalMem) {
         _buildSimExternal(busDW, busAW);
       } else {
@@ -474,8 +505,6 @@ class HarborDdr3 extends BridgeModule
     createPort('sdram_dqs_n', PortDirection.inOut, width: p.lanes);
     createPort('sdram_odt', PortDirection.output);
     createPort('sdram_reset_n', PortDirection.output);
-    // Self-trained (ECP5) calibration gave up. See [Ddr3Controller.calFailed].
-    if (isEcp5) addOutput('cal_failed');
 
     _build(
       clk,
@@ -841,6 +870,73 @@ struct DramStore {
 };
 ''';
 
+  // Crosses the controller status from ddr_clk to clk.
+  void _buildStatus(
+    Logic clk,
+    Logic reset,
+    Logic ddrClk,
+    Logic ddrReset,
+    Ddr3Controller ctrl,
+  ) {
+    // Registered on ddr_clk, so the synchronizer sees no glitches.
+    final flags = Logic(name: 'ddr_status_flags', width: 3);
+    Sequential(ddrClk, [
+      If(
+        ddrReset,
+        then: [flags < 0],
+        orElse: [
+          flags <
+              [
+                ctrl.calFailed ?? Const(0),
+                ctrl.calState.eq(Ddr3Controller.calStateDone) & ctrl.initDone,
+                ctrl.initDone,
+              ].swizzle(),
+        ],
+      ),
+    ]);
+    final sync = addSubModule(HarborCdcSync(width: 3, name: 'status_sync'));
+    sync.input('async_in').srcConnection! <= flags;
+    sync.input('dst_clk').srcConnection! <= clk;
+    sync.input('dst_reset').srcConnection! <= reset;
+    final level = sync.syncOut;
+
+    final failed = Logic(name: 'cal_failed_sticky');
+    Sequential(clk, [
+      If(
+        reset,
+        then: [failed < 0],
+        orElse: [
+          If(level[2], then: [failed < 1]),
+        ],
+      ),
+    ]);
+    output('init_done') <= level[0];
+    output('cal_done') <= level[1];
+    output('cal_failed') <= failed;
+
+    final hs = addSubModule(
+      HarborCdcHandshake(dataWidth: 6, name: 'cal_state_cdc'),
+    );
+    hs.input('src_clk').srcConnection! <= ddrClk;
+    hs.input('src_reset').srcConnection! <= ddrReset;
+    hs.input('src_data').srcConnection! <= ctrl.calState;
+    hs.input('src_valid').srcConnection! <= Const(1);
+    hs.input('dst_clk').srcConnection! <= clk;
+    hs.input('dst_reset').srcConnection! <= reset;
+    hs.input('dst_ready').srcConnection! <= Const(1);
+    final state = Logic(name: 'cal_state_sync', width: 6);
+    Sequential(clk, [
+      If(
+        reset,
+        then: [state < 0],
+        orElse: [
+          If(hs.output('dst_valid'), then: [state < hs.output('dst_data')]),
+        ],
+      ),
+    ]);
+    output('cal_state') <= state;
+  }
+
   void _build(
     Logic clk,
     Logic reset,
@@ -1028,7 +1124,7 @@ struct DramStore {
       minReadGap: wishbone ? 0 : readGap,
     );
     controller = ctrl;
-    if (isEcp5) output('cal_failed') <= ctrl.calFailed!;
+    _buildStatus(clk, reset, ddrClk, ddrReset, ctrl);
     ctrlStall <= ctrl.output('o_wb_stall');
     ctrlAck <= ctrl.output('o_wb_ack');
     ctrlAckAux <= ctrl.output('o_aux');

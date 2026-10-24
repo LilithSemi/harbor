@@ -129,7 +129,11 @@ class HarborCdcHandshake extends BridgeModule {
   final int dataWidth;
 
   HarborCdcHandshake({this.dataWidth = 32, super.name = 'cdc_handshake'})
-    : super('HarborCdcHandshake') {
+    : super(
+        dataWidth == 32
+            ? 'HarborCdcHandshake'
+            : 'HarborCdcHandshake_W$dataWidth',
+      ) {
     // Source domain
     createPort('src_clk', PortDirection.input);
     createPort('src_reset', PortDirection.input);

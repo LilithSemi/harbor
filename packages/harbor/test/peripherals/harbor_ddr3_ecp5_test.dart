@@ -63,7 +63,7 @@ void main() {
     ]);
     expect(d.controller, isNotNull);
     expect(d.controller!.phySelfTrainsRead, isFalse);
-    expect(d.outputs, isNot(contains('cal_failed')));
+    expect(d.outputs, contains('cal_failed'));
   });
 
   test('an ECP5 target rejects the CK/8 geared controller', () {

@@ -35,13 +35,10 @@ void main() {
     ddr.input('ddr_ck_fast').srcConnection! <= ck;
     ddr.input('ddr_clk').srcConnection! <= div[1];
     ddr.input('ddr_reset').srcConnection! <= ddrReset;
-    for (final n in [
-      'clk',
-      'reset',
-      'ddr_ck90_fast',
-      'ddr_ck_dqs_fast',
-      'ddr_idelay_ref',
-    ]) {
+    // The status outputs are on clk.
+    ddr.input('clk').srcConnection! <= ck;
+    ddr.input('reset').srcConnection! <= ddrReset;
+    for (final n in ['ddr_ck90_fast', 'ddr_ck_dqs_fast', 'ddr_idelay_ref']) {
       ddr.input(n).srcConnection! <= Const(0);
     }
     await ddr.build();
