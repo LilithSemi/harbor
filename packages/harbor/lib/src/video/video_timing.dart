@@ -23,7 +23,13 @@ class VideoTimingGenerator extends Module {
     required Logic clk,
     required Logic reset,
     super.name = 'video_timing',
-  }) : super(definitionName: 'VideoTimingGenerator') {
+  }) : super(
+         definitionName:
+             'VideoTimingGenerator_${timing.hActive}_${timing.hFrontPorch}'
+             '_${timing.hSyncWidth}_${timing.hBackPorch}_${timing.vActive}'
+             '_${timing.vFrontPorch}_${timing.vSyncWidth}_${timing.vBackPorch}'
+             '_${timing.hSyncPositive ? 1 : 0}${timing.vSyncPositive ? 1 : 0}',
+       ) {
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
 

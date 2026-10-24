@@ -1096,11 +1096,14 @@ class HarborDualClockDisplay extends Module {
       : harborStableDefinitionName('HarborDualClockDisplayOverlay', [
           name,
           'o${overlay.map(harborPixelFormatBitOrder.indexOf).join('x')}',
-          't${t.hActive}_${t.hFrontPorch}_${t.hSyncWidth}_${t.hBackPorch}'
-              '_${t.vActive}_${t.vFrontPorch}_${t.vSyncWidth}_${t.vBackPorch}'
-              '_${t.hSyncPositive ? 1 : 0}${t.vSyncPositive ? 1 : 0}',
+          _timingName(t),
           target is HarborFpgaTarget ? target.vendor.name : 'generic',
         ]);
+
+  static String _timingName(HarborDisplayTiming t) =>
+      't${t.hActive}_${t.hFrontPorch}_${t.hSyncWidth}_${t.hBackPorch}'
+      '_${t.vActive}_${t.vFrontPorch}_${t.vSyncWidth}_${t.vBackPorch}'
+      '_${t.hSyncPositive ? 1 : 0}${t.vSyncPositive ? 1 : 0}';
 
   /// The largest plane 0 line in bytes over [formats].
   static int _lineBytes(HarborDisplayTiming t, List<HarborPixelFormat> fs) =>
@@ -1137,9 +1140,7 @@ class HarborDualClockDisplay extends Module {
             : 'HarborDualClockDisplayPlanes',
         [
           'f${formats.map(harborPixelFormatBitOrder.indexOf).join('x')}',
-          't${t.hActive}_${t.hFrontPorch}_${t.hSyncWidth}_${t.hBackPorch}'
-              '_${t.vActive}_${t.vFrontPorch}_${t.vSyncWidth}_${t.vBackPorch}'
-              '_${t.hSyncPositive ? 1 : 0}${t.vSyncPositive ? 1 : 0}',
+          _timingName(t),
           'ram${target.blockRam?.name ?? "flop"}',
           ...mem,
         ],
@@ -1148,14 +1149,16 @@ class HarborDualClockDisplay extends Module {
     // A one plane YUV format reads words like rgb565, so its name has the
     // format to keep the two apart.
     final yuv = formats.single.yuv ? '_${formats.single.name}' : '';
-    return (port
-            ? 'HarborDualClockDisplayPort_s${stride}_w${lineBytes ~/ 4}'
-            : harborStableDefinitionName('HarborDualClockDisplay', [
-                's$stride',
-                'w${lineBytes ~/ 4}',
-                'ram${target.blockRam?.name ?? "flop"}',
-                ...mem,
-              ])) +
+    return harborStableDefinitionName(
+          port ? 'HarborDualClockDisplayPort' : 'HarborDualClockDisplay',
+          [
+            's$stride',
+            'w${lineBytes ~/ 4}',
+            _timingName(timing),
+            'ram${target.blockRam?.name ?? "flop"}',
+            ...mem,
+          ],
+        ) +
         yuv;
   }
 }

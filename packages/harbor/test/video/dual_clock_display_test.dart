@@ -91,6 +91,54 @@ void main() {
     );
   });
 
+  test('one plane builds of two timings have their own names', () {
+    String name(HarborDisplayTiming t, {bool port = false}) =>
+        HarborDualClockDisplay(
+          target: const HarborSimTarget(),
+          timing: t,
+          pixelClk: Logic(),
+          pixelReset: Logic(),
+          sysClk: Logic(),
+          sysReset: Logic(),
+          enable: Logic(),
+          fbBase: Logic(width: 32),
+          memory: port ? null : HarborMemoryWaist(_memConfig),
+          rqReady: port ? Logic() : null,
+          rdValid: port ? Logic() : null,
+          rdData: port ? Logic(width: 16) : null,
+          lineStride: 2560,
+          outputType: HarborDisplayInterface.parallelRgb,
+        ).definitionName;
+    const vga = HarborDisplayTiming.vga640x480();
+    const short = HarborDisplayTiming(
+      hActive: 640,
+      hFrontPorch: 16,
+      hSyncWidth: 96,
+      hBackPorch: 48,
+      vActive: 400,
+      vFrontPorch: 12,
+      vSyncWidth: 2,
+      vBackPorch: 35,
+      pixelClock: 25175000,
+    );
+    expect(name(vga), isNot(name(short)));
+    expect(name(vga, port: true), isNot(name(short, port: true)));
+    expect(
+      VideoTimingGenerator(
+        timing: vga,
+        clk: Logic(),
+        reset: Logic(),
+      ).definitionName,
+      isNot(
+        VideoTimingGenerator(
+          timing: short,
+          clk: Logic(),
+          reset: Logic(),
+        ).definitionName,
+      ),
+    );
+  });
+
   test('rgb888 pixel format throws', () {
     expect(
       () => _buildDisplay(
@@ -360,23 +408,20 @@ void main() {
   // use them only from the next frame.
   // The blank of 2 is the least a YUV build takes.
   for (final blank in [4, HarborPixelUnpack.latency - 1]) {
-    test(
-      'a new conversion set takes effect at the next frame start '
-      '(blank $blank)',
-      () {
-        final sets = [
-          HarborCscCoefficients.bt601Full,
-          HarborCscCoefficients.bt2020Limited,
-          HarborCscCoefficients.bt709Full,
-        ];
-        return _convert(
-          formats: [HarborPixelFormat.yuyv],
-          formatOf: (_) => 0,
-          setOf: (f) => sets[f % 3],
-          blank: blank,
-        );
-      },
-    );
+    test('a new conversion set takes effect at the next frame start '
+        '(blank $blank)', () {
+      final sets = [
+        HarborCscCoefficients.bt601Full,
+        HarborCscCoefficients.bt2020Limited,
+        HarborCscCoefficients.bt709Full,
+      ];
+      return _convert(
+        formats: [HarborPixelFormat.yuyv],
+        formatOf: (_) => 0,
+        setOf: (f) => sets[f % 3],
+        blank: blank,
+      );
+    });
   }
 
   // An xrgb8888 frame skips the conversion, a yuyv frame goes through it.
