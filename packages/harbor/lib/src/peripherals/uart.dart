@@ -14,22 +14,27 @@ import 'device_register.dart';
 ///
 /// Works with Linux `ns16550a` driver and U-Boot `ns16550` driver.
 ///
-/// Register map (standard 16550):
-/// - 0x0: RBR (read) / THR (write) / DLL (DLAB=1)
-/// - 0x1: IER (DLAB=0) / DLM (DLAB=1)
-/// - 0x2: IIR (read) / FCR (write)
-/// - 0x3: LCR (bit 7 = DLAB)
-/// - 0x4: MCR
-/// - 0x5: LSR (read-only)
-/// - 0x6: MSR (read-only)
-/// - 0x7: SCR
+/// Register map (standard 16550), register index n:
+/// - 0: RBR (read) / THR (write) / DLL (DLAB=1)
+/// - 1: IER (DLAB=0) / DLM (DLAB=1)
+/// - 2: IIR (read) / FCR (write)
+/// - 3: LCR (bit 7 = DLAB)
+/// - 4: MCR
+/// - 5: LSR (read-only)
+/// - 6: MSR (read-only)
+/// - 7: SCR
 ///
-/// Address space: 8 bytes (mapped to 0x1000 page for SoC).
+/// The registers sit in a 0x1000 window. [regShift] sets their stride:
 ///
-/// On a multi-byte bus the registers stay byte-mapped within words: writes
-/// pick their register through the byte-lane selects, and reads return the
-/// whole addressed word with every register in its lane, so masters that
-/// issue word-aligned loads extract the byte they want.
+/// - 0: register n is the byte at offset n (8 bytes). On a bus wider than
+///   8 bits the registers share words. A write selects its register through
+///   one byte lane. A write that selects more than one lane changes nothing
+///   and ends with a bus error. A read returns the whole word with each
+///   register in its lane, and the master takes the byte it wants.
+/// - 2: register n is the 32-bit word at offset n * 4 (32 bytes). The value
+///   is in bits 7:0 and bits 31:8 read 0. A write changes register n only
+///   when byte lane 0 of that word is selected. The bus must be 32 bits or
+///   wider, so a master that does only word accesses reaches every register.
 class HarborUart extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -41,6 +46,10 @@ class HarborUart extends BridgeModule
   final int baseAddress;
   int clockFrequency;
 
+  /// Register stride as a power of two: 0 for byte registers, 2 for word
+  /// registers.
+  final int regShift;
+
   /// TX serial output.
   Logic get tx => output('tx');
 
@@ -50,23 +59,60 @@ class HarborUart extends BridgeModule
   /// Bus slave port.
   late final BusSlavePort bus;
 
+  // A packed UART on a multi-byte bus fails multi-lane writes through ERR.
+  static bool _useErr(int regShift, int dataWidth) =>
+      regShift == 0 && dataWidth > 8;
+
+  static String _definitionName({
+    required HarborFabricKind kind,
+    required int addressWidth,
+    required int dataWidth,
+    required bool cross,
+    required int regShift,
+  }) {
+    if (regShift != 0 && regShift != 2) {
+      throw ArgumentError.value(
+        regShift,
+        'regShift',
+        'must be 0 (byte registers) or 2 (32-bit word registers)',
+      );
+    }
+    if (regShift == 2 && dataWidth < 32) {
+      throw ArgumentError.value(
+        dataWidth,
+        'busDataWidth',
+        'must be 32 or more when regShift is 2',
+      );
+    }
+    return harborStableDefinitionName('HarborUart', [
+      ...BusSlavePort.definitionNameParts(
+        kind: kind,
+        addressWidth: addressWidth,
+        dataWidth: dataWidth,
+        useErr: _useErr(regShift, dataWidth),
+        cross: cross,
+      ),
+      if (regShift != 0) 's$regShift',
+    ]);
+  }
+
   HarborUart({
     required this.baseAddress,
     this.clockFrequency = 0,
     int? busAddressWidth,
     this.busDataWidth,
+    this.regShift = 0,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     bool crossFabricClock = false,
     String? name,
   }) : super(
-         harborStableDefinitionName('HarborUart', [
-           ...BusSlavePort.definitionNameParts(
-             kind: fabricKind,
-             addressWidth: busAddressWidth ?? 12,
-             dataWidth: busDataWidth ?? 8,
-             cross: crossFabricClock,
-           ),
-         ]),
+         _definitionName(
+           kind: fabricKind,
+           addressWidth: busAddressWidth ?? 12,
+           dataWidth: busDataWidth ?? 8,
+           cross: crossFabricClock,
+           regShift: regShift,
+         ),
          name: name ?? 'uart',
        ) {
     createPort('clk', PortDirection.input);
@@ -84,6 +130,7 @@ class HarborUart extends BridgeModule
       // The full 0x1000 window, so no address in it aliases a register.
       addressWidth: busAddressWidth ?? 12,
       dataWidth: busDataWidth ?? 8,
+      useErr: _useErr(regShift, busDataWidth ?? 8),
       fabricClock: BusSlavePort.fabricClockInputs(
         this,
         cross: crossFabricClock,
@@ -92,19 +139,16 @@ class HarborUart extends BridgeModule
 
     final clk = input('clk');
     final reset = bus.reset;
-    // The bus carries word-aligned addresses with the byte position encoded
-    // in the SEL lanes (ns16550a registers are byte-mapped). Writes decode
-    // the active lane back into a register index and take their data from
-    // that lane. Reads return the whole addressed word with every byte
-    // register in its lane, and the master extracts the byte it asked for.
     final lanes = bus.dataIn.width ~/ 8;
-    final Logic addr;
-    final Logic datIn;
-    if (lanes == 1) {
-      // Byte-wide bus: addresses are already byte-granular.
+    final wide = regShift == 2;
+    // Register index and write data of the packed layout. The bus carries
+    // word-aligned addresses with the byte position in the SEL lanes.
+    Logic? addr;
+    Logic? datIn;
+    if (!wide && lanes == 1) {
       addr = bus.addr.getRange(0, 3);
       datIn = bus.dataIn.getRange(0, 8);
-    } else {
+    } else if (!wide) {
       final laneBits = (lanes - 1).bitLength;
       final wrLane = Logic(name: 'uart_wr_lane', width: laneBits);
       Combinational([
@@ -112,9 +156,8 @@ class HarborUart extends BridgeModule
         for (var i = 1; i < lanes; i++)
           If(bus.sel[i], then: [wrLane < Const(i, width: laneBits)]),
       ]);
-      // Write register index 0..7: the lane within the addressed word, plus
-      // the word-select address bit on a 32-bit bus (a 64-bit bus spans all
-      // 8 registers in one word).
+      // The lane in the word, plus the word-select address bit on a 32-bit
+      // bus. A 64-bit bus holds all 8 registers in one word.
       addr = laneBits >= 3 ? wrLane : [bus.addr[2], wrLane].swizzle();
       final laneData = Logic(name: 'uart_dat_in', width: 8);
       Combinational([
@@ -127,17 +170,20 @@ class HarborUart extends BridgeModule
       ]);
       datIn = laneData;
     }
-    // The registers span 8 bytes of the 0x1000 window. Other offsets in the
-    // window read 0 and ignore writes. Address bits above the window are
-    // ignored, so absolute and window-relative addresses both work.
-    final inWindow = bus.inSpan(8, 0x1000).named('uart_in_window');
-    // Every UART register is one byte. A write that selects no byte at all
-    // (AXI4 WSTRB 0) must change nothing, instead of falling through to lane
-    // 0 of a wide bus by default.
+    // Other offsets in the window read 0 and ignore writes. Address bits
+    // above the window are ignored, so absolute and window-relative
+    // addresses both work.
+    final inWindow = bus.inSpan(wide ? 32 : 8, 0x1000).named('uart_in_window');
+    // A write that selects no byte at all (AXI4 WSTRB 0) changes nothing.
     final anySel = bus.sel.or().named('uart_any_sel');
+    final multiLane = lanes == 1
+        ? Const(0)
+        : (bus.sel & (bus.sel - 1)).or().named('uart_multi_lane');
     final datOutW = Logic(name: 'uart_dat_out', width: bus.dataOut.width);
     bus.dataOut <= datOutW;
     final ack = bus.ack;
+    final errR = Logic(name: 'uart_err');
+    bus.err?.gets(errR);
     final stb = bus.stb;
     final we = bus.we;
 
@@ -208,41 +254,101 @@ class HarborUart extends BridgeModule
 
     final dlab = lcr[7];
 
-    // Read mux. On a multi-byte bus every byte register of the addressed word
-    // is returned in its lane and the master extracts the byte it wants. On a
-    // byte-wide bus each register is returned individually. Only a read that
-    // selects the RBR lane pops the receive buffer, so a read of IER, IIR or
-    // LCR in the same word does not.
+    // Read value of each register index.
+    final regValue = <Logic>[
+      mux(dlab, dll, rxData),
+      mux(dlab, dlm, ier),
+      computedIir,
+      lcr,
+      mcr,
+      lsr,
+      Const(0, width: 8),
+      scr,
+    ];
+
+    // Write of data [d] to the register at index [idx].
+    Conditional writeReg(Logic idx, Logic d) => Case(idx, [
+      CaseItem(Const(0, width: 3), [
+        If(
+          dlab,
+          then: [dll < d],
+          orElse: [txHolding < d, txHoldingFull < Const(1)],
+        ),
+      ]),
+      CaseItem(Const(1, width: 3), [
+        If(dlab, then: [dlm < d], orElse: [ier < d]),
+      ]),
+      CaseItem(Const(2, width: 3), [fcr < d]),
+      CaseItem(Const(3, width: 3), [lcr < d]),
+      CaseItem(Const(4, width: 3), [mcr < d]),
+      // LSR (5) and MSR (6) are read-only.
+      CaseItem(Const(7, width: 3), [scr < d]),
+    ]);
+
+    // Only a read that selects the RBR byte pops the receive buffer, so a
+    // read of another register in the same word does not.
     final List<Conditional> readItems;
-    if (lanes == 1) {
+    final List<Conditional> writeItems;
+    if (wide) {
+      // Each bus word holds `slots` registers, one per 32-bit slot. Slot s
+      // of word w is register w * slots + s.
+      final wordBits = lanes.bitLength - 1;
+      final slots = lanes ~/ 4;
+      final slotBits = wordBits - 2;
+      final Logic? word = wordBits < 5
+          ? bus.windowAddr(32).getRange(wordBits, 5)
+          : null;
+      Logic regIndex(int s) => switch ((word, slotBits)) {
+        (null, _) => Const(s, width: 3),
+        (final w?, 0) => w,
+        (final w?, _) => [w, Const(s, width: slotBits)].swizzle(),
+      };
+      final used = slots < 8 ? slots : 8;
+      final slotValue = [
+        for (var s = 0; s < slots; s++)
+          if (s >= used)
+            Const(0, width: 32)
+          else if (word == null)
+            regValue[s].zeroExtend(32)
+          else
+            word
+                .selectFrom([
+                  for (var w = 0; w < 8 ~/ slots; w++) regValue[w * slots + s],
+                ])
+                .zeroExtend(32),
+      ];
+      final rbrWord = word == null ? Const(1) : word.eq(0);
       readItems = [
-        Case(addr, [
-          CaseItem(Const(0, width: 3), [
-            If(
-              dlab,
-              then: [datOutW < dll],
-              orElse: [datOutW < rxData, rxReady < Const(0)],
-            ),
-          ]),
-          CaseItem(Const(1, width: 3), [
-            If(dlab, then: [datOutW < dlm], orElse: [datOutW < ier]),
-          ]),
-          CaseItem(Const(2, width: 3), [datOutW < computedIir]),
-          CaseItem(Const(3, width: 3), [datOutW < lcr]),
-          CaseItem(Const(4, width: 3), [datOutW < mcr]),
-          CaseItem(Const(5, width: 3), [datOutW < lsr]),
-          CaseItem(Const(6, width: 3), [datOutW < Const(0, width: 8)]),
-          CaseItem(Const(7, width: 3), [datOutW < scr]),
+        datOutW <
+            slotValue.reversed.toList().swizzle().zeroExtend(bus.dataOut.width),
+        If(~dlab & rbrWord & bus.sel[0], then: [rxReady < Const(0)]),
+      ];
+      writeItems = [
+        for (var s = 0; s < used; s++)
+          If(
+            bus.sel[4 * s],
+            then: [
+              writeReg(regIndex(s), bus.dataIn.getRange(32 * s, 32 * s + 8)),
+            ],
+          ),
+      ];
+    } else if (lanes == 1) {
+      readItems = [
+        Case(addr!, [
+          for (var i = 0; i < 8; i++)
+            CaseItem(Const(i, width: 3), [
+              datOutW < regValue[i],
+              if (i == 0) If(~dlab, then: [rxReady < Const(0)]),
+            ]),
         ]),
       ];
+      writeItems = [
+        If(anySel, then: [writeReg(addr, datIn!)]),
+      ];
     } else {
-      final word0 = [
-        lcr,
-        computedIir,
-        mux(dlab, dlm, ier),
-        mux(dlab, dll, rxData),
-      ].swizzle();
-      final word1 = [scr, Const(0, width: 8), lsr, mcr].swizzle();
+      // Every register of the addressed word is returned in its lane.
+      final word0 = regValue.sublist(0, 4).reversed.toList().swizzle();
+      final word1 = regValue.sublist(4).reversed.toList().swizzle();
       if (lanes >= 8) {
         readItems = [
           datOutW < [word1, word0].swizzle().zeroExtend(bus.dataOut.width),
@@ -260,6 +366,17 @@ class HarborUart extends BridgeModule
           ),
         ];
       }
+      // A write to more than one lane is not one register write, so it
+      // changes nothing and fails.
+      writeItems = [
+        If(
+          multiLane,
+          then: [errR < Const(1)],
+          orElse: [
+            If(anySel, then: [writeReg(addr!, datIn!)]),
+          ],
+        ),
+      ];
     }
 
     Sequential(clk, [
@@ -288,6 +405,7 @@ class HarborUart extends BridgeModule
           rxShift < Const(0, width: 8),
           baudCount < Const(0, width: 16),
           ack < Const(0),
+          errR < Const(0),
           datOutW < Const(0, width: bus.dataOut.width),
         ],
         orElse: [
@@ -392,6 +510,7 @@ class HarborUart extends BridgeModule
 
           // Bus access
           ack < Const(0),
+          errR < Const(0),
           datOutW < Const(0, width: bus.dataOut.width),
 
           If(
@@ -400,32 +519,8 @@ class HarborUart extends BridgeModule
               ack < Const(1),
 
               If(
-                inWindow & we & anySel,
-                then: [
-                  Case(addr, [
-                    // 0x0: THR/DLL
-                    CaseItem(Const(0, width: 3), [
-                      If(
-                        dlab,
-                        then: [dll < datIn],
-                        orElse: [txHolding < datIn, txHoldingFull < Const(1)],
-                      ),
-                    ]),
-                    // 0x1: IER/DLM
-                    CaseItem(Const(1, width: 3), [
-                      If(dlab, then: [dlm < datIn], orElse: [ier < datIn]),
-                    ]),
-                    // 0x2: FCR
-                    CaseItem(Const(2, width: 3), [fcr < datIn]),
-                    // 0x3: LCR
-                    CaseItem(Const(3, width: 3), [lcr < datIn]),
-                    // 0x4: MCR
-                    CaseItem(Const(4, width: 3), [mcr < datIn]),
-                    // 0x5 LSR and 0x6 MSR are read-only.
-                    // 0x7: SCR
-                    CaseItem(Const(7, width: 3), [scr < datIn]),
-                  ]),
-                ],
+                inWindow & we,
+                then: writeItems,
                 orElse: [If(inWindow & ~we, then: readItems)],
               ),
             ],
@@ -550,8 +645,8 @@ struct UartSink {
     compatible: ['ns16550a'],
     reg: BusAddressRange(baseAddress, 0x1000),
     properties: {
-      'reg-shift': 0,
-      'reg-io-width': 1,
+      'reg-shift': regShift,
+      'reg-io-width': 1 << regShift,
       if (clockFrequency > 0) 'clock-frequency': clockFrequency,
     },
   );
@@ -564,8 +659,8 @@ struct UartSink {
     memory: [BusAddressRange(baseAddress, 0x1000)],
     properties: {
       'compatible': ['ns16550a'],
-      'reg-shift': 0,
-      'reg-io-width': 1,
+      'reg-shift': regShift,
+      'reg-io-width': 1 << regShift,
       if (clockFrequency > 0) 'clock-frequency': clockFrequency,
     },
   );
@@ -577,6 +672,8 @@ struct UartSink {
     description: '16550-compatible UART',
     baseAddress: baseAddress,
     size: 0x1000,
-    registers: StandardRegisters.uart16550,
+    registers: regShift == 2
+        ? StandardRegisters.uart16550Word
+        : StandardRegisters.uart16550,
   );
 }

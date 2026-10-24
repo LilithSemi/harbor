@@ -45,11 +45,199 @@ void main() {
       final b = HarborUart(baseAddress: 0x10000000, busDataWidth: 32);
       expect(a.definitionName, isNot(equals(b.definitionName)));
     });
+
+    test('regShift gets its own definition name', () {
+      final a = HarborUart(baseAddress: 0x10000000, busDataWidth: 32);
+      final b = HarborUart(
+        baseAddress: 0x10000000,
+        busDataWidth: 32,
+        regShift: 2,
+      );
+      expect(a.definitionName, isNot(equals(b.definitionName)));
+    });
+
+    test('rejects a regShift other than 0 or 2', () {
+      expect(
+        () => HarborUart(baseAddress: 0, busDataWidth: 32, regShift: 1),
+        throwsArgumentError,
+      );
+      expect(
+        () => HarborUart(baseAddress: 0, busDataWidth: 32, regShift: 3),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects regShift 2 on a bus narrower than 32 bits', () {
+      expect(
+        () => HarborUart(baseAddress: 0, busDataWidth: 8, regShift: 2),
+        throwsArgumentError,
+      );
+    });
+
+    test('DT and ACPI give reg-shift and reg-io-width', () {
+      final packed = HarborUart(baseAddress: 0x10000000, busDataWidth: 32);
+      final word = HarborUart(
+        baseAddress: 0x10000000,
+        busDataWidth: 32,
+        regShift: 2,
+      );
+      expect(packed.dtNode.properties['reg-shift'], equals(0));
+      expect(packed.dtNode.properties['reg-io-width'], equals(1));
+      expect(word.dtNode.properties['reg-shift'], equals(2));
+      expect(word.dtNode.properties['reg-io-width'], equals(4));
+      expect(word.acpiDevice.properties['reg-shift'], equals(2));
+      expect(word.acpiDevice.properties['reg-io-width'], equals(4));
+      expect(word.svdPeripheral.registers!.fieldOffset('scr'), equals(0x1c));
+    });
   });
 
   for (final kind in HarborFabricKind.values) {
     registerTests(kind);
+    wordRegisterTests(kind);
+    packedLaneTests(kind);
   }
+}
+
+class _Dut {
+  final HarborUart uart;
+  final Logic clk;
+  final RegBus bus;
+  _Dut(this.uart, this.clk, this.bus);
+}
+
+Future<_Dut> _startUart(HarborUart uart) async {
+  final clk = SimpleClockGenerator(10).clk;
+  final reset = Logic(name: 'reset');
+  final rx = Logic(name: 'rx');
+  uart.input('clk').srcConnection! <= clk;
+  uart.input('reset').srcConnection! <= reset;
+  uart.input('rx').srcConnection! <= rx;
+  final bus = RegBus.attach(uart, clk);
+  await uart.build();
+  reset.inject(1);
+  bus.idle();
+  rx.inject(1);
+  Simulator.setMaxSimTime(400000);
+  unawaited(Simulator.run());
+  await clk.nextPosedge;
+  await clk.nextPosedge;
+  reset.inject(0);
+  await clk.nextPosedge;
+  return _Dut(uart, clk, bus);
+}
+
+// Samples TX until one 8N1 frame at [cyclesPerBit] arrives.
+Future<int?> _receiveByte(Logic tx, Logic clk, int cyclesPerBit) async {
+  Future<void> wait(int n) async {
+    for (var i = 0; i < n; i++) {
+      await clk.nextPosedge;
+    }
+  }
+
+  var guard = 0;
+  while (tx.value.toInt() == 1) {
+    if (guard++ > 400) return null;
+    await wait(1);
+  }
+  await wait(cyclesPerBit ~/ 2);
+  if (tx.value.toInt() != 0) return null;
+  var byte = 0;
+  for (var i = 0; i < 8; i++) {
+    await wait(cyclesPerBit);
+    byte |= tx.value.toInt() << i;
+  }
+  await wait(cyclesPerBit);
+  if (tx.value.toInt() != 1) return null;
+  return byte;
+}
+
+void wordRegisterTests(HarborFabricKind kind) {
+  group('HarborUart regShift 2 on a 32-bit bus (${kind.name})', () {
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test('a word access reaches each register at n * 4', () async {
+      final d = await _startUart(
+        HarborUart(
+          baseAddress: 0x10000000,
+          busDataWidth: 32,
+          regShift: 2,
+          fabricKind: kind,
+        ),
+      );
+      final bus = d.bus;
+      // Full-word writes with junk above bits 7:0.
+      await bus.write(0x0c, 0xdeadbe83);
+      await bus.write(0x00, 0xffffff04);
+      await bus.write(0x04, 0xffffff00);
+      expect(await bus.read(0x00), equals(0x04));
+      expect(await bus.read(0x04), equals(0x00));
+      expect(await bus.read(0x0c), equals(0x83));
+      await bus.write(0x0c, 0x03);
+      expect(await bus.read(0x0c), equals(0x03));
+
+      await bus.write(0x04, 0x02);
+      expect(await bus.read(0x04), equals(0x02));
+      // FCR sets IIR bits 7:6, and the THRE interrupt is pending.
+      await bus.write(0x08, 0xc1);
+      expect(await bus.read(0x08), equals(0xc2));
+      await bus.write(0x04, 0x00);
+      await bus.write(0x10, 0x0b);
+      expect(await bus.read(0x10), equals(0x0b));
+      expect(await bus.read(0x14), equals(0x60));
+      expect(await bus.read(0x18), equals(0x00));
+      await bus.write(0x1c, 0x5a);
+      expect(await bus.read(0x1c), equals(0x5a));
+
+      // A write without byte lane 0 changes nothing.
+      await bus.write(0x1c, 0xffffffff, sel: 0xe);
+      expect(await bus.read(0x1c), equals(0x5a));
+
+      final rx = _receiveByte(d.uart.tx, d.clk, 4);
+      await bus.write(0x00, 0xa5);
+      expect(await rx, equals(0xa5));
+
+      await Simulator.endSimulation();
+    });
+  });
+}
+
+void packedLaneTests(HarborFabricKind kind) {
+  group('HarborUart packed on a 32-bit bus (${kind.name})', () {
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test('a multi-lane write changes nothing and fails', () async {
+      final d = await _startUart(
+        HarborUart(baseAddress: 0x10000000, busDataWidth: 32, fabricKind: kind),
+      );
+      final bus = d.bus;
+      // LCR is lane 3 of word 0, SCR is lane 3 of word 4.
+      var r = await bus.access(0x0, data: 0x03 << 24, sel: 0x8, write: true);
+      expect(r.err, isFalse);
+      r = await bus.access(0x4, data: 0x5a << 24, sel: 0x8, write: true);
+      expect(r.err, isFalse);
+      expect((await bus.read(0x0) >> 24) & 0xff, equals(0x03));
+      expect((await bus.read(0x4) >> 24) & 0xff, equals(0x5a));
+
+      r = await bus.access(0x0, data: 0xffffffff, sel: 0xf, write: true);
+      expect(r.err, isTrue);
+      r = await bus.access(0x4, data: 0xffffffff, sel: 0xc, write: true);
+      expect(r.err, isTrue);
+      final w0 = await bus.read(0x0);
+      expect((w0 >> 24) & 0xff, equals(0x03), reason: 'LCR');
+      expect((w0 >> 8) & 0xff, equals(0x00), reason: 'IER');
+      expect((await bus.read(0x4) >> 24) & 0xff, equals(0x5a), reason: 'SCR');
+
+      // Reads of the whole word do not fail.
+      final read = await bus.access(0x0, write: false);
+      expect(read.err, isFalse);
+
+      await Simulator.endSimulation();
+    });
+  });
 }
 
 void registerTests(HarborFabricKind kind) {

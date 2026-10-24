@@ -165,6 +165,21 @@ abstract final class StandardRegisters {
     ],
   );
 
+  /// 16550 UART register map with 32-bit registers (`reg-shift` 2).
+  static const uart16550Word = HarborDeviceRegisterMap(
+    name: 'uart16550_word',
+    fields: [
+      HarborDeviceField(name: 'rbr_thr_dll', width: 4, offset: 0x00),
+      HarborDeviceField(name: 'ier_dlm', width: 4, offset: 0x04),
+      HarborDeviceField(name: 'iir_fcr', width: 4, offset: 0x08),
+      HarborDeviceField(name: 'lcr', width: 4, offset: 0x0c, resetValue: 0x03),
+      HarborDeviceField(name: 'mcr', width: 4, offset: 0x10),
+      HarborDeviceField(name: 'lsr', width: 4, offset: 0x14, readOnly: true),
+      HarborDeviceField(name: 'msr', width: 4, offset: 0x18, readOnly: true),
+      HarborDeviceField(name: 'scr', width: 4, offset: 0x1c),
+    ],
+  );
+
   /// SiFive CLINT register map (per hart 0).
   static const clint = HarborDeviceRegisterMap(
     name: 'clint',
