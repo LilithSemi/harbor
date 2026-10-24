@@ -1,8 +1,8 @@
-import 'dart:async';
 import 'dart:math';
 
 import 'package:rohd/rohd.dart';
 
+import 'pcie_bank_ram.dart';
 import 'pcie_stream.dart';
 
 /// The read tags of the PCIe DMA engine and their reorder buffer.
@@ -409,7 +409,7 @@ class HarborPcieDmaTags extends Module {
         bankLane,
         lanesReg,
       ).named('w_data_$b');
-      final ram = _ReorderRam(
+      final ram = HarborPcieBankRam(
         clk,
         width: 32,
         depth: bankDepth,
@@ -573,83 +573,4 @@ Logic _laneMux(Logic useFirst, Logic first, Logic l, List<Logic> lanes) {
     ),
   ]);
   return out;
-}
-
-/// A simple dual port RAM with a registered read, as [HarborBram].
-///
-/// The simulation body is a Dart list, because a flop array of this depth
-/// is slow in the simulator. Synthesis uses the same inferred block RAM
-/// template as [HarborBram].
-class _ReorderRam extends Module with SystemVerilog {
-  final int width;
-  final int depth;
-  final int addrWidth;
-
-  Logic get rdData => output('rd_data');
-
-  _ReorderRam(
-    Logic clk, {
-    required this.width,
-    required this.depth,
-    required Logic wrEn,
-    required Logic wrAddr,
-    required Logic wrData,
-    required Logic rdAddr,
-    super.name,
-  }) : addrWidth = (depth - 1).bitLength.clamp(1, 32),
-       super(
-         definitionName: 'HarborPcieDmaReorderRam_${width}x$depth',
-         reserveDefinitionName: true,
-       ) {
-    clk = addInput('clk', clk);
-    wrEn = addInput('wr_en', wrEn);
-    wrAddr = addInput('wr_addr', wrAddr, width: addrWidth);
-    wrData = addInput('wr_data', wrData, width: width);
-    rdAddr = addInput('rd_addr', rdAddr, width: addrWidth);
-    final reg = Logic(name: 'rd_reg', width: width);
-    addOutput('rd_data', width: width) <= reg;
-
-    final unknown = LogicValue.filled(width, LogicValue.x);
-    final cells = List<LogicValue>.filled(depth, unknown);
-    reg.put(unknown);
-    // Inputs are sampled at the clock edge. The read data changes when the
-    // flops change, so other flops see it in the next cycle.
-    clk.glitch.listen((event) {
-      if (event.previousValue != LogicValue.zero ||
-          event.newValue != LogicValue.one) {
-        return;
-      }
-      final ra = rdAddr.value;
-      final read = ra.isValid && ra.toInt() < depth
-          ? cells[ra.toInt()]
-          : unknown;
-      final we = wrEn.value;
-      if (we.isValid && we.toBool()) {
-        final wa = wrAddr.value;
-        if (!wa.isValid) {
-          throw StateError('$name: write address is not valid');
-        }
-        if (wa.toInt() < depth) cells[wa.toInt()] = wrData.value;
-      }
-      unawaited(Simulator.clkStable.first.then((_) => reg.put(read)));
-    });
-  }
-
-  @override
-  String? definitionVerilog(String definitionType) =>
-      '''
-module $definitionType (
-  input logic clk,
-  input logic wr_en,
-  input logic [${addrWidth - 1}:0] wr_addr,
-  input logic [${width - 1}:0] wr_data,
-  input logic [${addrWidth - 1}:0] rd_addr,
-  output logic [${width - 1}:0] rd_data
-);
-  logic [${width - 1}:0] mem [0:${depth - 1}];
-  always_ff @(posedge clk) begin
-    if (wr_en) mem[wr_addr] <= wr_data;
-    rd_data <= mem[rd_addr];
-  end
-endmodule''';
 }

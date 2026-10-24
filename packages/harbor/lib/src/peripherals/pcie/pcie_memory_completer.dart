@@ -1,9 +1,12 @@
+import 'dart:math';
+
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../../bus/port/fabric_kind.dart';
 import '../../bus/port/memory_port.dart';
 import '../../bus/port/memory_waist.dart';
+import 'pcie_bank_ram.dart';
 import 'pcie_endpoint.dart';
 import 'pcie_stream.dart';
 
@@ -287,10 +290,6 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     final errCount = Logic(name: 'err_count', width: 16);
     addOutput('write_errors', width: 16) <= errCount;
 
-    final buf = [
-      for (var j = 0; j < entries; j++) Logic(name: 'buf_$j', width: 32),
-    ];
-
     Logic laneOf(Logic addr) => dpb == 1
         ? Const(0, width: 2)
         : addr.slice(3, 2) & Const(dpb - 1, width: 2);
@@ -399,10 +398,12 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     mem.reqExclusive <= Const(0);
     final reqFire = mem.reqValid & mem.reqReady;
 
-    final words = [
-      for (var x = 0; x < entries ~/ dpb; x++)
-        [for (var l = dpb - 1; l >= 0; l--) buf[x * dpb + l]].swizzle(),
+    // Entries of the payload buffer from the read start of the last cycle.
+    final banks = max(n, dpb);
+    final window = [
+      for (var k = 0; k < banks; k++) Logic(name: 'payload_lane_$k', width: 32),
     ];
+
     final strobes = <Logic>[];
     for (var l = 0; l < dpb; l++) {
       final p = (word << dpbLog) + l;
@@ -424,7 +425,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     mem.wdataValid <= inState(sWdata);
     // Bytes with no strobe are driven 0.
     final strb = strobes.rswizzle();
-    final raw = word.selectFrom(words);
+    final raw = [for (var l = dpb - 1; l >= 0; l--) window[l]].swizzle();
     mem.wdataData <=
         [
           for (var b = beatBytes - 1; b >= 0; b--)
@@ -468,9 +469,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     final txKeep = <Logic>[];
     for (var i = 0; i < n; i++) {
       final t = txT + i;
-      Logic value = tlpSwapBytes(
-        (txBase + i).selectFrom(buf, defaultValue: Const(0, width: 32)),
-      );
+      Logic value = tlpSwapBytes(window[i]);
       for (var h = 2; h >= 0; h--) {
         if (h % n != i) continue;
         value = mux(t.eq(h), [dw0, dw1, dw2][h], value);
@@ -483,9 +482,68 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     txs.data <= txLanes.rswizzle();
     txs.keep <= txKeep.rswizzle();
     txs.last <= txLast;
-    txs.valid <= inState(sTx);
+    // With more than 3 lanes the first beat has payload. The buffer can
+    // write that payload in the last cycle before the TX state, so the
+    // first beat waits one cycle for the read.
+    final txPrimed = Logic(name: 'tx_primed');
+    Sequential(clk, [txPrimed < ~reset & inState(sTx)]);
+    txs.valid <= inState(sTx) & (n > 3 ? txPrimed : Const(1));
     txs.user <= Const(0, width: HarborPcieStream.userWidth);
     final txFire = txs.valid & txs.ready;
+
+    // The payload buffer. RX writes in the RX state and fabric reads write
+    // in the read data state. The read address leads the TX beat and the
+    // write data beat by one cycle.
+    final inRdata = inState(sRdata);
+    final hdrWrite = inRx & hdrFire & capture.payloadInHeaderBeat;
+    final rdataWrite = inRdata & rFire;
+    final rxLanes = [
+      for (var i = 0; i < n; i++)
+        tlpSwapBytes(rxs.data.slice(32 * i + 31, 32 * i)),
+    ];
+    final txBaseNext = mux(
+      inState(sTx),
+      mux(txFire & ~txLast, txBase + n, txBase),
+      lane0.zeroExtend(idxW) - 3,
+    );
+    final wordNext = mux(wFire, word + 1, word);
+    final payload = HarborPcieWindowBuffer(
+      clk,
+      entries: entries,
+      banks: banks,
+      wrEn: hdrWrite | payloadFire | rdataWrite,
+      wrStart: mux(
+        inRdata,
+        word << dpbLog,
+        mux(hdrWrite, lane0Comb.zeroExtend(idxW), rxBase),
+      ),
+      wrCount: mux(
+        inRdata,
+        Const(dpb, width: 3),
+        mux(hdrWrite, Const(1, width: 3), Const(n, width: 3)),
+      ),
+      wrLanes: [
+        for (var k = 0; k < banks; k++)
+          mux(
+            inRdata,
+            k < dpb
+                ? mem.rdataData.slice(32 * k + 31, 32 * k)
+                : Const(0, width: 32),
+            k == 0
+                ? mux(
+                    hdrWrite,
+                    tlpSwapBytes(capture.firstPayloadDw),
+                    rxLanes[0],
+                  )
+                : (k < n ? rxLanes[k] : Const(0, width: 32)),
+          ),
+      ],
+      rdStart: mux(inState(sTx) | inRdata, txBaseNext, wordNext << dpbLog),
+      name: 'payload',
+    );
+    for (var k = 0; k < banks; k++) {
+      window[k] <= payload.window[k];
+    }
 
     List<Conditional> countError() => [
       If(~errCount.and(), then: [errCount < errCount + 1]),
@@ -504,40 +562,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       ];
     }
 
-    final fill = <Conditional>[];
-    for (var j = 0; j < entries; j++) {
-      final x = j ~/ dpb;
-      final l = j % dpb;
-      final cases = <(Logic, Logic)>[
-        (
-          inRx &
-              hdrFire &
-              capture.payloadInHeaderBeat &
-              lane0Comb.zeroExtend(idxW).eq(j),
-          tlpSwapBytes(capture.firstPayloadDw),
-        ),
-        for (var i = 0; i < n && i <= j; i++)
-          (
-            payloadFire & rxBase.eq(j - i),
-            tlpSwapBytes(rxs.data.slice(32 * i + 31, 32 * i)),
-          ),
-        (
-          inState(sRdata) & rFire & word.eq(x),
-          mem.rdataData.slice(32 * l + 31, 32 * l),
-        ),
-      ];
-      fill.add(
-        If.block([
-          for (final (k, (cond, value)) in cases.indexed)
-            k == 0
-                ? Iff(cond, [buf[j] < value])
-                : ElseIf(cond, [buf[j] < value]),
-        ]),
-      );
-    }
-
     Sequential(clk, [
-      ...fill,
       If(
         reset,
         then: [
