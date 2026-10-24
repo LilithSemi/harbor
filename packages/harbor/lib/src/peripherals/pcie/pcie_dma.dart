@@ -8,6 +8,7 @@ import '../../bus/port/memory_port.dart';
 import '../../bus/port/memory_waist.dart';
 import '../../bus/port/reg_fifo.dart';
 import '../bram.dart';
+import 'pcie_bank_ram.dart';
 import 'pcie_dma_tags.dart';
 import 'pcie_endpoint.dart';
 import 'pcie_stream.dart';
@@ -568,8 +569,18 @@ class HarborPcieDma extends BridgeModule {
     final txT = Logic(name: 'tx_t', width: 12);
     final txBase = Logic(name: 'tx_base', width: idxW);
 
-    final buf = [
-      for (var j = 0; j < entries; j++) Logic(name: 'buf_$j', width: 32),
+    // Entries of the D2H payload buffer from the read start of the last
+    // cycle.
+    final banks = max(n, dpb);
+    final window = [
+      for (var k = 0; k < banks; k++) Logic(name: 'payload_lane_$k', width: 32),
+    ];
+    // The record DWs. They do not change while the record is sent.
+    final recWords = [
+      dCookie,
+      [phase, Const(0, width: 23), code].swizzle(),
+      done,
+      [dSrc[16], Const(0, width: 15), dSrc.slice(15, 0)].swizzle(),
     ];
 
     // BAR0 completion.
@@ -986,8 +997,13 @@ class HarborPcieDma extends BridgeModule {
     final eKeep = <Logic>[];
     for (var i = 0; i < n; i++) {
       final t = txT + i;
+      // In a record, DW k of the payload is record DW k.
       var value = tlpSwapBytes(
-        (txBase + i).selectFrom(buf, defaultValue: Const(0, width: 32)),
+        mux(
+          inState(sRecTx),
+          (txBase + i).slice(1, 0).selectFrom(recWords),
+          window[i],
+        ),
       );
       for (var h = 3; h >= 0; h--) {
         if (h % n != i) continue;
@@ -1103,6 +1119,31 @@ class HarborPcieDma extends BridgeModule {
     final cFire = txFire & pickCpl;
     final fFire = txFire & pickFetch;
     final recDone = (inState(sRecTx) & eFire & eLast).named('rec_done');
+
+    // The D2H payload buffer. Fabric reads write it, and the read address
+    // leads the TX beat by one cycle.
+    final payload = HarborPcieWindowBuffer(
+      clk,
+      entries: entries,
+      banks: banks,
+      wrEn: inState(sRdata) & rFire,
+      wrStart: word << dpbLog,
+      wrCount: Const(dpb, width: 3),
+      wrLanes: [
+        for (var l = 0; l < dpb; l++) mem.rdataData.slice(32 * l + 31, 32 * l),
+      ],
+      // The TX wait state sets the start of the next packet, so the start
+      // does not look at the last beat.
+      rdStart: mux(
+        inState(sTx),
+        mux(eFire, txBase + n, txBase),
+        lane0.zeroExtend(idxW) - hdrDws.slice(idxW - 1, 0),
+      ),
+      name: 'payload',
+    );
+    for (var k = 0; k < banks; k++) {
+      window[k] <= payload.window[k];
+    }
 
     // Host to device control.
     final wrespErr = inH2d & inD(dResp) & bFire & mem.wrespErr;
@@ -1452,28 +1493,8 @@ class HarborPcieDma extends BridgeModule {
       mux(cT.lte(3), Const(1, width: 3), Const(n, width: 3)),
     ).named('c_shift');
 
-    final fill = <Conditional>[];
-    final recWords = [
-      dCookie,
-      [phase, Const(0, width: 23), code].swizzle(),
-      done,
-      [dSrc[16], Const(0, width: 15), dSrc.slice(15, 0)].swizzle(),
-    ];
     final recLoad = (inState(sRecWait) & ~resetReq & ~cplFull & busMasterEnable)
         .named('rec_load');
-    for (var j = 0; j < entries; j++) {
-      final x = j ~/ dpb;
-      final l = j % dpb;
-      fill.add(
-        If.block([
-          Iff(inState(sRdata) & rFire & word.eq(x), [
-            buf[j] < mem.rdataData.slice(32 * l + 31, 32 * l),
-          ]),
-          if (j < recWords.length) ElseIf(recLoad, [buf[j] < recWords[j]]),
-        ]),
-      );
-    }
-
     List<Conditional> engineReset() => [
       state < sIdle,
       pushSeq < 0,
@@ -1501,7 +1522,6 @@ class HarborPcieDma extends BridgeModule {
     final pktBytes = (pktDw.zeroExtend(32) << 2).named('pkt_bytes');
 
     Sequential(clk, [
-      ...fill,
       If(
         reset,
         then: [
