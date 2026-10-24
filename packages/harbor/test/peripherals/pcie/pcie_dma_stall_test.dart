@@ -55,8 +55,177 @@ class _CdcTop extends BridgeModule {
   }
 }
 
+const _timeout = 2000;
+
+/// Cycles past [_timeout] for the record, with the host read and the TX
+/// port in the path.
+const _slack = 600;
+
+/// The stalls: AXI channel, transfer direction.
+const _stalls = [('ar', true), ('r', true), ('aw', false), ('b', false)];
+
+Future<DmaBench> _bench() async {
+  final b = await DmaBench.create(
+    const DmaConfig(axiGate: true, timeoutCycles: _timeout),
+  );
+  await b.start();
+  await b.setupRing(dmaCplBase, 4);
+  await b.enable();
+  return b;
+}
+
+Future<void> _push(DmaBench b, bool d2h, int host, int local, int cookie) {
+  if (!d2h) b.seedHost(host, 0x100);
+  return b.push(
+    hostAddress: host,
+    localAddress: local,
+    length: 0x100,
+    deviceToHost: d2h,
+    cookie: cookie,
+  );
+}
+
+int _dropped(int debug) => debug >> HarborPcieDma.debugDroppedShift;
+
+/// Runs a good transfer after an engine reset and checks its data.
+Future<void> _goodTransfer(DmaBench b, bool d2h, int records) async {
+  await _push(b, d2h, 0x80004000, 0x8000, 0x77);
+  await b.waitRecordWrites(0, records);
+  expect(b.record(0).code, 0);
+  expect(b.record(0).cookie, 0x77);
+  expect(b.record(0).bytes, 0x100);
+  if (d2h) {
+    b.checkCopy(0x80004000, 0x8000, 0x100);
+  } else {
+    b.checkLocal(0x80004000, 0x8000, 0x100);
+  }
+}
+
 void main() {
   tearDown(() async => Simulator.reset());
+
+  for (final (channel, d2h) in _stalls) {
+    test('the watchdog ends a stall on $channel with a record', () async {
+      final b = await _bench();
+      b.hold(channel);
+      await _push(b, d2h, 0x80000000, 0x1000, 0x71);
+      await b.waitUntil(
+        () => b.recordWrites(0).isNotEmpty,
+        timeout: _timeout + _slack,
+        what: 'timeout record',
+      );
+      await b.cycles(50);
+      final r = b.record(0);
+      expect(r.code, HarborPcieDma.errorFabricTimeout);
+      expect(r.cookie, 0x71);
+      final status = await b.readReg(HarborPcieDma.registerStatus);
+      expect(status & HarborPcieDma.statusHalted, isNonZero);
+      expect(status >> 8 & 0xff, HarborPcieDma.errorFabricTimeout);
+      expect(status >> HarborPcieDma.statusStateShift & 0xf, 0);
+
+      var records = 1;
+      if (channel == 'ar') {
+        // The next descriptor waits in the request state while the old
+        // read is owed, and times out there.
+        await b.writeReg(
+          HarborPcieDma.registerIrqCause,
+          HarborPcieDma.causeError,
+        );
+        await b.engineReset();
+        await _push(b, d2h, 0x80002000, 0x2000, 0x72);
+        await _waitState(b, 4);
+        await b.waitUntil(
+          () => b.recordWrites(0).length == 2,
+          timeout: _timeout + _slack,
+          what: 'second timeout record',
+        );
+        await b.cycles(50);
+        expect(b.record(0).code, HarborPcieDma.errorFabricTimeout);
+        expect(b.record(0).cookie, 0x72);
+        records = 2;
+      }
+
+      // The late fabric answer is dropped.
+      b.hold(channel, held: false);
+      await b.cycles(300);
+      final dropped = _dropped(await b.readReg(HarborPcieDma.registerDebug));
+      expect(dropped, d2h ? 16 : greaterThan(0));
+      expect(b.memory.bytes.containsKey(0x8000), isFalse);
+
+      await b.writeReg(
+        HarborPcieDma.registerIrqCause,
+        HarborPcieDma.causeError,
+      );
+      await b.engineReset();
+      await b.cycles(4);
+      expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+      await _goodTransfer(b, d2h, records + 1);
+      expect(
+        _dropped(await b.readReg(HarborPcieDma.registerDebug)),
+        dropped,
+        reason: 'no drops in a good transfer',
+      );
+      await b.finish();
+    });
+  }
+
+  test(
+    'a write beat stays on the port when the watchdog ends a stall on w',
+    () async {
+      final b = await _bench();
+      final w = b.dut.memory.waist;
+      List<int>? shown;
+      var cut = 0;
+      var bad = 0;
+      var stopped = false;
+      unawaited(() async {
+        while (!stopped) {
+          await b.clk.nextPosedge;
+          final valid = w.wdataValid.value.toBool();
+          final beat = [
+            if (valid) ...[
+              w.wdataData.value.toInt(),
+              w.wdataStrb.value.toInt(),
+              w.wdataLast.value.toInt(),
+            ],
+          ];
+          if (shown != null) {
+            if (!valid || beat.join() != shown!.join()) bad++;
+            // d_state 3 is the write data state.
+            if (_sig(b, 'd_state') != 3) cut++;
+          }
+          shown = valid && !w.wdataReady.value.toBool() ? beat : null;
+        }
+      }());
+      b.hold('w');
+      await _push(b, false, 0x80000000, 0x1000, 0x74);
+      await b.waitUntil(
+        () => b.recordWrites(0).isNotEmpty,
+        timeout: _timeout + _slack,
+        what: 'timeout record',
+      );
+      expect(b.record(0).code, HarborPcieDma.errorFabricTimeout);
+      expect(cut, greaterThan(0), reason: 'a beat waits after the stop');
+      final debug = await b.readReg(HarborPcieDma.registerDebug);
+      expect(debug & HarborPcieDma.debugWriteOwed, isNonZero);
+      expect(debug & HarborPcieDma.debugReadOwed, 0);
+
+      b.hold('w', held: false);
+      await b.cycles(300);
+      final after = await b.readReg(HarborPcieDma.registerDebug);
+      expect(after & HarborPcieDma.debugWriteOwed, 0);
+      stopped = true;
+      expect(bad, 0, reason: 'a beat changed before the port took it');
+      await b.writeReg(
+        HarborPcieDma.registerIrqCause,
+        HarborPcieDma.causeError,
+      );
+      await b.engineReset();
+      await b.cycles(4);
+      await _goodTransfer(b, false, 2);
+      await b.finish();
+    },
+  );
 
   for (final free in [false, true]) {
     test('PERST# resets a stuck engine and the reset counts go up, '

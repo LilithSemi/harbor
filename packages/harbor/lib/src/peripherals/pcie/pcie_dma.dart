@@ -142,6 +142,17 @@ class HarborPcieDma extends BridgeModule {
   /// An engine reset waits.
   static const debugResetRequest = 1 << 13;
 
+  /// The fabric owes read beats. With [debugWriteOwed] clear too, the
+  /// fabric is quiet and a new fabric request can go out.
+  static const debugReadOwed = 1 << 14;
+
+  /// The fabric owes a write response, and maybe write beats before it.
+  static const debugWriteOwed = 1 << 15;
+
+  /// DEBUG[31:16] counts the fabric read beats, write beats and write
+  /// responses of stopped transfers. The engine drops them. The count wraps.
+  static const debugDroppedShift = 16;
+
   static const causeDone = 1 << 0;
   static const causeError = 1 << 1;
   static const causeLineShift = 8;
@@ -174,6 +185,11 @@ class HarborPcieDma extends BridgeModule {
   /// The completion ring is not valid: log2 size 0, or base + size past
   /// 2^64. The engine halts with no record.
   static const errorCplRing = 11;
+
+  /// A fabric request, read beat, write beat or write response did not
+  /// come in [timeoutCycles] cycles. The fabric beats of that transfer that
+  /// come later are dropped.
+  static const errorFabricTimeout = 12;
 
   /// Bit 31 of the record status DW.
   static const recordPhase = 1 << 31;
@@ -998,7 +1014,19 @@ class HarborPcieDma extends BridgeModule {
       burstStale < inState(sChunk) | reqFire | inH2d & inD(dIdle),
     ], reset: reset);
 
-    mem.reqValid <= (inState(sReq) | inH2d & inD(dReq)) & ~burstStale;
+    // Beats and write responses owed by the fabric. A transfer that stops
+    // early leaves them owed, and the engine drops them when they come. No
+    // new request goes out until none are owed, so a late beat is never
+    // data for a later request.
+    final rOwe = Logic(name: 'r_owe', width: 9);
+    final wOwe = Logic(name: 'w_owe', width: 9);
+    final bOwe = Logic(name: 'b_owe');
+    final fabQuiet = (rOwe.eq(0) & wOwe.eq(0) & ~bOwe).named('fab_quiet');
+    final ownR = inState(sRdata);
+    final ownW = inH2d & (inD(dPrime) | inD(dData));
+    final ownB = ownW | inH2d & inD(dResp);
+    mem.reqValid <=
+        (inState(sReq) | inH2d & inD(dReq)) & ~burstStale & fabQuiet;
     mem.reqId <= Const(0, width: mem.config.idWidth);
     mem.reqWrite <= inH2d & inD(dReq);
     mem.reqAddr <= curAddr;
@@ -1010,7 +1038,7 @@ class HarborPcieDma extends BridgeModule {
           width: HarborMemoryWaistConfig.burstWidth,
         );
     mem.reqExclusive <= Const(0);
-    mem.rdataReady <= inState(sRdata);
+    mem.rdataReady <= ~rOwe.eq(0);
     reqFire <= mem.reqValid & mem.reqReady;
     final rFire = mem.rdataValid & mem.rdataReady;
 
@@ -1025,21 +1053,82 @@ class HarborPcieDma extends BridgeModule {
       strobes.add(inRange.replicate(4));
     }
     final strb = strobes.rswizzle().named('d_strb');
-    mem.wdataValid <= inH2d & inD(dData);
-    mem.wdataData <=
-        [
-          for (var b = beatBytes - 1; b >= 0; b--)
-            mux(
-              strb[b],
-              tags.rdData.slice(8 * b + 7, 8 * b),
-              Const(0, width: 8),
-            ),
-        ].swizzle();
-    mem.wdataStrb <= strb;
-    mem.wdataLast <= burstLeft.eq(1);
-    mem.wrespReady <= inH2d & inD(dResp);
+    // A beat that the port has not taken stays on the port unchanged, also
+    // when the transfer stops. The beats after it that are owed have
+    // strobes 0 and data 0.
+    final wLive = (inH2d & inD(dData) | ~ownW & ~wOwe.eq(0)).named('w_live');
+    final wHold = Logic(name: 'w_hold');
+    final wHoldData = Logic(name: 'w_hold_data', width: beatBytes * 8);
+    final wHoldStrb = Logic(name: 'w_hold_strb', width: strb.width);
+    final wHoldLast = Logic(name: 'w_hold_last');
+    final liveData = [
+      for (var b = beatBytes - 1; b >= 0; b--)
+        mux(
+          strb[b] & ownW,
+          tags.rdData.slice(8 * b + 7, 8 * b),
+          Const(0, width: 8),
+        ),
+    ].swizzle().named('w_live_data');
+    final liveStrb = mux(ownW, strb, Const(0, width: strb.width));
+    final liveLast = mux(ownW, burstLeft.eq(1), wOwe.eq(1));
+    mem.wdataValid <= wLive | wHold;
+    mem.wdataData <= mux(wHold, wHoldData, liveData);
+    mem.wdataStrb <= mux(wHold, wHoldStrb, liveStrb);
+    mem.wdataLast <= mux(wHold, wHoldLast, liveLast);
+    Sequential(clk, [
+      wHold < mem.wdataValid & ~mem.wdataReady,
+      If(
+        ~wHold,
+        then: [
+          wHoldData < liveData,
+          wHoldStrb < liveStrb,
+          wHoldLast < liveLast,
+        ],
+      ),
+    ], reset: reset);
+    mem.wrespReady <= inH2d & inD(dResp) | ~ownB & bOwe;
     final wFire = mem.wdataValid & mem.wdataReady;
     final bFire = mem.wrespValid & mem.wrespReady;
+    final burst9 = burst.slice(8, 0);
+    final dropped = Logic(name: 'fab_dropped', width: 16);
+    Sequential(clk, [
+      rOwe <
+          rOwe +
+              mux(reqFire & ~mem.reqWrite, burst9, Const(0, width: 9)) -
+              rFire.zeroExtend(9),
+      wOwe <
+          wOwe +
+              mux(reqFire & mem.reqWrite, burst9, Const(0, width: 9)) -
+              wFire.zeroExtend(9),
+      bOwe < reqFire & mem.reqWrite | bOwe & ~bFire,
+      dropped <
+          dropped +
+              (rFire & ~ownR).zeroExtend(16) +
+              (wFire & ~ownW).zeroExtend(16) +
+              (bFire & ~ownB).zeroExtend(16),
+    ], reset: reset);
+
+    // Fabric watchdog. It restarts on each fabric handshake.
+    final fabWait =
+        (inState(sReq) |
+                inState(sRdata) |
+                inH2d & (inD(dReq) | inD(dPrime) | inD(dData) | inD(dResp)))
+            .named('fab_wait');
+    final fabMove = (reqFire | rFire | wFire | bFire).named('fab_move');
+    final fabTimer = Logic(
+      name: 'fab_timer',
+      width: max(1, timeoutCycles.bitLength),
+    );
+    final fabLast = fabTimer.eq(timeoutCycles - 1);
+    final fabExpired = (fabWait & ~fabMove & fabLast).named('fab_expired');
+    Sequential(clk, [
+      fabTimer <
+          mux(
+            ~fabWait | fabMove,
+            Const(0, width: fabTimer.width),
+            mux(fabLast, fabTimer, fabTimer + 1),
+          ),
+    ], reset: reset);
     // The buffer address leads the beat by one cycle.
     final wBeatNext = mux(wFire, wBeat + 1, wBeat);
     rdIndex <=
@@ -1213,7 +1302,9 @@ class HarborPcieDma extends BridgeModule {
     final txFire = txs.valid & txs.ready;
     debug <=
         [
-          Const(0, width: 18),
+          dropped,
+          bOwe,
+          ~rOwe.eq(0),
           resetReq,
           txOwner,
           txLock,
@@ -1262,7 +1353,9 @@ class HarborPcieDma extends BridgeModule {
 
     // Host to device control.
     final wrespErr = inH2d & inD(dResp) & bFire & mem.wrespErr;
-    final errNow = (inH2d & tags.err | wrespErr).named('err_now');
+    final errNow = (inH2d & (tags.err | fabExpired) | wrespErr).named(
+      'err_now',
+    );
     final dSafe = (~iBusy & inD(dIdle)).named('d_safe');
     // The tags give an error one cycle late, so no read starts in a cycle
     // that can give one.
@@ -1952,6 +2045,10 @@ class HarborPcieDma extends BridgeModule {
                   state < sRdata,
                 ],
               ),
+              If(
+                fabExpired,
+                then: [code < errorFabricTimeout, state < sRecWait],
+              ),
             ]),
             CaseItem(Const(sRdata, width: 4), [
               If(
@@ -1974,6 +2071,10 @@ class HarborPcieDma extends BridgeModule {
                     ],
                   ),
                 ],
+              ),
+              If(
+                fabExpired,
+                then: [code < errorFabricTimeout, state < sRecWait],
               ),
             ]),
             CaseItem(Const(sTxWait, width: 4), [
@@ -2023,7 +2124,11 @@ class HarborPcieDma extends BridgeModule {
                       mux(
                         tags.err,
                         tags.errCode.zeroExtend(8),
-                        Const(errorFabric, width: 8),
+                        mux(
+                          wrespErr,
+                          Const(errorFabric, width: 8),
+                          Const(errorFabricTimeout, width: 8),
+                        ),
                       ),
                 ],
               ),
@@ -2113,6 +2218,9 @@ class HarborPcieDma extends BridgeModule {
                   ),
                 ]),
               ]),
+              // The local write stops. The fabric beats it still owes are
+              // dropped.
+              If(fabExpired, then: [dState < dIdle]),
               If.block([
                 Iff(engReset, engineReset()),
                 ElseIf(dSafe & ~code.eq(0), [state < sRecWait]),

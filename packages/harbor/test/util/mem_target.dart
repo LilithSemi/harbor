@@ -52,12 +52,67 @@ class MemBeatTarget extends BridgeModule {
   }
 }
 
+/// An AXI4 pass-through from `up` to `dn` that can hold each channel.
+///
+/// While input `pass_<ch>` is low, VALID and READY of channel `<ch>` (`ar`,
+/// `r`, `aw`, `w` or `b`) are low on both sides, so nothing transfers.
+class AxiStallGate extends BridgeModule {
+  static const channels = {
+    'ar': 'AR',
+    'r': 'R',
+    'aw': 'AW',
+    'w': 'W',
+    'b': 'B',
+  };
+
+  AxiStallGate(HarborMemoryWaistConfig config)
+    : super(
+        'AxiStallGate_a${config.addressWidth}_d${config.dataWidth}'
+        '_i${config.idWidth}',
+        name: 'axi_gate',
+      ) {
+    Axi4Interface axi() => Axi4Interface(
+      addressWidth: config.addressWidth,
+      dataWidth: config.dataWidth,
+      idWidth: config.idWidth,
+    );
+    final up = addInterface(
+      axi(),
+      name: 'up',
+      role: PairRole.consumer,
+    ).internalInterface!;
+    final dn = addInterface(
+      axi(),
+      name: 'dn',
+      role: PairRole.provider,
+    ).internalInterface!;
+    final pass = {
+      for (final c in channels.values)
+        c: createPort('pass_${c.toLowerCase()}', PortDirection.input).port,
+    };
+    Logic gated(String n, Logic v) {
+      for (final c in channels.values) {
+        if (n == '${c}VALID' || n == '${c}READY') return v & pass[c]!;
+      }
+      return v;
+    }
+
+    for (final n in up.getPorts([PairDirection.fromProvider]).keys) {
+      dn.port(n) <= gated(n, up.port(n));
+    }
+    for (final n in up.getPorts([PairDirection.fromConsumer]).keys) {
+      up.port(n) <= gated(n, dn.port(n));
+    }
+  }
+}
+
 /// A device under test whose memory master port [iface] drives a
 /// [MemBeatTarget] of the same kind.
 ///
 /// Every other interface of [dut] is pulled up with its own name, and every
 /// other port with its own name. The target beat ports come up as `t_*`.
-/// `clk` and `reset` drive both.
+/// `clk` and `reset` drive both. With [axiGate], an [AxiStallGate] sits
+/// between the two and its inputs come up as `pass_*`.
 class MasterTop extends BridgeModule {
   late final MemBeatTarget target;
 
@@ -68,6 +123,7 @@ class MasterTop extends BridgeModule {
     required HarborMemoryWaistConfig config,
     int burstBeats = 8,
     bool withErr = false,
+    bool axiGate = false,
   }) : super('MasterTop_${dut.definitionName}', name: 'top') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -79,7 +135,16 @@ class MasterTop extends BridgeModule {
       m.input('clk').srcConnection! <= input('clk');
       m.input('reset').srcConnection! <= input('reset');
     }
-    connectInterfaces(dut.interface(iface), target.interface('bus'));
+    if (axiGate) {
+      final gate = addSubModule(AxiStallGate(config));
+      connectInterfaces(dut.interface(iface), gate.interface('up'));
+      connectInterfaces(gate.interface('dn'), target.interface('bus'));
+      for (final c in AxiStallGate.channels.keys) {
+        pullUpPort(gate.port('pass_$c'), newPortName: 'pass_$c');
+      }
+    } else {
+      connectInterfaces(dut.interface(iface), target.interface('bus'));
+    }
     final intfNames = dut.interfaces.keys.toList();
     for (final n in intfNames) {
       if (n == iface) continue;

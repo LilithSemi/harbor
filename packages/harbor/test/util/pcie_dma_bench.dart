@@ -32,6 +32,9 @@ class DmaConfig {
   final bool ringSource;
   final int addressWidth;
 
+  /// Puts an [AxiStallGate] on the fabric port. See [DmaBench.hold].
+  final bool axiGate;
+
   /// Builds the reset status input. See [DmaBench.resetStatus].
   final bool resetStatus;
 
@@ -48,6 +51,7 @@ class DmaConfig {
     this.fifoSource = true,
     this.ringSource = false,
     this.addressWidth = dmaAddressWidth,
+    this.axiGate = false,
     this.resetStatus = false,
   });
 
@@ -98,6 +102,7 @@ class DmaBench {
   final Logic granted;
   final Logic? lines;
   final PcieFabricMemory memory;
+  final Map<String, Logic> _gates;
 
   /// The DMA reset status input, for the test to drive.
   final Logic? resetStatus;
@@ -130,6 +135,7 @@ class DmaBench {
     this.granted,
     this.lines,
     this.memory,
+    this._gates,
     this.resetStatus,
     this.driver,
     this.sink,
@@ -189,13 +195,22 @@ class DmaBench {
         dataWidth: config.dataWidth,
       ),
       withErr: true,
+      axiGate: config.axiGate,
     );
     await top.build();
+    final gates = {
+      if (config.axiGate)
+        for (final c in AxiStallGate.channels.keys) c: Logic(name: 'pass_$c'),
+    };
     final resetStatus = config.resetStatus
         ? Logic(name: 'reset_status', width: 64)
         : null;
     if (resetStatus != null) {
       top.input('reset_status').srcConnection! <= resetStatus;
+    }
+    for (final MapEntry(:key, :value) in gates.entries) {
+      top.input('pass_$key').srcConnection! <= value;
+      value.inject(1);
     }
 
     final rx = HarborPcieStream(width: config.width, name: 'rx');
@@ -241,6 +256,7 @@ class DmaBench {
       granted,
       lines,
       memory,
+      gates,
       resetStatus,
       PcieStreamDriver(clk: clk, stream: rx, seed: seed, gapChance: gapChance),
       PcieStreamSink(
@@ -261,6 +277,11 @@ class DmaBench {
     'valid' => s.valid,
     _ => s.user,
   };
+
+  /// Holds AXI channel [channel] (`ar`, `r`, `aw`, `w` or `b`) while
+  /// [held] is set. Needs [DmaConfig.axiGate].
+  void hold(String channel, {bool held = true}) =>
+      _gates[channel]!.inject(held ? 0 : 1);
 
   int get irqPending => top.output('irq_pending').value.toInt();
 
