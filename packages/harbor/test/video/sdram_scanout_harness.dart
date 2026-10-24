@@ -65,6 +65,10 @@ class BenchOverlay {
 }
 
 /// [HarborDualClockDisplay] on a [HarborSdram] scanout port.
+///
+/// With [driven], the bench drives `update`, `format_sel` and
+/// `plane_pitch_0` as a register block does, and the display has the
+/// `red`, `green`, `blue` and `update_pending` outputs.
 class BenchScanDisplay extends BridgeModule {
   BenchScanDisplay({
     required HarborDisplayTiming timing,
@@ -73,6 +77,7 @@ class BenchScanDisplay extends BridgeModule {
     List<int> planeBases = const [],
     List<int> planePitches = const [],
     BenchOverlay? overlay,
+    bool driven = false,
   }) : super('BenchScanDisplay', name: 'display') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -83,6 +88,15 @@ class BenchScanDisplay extends BridgeModule {
     createPort('rq_ready', PortDirection.input);
     createPort('rd_valid', PortDirection.input);
     createPort('rd_data', PortDirection.input, width: 16);
+    if (driven) {
+      createPort('update', PortDirection.input);
+      createPort(
+        'format_sel',
+        PortDirection.input,
+        width: (formats!.length - 1).bitLength,
+      );
+      createPort('plane_pitch_0', PortDirection.input, width: 32);
+    }
     final shift = Const(0);
     final xw = max((timing.hTotal - 1).bitLength, timing.hActive.bitLength);
     final yw = max((timing.vTotal - 1).bitLength, timing.vActive.bitLength);
@@ -96,16 +110,20 @@ class BenchScanDisplay extends BridgeModule {
       sysClk: input('clk'),
       sysReset: input('reset'),
       enable: input('enable'),
-      update: Const(1),
+      update: driven ? input('update') : Const(1),
       fbBase: input('fb_base'),
       rqReady: input('rq_ready'),
       rdValid: input('rd_valid'),
       rdData: input('rd_data'),
       lineStride: formats == null ? stride : null,
       formats: formats,
+      formatSel: driven && formats!.length > 1 ? input('format_sel') : null,
       planeBase: [for (final b in planeBases) Const(b, width: 32)],
       planePitch: [
-        if (formats != null) Const(stride, width: 32),
+        if (driven)
+          input('plane_pitch_0')
+        else if (formats != null)
+          Const(stride, width: 32),
         for (final p in planePitches) Const(p, width: 32),
       ],
       overlayFormats: overlay == null ? null : [overlay.format],
@@ -136,6 +154,12 @@ class BenchScanDisplay extends BridgeModule {
     addOutput('x', width: d.x.width) <= d.x;
     addOutput('y', width: d.y.width) <= d.y;
     addOutput('pixel_word', width: 32) <= d.pixelWord;
+    if (driven) {
+      addOutput('red', width: 8) <= d.red;
+      addOutput('green', width: 8) <= d.green;
+      addOutput('blue', width: 8) <= d.blue;
+      addOutput('update_pending') <= d.updatePending;
+    }
   }
 }
 
@@ -165,6 +189,14 @@ class SdramScanoutBench {
 
   /// The overlay of the display, or null.
   final BenchOverlay? overlay;
+
+  /// True when the bench drives the display controls, see
+  /// [BenchScanDisplay].
+  final bool driven;
+  final fbIn = Logic(name: 'fb_in', width: 32);
+  final update = Logic(name: 'update');
+  final formatSel = Logic(name: 'format_sel');
+  final pitch0 = Logic(name: 'pitch0', width: 32);
 
   late final HarborSoC soc;
   late final HarborSdram sdram;
@@ -235,6 +267,7 @@ class SdramScanoutBench {
     this.planeBases = const [],
     this.planePitches = const [],
     this.overlay,
+    this.driven = false,
   }) {
     this.stride = stride ?? timing.hActive * 4;
   }
@@ -282,6 +315,7 @@ class SdramScanoutBench {
       planeBases: planeBases,
       planePitches: planePitches,
       overlay: overlay,
+      driven: driven,
     );
     soc.addSubModule(display);
     sdram = soc.addPeripheral(
@@ -315,7 +349,16 @@ class SdramScanoutBench {
     bench.input('t_dat').srcConnection! <= tDat;
     display.input('pixel_clk').srcConnection! <= pixelClk;
     display.input('pixel_reset').srcConnection! <= pixelReset;
-    display.input('fb_base').srcConnection! <= Const(fbBase, width: 32);
+    display.input('fb_base').srcConnection! <=
+        (driven ? fbIn : Const(fbBase, width: 32));
+    if (driven) {
+      display.input('update').srcConnection! <= update;
+      display.input('format_sel').srcConnection! <= formatSel;
+      display.input('plane_pitch_0').srcConnection! <= pitch0;
+      for (final l in [fbIn, update, formatSel, pitch0]) {
+        l.inject(0);
+      }
+    }
     display.input('enable').srcConnection! <= enable;
     display.input('clk').srcConnection! <= sdram.output('scan_clk');
     display.input('reset').srcConnection! <= sdram.output('scan_reset');
