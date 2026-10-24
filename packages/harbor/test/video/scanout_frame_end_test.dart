@@ -144,7 +144,98 @@ Future<void> _run({
   expect(underrun, {2: false, 3: true, 4: late4, 5: false, 6: false});
 }
 
+/// Runs a planar display. The last line of frame 2 has latency [slow], so
+/// line 0 of frame 3 waits at its frame start. Each pixel clock with
+/// `first_line` high must send no request. It returns true when the held
+/// line 0 could go in that clock.
+Future<bool> _heldLine0(int slow) async {
+  final pixelClk = SimpleClockGenerator(20).clk;
+  final sysClk = SimpleClockGenerator(4).clk;
+  final pixelReset = Logic(name: 'pixel_reset');
+  final sysReset = Logic(name: 'sys_reset');
+  final memory = HarborMemoryWaist(
+    const HarborMemoryWaistConfig(
+      addressWidth: 32,
+      dataWidth: 32,
+      outstanding: 4,
+    ),
+  );
+  final disp = HarborDualClockDisplay(
+    target: const HarborSimTarget(),
+    timing: _timing,
+    pixelClk: pixelClk,
+    pixelReset: pixelReset,
+    sysClk: sysClk,
+    sysReset: sysReset,
+    enable: Const(1),
+    fbBase: Const(_base, width: 32),
+    memory: memory,
+    formats: const [HarborPixelFormat.xrgb8888, HarborPixelFormat.rgb565],
+    formatSel: Const(0),
+    planePitch: [Const(_stride, width: 32)],
+    outputType: HarborDisplayInterface.parallelRgb,
+  );
+  await disp.build();
+  final m = WaistMemory(memory, sysClk, latency: 4);
+  final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
+  final so = disp.subModules.whereType<HarborDualClockScanout>().single;
+  Logic sig(String n) => so.signals.firstWhere((s) => s.name == n);
+  final firstLine = so.input('first_line');
+  final reqToggle = sig('req_toggle');
+  final release = sig('p0_release');
+  final busy = sig('req_busy');
+
+  pixelReset.inject(1);
+  sysReset.inject(1);
+  Simulator.setMaxSimTime(1 << 40);
+  unawaited(Simulator.run());
+  addTearDown(() async {
+    if (!Simulator.simulationHasEnded) await Simulator.endSimulation();
+    Simulator.reset();
+  });
+  await pixelClk.nextPosedge;
+  await pixelClk.nextPosedge;
+  pixelReset.inject(0);
+  sysReset.inject(0);
+
+  var frame = -1;
+  var hit = false;
+  int? toggleAtFirst;
+  while (frame < 4) {
+    await pixelClk.nextNegedge;
+    final (gx, gy) = (gen.x.value.toInt(), gen.y.value.toInt());
+    if (gx == 0 && gy == 0) frame++;
+    // Line 7 goes at the line start of row 5.
+    if (frame == 2 && gy == 5 && gx == _timing.hActive) m.latency = slow;
+    if (frame == 2 && gy == 6 && gx == 0) m.latency = 4;
+    final t = reqToggle.value.toInt();
+    if (toggleAtFirst != null) {
+      expect(t, toggleAtFirst, reason: 'a request went with first_line');
+      toggleAtFirst = null;
+    }
+    if (firstLine.value.toInt() == 1) {
+      toggleAtFirst = t;
+      if (release.value.toInt() == 1 && busy.value.toInt() == 0) hit = true;
+    }
+  }
+  return hit;
+}
+
 void main() {
+  // The latencies move the end of the last line over the first line
+  // clock, one pixel clock a step. At 765 the held line 0 can go in that
+  // clock.
+  var hits = 0;
+  for (var slow = 760; slow <= 770; slow += 5) {
+    test('a held line 0 does not go in the first line clock, latency '
+        '$slow', () async {
+      if (await _heldLine0(slow)) hits++;
+    });
+  }
+  test('a latency puts the held line 0 on the first line clock', () {
+    expect(hits, greaterThan(0));
+  });
+
   for (final planar in [false, true]) {
     for (final port in [false, true]) {
       final kind =

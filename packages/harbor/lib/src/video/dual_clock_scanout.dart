@@ -1313,9 +1313,13 @@ class HarborDualClockScanout extends Module {
             ]),
           ]),
           // Send the held lines that can go. The prime steps wait for
-          // no held line, so they do not send in the same clock.
+          // no held line, so they do not send in the same clock. The
+          // first line check drops a held line 0, so it does not go then.
           If(
-            ~lineStart & ~busy & release.reduce((a, b) => a | b),
+            ~lineStart &
+                ~firstLine &
+                ~busy &
+                release.reduce((a, b) => a | b),
             then: [
               reqToggle < ~reqToggle,
               reqMask < release.rswizzle(),
