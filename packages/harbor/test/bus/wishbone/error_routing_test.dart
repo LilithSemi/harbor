@@ -126,4 +126,15 @@ void main() {
       await Simulator.endSimulation();
     },
   );
+
+  test('a decoder without ERR has no slave ERR to fold', () async {
+    final dut = WishboneDecoder(
+      const WishboneConfig(addressWidth: 32, dataWidth: 32),
+      [HarborAddressMapping(range: BusAddressRange(0, 4096), slaveIndex: 0)],
+    );
+    await dut.build();
+    expect(dut.tryOutput('master_ERR'), isNull);
+    expect(dut.tryInput('slave_0_ERR'), isNull);
+    expect(dut.tryOutput('fold_error'), isNull);
+  });
 }
