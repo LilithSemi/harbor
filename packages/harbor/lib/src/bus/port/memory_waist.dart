@@ -127,6 +127,11 @@ class HarborMemoryWaistConfig {
 /// A channel transfers when its VALID and READY are both high. The slave
 /// side states its depth in [HarborMemoryWaistConfig.outstanding].
 ///
+/// A master may drop REQ_VALID before the handshake, for example when it
+/// stops a request on a reset. A master adapter must take the request into
+/// a register or a FIFO, and must not drive the bus straight from the waist.
+/// WDATA_VALID, DATA, STRB and LAST do not change until the beat is taken.
+///
 /// REQ_READY must not depend on WDATA_VALID. The slave adapter sends write
 /// data only after its REQ is taken, so a device that waits for data before
 /// it accepts a write REQ deadlocks.

@@ -400,11 +400,14 @@ void main() {
     await b.engineReset();
     await b.doorbell(5);
     await b.writeReg(HarborPcieDma.registerCplHead, 3);
-    final pending = b.readRaw(HarborPcieDma.registerControl, 1);
     await b.cycles(50);
+    // A BAR0 read needs the TX port, and the reset ends with the open
+    // packet, so the read cannot see the pending reset.
+    final resetReq = b.dut.signals.firstWhere(
+      (s) => s.name == 'engine_reset_req',
+    );
+    expect(resetReq.value.toInt(), 1, reason: 'reset pending');
     b.sink.start();
-    final c = await pending;
-    expect(c.data.sublist(0, 4), [3, 0, 0, 0], reason: 'reset pending');
     var control = 3;
     for (var i = 0; i < 50 && control != 1; i++) {
       control = await b.readReg(HarborPcieDma.registerControl);

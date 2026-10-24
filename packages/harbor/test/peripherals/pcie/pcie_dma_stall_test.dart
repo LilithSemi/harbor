@@ -85,6 +85,9 @@ Future<void> _push(DmaBench b, bool d2h, int host, int local, int cookie) {
   );
 }
 
+int _sig(DmaBench b, String name) =>
+    b.dut.signals.firstWhere((s) => s.name == name).value.toInt();
+
 int _dropped(int debug) => debug >> HarborPcieDma.debugDroppedShift;
 
 /// Runs a good transfer after an engine reset and checks its data.
@@ -226,6 +229,81 @@ void main() {
       await b.finish();
     },
   );
+
+  for (final (channel, d2h) in _stalls) {
+    test('an engine reset during a stall on $channel ends in time', () async {
+      final b = await _bench();
+      b.hold(channel);
+      await _push(b, d2h, 0x80000000, 0x1000, 0x73);
+      await b.waitUntil(
+        () => _sig(b, 'fab_wait') == 1,
+        timeout: _slack,
+        what: 'fabric wait',
+      );
+      await b.cycles(100);
+      await b.engineReset();
+      await b.waitUntil(
+        () => _sig(b, 'engine_reset_req') == 1,
+        what: 'reset request',
+      );
+      await b.waitUntil(
+        () => _sig(b, 'engine_reset_req') == 0,
+        timeout: _timeout + _slack,
+        what: 'engine reset',
+      );
+      expect(b.recordWrites(0), isEmpty);
+      expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+      expect(await b.readReg(HarborPcieDma.registerControl), 1);
+
+      b.hold(channel, held: false);
+      await b.cycles(300);
+      final dropped = _dropped(await b.readReg(HarborPcieDma.registerDebug));
+      expect(dropped, d2h ? 16 : greaterThan(0));
+      await _goodTransfer(b, d2h, 1);
+      await b.finish();
+    });
+  }
+
+  test('an engine reset ends a TLP that waits on TX', () async {
+    final b = await DmaBench.create(const DmaConfig());
+    await b.start();
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable();
+    await b.cycles(20);
+    b.sink.stop();
+    await b.cycles(2);
+    b.sink.stream.ready.inject(0);
+    await b.push(hostAddress: 0x80000000, localAddress: 0x2000, length: 0x200);
+    await b.waitUntil(
+      () => _sig(b, 'state') == 7 && _sig(b, 'tx_lock') == 1,
+      what: 'TX state',
+    );
+    await b.cycles(200);
+    await b.engineReset();
+    await b.cycles(200);
+    expect(_sig(b, 'engine_reset_req'), 1, reason: 'the TLP is not done');
+
+    final before = b.sink.received.length;
+    b.sink.start();
+    await b.waitUntil(
+      () => _sig(b, 'engine_reset_req') == 0,
+      timeout: 500,
+      what: 'engine reset',
+    );
+    expect(await b.readReg(HarborPcieDma.registerControl), 1);
+    expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+    final writes = [
+      for (final t in b.sink.received.sublist(before))
+        if (t.kind.isRequest && t.kind.hasData) t,
+    ];
+    expect(writes, hasLength(1), reason: 'only the open TLP ends');
+    expect(writes.single.address, 0x80000000);
+    expect(writes.single.data, hasLength(0x80));
+    b.checkCopy(0x80000000, 0x2000, 0x80);
+    expect(b.recordWrites(0), isEmpty);
+    await _goodTransfer(b, true, 1);
+    await b.finish();
+  });
 
   for (final free in [false, true]) {
     test('PERST# resets a stuck engine and the reset counts go up, '

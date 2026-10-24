@@ -99,6 +99,9 @@ class HarborPcieDma extends BridgeModule {
   static const registerDebug = 0x034;
 
   static const controlEnable = 1 << 0;
+  /// Resets the engine. In the read data or write data state, the reset
+  /// waits the full [timeoutCycles] even while beats come. A host driver
+  /// must poll for at least that long.
   static const controlEngineReset = 1 << 1;
 
   /// Selects the ring when both sources are built. A change waits until
@@ -1026,7 +1029,10 @@ class HarborPcieDma extends BridgeModule {
     final ownW = inH2d & (inD(dPrime) | inD(dData));
     final ownB = ownW | inH2d & inD(dResp);
     mem.reqValid <=
-        (inState(sReq) | inH2d & inD(dReq)) & ~burstStale & fabQuiet;
+        (inState(sReq) | inH2d & inD(dReq)) &
+            ~burstStale &
+            fabQuiet &
+            ~resetReq;
     mem.reqId <= Const(0, width: mem.config.idWidth);
     mem.reqWrite <= inH2d & inD(dReq);
     mem.reqAddr <= curAddr;
@@ -1108,13 +1114,16 @@ class HarborPcieDma extends BridgeModule {
               (bFire & ~ownB).zeroExtend(16),
     ], reset: reset);
 
-    // Fabric watchdog. It restarts on each fabric handshake.
+    // Fabric watchdog. It restarts on each fabric handshake, but not while
+    // an engine reset waits, so the reset ends in time.
     final fabWait =
         (inState(sReq) |
                 inState(sRdata) |
                 inH2d & (inD(dReq) | inD(dPrime) | inD(dData) | inD(dResp)))
             .named('fab_wait');
-    final fabMove = (reqFire | rFire | wFire | bFire).named('fab_move');
+    final fabMove = ((reqFire | rFire | wFire | bFire) & ~resetReq).named(
+      'fab_move',
+    );
     final fabTimer = Logic(
       name: 'fab_timer',
       width: max(1, timeoutCycles.bitLength),
@@ -1370,25 +1379,30 @@ class HarborPcieDma extends BridgeModule {
             ~left.eq(0) &
             tags.issueReady &
             busMasterEnable;
-    // A fetch read that is on the TX port finishes first. An engine packet
-    // that has not sent a beat to the TX register yet is dropped. A packet
-    // that has sent a beat finishes first.
+    // An engine reset is served in every state. A fetch read that is on the
+    // TX port ends first. An engine packet that has not sent a beat to the
+    // TX register yet is dropped. A packet that has sent a beat ends first,
+    // with its data unchanged, so the TX lock drops. A fabric transfer ends
+    // first, or stops when the watchdog expires. Its owed beats are then
+    // dropped.
     final eShown = (txLock & txOwner.eq(0) | txFire & pick.eq(0)).named(
       'e_shown',
     );
-    // In the H2D state the drain must also be idle, so no local write
-    // burst is cut. The drain only writes data that is in the buffer, so
-    // it ends.
-    final eStaged = inState(sTx) | inState(sRecTx) | inH2d & iBusy & inD(dIdle);
-    engReset <=
-        resetReq &
-            ~fValid &
-            (inState(sIdle) |
+    final eOnTx = (inState(sTx) | inState(sRecTx) | inH2d & iBusy) & eShown;
+    final resetNow =
+        (inState(sIdle) |
+                inState(sLoad) |
+                inState(sCheck) |
+                inState(sChunk) |
+                inState(sReq) |
                 inState(sTxWait) |
+                inState(sTx) |
                 inState(sRecWait) |
-                inH2d & inD(dIdle) |
-                eStaged) &
-            ~(eStaged & eShown);
+                inState(sRecTx) |
+                inH2d & (inD(dIdle) | inD(dReq)) |
+                fabExpired)
+            .named('reset_now');
+    engReset <= resetReq & ~fValid & resetNow & (~eOnTx | eFire & eLast);
     tagAbort <= errNow | engReset;
     drainDone <=
         inH2d &
@@ -1950,7 +1964,7 @@ class HarborPcieDma extends BridgeModule {
           Case(state, [
             CaseItem(Const(sIdle, width: 4), [
               If.block([
-                Iff(resetReq, [If(engReset, then: engineReset())]),
+                Iff(resetReq, []),
                 // A waiting fetch error is reported first, because its
                 // record cannot be written either.
                 ElseIf(cplSizeBad, [
@@ -2079,7 +2093,7 @@ class HarborPcieDma extends BridgeModule {
             ]),
             CaseItem(Const(sTxWait, width: 4), [
               If.block([
-                Iff(resetReq, [If(engReset, then: engineReset())]),
+                Iff(resetReq, []),
                 ElseIf(busMasterEnable, [
                   txT < 0,
                   txBase < lane0.zeroExtend(idxW) - hdrDws.slice(idxW - 1, 0),
@@ -2112,7 +2126,6 @@ class HarborPcieDma extends BridgeModule {
                   ),
                 ],
               ),
-              If(engReset, then: engineReset()),
             ]),
             CaseItem(Const(sH2d, width: 4), [
               // After an error the drain still writes the rest of its tag,
@@ -2221,17 +2234,14 @@ class HarborPcieDma extends BridgeModule {
               // The local write stops. The fabric beats it still owes are
               // dropped.
               If(fabExpired, then: [dState < dIdle]),
-              If.block([
-                Iff(engReset, engineReset()),
-                ElseIf(dSafe & ~code.eq(0), [state < sRecWait]),
-                ElseIf(dSafe & code.eq(0) & ~errNow & left.eq(0) & ~tags.busy, [
-                  state < sRecWait,
-                ]),
-              ]),
+              If(
+                dSafe & (~code.eq(0) | ~errNow & left.eq(0) & ~tags.busy),
+                then: [state < sRecWait],
+              ),
             ]),
             CaseItem(Const(sRecWait, width: 4), [
               If.block([
-                Iff(resetReq, [If(engReset, then: engineReset())]),
+                Iff(resetReq, []),
                 ElseIf(recLoad, [
                   pktAddr < recAddr,
                   pktDw < 4,
@@ -2275,9 +2285,9 @@ class HarborPcieDma extends BridgeModule {
                   ),
                 ],
               ),
-              If(engReset, then: engineReset()),
             ]),
           ]),
+          If(engReset, then: engineReset()),
         ],
       ),
     ]);
