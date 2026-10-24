@@ -94,6 +94,10 @@ class HarborPcieDma extends BridgeModule {
   static const registerPush = 0x080;
   static const registerPushCommit = 0x09c;
 
+  /// Engine debug word, read only. It is also the `debug` output. See
+  /// [debugDStateShift] for the fields.
+  static const registerDebug = 0x034;
+
   static const controlEnable = 1 << 0;
   static const controlEngineReset = 1 << 1;
 
@@ -116,6 +120,27 @@ class HarborPcieDma extends BridgeModule {
   static const statusStateShift = 4;
   static const statusErrorShift = 8;
   static const statusFreeShift = 16;
+
+  /// DEBUG[3:0] is the engine state, as in STATUS[7:4]. DEBUG[6:4] is the
+  /// host to device drain state: 0 idle, 1 fabric request, 2 prime, 3 write
+  /// data, 4 write response.
+  static const debugDStateShift = 4;
+
+  /// A host read request is on the TX port.
+  static const debugIssueBusy = 1 << 7;
+
+  /// DEBUG[9:8] is the fetcher state: 0 idle, 1 send, 2 wait.
+  static const debugFetchStateShift = 8;
+
+  /// A TX packet holds the port.
+  static const debugTxLock = 1 << 10;
+
+  /// DEBUG[12:11] is the TX port owner: 0 engine, 1 BAR0 completion, 2
+  /// fetcher.
+  static const debugTxOwnerShift = 11;
+
+  /// An engine reset waits.
+  static const debugResetRequest = 1 << 13;
 
   static const causeDone = 1 << 0;
   static const causeError = 1 << 1;
@@ -212,6 +237,9 @@ class HarborPcieDma extends BridgeModule {
 
   /// Level per MSI vector, for the endpoint.
   Logic get irqPending => output('irq_pending');
+
+  /// The [registerDebug] word, for a top to show on a register or LEDs.
+  Logic get debug => output('debug');
 
   HarborPcieDma({
     required Logic clk,
@@ -770,6 +798,7 @@ class HarborPcieDma extends BridgeModule {
     // Register read port, used by the BAR0 completion.
     final rAddr = (cAddr + cG.zeroExtend(10)).named('reg_r_addr');
     final cplMask = ((Const(1, width: 17) << cplLog) - 1).slice(15, 0);
+    final debug = Logic(name: 'debug_word', width: 32);
     final status = [
       (Const(queueDepth, width: qBits + 1) - qCount).zeroExtend(16),
       errCode,
@@ -814,6 +843,7 @@ class HarborPcieDma extends BridgeModule {
         reg(registerIrqCause, cause),
         reg(registerIrqMask, mask),
         reg(registerStaleCompletions, tags.staleCount),
+        reg(registerDebug, debug),
         if (_romStatus != null) reg(registerRomStatus, _romStatus!),
         if (_resetStatus != null) ...[
           reg(registerResetCounts, _resetStatus!.slice(31, 0)),
@@ -1181,6 +1211,18 @@ class HarborPcieDma extends BridgeModule {
           recEnd & code.eq(0) & dFlags[1],
         ].swizzle().zeroExtend(HarborPcieStream.userWidth);
     final txFire = txs.valid & txs.ready;
+    debug <=
+        [
+          Const(0, width: 18),
+          resetReq,
+          txOwner,
+          txLock,
+          ringSource ? fState : Const(0, width: 2),
+          iBusy,
+          dState,
+          state,
+        ].swizzle();
+    addOutput('debug', width: 32) <= debug;
     final eFire = txFire & pick.eq(0);
     final cFire = txFire & pickCpl;
     final fFire = txFire & pickFetch;

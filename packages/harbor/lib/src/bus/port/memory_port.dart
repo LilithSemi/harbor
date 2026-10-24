@@ -57,6 +57,9 @@ class HarborMemorySlavePort {
   /// to see the responses the crossing gives in place of the device.
   final HarborMemoryWaist fabricWaist;
 
+  /// The clock domain crossing, or null when there is none.
+  final HarborMemoryWaistCdc? cdc;
+
   HarborMemorySlavePort._(
     this.waist,
     this.kind,
@@ -64,7 +67,12 @@ class HarborMemorySlavePort {
     this.reset,
     this.cdcDepth, [
     HarborMemoryWaist? fabricWaist,
+    this.cdc,
   ]) : fabricWaist = fabricWaist ?? waist;
+
+  /// Adds the crossing debug outputs to [module]. See [harborAddCdcDebug].
+  void addDebugOutputs(BridgeModule module, String prefix) =>
+      harborAddCdcDebug(module, prefix, cdc, waist.config);
 
   /// Adds the native memory slave port for [kind] to [module] and returns the
   /// waist behind it. AXI4 gives a full AXI4 subordinate, TileLink a TL-UH
@@ -145,6 +153,7 @@ class HarborMemorySlavePort {
         cdc.deviceReset,
         cdc.depth,
         inner.waist,
+        cdc,
       );
     }
     switch (kind) {
@@ -248,13 +257,21 @@ class HarborMemoryMasterPort {
   /// Entries in each FIFO of the crossing, or 0 when there is none.
   final int cdcDepth;
 
+  /// The clock domain crossing, or null when there is none.
+  final HarborMemoryWaistCdc? cdc;
+
   HarborMemoryMasterPort._(
     this.waist,
     this.kind,
     this.interfaceRef,
     this.reset,
-    this.cdcDepth,
-  );
+    this.cdcDepth, [
+    this.cdc,
+  ]);
+
+  /// Adds the crossing debug outputs to [module]. See [harborAddCdcDebug].
+  void addDebugOutputs(BridgeModule module, String prefix) =>
+      harborAddCdcDebug(module, prefix, cdc, waist.config);
 
   /// Adds the native memory master port for [kind] to [module] and returns
   /// the waist in front of it. [fabricClock] and [cdcDepth] work as for
@@ -297,6 +314,7 @@ class HarborMemoryMasterPort {
         inner.interfaceRef,
         cdc.deviceReset,
         cdc.depth,
+        cdc,
       );
     }
     switch (kind) {
@@ -344,6 +362,27 @@ class HarborMemoryMasterPort {
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);
     }
   }
+}
+
+/// Adds the debug outputs of [cdc] to [module] as plain outputs:
+/// `<prefix>_reads`, `<prefix>_writes`, `<prefix>_recover`, `<prefix>_empty`
+/// and `<prefix>_full`. See [HarborMemoryWaistCdc] for the fields. Without
+/// a crossing, the outputs are 0.
+void harborAddCdcDebug(
+  BridgeModule module,
+  String prefix,
+  HarborMemoryWaistCdc? cdc,
+  HarborMemoryWaistConfig config,
+) {
+  final cntW = config.outstanding.bitLength;
+  Logic or0(Logic? v, int width) => v ?? Const(0, width: width);
+  module.addOutput('${prefix}_reads', width: cntW) <=
+      or0(cdc?.debugReads, cntW);
+  module.addOutput('${prefix}_writes', width: cntW) <=
+      or0(cdc?.debugWrites, cntW);
+  module.addOutput('${prefix}_recover') <= or0(cdc?.debugRecover, 1);
+  module.addOutput('${prefix}_empty', width: 4) <= or0(cdc?.debugEmpty, 4);
+  module.addOutput('${prefix}_full', width: 4) <= or0(cdc?.debugFull, 4);
 }
 
 Axi4Interface _axi4(HarborMemoryWaistConfig config) => Axi4Interface(

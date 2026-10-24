@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
+import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:test/test.dart';
 
 import '../../util/pcie_dma_bench.dart';
@@ -13,6 +14,45 @@ Future<int> _waitState(DmaBench b, int state) async {
     if (status >> HarborPcieDma.statusStateShift & 0xf == state) return status;
   }
   fail('engine state $state not seen');
+}
+
+/// A module with a memory master port that crosses to a fabric clock, and
+/// its debug outputs on `cdc_*`.
+class _CdcTop extends BridgeModule {
+  _CdcTop() : super('PcieDmaStallCdcTop', name: 'top') {
+    for (final p in ['clk', 'reset', 'fclk', 'freset']) {
+      createPort(p, PortDirection.input);
+    }
+    final port = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'memory',
+      kind: HarborFabricKind.axi4,
+      config: const HarborMemoryWaistConfig(addressWidth: 16, dataWidth: 32),
+      clk: input('clk'),
+      reset: input('reset'),
+      fabricClock: HarborFabricClock(
+        clk: input('fclk'),
+        reset: input('freset'),
+      ),
+    );
+    port.addDebugOutputs(this, 'cdc');
+    final w = port.waist;
+    createPort('req_valid', PortDirection.input);
+    w.reqValid <= input('req_valid');
+    w.reqId <= Const(0, width: w.config.idWidth);
+    w.reqWrite <= Const(0);
+    w.reqAddr <= Const(0x100, width: 16);
+    w.reqLen <= Const(0, width: HarborMemoryWaistConfig.lenWidth);
+    w.reqSize <= Const(2, width: HarborMemoryWaistConfig.sizeWidth);
+    w.reqBurst <= Const(1, width: HarborMemoryWaistConfig.burstWidth);
+    w.reqExclusive <= Const(0);
+    w.wdataValid <= Const(0);
+    w.wdataData <= Const(0, width: 32);
+    w.wdataStrb <= Const(0, width: 4);
+    w.wdataLast <= Const(0);
+    w.rdataReady <= Const(0);
+    w.wrespReady <= Const(0);
+  }
 }
 
 void main() {
@@ -107,7 +147,7 @@ void main() {
     });
   }
 
-  test('STATUS shows the state while a fabric read waits', () async {
+  test('STATUS and DEBUG show the state while a fabric read waits', () async {
     final b = await DmaBench.create(const DmaConfig());
     await b.start();
     await b.setupRing(dmaCplBase, 4);
@@ -116,6 +156,77 @@ void main() {
     await b.push(hostAddress: 0x80000000, localAddress: 0x100, length: 0x40);
     final status = await _waitState(b, 5);
     expect(status & HarborPcieDma.statusBusy, 1);
+    final debug = await b.readReg(HarborPcieDma.registerDebug);
+    expect(debug & 0xf, 5);
+    expect(debug >> HarborPcieDma.debugDStateShift & 7, 0);
+    expect(b.top.output('debug').value.toInt() & 0xff, debug & 0xff);
     await b.finish();
+  });
+
+  test('DEBUG shows the drain state while a fabric write waits', () async {
+    final b = await DmaBench.create(const DmaConfig());
+    await b.start();
+    await b.setupRing(dmaCplBase, 4);
+    await b.enable();
+    b.memory.writeLimit = 0;
+    b.seedHost(0x80000000, 0x40);
+    await b.push(
+      hostAddress: 0x80000000,
+      localAddress: 0x100,
+      length: 0x40,
+      deviceToHost: false,
+    );
+    await _waitState(b, 10);
+    var dState = 0;
+    for (var i = 0; i < 200 && dState < 3; i++) {
+      final debug = await b.readReg(HarborPcieDma.registerDebug);
+      dState = debug >> HarborPcieDma.debugDStateShift & 7;
+    }
+    expect(dState, anyOf(3, 4));
+    await b.finish();
+  });
+
+  test('a memory port crossing shows its debug outputs', () async {
+    final top = _CdcTop();
+    await top.build();
+    final clk = SimpleClockGenerator(10).clk;
+    final fclk = SimpleClockGenerator(14).clk;
+    final reset = Logic();
+    final reqValid = Logic();
+    top.input('clk').srcConnection! <= clk;
+    top.input('fclk').srcConnection! <= fclk;
+    top.input('reset').srcConnection! <= reset;
+    top.input('freset').srcConnection! <= reset;
+    top.input('req_valid').srcConnection! <= reqValid;
+    for (final p in top.inputs.keys.where((p) => p.startsWith('memory_'))) {
+      final port = top.input(p);
+      (port.srcConnection ?? port).inject(p.endsWith('ARREADY') ? 1 : 0);
+    }
+    reset.inject(1);
+    reqValid.inject(0);
+    Simulator.setMaxSimTime(100000);
+    unawaited(Simulator.run());
+    for (var i = 0; i < 6; i++) {
+      await clk.nextPosedge;
+    }
+    reset.inject(0);
+    for (var i = 0; i < 12; i++) {
+      await clk.nextPosedge;
+    }
+    int out(String n) => top.output('cdc_$n').value.toInt();
+    expect(out('reads'), 0);
+    expect(out('writes'), 0);
+    expect(out('recover'), 0);
+    expect(out('empty'), 0xf);
+    expect(out('full'), 0);
+    reqValid.inject(1);
+    await clk.nextPosedge;
+    reqValid.inject(0);
+    for (var i = 0; i < 12; i++) {
+      await clk.nextPosedge;
+    }
+    expect(out('reads'), 1);
+    expect(out('empty'), 0xf);
+    await Simulator.endSimulation();
   });
 }

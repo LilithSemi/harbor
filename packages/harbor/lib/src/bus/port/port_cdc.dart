@@ -54,12 +54,32 @@ int harborCdcDepth(int outstanding) {
 /// reset net spans the die. A copy is two flops after `device_reset`, so it
 /// releases two cycles later, and it sets at once when either reset input
 /// asserts. Only the first flop of each copy loads `device_reset`.
+///
+/// The `debug_*` outputs are for a status register or LEDs. They are not
+/// synchronized to one clock.
 class HarborMemoryWaistCdc extends Module {
   /// Entries in each FIFO.
   final int depth;
 
   /// The device side reset joined with the fabric reset.
   Logic get deviceReset => output('device_reset');
+
+  /// Reads in flight on the fabric side, on the fabric clock.
+  Logic get debugReads => output('debug_reads');
+
+  /// Writes in flight on the fabric side, on the fabric clock.
+  Logic get debugWrites => output('debug_writes');
+
+  /// The fabric side answers or drops the requests from before a device
+  /// reset, on the fabric clock.
+  Logic get debugRecover => output('debug_recover');
+
+  /// Empty flag of each FIFO on its read side: [0] REQ, [1] WDATA, [2]
+  /// RDATA, [3] WRESP.
+  Logic get debugEmpty => output('debug_empty');
+
+  /// Full flag of each FIFO on its write side, in the order of [debugEmpty].
+  Logic get debugFull => output('debug_full');
 
   HarborMemoryWaistCdc({
     required Logic fabricClk,
@@ -204,6 +224,11 @@ class HarborMemoryWaistCdc extends Module {
     final n = config.outstanding;
     final cntW = n.bitLength;
     Logic nonZero(Logic c) => ~c.eq(Const(0, width: c.width));
+    final fifos = [reqF, wdF, rdF, wrF];
+    addOutput('debug_empty', width: 4) <=
+        [for (final q in fifos.reversed) q.rdEmpty].swizzle();
+    addOutput('debug_full', width: 4) <=
+        [for (final q in fifos.reversed) q.wrFull].swizzle();
 
     if (slave) {
       // Fabric side: the requester. The queues hold what is in flight, so
@@ -233,6 +258,9 @@ class HarborMemoryWaistCdc extends Module {
       );
       final wOwed = Logic(name: 'w_owed', width: cntW);
       final rBeat = Logic(name: 'r_beat', width: lenW);
+      addOutput('debug_reads', width: cntW) <= rdQ.count;
+      addOutput('debug_writes', width: cntW) <= wrQ.count;
+      addOutput('debug_recover') <= mode;
 
       up.reqReady <= ~reqF.wrFull & ~mode & rdQ.pushReady & wrQ.pushReady;
       reqFire <= up.reqValid & up.reqReady;
@@ -482,6 +510,9 @@ class HarborMemoryWaistCdc extends Module {
     final outR = Logic(name: 'out_reads', width: cntW);
     final outW = Logic(name: 'out_writes', width: cntW);
     final wBeat = Logic(name: 'w_beat', width: lenW);
+    addOutput('debug_reads', width: cntW) <= outR;
+    addOutput('debug_writes', width: cntW) <= outW;
+    addOutput('debug_recover') <= mode;
 
     final reqOpen = ~mode & lenQ.pushReady;
     dn.reqValid <= ~reqF.rdEmpty & reqOpen;
