@@ -32,8 +32,7 @@ const _base2 = 0xC000;
 const _pitch2 = 64;
 
 /// The requests of one frame of each format for [_timing], as
-/// (byte address, 32-bit beats). A one plane build fetches line 6 past the
-/// frame, a planar build does not.
+/// (byte address, 32-bit beats). No build fetches a line past the frame.
 const _frames = <HarborPixelFormat, List<(int, int)>>{
   HarborPixelFormat.xrgb8888: [
     (0x1000, 8),
@@ -42,7 +41,6 @@ const _frames = <HarborPixelFormat, List<(int, int)>>{
     (0x1060, 8),
     (0x1080, 8),
     (0x10A0, 8),
-    (0x10C0, 8),
   ],
   HarborPixelFormat.yuyv: [
     (0x1000, 4),
@@ -51,7 +49,6 @@ const _frames = <HarborPixelFormat, List<(int, int)>>{
     (0x1060, 4),
     (0x1080, 4),
     (0x10A0, 4),
-    (0x10C0, 4),
   ],
   HarborPixelFormat.nv12: [
     (0x1000, 2),

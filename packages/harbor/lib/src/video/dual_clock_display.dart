@@ -587,6 +587,7 @@ class HarborDualClockDisplay extends Module {
         fbBase: fbBase,
         stride: Const(this.lineStride, width: 32),
         wordsPerLine: Const(wordsPerLine, width: 16),
+        vActive: timing.vActive,
         memory: localMemory,
         rqReady: rqReady,
         rdValid: rdValid,

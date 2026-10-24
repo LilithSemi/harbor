@@ -39,6 +39,7 @@ void main() {
       fbBase: fbBase,
       stride: stride,
       wordsPerLine: words,
+      vActive: 8,
       memory: memory,
       maxWords: 4,
     );
@@ -144,6 +145,7 @@ void main() {
         fbBase: fbBase,
         stride: strideIn,
         wordsPerLine: words,
+        vActive: timing.vActive,
         memory: memory,
         // The burst length (what this test checks) comes from wordsPerLine,
         // not from the buffer's storage size, so a small buffer keeps

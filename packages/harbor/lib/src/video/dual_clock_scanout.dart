@@ -110,7 +110,8 @@ class HarborScanoutOverlay {
 /// low 2 bits of [fbBase] and [stride] are ignored.
 ///
 /// [formats] is the set of pixel formats that the build can scan. A build
-/// with one format of one plane uses [wordsPerLine] and [maxWords] as given.
+/// with one format of one plane uses [wordsPerLine] and [maxWords] as given,
+/// and fetches no line past line `vActive - 1`.
 /// Any other build is planar: it needs [hActive] and [vActive], takes the
 /// line size of each plane from [HarborPixelFormat.lineBytes], and has one
 /// double line buffer for each plane. Planar inputs, sampled at
@@ -308,6 +309,7 @@ class HarborDualClockScanout extends Module {
                      : 'HarborDualClockScanout',
                  [
                    'w$maxWords',
+                   'v$vActive',
                    'ram${blockRam?.name ?? "flop"}',
                    if (memory != null) ...[
                      'b$burstWords',
@@ -318,8 +320,8 @@ class HarborDualClockScanout extends Module {
                ),
        ) {
     if (!planar) {
-      if (wordsPerLine == null) {
-        throw ArgumentError('a one plane build needs wordsPerLine');
+      if (wordsPerLine == null || vActive == null || vActive < 1) {
+        throw ArgumentError('a one plane build needs wordsPerLine and vActive');
       }
       _buildSingle(
         pixelClk: pixelClk,
@@ -333,6 +335,7 @@ class HarborDualClockScanout extends Module {
         fbBase: fbBase,
         stride: stride,
         wordsPerLine: wordsPerLine,
+        vActive: vActive,
         memory: memory,
         rqReady: rqReady,
         rdValid: rdValid,
@@ -409,6 +412,7 @@ class HarborDualClockScanout extends Module {
     required Logic fbBase,
     required Logic stride,
     required Logic wordsPerLine,
+    required int vActive,
     required HarborMemoryWaist? memory,
     required Logic? rqReady,
     required Logic? rdValid,
@@ -451,6 +455,9 @@ class HarborDualClockScanout extends Module {
     ); // 0 idle,1 primeA,2 primeB,3 run
     final readSel = Logic(name: 'read_sel');
     final fetchAddr = Logic(name: 'fetch_addr', width: 32);
+    // The line at fetch_addr. No line past the frame is fetched.
+    final fetchLine = Logic(name: 'fetch_line', width: (vActive + 2).bitLength);
+    final more = fetchLine.lt(vActive).named('line_left');
     final outstanding = Logic(name: 'outstanding');
     final underrunReg = Logic(name: 'underrun_reg');
     // Line 0 waits for the line in flight at the frame start.
@@ -544,11 +551,20 @@ class HarborDualClockScanout extends Module {
 
     // Issue a request: toggle req, latch payload, advance the line pointer.
     final fetchNext = (fetchAddr + stride).named('fetch_next');
+    List<Conditional> skip() => [
+      fetchAddr < fetchNext,
+      fetchLine < fetchLine + 1,
+    ];
     List<Conditional> issue(Logic addr, Logic fill) => [
       reqAddr < addr,
       reqFill < fill,
       reqToggle < ~reqToggle,
-      fetchAddr < (identical(addr, fetchAddr) ? fetchNext : addr + stride),
+      if (identical(addr, fetchAddr))
+        ...skip()
+      else ...[
+        fetchAddr < addr + stride,
+        fetchLine < Const(1, width: fetchLine.width),
+      ],
       outstanding < Const(1),
     ];
     final busy = (outstanding & ~doneEdge).named('line_busy');
@@ -568,7 +584,14 @@ class HarborDualClockScanout extends Module {
           // The system side takes one request at a time, so line 0 waits
           // for a line that is still in flight.
           wait0 < busy,
-          If(busy, then: [fetchAddr < fbBase], orElse: issue(fbBase, Const(0))),
+          If(
+            busy,
+            then: [
+              fetchAddr < fbBase,
+              fetchLine < Const(0, width: fetchLine.width),
+            ],
+            orElse: issue(fbBase, Const(0)),
+          ),
         ],
         orElse: [
           Case(phase, [
@@ -581,13 +604,13 @@ class HarborDualClockScanout extends Module {
                 Iff(lineStart, [
                   readSel < ~readSel,
                   underrunReg < Const(1),
-                  fetchAddr < fetchNext,
+                  ...skip(),
                 ]),
                 ElseIf(firstLine & (wait0 | busy), [
                   underrunReg < Const(1),
-                  If(wait0, then: [wait0 < Const(0), fetchAddr < fetchNext]),
+                  If(wait0, then: [wait0 < Const(0), ...skip()]),
                 ]),
-                ElseIf(~outstanding, [
+                ElseIf(~outstanding & more, [
                   ...issue(fetchAddr, ~(readSel | wait0)),
                   wait0 < Const(0),
                   If(~wait0, then: [phase < Const(2, width: 2)]),
@@ -615,7 +638,7 @@ class HarborDualClockScanout extends Module {
                   If(
                     busy,
                     then: [underrunReg < Const(1), phase < Const(1, width: 2)],
-                    orElse: issue(fetchAddr, readSel),
+                    orElse: [If(more, then: issue(fetchAddr, readSel))],
                   ),
                 ],
               ),
@@ -1316,10 +1339,7 @@ class HarborDualClockScanout extends Module {
           // no held line, so they do not send in the same clock. The
           // first line check drops a held line 0, so it does not go then.
           If(
-            ~lineStart &
-                ~firstLine &
-                ~busy &
-                release.reduce((a, b) => a | b),
+            ~lineStart & ~firstLine & ~busy & release.reduce((a, b) => a | b),
             then: [
               reqToggle < ~reqToggle,
               reqMask < release.rswizzle(),

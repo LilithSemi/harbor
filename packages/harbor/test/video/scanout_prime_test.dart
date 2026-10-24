@@ -147,9 +147,21 @@ Future<void> _run({
         _timing.hActive,
   );
   expect(underrun, {for (var f = 2; f < frames; f++) f: slowOf(f) != null});
+  final end = _base + _timing.vActive * _stride;
+  for (final (a, _) in requests) {
+    expect(a, lessThan(end), reason: 'a fetch past the frame');
+  }
 }
 
 void main() {
+  for (final port in [false, true]) {
+    test('a one plane scanout on '
+        '${port ? 'a scanout port' : 'a memory waist'} fetches no line past '
+        'the frame', () async {
+      await _run(port: port, slow: const [null, null]);
+    });
+  }
+
   // Line 0 is late, so one or more line starts come before the prime
   // sends line 1. Request n is the first request of line 0.
   for (final port in [false, true]) {
