@@ -446,6 +446,7 @@ void main() {
       sysReset: sysReset,
       frameStart: frameStart,
       lineStart: lineStart,
+      firstLine: Const(0),
       col: col0,
       fbBase: Const(_fb, width: 32),
       stride: Const(_stride, width: 32),

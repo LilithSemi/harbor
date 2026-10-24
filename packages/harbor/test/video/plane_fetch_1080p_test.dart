@@ -46,6 +46,7 @@ Future<void> _scan(HarborPixelFormat format, {int lines = 6}) async {
     sysReset: sysReset,
     frameStart: frameStart,
     lineStart: lineStart,
+    firstLine: Const(0),
     col: col0,
     fbBase: Const(_y, width: 32),
     stride: Const(pitch0, width: 32),

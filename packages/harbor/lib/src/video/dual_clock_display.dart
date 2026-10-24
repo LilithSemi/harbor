@@ -442,6 +442,12 @@ class HarborDualClockDisplay extends Module {
     // horizontal blank and never overlaps.
     final lineStart =
         enable & tx.eq(timing.hActive) & ty.lt(timing.vActive - 1);
+    // The first pixel of line 0, where the scanout checks line 0. It is a
+    // register, so no compare is on the scanout control path.
+    final firstLine = delay(
+      enable & tx.eq(timing.hTotal - 1) & ty.eq(timing.vTotal - 1),
+      'first_line',
+    );
 
     // rgb565 packs two pixels in each word. The word is tx >> 1 and the half
     // is tx bit 0.
@@ -535,6 +541,7 @@ class HarborDualClockDisplay extends Module {
         sysReset: sysReset,
         frameStart: frameStart,
         lineStart: lineStart,
+        firstLine: firstLine,
         col: unpack != null
             ? unpack.planeCol(0)
             : shift == 0
@@ -575,6 +582,7 @@ class HarborDualClockDisplay extends Module {
         sysReset: sysReset,
         frameStart: frameStart,
         lineStart: lineStart,
+        firstLine: firstLine,
         col: scanoutCol,
         fbBase: fbBase,
         stride: Const(this.lineStride, width: 32),
@@ -615,6 +623,7 @@ class HarborDualClockDisplay extends Module {
         sysReset: sysReset,
         frameStart: frameStart,
         lineStart: lineStart,
+        firstLine: firstLine,
         col: cols[0],
         fbBase: fbBase,
         stride: planePitch[0],

@@ -43,14 +43,17 @@ int _byte(int a) => (_word(a & ~3) >> (8 * (a & 3))) & 0xff;
 /// format [primary] and the overlay set [overlay], after two frames that
 /// prime it. The test sets the overlay inputs for frame f + 1 at pixel
 /// [setAt] of frame f. Every active pixel must match [overlayFrame], and
-/// the overlay requests of each frame must be [overlayFetches].
+/// the overlay requests of each frame must be [overlayFetches]. No frame
+/// may fetch a word twice.
 ///
 /// [slow] makes the prime of a state slow: for state i, request n after
 /// its frame start has latency l when `slow[i]` is (n, l). Then the first
 /// [lateRows] rows of that frame are not checked, and neither are its
-/// requests. The underrun counts named in [late] must be more than 0, and
-/// the others 0. With [surfaceWidth], no overlay request may go past the
-/// end of a surface line of that many pixels.
+/// overlay requests. The underrun counts named in [late] must be more than
+/// 0, and the others 0. With [surfaceWidth], no overlay request may go
+/// past the end of a surface line of that many pixels. With [port], the
+/// display reads a scanout port model in place of the memory waist.
+/// [clocks] are the pixel and system clock periods.
 Future<void> _run({
   required HarborPixelFormat primary,
   required List<HarborPixelFormat> overlay,
@@ -61,13 +64,18 @@ Future<void> _run({
   int lateRows = 2,
   Set<String> late = const {},
   int? surfaceWidth,
+  bool port = false,
+  (int, int) clocks = (20, 4),
 }) async {
   final ovCsc = csc ?? HarborCscCoefficients.bt601Limited;
-  final pixelClk = SimpleClockGenerator(20).clk;
-  final sysClk = SimpleClockGenerator(4).clk;
+  final pixelClk = SimpleClockGenerator(clocks.$1).clk;
+  final sysClk = SimpleClockGenerator(clocks.$2).clk;
   final pixelReset = Logic(name: 'pixel_reset');
   final sysReset = Logic(name: 'sys_reset');
-  final memory = HarborMemoryWaist(_memConfig);
+  final memory = port ? null : HarborMemoryWaist(_memConfig);
+  final rqReady = Logic(name: 'rq_ready');
+  final rdValid = Logic(name: 'rd_valid');
+  final rdData = Logic(name: 'rd_data', width: 16);
   final planar = primary.planes.length > 1;
   final n = overlay.map((f) => f.planes.length).reduce((a, b) => a > b ? a : b);
   final enable = Logic(name: 'ov_enable');
@@ -95,6 +103,9 @@ Future<void> _run({
     enable: Const(1),
     fbBase: Const(_primary.base[0], width: 32),
     memory: memory,
+    rqReady: port ? rqReady : null,
+    rdValid: port ? rdValid : null,
+    rdData: port ? rdData : null,
     outputType: HarborDisplayInterface.parallelRgb,
     pixelFormat: primary,
     lineStride: planar ? null : _primary.pitch[0],
@@ -123,7 +134,30 @@ Future<void> _run({
     overlayCscOutOffset: ovYuv ? outOff : null,
   );
   await disp.build();
-  final mem = WaistMemory(memory, sysClk, latency: 4, data: _word);
+  // Each request as (byte address, 32-bit words).
+  final List<(int, int)> Function() requests;
+  final int Function() count;
+  final void Function(int) setLatency;
+  if (port) {
+    final m = PortMemory(
+      rqValid: disp.rqValid,
+      rqAddr: disp.rqAddr,
+      rqWords: disp.rqWords,
+      rqReady: rqReady,
+      rdValid: rdValid,
+      rdData: rdData,
+      clk: sysClk,
+      data: _word,
+    );
+    requests = () => [for (final (a, n) in m.requests) (a, n ~/ 2)];
+    count = () => m.requests.length;
+    setLatency = (l) => m.latency = l;
+  } else {
+    final m = WaistMemory(memory!, sysClk, latency: 4, data: _word);
+    requests = () => m.requests;
+    count = () => m.requests.length;
+    setLatency = (l) => m.latency = l;
+  }
   final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
   final delay = disp.pipelineDelay;
 
@@ -210,16 +244,16 @@ Future<void> _run({
     final (gx, gy) = (gen.x.value.toInt(), gen.y.value.toInt());
     if (gx == 0 && gy == 0) frame++;
     if (gx == 0 && gy == _timing.vActive) {
-      firstRequest[frame + 1] = mem.requests.length;
+      firstRequest[frame + 1] = count();
       if (slow[frame + 1 - 2] case (final n, final l)) {
-        slowAt = (mem.requests.length + n, l);
+        slowAt = (count() + n, l);
       }
     }
     if (slowAt case (final at, final l)) {
-      if (mem.requests.length == at) {
-        mem.latency = l;
-      } else if (mem.requests.length > at) {
-        mem.latency = 4;
+      if (count() == at) {
+        setLatency(l);
+      } else if (count() > at) {
+        setLatency(4);
         slowAt = null;
       }
     }
@@ -250,11 +284,27 @@ Future<void> _run({
         _timing.hActive,
   );
 
+  // A frame fetches each word at most once, also a slow frame.
+  for (var f = 2; f < frames; f++) {
+    final words = [
+      for (final (a, n) in requests().sublist(
+        firstRequest[f]!,
+        firstRequest[f + 1]!,
+      ))
+        for (var i = 0; i < n; i++) a + 4 * i,
+    ];
+    expect(
+      words.length,
+      words.toSet().length,
+      reason: 'frame $f fetches a word twice',
+    );
+  }
+
   // The overlay requests of each frame, joined into lines.
   for (var f = 2; f < frames; f++) {
     if (isSlow(f)) continue;
     final lines = <(int, int)>[];
-    for (final (a, beats) in mem.requests.sublist(
+    for (final (a, beats) in requests().sublist(
       firstRequest[f]!,
       firstRequest[f + 1]!,
     )) {
@@ -268,7 +318,7 @@ Future<void> _run({
     final s = stateOf(f);
     if (surfaceWidth != null) {
       final format = overlay[s.format];
-      for (final (a, beats) in mem.requests.sublist(
+      for (final (a, beats) in requests().sublist(
         firstRequest[f]!,
         firstRequest[f + 1]!,
       )) {
@@ -569,55 +619,131 @@ void main() {
     );
   });
 
-  // Line 0 comes so late that the first line start comes before the
-  // prime ends. Rows 0 and 1 are late, and the rows after them must be the
-  // correct rows.
-  test('a line start in the prime counts the late lines', () {
-    const full = OverlayFrame(
+  for (final port in [false, true]) {
+    final mode = port ? 'a scanout port' : 'a memory waist';
+
+    // Line 0 comes so late that the first line start comes before the
+    // prime ends. Rows 0 and 1 are late, and the rows after them must be
+    // the correct rows.
+    test('a line start in the prime counts the late lines on $mode', () {
+      const full = OverlayFrame(
+        dstX: 0,
+        dstY: 0,
+        width: 16,
+        height: 8,
+        alpha: 128,
+      );
+      const low = OverlayFrame(
+        srcX: 2,
+        srcY: 2,
+        dstX: 2,
+        dstY: 3,
+        width: 10,
+        height: 4,
+      );
+      return _run(
+        primary: HarborPixelFormat.xrgb8888,
+        overlay: const [HarborPixelFormat.nv12],
+        states: const [full, full, low, low],
+        slow: const {0: (0, 620), 2: (0, 620)},
+        late: const {
+          'plane_underrun_count_0',
+          'overlay_underrun_count_0',
+          'overlay_underrun_count_1',
+        },
+        port: port,
+      );
+    });
+
+    // Primary line 1 comes so late that the first line start comes in the
+    // second prime step, before overlay line 1 goes.
+    test('a line start in the second prime step counts the late lines on '
+        '$mode', () {
+      const top = OverlayFrame(dstX: 0, dstY: 0, width: 16, height: 8);
+      const inside = OverlayFrame(
+        dstX: 1,
+        dstY: 1,
+        width: 12,
+        height: 6,
+        alpha: 99,
+      );
+      return _run(
+        primary: HarborPixelFormat.nv12,
+        overlay: const [HarborPixelFormat.xrgb8888],
+        states: const [top, top, inside, inside],
+        slow: const {0: (2, 580), 2: (2, 580)},
+        late: {
+          'plane_underrun_count_0',
+          'overlay_underrun_count_0',
+          if (port) 'plane_underrun_count_1',
+        },
+        port: port,
+      );
+    });
+  }
+
+  // The pixel clock period is 2 system clocks. Line 0 is so late that the
+  // second prime step sends its request one or two pixel clocks before the
+  // first line start. The line start must not send its lines before the
+  // system side took that request. An overlay at screen line 3 keeps the
+  // prime in phase 2 until its line 0 is done.
+  test('a line start just after the second prime step waits for its '
+      'request', () {
+    const top = OverlayFrame(
+      srcX: 3,
       dstX: 0,
       dstY: 0,
-      width: 16,
+      width: 4,
       height: 8,
       alpha: 128,
     );
     const low = OverlayFrame(
-      srcX: 2,
-      srcY: 2,
+      srcX: 3,
       dstX: 2,
       dstY: 3,
-      width: 10,
+      width: 4,
       height: 4,
-    );
-    return _run(
-      primary: HarborPixelFormat.xrgb8888,
-      overlay: const [HarborPixelFormat.nv12],
-      states: const [full, full, low, low],
-      slow: const {0: (0, 620), 2: (0, 620)},
-      late: const {
-        'plane_underrun_count_0',
-        'overlay_underrun_count_0',
-        'overlay_underrun_count_1',
-      },
-    );
-  });
-
-  // Primary line 1 comes so late that the first line start comes in the
-  // second prime step, before overlay line 1 goes.
-  test('a line start in the second prime step counts the late lines', () {
-    const top = OverlayFrame(dstX: 0, dstY: 0, width: 16, height: 8);
-    const inside = OverlayFrame(
-      dstX: 1,
-      dstY: 1,
-      width: 12,
-      height: 6,
-      alpha: 99,
+      alpha: 128,
     );
     return _run(
       primary: HarborPixelFormat.nv12,
       overlay: const [HarborPixelFormat.xrgb8888],
-      states: const [top, top, inside, inside],
-      slow: const {0: (2, 580), 2: (2, 580)},
-      late: const {'plane_underrun_count_0', 'overlay_underrun_count_0'},
+      states: const [top, top, top, top, low, low],
+      slow: const {
+        0: (0, 220),
+        1: (0, 221),
+        2: (0, 222),
+        3: (0, 223),
+        4: (0, 222),
+        5: (0, 223),
+      },
+      lateRows: 3,
+      late: const {
+        'plane_underrun_count_0',
+        'plane_underrun_count_1',
+        'overlay_underrun_count_0',
+      },
+      clocks: (8, 4),
+    );
+  });
+
+  // Overlay line 0 is on screen line 0 only, and comes after the first
+  // pixel of line 0. Nothing else in the frame is late.
+  test('a late overlay line 0 on screen line 0 counts', () {
+    const row0 = OverlayFrame(
+      dstX: 0,
+      dstY: 0,
+      width: 16,
+      height: 1,
+      alpha: 128,
+    );
+    return _run(
+      primary: HarborPixelFormat.xrgb8888,
+      overlay: const [HarborPixelFormat.xrgb8888],
+      states: const [row0, row0],
+      slow: const {0: (2, 540), 1: (2, 570)},
+      lateRows: 1,
+      late: const {'overlay_underrun_count_0'},
     );
   });
 

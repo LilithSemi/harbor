@@ -92,7 +92,13 @@ class HarborScanoutOverlay {
 /// the freed one. [pixel] is `buffer[col]`, [underrun] latches if a requested
 /// line had not completed by the swap. A line start before the prime ends
 /// also latches [underrun], and the lines after it go to the correct
-/// buffers.
+/// buffers. [firstLine] pulses at the first pixel of line 0, and line 0
+/// that is not done there also latches [underrun].
+///
+/// A plane has at most one line in flight, and a request stays stable
+/// until the system side takes it. A line that cannot go yet waits, also
+/// line 0 at a frame start. A line that still waits when its read starts
+/// counts as an underrun and does not go.
 ///
 /// [pixel] is registered: it is the word at the [col] of the cycle before.
 /// The system side reads memory through one of two ports. Give [memory] for
@@ -135,16 +141,17 @@ class HarborScanoutOverlay {
 /// Give [overlay] to fetch an overlay plane on the same memory port. It
 /// makes a planar build. The overlay planes come after the primary planes
 /// in the request mask. Overlay plane 0 goes before the primary chroma
-/// planes, because they have two line times. An overlay
-/// plane line holds only the words from the word of the first source pixel
-/// to the word of the last visible source pixel, plus one word when the
-/// plane reads one pixel ahead and the screen edge clips the crop. The scanout fetches overlay lines only for
-/// the screen lines in the overlay. Overlay line r (source line
-/// `src_y + r`) is in buffer `r & 1`, and overlay chroma line c in buffer
-/// `c & 1`. Overlay line 0 goes with primary line 1 at frame start, when
-/// the address of the first source line is ready. Overlay line 1 goes when
-/// that request is done. After that each line start fetches the next
-/// line, as for the primary planes.
+/// planes, because they have two line times. An overlay plane line holds
+/// only the words from the word of the first source pixel to the word of
+/// the last visible source pixel, plus one word when the plane reads one
+/// pixel ahead and the screen edge clips the crop. The scanout fetches
+/// overlay lines only for the screen lines in the overlay. Overlay line r
+/// (source line `src_y + r`) is in buffer `r & 1`, and overlay chroma line
+/// c in buffer `c & 1`. Overlay line 0 goes with primary line 1 at frame
+/// start, when the address of the first source line is ready. Overlay line
+/// 1 goes when that request is done. After that each line start fetches
+/// the next line, as for the primary planes. Overlay line 0 that is not
+/// done at the first pixel of its screen line 0 counts as an underrun.
 ///
 /// The scanout aligns the source origin to the chroma samples: it clears
 /// bit 0 of `src_x` for a 4:2:2 or 4:2:0 format and bit 0 of `src_y` for
@@ -230,6 +237,7 @@ class HarborDualClockScanout extends Module {
     required Logic sysReset,
     required Logic frameStart,
     required Logic lineStart,
+    required Logic firstLine,
     required Logic col,
     required Logic fbBase,
     required Logic stride,
@@ -320,6 +328,7 @@ class HarborDualClockScanout extends Module {
         sysReset: sysReset,
         frameStart: frameStart,
         lineStart: lineStart,
+        firstLine: firstLine,
         col: col,
         fbBase: fbBase,
         stride: stride,
@@ -346,6 +355,7 @@ class HarborDualClockScanout extends Module {
       sysReset: sysReset,
       frameStart: frameStart,
       lineStart: lineStart,
+      firstLine: firstLine,
       col: col,
       fbBase: fbBase,
       stride: stride,
@@ -394,6 +404,7 @@ class HarborDualClockScanout extends Module {
     required Logic sysReset,
     required Logic frameStart,
     required Logic lineStart,
+    required Logic firstLine,
     required Logic col,
     required Logic fbBase,
     required Logic stride,
@@ -414,6 +425,7 @@ class HarborDualClockScanout extends Module {
     sysReset = addInput('sys_reset', sysReset);
     frameStart = addInput('frame_start', frameStart);
     lineStart = addInput('line_start', lineStart);
+    firstLine = addInput('first_line', firstLine);
     col = addInput('col', col, width: col.width);
     fbBase = addInput('fb_base', fbBase, width: 32);
     stride = addInput('stride', stride, width: 32);
@@ -441,6 +453,8 @@ class HarborDualClockScanout extends Module {
     final fetchAddr = Logic(name: 'fetch_addr', width: 32);
     final outstanding = Logic(name: 'outstanding');
     final underrunReg = Logic(name: 'underrun_reg');
+    // Line 0 waits for the line in flight at the frame start.
+    final wait0 = Logic(name: 'wait0');
     final dSync0 = Logic(name: 'd_sync0');
     final dSync1 = Logic(name: 'd_sync1');
     final dPrev = Logic(name: 'd_prev');
@@ -529,13 +543,15 @@ class HarborDualClockScanout extends Module {
     underrun <= underrunReg;
 
     // Issue a request: toggle req, latch payload, advance the line pointer.
+    final fetchNext = (fetchAddr + stride).named('fetch_next');
     List<Conditional> issue(Logic addr, Logic fill) => [
       reqAddr < addr,
       reqFill < fill,
       reqToggle < ~reqToggle,
-      fetchAddr < (addr + stride),
+      fetchAddr < (identical(addr, fetchAddr) ? fetchNext : addr + stride),
       outstanding < Const(1),
     ];
+    final busy = (outstanding & ~doneEdge).named('line_busy');
 
     // Pixel-domain sequential.
     Sequential(pixelClk, reset: pixelReset, [
@@ -549,23 +565,32 @@ class HarborDualClockScanout extends Module {
           readSel < Const(0),
           underrunReg < Const(0),
           phase < Const(1, width: 2),
-          ...issue(fbBase, Const(0)),
+          // The system side takes one request at a time, so line 0 waits
+          // for a line that is still in flight.
+          wait0 < busy,
+          If(busy, then: [fetchAddr < fbBase], orElse: issue(fbBase, Const(0))),
         ],
         orElse: [
           Case(phase, [
             // Phase 1 sends the next line when no line is in flight. A
             // line start here skips the line that was not requested, so it
-            // is an underrun.
+            // is an underrun. Line 0 that is not done at the first line is
+            // an underrun, and if it did not go, line 1 goes in its place.
             CaseItem(Const(1, width: 2), [
               If.block([
                 Iff(lineStart, [
                   readSel < ~readSel,
                   underrunReg < Const(1),
-                  fetchAddr < (fetchAddr + stride),
+                  fetchAddr < fetchNext,
+                ]),
+                ElseIf(firstLine & (wait0 | busy), [
+                  underrunReg < Const(1),
+                  If(wait0, then: [wait0 < Const(0), fetchAddr < fetchNext]),
                 ]),
                 ElseIf(~outstanding, [
-                  ...issue(fetchAddr, ~readSel),
-                  phase < Const(2, width: 2),
+                  ...issue(fetchAddr, ~(readSel | wait0)),
+                  wait0 < Const(0),
+                  If(~wait0, then: [phase < Const(2, width: 2)]),
                 ]),
               ]),
             ]),
@@ -576,7 +601,7 @@ class HarborDualClockScanout extends Module {
               If.block([
                 Iff(lineStart, [
                   readSel < ~readSel,
-                  If(outstanding & ~doneEdge, then: [underrunReg < Const(1)]),
+                  If(busy, then: [underrunReg < Const(1)]),
                   phase < Const(1, width: 2),
                 ]),
                 ElseIf(doneEdge, [phase < Const(3, width: 2)]),
@@ -587,8 +612,11 @@ class HarborDualClockScanout extends Module {
                 lineStart,
                 then: [
                   readSel < ~readSel,
-                  If(outstanding & ~doneEdge, then: [underrunReg < Const(1)]),
-                  ...issue(fetchAddr, readSel),
+                  If(
+                    busy,
+                    then: [underrunReg < Const(1), phase < Const(1, width: 2)],
+                    orElse: issue(fetchAddr, readSel),
+                  ),
                 ],
               ),
             ]),
@@ -630,6 +658,7 @@ class HarborDualClockScanout extends Module {
     required Logic sysReset,
     required Logic frameStart,
     required Logic lineStart,
+    required Logic firstLine,
     required Logic col,
     required Logic fbBase,
     required Logic stride,
@@ -740,6 +769,7 @@ class HarborDualClockScanout extends Module {
     sysReset = addInput('sys_reset', sysReset);
     frameStart = addInput('frame_start', frameStart);
     lineStart = addInput('line_start', lineStart);
+    firstLine = addInput('first_line', firstLine);
     if (multi) {
       formatSel = addInput('format_sel', formatSel!, width: selW);
     }
@@ -834,6 +864,24 @@ class HarborDualClockScanout extends Module {
         .map((o) => ~o)
         .reduce((a, b) => a & b)
         .named('all_idle');
+    // A held line waits until the line in flight of its plane is done and
+    // the system side took the last request. Its address is the next
+    // address minus the pitch.
+    final hold = regs('hold');
+    final holdFill = regs('hold_fill');
+    final anyHold = hold.reduce((a, b) => a | b).named('any_hold');
+    final aSync0 = Logic(name: 'a_sync0');
+    final aSync1 = Logic(name: 'a_sync1');
+    final ackToggle = Logic(name: 'ack_toggle'); // system domain
+    final busy = (reqToggle ^ aSync1).named('req_busy');
+    final blocked = [
+      for (var k = 0; k < all; k++)
+        (busy | outstanding[k]).named('p${k}_blocked'),
+    ];
+    final release = [
+      for (var k = 0; k < all; k++)
+        (hold[k] & ~outstanding[k]).named('p${k}_release'),
+    ];
 
     final phase = Logic(
       name: 'phase',
@@ -863,46 +911,69 @@ class HarborDualClockScanout extends Module {
     Logic r17(Logic v) => v.zeroExtend(17);
 
     // One request carries the lines of all planes for a line start. The
-    // system side takes them together.
+    // system side takes them together. A plane that is blocked holds its
+    // line. With [wait] false the caller makes sure that no plane is
+    // blocked.
     // Each entry is (fetch, address, fill, pitch), null for no fetch.
-    List<Conditional> issue(List<(Logic, Logic, Logic, Logic)?> lines) {
+    List<Conditional> issue(
+      List<(Logic, Logic, Logic, Logic)?> lines, {
+      bool wait = true,
+    }) {
       lines = [...lines, for (var k = lines.length; k < all; k++) null];
       if (lines.every((l) => l == null)) return [];
-      final fetch = [for (final l in lines) l?.$1 ?? Const(0)];
+      final go = [
+        for (var k = 0; k < all; k++)
+          if (lines[k] case (final f, _, _, _))
+            wait ? f & ~blocked[k] : f
+          else
+            Const(0),
+      ];
       return [
         If(
-          fetch.reduce((a, b) => a | b),
-          then: [
-            reqToggle < ~reqToggle,
-            reqMask < fetch.rswizzle(),
-            for (var k = 0; k < all; k++)
-              if (lines[k] case (final f, final addr, final fill, final step))
-                If(
-                  f,
-                  then: [
-                    reqAddr[k] < addr,
-                    reqFill[k] < fill,
-                    want[k] < ~want[k],
-                    nextAddr[k] < (addr + step),
-                  ],
-                ),
-          ],
+          go.reduce((a, b) => a | b),
+          then: [reqToggle < ~reqToggle, reqMask < go.rswizzle()],
         ),
+        for (var k = 0; k < all; k++)
+          if (lines[k] case (final f, final addr, final fill, final step))
+            If(
+              f,
+              then: [
+                nextAddr[k] < (addr + step),
+                if (wait)
+                  If(
+                    blocked[k],
+                    then: [hold[k] < Const(1), holdFill[k] < fill],
+                    orElse: [
+                      reqAddr[k] < addr,
+                      reqFill[k] < fill,
+                      want[k] < ~want[k],
+                    ],
+                  )
+                else ...[
+                  reqAddr[k] < addr,
+                  reqFill[k] < fill,
+                  want[k] < ~want[k],
+                ],
+              ],
+            ),
       ];
     }
 
-    // A line that is not ready when its read starts.
+    // A line that is not ready when its read starts. A held line does not
+    // go after that.
     List<Conditional> late(int k) => [
       If(
-        outstanding[k],
+        outstanding[k] | hold[k],
         then: [underrunReg[k] < Const(1), underrunTog[k] < ~underrunTog[k]],
       ),
+      hold[k] < Const(0),
     ];
 
     // A line that was not requested before its read starts.
     List<Conditional> miss(int k) => [
       underrunReg[k] < Const(1),
       underrunTog[k] < ~underrunTog[k],
+      hold[k] < Const(0),
     ];
 
     // The primary planes at a line start. The line after an odd line is
@@ -1050,10 +1121,22 @@ class HarborDualClockScanout extends Module {
 
     // A line start before the request of prime phase 2 goes. The primary
     // planes go on as in the run phase. Overlay line 1 goes now, or if it
-    // starts now, it is late and line 2 goes.
+    // starts now, it is late and line 2 goes. If the overlay starts at a
+    // later line and its line 0 is not done, the prime stays in phase 2,
+    // so the line start into overlay line 0 checks that line.
     List<Conditional> primeLine2() {
       final e0 = ov == null ? null : rEnter.eq(0);
       final e1 = ov == null ? null : rEnter.eq(1);
+      final stay = ov == null
+          ? null
+          : (ov.on &
+                    ~e0! &
+                    ~e1! &
+                    [
+                      for (var j = 0; j < ovPlanes; j++)
+                        outstanding[planes + j] | hold[planes + j],
+                    ].reduce((a, b) => a | b))
+                .named('ov_prime_stay');
       return [
         ...primaryState(),
         if (ov != null) ...[
@@ -1069,31 +1152,56 @@ class HarborDualClockScanout extends Module {
             for (var j = 0; j < ovPlanes; j++)
               j == 0
                   ? (
-                      mux(e1!, overlayLines()[0]!.$1, ovSecond(0)),
+                      mux(e1!, overlayLines()[0]!.$1, ovSecond(0)) & ~stay!,
                       nextAddr[planes] +
                           mux(e1, pitch[planes], Const(0, width: 32)),
                       ~e1,
                       pitch[planes],
                     )
                   : (
-                      ovSecond(j),
+                      ovSecond(j) & ~stay!,
                       nextAddr[planes + j],
                       Const(1),
                       pitch[planes + j],
                     ),
         ]),
-        phase < Const(3, width: 2),
+        phase <
+            (stay == null
+                ? Const(3, width: 2)
+                : mux(stay, Const(2, width: 2), Const(3, width: 2))),
       ];
     }
+
+    // Line 0 of each plane that is not done at the first line. Phase 1
+    // waits for the line 0 requests. Overlay line 0 goes in phase 1 and is
+    // done before phase 3.
+    List<Conditional> firstLineCheck() => [
+      If(phase.eq(1), then: [for (var k = 0; k < planes; k++) ...late(k)]),
+      if (ov != null)
+        for (var j = 0; j < ovPlanes; j++)
+          If(
+            ov.on & active[planes + j] & ov.dstY.eq(0),
+            then: [
+              If(
+                phase.eq(1),
+                then: miss(planes + j),
+                orElse: [If(phase.eq(2), then: late(planes + j))],
+              ),
+            ],
+          ),
+    ];
 
     Sequential(pixelClk, reset: pixelReset, [
       for (var k = 0; k < all; k++) ...[
         dSync0[k] < doneToggle[k],
         dSync1[k] < dSync0[k],
       ],
+      aSync0 < ackToggle,
+      aSync1 < aSync0,
       If(
         frameStart,
         then: [
+          for (var k = 0; k < all; k++) hold[k] < Const(0),
           readSel < Const(0),
           chromaSel < Const(0),
           phase < Const(1, width: 2),
@@ -1129,10 +1237,13 @@ class HarborDualClockScanout extends Module {
                 lineStart,
                 then: primeLine1(),
                 orElse: [
+                  If(firstLine, then: firstLineCheck()),
                   If(
-                    ov == null ? allIdle : allIdle & ov.ready,
+                    (ov == null ? allIdle : allIdle & ov.ready) &
+                        ~anyHold &
+                        ~busy,
                     then: [
-                      ...issue([
+                      ...issue(wait: false, [
                         for (var k = 0; k < planes; k++)
                           if (k == 0 ? vActive > 1 : chromaLines > 1)
                             (
@@ -1166,11 +1277,12 @@ class HarborDualClockScanout extends Module {
                 lineStart,
                 then: primeLine2(),
                 orElse: [
+                  If(firstLine, then: firstLineCheck()),
                   If(
-                    allIdle,
+                    allIdle & ~anyHold & ~busy,
                     then: [
                       if (ov != null)
-                        ...issue([
+                        ...issue(wait: false, [
                           for (var k = 0; k < planes; k++) null,
                           for (var j = 0; j < ovPlanes; j++)
                             (
@@ -1200,6 +1312,25 @@ class HarborDualClockScanout extends Module {
               ),
             ]),
           ]),
+          // Send the held lines that can go. The prime steps wait for
+          // no held line, so they do not send in the same clock.
+          If(
+            ~lineStart & ~busy & release.reduce((a, b) => a | b),
+            then: [
+              reqToggle < ~reqToggle,
+              reqMask < release.rswizzle(),
+              for (var k = 0; k < all; k++)
+                If(
+                  release[k],
+                  then: [
+                    reqAddr[k] < nextAddr[k] - pitch[k],
+                    reqFill[k] < holdFill[k],
+                    want[k] < ~want[k],
+                    hold[k] < Const(0),
+                  ],
+                ),
+            ],
+          ),
         ],
       ),
     ]);
@@ -1372,6 +1503,8 @@ class HarborDualClockScanout extends Module {
       rSync0 < reqToggle,
       rSync1 < rSync0,
       reqEdge < rSync0 ^ rSync1,
+      // It changes in the clock that takes the request.
+      ackToggle < rSync1,
       for (var k = 0; k < all; k++) ...[
         uSync0[k] < underrunTog[k],
         uSync1[k] < uSync0[k],

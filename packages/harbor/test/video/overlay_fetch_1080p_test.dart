@@ -56,6 +56,7 @@ Future<List<int>> _scan({
     sysReset: sysReset,
     frameStart: frameStart,
     lineStart: lineStart,
+    firstLine: Const(0),
     col: col0,
     fbBase: Const(_y, width: 32),
     stride: Const(pitch, width: 32),
