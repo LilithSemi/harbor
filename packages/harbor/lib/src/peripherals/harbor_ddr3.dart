@@ -75,10 +75,15 @@ import 'sim_dram.dart';
 ///   13 ANALYZE_DATA, 23 DONE_CALIBRATE, and on ECP5 also 24 READ_LEVEL,
 ///   25 READ_LEVEL_WAIT and 26 CAL_FAILED.
 ///
+/// - `cal_attempts`: 8-bit count of calibration starts, saturating at 255.
+///   The first start counts as 1, so a value above 1 means calibration
+///   restarted. Only `ddr_reset` clears the count in the controller, and
+///   `reset` clears the copy on `clk`. A sim target reports 1.
+///
 /// `init_done`, `cal_done` and `cal_failed` cross from `ddr_clk` through a
-/// two-flop synchronizer, and `cal_state` through a handshake that samples a
-/// stable value. A sim target has no controller: `init_done` and `cal_done`
-/// are 1, `cal_failed` is 0 and `cal_state` is 23.
+/// two-flop synchronizer, and `cal_state` with `cal_attempts` through a
+/// handshake that samples a stable value. A sim target has no controller:
+/// `init_done` and `cal_done` are 1, `cal_failed` is 0 and `cal_state` is 23.
 class HarborDdr3 extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -453,6 +458,7 @@ class HarborDdr3 extends BridgeModule
     addOutput('cal_done');
     addOutput('cal_failed');
     addOutput('cal_state', width: 6);
+    addOutput('cal_attempts', width: 8);
 
     // Under Verilator there is no PHY, so there are no pads to expose and
     // nothing to drive them. Creating them anyway would leave the bidirectional
@@ -463,6 +469,7 @@ class HarborDdr3 extends BridgeModule
       output('cal_done') <= Const(1);
       output('cal_failed') <= Const(0);
       output('cal_state') <= Const(Ddr3Controller.calStateDone, width: 6);
+      output('cal_attempts') <= Const(1, width: 8);
       if (simExternalMem) {
         _buildSimExternal(busDW, busAW);
       } else {
@@ -915,26 +922,35 @@ struct DramStore {
     output('cal_failed') <= failed;
 
     final hs = addSubModule(
-      HarborCdcHandshake(dataWidth: 6, name: 'cal_state_cdc'),
+      HarborCdcHandshake(dataWidth: 14, name: 'cal_state_cdc'),
     );
     hs.input('src_clk').srcConnection! <= ddrClk;
     hs.input('src_reset').srcConnection! <= ddrReset;
-    hs.input('src_data').srcConnection! <= ctrl.calState;
+    hs.input('src_data').srcConnection! <=
+        [ctrl.calStarts, ctrl.calState].swizzle();
     hs.input('src_valid').srcConnection! <= Const(1);
     hs.input('dst_clk').srcConnection! <= clk;
     hs.input('dst_reset').srcConnection! <= reset;
-    hs.input('dst_ready').srcConnection! <= Const(1);
+    hs.input('dst_ready').srcConnection! <= ~hs.output('dst_valid');
     final state = Logic(name: 'cal_state_sync', width: 6);
+    final attempts = Logic(name: 'cal_attempts_sync', width: 8);
     Sequential(clk, [
       If(
         reset,
-        then: [state < 0],
+        then: [state < 0, attempts < 0],
         orElse: [
-          If(hs.output('dst_valid'), then: [state < hs.output('dst_data')]),
+          If(
+            hs.output('dst_valid'),
+            then: [
+              state < hs.output('dst_data').slice(5, 0),
+              attempts < hs.output('dst_data').slice(13, 6),
+            ],
+          ),
         ],
       ),
     ]);
     output('cal_state') <= state;
+    output('cal_attempts') <= attempts;
   }
 
   void _build(

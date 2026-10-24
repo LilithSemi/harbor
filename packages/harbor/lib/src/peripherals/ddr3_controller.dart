@@ -250,6 +250,7 @@ class Ddr3Controller extends Module {
 
     addOutput('o_init_done');
     addOutput('o_cal_state', width: 6);
+    addOutput('o_cal_attempts', width: 8);
 
     // --- debug ---
     addOutput('o_debug1', width: 32);
@@ -1433,6 +1434,10 @@ class Ddr3Controller extends Module {
   /// The calibration FSM state. See [calStateDone] and [calStateFailed].
   Logic get calState => output('o_cal_state');
 
+  /// Number of calibration starts since `i_rst_n` went low. It stops at 255.
+  /// The first start counts as 1, so a value above 1 means a restart.
+  Logic get calStarts => output('o_cal_attempts');
+
   /// High when a self-trained calibration failed [maxCalAttempts] times. Null
   /// unless [phySelfTrainsRead].
   Logic? get calFailed => phySelfTrainsRead ? output('o_cal_failed') : null;
@@ -1529,6 +1534,19 @@ class Ddr3Controller extends Module {
         If(resetFromCalibrateReg, then: [calAttempts! < calAttempts + 1]),
       ]);
     }
+
+    final calStarts = Logic(name: 'cal_starts', width: 8);
+    Sequential(clk, reset: ~input('i_rst_n'), [
+      If(
+        ~_syncRst &
+            state.eq(Const(_stIdle, width: 6)) &
+            idelayctrlRdy &
+            _instructionAddress.eq(13) &
+            ~calStarts.eq(255),
+        then: [calStarts < calStarts + 1],
+      ),
+    ]);
+    output('o_cal_attempts') <= calStarts;
 
     // Per-lane registers.
     List<Logic> perLane(String base, int w) => [

@@ -7,16 +7,24 @@ import 'package:rohd/rohd.dart';
 import 'ddr3_ecp5_pad_dram_model.dart';
 
 /// The status outputs of [HarborDdr3], sampled on `clk`.
-typedef Ddr3Status = ({bool init, bool done, bool failed, int state});
+typedef Ddr3Status = ({
+  bool init,
+  bool done,
+  bool failed,
+  int state,
+  int attempts,
+});
 
 Ddr3Status ddr3Status(HarborDdr3 ddr) {
   bool high(String n) => ddr.output(n).value == LogicValue.one;
   final s = ddr.output('cal_state').value;
+  final a = ddr.output('cal_attempts').value;
   return (
     init: high('init_done'),
     done: high('cal_done'),
     failed: high('cal_failed'),
     state: s.isValid ? s.toInt() : -1,
+    attempts: a.isValid ? a.toInt() : -1,
   );
 }
 
@@ -43,7 +51,11 @@ class Ddr3Ecp5StatusRun {
 
   /// Builds and starts the run. [readSkewBeats] delays the read data of the
   /// model. 40 is more than leveling can correct, so calibration fails.
-  static Future<Ddr3Ecp5StatusRun> start({int readSkewBeats = 0}) async {
+  /// `ddr_clk` has period 16, so a [clkPeriod] of 32 is an even ratio.
+  static Future<Ddr3Ecp5StatusRun> start({
+    int readSkewBeats = 0,
+    int clkPeriod = 10,
+  }) async {
     const config = HarborDdrConfig.orangeCrab();
     final ddr = HarborDdr3(
       config: config,
@@ -63,7 +75,7 @@ class Ddr3Ecp5StatusRun {
     final div = Logic(name: 'div', width: 2);
     Sequential(ck, reset: divInit, [div < div + 1]);
     final ddrClk = div[1];
-    final clk = SimpleClockGenerator(10).clk;
+    final clk = SimpleClockGenerator(clkPeriod).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final ddrReset = Logic(name: 'ddr_reset')..inject(1);
     ddr.input('clk').srcConnection! <= clk;

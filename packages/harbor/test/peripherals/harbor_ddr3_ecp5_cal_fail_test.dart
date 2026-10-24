@@ -45,8 +45,14 @@ void main() {
 
     expect(held, isTrue, reason: 'cal_failed dropped before reset');
     expect(atFail.state, Ddr3Controller.calStateFailed);
+    expect(
+      atFail.attempts,
+      Ddr3Controller.defaultMaxCalAttempts,
+      reason: 'each try is a calibration start',
+    );
     expect(atFail.done, isFalse);
     expect(inReset.failed, isFalse);
+    expect(inReset.attempts, 0);
     expect(after.failed, isFalse);
     expect(after.state, isNot(Ddr3Controller.calStateFailed));
   }, timeout: const Timeout(Duration(hours: 5)));

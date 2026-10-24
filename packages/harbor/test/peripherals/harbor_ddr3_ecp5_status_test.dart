@@ -9,9 +9,19 @@ import 'harbor_ddr3_status_bench.dart';
 void main() {
   tearDown(Simulator.reset);
 
-  test('ECP5 calibration: init_done and cal_done rise in order and cal_state '
-      'ends in DONE_CALIBRATE', () async {
-    final run = await Ddr3Ecp5StatusRun.start();
+  // 10 is an uneven ratio to ddr_clk, 32 is an even one.
+  for (final clkPeriod in [10, 32]) {
+    test('ECP5 calibration, clk period $clkPeriod: init_done and cal_done '
+        'rise in order and cal_state follows the FSM', () async {
+      await _run(clkPeriod);
+    }, timeout: const Timeout(Duration(hours: 2)));
+  }
+}
+
+Future<void> _run(int clkPeriod) async {
+  {
+    final run = await Ddr3Ecp5StatusRun.start(clkPeriod: clkPeriod);
+    final states = <int>{};
     int? initAt;
     int? doneAt;
     var calStarted = false;
@@ -19,6 +29,7 @@ void main() {
       await run.clk.nextPosedge;
       final s = run.status;
       if (s.state > 0) calStarted = true;
+      states.add(s.state);
       if (s.init) initAt ??= i;
       if (s.done) doneAt = i;
       expect(s.failed, isFalse, reason: 'cal_failed at cycle $i');
@@ -37,5 +48,11 @@ void main() {
     expect(last.failed, isFalse);
     expect(last.state, Ddr3Controller.calStateDone);
     expect(run.dram.errors, isEmpty);
-  }, timeout: const Timeout(Duration(hours: 2)));
+    expect(
+      states.where((s) => s > 0).length,
+      greaterThan(3),
+      reason: '$states',
+    );
+    expect(last.attempts, 1);
+  }
 }

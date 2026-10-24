@@ -50,17 +50,31 @@ void main() {
         expect(ddr.output(n).width, 1, reason: n);
       }
       expect(ddr.output('cal_state').width, 6);
+      expect(ddr.output('cal_attempts').width, 8);
       final sv = ddr.generateSynth();
       for (final n in ['init_done', 'cal_done', 'cal_failed', 'cal_state']) {
         expect(sv, matches(RegExp('output logic (\\[5:0\\] )?$n\\b')));
       }
+      expect(sv, matches(RegExp(r'output logic \[7:0\] cal_attempts\b')));
     });
   }
 
-  test('fastSim: init_done and cal_done rise in order', () async {
+  for (final (ddrPeriod, label) in [
+    (14, 'uneven clock ratio'),
+    (20, 'ddr_clk at 2x the clk period'),
+    (40, 'ddr_clk at 4x the clk period'),
+  ]) {
+    test('fastSim: init_done and cal_done rise in order, $label', () async {
+      await _fastSimOrder(ddrPeriod);
+    });
+  }
+}
+
+Future<void> _fastSimOrder(int ddrPeriod) async {
+  {
     final ddr = _ddr(target: _artix, fastSim: true);
     final clk = SimpleClockGenerator(10).clk;
-    final ddrClk = SimpleClockGenerator(14).clk;
+    final ddrClk = SimpleClockGenerator(ddrPeriod).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final ddrReset = Logic(name: 'ddr_reset')..inject(1);
     ddr.input('clk').srcConnection! <= clk;
@@ -104,5 +118,6 @@ void main() {
     expect(last.done, isTrue);
     expect(last.failed, isFalse);
     expect(last.state, Ddr3Controller.calStateDone);
-  });
+    expect(last.attempts, 1);
+  }
 }
