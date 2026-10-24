@@ -585,8 +585,7 @@ class HarborPcieDma extends BridgeModule {
 
     // BAR0 completion.
     const cIdle = 0;
-    const cGather = 1;
-    const cSend = 2;
+    const cSend = 1;
     final cState = Logic(name: 'c_state', width: 2);
     final cReqId = Logic(name: 'c_req_id', width: 16);
     final cTag = Logic(name: 'c_tag', width: 8);
@@ -597,12 +596,14 @@ class HarborPcieDma extends BridgeModule {
     final cByteCount = Logic(name: 'c_byte_count', width: 12);
     final cLowAddr = Logic(name: 'c_low_addr', width: 7);
     final cDw = Logic(name: 'c_dw', width: 6);
-    final cG = Logic(name: 'c_g', width: 5);
+    // DWs read so far.
+    final cG = Logic(name: 'c_g', width: 6);
     final cFirstBe = Logic(name: 'c_first_be', width: 4);
     final cLastBe = Logic(name: 'c_last_be', width: 4);
     final cT = Logic(name: 'c_t', width: 6);
-    final cData = [
-      for (var i = 0; i < maxReadDw; i++) Logic(name: 'c_data_$i', width: 32),
+    // DW k of the payload goes to lane (3 + k) mod n of the beat.
+    final cPack = [
+      for (var i = 0; i < n; i++) Logic(name: 'c_pack_$i', width: 32),
     ];
     final cplBusy = ~cState.eq(cIdle);
 
@@ -1038,15 +1039,13 @@ class HarborPcieDma extends BridgeModule {
       [completerId, cStatus, Const(0, width: 1), cByteCount].swizzle(),
       [cReqId, cTag, Const(0, width: 1), cLowAddr].swizzle(),
     ];
-    // The payload shifts down after each beat, so lane i of a payload beat
-    // is c_data_i and the first payload DW is c_data_0.
+    // A beat shows when the reads have filled its payload lanes.
     final cTotal = (Const(3, width: 6) + cDw).named('c_total');
     final cLanes = <Logic>[];
     final cKeep = <Logic>[];
     for (var i = 0; i < n; i++) {
       final t = cT + i;
-      Logic value = tlpSwapBytes(cData[i]);
-      if (3 % n == i) value = mux(t.eq(3), tlpSwapBytes(cData[0]), value);
+      Logic value = tlpSwapBytes(cPack[i]);
       for (var h = 2; h >= 0; h--) {
         if (h % n != i) continue;
         value = mux(t.eq(h), cHdr[h], value);
@@ -1056,7 +1055,10 @@ class HarborPcieDma extends BridgeModule {
       cKeep.add(live.replicate(4));
     }
     final cLast = (cT + n).gte(cTotal);
-    final cValid = cState.eq(cSend);
+    final cEnd = cT + n;
+    final cNeedRaw = mux(cEnd.lt(3), Const(0, width: 6), cEnd - 3);
+    final cNeed = mux(cNeedRaw.lt(cDw), cNeedRaw, cDw).named('c_need');
+    final cValid = cState.eq(cSend) & cG.gte(cNeed);
 
     // Fetch TX: a memory read of f_count descriptors.
     final fIs4 = fAddr.slice(63, 32).or();
@@ -1118,6 +1120,12 @@ class HarborPcieDma extends BridgeModule {
     final eFire = txFire & pick.eq(0);
     final cFire = txFire & pickCpl;
     final fFire = txFire & pickFetch;
+    // A register read fills a lane of the beat on the port, or of the next
+    // beat in the cycle where the beat on the port goes.
+    final cRead =
+        (cState.eq(cSend) & (cG.lt(cNeed) | cFire & ~cLast & cG.lt(cDw))).named(
+          'c_read',
+        );
     final recDone = (inState(sRecTx) & eFire & eLast).named('rec_done');
 
     // The D2H payload buffer. Fabric reads write it, and the read address
@@ -1414,9 +1422,7 @@ class HarborPcieDma extends BridgeModule {
       mux((cG.zeroExtend(6) + 1).eq(cDw), cLastBe, Const(0xf, width: 4)),
     ).named('reg_r_be');
     final causeRead =
-        (cState.eq(cGather) &
-                rBe.or() &
-                rAddr.eq(Const(registerIrqCause ~/ 4, width: 10)))
+        (cRead & rBe.or() & rAddr.eq(Const(registerIrqCause ~/ 4, width: 10)))
             .named('irq_cause_read');
     final readBits = [
       for (var i = 3; i >= 0; i--) (causeRead & rBe[i]).replicate(8),
@@ -1487,11 +1493,7 @@ class HarborPcieDma extends BridgeModule {
           tailTrim.zeroExtend(13),
     ).named('byte_count');
     final readOk = hdrLen.lte(maxReadDw);
-    final cShift = mux(
-      (cT + n).lte(3),
-      Const(0, width: 3),
-      mux(cT.lte(3), Const(1, width: 3), Const(n, width: 3)),
-    ).named('c_shift');
+    final cLane = (cG.slice(_log2(n) - 1, 0) + (3 % n)).named('c_lane');
 
     final recLoad = (inState(sRecWait) & ~resetReq & ~cplFull & busMasterEnable)
         .named('rec_load');
@@ -1697,7 +1699,7 @@ class HarborPcieDma extends BridgeModule {
                       cDw < hdrLen.slice(5, 0),
                       cByteCount < byteCount.slice(11, 0),
                       cLowAddr < aByte + fe.zeroExtend(7),
-                      cState < cGather,
+                      cState < cSend,
                     ]),
                     ElseIf(isMRd, [
                       cStatus < 4,
@@ -1717,36 +1719,14 @@ class HarborPcieDma extends BridgeModule {
                 ],
               ),
             ]),
-            CaseItem(Const(cGather, width: 2), [
-              for (var i = 0; i < maxReadDw; i++)
-                If(cG.eq(i), then: [cData[i] < regValue]),
-              If(
-                (cG.zeroExtend(6) + 1).eq(cDw),
-                then: [cState < cSend],
-                orElse: [cG < cG + 1],
-              ),
-            ]),
             CaseItem(Const(cSend, width: 2), [
+              If(cRead, then: [cG < cG + 1]),
+              for (var i = 0; i < n; i++)
+                If(cRead & cLane.eq(i), then: [cPack[i] < regValue]),
               If(
                 cFire,
                 then: [
-                  If(
-                    cLast,
-                    then: [cState < cIdle],
-                    orElse: [
-                      cT < cT + n,
-                      for (var i = 0; i < maxReadDw; i++)
-                        Case(cShift, [
-                          for (final k in {1, n})
-                            CaseItem(Const(k, width: 3), [
-                              cData[i] <
-                                  (i + k < maxReadDw
-                                      ? cData[i + k]
-                                      : Const(0, width: 32)),
-                            ]),
-                        ]),
-                    ],
-                  ),
+                  If(cLast, then: [cState < cIdle], orElse: [cT < cT + n]),
                 ],
               ),
             ]),
