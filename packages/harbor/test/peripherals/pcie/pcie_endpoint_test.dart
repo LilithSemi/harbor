@@ -7,6 +7,18 @@ import 'package:test/test.dart';
 import '../../support/gtpe2_status_model.dart';
 import '../../util/pcie_dma_bench.dart';
 
+Module _find(Module m, String name) {
+  for (final s in m.subModules) {
+    if (s.name == name) return s;
+    try {
+      return _find(s, name);
+    } on StateError {
+      continue;
+    }
+  }
+  throw StateError('no module $name');
+}
+
 void main() {
   tearDown(() async => Simulator.reset());
 
@@ -33,6 +45,133 @@ void main() {
     pipeStages: pipeStages,
     timeouts: timeouts,
   );
+
+  test('a free clock counts PERST# on its own clock', () async {
+    final dut = HarborPcieEndpoint(
+      target: const HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+        useOpenXc7: true,
+      ),
+      refClkP: bit(),
+      refClkN: bit(),
+      perstN: bit(),
+      rxP: bit(),
+      rxN: bit(),
+      rxReady: bit(),
+      txData: Logic(width: 64),
+      txKeep: Logic(width: 8),
+      txLast: bit(),
+      txValid: bit(),
+      freeClk: bit(),
+    );
+    await dut.build();
+    final sv = dut.generateSynth();
+    expect(dut.definitionName, endsWith('_Free'));
+    expect(sv, contains('HarborPcieResetCounters_F'));
+    expect(dut.resetStatus.width, 64);
+  });
+
+  for (final free in [false, true]) {
+    test('the reset counters start at 0 and count a PERST# that stops the '
+        'user clock, ${free ? 'free clock' : 'user clock'}', () async {
+      final perstN = Logic(name: 'perst_n');
+      final dut = HarborPcieEndpoint(
+        target: const HarborFpgaTarget.artix7(
+          device: 'xc7a200t',
+          package: 'fbg484',
+          useOpenXc7: true,
+        ),
+        refClkP: bit(),
+        refClkN: bit(),
+        perstN: perstN,
+        rxP: bit(),
+        rxN: bit(),
+        rxReady: Const(1),
+        txData: Const(0, width: 64),
+        txKeep: Const(0, width: 8),
+        txLast: Const(0),
+        txValid: Const(0),
+        freeClk: free ? SimpleClockGenerator(26).clk : null,
+      );
+      await dut.build();
+
+      // The MMCM and the hard block are leaves with no model, so the test
+      // drives their outputs.
+      final mmcm = _find(dut, 'pipe_mmcm');
+      final hard = _find(dut, 'pcie_hard_block');
+      final userClk = mmcm.output('CLKOUT2');
+      final lock = mmcm.output('LOCKED');
+      final userRstN = hard.output('USERRSTN');
+      final linkUp = hard.output('TRNLNKUP');
+      final hotReset = hard.output('PLRECEIVEDHOTRST');
+      final time = SimpleClockGenerator(10).clk;
+
+      var running = true;
+      void edge(int t, int v) => Simulator.registerAction(t, () {
+        if (running) userClk.put(v);
+        edge(t + 5, v ^ 1);
+      });
+      edge(1, 0);
+      for (final (l, v) in [
+        (perstN, 1),
+        (lock, 0),
+        (userRstN, 0),
+        (linkUp, 0),
+        (hotReset, 0),
+      ]) {
+        l.inject(v);
+      }
+      Simulator.setMaxSimTime(100000);
+      unawaited(Simulator.run());
+
+      Future<void> wait(int n) async {
+        for (var i = 0; i < n; i++) {
+          await time.nextPosedge;
+        }
+      }
+
+      int counts() => dut.resetStatus.value.getRange(0, 32).toInt();
+      int perstLow() => dut.resetStatus.value[48].toInt();
+
+      // Nothing counts before the first lock.
+      await wait(10);
+      expect(counts(), 0);
+      lock.inject(1);
+      await wait(10);
+      // The reset at power-on.
+      expect(counts(), 0x00000001);
+      userRstN.inject(1);
+      linkUp.inject(1);
+      await wait(10);
+      expect(counts(), 0x00000001);
+
+      // PERST# resets the MMCM, so the user clock stops.
+      perstN.inject(0);
+      lock.inject(0);
+      userRstN.inject(0);
+      linkUp.inject(0);
+      running = false;
+      await wait(20);
+      if (!free) expect(perstLow(), 1);
+      expect(counts() & 0xffff00ff, 0x00000001);
+
+      perstN.inject(1);
+      await wait(5);
+      // The clock runs before the lock.
+      running = true;
+      await wait(5);
+      expect(counts() & 0xffff00ff, 0x00000001);
+      lock.inject(1);
+      await wait(10);
+      userRstN.inject(1);
+      linkUp.inject(1);
+      await wait(10);
+      expect(counts(), 0x01000102);
+      expect(perstLow(), 0);
+      await Simulator.endSimulation();
+    });
+  }
 
   test('rejects targets without an Artix-7 PCIe hard block', () {
     expect(
@@ -350,7 +489,7 @@ void main() {
       // USERRSTN low. Here the PHY ready drives the reset of the DMA engine
       // in the same way, on the same clock.
       const linkWait = 200;
-      final b = await DmaBench.create(const DmaConfig());
+      final b = await DmaBench.create(const DmaConfig(resetStatus: true));
       final perstN = Logic(name: 'perst_n')..put(0);
       final link = Logic(name: 'link')..put(0);
       final phyLinkN = Logic(name: 'phy_link_n')..put(1);
@@ -392,6 +531,20 @@ void main() {
         ),
       );
       await phy.build();
+      final counters = HarborPcieResetCounters(
+        clk: b.clk,
+        mmcmLock: model.mmcmLock,
+        perstN: perstN,
+        userReset: b.reset,
+        hotReset: Const(0),
+        linkUp: link,
+        phyResetState: phy.resetState,
+        phyFailState: phy.resetFailState,
+        phyRetries: phy.resetRetries,
+        linkRetrains: phy.linkRetrains,
+      );
+      await counters.build();
+      b.resetStatus! <= counters.status;
       for (final l in [
         pipe.txData,
         pipe.txDataK,
@@ -449,6 +602,7 @@ void main() {
       expect(busy & HarborPcieDma.statusBusy, isNonZero);
       expect(busy >> HarborPcieDma.statusFreeShift, 63);
       expect(retrains(), 0);
+      expect(await b.readReg(HarborPcieDma.registerPhyStatus) >> 24, 0);
 
       setLink(false);
       await b.waitUntil(() => !ready(), timeout: linkWait + 10, what: 'drop');
@@ -463,6 +617,7 @@ void main() {
       );
       expect(await b.readReg(HarborPcieDma.registerControl), 0);
       expect(retrains(), 1);
+      expect(await b.readReg(HarborPcieDma.registerPhyStatus) >> 24, 1);
       expect(phy.resetRetries.value.toInt(), 0);
       running = false;
       model.stop();

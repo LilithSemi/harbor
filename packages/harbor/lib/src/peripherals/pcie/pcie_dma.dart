@@ -64,6 +64,18 @@ class HarborPcieDma extends BridgeModule {
   /// CAPS bit: the ROM counter word at [registerRomStatus] is built.
   static const capsRomStatus = 1 << 2;
 
+  /// Reset event counts, read only, when [resetStatusBuilt]. See
+  /// `HarborPcieResetCounters` for the fields.
+  static const registerResetCounts = 0x038;
+
+  /// PHY reset state, read only, when [resetStatusBuilt]. Bits 31:24 are the
+  /// link retrain count of the endpoint, 0 with no link watchdog.
+  static const registerPhyStatus = 0x03c;
+
+  /// CAPS bit: the words at [registerResetCounts] and [registerPhyStatus]
+  /// are built.
+  static const capsResetStatus = 1 << 3;
+
   /// Bits 3:0 of the ring base are always 0.
   static const registerCplBaseLow = 0x020;
   static const registerCplBaseHigh = 0x024;
@@ -97,6 +109,11 @@ class HarborPcieDma extends BridgeModule {
 
   /// The ring is the active descriptor source.
   static const statusRingSource = 1 << 3;
+
+  /// STATUS[7:4] is the engine state: 0 idle, 1 load, 2 check, 3 chunk,
+  /// 4 fabric request, 5 fabric read data, 6 TX wait, 7 TX, 8 record wait,
+  /// 9 record TX, 10 host to device.
+  static const statusStateShift = 4;
   static const statusErrorShift = 8;
   static const statusFreeShift = 16;
 
@@ -210,6 +227,7 @@ class HarborPcieDma extends BridgeModule {
     required HarborPcieStream tx,
     Logic? irqInputs,
     Logic? romStatus,
+    Logic? resetStatus,
     required HarborPcieEndpointConfig endpointConfig,
     this.fabricKind = HarborFabricKind.axi4,
     this.dataWidth = 64,
@@ -226,12 +244,14 @@ class HarborPcieDma extends BridgeModule {
     String? name,
   }) : width = rx.width,
        romStatusBuilt = romStatus != null,
+       resetStatusBuilt = resetStatus != null,
        super(
          'HarborPcieDma_W${rx.width}_D${dataWidth}_A${addressWidth}_'
          '${fabricKind.name}_S${fifoSource ? 'f' : ''}${ringSource ? 'r' : ''}'
          '_Q${queueDepth}_T${readTags}_L${irqLines}_O${timeoutCycles}'
          '_P${maxPayloadBytes}_R${maxReadRequestBytes}'
-         '_I${_infoTag(infoWords)}${romStatus == null ? '' : '_M'}',
+         '_I${_infoTag(infoWords)}${romStatus == null ? '' : '_M'}'
+         '${resetStatus == null ? '' : '_X'}',
          name: name ?? 'pcie_dma',
        ) {
     _validate(tx, irqInputs);
@@ -263,6 +283,9 @@ class HarborPcieDma extends BridgeModule {
     _romStatus = romStatus == null
         ? null
         : addInput('rom_status', romStatus, width: 32);
+    _resetStatus = resetStatus == null
+        ? null
+        : addInput('reset_status', resetStatus, width: 64);
     // A register stage on RX keeps the completion checks away from the
     // endpoint and the router decode.
     final rxIn = HarborPcieStream.addSink(this, rx);
@@ -326,11 +349,17 @@ class HarborPcieDma extends BridgeModule {
 
   Logic? _romStatus;
 
+  /// True when the reset status words are built.
+  final bool resetStatusBuilt;
+
+  Logic? _resetStatus;
+
   /// The CAPS register value for these build options.
   int get caps =>
       (fifoSource ? 1 : 0) |
       (ringSource ? 2 : 0) |
       (romStatusBuilt ? capsRomStatus : 0) |
+      (resetStatusBuilt ? capsResetStatus : 0) |
       _log2(queueDepth) << 4 |
       readTags << 8 |
       (width ~/ 32) << 16 |
@@ -744,7 +773,7 @@ class HarborPcieDma extends BridgeModule {
     final status = [
       (Const(queueDepth, width: qBits + 1) - qCount).zeroExtend(16),
       errCode,
-      Const(0, width: 4),
+      state,
       ringActive,
       overflow,
       halted,
@@ -786,6 +815,10 @@ class HarborPcieDma extends BridgeModule {
         reg(registerIrqMask, mask),
         reg(registerStaleCompletions, tags.staleCount),
         if (_romStatus != null) reg(registerRomStatus, _romStatus!),
+        if (_resetStatus != null) ...[
+          reg(registerResetCounts, _resetStatus!.slice(31, 0)),
+          reg(registerPhyStatus, _resetStatus!.slice(63, 32)),
+        ],
         reg(registerCplBaseLow, cplBase.slice(31, 0)),
         reg(registerCplBaseHigh, cplBase.slice(63, 32)),
         reg(registerCplSize, cplLog),

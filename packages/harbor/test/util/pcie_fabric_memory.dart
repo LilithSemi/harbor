@@ -18,6 +18,9 @@ class PcieFabricMemory {
   /// When set, write beats after this many get no answer.
   int? writeLimit;
 
+  /// When set, read beats after this many get no answer.
+  int? readLimit;
+
   /// Write beats answered.
   int writeBeats = 0;
 
@@ -61,6 +64,13 @@ class PcieFabricMemory {
     if (limit != null &&
         writeBeats >= limit &&
         top.output('t_we').value.toBool()) {
+      _wait = -1;
+      return;
+    }
+    final readCap = readLimit;
+    if (readCap != null &&
+        readBeats >= readCap &&
+        !top.output('t_we').value.toBool()) {
       _wait = -1;
       return;
     }

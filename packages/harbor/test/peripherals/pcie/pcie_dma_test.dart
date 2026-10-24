@@ -1033,7 +1033,11 @@ void main() {
     await b.push(hostAddress: 0x80000200, localAddress: 0x200, length: 16);
     await b.waitRecordWrites(0, 1);
     await b.cycles(200);
-    expect(await b.readReg(HarborPcieDma.registerStatus), 1 | 63 << 16);
+    // Busy in the record wait state.
+    expect(
+      await b.readReg(HarborPcieDma.registerStatus),
+      1 | 8 << HarborPcieDma.statusStateShift | 63 << 16,
+    );
     await b.engineReset();
     await b.cycles(2);
     expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
@@ -1061,7 +1065,11 @@ void main() {
     b.busMaster.inject(0);
     await b.push(hostAddress: 0x80000000, localAddress: 0, length: 64);
     await b.cycles(200);
-    expect(await b.readReg(HarborPcieDma.registerStatus), 1 | 64 << 16);
+    // Busy in the TX wait state.
+    expect(
+      await b.readReg(HarborPcieDma.registerStatus),
+      1 | 6 << HarborPcieDma.statusStateShift | 64 << 16,
+    );
     await b.engineReset();
     await b.cycles(2);
     expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);

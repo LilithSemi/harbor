@@ -32,6 +32,9 @@ class DmaConfig {
   final bool ringSource;
   final int addressWidth;
 
+  /// Builds the reset status input. See [DmaBench.resetStatus].
+  final bool resetStatus;
+
   const DmaConfig({
     this.width = 64,
     this.dataWidth = 64,
@@ -45,6 +48,7 @@ class DmaConfig {
     this.fifoSource = true,
     this.ringSource = false,
     this.addressWidth = dmaAddressWidth,
+    this.resetStatus = false,
   });
 
   @override
@@ -94,6 +98,9 @@ class DmaBench {
   final Logic granted;
   final Logic? lines;
   final PcieFabricMemory memory;
+
+  /// The DMA reset status input, for the test to drive.
+  final Logic? resetStatus;
   final PcieStreamDriver driver;
   final PcieStreamSink sink;
   final PcieHostModel host;
@@ -123,6 +130,7 @@ class DmaBench {
     this.granted,
     this.lines,
     this.memory,
+    this.resetStatus,
     this.driver,
     this.sink,
     this.host,
@@ -170,6 +178,7 @@ class DmaBench {
       maxReadRequestBytes: config.maxReadRequestBytes,
       fifoSource: config.fifoSource,
       ringSource: config.ringSource,
+      resetStatus: config.resetStatus ? Logic(width: 64) : null,
     );
     final top = MasterTop(
       dut,
@@ -182,6 +191,12 @@ class DmaBench {
       withErr: true,
     );
     await top.build();
+    final resetStatus = config.resetStatus
+        ? Logic(name: 'reset_status', width: 64)
+        : null;
+    if (resetStatus != null) {
+      top.input('reset_status').srcConnection! <= resetStatus;
+    }
 
     final rx = HarborPcieStream(width: config.width, name: 'rx');
     final tx = HarborPcieStream(width: config.width, name: 'tx');
@@ -226,6 +241,7 @@ class DmaBench {
       granted,
       lines,
       memory,
+      resetStatus,
       PcieStreamDriver(clk: clk, stream: rx, seed: seed, gapChance: gapChance),
       PcieStreamSink(
         clk: clk,

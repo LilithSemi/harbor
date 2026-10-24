@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
@@ -23,12 +25,19 @@ class HarborCdcSync extends BridgeModule {
   /// Synchronized output.
   Logic get syncOut => output('sync_out');
 
-  HarborCdcSync({this.stages = 2, this.width = 1, super.name = 'cdc_sync'})
-    : super(
-        stages == 2 && width == 1
-            ? 'HarborCdcSync'
-            : 'HarborCdcSync_S${stages}_W$width',
-      ) {
+  /// With [powerUpValue], a simulation starts each stage at this value, as
+  /// an FPGA flop starts at its init value. The SystemVerilog does not
+  /// change.
+  HarborCdcSync({
+    this.stages = 2,
+    this.width = 1,
+    int? powerUpValue,
+    super.name = 'cdc_sync',
+  }) : super(
+         stages == 2 && width == 1
+             ? 'HarborCdcSync'
+             : 'HarborCdcSync_S${stages}_W$width',
+       ) {
     assert(stages >= 2, 'CDC synchronizer requires at least 2 stages');
     assert(width >= 1, 'CDC synchronizer requires at least 1 bit');
 
@@ -59,7 +68,56 @@ class HarborCdcSync extends BridgeModule {
     ]);
 
     syncOut <= regs.last;
+    if (powerUpValue != null) {
+      harborSimPowerUp(dstClk, regs, value: powerUpValue);
+    }
   }
+}
+
+/// Puts [value] on each of [flops] before a simulation starts, as an FPGA
+/// loads its flops at configuration. The SystemVerilog does not change.
+///
+/// A ROHD flop starts at X, and it drives X when its clock or asynchronous
+/// reset changes from X. Until the first valid rising edge of [clk], each X
+/// on a flop is replaced with [value].
+void harborSimPowerUp(Logic clk, Iterable<Logic> flops, {int value = 0}) {
+  final subs = [
+    for (final f in flops)
+      f.glitch.listen((e) {
+        if (!e.newValue.isValid) f.inject(value, fill: true);
+      }),
+  ];
+  for (final f in flops) {
+    f.put(value, fill: true);
+  }
+  var done = false;
+  clk.glitch.listen((e) {
+    if (done ||
+        !e.previousValue.isValid ||
+        !LogicValue.isPosedge(e.previousValue, e.newValue)) {
+      return;
+    }
+    done = true;
+    unawaited(
+      Simulator.postTick.first.then((_) {
+        for (final s in subs) {
+          s.cancel();
+        }
+      }),
+    );
+  });
+}
+
+/// Gray code of [b].
+Logic harborGray(Logic b) => b ^ (b >>> 1);
+
+/// Binary value of the gray code [g].
+Logic harborGrayToBin(Logic g) {
+  final bits = List<Logic>.filled(g.width, g[g.width - 1]);
+  for (var i = g.width - 2; i >= 0; i--) {
+    bits[i] = bits[i + 1] ^ g[i];
+  }
+  return bits.rswizzle();
 }
 
 /// Reset for one side of a two-clock bridge.
@@ -71,12 +129,13 @@ class HarborCdcSync extends BridgeModule {
 /// The flops of the chain reset asynchronously and release synchronously, so
 /// the result is a flop output in the [clk] domain. A peer pulse of any width
 /// that the reset pins of the chain accept resets the full domain for at least
-/// [stages] edges of [clk].
+/// [stages] edges of [clk]. [powerUpValue] is as for [HarborCdcSync].
 Logic harborCdcJoinReset(
   Logic clk,
   Logic own,
   Logic other, {
   int stages = 2,
+  int? powerUpValue,
   String name = 'join_reset',
 }) {
   assert(stages >= 2, 'reset synchronizer needs >= 2 stages');
@@ -94,6 +153,9 @@ Logic harborCdcJoinReset(
     asyncReset: true,
     resetValues: {for (final c in chain) c: Const(1)},
   );
+  if (powerUpValue != null) {
+    harborSimPowerUp(clk, chain, value: powerUpValue);
+  }
   return chain.last.named(name);
 }
 

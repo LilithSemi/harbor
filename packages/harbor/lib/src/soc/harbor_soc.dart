@@ -190,9 +190,11 @@ class HarborSoC extends BridgeModule {
 
   late final HarborClockGenerator _clockGen;
 
-  /// The board clock after the input buffer. It is the `clk` port itself for
-  /// a single-ended clock.
   late final Logic _boardClk;
+
+  /// The board clock after the input buffer. It is the `clk` port itself for
+  /// a single-ended clock. It runs before any MMCM or PLL locks.
+  Logic get boardClk => _boardClk;
   final Map<String, HarborClockDomain> _clockDomains = {};
 
   /// The Xilinx DDR3-fast clock tree, built in this SoC's clock generation when

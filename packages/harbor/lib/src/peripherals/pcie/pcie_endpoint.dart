@@ -7,6 +7,7 @@ import 'gtp_primitives.dart';
 import 'pcie_2_1.dart';
 import 'pcie_interrupt.dart';
 import 'pcie_pipe.dart';
+import 'pcie_reset_counters.dart';
 import 'pcie_trn_axi.dart';
 
 class HarborPcieEndpointConfig {
@@ -44,6 +45,11 @@ class HarborPcieEndpointConfig {
 }
 
 /// PCIe physical endpoint with 64-bit AXI transmit and receive streams.
+///
+/// [freeClk] is a clock that runs while PERST# is low, such as the board
+/// oscillator. The reset counters use it to see PERST# on the pin. No
+/// endpoint clock runs while PERST# is low: PERST# resets the MMCM, and the
+/// host can stop the reference clock.
 class HarborPcieEndpoint extends Module {
   Logic get txP => output('tx_p');
   Logic get txN => output('tx_n');
@@ -85,6 +91,9 @@ class HarborPcieEndpoint extends Module {
   Logic? get linkRetrains =>
       timeouts.linkWait == 0 ? null : output('link_retrains');
 
+  /// The [HarborPcieResetCounters] status, for the DMA reset status input.
+  Logic get resetStatus => output('reset_status');
+
   HarborPcieEndpoint({
     required HarborDeviceTarget target,
     required Logic refClkP,
@@ -99,11 +108,19 @@ class HarborPcieEndpoint extends Module {
     required Logic txValid,
     Logic? txUser,
     Logic? irqPending,
+    Logic? freeClk,
     this.config = const HarborPcieEndpointConfig(),
     this.pipeStages = 1,
     this.timeouts = const HarborGtpPcieTimeouts(),
     super.name = 'pcie_endpoint',
-  }) : super(definitionName: _definitionName(config, pipeStages, timeouts)) {
+  }) : super(
+         definitionName: _definitionName(
+           config,
+           pipeStages,
+           timeouts,
+           freeClk != null,
+         ),
+       ) {
     harborCheckPipeStages(pipeStages);
     _checkTarget(target);
     _checkConfig(config);
@@ -315,6 +332,20 @@ class HarborPcieEndpoint extends Module {
     mimTxReadData <= txRam.readData;
     mimRxReadData <= rxRam.readData;
 
+    final counters = HarborPcieResetCounters(
+      clk: phy.userClk2,
+      mmcmLock: phy.mmcmLock,
+      freeClk: freeClk == null ? null : addInput('free_clk', freeClk),
+      perstN: perstN,
+      userReset: reset,
+      hotReset: hardBlock.output('PLRECEIVEDHOTRST'),
+      linkUp: link,
+      phyResetState: phy.resetState,
+      phyFailState: phy.resetFailState,
+      phyRetries: phy.resetRetries,
+      linkRetrains: watch ? phy.linkRetrains : null,
+    );
+
     final busNumber = Logic(name: 'bus_number', width: 8);
     final deviceNumber = Logic(name: 'device_number', width: 5);
     final functionNumber = Logic(name: 'function_number', width: 3);
@@ -349,6 +380,7 @@ class HarborPcieEndpoint extends Module {
     addOutput('reset_fail_state', width: 4) <= phy.resetFailState;
     addOutput('reset_retries', width: 8) <= phy.resetRetries;
     if (watch) addOutput('link_retrains', width: 8) <= phy.linkRetrains!;
+    addOutput('reset_status', width: 64) <= counters.status;
     addOutput('completer_id', width: 16) <=
         [busNumber, deviceNumber, functionNumber].swizzle();
     addOutput('rx_data', width: 64) <= stream.rxData;
@@ -426,6 +458,7 @@ class HarborPcieEndpoint extends Module {
     HarborPcieEndpointConfig config,
     int pipeStages,
     HarborGtpPcieTimeouts timeouts,
+    bool freeClk,
   ) => [
     'HarborPcieEndpoint_Xilinx7_X1',
     if (config.packetMemoryEntries != 2048) 'Pm${config.packetMemoryEntries}',
@@ -433,6 +466,7 @@ class HarborPcieEndpoint extends Module {
     if (config.msiVectors != 1) 'Msi${config.msiVectors}',
     if (pipeStages != 0) 'Pipe$pipeStages',
     if (timeouts.linkWait != 0) 'LinkWd',
+    if (freeClk) 'Free',
   ].join('_');
 
   static Map<String, String> _packetMemoryParameters(int entries) =>

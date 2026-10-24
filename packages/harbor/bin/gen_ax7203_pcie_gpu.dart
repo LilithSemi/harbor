@@ -16,6 +16,9 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 /// Timing and placement of the endpoint on the AX7203.
 const ax7203PcieConstraints = [
   'create_clock -period 10 [get_ports {pcie_refclk_p}]',
+  'create_clock -period 5 [get_ports {clk}]',
+  'create_clock -period 5 '
+      '[get_nets {${HarborFpgaTarget.differentialClockNet}}]',
   'create_clock -period 10 [get_nets {pcie_endpoint.pcie_phy.gt0_TXOUTCLK}]',
   'create_clock -period 8 '
       '[get_nets {pcie_endpoint.pcie_phy.gtp_pcie_phy.pipe_clock.pclk}]',
@@ -58,9 +61,19 @@ class Ax7203PcieGpu extends BridgeModule {
     final refClkP = createPort('pcie_refclk_p', PortDirection.input).port;
     final refClkN = createPort('pcie_refclk_n', PortDirection.input).port;
     final perstN = createPort('pcie_perst_n', PortDirection.input).port;
+    final boardClkP = createPort('clk', PortDirection.input).port;
+    final boardClkN = createPort('clk_n', PortDirection.input).port;
     final rxP = createPort('pcie_rxp', PortDirection.input).port;
     final rxN = createPort('pcie_rxn', PortDirection.input).port;
     final keyN = createPort('key_n', PortDirection.input, width: 2).port;
+
+    // The 200 MHz board oscillator runs while PERST# is low. The reset
+    // counters use it to count PERST# on the pin.
+    final boardIbuf = addSubModule(XilinxIbufds(name: 'sysclk_ibufds'));
+    boardIbuf.input('I').srcConnection! <= boardClkP;
+    boardIbuf.input('IB').srcConnection! <= boardClkN;
+    final boardClk = Logic(name: HarborFpgaTarget.differentialClockNet);
+    boardClk <= boardIbuf.o;
 
     final up = HarborPcieStream(width: 64, name: 'ep_rx');
     final down = HarborPcieStream(width: 64, name: 'ep_tx');
@@ -78,6 +91,7 @@ class Ax7203PcieGpu extends BridgeModule {
       txLast: down.last,
       txValid: down.valid,
       irqPending: irqPending,
+      freeClk: boardClk,
       config: ax7203EndpointConfig,
     );
     up.data <= endpoint.rxData;
@@ -134,6 +148,7 @@ class Ax7203PcieGpu extends BridgeModule {
         ringSource: true,
         irqLines: ax7203IrqLines,
         romStatus: romStatus,
+        resetStatus: endpoint.resetStatus,
         // Checks that msiVectors covers 1 + irqLines.
         endpointConfig: ax7203EndpointConfig,
         infoWords: ax7203InfoWords,
@@ -253,6 +268,8 @@ HarborFpgaTarget ax7203PcieTarget() {
       'pcie_refclk_p',
       'pcie_refclk_n',
       'pcie_perst_n',
+      'clk',
+      'clk_n',
       for (var i = 0; i < 4; i++) 'led_n[$i]',
       'key_n[0]',
       'key_n[1]',

@@ -38,6 +38,9 @@ void main() {
       expect(top, contains('por_count'));
       expect(top, contains('.counter_reset('));
       expect(top, contains('.rom_status('));
+      // The reset counters count PERST# on the board clock and reach BAR0.
+      expect(top, contains('.reset_status('));
+      expect(top, contains('.free_clk('));
       expect(rtl, contains(RegExp(r'HarborPcieInterrupt\s+pcie_interrupt')));
       expect(rtl, contains(".MSI_CAP_MULTIMSGCAP(1)"));
       expect(rtl, contains(".irq_pending(irq_pending)"));

@@ -397,6 +397,7 @@ export 'src/peripherals/pcie/pcie_dma.dart';
 export 'src/peripherals/pcie/pcie_endpoint.dart';
 export 'src/peripherals/pcie/pcie_interrupt.dart';
 export 'src/peripherals/pcie/pcie_memory_completer.dart';
+export 'src/peripherals/pcie/pcie_reset_counters.dart';
 export 'src/peripherals/pcie/pipe_clock.dart';
 export 'src/peripherals/pcie_option_rom.dart';
 export 'src/peripherals/plic.dart';
