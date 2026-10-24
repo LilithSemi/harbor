@@ -65,12 +65,12 @@ class RegBus {
   }
 
   // Read data, or -1 when a bit is X, such as a word never written.
-  int _data(String port) {
+  BigInt _data(String port) {
     final v = _out(port).value;
-    return v.isValid ? v.toInt() : -1;
+    return v.isValid ? v.toBigInt() : BigInt.from(-1);
   }
 
-  void _set(String port, int v) => _in[port]?.inject(v);
+  void _set(String port, Object v) => _in[port]?.inject(v);
 
   /// Puts every input in its idle state.
   void idle() {
@@ -110,11 +110,31 @@ class RegBus {
     int data = 0,
     int? sel,
     required bool write,
-  }) => switch (kind) {
-    HarborFabricKind.wishbone => _wishbone(addr, data, sel ?? _allSel, write),
-    HarborFabricKind.axi4 => _axi4(addr, data, sel ?? _allSel, write),
-    HarborFabricKind.tilelink => _tileLink(addr, data, sel ?? _allSel, write),
-  };
+  }) async {
+    final r = await accessWide(
+      addr,
+      data: BigInt.from(data),
+      sel: sel,
+      write: write,
+    );
+    return (data: r.data.toInt(), err: r.err);
+  }
+
+  /// Like [access], with data of any width.
+  Future<({BigInt data, bool err})> accessWide(
+    int addr, {
+    BigInt? data,
+    int? sel,
+    required bool write,
+  }) {
+    final d = data ?? BigInt.zero;
+    final s = sel ?? _allSel;
+    return switch (kind) {
+      HarborFabricKind.wishbone => _wishbone(addr, d, s, write),
+      HarborFabricKind.axi4 => _axi4(addr, d, s, write),
+      HarborFabricKind.tilelink => _tileLink(addr, d, s, write),
+    };
+  }
 
   Future<void> _wait(bool Function() done) async {
     for (var i = 0; i < timeout; i++) {
@@ -125,9 +145,9 @@ class RegBus {
     throw StateError('$name: no response in $timeout cycles');
   }
 
-  Future<({int data, bool err})> _wishbone(
+  Future<({BigInt data, bool err})> _wishbone(
     int addr,
-    int data,
+    BigInt data,
     int sel,
     bool write,
   ) async {
@@ -151,9 +171,9 @@ class RegBus {
     return (data: rdata, err: err);
   }
 
-  Future<({int data, bool err})> _axi4(
+  Future<({BigInt data, bool err})> _axi4(
     int addr,
-    int data,
+    BigInt data,
     int sel,
     bool write,
   ) async {
@@ -186,7 +206,7 @@ class RegBus {
         }
       }
       if (!done) throw StateError('$name: no B in $timeout cycles');
-      return (data: 0, err: err);
+      return (data: BigInt.zero, err: err);
     }
     _set('ARADDR', sel == _allSel ? addr : _laneAddr(addr, sel));
     _set('ARVALID', 1);
@@ -209,9 +229,9 @@ class RegBus {
     throw StateError('$name: no R in $timeout cycles');
   }
 
-  Future<({int data, bool err})> _tileLink(
+  Future<({BigInt data, bool err})> _tileLink(
     int addr,
-    int data,
+    BigInt data,
     int sel,
     bool write,
   ) async {

@@ -95,6 +95,11 @@ void main() {
     registerTests(kind);
     wordRegisterTests(kind);
     packedLaneTests(kind);
+    for (final width in [64, 128]) {
+      // Wishbone has no 128-bit data width.
+      if (kind == HarborFabricKind.wishbone && width > 64) continue;
+      wideWordRegisterTests(kind, width);
+    }
   }
 }
 
@@ -102,7 +107,8 @@ class _Dut {
   final HarborUart uart;
   final Logic clk;
   final RegBus bus;
-  _Dut(this.uart, this.clk, this.bus);
+  final Logic rx;
+  _Dut(this.uart, this.clk, this.bus, this.rx);
 }
 
 Future<_Dut> _startUart(HarborUart uart) async {
@@ -123,7 +129,7 @@ Future<_Dut> _startUart(HarborUart uart) async {
   await clk.nextPosedge;
   reset.inject(0);
   await clk.nextPosedge;
-  return _Dut(uart, clk, bus);
+  return _Dut(uart, clk, bus, rx);
 }
 
 // Samples TX until one 8N1 frame at [cyclesPerBit] arrives.
@@ -369,6 +375,241 @@ void registerTests(HarborFabricKind kind) {
       final after = await bus.read(0, sel: 0x20);
       expect((after >> 40) & 1, equals(0));
 
+      await Simulator.endSimulation();
+    });
+  });
+}
+
+// Register [n] of a regShift 2 UART on a [width] bit bus: the slot value in
+// bits 31:0 of its slot.
+final _slotMask = BigInt.from(0xffffffff);
+
+Future<int> _readSlot(RegBus bus, int width, int n, {bool wholeWord = false}) {
+  final slots = width ~/ 32;
+  final slot = n % slots;
+  return _readWord(
+    bus,
+    width,
+    n ~/ slots,
+    sel: wholeWord ? null : 0xf << (4 * slot),
+  ).then((w) => w[slot]);
+}
+
+// The slots of the word [word], each as a 32 bit value.
+Future<List<int>> _readWord(RegBus bus, int width, int word, {int? sel}) async {
+  final r = await bus.accessWide(word * (width ~/ 8), sel: sel, write: false);
+  return [
+    for (var s = 0; s < width ~/ 32; s++)
+      ((r.data >> (32 * s)) & _slotMask).toInt(),
+  ];
+}
+
+Future<void> _writeSlots(
+  RegBus bus,
+  int width,
+  int word,
+  Map<int, int> slotData, {
+  int? sel,
+}) async {
+  var data = BigInt.zero;
+  var strobe = 0;
+  slotData.forEach((s, v) {
+    data |= BigInt.from(v) << (32 * s);
+    strobe |= 0xf << (4 * s);
+  });
+  await bus.accessWide(
+    word * (width ~/ 8),
+    data: data,
+    sel: sel ?? strobe,
+    write: true,
+  );
+}
+
+Future<void> _writeReg(RegBus bus, int width, int n, int v) {
+  final slots = width ~/ 32;
+  return _writeSlots(bus, width, n ~/ slots, {n % slots: v});
+}
+
+Future<void> _sendRx(Logic rx, Logic clk, int byte) async {
+  rx.inject(0);
+  await clk.nextPosedge;
+  await clk.nextPosedge;
+  for (var i = 0; i < 8; i++) {
+    rx.inject((byte >> i) & 1);
+    await clk.nextPosedge;
+  }
+  rx.inject(1);
+  await clk.nextPosedge;
+  await clk.nextPosedge;
+}
+
+void wideWordRegisterTests(HarborFabricKind kind, int width) {
+  group('HarborUart regShift 2 on a $width-bit bus (${kind.name})', () {
+    final slots = width ~/ 32;
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    Future<_Dut> start() => _startUart(
+      HarborUart(
+        baseAddress: 0x10000000,
+        busDataWidth: width,
+        regShift: 2,
+        fabricKind: kind,
+      ),
+    );
+
+    test('a word write reaches only its own register', () async {
+      final d = await start();
+      final bus = d.bus;
+      // Reset values of registers 0 to 7 as read back.
+      final model = [0, 0, 0x01, 0x03, 0, 0x60, 0, 0];
+      Future<void> check(String why) async {
+        for (var n = 0; n < 8; n++) {
+          expect(await _readSlot(bus, width, n), model[n], reason: '$why r$n');
+        }
+      }
+
+      await check('reset');
+      // Junk above bits 7:0 must not reach any register.
+      await _writeReg(bus, width, 7, 0xffffff5a);
+      model[7] = 0x5a;
+      await check('scr');
+      await _writeReg(bus, width, 4, 0xabcdef0a);
+      model[4] = 0x0a;
+      await check('mcr');
+      await _writeReg(bus, width, 1, 0x12345602);
+      model[1] = 0x02;
+      model[2] = 0x02;
+      await check('ier');
+      await _writeReg(bus, width, 2, 0xffffffc1);
+      model[2] = 0xc2;
+      await check('fcr');
+      await _writeReg(bus, width, 3, 0xffffff83);
+      model[3] = 0x83;
+      model[0] = 0x01;
+      model[1] = 0x00;
+      await check('lcr dlab');
+      // With DLAB set, register 0 and 1 are the divisor latch.
+      await _writeReg(bus, width, 0, 0x04);
+      model[0] = 0x04;
+      await check('dll');
+      await _writeReg(bus, width, 1, 0x00);
+      await check('dlm');
+      await _writeReg(bus, width, 3, 0x03);
+      model[3] = 0x03;
+      model[0] = 0;
+      model[1] = 0x02;
+      await check('lcr');
+
+      // Registers 5 and 6 are read only.
+      await _writeReg(bus, width, 5, 0xff);
+      await _writeReg(bus, width, 6, 0xff);
+      await check('read only');
+
+      // THR sends a character.
+      await _writeReg(bus, width, 3, 0x83);
+      await _writeReg(bus, width, 0, 0x04);
+      await _writeReg(bus, width, 3, 0x03);
+      final rx = _receiveByte(d.uart.tx, d.clk, 4);
+      await _writeReg(bus, width, 0, 0xa5);
+      expect(await rx, equals(0xa5));
+      await Simulator.endSimulation();
+    });
+
+    test('registers in one bus word are written in one cycle', () async {
+      final d = await start();
+      final bus = d.bus;
+      // The last word holds registers 8 - slots to 7.
+      final last = 8 ~/ slots - 1;
+      final first = 8 - slots;
+      final writes = {
+        for (var s = 0; s < slots; s++) s: 0xffffff00 | (0x10 + s),
+      };
+      await _writeSlots(bus, width, last, writes);
+      // Registers 5 and 6 are read only, so they keep their values.
+      final read = await _readWord(bus, width, last);
+      for (var s = 0; s < slots; s++) {
+        final n = first + s;
+        final want = switch (n) {
+          5 => 0x60,
+          6 => 0x00,
+          _ => 0x10 + s,
+        };
+        expect(read[s], want, reason: 'register $n');
+      }
+
+      // A slot with lane 0 off keeps its value, a neighbour is written.
+      final skipped = slots; // slot 0 of word 1
+      final strobed = slots + (slots == 2 ? 1 : 3);
+      final before = await _readSlot(bus, width, skipped);
+      final strobedSlot = strobed % slots;
+      await _writeSlots(bus, width, 1, {
+        0: 0xffffffff,
+        strobedSlot: 0x00000007,
+      }, sel: 0xe | (0xf << (4 * strobedSlot)));
+      expect(await _readSlot(bus, width, skipped), before, reason: 'skipped');
+      expect(await _readSlot(bus, width, strobed), 0x07, reason: 'strobed');
+
+      // Word 0 has THR, so the same write sends a character.
+      await _writeReg(bus, width, 3, 0x83);
+      await _writeReg(bus, width, 0, 0x04);
+      await _writeReg(bus, width, 3, 0x03);
+      final rx = _receiveByte(d.uart.tx, d.clk, 4);
+      await _writeSlots(bus, width, 0, {0: 0x5c});
+      expect(await rx, equals(0x5c));
+      await Simulator.endSimulation();
+    });
+
+    test('an RBR read pops once and only for its slot', () async {
+      final d = await start();
+      final bus = d.bus;
+      Future<bool> dataReady() async =>
+          (await _readSlot(bus, width, 5)) & 1 == 1;
+      Future<void> waitReady() async {
+        for (var i = 0; i < 50 && !await dataReady(); i++) {
+          await d.clk.nextPosedge;
+        }
+      }
+
+      await _sendRx(d.rx, d.clk, 0xA5);
+      await waitReady();
+      expect(await dataReady(), isTrue);
+
+      // A read of another slot in word 0 does not pop.
+      await _readSlot(bus, width, 3);
+      await _readSlot(bus, width, 1);
+      expect(await dataReady(), isTrue);
+      // A read of a word that has no RBR does not pop.
+      await _readWord(bus, width, 8 ~/ slots - 1);
+      expect(await dataReady(), isTrue);
+
+      expect(await _readSlot(bus, width, 0), 0xA5);
+      expect(await dataReady(), isFalse);
+
+      // The next byte is not lost by the pop of the first.
+      await _sendRx(d.rx, d.clk, 0x3C);
+      await waitReady();
+      expect(await dataReady(), isTrue);
+      expect(await _readSlot(bus, width, 0), 0x3C);
+      expect(await dataReady(), isFalse);
+      await Simulator.endSimulation();
+    });
+
+    test('a full word read returns each register in its slot', () async {
+      final d = await start();
+      final bus = d.bus;
+      await _writeReg(bus, width, 7, 0x6b);
+      await _writeReg(bus, width, 4, 0x0c);
+      for (var w = 0; w < 8 ~/ slots; w++) {
+        final read = await _readWord(bus, width, w);
+        for (var s = 0; s < slots; s++) {
+          final n = w * slots + s;
+          final one = await _readSlot(bus, width, n);
+          expect(read[s], one, reason: 'register $n');
+          expect(read[s] >> 8, 0, reason: 'register $n upper bits');
+        }
+      }
       await Simulator.endSimulation();
     });
   });
