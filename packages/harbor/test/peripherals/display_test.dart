@@ -73,6 +73,7 @@ HarborDualClockDisplay _buildDisplay(HarborPixelFormat format) =>
       sysClk: Logic(name: 'sys_clk'),
       sysReset: Logic(name: 'sys_reset'),
       enable: Logic(name: 'enable'),
+      update: Const(1),
       fbBase: Logic(name: 'fb_base', width: 32),
       memory: HarborMemoryWaist(
         const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),

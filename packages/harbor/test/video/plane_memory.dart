@@ -1,6 +1,15 @@
+import 'dart:async';
+
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
+
+/// Drives [update] high for one rising edge of [clk], as a register block
+/// does after a write.
+void pulseUpdate(Logic update, Logic clk) {
+  update.inject(1);
+  unawaited(clk.nextPosedge.then((_) => update.inject(0)));
+}
 
 bool _high(Logic s) {
   final v = s.previousValue ?? s.value;

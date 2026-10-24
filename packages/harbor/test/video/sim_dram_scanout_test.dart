@@ -69,6 +69,7 @@ void main() {
         sysClk: clk,
         sysReset: reset,
         enable: enable,
+        update: Const(1),
         fbBase: Const(fbBase, width: 32),
         rqReady: scanRqReady,
         rdValid: scanRdValid,

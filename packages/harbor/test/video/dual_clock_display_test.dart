@@ -7,6 +7,7 @@ import 'package:test/test.dart';
 
 import 'csc_reference.dart';
 import 'echo_memory.dart';
+import 'plane_memory.dart';
 import 'pixel_unpack_reference.dart';
 
 const _memConfig = HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32);
@@ -42,6 +43,7 @@ HarborDualClockDisplay _buildDisplay({
     sysClk: Logic(name: 'sys_clk'),
     sysReset: Logic(name: 'sys_reset'),
     enable: Logic(name: 'enable'),
+    update: Const(1),
     fbBase: Logic(name: 'fb_base', width: 32),
     memory: HarborMemoryWaist(_memConfig),
     pixelFormat: pixelFormat,
@@ -101,6 +103,7 @@ void main() {
           sysClk: Logic(),
           sysReset: Logic(),
           enable: Logic(),
+          update: Logic(),
           fbBase: Logic(width: 32),
           memory: port ? null : HarborMemoryWaist(_memConfig),
           rqReady: port ? Logic() : null,
@@ -159,6 +162,7 @@ void main() {
           sysClk: Logic(),
           sysReset: Logic(),
           enable: Logic(),
+          update: Const(1),
           fbBase: Logic(width: 32),
           memory: HarborMemoryWaist(_memConfig),
           outputType: out,
@@ -250,6 +254,7 @@ void main() {
       sysClk: sysClk,
       sysReset: sysReset,
       enable: enable,
+      update: Const(1),
       fbBase: base,
       memory: memory,
       pixelFormat: HarborPixelFormat.rgb565,
@@ -332,6 +337,7 @@ void main() {
       sysClk: sysClk,
       sysReset: sysReset,
       enable: enable,
+      update: Const(1),
       fbBase: base,
       memory: memory,
     );
@@ -449,6 +455,7 @@ void main() {
       sysClk: clk,
       sysReset: reset,
       enable: Const(0),
+      update: Const(1),
       fbBase: Const(0, width: 32),
       memory: HarborMemoryWaist(_memConfig),
       outputType: HarborDisplayInterface.parallelRgb,
@@ -540,6 +547,7 @@ Future<void> _convert({
   final coeff = [for (var k = 0; k < 9; k++) Logic(width: 16)];
   final inOff = [for (var j = 0; j < 3; j++) Logic(width: 10)];
   final outOff = [for (var i = 0; i < 3; i++) Logic(width: 8)];
+  final update = Logic(name: 'update');
   final disp = HarborDualClockDisplay(
     target: const HarborSimTarget(),
     timing: timing,
@@ -550,6 +558,7 @@ Future<void> _convert({
     sysClk: sysClk,
     sysReset: sysReset,
     enable: Const(1),
+    update: update,
     fbBase: Const(fbBase, width: 32),
     memory: memory,
     formats: formats,
@@ -566,7 +575,9 @@ Future<void> _convert({
   final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
   final delay = disp.pipelineDelay;
 
-  void set(int frame) {
+  // A register block writes the inputs, then pulses update. Frame 0 shows
+  // nothing, so the values at reset need no update.
+  void set(int frame, {bool pulse = true}) {
     formatSel?.inject(formatOf(frame));
     final regs = setOf(frame).registers();
     for (var k = 0; k < 9; k++) {
@@ -576,11 +587,13 @@ Future<void> _convert({
       inOff[j].inject(regs[9 + j]);
       outOff[j].inject(regs[12 + j]);
     }
+    if (pulse) pulseUpdate(update, sysClk);
   }
 
   pixelReset.inject(1);
   sysReset.inject(1);
-  set(0);
+  update.inject(0);
+  set(0, pulse: false);
   Simulator.setMaxSimTime(50000000);
   unawaited(Simulator.run());
   addTearDown(() async {
@@ -662,6 +675,7 @@ Future<void> _alignment(HarborPixelFormat format) async {
     sysClk: sysClk,
     sysReset: sysReset,
     enable: enable,
+    update: Const(1),
     fbBase: base,
     memory: memory,
     pixelFormat: format,

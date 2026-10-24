@@ -93,6 +93,7 @@ Future<void> _run({
   final inOff = [for (var j = 0; j < 3; j++) Logic(width: 10)];
   final outOff = [for (var i = 0; i < 3; i++) Logic(width: 8)];
   final ovYuv = overlay.any((f) => f.yuv);
+  final update = Logic(name: 'update');
   final disp = HarborDualClockDisplay(
     target: const HarborSimTarget(),
     timing: _timing,
@@ -101,6 +102,7 @@ Future<void> _run({
     sysClk: sysClk,
     sysReset: sysReset,
     enable: Const(1),
+    update: update,
     fbBase: Const(_primary.base[0], width: 32),
     memory: memory,
     rqReady: port ? rqReady : null,
@@ -161,7 +163,9 @@ Future<void> _run({
   final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
   final delay = disp.pipelineDelay;
 
-  void set(OverlayFrame s) {
+  // A register block writes the inputs, then pulses update. The values
+  // at reset need no update, because frame 0 shows nothing.
+  void set(OverlayFrame s, {bool pulse = true}) {
     enable.inject(s.enable ? 1 : 0);
     sel?.inject(s.format);
     srcX.inject(s.srcX);
@@ -179,6 +183,7 @@ Future<void> _run({
       inOff[j].inject(regs[9 + j]);
       outOff[j].inject(regs[12 + j]);
     }
+    if (pulse) pulseUpdate(update, sysClk);
   }
 
   // Frames 0 and 1 prime the display with an overlay off, frame f + 2
@@ -217,7 +222,8 @@ Future<void> _run({
 
   pixelReset.inject(1);
   sysReset.inject(1);
-  set(off);
+  update.inject(0);
+  set(off, pulse: false);
   Simulator.setMaxSimTime(1 << 40);
   unawaited(Simulator.run());
   addTearDown(() async {
@@ -764,6 +770,7 @@ void main() {
       sysClk: Logic(),
       sysReset: Logic(),
       enable: Logic(),
+      update: Const(1),
       fbBase: Logic(width: 32),
       memory: HarborMemoryWaist(_memConfig),
       outputType: HarborDisplayInterface.parallelRgb,

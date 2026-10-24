@@ -109,6 +109,7 @@ void main() {
       sysClk: l(),
       sysReset: l(),
       enable: l(),
+      update: Const(1),
       fbBase: l(32),
       memory: HarborMemoryWaist(
         const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
@@ -134,6 +135,7 @@ void main() {
       sysClk: l(),
       sysReset: l(),
       enable: l(),
+      update: Const(1),
       fbBase: l(32),
       memory: HarborMemoryWaist(
         const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
@@ -198,6 +200,7 @@ void main() {
       sysClk: clk,
       sysReset: reset,
       enable: Const(0),
+      update: Const(1),
       fbBase: Const(0, width: 32),
       memory: _idleMemory(),
       outputType: HarborDisplayInterface.parallelRgb,

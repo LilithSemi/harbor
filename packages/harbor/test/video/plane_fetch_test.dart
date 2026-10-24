@@ -109,7 +109,8 @@ Future<void> _stop() async {
 /// Runs a display of [formats] for two frames and returns its requests.
 /// The tear down ends the simulation.
 /// [port] reads through a scanout port, else through a memory waist.
-/// [onCycle] runs at each pixel clock fall with the cycle count.
+/// [onCycle] runs at each pixel clock fall with the cycle count, and can
+/// pulse `update`. With [updateAtReset], `update` pulses after reset.
 Future<_Run> _display(
   List<HarborPixelFormat> formats, {
   bool port = false,
@@ -121,13 +122,21 @@ Future<_Run> _display(
   int runCycles = _runCycles,
   int latency = 3,
   int Function(int cycle)? latencyAt,
-  void Function(int cycle, Logic? formatSel, Module display)? onCycle,
+  bool updateAtReset = true,
+  void Function(
+    int cycle,
+    Logic? formatSel,
+    Module display,
+    void Function() update,
+  )?
+  onCycle,
 }) async {
   final pixelClk = SimpleClockGenerator(14).clk;
   final sysClk = SimpleClockGenerator(6).clk;
   final pixelReset = Logic(name: 'pixel_reset');
   final sysReset = Logic(name: 'sys_reset');
   final enable = Logic(name: 'enable');
+  final update = Logic(name: 'update');
   final planes = formats
       .map((f) => f.planes.length)
       .reduce((a, b) => a > b ? a : b);
@@ -162,6 +171,7 @@ Future<_Run> _display(
     sysClk: sysClk,
     sysReset: sysReset,
     enable: enable,
+    update: update,
     fbBase: Const(fb, width: 32),
     memory: memory,
     rqReady: rqReady,
@@ -195,6 +205,7 @@ Future<_Run> _display(
   sysReset.inject(1);
   enable.inject(1);
   formatSel?.inject(0);
+  update.inject(0);
   Simulator.setMaxSimTime(100000000);
   _ran = true;
   unawaited(Simulator.run());
@@ -202,10 +213,11 @@ Future<_Run> _display(
   await pixelClk.nextPosedge;
   pixelReset.inject(0);
   sysReset.inject(0);
+  if (updateAtReset) pulseUpdate(update, sysClk);
   for (var c = 0; c < runCycles; c++) {
     await pixelClk.nextNegedge;
     if (latencyAt != null) waistMemory!.latency = latencyAt(c);
-    onCycle?.call(c, formatSel, d);
+    onCycle?.call(c, formatSel, d, () => pulseUpdate(update, sysClk));
   }
   return _Run(
     List.of(requests),
@@ -292,7 +304,7 @@ void main() {
       [HarborPixelFormat.nv12],
       // Slow only in the active lines, so each frame start primes in time.
       latencyAt: (c) => (c >= 445 && c < 745) || c >= 895 ? 300 : 3,
-      onCycle: (c, _, d) {
+      onCycle: (c, _, d, _) {
         // After the first frame, before the second frame start.
         if (c == 740) {
           mid = [
@@ -319,10 +331,19 @@ void main() {
         HarborPixelFormat.nv12,
         HarborPixelFormat.i420,
       ],
-      onCycle: (c, sel, _) {
+      // An update that waits for the take of the one at reset would go
+      // one frame late, so there is none at reset.
+      updateAtReset: false,
+      onCycle: (c, sel, _, update) {
         // Before the first frame start and again between the two.
-        if (c == 10) sel!.inject(1);
-        if (c == 500) sel!.inject(2);
+        if (c == 10) {
+          sel!.inject(1);
+          update();
+        }
+        if (c == 500) {
+          sel!.inject(2);
+          update();
+        }
       },
     );
     expect(r.requests, [
@@ -384,6 +405,7 @@ void main() {
       sysClk: Logic(),
       sysReset: Logic(),
       enable: Logic(),
+      update: Const(1),
       fbBase: Logic(width: 32),
       memory: HarborMemoryWaist(
         const HarborMemoryWaistConfig(addressWidth: 32, dataWidth: 32),
@@ -621,6 +643,7 @@ class _KindRig extends BridgeModule {
       sysClk: input('clk'),
       sysReset: input('reset'),
       enable: input('enable'),
+      update: Const(1),
       fbBase: Const(_fb, width: 32),
       memory: mem.waist,
       outputType: HarborDisplayInterface.parallelRgb,

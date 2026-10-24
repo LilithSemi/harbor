@@ -62,6 +62,7 @@ void main() {
     final sysReset = Logic(name: 'sys_reset');
     final formatSel = Logic(name: 'format_sel');
     final pitch0 = Logic(name: 'pitch0', width: 32);
+    final update = Logic(name: 'update');
     final memory = HarborMemoryWaist(
       const HarborMemoryWaistConfig(
         addressWidth: 32,
@@ -77,6 +78,7 @@ void main() {
       sysClk: sysClk,
       sysReset: sysReset,
       enable: Const(1),
+      update: update,
       fbBase: Const(_fb, width: 32),
       memory: memory,
       burstWords: 64,
@@ -93,17 +95,20 @@ void main() {
     sysReset.inject(1);
     formatSel.inject(0);
     pitch0.inject(7680);
+    update.inject(0);
     Simulator.setMaxSimTime(1 << 40);
     unawaited(Simulator.run());
     await pixelClk.nextPosedge;
     await pixelClk.nextPosedge;
     pixelReset.inject(0);
     sysReset.inject(0);
+    pulseUpdate(update, sysClk);
     for (var c = 0; c < 28000; c++) {
       await pixelClk.nextNegedge;
       if (c == 12000) {
         formatSel.inject(1);
         pitch0.inject(1920);
+        pulseUpdate(update, sysClk);
       }
     }
     expect(fetches, [

@@ -232,6 +232,7 @@ Future<(int, bool)> _display({required int sysPs}) async {
     sysClk: sysClk,
     sysReset: sysReset,
     enable: Const(1),
+    update: Const(1),
     fbBase: Const(_y, width: 32),
     memory: memory,
     outputType: HarborDisplayInterface.parallelRgb,

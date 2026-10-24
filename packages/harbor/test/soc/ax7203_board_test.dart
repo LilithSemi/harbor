@@ -171,6 +171,7 @@ class _BoardIo extends BridgeModule with HarborDeviceTreeNodeProvider {
       sysClk: clk,
       sysReset: reset,
       enable: Const(1),
+      update: Const(1),
       fbBase: Const(0, width: 32),
       memory: _idleMemory(),
       outputType: HarborDisplayInterface.parallelRgb,

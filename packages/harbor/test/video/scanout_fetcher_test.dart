@@ -293,6 +293,7 @@ void main() {
       sysClk: Logic(),
       sysReset: Logic(),
       enable: Logic(),
+      update: Const(1),
       fbBase: Logic(width: 32),
       memory: wishbone
           ? HarborMemoryWaist(

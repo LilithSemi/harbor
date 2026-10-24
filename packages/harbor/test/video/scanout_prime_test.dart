@@ -57,6 +57,7 @@ Future<void> _run({
     sysClk: sysClk,
     sysReset: sysReset,
     enable: Const(1),
+    update: Const(1),
     fbBase: Const(_base, width: 32),
     memory: memory,
     rqReady: port ? rqReady : null,

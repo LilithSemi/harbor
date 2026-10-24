@@ -94,6 +94,7 @@ class DviUlx3sTop extends BridgeModule {
       sysClk: sys.clk,
       sysReset: sys.reset,
       enable: Const(1),
+      update: Const(1),
       fbBase: Const(0x1000, width: 32),
       memory: memWaist,
     );

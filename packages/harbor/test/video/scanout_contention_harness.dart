@@ -75,6 +75,7 @@ class _BenchDisplay extends BridgeModule {
       sysClk: input('clk'),
       sysReset: input('reset'),
       enable: input('enable'),
+      update: Const(1),
       fbBase: input('fb_base'),
       memory: mem.waist,
       burstWords: burstWords,

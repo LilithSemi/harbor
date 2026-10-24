@@ -96,6 +96,7 @@ class BenchScanDisplay extends BridgeModule {
       sysClk: input('clk'),
       sysReset: input('reset'),
       enable: input('enable'),
+      update: Const(1),
       fbBase: input('fb_base'),
       rqReady: input('rq_ready'),
       rdValid: input('rd_valid'),
