@@ -51,6 +51,10 @@ import 'video_timing.dart';
 /// port, start each plane at an sdram row and use a pitch from
 /// [HarborSdram.scanoutStride], so each line starts on a new row.
 ///
+/// The constant outputs tell the build: `plane_count` (4 bits) is
+/// [planeCount], `plane_formats_0` and, with an overlay, `plane_formats_1`
+/// are [planeFormats], and `overlay_present` is [overlayPresent].
+///
 /// Emits parallel RGB+sync (for a VGA-style backend or observation) and,
 /// depending on [outputType], either the four GPDI lanes (dvi/hdmi) or a
 /// packed [rgb] plus a forwarded pixel clock [pclk] (parallelRgb). See
@@ -179,9 +183,27 @@ class HarborDualClockDisplay extends Module {
   /// 0 line.
   final int lineStride;
 
+  /// The value of the `plane_count` output: the most primary planes of a
+  /// format in [formats], plus 1 for an overlay.
+  final int planeCount;
+
+  /// The values of the `plane_formats_<n>` outputs: [formatMask] of
+  /// [formats], then of [overlayFormats] if there is an overlay.
+  final List<int> planeFormats;
+
+  /// The value of the `overlay_present` output.
+  bool get overlayPresent => overlayFormats != null;
+
   /// High from the clock after an `update` pulse until the system side
   /// sees that the pixel side took the set (system domain).
   Logic get updatePending => output('update_pending');
+
+  /// One bit for each format in [formats], at its index in
+  /// [harborPixelFormatBitOrder].
+  static int formatMask(List<HarborPixelFormat> formats) => formats.fold(
+    0,
+    (m, f) => m | (1 << harborPixelFormatBitOrder.indexOf(f)),
+  );
 
   HarborDualClockDisplay({
     required this.timing,
@@ -235,6 +257,17 @@ class HarborDualClockDisplay extends Module {
            ? null
            : List.unmodifiable(overlayFormats),
        lineStride = lineStride ?? _lineBytes(timing, formats ?? [pixelFormat]),
+       planeCount =
+           (HarborDualClockScanout.isPlanar(formats ?? [pixelFormat])
+               ? (formats ?? [pixelFormat])
+                     .map((f) => f.planes.length)
+                     .reduce(max)
+               : 1) +
+           (overlayFormats == null ? 0 : 1),
+       planeFormats = [
+         formatMask(formats ?? [pixelFormat]),
+         if (overlayFormats != null) formatMask(overlayFormats),
+       ],
        super(
          definitionName:
              _overlayName(
@@ -872,6 +905,13 @@ class HarborDualClockDisplay extends Module {
       ),
       pending: output('update_pending'),
     );
+
+    addOutput('plane_count', width: 4) <= Const(planeCount, width: 4);
+    for (final (n, m) in planeFormats.indexed) {
+      addOutput('plane_formats_$n', width: harborPixelFormatBitOrder.length) <=
+          Const(m, width: harborPixelFormatBitOrder.length);
+    }
+    addOutput('overlay_present') <= Const(overlayPresent ? 1 : 0);
 
     if (parallelRgb) {
       // No TMDS encoder or serializer, and no shift clock: rgb/hsync/vsync/de

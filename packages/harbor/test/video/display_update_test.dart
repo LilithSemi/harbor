@@ -407,4 +407,86 @@ void main() {
     expect(pendingAt, 1);
     expect(d.updatePending.value.toInt(), 0);
   });
+
+  group('caps', () {
+    HarborDualClockDisplay build(
+      List<HarborPixelFormat> formats, {
+      List<HarborPixelFormat>? overlay,
+    }) {
+      final planar = HarborDualClockScanout.isPlanar(formats);
+      final planes = formats
+          .map((f) => f.planes.length)
+          .reduce((a, b) => a > b ? a : b);
+      return HarborDualClockDisplay(
+        target: const HarborSimTarget(),
+        timing: _timing,
+        pixelClk: Logic(),
+        pixelReset: Logic(),
+        sysClk: Logic(),
+        sysReset: Logic(),
+        enable: Logic(),
+        update: Logic(),
+        fbBase: Logic(width: 32),
+        memory: HarborMemoryWaist(_memConfig),
+        outputType: HarborDisplayInterface.parallelRgb,
+        formats: formats,
+        formatSel: formats.length > 1 ? Logic() : null,
+        planeBase: [for (var k = 1; k < planes; k++) Logic(width: 32)],
+        planePitch: planar
+            ? [for (var k = 0; k < planes; k++) Logic(width: 32)]
+            : const [],
+        overlayFormats: overlay,
+        overlayEnable: overlay == null ? null : Logic(),
+        overlayBase: [if (overlay != null) Logic(width: 32)],
+        overlayPitch: [if (overlay != null) Logic(width: 32)],
+        overlaySrcX: overlay == null ? null : Logic(width: 5),
+        overlaySrcY: overlay == null ? null : Logic(width: 4),
+        overlayDstX: overlay == null ? null : Logic(width: 5),
+        overlayDstY: overlay == null ? null : Logic(width: 4),
+        overlayWidth: overlay == null ? null : Logic(width: 5),
+        overlayHeight: overlay == null ? null : Logic(width: 4),
+        overlayAlpha: overlay == null ? null : Logic(width: 8),
+      );
+    }
+
+    for (final (name, formats, overlay, count, masks) in [
+      ('rgb only', [HarborPixelFormat.xrgb8888], null, 1, [0x004]),
+      (
+        'nv12 and xrgb8888',
+        [HarborPixelFormat.nv12, HarborPixelFormat.xrgb8888],
+        null,
+        2,
+        [0x044],
+      ),
+      (
+        'nv12 and xrgb8888 with an xrgb8888 overlay',
+        [HarborPixelFormat.nv12, HarborPixelFormat.xrgb8888],
+        [HarborPixelFormat.xrgb8888],
+        3,
+        [0x044, 0x004],
+      ),
+    ]) {
+      test(name, () async {
+        final d = build(formats, overlay: overlay);
+        await d.build();
+        expect(d.planeCount, count);
+        expect(d.planeFormats, masks);
+        expect(d.overlayPresent, overlay != null);
+        expect(d.output('plane_count').width, 4);
+        expect(d.output('plane_count').value.toInt(), count);
+        for (final (n, mask) in masks.indexed) {
+          final port = d.output('plane_formats_$n');
+          expect(port.width, harborPixelFormatBitOrder.length);
+          expect(port.value.toInt(), mask);
+        }
+        expect(d.tryOutput('plane_formats_${masks.length}'), isNull);
+        expect(
+          d.output('overlay_present').value.toInt(),
+          overlay == null ? 0 : 1,
+        );
+        expect(d.tryInput('update'), isNotNull);
+        expect(d.updatePending.width, 1);
+      });
+    }
+  });
 }

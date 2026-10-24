@@ -797,11 +797,17 @@ void main() {
       final d = build(f);
       await d.build();
       final ports = [...d.inputs.keys, ...d.outputs.keys];
-      expect(ports.where((p) => p.contains('overlay')), isEmpty);
+      expect(
+        ports.where((p) => p.contains('overlay') && p != 'overlay_present'),
+        isEmpty,
+      );
       expect(d.blend, isNull);
       expect(d.overlayUnpack, isNull);
       expect(d.pipelineDelay, f.yuv ? 9 : 2);
-      expect(d.generateSynth(), isNot(contains('overlay')));
+      expect(
+        d.generateSynth().replaceAll('overlay_present', ''),
+        isNot(contains('overlay')),
+      );
     }
   });
 
