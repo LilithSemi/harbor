@@ -274,7 +274,25 @@ class HarborPcieDma extends BridgeModule {
       downstream: rxs,
       name: 'rx_register',
     );
-    final txs = HarborPcieStream.addSource(this, tx);
+    // A register stage on TX keeps the lane muxes away from the router mux
+    // and the endpoint. User bits 0 and 1 mark the last beat of a record
+    // that sets the done or the error cause. They do not go out.
+    final txOut = HarborPcieStream.addSource(this, tx);
+    final txs = HarborPcieStream(width: width, name: 'tx_int');
+    final txr = HarborPcieStream(width: width, name: 'tx_reg');
+    HarborPcieStreamRegister(
+      clk: clk,
+      reset: reset,
+      upstream: txs,
+      downstream: txr,
+      name: 'tx_register',
+    );
+    txOut.valid <= txr.valid;
+    txOut.data <= txr.data;
+    txOut.keep <= txr.keep;
+    txOut.last <= txr.last;
+    txOut.user <= Const(0, width: HarborPcieStream.userWidth);
+    txr.ready <= txOut.ready;
 
     memory = HarborMemoryMasterPort.create(
       module: this,
@@ -299,6 +317,7 @@ class HarborPcieDma extends BridgeModule {
       lines,
       rxs,
       txs,
+      txr,
     );
   }
 
@@ -427,6 +446,7 @@ class HarborPcieDma extends BridgeModule {
     Logic? lines,
     HarborPcieStream rxs,
     HarborPcieStream txs,
+    HarborPcieStream txr,
   ) {
     final mem = memory.waist;
     final aw = addressWidth;
@@ -1015,9 +1035,10 @@ class HarborPcieDma extends BridgeModule {
       eKeep.add(live.replicate(4));
     }
     final eLast = (txT + n).gte(eTotal);
-    // The TX port keeps a source until its last beat. Owner 0 is the
-    // engine, 1 the BAR0 completion, 2 the fetcher. A request shows no beat
-    // while bus master enable is 0, but a packet that holds the port ends.
+    // The TX register keeps a source from its first beat until its last
+    // beat. Owner 0 is the engine, 1 the BAR0 completion, 2 the fetcher. A
+    // request sends no beat while bus master enable is 0, but a packet that
+    // holds the port ends.
     final txLock = Logic(name: 'tx_lock');
     final txOwner = Logic(name: 'tx_owner', width: 2);
     Logic mayRequest(int owner) =>
@@ -1101,7 +1122,12 @@ class HarborPcieDma extends BridgeModule {
     ).named('tx_pick');
     final pickCpl = pick.eq(1);
     final pickFetch = pick.eq(2);
-    txs.valid <= mux(pickCpl, cValid, mux(pickFetch, fValid, eValid));
+    // A packet starts only when the TX register is empty, so a packet that
+    // waits behind another one has not left the engine yet.
+    final txEmpty = (txs.ready & ~txr.valid).named('tx_empty');
+    txs.valid <=
+        mux(pickCpl, cValid, mux(pickFetch, fValid, eValid)) &
+            (txLock | txEmpty);
     txs.data <=
         harborBitMux(
           pickCpl,
@@ -1115,7 +1141,12 @@ class HarborPcieDma extends BridgeModule {
           mux(pickFetch, fKeep.rswizzle(), eKeep.rswizzle()),
         );
     txs.last <= mux(pickCpl, cLast, mux(pickFetch, fLast, eLast));
-    txs.user <= Const(0, width: HarborPcieStream.userWidth);
+    final recEnd = inState(sRecTx) & eLast & pick.eq(0);
+    txs.user <=
+        [
+          recEnd & ~code.eq(0),
+          recEnd & code.eq(0) & dFlags[1],
+        ].swizzle().zeroExtend(HarborPcieStream.userWidth);
     final txFire = txs.valid & txs.ready;
     final eFire = txFire & pick.eq(0);
     final cFire = txFire & pickCpl;
@@ -1126,7 +1157,8 @@ class HarborPcieDma extends BridgeModule {
         (cState.eq(cSend) & (cG.lt(cNeed) | cFire & ~cLast & cG.lt(cDw))).named(
           'c_read',
         );
-    final recDone = (inState(sRecTx) & eFire & eLast).named('rec_done');
+    // The last record beat leaves the TX port.
+    final recOut = (txr.valid & txr.ready).named('rec_out');
 
     // The D2H payload buffer. Fabric reads write it, and the read address
     // leads the TX beat by one cycle.
@@ -1171,9 +1203,9 @@ class HarborPcieDma extends BridgeModule {
             tags.issueReady &
             busMasterEnable;
     // A fetch read that is on the TX port finishes first. An engine packet
-    // that has not shown a beat yet is dropped. A packet that has shown a
-    // beat finishes first.
-    final eShown = (txLock & txOwner.eq(0) | txs.valid & pick.eq(0)).named(
+    // that has not sent a beat to the TX register yet is dropped. A packet
+    // that has sent a beat finishes first.
+    final eShown = (txLock & txOwner.eq(0) | txFire & pick.eq(0)).named(
       'e_shown',
     );
     // In the H2D state the drain must also be idle, so no local write
@@ -1391,8 +1423,8 @@ class HarborPcieDma extends BridgeModule {
                   writes(registerCplSize ~/ 4)) &
               cplWritable,
     ], reset: reset);
-    final doneSet = recDone & code.eq(0) & dFlags[1];
-    final errSet = recDone & ~code.eq(0) | cplSizeBad;
+    final doneSet = recOut & txr.user[0];
+    final errSet = recOut & txr.user[1] | cplSizeBad;
     final sets = [
       if (irqLines < 7) Const(0, width: causeWidth - causeLineShift - irqLines),
       ?lines,
@@ -1741,9 +1773,6 @@ class HarborPcieDma extends BridgeModule {
                 then: [txLock < 0],
                 orElse: [txLock < 1, txOwner < pick],
               ),
-            ],
-            orElse: [
-              If(txs.valid, then: [txLock < 1, txOwner < pick]),
             ],
           ),
 
