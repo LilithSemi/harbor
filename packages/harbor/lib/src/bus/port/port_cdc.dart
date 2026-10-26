@@ -81,6 +81,11 @@ class HarborMemoryWaistCdc extends Module {
   /// Full flag of each FIFO on its write side, in the order of [debugEmpty].
   Logic get debugFull => output('debug_full');
 
+  /// Read beats and write responses that the fabric side dropped after a
+  /// device reset, on the fabric clock. The count wraps. It is 0 with
+  /// [slave] set, because that side answers and drops nothing.
+  Logic get debugDropped => output('debug_dropped');
+
   HarborMemoryWaistCdc({
     required Logic fabricClk,
     required Logic fabricReset,
@@ -261,6 +266,7 @@ class HarborMemoryWaistCdc extends Module {
       addOutput('debug_reads', width: cntW) <= rdQ.count;
       addOutput('debug_writes', width: cntW) <= wrQ.count;
       addOutput('debug_recover') <= mode;
+      addOutput('debug_dropped', width: 16) <= Const(0, width: 16);
 
       up.reqReady <= ~reqF.wrFull & ~mode & rdQ.pushReady & wrQ.pushReady;
       reqFire <= up.reqValid & up.reqReady;
@@ -556,10 +562,16 @@ class HarborMemoryWaistCdc extends Module {
     );
     final rDone = dn.rdataValid & dn.rdataReady & dn.rdataLast;
     final bDone = dn.wrespValid & dn.wrespReady;
+    final dropped = Logic(name: 'dropped', width: 16);
+    addOutput('debug_dropped', width: 16) <= dropped;
     final reqR = reqFire & ~write;
     final reqW = reqFire & write;
 
     Sequential(fClk, reset: fReset, [
+      dropped <
+          dropped +
+              (dn.rdataValid & dn.rdataReady & mode).zeroExtend(16) +
+              (bDone & mode).zeroExtend(16),
       If.block([
         Iff(wdLastFire, [wBeat < Const(0, width: lenW)]),
         ElseIf(wdFire, [wBeat < wBeat + 1]),

@@ -365,9 +365,9 @@ class HarborMemoryMasterPort {
 }
 
 /// Adds the debug outputs of [cdc] to [module] as plain outputs:
-/// `<prefix>_reads`, `<prefix>_writes`, `<prefix>_recover`, `<prefix>_empty`
-/// and `<prefix>_full`. See [HarborMemoryWaistCdc] for the fields. Without
-/// a crossing, the outputs are 0.
+/// `<prefix>_reads`, `<prefix>_writes`, `<prefix>_recover`, `<prefix>_empty`,
+/// `<prefix>_full` and `<prefix>_dropped`. See [HarborMemoryWaistCdc] for the
+/// fields. Without a crossing, the outputs are 0.
 void harborAddCdcDebug(
   BridgeModule module,
   String prefix,
@@ -383,6 +383,8 @@ void harborAddCdcDebug(
   module.addOutput('${prefix}_recover') <= or0(cdc?.debugRecover, 1);
   module.addOutput('${prefix}_empty', width: 4) <= or0(cdc?.debugEmpty, 4);
   module.addOutput('${prefix}_full', width: 4) <= or0(cdc?.debugFull, 4);
+  module.addOutput('${prefix}_dropped', width: 16) <=
+      or0(cdc?.debugDropped, 16);
 }
 
 Axi4Interface _axi4(HarborMemoryWaistConfig config) => Axi4Interface(

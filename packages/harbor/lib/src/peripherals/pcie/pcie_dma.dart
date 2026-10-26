@@ -154,6 +154,8 @@ class HarborPcieDma extends BridgeModule {
 
   /// DEBUG[31:16] counts the fabric read beats, write beats and write
   /// responses of stopped transfers. The engine drops them. The count wraps.
+  /// After an engine reset with [resetMemoryOnEngineReset], the memory port
+  /// crossing drops them instead and counts them in its `debug_dropped`.
   static const debugDroppedShift = 16;
 
   static const causeDone = 1 << 0;
@@ -254,6 +256,24 @@ class HarborPcieDma extends BridgeModule {
   /// The memory master port.
   late final HarborMemoryMasterPort memory;
 
+  /// An engine reset also resets the memory path. The engine then forgets
+  /// the fabric beats and write responses it is owed, resets [memory], and
+  /// pulses `memory_reset` for one cycle. The pulse must reset every port
+  /// between [memory] and the recovering crossing, such as a
+  /// [HarborMemorySlavePort] on the DMA clock, and the device side of a
+  /// [HarborMemoryMasterPort] with a fabric clock. A port that keeps a half
+  /// burst after an AW handshake lets the next W beats finish the old burst
+  /// at the old address. The crossing answers or drops the requests that
+  /// are still on the fabric, and holds new requests until it is idle, so a
+  /// late response never reaches the engine. Without such a crossing, keep
+  /// this off.
+  final bool resetMemoryOnEngineReset;
+
+  /// The pulse from [resetMemoryOnEngineReset]. It is 0 when that is off.
+  Logic get memoryReset => output('memory_reset');
+
+  late final Logic _memReset;
+
   /// Level per MSI vector, for the endpoint.
   Logic get irqPending => output('irq_pending');
 
@@ -288,6 +308,7 @@ class HarborPcieDma extends BridgeModule {
     this.maxPayloadBytes = 256,
     this.maxReadRequestBytes = 512,
     this.infoWords = const [],
+    this.resetMemoryOnEngineReset = false,
     String? name,
   }) : width = rx.width,
        romStatusBuilt = romStatus != null,
@@ -298,7 +319,8 @@ class HarborPcieDma extends BridgeModule {
          '_Q${queueDepth}_T${readTags}_L${irqLines}_O${timeoutCycles}'
          '_P${maxPayloadBytes}_R${maxReadRequestBytes}'
          '_I${_infoTag(infoWords)}${romStatus == null ? '' : '_M'}'
-         '${resetStatus == null ? '' : '_X'}',
+         '${resetStatus == null ? '' : '_X'}'
+         '${resetMemoryOnEngineReset ? '_Mr' : ''}',
          name: name ?? 'pcie_dma',
        ) {
     _validate(tx, irqInputs);
@@ -364,6 +386,7 @@ class HarborPcieDma extends BridgeModule {
     txOut.user <= Const(0, width: HarborPcieStream.userWidth);
     txr.ready <= txOut.ready;
 
+    _memReset = Logic(name: 'memory_reset_q');
     memory = HarborMemoryMasterPort.create(
       module: this,
       name: 'memory',
@@ -373,7 +396,9 @@ class HarborPcieDma extends BridgeModule {
         dataWidth: dataWidth,
       ),
       clk: clk,
-      reset: reset,
+      reset: resetMemoryOnEngineReset
+          ? (reset | _memReset).named('memory_port_reset')
+          : reset,
     );
     _build(
       clk,
@@ -1081,6 +1106,7 @@ class HarborPcieDma extends BridgeModule {
     mem.wdataData <= mux(wHold, wHoldData, liveData);
     mem.wdataStrb <= mux(wHold, wHoldStrb, liveStrb);
     mem.wdataLast <= mux(wHold, wHoldLast, liveLast);
+    final portReset = resetMemoryOnEngineReset ? reset | _memReset : reset;
     Sequential(clk, [
       wHold < mem.wdataValid & ~mem.wdataReady,
       If(
@@ -1091,22 +1117,29 @@ class HarborPcieDma extends BridgeModule {
           wHoldLast < liveLast,
         ],
       ),
-    ], reset: reset);
+    ], reset: portReset);
     mem.wrespReady <= inH2d & inD(dResp) | ~ownB & bOwe;
     final wFire = mem.wdataValid & mem.wdataReady;
     final bFire = mem.wrespValid & mem.wrespReady;
     final burst9 = burst.slice(8, 0);
     final dropped = Logic(name: 'fab_dropped', width: 16);
+    final oweClear = resetMemoryOnEngineReset ? engReset : Const(0);
     Sequential(clk, [
-      rOwe <
-          rOwe +
-              mux(reqFire & ~mem.reqWrite, burst9, Const(0, width: 9)) -
-              rFire.zeroExtend(9),
-      wOwe <
-          wOwe +
-              mux(reqFire & mem.reqWrite, burst9, Const(0, width: 9)) -
-              wFire.zeroExtend(9),
-      bOwe < reqFire & mem.reqWrite | bOwe & ~bFire,
+      If(
+        oweClear,
+        then: [rOwe < 0, wOwe < 0, bOwe < 0],
+        orElse: [
+          rOwe <
+              rOwe +
+                  mux(reqFire & ~mem.reqWrite, burst9, Const(0, width: 9)) -
+                  rFire.zeroExtend(9),
+          wOwe <
+              wOwe +
+                  mux(reqFire & mem.reqWrite, burst9, Const(0, width: 9)) -
+                  wFire.zeroExtend(9),
+          bOwe < reqFire & mem.reqWrite | bOwe & ~bFire,
+        ],
+      ),
       dropped <
           dropped +
               (rFire & ~ownR).zeroExtend(16) +
@@ -1323,6 +1356,13 @@ class HarborPcieDma extends BridgeModule {
           state,
         ].swizzle();
     addOutput('debug', width: 32) <= debug;
+    if (resetMemoryOnEngineReset) {
+      Sequential(clk, [_memReset < engReset], reset: reset);
+      addOutput('memory_reset') <= _memReset;
+    } else {
+      _memReset <= Const(0);
+      addOutput('memory_reset') <= Const(0);
+    }
     final eFire = txFire & pick.eq(0);
     final cFire = txFire & pickCpl;
     final fFire = txFire & pickFetch;

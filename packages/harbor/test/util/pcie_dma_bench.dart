@@ -38,6 +38,14 @@ class DmaConfig {
   /// Builds the reset status input. See [DmaBench.resetStatus].
   final bool resetStatus;
 
+  /// Puts a memory port crossing and a fabric on their own clock between
+  /// the DMA and the memory. See [MasterTop].
+  final bool crossing;
+
+  /// Builds the DMA with `resetMemoryOnEngineReset`, and connects
+  /// `memory_reset` to the crossing.
+  final bool resetMemory;
+
   const DmaConfig({
     this.width = 64,
     this.dataWidth = 64,
@@ -53,6 +61,8 @@ class DmaConfig {
     this.addressWidth = dmaAddressWidth,
     this.axiGate = false,
     this.resetStatus = false,
+    this.crossing = false,
+    this.resetMemory = false,
   });
 
   @override
@@ -185,6 +195,7 @@ class DmaBench {
       fifoSource: config.fifoSource,
       ringSource: config.ringSource,
       resetStatus: config.resetStatus ? Logic(width: 64) : null,
+      resetMemoryOnEngineReset: config.resetMemory,
     );
     final top = MasterTop(
       dut,
@@ -196,8 +207,17 @@ class DmaBench {
       ),
       withErr: true,
       axiGate: config.axiGate,
+      fabricCrossing: config.crossing,
+      memoryReset: config.crossing && config.resetMemory
+          ? 'memory_reset'
+          : null,
     );
     await top.build();
+    final fclk = config.crossing ? SimpleClockGenerator(14).clk : clk;
+    if (config.crossing) {
+      top.input('fclk').srcConnection! <= fclk;
+      top.input('freset').srcConnection! <= reset;
+    }
     final gates = {
       if (config.axiGate)
         for (final c in AxiStallGate.channels.keys) c: Logic(name: 'pass_$c'),
@@ -240,7 +260,7 @@ class DmaBench {
     granted.inject(0);
     lines?.inject(0);
     reset.inject(1);
-    final memory = PcieFabricMemory(top, clk, seed: seed + 7, fill: dmaFill);
+    final memory = PcieFabricMemory(top, fclk, seed: seed + 7, fill: dmaFill);
     memory.start();
     final host = PcieHostModel(seed: seed, maxPayload: 128);
     return DmaBench._(

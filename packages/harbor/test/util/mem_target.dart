@@ -106,6 +106,45 @@ class AxiStallGate extends BridgeModule {
   }
 }
 
+/// A memory slave port on `device_clk` joined to a memory master port that
+/// crosses to `clk`, as a device puts its memory port on a fabric with
+/// another clock. Both ports reset on `device_reset`. The crossing debug
+/// outputs come up as `cdc_*`.
+class WaistCrossing extends BridgeModule {
+  WaistCrossing(HarborFabricKind kind, HarborMemoryWaistConfig config)
+    : super('WaistCrossing_${kind.name}', name: 'crossing') {
+    for (final p in ['clk', 'reset', 'device_clk', 'device_reset']) {
+      createPort(p, PortDirection.input);
+    }
+    final device = HarborMemorySlavePort.create(
+      module: this,
+      name: 'device',
+      kind: kind,
+      config: config,
+      clk: input('device_clk'),
+      reset: input('device_reset'),
+    );
+    final memory = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'memory',
+      kind: kind,
+      config: config,
+      clk: input('device_clk'),
+      reset: input('device_reset'),
+      fabricClock: HarborFabricClock(clk: input('clk'), reset: input('reset')),
+    );
+    memory.addDebugOutputs(this, 'cdc');
+    final s = device.waist;
+    final k = memory.waist;
+    for (final n in s.getPorts([PairDirection.fromProvider]).keys) {
+      k.port(n) <= s.port(n);
+    }
+    for (final n in s.getPorts([PairDirection.fromConsumer]).keys) {
+      s.port(n) <= k.port(n);
+    }
+  }
+}
+
 /// A device under test whose memory master port [iface] drives a
 /// [MemBeatTarget] of the same kind.
 ///
@@ -113,8 +152,14 @@ class AxiStallGate extends BridgeModule {
 /// other port with its own name. The target beat ports come up as `t_*`.
 /// `clk` and `reset` drive both. With [axiGate], an [AxiStallGate] sits
 /// between the two and its inputs come up as `pass_*`.
+///
+/// With `fabricCrossing`, the port goes through a [WaistCrossing] and a
+/// [HarborFabric] on the clock `fclk` and reset `freset`, and the target
+/// runs on `fclk`. With `memoryReset`, the output of `dut` of that name
+/// also resets the device side of the crossing.
 class MasterTop extends BridgeModule {
   late final MemBeatTarget target;
+  WaistCrossing? crossing;
 
   MasterTop(
     BridgeModule dut, {
@@ -124,6 +169,8 @@ class MasterTop extends BridgeModule {
     int burstBeats = 8,
     bool withErr = false,
     bool axiGate = false,
+    bool fabricCrossing = false,
+    String? memoryReset,
   }) : super('MasterTop_${dut.definitionName}', name: 'top') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -131,11 +178,54 @@ class MasterTop extends BridgeModule {
     target = addSubModule(
       MemBeatTarget(kind, config, burstBeats: burstBeats, withErr: withErr),
     );
-    for (final m in [dut, target]) {
-      m.input('clk').srcConnection! <= input('clk');
-      m.input('reset').srcConnection! <= input('reset');
+    dut.input('clk').srcConnection! <= input('clk');
+    dut.input('reset').srcConnection! <= input('reset');
+    if (fabricCrossing) {
+      createPort('fclk', PortDirection.input);
+      createPort('freset', PortDirection.input);
+      target.input('clk').srcConnection! <= input('fclk');
+      target.input('reset').srcConnection! <= input('freset');
+      final x = addSubModule(WaistCrossing(kind, config));
+      crossing = x;
+      x.input('clk').srcConnection! <= input('fclk');
+      x.input('reset').srcConnection! <= input('freset');
+      x.input('device_clk').srcConnection! <= input('clk');
+      x.input('device_reset').srcConnection! <=
+          (memoryReset == null
+              ? input('reset')
+              : input('reset') | dut.output(memoryReset));
+      connectInterfaces(dut.interface(iface), x.interface('device'));
+      HarborFabric.build(
+        kind: kind,
+        topology: HarborFabricTopology.shared,
+        clk: input('fclk'),
+        reset: input('freset'),
+        masters: [
+          HarborFabricMaster(
+            name: 'dut',
+            interface: x.interface('memory').interface,
+            outstanding: config.outstanding,
+          ),
+        ],
+        slaves: [
+          HarborFabricSlave(
+            name: 'target',
+            range: BusAddressRange(0, 1 << config.addressWidth),
+            interface: target.interface('bus').interface,
+            outstanding: config.outstanding,
+          ),
+        ],
+      );
+      for (final p in x.outputs.keys) {
+        if (p.startsWith('cdc_')) pullUpPort(x.port(p), newPortName: p);
+      }
+    } else {
+      target.input('clk').srcConnection! <= input('clk');
+      target.input('reset').srcConnection! <= input('reset');
     }
-    if (axiGate) {
+    if (fabricCrossing) {
+      // The crossing above carries the port.
+    } else if (axiGate) {
       final gate = addSubModule(AxiStallGate(config));
       connectInterfaces(dut.interface(iface), gate.interface('up'));
       connectInterfaces(gate.interface('dn'), target.interface('bus'));

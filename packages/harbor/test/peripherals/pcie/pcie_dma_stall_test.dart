@@ -264,6 +264,62 @@ void main() {
     });
   }
 
+  for (final on in [true, false]) {
+    test('an engine reset clears a read that the fabric answers late, '
+        'memory reset ${on ? 'on' : 'off'}', () async {
+      final b = await DmaBench.create(
+        DmaConfig(crossing: true, resetMemory: on, timeoutCycles: _timeout),
+      );
+      var pulses = 0;
+      b.clk.posedge.listen((_) {
+        if (b.dut.memoryReset.value.toBool()) pulses++;
+      });
+      await b.start();
+      await b.setupRing(dmaCplBase, 4);
+      await b.enable();
+      b.memory.readLimit = 0;
+      await _push(b, true, 0x80000000, 0x1000, 0x75);
+      await b.waitUntil(
+        () => b.recordWrites(0).isNotEmpty,
+        timeout: _timeout + _slack,
+        what: 'timeout record',
+      );
+      await b.cycles(50);
+      expect(b.record(0).code, HarborPcieDma.errorFabricTimeout);
+
+      await b.writeReg(
+        HarborPcieDma.registerIrqCause,
+        HarborPcieDma.causeError,
+      );
+      await b.engineReset();
+      await b.waitUntil(
+        () => _sig(b, 'engine_reset_req') == 0,
+        timeout: _slack,
+        what: 'engine reset',
+      );
+      expect(await b.readReg(HarborPcieDma.registerStatus), 64 << 16);
+      expect(pulses, on ? 1 : 0);
+      const owed = HarborPcieDma.debugReadOwed | HarborPcieDma.debugWriteOwed;
+      final debug = await b.readReg(HarborPcieDma.registerDebug);
+      expect(debug & owed, on ? 0 : HarborPcieDma.debugReadOwed);
+
+      // The fabric answers the read now.
+      b.memory.readLimit = null;
+      await b.cycles(500);
+      final cdcDropped = b.top.output('cdc_dropped').value.toInt();
+      final dmaDropped = _dropped(await b.readReg(HarborPcieDma.registerDebug));
+      if (on) {
+        expect(cdcDropped, greaterThan(0));
+        expect(dmaDropped, 0);
+      } else {
+        expect(cdcDropped, 0);
+        expect(dmaDropped, greaterThan(0));
+      }
+      await _goodTransfer(b, true, 2);
+      await b.finish();
+    });
+  }
+
   test('an engine reset ends a TLP that waits on TX', () async {
     final b = await DmaBench.create(const DmaConfig());
     await b.start();
