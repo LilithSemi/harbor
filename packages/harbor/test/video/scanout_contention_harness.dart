@@ -282,7 +282,10 @@ class ScanoutContentionBench {
     // The display takes enable at a frame start, so wait for its first
     // fetch.
     final busy = _fetcherBusy();
-    while (busy.value != LogicValue.one) {
+    final limit =
+        3 * timing.hTotal * timing.vTotal * pixelPeriodPs ~/ sysPeriodPs;
+    for (var i = 0; busy.value != LogicValue.one; i++) {
+      if (i > limit) throw StateError('no fetch in $limit system clocks');
       await sysClk.nextPosedge;
     }
   }

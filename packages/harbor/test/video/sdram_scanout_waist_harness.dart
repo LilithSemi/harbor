@@ -223,8 +223,8 @@ Future<WaistScanResult> runWaistScanout({
   var underrunFrames = 0;
   var checked = false;
   var sawUnder = false;
-  // The display takes enable at a frame start, so a frame counts only when
-  // it showed pixels.
+  // The display takes enable at a frame start, so the frames count from
+  // the first frame that showed pixels.
   var shown = false;
   var prevY = -1;
   pixelClk.posedge.listen((_) {
@@ -242,7 +242,6 @@ Future<WaistScanResult> runWaistScanout({
     if (prevY == timing.vActive - 1 && yv == timing.vActive && !shown) {
       sawUnder = false;
     } else if (prevY == timing.vActive - 1 && yv == timing.vActive) {
-      shown = false;
       frameCount++;
       if (checked) {
         for (var py = 0; py < lines && errors.length < 8; py++) {
@@ -319,7 +318,12 @@ Future<WaistScanResult> runWaistScanout({
   await waitUntil(s, () => req.done, limit: 4000000);
   top.input('enable').srcConnection!.inject(1);
   started = true;
-  await waitUntilFrames(pixelClk, () => frameCount, 1);
+  await waitUntilFrames(
+    pixelClk,
+    () => frameCount,
+    1,
+    limit: 4 * timing.hTotal * timing.vTotal,
+  );
   checked = true;
 
   // Then rounds of random writes and reads outside the frame until enough
@@ -406,10 +410,16 @@ int _lanes(int addr, int size) {
   return m;
 }
 
-/// Waits until [count] has grown by [n].
-Future<void> waitUntilFrames(Logic clk, int Function() count, int n) async {
+/// Waits until [count] has grown by [n]. It fails after [limit] clocks.
+Future<void> waitUntilFrames(
+  Logic clk,
+  int Function() count,
+  int n, {
+  required int limit,
+}) async {
   final target = count() + n;
-  while (count() < target) {
+  for (var i = 0; count() < target; i++) {
+    if (i > limit) throw StateError('no $n frames in $limit clocks');
     await clk.nextPosedge;
   }
 }

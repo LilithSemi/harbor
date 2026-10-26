@@ -486,8 +486,8 @@ class SdramScanoutBench {
     final word = display.output('pixel_word');
     final under = display.output('underrun');
     var sawUnder = false;
-    // The display takes enable at a frame start, so a frame counts only
-    // when it showed pixels.
+    // The display takes enable at a frame start, so the frames count from
+    // the first frame that showed pixels.
     var shown = false;
     var prevY = -1;
     pixelClk.posedge.listen((_) {
@@ -503,7 +503,6 @@ class SdramScanoutBench {
       if (prevY == timing.vActive - 1 && yv == timing.vActive && !shown) {
         sawUnder = false;
       } else if (prevY == timing.vActive - 1 && yv == timing.vActive) {
-        shown = false;
         frames++;
         if (checkFrames) {
           final bad = frameErrors();
@@ -556,10 +555,13 @@ class SdramScanoutBench {
     await sysClk.nextPosedge;
   }
 
-  /// Waits until [n] more frames have been scanned.
+  /// Waits until [n] more frames have been scanned. It fails after [n] + 3
+  /// frame times.
   Future<void> waitFrames(int n) async {
     final target = frames + n;
-    while (frames < target) {
+    final limit = (n + 3) * timing.hTotal * timing.vTotal;
+    for (var i = 0; frames < target; i++) {
+      if (i > limit) throw StateError('no $n frames in $limit pixel clocks');
       await pixelClk.nextPosedge;
     }
   }
