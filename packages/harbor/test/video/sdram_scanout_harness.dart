@@ -486,17 +486,24 @@ class SdramScanoutBench {
     final word = display.output('pixel_word');
     final under = display.output('underrun');
     var sawUnder = false;
+    // The display takes enable at a frame start, so a frame counts only
+    // when it showed pixels.
+    var shown = false;
     var prevY = -1;
     pixelClk.posedge.listen((_) {
       if (enable.value != LogicValue.one || !y.value.isValid) return;
       final yv = y.value.toInt();
       if (de.value == LogicValue.one) {
+        shown = true;
         frame[yv * timing.hActive + x.value.toInt()] = word.value.isValid
             ? word.value.toInt()
             : -1;
       }
       if (under.value == LogicValue.one) sawUnder = true;
-      if (prevY == timing.vActive - 1 && yv == timing.vActive) {
+      if (prevY == timing.vActive - 1 && yv == timing.vActive && !shown) {
+        sawUnder = false;
+      } else if (prevY == timing.vActive - 1 && yv == timing.vActive) {
+        shown = false;
         frames++;
         if (checkFrames) {
           final bad = frameErrors();

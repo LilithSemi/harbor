@@ -279,6 +279,12 @@ class ScanoutContentionBench {
       await memClk.nextPosedge;
     }
     enable.put(1);
+    // The display takes enable at a frame start, so wait for its first
+    // fetch.
+    final busy = _fetcherBusy();
+    while (busy.value != LogicValue.one) {
+      await sysClk.nextPosedge;
+    }
   }
 
   /// The fetcher's busy flag, found by type in the display.

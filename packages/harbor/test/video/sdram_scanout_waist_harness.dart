@@ -223,6 +223,9 @@ Future<WaistScanResult> runWaistScanout({
   var underrunFrames = 0;
   var checked = false;
   var sawUnder = false;
+  // The display takes enable at a frame start, so a frame counts only when
+  // it showed pixels.
+  var shown = false;
   var prevY = -1;
   pixelClk.posedge.listen((_) {
     if (top.input('enable').value != LogicValue.one || !y.value.isValid) {
@@ -230,12 +233,16 @@ Future<WaistScanResult> runWaistScanout({
     }
     final yv = y.value.toInt();
     if (de.value == LogicValue.one) {
+      shown = true;
       frame[yv * 640 + x.value.toInt()] = word.value.isValid
           ? word.value.toInt()
           : -1;
     }
     if (under.value == LogicValue.one) sawUnder = true;
-    if (prevY == timing.vActive - 1 && yv == timing.vActive) {
+    if (prevY == timing.vActive - 1 && yv == timing.vActive && !shown) {
+      sawUnder = false;
+    } else if (prevY == timing.vActive - 1 && yv == timing.vActive) {
+      shown = false;
       frameCount++;
       if (checked) {
         for (var py = 0; py < lines && errors.length < 8; py++) {
