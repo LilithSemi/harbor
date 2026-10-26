@@ -209,8 +209,11 @@ class _Bench {
     }
   }
 
-  Future<void> start() async {
+  /// Builds and starts the bench with the inputs at [initial], which the
+  /// display copies after the reset.
+  Future<void> start(_Set initial) async {
     await display.build();
+    set(initial);
     WaistMemory(memory, sysClk, latency: 4);
     gen = display.subModules.whereType<VideoTimingGenerator>().single;
     scanout = display.subModules.whereType<HarborDualClockScanout>().single;
@@ -279,9 +282,7 @@ void main() {
   test('a mid-frame update takes effect at the next frame start and an '
       'input change without update changes nothing', () async {
     final b = _Bench();
-    await b.start();
-    b.set(_Set(0));
-    pulseUpdate(b.update, b.sysClk);
+    await b.start(_Set(0));
     final pending = <(int, int, int), int>{};
     final got = await _frames(b, 6, (f, x, y) {
       pending[(f, x, y)] = b.display.updatePending.value.toInt();
@@ -310,9 +311,7 @@ void main() {
   test('an update while one is pending waits and does not tear the '
       'set', () async {
     final b = _Bench();
-    await b.start();
-    b.set(_Set(0));
-    pulseUpdate(b.update, b.sysClk);
+    await b.start(_Set(0));
     final pending = <(int, int, int), int>{};
     final got = await _frames(b, 6, (f, x, y) async {
       pending[(f, x, y)] = b.display.updatePending.value.toInt();
@@ -383,7 +382,6 @@ void main() {
     await pixelClk.nextPosedge;
     pixelReset.inject(0);
     sysReset.inject(0);
-    pulseUpdate(update, sysClk);
     final first = <int, int>{};
     var frame = -1;
     var pendingAt = -1;
@@ -407,6 +405,42 @@ void main() {
     expect(pendingAt, 1);
     expect(d.updatePending.value.toInt(), 0);
   });
+
+  // The toggle has another value after an odd and after an even count of
+  // updates. A reset of one side must give the live inputs in both cases.
+  for (final pixel in [true, false]) {
+    for (final updates in [1, 2]) {
+      final side = pixel ? 'pixel' : 'control';
+      test('a $side only reset after $updates updates applies the live '
+          'inputs', () async {
+        final b = _Bench();
+        await b.start(_Set(0));
+        var resetFrame = -1;
+        final got = await _frames(b, 9, (f, x, y) async {
+          if (x == 0 && y == 2 && f >= 1 && f <= updates) {
+            b.set(_Set(f));
+            pulseUpdate(b.update, b.sysClk);
+          }
+          if (f == 4 && x == 0 && y == 3 && resetFrame < 0) {
+            resetFrame = f;
+            final (r, clk) = pixel
+                ? (b.pixelReset, b.pixelClk)
+                : (b.sysReset, b.sysClk);
+            r.inject(1);
+            for (var i = 0; i < 3; i++) {
+              await clk.nextPosedge;
+            }
+            r.inject(0);
+          }
+        });
+        expect(got[updates + 1], _Set(updates).frame);
+        for (var f = 7; f <= 9; f++) {
+          expect(got[f], _Set(updates).frame, reason: 'frame $f');
+        }
+        expect(b.display.updatePending.value.toInt(), 0);
+      });
+    }
+  }
 
   group('caps', () {
     HarborDualClockDisplay build(

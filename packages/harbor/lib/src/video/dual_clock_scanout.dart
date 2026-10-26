@@ -134,6 +134,12 @@ class HarborScanoutOverlay {
 /// stops there. A line that was not requested in time counts as an
 /// underrun, and the lines after it go to the correct buffers.
 ///
+/// A planar build with [frameLoad] loads the frame registers of
+/// `format_sel`, the pitches and the overlay inputs when [frameLoad] is
+/// high, not at [frameStart]. In a [frameStart] clock it uses the inputs
+/// when [frameLoad] is high, else the frame registers. The caller holds
+/// [frameLoad] in the [frameStart] clock or with no [frameStart].
+///
 /// The pixel domain reads plane n with `plane_col_<n>` ([planeCol]), the
 /// word index in the line, and gets [planeData] one [pixelClk] cycle later.
 /// Plane 0 uses [col] and [pixel]. [planeUnderrun] has one bit per plane,
@@ -237,6 +243,7 @@ class HarborDualClockScanout extends Module {
     required Logic sysClk,
     required Logic sysReset,
     required Logic frameStart,
+    Logic? frameLoad,
     required Logic lineStart,
     required Logic firstLine,
     required Logic col,
@@ -357,6 +364,7 @@ class HarborDualClockScanout extends Module {
       sysClk: sysClk,
       sysReset: sysReset,
       frameStart: frameStart,
+      frameLoad: frameLoad,
       lineStart: lineStart,
       firstLine: firstLine,
       col: col,
@@ -680,6 +688,7 @@ class HarborDualClockScanout extends Module {
     required Logic sysClk,
     required Logic sysReset,
     required Logic frameStart,
+    required Logic? frameLoad,
     required Logic lineStart,
     required Logic firstLine,
     required Logic col,
@@ -791,6 +800,12 @@ class HarborDualClockScanout extends Module {
     sysClk = addInput('sys_clk', sysClk);
     sysReset = addInput('sys_reset', sysReset);
     frameStart = addInput('frame_start', frameStart);
+    final load = frameLoad == null
+        ? frameStart
+        : addInput('frame_load', frameLoad);
+    // The value of a frame register in a frame start clock.
+    Logic now(Logic input, Logic reg) =>
+        frameLoad == null ? input : mux(load, input, reg);
     lineStart = addInput('line_start', lineStart);
     firstLine = addInput('first_line', firstLine);
     if (multi) {
@@ -843,11 +858,14 @@ class HarborDualClockScanout extends Module {
     addOutput('underrun');
     addOutput('plane_underrun', width: planes);
 
-    // Line words of each plane for the format on format_sel.
+    final fmt = multi ? Logic(name: 'format_reg', width: selW) : null;
+    final selNow = multi ? now(formatSel!, fmt!) : null;
+
+    // Line words of each plane for the format of the frame start.
     Logic pick(List<Logic> values) {
       var out = values.last;
       for (var i = values.length - 2; i >= 0; i--) {
-        out = mux(formatSel!.eq(i), values[i], out);
+        out = mux(selNow!.eq(i), values[i], out);
       }
       return out;
     }
@@ -914,7 +932,10 @@ class HarborDualClockScanout extends Module {
     final chromaSel = Logic(name: 'chroma_sel');
     final lineNo = Logic(name: 'line_no', width: 16);
     final chromaNo = Logic(name: 'chroma_no', width: 16);
-    final fmt = multi ? Logic(name: 'format_reg', width: selW) : null;
+    final pitchNow = [
+      for (var k = 0; k < planes; k++)
+        now(pitchIn[k], pitch[k]).named('p${k}_pitch_now'),
+    ];
     final ov = overlay == null
         ? null
         : _overlayState(
@@ -922,6 +943,8 @@ class HarborDualClockScanout extends Module {
             pixelClk: pixelClk,
             pixelReset: pixelReset,
             frameStart: frameStart,
+            frameLoad: load,
+            now: now,
             word32: word32,
             hActive: hActive,
             vActive: vActive,
@@ -1222,6 +1245,13 @@ class HarborDualClockScanout extends Module {
       aSync0 < ackToggle,
       aSync1 < aSync0,
       If(
+        load,
+        then: [
+          if (fmt != null) fmt < formatSel!,
+          for (var k = 0; k < planes; k++) pitch[k] < pitchIn[k],
+        ],
+      ),
+      If(
         frameStart,
         then: [
           for (var k = 0; k < all; k++) hold[k] < Const(0),
@@ -1230,11 +1260,9 @@ class HarborDualClockScanout extends Module {
           phase < Const(1, width: 2),
           lineNo < Const(1, width: 16),
           chromaNo < Const(1, width: 16),
-          if (fmt != null) fmt < formatSel!,
           for (var k = 0; k < planes; k++) ...[
             underrunReg[k] < Const(0),
             words[k] < wordsSel[k],
-            pitch[k] < pitchIn[k],
             active[k] < wordsSel[k].neq(0),
           ],
           for (var k = planes; k < all; k++) underrunReg[k] < Const(0),
@@ -1246,7 +1274,7 @@ class HarborDualClockScanout extends Module {
                 k == 0 ? Const(1) : wordsSel[k].neq(0),
                 base[k],
                 Const(0),
-                pitchIn[k],
+                pitchNow[k],
               ),
           ]),
         ],
@@ -1582,6 +1610,8 @@ class HarborDualClockScanout extends Module {
     required Logic pixelClk,
     required Logic pixelReset,
     required Logic frameStart,
+    required Logic frameLoad,
+    required Logic Function(Logic, Logic) now,
     required Logic Function(Logic) word32,
     required int hActive,
     required int vActive,
@@ -1730,9 +1760,10 @@ class HarborDualClockScanout extends Module {
     ];
     final hHalf = flag(selIn, (f) => f.hSub == 2);
     final vHalf = flag(selIn, (f) => f.vSub == 2);
+    final selNow = fmt == null ? null : now(selIn!, fmt);
     Sequential(pixelClk, reset: pixelReset, [
       If(
-        frameStart,
+        frameLoad,
         then: [
           enF < enable,
           if (fmt != null) fmt < selIn!,
@@ -1745,8 +1776,14 @@ class HarborDualClockScanout extends Module {
           for (var j = 0; j < n; j++) ...[
             base[j] < baseIn[j],
             pitch[j] < pitchIn[j],
-            active[j] < flag(selIn, (f) => j < f.planes.length),
           ],
+        ],
+      ),
+      If(
+        frameStart,
+        then: [
+          for (var j = 0; j < n; j++)
+            active[j] < flag(selNow, (f) => j < f.planes.length),
           step < Const(0, width: stepW),
           ready < Const(0),
         ],
@@ -1791,7 +1828,7 @@ class HarborDualClockScanout extends Module {
       ready: ready,
       format: fmt,
       rowAddr: acc,
-      dstYIn: dstYIn,
+      dstYIn: now(dstYIn, dstY),
       srcX: srcX,
       dstX: dstX,
       dstY: dstY,
@@ -1811,7 +1848,7 @@ class _OverlayState {
   final Logic? format;
   final List<Logic> rowAddr;
 
-  /// The `overlay_dst_y` input before the latch.
+  /// The `overlay_dst_y` value of a frame start clock.
   final Logic dstYIn;
   final Logic srcX;
   final Logic dstX;

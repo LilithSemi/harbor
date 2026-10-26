@@ -4,6 +4,7 @@ import 'package:rohd/rohd.dart';
 
 import '../arith/fpu_config.dart';
 import '../bus/port/memory_waist.dart';
+import '../clock/cdc.dart';
 import '../soc/target.dart';
 import 'tmds_serializer.dart';
 
@@ -32,18 +33,33 @@ import 'video_timing.dart';
 /// line to the next, the line size by default. Use
 /// [HarborSdram.scanoutStride] to start each line on a new sdram row.
 ///
-/// The control inputs are `fb_base`, `format_sel`, `plane_base_<n>`,
-/// `plane_pitch_<n>`, `csc_*` and all `overlay_*` inputs. They are in the
-/// system domain ([sysClk]). A pulse of one clock on [update] copies all
-/// of them into a shadow set. The pixel side takes the full set in the
-/// clock before the next frame start, so all planes, both color
-/// conversions and the overlay change on the same frame. A change of an
-/// input without [update] changes nothing. [updatePending] is high from
-/// the clock after the pulse until the system side sees that the pixel
-/// side took the set. An [update] while [updatePending] is high waits, and
-/// the display copies the inputs again when it took the set before. The
-/// sets reset to 0, and the `csc_*` and `overlay_csc_*` values to
-/// [HarborCscCoefficients.bt709Limited]. `enable` is not in the set.
+/// The control inputs are `enable`, `fb_base`, `format_sel`,
+/// `plane_base_<n>`, `plane_pitch_<n>`, `csc_*` and all `overlay_*`
+/// inputs. They are in the control domain, `control_clk` and
+/// `control_reset`, which are [sysClk] and [sysReset] when not given. A
+/// pulse of one clock on [update] copies all of them into a shadow set.
+/// The pixel side takes the full set at the next frame start of the timing
+/// generator, also with the display off, so all planes, both color
+/// conversions, the overlay and `enable` change on the same frame. A
+/// change of an input without [update] changes nothing. [updatePending] is
+/// high from the clock after the pulse until the control side sees that
+/// the pixel side took the set. An [update] while [updatePending] is high
+/// waits, and the display copies the inputs again when it took the set
+/// before. The set crosses as data that does not change for at least two
+/// pixel clocks before the take. openXC7 nextpnr has no false path or
+/// clock group constraint, so it times these paths as related clocks.
+///
+/// A reset of the control or of the pixel domain resets the handshake of
+/// both sides. After it, the display copies the inputs and takes them at
+/// the next frame start, so [updatePending] is high from the reset until
+/// that take. The sets reset to 0, and the `csc_*` and `overlay_csc_*`
+/// values to [HarborCscCoefficients.bt709Limited]. A control reset does
+/// not reset the pixel side copy.
+///
+/// The status outputs `underrun`, `plane_underrun`, `overlay_underrun`,
+/// `plane_underrun_count_<n>` and `overlay_underrun_count_<n>` are in the
+/// control domain. A count crosses as gray code when `control_clk` is not
+/// [sysClk].
 ///
 /// A pitch input is in bytes. The display ignores its low 2 bits, so a
 /// pitch is a multiple of 4. It must be at least
@@ -194,8 +210,9 @@ class HarborDualClockDisplay extends Module {
   /// The value of the `overlay_present` output.
   bool get overlayPresent => overlayFormats != null;
 
-  /// High from the clock after an `update` pulse until the system side
-  /// sees that the pixel side took the set (system domain).
+  /// High from the clock after an `update` pulse until the control side
+  /// sees that the pixel side took the set (control domain). It is also
+  /// high after a reset until the first take.
   Logic get updatePending => output('update_pending');
 
   /// One bit for each format in [formats], at its index in
@@ -213,6 +230,8 @@ class HarborDualClockDisplay extends Module {
     Logic? shiftReset,
     required Logic sysClk,
     required Logic sysReset,
+    Logic? controlClk,
+    Logic? controlReset,
     required Logic enable,
     required Logic update,
     required Logic fbBase,
@@ -404,11 +423,19 @@ class HarborDualClockDisplay extends Module {
     if (shiftReset != null) shiftReset = addInput('shift_reset', shiftReset);
     sysClk = addInput('sys_clk', sysClk);
     sysReset = addInput('sys_reset', sysReset);
-    enable = addInput('enable', enable);
+    if ((controlClk == null) != (controlReset == null)) {
+      throw ArgumentError('give controlClk and controlReset together');
+    }
+    final ownControl = controlClk != null;
+    final ctrlClk = ownControl ? addInput('control_clk', controlClk) : sysClk;
+    final ctrlReset = ownControl
+        ? addInput('control_reset', controlReset!)
+        : sysReset;
     update = addInput('update', update);
     addOutput('update_pending');
     final shadow = _ShadowSet();
-    fbBase = shadow.add(addInput('fb_base', fbBase, width: 32));
+    enable = shadow.add(addInput('enable', enable), early: true);
+    fbBase = shadow.add(addInput('fb_base', fbBase, width: 32), early: true);
     final planes = planar
         ? this.formats.map((f) => f.planes.length).reduce(max)
         : 1;
@@ -435,7 +462,10 @@ class HarborDualClockDisplay extends Module {
       }
       planeBase = [
         for (var k = 1; k < planes; k++)
-          shadow.add(addInput('plane_base_$k', planeBase[k - 1], width: 32)),
+          shadow.add(
+            addInput('plane_base_$k', planeBase[k - 1], width: 32),
+            early: true,
+          ),
       ];
       planePitch = [
         for (var k = 0; k < planes; k++)
@@ -495,6 +525,27 @@ class HarborDualClockDisplay extends Module {
 
     Logic delay(Logic v, String name) =>
         flop(pixelClk, v, reset: pixelReset).named(name);
+
+    // A sticky flag goes to the control domain through two flops for each
+    // bit.
+    Logic status(Logic v, String name) {
+      for (var i = 0; i < 2; i++) {
+        v = flop(ctrlClk, v, reset: ctrlReset).named('${name}_underrun_sync$i');
+      }
+      return v;
+    }
+
+    // A count goes to the control domain as gray code.
+    Logic count(Logic v, String name) => ownControl
+        ? _grayCross(
+            v,
+            srcClk: sysClk,
+            srcReset: sysReset,
+            dstClk: ctrlClk,
+            dstReset: ctrlReset,
+            name: name,
+          )
+        : v;
 
     final frameStart = enable & tx.eq(0) & ty.eq(timing.vActive);
     // End of an active line: swap to the prefetched buffer and start the next
@@ -592,7 +643,7 @@ class HarborDualClockDisplay extends Module {
       ovAlpha = flop(
         pixelClk,
         shadow.add(addInput('overlay_alpha', overlayAlpha!, width: 8)),
-        en: frameStart,
+        en: shadow.load,
         reset: pixelReset,
       ).named('overlay_alpha_frame');
     }
@@ -609,6 +660,7 @@ class HarborDualClockDisplay extends Module {
         sysClk: sysClk,
         sysReset: sysReset,
         frameStart: frameStart,
+        frameLoad: shadow.load,
         lineStart: lineStart,
         firstLine: firstLine,
         col: unpack != null
@@ -629,9 +681,9 @@ class HarborDualClockDisplay extends Module {
         vActive: timing.vActive,
         overlay: so,
       );
-      addOutput('plane_underrun') <= scanout.planeUnderrun;
+      addOutput('plane_underrun') <= status(scanout.planeUnderrun, 'plane');
       addOutput('plane_underrun_count_0', width: 16) <=
-          scanout.planeUnderrunCount(0);
+          count(scanout.planeUnderrunCount(0), 'plane_underrun_count_0');
     } else if (!planar) {
       final wordsPerLine = HarborDualClockScanout.planeWords(
         this.pixelFormat,
@@ -692,6 +744,7 @@ class HarborDualClockDisplay extends Module {
         sysClk: sysClk,
         sysReset: sysReset,
         frameStart: frameStart,
+        frameLoad: shadow.load,
         lineStart: lineStart,
         firstLine: firstLine,
         col: cols[0],
@@ -716,18 +769,20 @@ class HarborDualClockDisplay extends Module {
         fmt <= scanout.format;
         frameFormat = fmt;
       }
-      addOutput('plane_underrun', width: planes) <= scanout.planeUnderrun;
+      addOutput('plane_underrun', width: planes) <=
+          status(scanout.planeUnderrun, 'plane');
       for (var k = 0; k < planes; k++) {
         addOutput('plane_underrun_count_$k', width: 16) <=
-            scanout.planeUnderrunCount(k);
+            count(scanout.planeUnderrunCount(k), 'plane_underrun_count_$k');
       }
     }
 
     if (so != null) {
-      addOutput('overlay_underrun', width: ovPlanes) <= scanout.overlayUnderrun;
+      addOutput('overlay_underrun', width: ovPlanes) <=
+          status(scanout.overlayUnderrun, 'overlay');
       for (var j = 0; j < ovPlanes; j++) {
         addOutput('overlay_underrun_count_$j', width: 16) <=
-            scanout.overlayUnderrunCount(j);
+            count(scanout.overlayUnderrunCount(j), 'overlay_underrun_count_$j');
       }
     }
     if (scanout.scanoutPort) {
@@ -735,7 +790,7 @@ class HarborDualClockDisplay extends Module {
       addOutput('rq_addr', width: 32) <= scanout.rqAddr;
       addOutput('rq_words', width: scanout.rqWords.width) <= scanout.rqWords;
     }
-    underrun <= scanout.underrun;
+    underrun <= status(scanout.underrun, 'all');
     if (unpack != null) {
       for (var k = 0; k < planes; k++) {
         planeWord[k] <= scanout.planeData(k);
@@ -761,7 +816,6 @@ class HarborDualClockDisplay extends Module {
         prefix: 'csc',
         clk: pixelClk,
         reset: pixelReset,
-        frameStart: frameStart,
         target: target,
         unpack: unpack,
         shadow: shadow,
@@ -828,7 +882,6 @@ class HarborDualClockDisplay extends Module {
       (r, g, b) = _overlay(
         pixelClk: pixelClk,
         pixelReset: pixelReset,
-        frameStart: frameStart,
         target: target,
         scanout: scanout,
         formats: ovFormats!,
@@ -891,16 +944,16 @@ class HarborDualClockDisplay extends Module {
     }
     pixelWord <= wordLast;
 
-    // The take is in the clock before the frame start, so the frame
-    // latches of the scanout and the color conversions get the new set.
+    // The take is in the clock before the frame start of the timing
+    // generator, also with the display off.
     shadow.build(
-      sysClk: sysClk,
-      sysReset: sysReset,
+      ctrlClk: ctrlClk,
+      ctrlReset: ctrlReset,
       pixelClk: pixelClk,
       pixelReset: pixelReset,
       update: update,
       take: delay(
-        enable & tx.eq(timing.hTotal - 2) & ty.eq(timing.vActive - 1),
+        tx.eq(timing.hTotal - 2) & ty.eq(timing.vActive - 1),
         'pre_frame',
       ),
       pending: output('update_pending'),
@@ -945,14 +998,13 @@ class HarborDualClockDisplay extends Module {
     }
   }
 
-  /// A color conversion with its settings latched at [frameStart]. The
+  /// A color conversion with its settings latched at the take. The
   /// inputs are `<prefix>_coeff_<k>`, `<prefix>_in_offset_<j>` and
   /// `<prefix>_out_offset_<i>`, tied to BT.709 limited when not given.
   HarborCsc _conversion({
     required String prefix,
     required Logic clk,
     required Logic reset,
-    required Logic frameStart,
     required HarborDeviceTarget target,
     required HarborPixelUnpack unpack,
     required _ShadowSet shadow,
@@ -970,7 +1022,7 @@ class HarborDualClockDisplay extends Module {
       return flop(
         clk,
         port,
-        en: frameStart,
+        en: shadow.load,
         reset: reset,
         resetValue: resetValue,
       ).named('${name}_frame');
@@ -1004,7 +1056,6 @@ class HarborDualClockDisplay extends Module {
   (Logic, Logic, Logic) _overlay({
     required Logic pixelClk,
     required Logic pixelReset,
-    required Logic frameStart,
     required HarborDeviceTarget target,
     required HarborDualClockScanout scanout,
     required List<HarborPixelFormat> formats,
@@ -1111,7 +1162,6 @@ class HarborDualClockDisplay extends Module {
         prefix: 'overlay_csc',
         clk: pixelClk,
         reset: pixelReset,
-        frameStart: frameStart,
         target: target,
         unpack: unpack,
         shadow: shadow,
@@ -1165,6 +1215,31 @@ class HarborDualClockDisplay extends Module {
     );
     this.blend = blend;
     return (blend.red, blend.green, blend.blue);
+  }
+
+  /// [bin] from the [srcClk] domain in the [dstClk] domain. [bin] must
+  /// change by at most 1 in each clock of [srcClk].
+  static Logic _grayCross(
+    Logic bin, {
+    required Logic srcClk,
+    required Logic srcReset,
+    required Logic dstClk,
+    required Logic dstReset,
+    required String name,
+  }) {
+    var g = flop(
+      srcClk,
+      bin ^ (bin >>> 1),
+      reset: srcReset,
+    ).named('${name}_gray');
+    for (var i = 0; i < 2; i++) {
+      g = flop(dstClk, g, reset: dstReset).named('${name}_gray_sync$i');
+    }
+    final bits = <Logic>[g[g.width - 1]];
+    for (var i = g.width - 2; i >= 0; i--) {
+      bits.add(bits.last ^ g[i]);
+    }
+    return bits.swizzle().named('${name}_sync');
   }
 
   /// Pixel cycles from the timing generator to the outputs.
@@ -1258,39 +1333,67 @@ class HarborDualClockDisplay extends Module {
   }
 }
 
-/// The control inputs that the system side copies at an `update` pulse
-/// and that the pixel side takes in one clock before a frame start.
+/// The control inputs that the control side copies at an `update` pulse
+/// and that the pixel side takes at a frame start.
 ///
-/// The copy is a shadow set on the system clock. A toggle tells the pixel
+/// The copy is a shadow set on the control clock. A toggle tells the pixel
 /// side that a new set is there, and the pixel side toggles an ack back
 /// when it takes the set. The shadow set does not change from the copy
-/// until the system side sees the ack, so it crosses as quasi-static data.
-/// An `update` in that time waits, and the system side copies the inputs
-/// when the ack comes.
+/// until the control side sees the ack, so it crosses as quasi-static
+/// data. An `update` in that time waits, and the control side copies the
+/// inputs when the ack comes.
+///
+/// An early field has a pixel copy that loads in the clock before the
+/// frame start. A late field has no pixel copy here: the caller loads the
+/// shadow value into its frame register when [load] is high, in the frame
+/// start clock. The ack changes in that clock too.
 class _ShadowSet {
-  final _fields = <(Logic, Logic, Logic, int, int)>[];
+  final _fields = <(Logic, Logic, Logic?, int, int)>[];
 
-  /// Adds [input] to the set and gives its value on the pixel side. With
-  /// [word], the set ignores the low 2 bits and gives them as 0.
-  Logic add(Logic input, {int resetValue = 0, bool word = false}) {
+  /// High in the clock where the late fields load.
+  final load = Logic(name: 'update_load');
+
+  /// Adds [input] to the set. It gives the pixel copy of an [early] field,
+  /// else the shadow value. With [word], the set ignores the low 2 bits
+  /// and gives them as 0.
+  Logic add(
+    Logic input, {
+    int resetValue = 0,
+    bool word = false,
+    bool early = false,
+  }) {
     final low = word ? 2 : 0;
     final name = input.name;
     final w = input.width - low;
     final shadow = Logic(name: '${name}_shadow', width: w);
-    final applied = Logic(name: '${name}_applied', width: w);
+    final applied = early ? Logic(name: '${name}_applied', width: w) : null;
     _fields.add((input, shadow, applied, resetValue >> low, low));
-    return low == 0 ? applied : [applied, Const(0, width: low)].swizzle();
+    final v = applied ?? shadow;
+    return low == 0 ? v : [v, Const(0, width: low)].swizzle();
   }
 
   void build({
-    required Logic sysClk,
-    required Logic sysReset,
+    required Logic ctrlClk,
+    required Logic ctrlReset,
     required Logic pixelClk,
     required Logic pixelReset,
     required Logic update,
     required Logic take,
     required Logic pending,
   }) {
+    // A reset of one side also resets the handshake of the other side.
+    final ctrlJoin = harborCdcJoinReset(
+      ctrlClk,
+      ctrlReset,
+      pixelReset,
+      name: 'update_ctrl_join',
+    );
+    final pixelJoin = harborCdcJoinReset(
+      pixelClk,
+      pixelReset,
+      ctrlReset,
+      name: 'update_pixel_join',
+    );
     final toggle = Logic(name: 'update_toggle');
     final held = Logic(name: 'update_held');
     final ack = Logic(name: 'update_ack');
@@ -1298,43 +1401,66 @@ class _ShadowSet {
     final aSync1 = Logic(name: 'update_ack_sync1');
     final uSync0 = Logic(name: 'update_sync0');
     final uSync1 = Logic(name: 'update_sync1');
+    final takeLate = Logic(name: 'update_take_late');
     final inFlight = (toggle ^ aSync1).named('update_in_flight');
-    final capture = (~inFlight & (update | held)).named('update_capture');
+    final capture = (~ctrlJoin & ~inFlight & (update | held)).named(
+      'update_capture',
+    );
+    // held resets to 1, so the first capture after a reset copies the
+    // inputs.
     Sequential(
-      sysClk,
-      reset: sysReset,
-      resetValues: {for (final f in _fields) f.$2: f.$4},
+      ctrlClk,
+      reset: ctrlJoin,
+      resetValues: {held: 1},
       [
         aSync0 < ack,
         aSync1 < aSync0,
         If(
           capture,
-          then: [
-            for (final (input, shadow, _, _, low) in _fields)
-              shadow < input.getRange(low),
-            toggle < ~toggle,
-            held < Const(0),
-          ],
+          then: [toggle < ~toggle, held < Const(0)],
           orElse: [
             If(update, then: [held < Const(1)]),
           ],
         ),
       ],
     );
+    Sequential(
+      ctrlClk,
+      reset: ctrlReset,
+      resetValues: {for (final f in _fields) f.$2: f.$4},
+      [
+        If(
+          capture,
+          then: [
+            for (final (input, shadow, _, _, low) in _fields)
+              shadow < input.getRange(low),
+          ],
+        ),
+      ],
+    );
     pending <= inFlight | held;
-    final takeNow = (take & (uSync1 ^ ack)).named('update_take');
+    final takeNow = (take & (uSync1 ^ ack) & ~pixelJoin).named('update_take');
+    load <= takeLate & ~pixelJoin;
+    Sequential(pixelClk, reset: pixelJoin, [
+      uSync0 < toggle,
+      uSync1 < uSync0,
+      takeLate < takeNow,
+      If(load, then: [ack < uSync1]),
+    ]);
+    final early = [
+      for (final f in _fields)
+        if (f.$3 != null) f,
+    ];
+    if (early.isEmpty) return;
     Sequential(
       pixelClk,
       reset: pixelReset,
-      resetValues: {for (final f in _fields) f.$3: f.$4},
+      resetValues: {for (final f in early) f.$3!: f.$4},
       [
-        uSync0 < toggle,
-        uSync1 < uSync0,
         If(
           takeNow,
           then: [
-            for (final (_, shadow, applied, _, _) in _fields) applied < shadow,
-            ack < uSync1,
+            for (final (_, shadow, applied, _, _) in early) applied! < shadow,
           ],
         ),
       ],

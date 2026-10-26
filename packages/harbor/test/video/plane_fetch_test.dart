@@ -110,7 +110,8 @@ Future<void> _stop() async {
 /// The tear down ends the simulation.
 /// [port] reads through a scanout port, else through a memory waist.
 /// [onCycle] runs at each pixel clock fall with the cycle count, and can
-/// pulse `update`. With [updateAtReset], `update` pulses after reset.
+/// pulse `update`. The display copies the inputs after reset, with
+/// `format_sel` at [formatAtReset].
 Future<_Run> _display(
   List<HarborPixelFormat> formats, {
   bool port = false,
@@ -122,7 +123,7 @@ Future<_Run> _display(
   int runCycles = _runCycles,
   int latency = 3,
   int Function(int cycle)? latencyAt,
-  bool updateAtReset = true,
+  int formatAtReset = 0,
   void Function(
     int cycle,
     Logic? formatSel,
@@ -204,7 +205,7 @@ Future<_Run> _display(
   pixelReset.inject(1);
   sysReset.inject(1);
   enable.inject(1);
-  formatSel?.inject(0);
+  formatSel?.inject(formatAtReset);
   update.inject(0);
   Simulator.setMaxSimTime(100000000);
   _ran = true;
@@ -213,7 +214,6 @@ Future<_Run> _display(
   await pixelClk.nextPosedge;
   pixelReset.inject(0);
   sysReset.inject(0);
-  if (updateAtReset) pulseUpdate(update, sysClk);
   for (var c = 0; c < runCycles; c++) {
     await pixelClk.nextNegedge;
     if (latencyAt != null) waistMemory!.latency = latencyAt(c);
@@ -331,15 +331,9 @@ void main() {
         HarborPixelFormat.nv12,
         HarborPixelFormat.i420,
       ],
-      // An update that waits for the take of the one at reset would go
-      // one frame late, so there is none at reset.
-      updateAtReset: false,
+      formatAtReset: 1,
       onCycle: (c, sel, _, update) {
-        // Before the first frame start and again between the two.
-        if (c == 10) {
-          sel!.inject(1);
-          update();
-        }
+        // Between the two frame starts.
         if (c == 500) {
           sel!.inject(2);
           update();

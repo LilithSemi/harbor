@@ -163,8 +163,9 @@ Future<void> _run({
   final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
   final delay = disp.pipelineDelay;
 
-  // A register block writes the inputs, then pulses update. The values
-  // at reset need no update, because frame 0 shows nothing.
+  // A register block writes the inputs, then pulses update. The display
+  // copies the inputs after reset. An update in frame 0 waits for that
+  // take and goes one frame late, so the first update is in frame 1.
   void set(OverlayFrame s, {bool pulse = true}) {
     enable.inject(s.enable ? 1 : 0);
     sel?.inject(s.format);
@@ -267,7 +268,7 @@ Future<void> _run({
       slowSeen.add(frame);
     }
     history.add(frame);
-    if ((gx, gy) == setAt && frame >= 0) set(stateOf(frame + 1));
+    if ((gx, gy) == setAt && frame >= 1) set(stateOf(frame + 1));
     if (history.length <= delay) continue;
     final f = history[history.length - 1 - delay];
     if (f < 2 || f >= frames || disp.de.value.toInt() != 1) continue;

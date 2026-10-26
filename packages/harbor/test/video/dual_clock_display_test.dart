@@ -575,8 +575,9 @@ Future<void> _convert({
   final gen = disp.subModules.whereType<VideoTimingGenerator>().single;
   final delay = disp.pipelineDelay;
 
-  // A register block writes the inputs, then pulses update. Frame 0 shows
-  // nothing, so the values at reset need no update.
+  // A register block writes the inputs, then pulses update. The display
+  // copies the inputs after reset. An update in frame 0 waits for that
+  // take and goes one frame late, so the first update is in frame 1.
   void set(int frame, {bool pulse = true}) {
     formatSel?.inject(formatOf(frame));
     final regs = setOf(frame).registers();
@@ -616,7 +617,7 @@ Future<void> _convert({
     final (gx, gy) = (gen.x.value.toInt(), gen.y.value.toInt());
     if (gx == 0 && gy == 0) frame++;
     history.add(frame);
-    if (gx == 1 && gy == 0 && frame >= 0) set(frame + 1);
+    if (gx == 1 && gy == 0 && frame >= 1) set(frame + 1);
     if (history.length <= delay) continue;
     final f = history[history.length - 1 - delay];
     if (f < 2 || disp.de.value.toInt() != 1) continue;
