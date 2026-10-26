@@ -1,8 +1,15 @@
+import 'dart:async';
+
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+import '../../support/gtpe2_status_model.dart';
+import '../../util/pcie_dma_bench.dart';
+
 void main() {
+  tearDown(() async => Simulator.reset());
+
   Logic bit() => Logic();
 
   HarborPcieEndpoint endpoint(
@@ -107,6 +114,7 @@ void main() {
         'reset_state': 4,
         'reset_fail_state': 4,
         'reset_retries': 8,
+        'link_retrains': 8,
       };
       for (final e in widths.entries) {
         final out = dut.output(e.key);
@@ -116,6 +124,14 @@ void main() {
         ).where((l) => l.parentModule is HarborGtpPciePhy && l.isOutput);
         expect(phyOut.map((l) => l.name), [e.key], reason: e.key);
       }
+
+      // The watchdog looks at the link up that the endpoint gives out.
+      final linkIn = dut.subModules
+          .expand((m) => m.subModules)
+          .whereType<HarborGtpPciePhy>()
+          .single
+          .input('hard_link_up');
+      expect(path(linkIn), contains(dut.linkUp.srcConnection));
     },
     timeout: const Timeout(Duration(minutes: 3)),
   );
@@ -237,4 +253,121 @@ void main() {
       throwsArgumentError,
     );
   });
+
+  test(
+    'a link retrain resets the DMA engine through the user reset',
+    () async {
+      // PCIE_2_1 is a black box. In the hard block, SYSRSTN low holds
+      // USERRSTN low. Here the PHY ready drives the reset of the DMA engine
+      // in the same way, on the same clock.
+      const linkWait = 200;
+      final b = await DmaBench.create(const DmaConfig());
+      final perstN = Logic(name: 'perst_n')..put(0);
+      final link = Logic(name: 'link')..put(0);
+      final common = HarborGtpCommonPorts();
+      final channels = [HarborGtpChannelPorts()];
+      final pipe = HarborPciePipeLane();
+      final model = Gtpe2StatusModel(b.clk, common, channels);
+      final phy = HarborGtpPciePhy(
+        perstN: perstN,
+        hardLinkUp: link,
+        common: common,
+        channels: channels,
+        pipes: [pipe],
+        clocks: HarborPipeClocks(
+          pclk: b.clk,
+          userClk1: b.clk,
+          userClk2: b.clk,
+          mmcmLock: model.mmcmLock,
+        ),
+        timeouts: const HarborGtpPcieTimeouts(
+          pllLock: 100,
+          resetDone: 100,
+          pmaResetDone: 50,
+          mmcmLock: 100,
+          txSync: 40,
+          rate: 60,
+          drp: 20,
+          linkWait: linkWait,
+        ),
+      );
+      await phy.build();
+      for (final l in [
+        pipe.txData,
+        pipe.txDataK,
+        pipe.txDetectRx,
+        pipe.txCompliance,
+        pipe.rxPolarity,
+        pipe.powerDown,
+        pipe.pipeRate,
+        pipe.txMargin,
+        pipe.txSwing,
+        pipe.txDeemph,
+      ]) {
+        l.inject(0);
+      }
+      pipe.txElecIdle.inject(1);
+      for (final l in phy.internalSignals) {
+        if (l.name.startsWith('por_')) l.inject(0);
+      }
+      bool ready() => phy.phyReady.value.isValid && phy.phyReady.value.toBool();
+      int retrains() => phy.linkRetrains!.value.toInt();
+
+      await b.start();
+      model.start();
+      var running = true;
+      var resets = 0;
+      unawaited(() async {
+        while (running) {
+          await b.clk.nextNegedge;
+          final r = !ready();
+          if (r && b.reset.value.toInt() == 0) resets++;
+          b.reset.inject(r ? 1 : 0);
+        }
+      }());
+      await b.cycles(4);
+      perstN.inject(1);
+      await b.waitUntil(ready, timeout: 2000, what: 'PHY ready');
+      link.inject(1);
+      await b.cycles(10);
+
+      // One descriptor in progress and one in the queue.
+      b.seedHost(0x80000000, 0x1000);
+      b.holdCompletions = true;
+      await b.setupRing(dmaCplBase, 4);
+      await b.enable();
+      for (final local in [0x1000, 0x3000]) {
+        await b.push(
+          hostAddress: 0x80000000,
+          localAddress: local,
+          length: 0x800,
+          deviceToHost: false,
+        );
+      }
+      await b.waitUntil(() => b.reads.isNotEmpty, what: 'first read');
+      final busy = await b.readReg(HarborPcieDma.registerStatus);
+      expect(busy & HarborPcieDma.statusBusy, isNonZero);
+      expect(busy >> HarborPcieDma.statusFreeShift, 63);
+      expect(retrains(), 0);
+
+      link.inject(0);
+      await b.waitUntil(() => !ready(), timeout: linkWait + 10, what: 'drop');
+      expect(retrains(), 1);
+      await b.waitUntil(ready, timeout: 2000, what: 'PHY ready again');
+      link.inject(1);
+      await b.cycles(10);
+      expect(resets, 2);
+      expect(
+        await b.readReg(HarborPcieDma.registerStatus),
+        64 << HarborPcieDma.statusFreeShift,
+      );
+      expect(await b.readReg(HarborPcieDma.registerControl), 0);
+      expect(retrains(), 1);
+      expect(phy.resetRetries.value.toInt(), 0);
+      running = false;
+      model.stop();
+      await b.finish();
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+  );
 }

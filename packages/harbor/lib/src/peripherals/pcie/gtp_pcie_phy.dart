@@ -177,6 +177,18 @@ class HarborGtpPcieTimeouts {
   /// Each wait for DRPRDY in the receive reset DRP transaction.
   final int drp;
 
+  /// Bound of the link training watchdog. When the PHY is ready and the hard
+  /// block link up stays low for this many cycles, the sequence starts again
+  /// at [HarborGtpResetState.pllReset]. 0 removes the watchdog.
+  ///
+  /// The default is 2^25 cycles, 268 ms at 125 MHz. One LTSSM pass through
+  /// Detect, Polling and Configuration with each state at its timeout takes
+  /// about 130 ms, so a slow partner gets two passes.
+  ///
+  /// A restart pulls the PHY ready low, and the hard block then resets all
+  /// user logic on its user reset. Transfers in flight stop.
+  final int linkWait;
+
   const HarborGtpPcieTimeouts({
     this.pllLock = 1 << 18,
     this.resetDone = 1 << 17,
@@ -185,6 +197,7 @@ class HarborGtpPcieTimeouts {
     this.txSync = 1 << 12,
     this.rate = 1 << 14,
     this.drp = 1 << 12,
+    this.linkWait = 1 << 25,
   });
 
   List<int> get all => [
@@ -432,6 +445,14 @@ class HarborGtpPcieLane extends Module {
 /// RXRATEDONE and PHYSTATUS, does the TX sync again, and then gives one
 /// PHYSTATUS pulse.
 ///
+/// With [HarborGtpPcieTimeouts.linkWait] above 0, a watchdog looks at the
+/// link up of the hard block on `hard_link_up`. It goes through two flop
+/// synchronisers to `pclk`. When the PHY is ready and the link stays down
+/// for `linkWait` cycles, the sequence starts again at step 2 and
+/// `link_retrains` counts up. This is not a failure, so `reset_fail_state`
+/// and `reset_retries` do not change. `reset_retries` counts GT faults and
+/// `link_retrains` counts restarts with no link partner.
+///
 /// The sequence uses the TX sync done signals of lane 0 only. Lanes 1 to 3
 /// get the same sync controls.
 ///
@@ -482,11 +503,17 @@ class HarborGtpPciePhy extends Module {
   /// Number of failures since reset, it stops at 255.
   Logic get resetRetries => output('reset_retries');
 
+  /// Number of watchdog restarts since PERST# or power-on, it stops at 255.
+  /// Null when the watchdog is off.
+  Logic? get linkRetrains =>
+      timeouts.linkWait == 0 ? null : output('link_retrains');
+
   /// High when the PIPE side is up.
   Logic get phyReady => output('phy_ready');
 
   HarborGtpPciePhy({
     required Logic perstN,
+    Logic? hardLinkUp,
     required HarborGtpCommonPorts common,
     required List<HarborGtpChannelPorts> channels,
     required List<HarborPciePipeLane> pipes,
@@ -501,9 +528,11 @@ class HarborGtpPciePhy extends Module {
     this.pipeStages = 1,
     super.name = 'gtp_pcie_phy',
   }) : super(
-         definitionName: pipeStages == 0
-             ? 'HarborGtpPciePhy_X$lanes'
-             : 'HarborGtpPciePhy_X${lanes}_Pipe$pipeStages',
+         definitionName: [
+           'HarborGtpPciePhy_X$lanes',
+           if (pipeStages != 0) 'Pipe$pipeStages',
+           if (timeouts.linkWait != 0) 'LinkWd',
+         ].join('_'),
        ) {
     harborCheckPipeStages(pipeStages);
     if (lanes != 1 && lanes != 4) {
@@ -517,6 +546,15 @@ class HarborGtpPciePhy extends Module {
     }
     for (final t in timeouts.all) {
       if (t < 4) throw ArgumentError.value(t, 'timeouts', 'below 4 cycles');
+    }
+    final linkWait = timeouts.linkWait;
+    if (linkWait < 0 || (linkWait > 0 && linkWait < 4)) {
+      throw ArgumentError.value(linkWait, 'linkWait', 'must be 0 or 4 and up');
+    }
+    if ((linkWait != 0) != (hardLinkUp != null)) {
+      throw ArgumentError(
+        'hardLinkUp must be given when linkWait is not 0, and only then',
+      );
     }
 
     perstN = addInput('perst_n', perstN);
@@ -804,7 +842,10 @@ class HarborGtpPciePhy extends Module {
     final failNow = (timedOut | lostLock | rateFail).named('fail_now');
     final fail = Logic(name: 'fail');
     final failCause = Logic(name: 'fail_cause', width: 4);
-    next <= mux(fail, s(_S.pllReset), stepNext);
+    // A watchdog restart takes the retry path, but it is not a failure.
+    final restart = linkWait == 0 ? null : Logic(name: 'link_restart');
+    final failOrRestart = restart == null ? fail : fail | restart;
+    next <= mux(failOrRestart, s(_S.pllReset), stepNext);
 
     Logic nextIs(List<HarborGtpResetState> l) =>
         l.map((v) => next.eq(s(v))).reduce((a, b) => a | b);
@@ -896,7 +937,7 @@ class HarborGtpPciePhy extends Module {
                 Const(timeouts.rate - 2, width: timeouts.rate.bitLength),
               ),
       If(
-        fail,
+        failOrRestart,
         then: [rateState < _r(_rIdle), rateTimer < 0],
         orElse: [
           Case(
@@ -938,7 +979,7 @@ class HarborGtpPciePhy extends Module {
       ),
       linkUp <
           (nextIs([_S.idle]) | ~rateState.eq(_r(_rIdle))) &
-              ~fail &
+              ~failOrRestart &
               ~failNow &
               ~drpReset.failed,
     ], reset: rst);
@@ -947,6 +988,28 @@ class HarborGtpPciePhy extends Module {
     addOutput('reset_fail_state', width: 4) <= failState;
     addOutput('reset_retries', width: 8) <= retries;
     addOutput('phy_ready') <= linkUp;
+
+    if (restart == null) return;
+    final hardUp = sync(
+      addInput('hard_link_up', hardLinkUp!),
+      'hard_link_up_s',
+    );
+    final waiting = (linkUp & ~hardUp).named('link_waiting');
+    final lw = linkWait.bitLength;
+    final linkTimer = Logic(name: 'link_timer', width: lw);
+    final linkHit = Logic(name: 'link_hit');
+    final linkRetrains = Logic(name: 'link_retrains', width: 8);
+    restart <= linkHit & waiting;
+    // link_hit is high when the timer was linkWait - 1 in the last cycle.
+    Sequential(pclk, [
+      If(waiting, then: [linkTimer < linkTimer + 1], orElse: [linkTimer < 0]),
+      linkHit < waiting & linkTimer.eq(Const(linkWait - 1, width: lw)),
+      If(
+        restart & ~linkRetrains.and(),
+        then: [linkRetrains < linkRetrains + 1],
+      ),
+    ], reset: rst);
+    addOutput('link_retrains', width: 8) <= linkRetrains;
   }
 
   static const _rIdle = 0;

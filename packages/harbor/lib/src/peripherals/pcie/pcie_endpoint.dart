@@ -78,6 +78,12 @@ class HarborPcieEndpoint extends Module {
   /// Number of failures since reset, it stops at 255.
   Logic get resetRetries => output('reset_retries');
 
+  /// Number of PHY restarts because the link did not come up, or went down
+  /// and did not come back, since PERST# or power-on. It stops at 255. A
+  /// restart resets all user logic on [userReset], so a bus master or driver
+  /// sees transfers in flight abort.
+  Logic get linkRetrains => output('link_retrains');
+
   HarborPcieEndpoint({
     required HarborDeviceTarget target,
     required Logic refClkP,
@@ -121,10 +127,12 @@ class HarborPcieEndpoint extends Module {
     );
 
     final pipe = HarborPciePipeLane();
+    final hardLinkUp = Logic(name: 'hard_link_up');
     final phy = HarborArtix7PciePhy(
       refClkP: refClkP,
       refClkN: refClkN,
       perstN: perstN,
+      hardLinkUp: hardLinkUp,
       rxP: rxP,
       rxN: rxN,
       pipe: pipe,
@@ -220,6 +228,7 @@ class HarborPcieEndpoint extends Module {
 
     final reset = ~hardBlock.output('USERRSTN');
     final link = hardBlock.output('TRNLNKUP');
+    hardLinkUp <= link;
     final stream = HarborPcieTrnAxi(
       clk: phy.userClk2,
       reset: reset,
@@ -327,6 +336,7 @@ class HarborPcieEndpoint extends Module {
     addOutput('reset_state', width: 4) <= phy.resetState;
     addOutput('reset_fail_state', width: 4) <= phy.resetFailState;
     addOutput('reset_retries', width: 8) <= phy.resetRetries;
+    addOutput('link_retrains', width: 8) <= phy.linkRetrains;
     addOutput('completer_id', width: 16) <=
         [busNumber, deviceNumber, functionNumber].swizzle();
     addOutput('rx_data', width: 64) <= stream.rxData;

@@ -102,10 +102,14 @@ class HarborArtix7PciePhy extends Module {
   /// Number of failures since reset, it stops at 255.
   Logic get resetRetries => output('reset_retries');
 
+  /// Number of link training watchdog restarts, it stops at 255.
+  Logic get linkRetrains => output('link_retrains');
+
   HarborArtix7PciePhy({
     required Logic refClkP,
     required Logic refClkN,
     required Logic perstN,
+    required Logic hardLinkUp,
     required Logic rxP,
     required Logic rxN,
     required HarborPciePipeLane pipe,
@@ -121,6 +125,7 @@ class HarborArtix7PciePhy extends Module {
     refClkP = addInput('refclk_p', refClkP);
     refClkN = addInput('refclk_n', refClkN);
     perstN = addInput('perst_n', perstN);
+    hardLinkUp = addInput('hard_link_up', hardLinkUp);
     rxP = addInput('rx_p', rxP);
     rxN = addInput('rx_n', rxN);
     final localPipe = HarborPciePipeLane()
@@ -142,6 +147,7 @@ class HarborArtix7PciePhy extends Module {
     );
     final phy = HarborGtpPciePhy(
       perstN: perstN,
+      hardLinkUp: hardLinkUp,
       common: commonPorts,
       channels: [channelPorts],
       pipes: [localPipe],
@@ -160,6 +166,7 @@ class HarborArtix7PciePhy extends Module {
     addOutput('reset_state', width: 4) <= phy.resetState;
     addOutput('reset_fail_state', width: 4) <= phy.resetFailState;
     addOutput('reset_retries', width: 8) <= phy.resetRetries;
+    addOutput('link_retrains', width: 8) <= phy.linkRetrains!;
   }
 
   /// Wait for RXRESETDONE and startup PHYSTATUS before TX buffer alignment.
