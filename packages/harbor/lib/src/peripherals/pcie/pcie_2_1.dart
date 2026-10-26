@@ -5,6 +5,9 @@ import 'pcie_2_1_params.dart';
 import 'pcie_2_1_ports.dart';
 
 /// Xilinx 7-series integrated PCIe block primitive.
+///
+/// In simulation, the link outputs show Detect with no link partner. The other
+/// outputs are not driven.
 class HarborXilinxPcie21 extends BridgeModule {
   HarborXilinxPcie21({
     required Map<String, Logic> inputs,
@@ -52,6 +55,11 @@ class HarborXilinxPcie21 extends BridgeModule {
     for (final port in xilinxPcie21OutputWidths.entries) {
       addOutput(port.key, width: port.value);
     }
+    // Simulation only. The block has no model, so these link outputs show a
+    // link with no partner. Thus no X goes into the PHY link watchdog.
+    output('TRNLNKUP') <= Const(0);
+    output('PLPHYLNKUPN') <= Const(1);
+    output('PLLTSSMSTATE') <= Const(0, width: 6);
   }
 }
 

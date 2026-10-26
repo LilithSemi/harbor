@@ -81,8 +81,9 @@ class HarborPcieEndpoint extends Module {
   /// Number of PHY restarts because the link did not come up, or went down
   /// and did not come back, since PERST# or power-on. It stops at 255. A
   /// restart resets all user logic on [userReset], so a bus master or driver
-  /// sees transfers in flight abort.
-  Logic get linkRetrains => output('link_retrains');
+  /// sees transfers in flight abort. Null when the watchdog is off.
+  Logic? get linkRetrains =>
+      timeouts.linkWait == 0 ? null : output('link_retrains');
 
   HarborPcieEndpoint({
     required HarborDeviceTarget target,
@@ -100,8 +101,9 @@ class HarborPcieEndpoint extends Module {
     Logic? irqPending,
     this.config = const HarborPcieEndpointConfig(),
     this.pipeStages = 1,
+    this.timeouts = const HarborGtpPcieTimeouts(),
     super.name = 'pcie_endpoint',
-  }) : super(definitionName: _definitionName(config, pipeStages)) {
+  }) : super(definitionName: _definitionName(config, pipeStages, timeouts)) {
     harborCheckPipeStages(pipeStages);
     _checkTarget(target);
     _checkConfig(config);
@@ -127,18 +129,24 @@ class HarborPcieEndpoint extends Module {
     );
 
     final pipe = HarborPciePipeLane();
-    final hardLinkUp = Logic(name: 'hard_link_up');
+    final watch = timeouts.linkWait != 0;
+    final hardLinkUp = watch ? Logic(name: 'hard_link_up') : null;
+    final phyLinkUpN = watch ? Logic(name: 'phy_link_up_n') : null;
+    final ltssmState = watch ? Logic(name: 'ltssm_state', width: 6) : null;
     final phy = HarborArtix7PciePhy(
       refClkP: refClkP,
       refClkN: refClkN,
       perstN: perstN,
       hardLinkUp: hardLinkUp,
+      phyLinkUpN: phyLinkUpN,
+      ltssmState: ltssmState,
       rxP: rxP,
       rxN: rxN,
       pipe: pipe,
       waitForRxResetStatus:
           (target as HarborFpgaTarget).vendor != HarborFpgaVendor.openXc7,
       pipeStages: pipeStages,
+      timeouts: timeouts,
     );
     final hardInputs = harborPcie21TiedInputs();
     hardInputs['PIPECLK'] = phy.pclk;
@@ -228,7 +236,11 @@ class HarborPcieEndpoint extends Module {
 
     final reset = ~hardBlock.output('USERRSTN');
     final link = hardBlock.output('TRNLNKUP');
-    hardLinkUp <= link;
+    if (watch) {
+      hardLinkUp! <= link;
+      phyLinkUpN! <= hardBlock.output('PLPHYLNKUPN');
+      ltssmState! <= hardBlock.output('PLLTSSMSTATE');
+    }
     final stream = HarborPcieTrnAxi(
       clk: phy.userClk2,
       reset: reset,
@@ -336,7 +348,7 @@ class HarborPcieEndpoint extends Module {
     addOutput('reset_state', width: 4) <= phy.resetState;
     addOutput('reset_fail_state', width: 4) <= phy.resetFailState;
     addOutput('reset_retries', width: 8) <= phy.resetRetries;
-    addOutput('link_retrains', width: 8) <= phy.linkRetrains;
+    if (watch) addOutput('link_retrains', width: 8) <= phy.linkRetrains!;
     addOutput('completer_id', width: 16) <=
         [busNumber, deviceNumber, functionNumber].swizzle();
     addOutput('rx_data', width: 64) <= stream.rxData;
@@ -361,6 +373,10 @@ class HarborPcieEndpoint extends Module {
 
   /// Registers on each PIPE signal between the GTP and the hard block.
   final int pipeStages;
+
+  /// Bounds of the GTP reset waits and of the link training watchdog.
+  /// [HarborGtpPcieTimeouts.linkWait] 0 removes the watchdog.
+  final HarborGtpPcieTimeouts timeouts;
 
   static void _checkTarget(HarborDeviceTarget target) {
     if (target is! HarborFpgaTarget ||
@@ -409,12 +425,14 @@ class HarborPcieEndpoint extends Module {
   static String _definitionName(
     HarborPcieEndpointConfig config,
     int pipeStages,
+    HarborGtpPcieTimeouts timeouts,
   ) => [
     'HarborPcieEndpoint_Xilinx7_X1',
     if (config.packetMemoryEntries != 2048) 'Pm${config.packetMemoryEntries}',
     if (config.bar2Bytes != 0) 'Bar2x${config.bar2Bytes.toRadixString(16)}',
     if (config.msiVectors != 1) 'Msi${config.msiVectors}',
     if (pipeStages != 0) 'Pipe$pipeStages',
+    if (timeouts.linkWait != 0) 'LinkWd',
   ].join('_');
 
   static Map<String, String> _packetMemoryParameters(int entries) =>

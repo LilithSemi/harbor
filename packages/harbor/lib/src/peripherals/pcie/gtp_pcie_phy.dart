@@ -177,9 +177,12 @@ class HarborGtpPcieTimeouts {
   /// Each wait for DRPRDY in the receive reset DRP transaction.
   final int drp;
 
-  /// Bound of the link training watchdog. When the PHY is ready and the hard
-  /// block link up stays low for this many cycles, the sequence starts again
-  /// at [HarborGtpResetState.pllReset]. 0 removes the watchdog.
+  /// Bound of the link training watchdog in Detect. When the PHY is ready,
+  /// the data link is down and the LTSSM is in Detect, this timer counts. When
+  /// the LTSSM is in Polling, Configuration or a different training state, the
+  /// timer holds its value. At the bound the sequence starts again at
+  /// [HarborGtpResetState.pllReset]. Thus a restart occurs only in Detect, and
+  /// a training that is in progress is not stopped. 0 removes the watchdog.
   ///
   /// The default is 2^25 cycles, 268 ms at 125 MHz. One LTSSM pass through
   /// Detect, Polling and Configuration with each state at its timeout takes
@@ -188,6 +191,15 @@ class HarborGtpPcieTimeouts {
   /// A restart pulls the PHY ready low, and the hard block then resets all
   /// user logic on its user reset. Transfers in flight stop.
   final int linkWait;
+
+  /// Bound of the link training watchdog in L0. When the physical link is up
+  /// and the data link stays down for this many cycles, the sequence starts
+  /// again. Data link initialisation takes microseconds, so this is a fault.
+  /// It has an effect only when [linkWait] is not 0.
+  ///
+  /// The default is 2^27 cycles, 1.07 s at 125 MHz. This is longer than
+  /// [linkWait] and longer than many Recovery passes.
+  final int dataLinkWait;
 
   const HarborGtpPcieTimeouts({
     this.pllLock = 1 << 18,
@@ -198,6 +210,7 @@ class HarborGtpPcieTimeouts {
     this.rate = 1 << 14,
     this.drp = 1 << 12,
     this.linkWait = 1 << 25,
+    this.dataLinkWait = 1 << 27,
   });
 
   List<int> get all => [
@@ -445,13 +458,21 @@ class HarborGtpPcieLane extends Module {
 /// RXRATEDONE and PHYSTATUS, does the TX sync again, and then gives one
 /// PHYSTATUS pulse.
 ///
-/// With [HarborGtpPcieTimeouts.linkWait] above 0, a watchdog looks at the
-/// link up of the hard block on `hard_link_up`. It goes through two flop
-/// synchronisers to `pclk`. When the PHY is ready and the link stays down
-/// for `linkWait` cycles, the sequence starts again at step 2 and
-/// `link_retrains` counts up. This is not a failure, so `reset_fail_state`
-/// and `reset_retries` do not change. `reset_retries` counts GT faults and
-/// `link_retrains` counts restarts with no link partner.
+/// With [HarborGtpPcieTimeouts.linkWait] above 0, a watchdog looks at three
+/// outputs of the hard block: the data link up on `hard_link_up` (TRNLNKUP),
+/// the physical link up on `phy_link_up_n` (PLPHYLNKUPN) and the LTSSM state
+/// on `ltssm_state` (PLLTSSMSTATE). They go through two flop synchronisers to
+/// `pclk`. The PHY uses an LTSSM state only when it is the same for two
+/// cycles. The watchdog restarts the sequence at step 2 in two cases:
+///
+/// - The data link is down and the LTSSM is in Detect for `linkWait` cycles.
+///   The time in other training states does not count.
+/// - The physical link is up and the data link is down for `dataLinkWait`
+///   cycles.
+///
+/// Each restart increments `link_retrains`. A restart is not a failure, so
+/// `reset_fail_state` and `reset_retries` do not change. `reset_retries`
+/// counts GT faults and `link_retrains` counts link faults.
 ///
 /// The sequence uses the TX sync done signals of lane 0 only. Lanes 1 to 3
 /// get the same sync controls.
@@ -514,6 +535,8 @@ class HarborGtpPciePhy extends Module {
   HarborGtpPciePhy({
     required Logic perstN,
     Logic? hardLinkUp,
+    Logic? phyLinkUpN,
+    Logic? ltssmState,
     required HarborGtpCommonPorts common,
     required List<HarborGtpChannelPorts> channels,
     required List<HarborPciePipeLane> pipes,
@@ -551,10 +574,20 @@ class HarborGtpPciePhy extends Module {
     if (linkWait < 0 || (linkWait > 0 && linkWait < 4)) {
       throw ArgumentError.value(linkWait, 'linkWait', 'must be 0 or 4 and up');
     }
-    if ((linkWait != 0) != (hardLinkUp != null)) {
-      throw ArgumentError(
-        'hardLinkUp must be given when linkWait is not 0, and only then',
-      );
+    if (linkWait != 0) {
+      if (timeouts.dataLinkWait < 4) {
+        throw ArgumentError.value(
+          timeouts.dataLinkWait,
+          'dataLinkWait',
+          'below 4 cycles',
+        );
+      }
+      if (hardLinkUp == null || phyLinkUpN == null || ltssmState == null) {
+        throw ArgumentError(
+          'hardLinkUp, phyLinkUpN and ltssmState must be given when linkWait '
+          'is not 0',
+        );
+      }
     }
 
     perstN = addInput('perst_n', perstN);
@@ -994,22 +1027,84 @@ class HarborGtpPciePhy extends Module {
       addInput('hard_link_up', hardLinkUp!),
       'hard_link_up_s',
     );
-    final waiting = (linkUp & ~hardUp).named('link_waiting');
-    final lw = linkWait.bitLength;
-    final linkTimer = Logic(name: 'link_timer', width: lw);
-    final linkHit = Logic(name: 'link_hit');
-    final linkRetrains = Logic(name: 'link_retrains', width: 8);
-    restart <= linkHit & waiting;
-    // link_hit is high when the timer was linkWait - 1 in the last cycle.
+    final phyUp = sync(
+      ~addInput('phy_link_up_n', phyLinkUpN!),
+      'phy_link_up_s',
+    );
+    final ltssm = HarborCdcSync(width: 6, name: 'ltssm_state_sync');
+    ltssm.input('async_in').srcConnection! <=
+        addInput('ltssm_state', ltssmState!, width: 6);
+    ltssm.input('dst_clk').srcConnection! <= pclk;
+    ltssm.input('dst_reset').srcConnection! <= rst;
+    final ltssmS = ltssm.syncOut.named('ltssm_state_s');
+    final ltssmQ = Logic(name: 'ltssm_state_q', width: 6);
+    final inDetect = Logic(name: 'ltssm_detect');
+    // Codes 0 to 3 are the Detect states (PG054).
     Sequential(pclk, [
-      If(waiting, then: [linkTimer < linkTimer + 1], orElse: [linkTimer < 0]),
-      linkHit < waiting & linkTimer.eq(Const(linkWait - 1, width: lw)),
+      ltssmQ < ltssmS,
+      inDetect < ltssmS.eq(ltssmQ) & ltssmS.getRange(2).eq(0),
+    ], reset: rst);
+
+    final dlDown = (linkUp & ~hardUp).named('dl_down');
+    final training = (dlDown & ~phyUp).named('link_training');
+    final detectRestart = _watch(
+      pclk,
+      rst,
+      'detect',
+      linkWait,
+      run: training & inDetect,
+      clear: ~training,
+    );
+    final l0 = (dlDown & phyUp).named('link_l0_dl_down');
+    final l0Restart = _watch(
+      pclk,
+      rst,
+      'l0',
+      timeouts.dataLinkWait,
+      run: l0,
+      clear: ~l0,
+    );
+    restart <= detectRestart | l0Restart;
+    final linkRetrains = Logic(name: 'link_retrains', width: 8);
+    Sequential(pclk, [
       If(
         restart & ~linkRetrains.and(),
         then: [linkRetrains < linkRetrains + 1],
       ),
     ], reset: rst);
     addOutput('link_retrains', width: 8) <= linkRetrains;
+  }
+
+  /// A timer that counts while [run] is high, holds while [run] and [clear]
+  /// are low, and goes to 0 while [clear] is high. The result is high on the
+  /// first cycle with [run] high after [bound] counted cycles.
+  static Logic _watch(
+    Logic clk,
+    Logic reset,
+    String name,
+    int bound, {
+    required Logic run,
+    required Logic clear,
+  }) {
+    final w = bound.bitLength;
+    final timer = Logic(name: '${name}_timer', width: w);
+    final hit = Logic(name: '${name}_hit');
+    Sequential(clk, [
+      If(
+        clear,
+        then: [timer < 0, hit < 0],
+        orElse: [
+          If(
+            run & ~hit,
+            then: [
+              timer < timer + 1,
+              hit < timer.eq(Const(bound - 1, width: w)),
+            ],
+          ),
+        ],
+      ),
+    ], reset: reset);
+    return (hit & run).named('${name}_restart');
   }
 
   static const _rIdle = 0;

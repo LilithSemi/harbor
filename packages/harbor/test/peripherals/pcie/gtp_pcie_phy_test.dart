@@ -18,7 +18,10 @@ const _timeouts = HarborGtpPcieTimeouts(
   drp: 20,
 );
 
-HarborGtpPcieTimeouts _withLinkWait(int linkWait) => HarborGtpPcieTimeouts(
+HarborGtpPcieTimeouts _withLinkWait(
+  int linkWait, {
+  int dataLinkWait = 1 << 27,
+}) => HarborGtpPcieTimeouts(
   pllLock: _timeouts.pllLock,
   resetDone: _timeouts.resetDone,
   pmaResetDone: _timeouts.pmaResetDone,
@@ -27,7 +30,14 @@ HarborGtpPcieTimeouts _withLinkWait(int linkWait) => HarborGtpPcieTimeouts(
   rate: _timeouts.rate,
   drp: _timeouts.drp,
   linkWait: linkWait,
+  dataLinkWait: dataLinkWait,
 );
+
+/// PLLTSSMSTATE codes from PG054.
+const _detectQuiet = 0x00;
+const _pollingActive = 0x04;
+const _configLinkWidthStart = 0x0b;
+const _l0 = 0x16;
 
 const _porFlops = {'por_lock_0', 'por_lock_1', 'por_count'};
 
@@ -58,6 +68,12 @@ class _Bench {
   /// Link up of the hard block, null when the watchdog is off.
   final Logic? hardLinkUp;
 
+  /// Physical link up of the hard block, active low.
+  final Logic? phyLinkUpN;
+
+  /// LTSSM state of the hard block.
+  final Logic? ltssmState;
+
   /// The state after each change, from the start.
   final List<_S> trace = [];
 
@@ -79,6 +95,8 @@ class _Bench {
     this.perstN,
     this.pclk,
     this.hardLinkUp,
+    this.phyLinkUpN,
+    this.ltssmState,
   );
 
   _S get state => _S.fromCode(phy.resetState.value.toInt());
@@ -86,6 +104,20 @@ class _Bench {
   int get retries => phy.resetRetries.value.toInt();
   int get linkRetrains => phy.linkRetrains!.value.toInt();
   bool hi(Logic l) => l.value.isValid && l.value.toBool();
+
+  /// Sets the hard block link outputs: the LTSSM state, the physical link up
+  /// and the data link up.
+  void link(int ltssm, {bool phy = false, bool data = false}) {
+    ltssmState!.inject(ltssm);
+    phyLinkUpN!.inject(phy ? 0 : 1);
+    hardLinkUp!.inject(data ? 1 : 0);
+  }
+
+  /// A link in L0 with the data link up.
+  void linkUp() => link(_l0, phy: true, data: true);
+
+  /// A link that is down, with the LTSSM in Detect.
+  void linkDown() => link(_detectQuiet);
 
   static Future<_Bench> start({
     int lanes = 1,
@@ -95,6 +127,7 @@ class _Bench {
     bool perstEdge = true,
     int pipeStages = 1,
     int linkWait = 1 << 25,
+    int dataLinkWait = 1 << 27,
     void Function(Gtpe2StatusModel m)? setup,
   }) async {
     final pclk = SimpleClockGenerator(8).clk;
@@ -106,10 +139,17 @@ class _Bench {
     final pipes = [for (var i = 0; i < lanes; i++) HarborPciePipeLane()];
     final model = Gtpe2StatusModel(pclk, common, channels);
     setup?.call(model);
-    final hardLinkUp = linkWait == 0 ? null : (Logic(name: 'link')..put(0));
+    final watch = linkWait != 0;
+    final hardLinkUp = watch ? (Logic(name: 'link')..put(0)) : null;
+    final phyLinkUpN = watch ? (Logic(name: 'phy_link_n')..put(1)) : null;
+    final ltssmState = watch
+        ? (Logic(name: 'ltssm', width: 6)..put(_detectQuiet))
+        : null;
     final phy = HarborGtpPciePhy(
       perstN: perstN,
       hardLinkUp: hardLinkUp,
+      phyLinkUpN: phyLinkUpN,
+      ltssmState: ltssmState,
       common: common,
       channels: channels,
       pipes: pipes,
@@ -120,7 +160,7 @@ class _Bench {
         userClk2: pclk,
         mmcmLock: model.mmcmLock,
       ),
-      timeouts: _withLinkWait(linkWait),
+      timeouts: _withLinkWait(linkWait, dataLinkWait: dataLinkWait),
       drivePllReset: drivePllReset,
       waitRxPmaResetDone: waitRxPmaResetDone,
       waitForRxResetStatus: waitForRxResetStatus,
@@ -153,6 +193,8 @@ class _Bench {
       perstN,
       pclk,
       hardLinkUp,
+      phyLinkUpN,
+      ltssmState,
     );
     Simulator.setMaxSimTime(10000000);
     unawaited(Simulator.run());
@@ -566,7 +608,7 @@ void main() {
       await b.waitFor(_S.pllReset, limit: 400);
       await b.waitFor(_S.idle);
       await b.cycles(wait ~/ 2);
-      b.hardLinkUp!.inject(1);
+      b.linkUp();
       await b.cycles(wait * 10);
       expect(b.state, _S.idle);
       expect(b.linkRetrains, 1);
@@ -580,25 +622,26 @@ void main() {
       () async {
         final b = await _Bench.start(linkWait: wait);
         await b.waitFor(_S.idle);
-        b.hardLinkUp!.inject(1);
+        b.linkUp();
         await b.cycles(wait * 2);
 
         // Down for less than linkWait.
-        b.hardLinkUp!.inject(0);
+        b.linkDown();
         await b.cycles(wait - 10);
-        b.hardLinkUp!.inject(1);
+        b.linkUp();
         await b.cycles(wait * 2);
         expect(b.state, _S.idle);
         expect(b.linkRetrains, 0);
 
-        // Down for good. The synchroniser adds 2 cycles.
-        b.hardLinkUp!.inject(0);
+        // Down for good. The synchroniser adds 2 cycles and the registered
+        // LTSSM stable check adds 2.
+        b.linkDown();
         final down = await b.until(() => b.state != _S.idle, limit: 400);
-        expect(down, wait + 3);
+        expect(down, wait + 5);
         expect(b.state, _S.pllReset);
         expect(b.linkRetrains, 1);
         await b.waitFor(_S.idle);
-        b.hardLinkUp!.inject(1);
+        b.linkUp();
         await b.cycles(wait * 3);
         expect(b.state, _S.idle);
         expect(b.linkRetrains, 1);
@@ -616,9 +659,70 @@ void main() {
       expect(b.linkRetrains, 0);
       b.perstN.inject(1);
       await b.waitFor(_S.idle);
-      b.hardLinkUp!.inject(1);
+      b.linkUp();
       await b.cycles(wait * 2);
       expect(b.linkRetrains, 0);
+      await b.finish();
+    });
+
+    test(
+      'training in progress at the end of linkWait is not stopped',
+      () async {
+        final b = await _Bench.start(linkWait: wait);
+        await b.waitFor(_S.idle);
+        // The partner starts to train just before the Detect bound.
+        await b.cycles(wait - 10);
+        b.link(_pollingActive);
+        await b.cycles(wait * 3);
+        b.link(_configLinkWidthStart);
+        await b.cycles(wait * 3);
+        expect(b.state, _S.idle);
+        expect(b.linkRetrains, 0);
+        b.linkUp();
+        await b.cycles(wait * 3);
+        expect(b.state, _S.idle);
+        expect(b.linkRetrains, 0);
+        await b.finish();
+      },
+    );
+
+    test('a failed training restarts after linkWait in Detect', () async {
+      final b = await _Bench.start(linkWait: wait);
+      await b.waitFor(_S.idle);
+      await b.cycles(wait ~/ 2);
+      b.link(_pollingActive);
+      await b.cycles(wait * 3);
+      expect(b.linkRetrains, 0);
+      // Back to Detect. The time from the first Detect stays on the timer.
+      b.linkDown();
+      final back = await b.until(() => b.state != _S.idle, limit: 400);
+      expect(back, lessThan(wait));
+      expect(b.state, _S.pllReset);
+      expect(b.linkRetrains, 1);
+      await b.finish();
+    });
+
+    test('L0 with no data link up restarts after dataLinkWait', () async {
+      const dataWait = wait * 4;
+      final b = await _Bench.start(linkWait: wait, dataLinkWait: dataWait);
+      await b.waitFor(_S.idle);
+      b.link(_l0, phy: true);
+      final restart = await b.until(
+        () => b.state != _S.idle,
+        limit: dataWait * 2,
+      );
+      // The synchroniser adds 2 cycles.
+      expect(restart, dataWait + 3);
+      expect(b.state, _S.pllReset);
+      expect(b.linkRetrains, 1);
+      expect(b.retries, 0);
+      expect(b.failState, _S.none);
+      // With the data link up, L0 has no restart.
+      await b.waitFor(_S.idle);
+      b.linkUp();
+      await b.cycles(dataWait * 2);
+      expect(b.state, _S.idle);
+      expect(b.linkRetrains, 1);
       await b.finish();
     });
 
@@ -632,28 +736,47 @@ void main() {
       await b.finish();
     });
 
-    HarborGtpPciePhy build(int linkWait, {bool link = true}) =>
-        HarborGtpPciePhy(
-          perstN: Logic(name: 'perst_n'),
-          hardLinkUp: link ? Logic(name: 'link') : null,
-          common: HarborGtpCommonPorts(),
-          channels: [HarborGtpChannelPorts()],
-          pipes: [HarborPciePipeLane()],
-          timeouts: HarborGtpPcieTimeouts(linkWait: linkWait),
-        );
+    HarborGtpPciePhy build(
+      int linkWait, {
+      bool link = true,
+      bool phyLink = true,
+      bool ltssm = true,
+      int dataLinkWait = 1 << 27,
+    }) => HarborGtpPciePhy(
+      perstN: Logic(name: 'perst_n'),
+      hardLinkUp: link ? Logic(name: 'link') : null,
+      phyLinkUpN: phyLink ? Logic(name: 'phy_link_n') : null,
+      ltssmState: ltssm ? Logic(name: 'ltssm', width: 6) : null,
+      common: HarborGtpCommonPorts(),
+      channels: [HarborGtpChannelPorts()],
+      pipes: [HarborPciePipeLane()],
+      timeouts: HarborGtpPcieTimeouts(
+        linkWait: linkWait,
+        dataLinkWait: dataLinkWait,
+      ),
+    );
 
     test('linkWait 0 builds no watchdog logic', () async {
-      final off = build(0, link: false);
+      final off = build(0);
       await off.build();
       final sv = off.generateSynth();
       expect(off.definitionName, 'HarborGtpPciePhy_X1_Pipe1');
-      for (final name in ['hard_link_up', 'link_retrains', 'link_timer']) {
+      for (final name in [
+        'hard_link_up',
+        'phy_link_up_n',
+        'ltssm_state',
+        'link_retrains',
+        'detect_timer',
+        'l0_timer',
+      ]) {
         expect(sv, isNot(contains(name)), reason: name);
       }
       final on = build(1 << 25);
       await on.build();
       expect(on.definitionName, 'HarborGtpPciePhy_X1_Pipe1_LinkWd');
       expect(on.input('hard_link_up').width, 1);
+      expect(on.input('phy_link_up_n').width, 1);
+      expect(on.input('ltssm_state').width, 6);
       expect(on.linkRetrains!.width, 8);
     });
 
@@ -662,7 +785,13 @@ void main() {
         expect(() => build(n), throwsArgumentError, reason: '$n');
       }
       expect(() => build(100, link: false), throwsArgumentError);
-      expect(() => build(0), throwsArgumentError);
+      expect(() => build(100, phyLink: false), throwsArgumentError);
+      expect(() => build(100, ltssm: false), throwsArgumentError);
+      expect(() => build(100, dataLinkWait: 3), throwsArgumentError);
+      expect(
+        build(0, link: false, phyLink: false, ltssm: false).definitionName,
+        'HarborGtpPciePhy_X1_Pipe1',
+      );
       expect(build(4).definitionName, endsWith('_LinkWd'));
     });
   });
@@ -923,6 +1052,8 @@ void main() {
           () => HarborGtpPciePhy(
             perstN: Logic(),
             hardLinkUp: Logic(),
+            phyLinkUpN: Logic(),
+            ltssmState: Logic(width: 6),
             common: HarborGtpCommonPorts(),
             channels: [HarborGtpChannelPorts()],
             pipes: [HarborPciePipeLane()],
@@ -960,6 +1091,8 @@ void main() {
         final phy = HarborGtpPciePhy(
           perstN: Logic(name: 'perst_n'),
           hardLinkUp: Logic(name: 'link'),
+          phyLinkUpN: Logic(name: 'phy_link_n'),
+          ltssmState: Logic(name: 'ltssm', width: 6),
           common: common,
           channels: [for (var i = 0; i < lanes; i++) HarborGtpChannelPorts()],
           pipes: [for (var i = 0; i < lanes; i++) HarborPciePipeLane()],
@@ -1004,6 +1137,8 @@ void main() {
         final phy = HarborGtpPciePhy(
           perstN: perstN,
           hardLinkUp: Logic(),
+          phyLinkUpN: Logic(),
+          ltssmState: Logic(width: 6),
           common: HarborGtpCommonPorts(),
           channels: [HarborGtpChannelPorts()],
           pipes: [HarborPciePipeLane()],
@@ -1032,6 +1167,8 @@ void main() {
         () => HarborGtpPciePhy(
           perstN: Logic(),
           hardLinkUp: Logic(),
+          phyLinkUpN: Logic(),
+          ltssmState: Logic(width: 6),
           common: HarborGtpCommonPorts(),
           channels: [HarborGtpChannelPorts(), HarborGtpChannelPorts()],
           pipes: [HarborPciePipeLane(), HarborPciePipeLane()],

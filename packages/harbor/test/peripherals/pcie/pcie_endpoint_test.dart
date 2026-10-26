@@ -16,6 +16,7 @@ void main() {
     HarborDeviceTarget target, {
     HarborPcieEndpointConfig config = const HarborPcieEndpointConfig(),
     int pipeStages = 1,
+    HarborGtpPcieTimeouts timeouts = const HarborGtpPcieTimeouts(),
   }) => HarborPcieEndpoint(
     target: target,
     refClkP: bit(),
@@ -30,6 +31,7 @@ void main() {
     txValid: bit(),
     config: config,
     pipeStages: pipeStages,
+    timeouts: timeouts,
   );
 
   test('rejects targets without an Artix-7 PCIe hard block', () {
@@ -59,7 +61,7 @@ void main() {
       expect(sv, contains('IBUFDS_GTE2'));
       expect(sv, isNot(contains('GTWESTREFCLK')));
       expect(sv, contains('HarborBram_68x2048'));
-      expect(sv, contains('HarborGtpPciePhy_X1_Pipe1'));
+      expect(sv, contains('HarborGtpPciePhy_X1_Pipe1_LinkWd'));
       expect(dut.pipeStages, 1);
       expect(sv, contains('HarborBram_69x2048'));
       expect(sv, contains(".VC0_RX_RAM_LIMIT(13'h7FF)"));
@@ -125,13 +127,29 @@ void main() {
         expect(phyOut.map((l) => l.name), [e.key], reason: e.key);
       }
 
-      // The watchdog looks at the link up that the endpoint gives out.
-      final linkIn = dut.subModules
+      // The watchdog looks at the link up that the endpoint gives out, and
+      // at the physical link up and the LTSSM state of the hard block.
+      final phy = dut.subModules
           .expand((m) => m.subModules)
           .whereType<HarborGtpPciePhy>()
-          .single
-          .input('hard_link_up');
-      expect(path(linkIn), contains(dut.linkUp.srcConnection));
+          .single;
+      final hard = dut.subModules.whereType<HarborXilinxPcie21>().single;
+      expect(
+        path(phy.input('hard_link_up')),
+        contains(dut.linkUp.srcConnection),
+      );
+      expect(
+        path(phy.input('hard_link_up')),
+        contains(hard.output('TRNLNKUP')),
+      );
+      expect(
+        path(phy.input('phy_link_up_n')),
+        contains(hard.output('PLPHYLNKUPN')),
+      );
+      expect(
+        path(phy.input('ltssm_state')),
+        contains(hard.output('PLLTSSMSTATE')),
+      );
     },
     timeout: const Timeout(Duration(minutes: 3)),
   );
@@ -158,7 +176,7 @@ void main() {
       expect(sv, contains('HarborPcieInterrupt'));
       expect(
         dut.definitionName,
-        'HarborPcieEndpoint_Xilinx7_X1_Bar2x1000000_Msi8_Pipe1',
+        'HarborPcieEndpoint_Xilinx7_X1_Bar2x1000000_Msi8_Pipe1_LinkWd',
       );
       expect(dut.input('irq_pending').width, 8);
       expect(dut.maxPayload.width, 3);
@@ -220,8 +238,8 @@ void main() {
     await dut.build();
     final sv = dut.generateSynth();
     expect(dut.pipeStages, 2);
-    expect(dut.definitionName, 'HarborPcieEndpoint_Xilinx7_X1_Pipe2');
-    expect(sv, contains('HarborGtpPciePhy_X1_Pipe2'));
+    expect(dut.definitionName, 'HarborPcieEndpoint_Xilinx7_X1_Pipe2_LinkWd');
+    expect(sv, contains('HarborGtpPciePhy_X1_Pipe2_LinkWd'));
     expect(sv, contains('HarborGtpPcieLane_Pipe2'));
   }, timeout: const Timeout(Duration(minutes: 3)));
 
@@ -239,6 +257,77 @@ void main() {
       );
     }
   });
+
+  test(
+    'passes the PHY timeouts, linkWait 0 removes the watchdog',
+    () async {
+      const target = HarborFpgaTarget.artix7(
+        device: 'xc7a200t',
+        package: 'fbg484',
+        useOpenXc7: true,
+      );
+      final on = endpoint(
+        target,
+        timeouts: const HarborGtpPcieTimeouts(
+          linkWait: 1000,
+          dataLinkWait: 4000,
+        ),
+      );
+      await on.build();
+      final phyOn = on.subModules
+          .expand((m) => m.subModules)
+          .whereType<HarborGtpPciePhy>()
+          .single;
+      expect(phyOn.timeouts.linkWait, 1000);
+      expect(phyOn.timeouts.dataLinkWait, 4000);
+      expect(on.linkRetrains!.width, 8);
+      await Simulator.reset();
+
+      final off = endpoint(
+        target,
+        timeouts: const HarborGtpPcieTimeouts(linkWait: 0),
+      );
+      await off.build();
+      final sv = off.generateSynth();
+      expect(off.definitionName, 'HarborPcieEndpoint_Xilinx7_X1_Pipe1');
+      expect(sv, contains('HarborArtix7PciePhy_X1_Pipe1 '));
+      expect(sv, contains('HarborGtpPciePhy_X1_Pipe1 '));
+      expect(off.linkRetrains, isNull);
+      for (final name in [
+        'link_retrains',
+        'hard_link_up',
+        'phy_link_up_n',
+        'ltssm_state',
+      ]) {
+        expect(sv, isNot(contains(name)), reason: name);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+  );
+
+  test(
+    'the hard block link outputs have values in simulation',
+    () async {
+      final dut = endpoint(
+        const HarborFpgaTarget.artix7(
+          device: 'xc7a200t',
+          package: 'fbg484',
+          useOpenXc7: true,
+        ),
+      );
+      await dut.build();
+      final phy = dut.subModules
+          .expand((m) => m.subModules)
+          .whereType<HarborGtpPciePhy>()
+          .single;
+      // PCIE_2_1 has no model, so it shows Detect with no link partner.
+      expect(phy.input('hard_link_up').value, LogicValue.zero);
+      expect(phy.input('phy_link_up_n').value, LogicValue.one);
+      expect(phy.input('ltssm_state').value, LogicValue.ofInt(0, 6));
+      expect(dut.linkUp.value, LogicValue.zero);
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+  );
 
   test('rejects unsupported packet SRAM depths', () {
     expect(
@@ -264,6 +353,15 @@ void main() {
       final b = await DmaBench.create(const DmaConfig());
       final perstN = Logic(name: 'perst_n')..put(0);
       final link = Logic(name: 'link')..put(0);
+      final phyLinkN = Logic(name: 'phy_link_n')..put(1);
+      final ltssm = Logic(name: 'ltssm', width: 6)..put(0);
+      // L0 with the data link up, or Detect with the link down.
+      void setLink(bool up) {
+        link.inject(up ? 1 : 0);
+        phyLinkN.inject(up ? 0 : 1);
+        ltssm.inject(up ? 0x16 : 0);
+      }
+
       final common = HarborGtpCommonPorts();
       final channels = [HarborGtpChannelPorts()];
       final pipe = HarborPciePipeLane();
@@ -271,6 +369,8 @@ void main() {
       final phy = HarborGtpPciePhy(
         perstN: perstN,
         hardLinkUp: link,
+        phyLinkUpN: phyLinkN,
+        ltssmState: ltssm,
         common: common,
         channels: channels,
         pipes: [pipe],
@@ -328,7 +428,7 @@ void main() {
       await b.cycles(4);
       perstN.inject(1);
       await b.waitUntil(ready, timeout: 2000, what: 'PHY ready');
-      link.inject(1);
+      setLink(true);
       await b.cycles(10);
 
       // One descriptor in progress and one in the queue.
@@ -350,11 +450,11 @@ void main() {
       expect(busy >> HarborPcieDma.statusFreeShift, 63);
       expect(retrains(), 0);
 
-      link.inject(0);
+      setLink(false);
       await b.waitUntil(() => !ready(), timeout: linkWait + 10, what: 'drop');
       expect(retrains(), 1);
       await b.waitUntil(ready, timeout: 2000, what: 'PHY ready again');
-      link.inject(1);
+      setLink(true);
       await b.cycles(10);
       expect(resets, 2);
       expect(

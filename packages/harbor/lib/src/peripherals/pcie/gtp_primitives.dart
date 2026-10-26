@@ -102,30 +102,45 @@ class HarborArtix7PciePhy extends Module {
   /// Number of failures since reset, it stops at 255.
   Logic get resetRetries => output('reset_retries');
 
-  /// Number of link training watchdog restarts, it stops at 255.
-  Logic get linkRetrains => output('link_retrains');
+  /// Number of link training watchdog restarts, it stops at 255. Null when
+  /// the watchdog is off.
+  Logic? get linkRetrains =>
+      timeouts.linkWait == 0 ? null : output('link_retrains');
 
+  /// The link inputs are optional as in [HarborGtpPciePhy]. They are
+  /// necessary only when [HarborGtpPcieTimeouts.linkWait] is not 0, and the
+  /// PHY gives an [ArgumentError] when they are missing.
   HarborArtix7PciePhy({
     required Logic refClkP,
     required Logic refClkN,
     required Logic perstN,
-    required Logic hardLinkUp,
+    Logic? hardLinkUp,
+    Logic? phyLinkUpN,
+    Logic? ltssmState,
     required Logic rxP,
     required Logic rxN,
     required HarborPciePipeLane pipe,
     this.waitForRxResetStatus = true,
     this.pipeStages = 1,
+    this.timeouts = const HarborGtpPcieTimeouts(),
     super.name = 'pcie_phy',
   }) : super(
-         definitionName: pipeStages == 0
-             ? 'HarborArtix7PciePhy_X1'
-             : 'HarborArtix7PciePhy_X1_Pipe$pipeStages',
+         definitionName: [
+           'HarborArtix7PciePhy_X1',
+           if (pipeStages != 0) 'Pipe$pipeStages',
+           if (timeouts.linkWait != 0) 'LinkWd',
+         ].join('_'),
        ) {
     harborCheckPipeStages(pipeStages);
     refClkP = addInput('refclk_p', refClkP);
     refClkN = addInput('refclk_n', refClkN);
     perstN = addInput('perst_n', perstN);
-    hardLinkUp = addInput('hard_link_up', hardLinkUp);
+    final watch = timeouts.linkWait != 0;
+    Logic? port(String name, Logic? l, [int width = 1]) =>
+        watch && l != null ? addInput(name, l, width: width) : null;
+    hardLinkUp = port('hard_link_up', hardLinkUp);
+    phyLinkUpN = port('phy_link_up_n', phyLinkUpN);
+    ltssmState = port('ltssm_state', ltssmState, 6);
     rxP = addInput('rx_p', rxP);
     rxN = addInput('rx_n', rxN);
     final localPipe = HarborPciePipeLane()
@@ -148,12 +163,15 @@ class HarborArtix7PciePhy extends Module {
     final phy = HarborGtpPciePhy(
       perstN: perstN,
       hardLinkUp: hardLinkUp,
+      phyLinkUpN: phyLinkUpN,
+      ltssmState: ltssmState,
       common: commonPorts,
       channels: [channelPorts],
       pipes: [localPipe],
       drivePllReset: false,
       waitForRxResetStatus: waitForRxResetStatus,
       pipeStages: pipeStages,
+      timeouts: timeouts,
     );
 
     addOutput('tx_p') <= channel.txP;
@@ -166,8 +184,11 @@ class HarborArtix7PciePhy extends Module {
     addOutput('reset_state', width: 4) <= phy.resetState;
     addOutput('reset_fail_state', width: 4) <= phy.resetFailState;
     addOutput('reset_retries', width: 8) <= phy.resetRetries;
-    addOutput('link_retrains', width: 8) <= phy.linkRetrains!;
+    if (watch) addOutput('link_retrains', width: 8) <= phy.linkRetrains!;
   }
+
+  /// Bounds of the waits and of the link training watchdog.
+  final HarborGtpPcieTimeouts timeouts;
 
   /// Wait for RXRESETDONE and startup PHYSTATUS before TX buffer alignment.
   final bool waitForRxResetStatus;
