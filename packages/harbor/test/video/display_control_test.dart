@@ -250,4 +250,125 @@ void main() {
       expect(out.value.toInt(), n);
     });
   }
+
+  // A port mode display with its own control clock. fb_base changes in
+  // frame 2 with no update, then one reset goes in the vertical blank of
+  // frame 3.
+  for (final control in [true, false]) {
+    final what = control
+        ? 'control_reset alone copies the live inputs'
+        : 'sys_reset alone does not touch the update handshake';
+    test(what, () async {
+      final pixelClk = SimpleClockGenerator(20).clk;
+      final scanClk = SimpleClockGenerator(4).clk;
+      final ctrlClk = SimpleClockGenerator(14).clk;
+      final pixelReset = Logic(name: 'pixel_reset');
+      final scanReset = Logic(name: 'scan_reset');
+      final ctrlReset = Logic(name: 'ctrl_reset');
+      final update = Logic(name: 'update');
+      final fbBase = Logic(name: 'fb_base', width: 32);
+      final rqReady = Logic(name: 'rq_ready');
+      final rdValid = Logic(name: 'rd_valid');
+      final rdData = Logic(name: 'rd_data', width: 16);
+      final d = HarborDualClockDisplay(
+        target: const HarborSimTarget(),
+        timing: _timing,
+        pixelClk: pixelClk,
+        pixelReset: pixelReset,
+        sysClk: scanClk,
+        sysReset: scanReset,
+        controlClk: ctrlClk,
+        controlReset: ctrlReset,
+        enable: Const(1),
+        update: update,
+        fbBase: fbBase,
+        rqReady: rqReady,
+        rdValid: rdValid,
+        rdData: rdData,
+        outputType: HarborDisplayInterface.parallelRgb,
+        formats: const [HarborPixelFormat.xrgb8888, HarborPixelFormat.rgb565],
+        formatSel: Const(0),
+        planePitch: [Const(64, width: 32)],
+      );
+      await d.build();
+      final gen = d.subModules.whereType<VideoTimingGenerator>().single;
+      final mem = PortMemory(
+        rqValid: d.rqValid,
+        rqAddr: d.rqAddr,
+        rqWords: d.rqWords,
+        rqReady: rqReady,
+        rdValid: rdValid,
+        rdData: rdData,
+        clk: scanClk,
+      );
+      Logic sig(String n) => d.signals.firstWhere((s) => s.name == n);
+      final toggle = sig('update_toggle');
+      final ack = sig('update_ack');
+      for (final r in [pixelReset, scanReset, ctrlReset]) {
+        r.inject(1);
+      }
+      update.inject(0);
+      fbBase.inject(0x10000);
+      Simulator.setMaxSimTime(1 << 40);
+      unawaited(Simulator.run());
+      addTearDown(() async {
+        if (!Simulator.simulationHasEnded) await Simulator.endSimulation();
+        Simulator.reset();
+      });
+      await pixelClk.nextPosedge;
+      await pixelClk.nextPosedge;
+      for (final r in [pixelReset, scanReset, ctrlReset]) {
+        r.inject(0);
+      }
+
+      // The handshake state at each control clock from frame 2 on.
+      var watch = false;
+      final toggles = <int>{};
+      final acks = <int>{};
+      final pending = <int>{};
+      ctrlClk.posedge.listen((_) {
+        if (!watch) return;
+        toggles.add(toggle.value.toInt());
+        acks.add(ack.value.toInt());
+        pending.add(d.updatePending.value.toInt());
+      });
+
+      final first = <int, int>{};
+      var frame = -1;
+      while (frame < 6) {
+        await pixelClk.nextNegedge;
+        final (gx, gy) = (gen.x.value.toInt(), gen.y.value.toInt());
+        if (gx == 0 && gy == 0) frame++;
+        if (gx == 0 && gy == _timing.vActive) {
+          first[frame + 1] = mem.requests.length;
+        }
+        if (frame == 2 && gx == 0 && gy == 0) watch = true;
+        if (frame == 2 && gx == 0 && gy == 2) fbBase.inject(0x30000);
+        if (frame == 3 && gx == 0 && gy == _timing.vActive + 2) {
+          final (r, clk) = control
+              ? (ctrlReset, ctrlClk)
+              : (scanReset, scanClk);
+          r.inject(1);
+          for (var i = 0; i < 3; i++) {
+            await clk.nextPosedge;
+          }
+          r.inject(0);
+        }
+      }
+      int baseOf(int f) => mem.requests[first[f]!].$1;
+      expect(baseOf(2), 0x10000);
+      expect(baseOf(3), 0x10000);
+      expect(baseOf(4), 0x10000);
+      expect([
+        baseOf(5),
+        baseOf(6),
+      ], control ? [0x30000, 0x30000] : [0x10000, 0x10000]);
+      expect(d.updatePending.value.toInt(), 0);
+      if (!control) {
+        expect(toggles, hasLength(1));
+        expect(acks, hasLength(1));
+        expect(pending, {0});
+      }
+    });
+  }
 }

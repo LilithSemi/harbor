@@ -407,12 +407,14 @@ void main() {
   });
 
   // The toggle has another value after an odd and after an even count of
-  // updates. A reset of one side must give the live inputs in both cases.
+  // updates. Before the reset the inputs change to set 4 with no update. A
+  // pixel reset alone must show the last set of an update again, and a
+  // control reset must copy the live inputs.
   for (final pixel in [true, false]) {
     for (final updates in [1, 2]) {
       final side = pixel ? 'pixel' : 'control';
-      test('a $side only reset after $updates updates applies the live '
-          'inputs', () async {
+      final shows = pixel ? 'the last updated set' : 'the live inputs';
+      test('a $side only reset after $updates updates shows $shows', () async {
         final b = _Bench();
         await b.start(_Set(0));
         var resetFrame = -1;
@@ -421,6 +423,7 @@ void main() {
             b.set(_Set(f));
             pulseUpdate(b.update, b.sysClk);
           }
+          if (f == 3 && x == 0 && y == 2) b.set(_Set(4));
           if (f == 4 && x == 0 && y == 3 && resetFrame < 0) {
             resetFrame = f;
             final (r, clk) = pixel
@@ -434,8 +437,10 @@ void main() {
           }
         });
         expect(got[updates + 1], _Set(updates).frame);
+        expect(got[4], _Set(updates).frame);
+        final want = _Set(pixel ? updates : 4).frame;
         for (var f = 7; f <= 9; f++) {
-          expect(got[f], _Set(updates).frame, reason: 'frame $f');
+          expect(got[f], want, reason: 'frame $f');
         }
         expect(b.display.updatePending.value.toInt(), 0);
       });

@@ -138,7 +138,11 @@ class HarborScanoutOverlay {
 /// `format_sel`, the pitches and the overlay inputs when [frameLoad] is
 /// high, not at [frameStart]. In a [frameStart] clock it uses the inputs
 /// when [frameLoad] is high, else the frame registers. The caller holds
-/// [frameLoad] in the [frameStart] clock or with no [frameStart].
+/// [frameLoad] in the [frameStart] clock or with no [frameStart]. The
+/// inputs that go through logic before a frame register (`format_sel`,
+/// the pitches, `overlay_format_sel`, `overlay_src_x`, `overlay_src_y` and
+/// `overlay_dst_y`) must then be [pixelClk] registers, so that no path
+/// from another clock goes through this logic.
 ///
 /// The pixel domain reads plane n with `plane_col_<n>` ([planeCol]), the
 /// word index in the line, and gets [planeData] one [pixelClk] cycle later.
@@ -287,6 +291,7 @@ class HarborDualClockScanout extends Module {
                    'h${hActive}v$vActive',
                    'x${overlay.srcX.width}y${overlay.srcY.width}',
                    'ram${blockRam?.name ?? "flop"}',
+                   if (frameLoad != null) 'load',
                    if (memory != null) ...[
                      'b$burstWords',
                      'i${memory.config.idWidth}',
@@ -303,6 +308,7 @@ class HarborDualClockScanout extends Module {
                    'f${formats.map(harborPixelFormatBitOrder.indexOf).join('x')}',
                    'h${hActive}v$vActive',
                    'ram${blockRam?.name ?? "flop"}',
+                   if (frameLoad != null) 'load',
                    if (memory != null) ...[
                      'b$burstWords',
                      'i${memory.config.idWidth}',
