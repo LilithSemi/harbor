@@ -38,6 +38,10 @@ class DviPatternSlave extends Module {
 /// One ehxplll makes the 125 MHz shift clock (clkop) and the 25 MHz pixel
 /// clock (clkos). The 25 MHz oscillator clocks the scanout DMA and a
 /// [DviPatternSlave]. [HarborDualClockDisplay] drives the four gpdi lanes.
+///
+/// With [hdmi] the display is an HDMI build. `btn_fire1` gives
+/// `hdmi_enable`, and an LFSR in the pixel domain offers a new packet at
+/// each take.
 class DviUlx3sTop extends BridgeModule {
   late final HarborDualClockDisplay display;
 
@@ -45,9 +49,11 @@ class DviUlx3sTop extends BridgeModule {
     required HarborFpgaTarget target,
     HarborDisplayTiming timing = const HarborDisplayTiming.vga640x480(),
     int pixelHz = 25000000,
-  }) : super('DviUlx3sTop', name: 'top') {
+    bool hdmi = false,
+  }) : super(hdmi ? 'HdmiUlx3sTop' : 'DviUlx3sTop', name: 'top') {
     createPort('clk', PortDirection.input);
     createPort('rst_n', PortDirection.input);
+    if (hdmi) createPort('btn_fire1', PortDirection.input);
     addOutput('gpdi_dp', width: 4);
     addOutput('led', width: 8);
 
@@ -84,6 +90,25 @@ class DviUlx3sTop extends BridgeModule {
         outstanding: 4,
       ),
     );
+    final ready = Logic(name: 'packet_ready');
+    final lfsr = Logic(name: 'packet_lfsr', width: 32);
+    if (hdmi) {
+      // x^32 + x^22 + x^2 + x + 1.
+      final fb = lfsr[31] ^ lfsr[21] ^ lfsr[1] ^ lfsr[0];
+      Sequential(pair.secondary.clk, reset: pair.secondary.reset, [
+        If(
+          ready,
+          then: [
+            lfsr <
+                mux(
+                  lfsr.eq(0),
+                  Const(1, width: 32),
+                  [lfsr.getRange(0, 31), fb].swizzle(),
+                ),
+          ],
+        ),
+      ]);
+    }
     display = HarborDualClockDisplay(
       target: target,
       timing: timing,
@@ -97,7 +122,22 @@ class DviUlx3sTop extends BridgeModule {
       update: Const(1),
       fbBase: Const(0x1000, width: 32),
       memory: memWaist,
+      hdmi: hdmi,
+      hdmiEnable: hdmi ? input('btn_fire1') : null,
+      hdmiPacketValid: hdmi ? Const(1) : null,
+      hdmiPacketHeader: hdmi ? lfsr.getRange(0, 24) : null,
+      hdmiPacketSubpacket: hdmi
+          ? [
+              for (var k = 0; k < 4; k++)
+                [lfsr.getRange(2 * k, 24 + 2 * k), lfsr].swizzle() ^
+                    Const(
+                      0x5A5A5A5A5A5A5A * (k + 1) & 0xFFFFFFFFFFFFFF,
+                      width: 56,
+                    ),
+            ]
+          : null,
     );
+    if (hdmi) ready <= display.output('hdmi_packet_ready');
     final wb = WishboneInterface(harborWishboneMemoryConfig(memWaist.config));
     HarborWishboneMemoryMaster(
       clk: sys.clk,
