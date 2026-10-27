@@ -67,8 +67,9 @@ import 'video_timing.dart';
 /// A reset of one clock is sufficient. The control side stays in reset
 /// until the pixel side was in reset and left it, so it copies no input
 /// while the pixel side can take the set from before the reset. After a
-/// pixel reset alone, [updatePending] goes high about two control clocks
-/// late.
+/// pixel reset alone, [updatePending] goes high up to three control clocks
+/// late. It stays high while the pixel clock is stopped or in reset, so a
+/// wait for it to clear needs a limit.
 ///
 /// The status outputs `underrun`, `plane_underrun`, `overlay_underrun`,
 /// `plane_underrun_count_<n>` and `overlay_underrun_count_<n>` are in the
