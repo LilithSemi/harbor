@@ -14,6 +14,7 @@ import 'csc.dart';
 import 'display_output.dart';
 import 'dual_clock_scanout.dart';
 import 'dvi_transmitter.dart';
+import 'hdmi_framer.dart';
 import 'parallel_rgb_output.dart';
 import 'pixel_unpack.dart';
 import 'tmds_encoder.dart';
@@ -143,6 +144,14 @@ import 'video_timing.dart';
 /// has the `overlay_underrun` and `overlay_underrun_count_<n>` outputs,
 /// and the `plane_underrun` outputs also for one primary plane. Its
 /// [underrun] includes the overlay planes.
+///
+/// [hdmi] adds an [HdmiFramer] to a TMDS build. It has the
+/// `hdmi_enable` input (control domain, two flops into the pixel domain)
+/// and, with [hdmiPacketValid], the packet inputs `hdmi_packet_valid`,
+/// `hdmi_packet_header` and `hdmi_packet_subpacket_0` to `_3` and the
+/// `hdmi_packet_ready` output (pixel domain), see [HdmiFramer]. With
+/// `hdmi_enable` at 0 the lanes are the same as a build without [hdmi].
+/// The TMDS latency does not change.
 class HarborDualClockDisplay extends Module {
   /// Pixel cycles from the timing generator to the parallel outputs: one for
   /// the line buffer read and one for the output register. A build with a
@@ -161,6 +170,15 @@ class HarborDualClockDisplay extends Module {
 
   /// The overlay formats, or null.
   final List<HarborPixelFormat>? overlayFormats;
+
+  /// The TMDS transmitter, null for parallelRgb.
+  DviTransmitter? transmitter;
+
+  /// The HDMI framer, null without [hdmi].
+  HdmiFramer? framer;
+
+  /// HDMI periods on the TMDS lanes, see [HdmiFramer].
+  final bool hdmi;
 
   /// The color conversion of a build with a YUV format, null for an RGB
   /// build.
@@ -283,6 +301,11 @@ class HarborDualClockDisplay extends Module {
     List<Logic>? overlayCscOutOffset,
     HarborParallelRgbLatchEdge parallelRgbLatchEdge =
         HarborParallelRgbLatchEdge.falling,
+    this.hdmi = false,
+    Logic? hdmiEnable,
+    Logic? hdmiPacketValid,
+    Logic? hdmiPacketHeader,
+    List<Logic>? hdmiPacketSubpacket,
     required HarborDeviceTarget target,
     super.name = 'dual_clock_display',
   }) : formats = List.unmodifiable(formats ?? [pixelFormat]),
@@ -322,9 +345,27 @@ class HarborDualClockDisplay extends Module {
              ) +
              (outputType == HarborDisplayInterface.parallelRgb
                  ? '_parallelRgb'
-                 : ''),
+                 : '') +
+             (hdmi ? '_hdmi' : ''),
        ) {
     requireDisplayOutputSupported(outputType);
+    if (hdmi) {
+      if (outputType == HarborDisplayInterface.parallelRgb) {
+        throw ArgumentError('hdmi needs a TMDS output');
+      }
+      if (hdmiEnable == null) {
+        throw ArgumentError('an hdmi build needs hdmiEnable');
+      }
+      if ((hdmiPacketValid == null) != (hdmiPacketHeader == null) ||
+          (hdmiPacketValid == null) != (hdmiPacketSubpacket == null)) {
+        throw ArgumentError(
+          'give hdmiPacketValid, hdmiPacketHeader and hdmiPacketSubpacket '
+          'together',
+        );
+      }
+    } else if (hdmiEnable != null || hdmiPacketValid != null) {
+      throw ArgumentError('give hdmi: true for the hdmi inputs');
+    }
     if (timing.hTotal < 2 || timing.vActive < 1) {
       throw ArgumentError('the timing needs hTotal 2 or more and vActive 1');
     }
@@ -999,7 +1040,53 @@ class HarborDualClockDisplay extends Module {
             latchEdge: parallelRgbLatchEdge,
           ).q;
     } else {
-      final transmitter = DviTransmitter(
+      HdmiFramer? f;
+      if (hdmi) {
+        var on = addInput('hdmi_enable', hdmiEnable!);
+        for (var i = 0; i < 2; i++) {
+          on = flop(
+            pixelClk,
+            on,
+            reset: pixelReset,
+          ).named('hdmi_enable_sync$i');
+        }
+        final pv = hdmiPacketValid == null
+            ? Const(0)
+            : addInput('hdmi_packet_valid', hdmiPacketValid);
+        final ph = hdmiPacketHeader == null
+            ? Const(0, width: 24)
+            : addInput('hdmi_packet_header', hdmiPacketHeader, width: 24);
+        final ps = [
+          for (var k = 0; k < 4; k++)
+            hdmiPacketSubpacket == null
+                ? Const(0, width: 56)
+                : addInput(
+                    'hdmi_packet_subpacket_$k',
+                    hdmiPacketSubpacket[k],
+                    width: 56,
+                  ),
+        ];
+        f = HdmiFramer(
+          timing: timing,
+          clk: pixelClk,
+          reset: pixelReset,
+          hdmiEnable: on,
+          videoEnable: enable,
+          de: de2,
+          hsync: hsync2,
+          vsync: vsync2,
+          x: x,
+          y: y,
+          packetValid: pv,
+          packetHeader: ph,
+          packetSubpacket: ps,
+        );
+        if (hdmiPacketValid != null) {
+          addOutput('hdmi_packet_ready') <= f.packetReady;
+        }
+        framer = f;
+      }
+      final t = DviTransmitter(
         target: target,
         pixelClk: pixelClk,
         shiftClk: shiftClk!, // 5x pixel clock from the SoC's display PLL
@@ -1011,10 +1098,14 @@ class HarborDualClockDisplay extends Module {
         red: r2,
         green: g2,
         blue: b2,
+        hdmiMode: f?.mode,
+        hdmiAux: f?.aux,
+        hdmiCtl: f?.ctl,
       );
-      gpdi <= transmitter.gpdi;
+      transmitter = t;
+      gpdi <= t.gpdi;
       if (tmdsComplement) {
-        gpdiN <= transmitter.gpdiN;
+        gpdiN <= t.gpdiN;
       }
     }
   }
