@@ -64,6 +64,12 @@ import 'video_timing.dart';
 /// [HarborCscCoefficients.bt709Limited]. A control reset does not reset
 /// the pixel side. The shadow set has no reset.
 ///
+/// A reset of one clock is sufficient. The control side stays in reset
+/// until the pixel side was in reset and left it, so it copies no input
+/// while the pixel side can take the set from before the reset. After a
+/// pixel reset alone, [updatePending] goes high about two control clocks
+/// late.
+///
 /// The status outputs `underrun`, `plane_underrun`, `overlay_underrun`,
 /// `plane_underrun_count_<n>` and `overlay_underrun_count_<n>` are in the
 /// control domain. A count crosses as gray code when `control_clk` is not
@@ -1400,7 +1406,7 @@ class _ShadowSet {
     // A reset of one side also resets the handshake of the other side.
     // Each side uses a copy of its join reset that changes only on its own
     // clock edges.
-    final ctrlJoin = harborCdcSyncReset(
+    final ctrlSync = harborCdcSyncReset(
       ctrlClk,
       ctrlReset,
       harborCdcJoinReset(
@@ -1411,7 +1417,7 @@ class _ShadowSet {
       ),
       name: 'update_ctrl_sync',
     );
-    final pixelJoin = harborCdcSyncReset(
+    final pixelSync = harborCdcSyncReset(
       pixelClk,
       pixelReset,
       harborCdcJoinReset(
@@ -1422,6 +1428,31 @@ class _ShadowSet {
       ),
       name: 'update_pixel_sync',
     );
+    // The control side then stays in reset until the pixel side was in
+    // reset and left it.
+    final req = Logic(name: 'update_reset_req');
+    final reqSync0 = Logic(name: 'update_reset_req_sync0');
+    final reqSync1 = Logic(name: 'update_reset_req_sync1');
+    final doneSync0 = Logic(name: 'update_reset_done_sync0');
+    final doneSync1 = Logic(name: 'update_reset_done_sync1');
+    Sequential(
+      ctrlClk,
+      reset: ctrlSync,
+      resetValues: {req: 1},
+      [
+        doneSync0 < reqSync1,
+        doneSync1 < doneSync0,
+        If(doneSync1, then: [req < Const(0)]),
+      ],
+    );
+    Sequential(
+      pixelClk,
+      reset: pixelSync,
+      resetValues: {reqSync0: 1, reqSync1: 1},
+      [reqSync0 < req, reqSync1 < reqSync0],
+    );
+    final ctrlJoin = (ctrlSync | req | doneSync1).named('update_ctrl_reset');
+    final pixelJoin = (pixelSync | reqSync1).named('update_pixel_reset');
     final toggle = Logic(name: 'update_toggle');
     final held = Logic(name: 'update_held');
     final resend = Logic(name: 'update_resend');

@@ -371,4 +371,133 @@ void main() {
       }
     });
   }
+
+  // A 1-clock control_reset on a fast control clock while an update waits
+  // for its take. The reset goes in at each control clock up to 12 before
+  // the take. The control side must not copy the inputs from a take to
+  // its load.
+  for (final controlPeriod in [2, 4]) {
+    test('a 1-clock control_reset of period $controlPeriod during an '
+        'update does not change the set that the pixel side takes', () async {
+      final pixelClk = SimpleClockGenerator(20).clk;
+      final scanClk = SimpleClockGenerator(4).clk;
+      final ctrlClk = SimpleClockGenerator(controlPeriod).clk;
+      final pixelReset = Logic(name: 'pixel_reset');
+      final scanReset = Logic(name: 'scan_reset');
+      final ctrlReset = Logic(name: 'ctrl_reset');
+      final update = Logic(name: 'update');
+      final fbBase = Logic(name: 'fb_base', width: 32);
+      final rqReady = Logic(name: 'rq_ready');
+      final rdValid = Logic(name: 'rd_valid');
+      final rdData = Logic(name: 'rd_data', width: 16);
+      final d = HarborDualClockDisplay(
+        target: const HarborSimTarget(),
+        timing: _timing,
+        pixelClk: pixelClk,
+        pixelReset: pixelReset,
+        sysClk: scanClk,
+        sysReset: scanReset,
+        controlClk: ctrlClk,
+        controlReset: ctrlReset,
+        enable: Const(1),
+        update: update,
+        fbBase: fbBase,
+        rqReady: rqReady,
+        rdValid: rdValid,
+        rdData: rdData,
+        outputType: HarborDisplayInterface.parallelRgb,
+        formats: const [HarborPixelFormat.xrgb8888, HarborPixelFormat.rgb565],
+        formatSel: Const(0),
+        planePitch: [Const(64, width: 32)],
+      );
+      await d.build();
+      final gen = d.subModules.whereType<VideoTimingGenerator>().single;
+      final mem = PortMemory(
+        rqValid: d.rqValid,
+        rqAddr: d.rqAddr,
+        rqWords: d.rqWords,
+        rqReady: rqReady,
+        rdValid: rdValid,
+        rdData: rdData,
+        clk: scanClk,
+      );
+      Logic sig(String n) => d.signals.firstWhere((s) => s.name == n);
+      final take = sig('update_take');
+      final capture = sig('update_capture');
+      for (final r in [pixelReset, scanReset, ctrlReset]) {
+        r.inject(1);
+      }
+      update.inject(0);
+      fbBase.inject(0x10000);
+      Simulator.setMaxSimTime(1 << 40);
+      unawaited(Simulator.run());
+      addTearDown(() async {
+        if (!Simulator.simulationHasEnded) await Simulator.endSimulation();
+        Simulator.reset();
+      });
+      await pixelClk.nextPosedge;
+      await pixelClk.nextPosedge;
+      for (final r in [pixelReset, scanReset, ctrlReset]) {
+        r.inject(0);
+      }
+
+      // The edge times of each take and each capture. The values are read
+      // half a clock before the edge.
+      final takes = <int>[];
+      final captures = <int>[];
+      pixelClk.negedge.listen((_) {
+        if (take.value == LogicValue.one) takes.add(Simulator.time + 10);
+      });
+      ctrlClk.negedge.listen((_) {
+        if (capture.value == LogicValue.one) {
+          captures.add(Simulator.time + controlPeriod ~/ 2);
+        }
+      });
+
+      const tries = 12;
+      final h = _timing.hTotal;
+      final first = <int, int>{};
+      var frame = -1;
+      while (frame < 2 * tries + 3) {
+        await pixelClk.nextNegedge;
+        final (gx, gy) = (gen.x.value.toInt(), gen.y.value.toInt());
+        if (gx == 0 && gy == 0) frame++;
+        if (gx == 0 && gy == _timing.vActive) {
+          first[frame + 1] = mem.requests.length;
+        }
+        final i = (frame - 2) ~/ 2;
+        if (frame < 2 || frame.isOdd || i >= tries) continue;
+        if (gx == 0 && gy == 2) {
+          fbBase.inject(0x20000 + 0x10000 * i);
+          pulseUpdate(update, ctrlClk);
+        }
+        // The take edge is 3.5 pixel clocks after this negedge.
+        if (gx == h - 4 && gy == _timing.vActive - 1) {
+          final edge = Simulator.time + 70 - (i + 1) * controlPeriod;
+          for (var n = 0; Simulator.time < edge - controlPeriod; n++) {
+            if (n > 100) fail('no control clock before $edge');
+            await ctrlClk.nextNegedge;
+          }
+          ctrlReset.inject(1);
+          await ctrlClk.nextNegedge;
+          ctrlReset.inject(0);
+        }
+      }
+      final torn = [
+        for (final t in takes)
+          for (final c in captures)
+            if (c >= t && c <= t + 20) 'take $t capture $c',
+      ];
+      expect(takes.length, greaterThanOrEqualTo(tries));
+      expect(torn, isEmpty);
+      for (var i = 0; i < tries; i++) {
+        expect(
+          mem.requests[first[2 * i + 4]!].$1,
+          0x20000 + 0x10000 * i,
+          reason: 'try $i',
+        );
+      }
+      expect(d.updatePending.value.toInt(), 0);
+    });
+  }
 }
