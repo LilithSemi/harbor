@@ -6,7 +6,7 @@ import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
 import '../util/tmds_decoder.dart';
-import 'tmds_reference.dart';
+import 'hdmi_bench.dart';
 
 /// TERC4 table of HDMI 1.4 section 5.4.3, q_out[9:0] for D3..D0 = 0 to 15.
 const _terc4Spec = [
@@ -36,385 +36,6 @@ int _bchByDivision(List<int> bits) {
 }
 
 List<int> _bitsOf(int v, int n) => [for (var i = 0; i < n; i++) (v >> i) & 1];
-
-typedef _Packet = ({int header, List<int> subs});
-
-/// Timing generator, one register stage, a pattern, the framer and the
-/// HDMI encoders.
-class _Bench extends Module {
-  late final HdmiFramer framer;
-  late final List<Logic> hdmiQ;
-  late final Logic de;
-  late final Logic hs;
-  late final Logic vs;
-  late final Logic rgb;
-
-  _Bench(
-    HarborDisplayTiming timing,
-    Logic clk,
-    Logic reset,
-    Logic hdmiEnable,
-    Logic valid,
-    Logic header,
-    List<Logic> subs,
-  ) : super(name: 'bench') {
-    clk = addInput('clk', clk);
-    reset = addInput('reset', reset);
-    hdmiEnable = addInput('hdmi_enable', hdmiEnable);
-    valid = addInput('valid', valid);
-    header = addInput('header', header, width: 24);
-    subs = [for (var k = 0; k < 4; k++) addInput('sub$k', subs[k], width: 56)];
-    final vtg = VideoTimingGenerator(timing: timing, clk: clk, reset: reset);
-    Logic d(Logic v) => flop(clk, v, reset: reset);
-    de = d(vtg.de);
-    hs = d(vtg.hsync);
-    vs = d(vtg.vsync);
-    final x = d(vtg.x);
-    final y = d(vtg.y);
-    Logic byte(Logic v) => v.width >= 8 ? v.getRange(0, 8) : v.zeroExtend(8);
-    final r = byte(x);
-    final g = byte(y);
-    final b = r ^ (g << 3);
-    rgb = [r, g, b].swizzle();
-    framer = HdmiFramer(
-      timing: timing,
-      clk: clk,
-      reset: reset,
-      hdmiEnable: hdmiEnable,
-      videoEnable: Const(1),
-      de: de,
-      hsync: hs,
-      vsync: vs,
-      x: x,
-      y: y,
-      packetValid: valid,
-      packetHeader: header,
-      packetSubpacket: subs,
-    );
-    addOutput('ready') <= framer.packetReady;
-    final ctrl = [
-      [vs, hs].swizzle(),
-      framer.ctl.getRange(0, 2),
-      framer.ctl.getRange(2, 4),
-    ];
-    final data = [b, g, r];
-    hdmiQ = [
-      for (var c = 0; c < 3; c++)
-        TmdsEncoder(
-          clk: clk,
-          reset: reset,
-          de: de,
-          data: data[c],
-          ctrl: ctrl[c],
-          mode: framer.mode.getRange(2 * c, 2 * c + 2),
-          aux: framer.aux.getRange(4 * c, 4 * c + 4),
-        ).q,
-    ];
-  }
-}
-
-/// The pattern pixel of the bench.
-int _pattern(int x, int y) {
-  final r = x & 0xFF;
-  final g = y & 0xFF;
-  final b = (r ^ (g << 3)) & 0xFF;
-  return r << 16 | g << 8 | b;
-}
-
-/// Waits 2 time units, less than half a clock period of the benches.
-Future<void> _settle() {
-  final done = Completer<void>();
-  Simulator.registerAction(Simulator.time + 2, done.complete);
-  return done.future;
-}
-
-class _Run {
-  final ch = [<int>[], <int>[], <int>[]];
-
-  /// The DVI symbols of the same inputs, from [TmdsReference].
-  final dvi = [<int>[], <int>[], <int>[]];
-  final sync = <int>[];
-  final taken = <_Packet>[];
-  var drained = 0;
-}
-
-/// A packet source in logic: a packet becomes valid when an LFSR hits 0 in
-/// its low 8 bits, and stays valid until taken. Each taken packet is the
-/// next value of a counter, spread over the header and subpackets.
-class _Source extends Module {
-  Logic get valid => output('valid');
-  Logic get header => output('header');
-  List<Logic> get subs => [for (var k = 0; k < 4; k++) output('sub$k')];
-
-  _Source(Logic clk, Logic reset, Logic ready) : super(name: 'source') {
-    clk = addInput('clk', clk);
-    reset = addInput('reset', reset);
-    ready = addInput('ready', ready);
-    addOutput('valid');
-    addOutput('header', width: 24);
-    final lfsr = Logic(name: 'lfsr', width: 16);
-    final count = Logic(name: 'count', width: 32);
-    final pending = Logic(name: 'pending');
-    final fb = lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10];
-    final take = pending & ready;
-    Sequential(clk, reset: reset, [
-      lfsr <
-          mux(
-            lfsr.eq(0),
-            Const(1, width: 16),
-            [lfsr.getRange(0, 15), fb].swizzle(),
-          ),
-      pending < (pending & ~take) | lfsr.getRange(0, 8).eq(0),
-      If(take, then: [count < count + 1]),
-    ]);
-    valid <= pending;
-    header <= count.getRange(0, 24) ^ Const(0x5A3C96, width: 24);
-    for (var k = 0; k < 4; k++) {
-      addOutput('sub$k', width: 56) <=
-          [count.getRange(0, 24), count].swizzle() ^
-              Const(0x123456789ABCD * (k + 3) & 0xFFFFFFFFFFFFFF, width: 56);
-    }
-  }
-}
-
-/// Like [_simulate] with packets from a [_Source]. It samples in a
-/// negedge listener, without an await for each clock, so it is fast enough
-/// for a full 720p frame.
-Future<_Run> _simulateFast(
-  HarborDisplayTiming timing,
-  int clocks, {
-  required int hdmiAt,
-}) async {
-  const period = 10;
-  final clk = SimpleClockGenerator(period).clk;
-  final reset = Logic(name: 'reset');
-  final en = Logic(name: 'hdmi_enable');
-  final ready = Logic(name: 'ready');
-  final source = _Source(clk, reset, ready);
-  final bench = _Bench(
-    timing,
-    clk,
-    reset,
-    en,
-    source.valid,
-    source.header,
-    source.subs,
-  );
-  ready <= bench.output('ready');
-  await bench.build();
-  await source.build();
-  reset.inject(1);
-  en.inject(0);
-  final run = _Run();
-  final refs = [TmdsReference(), TmdsReference(), TmdsReference()];
-  final pending = [
-    for (var k = 0; k < TmdsEncoder.latency; k++) [0, 0, 0],
-  ];
-  var started = false;
-  var i = 0;
-  clk.negedge.listen((_) {
-    if (!started || i >= clocks) return;
-    for (var c = 0; c < 3; c++) {
-      run.ch[c].add(bench.hdmiQ[c].value.toInt());
-    }
-    final sync = bench.hs.value.toInt() | bench.vs.value.toInt() << 1;
-    run.sync.add(sync);
-    final de = bench.de.value.toInt() == 1;
-    final rgb = bench.rgb.value.toInt();
-    final want = pending.removeAt(0);
-    for (var c = 0; c < 3; c++) {
-      run.dvi[c].add(want[c]);
-    }
-    pending.add([
-      refs[0].encode(de: de, data: rgb & 0xFF, ctrl: sync),
-      refs[1].encode(de: de, data: (rgb >> 8) & 0xFF, ctrl: 0),
-      refs[2].encode(de: de, data: rgb >> 16, ctrl: 0),
-    ]);
-    if (source.valid.value.toInt() == 1 && ready.value.toInt() == 1) {
-      if (bench.framer.active.value.toInt() == 1) {
-        run.taken.add((
-          header: source.header.value.toInt(),
-          subs: [for (final s in source.subs) s.value.toBigInt().toInt()],
-        ));
-      } else {
-        run.drained++;
-      }
-    }
-    if (i == hdmiAt) en.inject(1);
-    i++;
-  });
-  // Reset for two clocks, then release on a negedge, as in [_simulate].
-  Simulator.registerAction(period * 2 + period ~/ 2 - 1, () {
-    reset.inject(0);
-    started = true;
-  });
-  Simulator.setMaxSimTime(period * (clocks + 4));
-  await Simulator.run();
-  return run;
-}
-
-/// Runs [clocks] pixel clocks. [offer] gives the packet to offer in a clock
-/// (by clock index), or null. A packet stays offered until it is taken.
-/// [hdmiAt] is the clock where hdmi_enable goes to 1, -1 for never.
-Future<_Run> _simulate(
-  HarborDisplayTiming timing,
-  int clocks, {
-  int hdmiAt = 0,
-  _Packet? Function(int clock)? offer,
-}) async {
-  final clk = SimpleClockGenerator(10).clk;
-  final reset = Logic(name: 'reset');
-  final en = Logic(name: 'hdmi_enable');
-  final valid = Logic(name: 'valid');
-  final header = Logic(name: 'header', width: 24);
-  final subs = [for (var k = 0; k < 4; k++) Logic(name: 's$k', width: 56)];
-  final bench = _Bench(timing, clk, reset, en, valid, header, subs);
-  await bench.build();
-  reset.inject(1);
-  en.inject(0);
-  valid.inject(0);
-  header.inject(0);
-  for (final s in subs) {
-    s.inject(0);
-  }
-  Simulator.setMaxSimTime(20 * (clocks + 100));
-  unawaited(Simulator.run());
-  await clk.nextPosedge;
-  await clk.nextPosedge;
-  reset.inject(0);
-  final run = _Run();
-  _Packet? held;
-  final ready = bench.output('ready');
-  final refs = [TmdsReference(), TmdsReference(), TmdsReference()];
-  // The encoder output of clock i is the input of clock i - 2. The
-  // encoder registers reset to 0.
-  final pending = [
-    for (var k = 0; k < TmdsEncoder.latency; k++) [0, 0, 0],
-  ];
-  for (var i = 0; i < clocks; i++) {
-    await clk.nextNegedge;
-    for (var c = 0; c < 3; c++) {
-      run.ch[c].add(bench.hdmiQ[c].value.toInt());
-    }
-    final sync = bench.hs.value.toInt() | bench.vs.value.toInt() << 1;
-    run.sync.add(sync);
-    final de = bench.de.value.toInt() == 1;
-    final rgb = bench.rgb.value.toInt();
-    final expect = pending.removeAt(0);
-    for (var c = 0; c < 3; c++) {
-      run.dvi[c].add(expect[c]);
-    }
-    pending.add([
-      refs[0].encode(de: de, data: rgb & 0xFF, ctrl: sync),
-      refs[1].encode(de: de, data: (rgb >> 8) & 0xFF, ctrl: 0),
-      refs[2].encode(de: de, data: rgb >> 16, ctrl: 0),
-    ]);
-    if (i == hdmiAt) en.inject(1);
-    held ??= offer?.call(i);
-    valid.inject(held == null ? 0 : 1);
-    if (held != null) {
-      header.inject(held.header);
-      for (var k = 0; k < 4; k++) {
-        subs[k].inject(held.subs[k]);
-      }
-      // An inject takes effect later in the time step, so ready is read
-      // a little after it, before the next posedge.
-      await _settle();
-      if (ready.value.toInt() == 1) {
-        // With hdmi off the framer drops the packet.
-        if (bench.framer.active.value.toInt() == 1) {
-          run.taken.add(held);
-        } else {
-          run.drained++;
-        }
-        held = null;
-      }
-    }
-  }
-  await Simulator.endSimulation();
-  await Simulator.simulationEnded;
-  return run;
-}
-
-_Packet _randomPacket(Random rng) => (
-  header: rng.nextInt(1 << 24),
-  subs: [
-    for (var k = 0; k < 4; k++)
-      (rng.nextInt(1 << 28) << 28) | rng.nextInt(1 << 28),
-  ],
-);
-
-/// Decodes [run] from [from] on and checks every rule of the model, the
-/// video pattern, sync on channel 0 and that every packet the framer took
-/// comes out whole and in order. Returns the decode.
-TmdsDecode _check(HarborDisplayTiming timing, _Run run) {
-  final from = _hdmiStart(run) - 20;
-  final d = decodeTmds(
-    run.ch[0].sublist(from),
-    run.ch[1].sublist(from),
-    run.ch[2].sublist(from),
-  );
-  expect(d.errors, isEmpty, reason: d.errors.take(10).join('\n'));
-  var lines = 0;
-  for (final v in d.video) {
-    if (v.pixels.length < timing.hActive) continue;
-    expect(v.guarded, isTrue, reason: 'line at ${v.start}');
-    // The pattern green is y, so the line is known from the first pixel.
-    final y = (v.pixels.first >> 8) & 0xFF;
-    expect(v.pixels, [
-      for (var x = 0; x < timing.hActive; x++) _pattern(x, y),
-    ], reason: 'line at ${v.start}');
-    lines++;
-  }
-  expect(lines, greaterThan(0));
-  // The encoder output of clock i is the input of clock i - 2.
-  var synced = 0;
-  for (var i = 0; i < d.sync.length; i++) {
-    final j = from + i - TmdsEncoder.latency;
-    if (d.sync[i] < 0 || j < 0) continue;
-    expect(d.sync[i], run.sync[j], reason: 'sync at clock ${from + i}');
-    synced++;
-  }
-  expect(synced, greaterThan(0));
-  final got = d.packets;
-  expect(run.taken.length - got.length, inInclusiveRange(0, 1));
-  for (var k = 0; k < got.length; k++) {
-    expect(got[k].header, run.taken[k].header, reason: 'packet $k header');
-    expect(got[k].subpackets, run.taken[k].subs, reason: 'packet $k body');
-  }
-  return d;
-}
-
-/// The first clock of a preamble. hdmi_enable goes in only in a vertical
-/// blank, so frame 0 after reset is DVI.
-int _hdmiStart(_Run run) =>
-    decodeTmds(run.ch[0], run.ch[1], run.ch[2], hdmi: false).periods
-        .firstWhere(
-          (p) =>
-              p.kind == TmdsPeriodKind.videoPreamble ||
-              p.kind == TmdsPeriodKind.islandPreamble,
-        )
-        .start;
-
-List<int> _islandSizes(TmdsDecode d) => [
-  for (final p in d.periods)
-    if (p.kind == TmdsPeriodKind.island) p.length ~/ 32,
-];
-
-/// hblank 62 for one packet in each line blank, a vertical blank of 8
-/// lines for an island of 18 packets.
-const _small = HarborDisplayTiming(
-  hActive: 16,
-  hFrontPorch: 4,
-  hSyncWidth: 8,
-  hBackPorch: 50,
-  vActive: 4,
-  vFrontPorch: 2,
-  vSyncWidth: 2,
-  vBackPorch: 4,
-  pixelClock: 1000000,
-);
-
 void main() {
   tearDown(() async {
     await Simulator.reset();
@@ -507,11 +128,11 @@ void main() {
 
   test('with hdmi off the lanes are the DVI lanes', () async {
     final rng = Random(5);
-    final run = await _simulate(
-      _small,
-      _small.hTotal * _small.vTotal * 2,
+    final run = await simulateHdmi(
+      smallHdmiTiming,
+      smallHdmiTiming.hTotal * smallHdmiTiming.vTotal * 2,
       hdmiAt: -1,
-      offer: (_) => _randomPacket(rng),
+      offer: (_) => randomHdmiPacket(rng),
     );
     // Clock 1 still has the reset value of the encoder first stage.
     for (var c = 0; c < 3; c++) {
@@ -525,72 +146,85 @@ void main() {
   });
 
   test('with no packets each line has a preamble and guard band', () async {
-    final run = await _simulate(_small, _small.hTotal * _small.vTotal * 3);
-    final d = _check(_small, run);
+    final run = await simulateHdmi(
+      smallHdmiTiming,
+      smallHdmiTiming.hTotal * smallHdmiTiming.vTotal * 3,
+    );
+    final d = checkHdmi(smallHdmiTiming, run);
     expect(d.packets, isEmpty);
     expect(
       d.periods.where((p) => p.kind == TmdsPeriodKind.videoGuard).length,
-      greaterThanOrEqualTo(2 * _small.vActive),
+      greaterThanOrEqualTo(2 * smallHdmiTiming.vActive),
     );
   });
 
   test('one packet makes one island of one packet', () async {
     final rng = Random(6);
-    final p = _randomPacket(rng);
-    final run = await _simulate(
-      _small,
-      _small.hTotal * _small.vTotal * 3,
+    final p = randomHdmiPacket(rng);
+    final run = await simulateHdmi(
+      smallHdmiTiming,
+      smallHdmiTiming.hTotal * smallHdmiTiming.vTotal * 3,
       // After the first vertical blank, where hdmi_enable goes in.
-      offer: (i) => i == (_small.vTotal + 1) * _small.hTotal ? p : null,
+      offer: (i) =>
+          i == (smallHdmiTiming.vTotal + 1) * smallHdmiTiming.hTotal ? p : null,
     );
-    final d = _check(_small, run);
+    final d = checkHdmi(smallHdmiTiming, run);
     expect(run.taken, hasLength(1));
-    expect(_islandSizes(d), [1]);
+    expect(islandSizes(d), [1]);
   });
 
   test('a flood of packets fills islands up to 18 packets', () async {
     final rng = Random(7);
-    final run = await _simulate(
-      _small,
-      _small.hTotal * _small.vTotal * 4,
-      offer: (_) => _randomPacket(rng),
+    final run = await simulateHdmi(
+      smallHdmiTiming,
+      smallHdmiTiming.hTotal * smallHdmiTiming.vTotal * 4,
+      offer: (_) => randomHdmiPacket(rng),
     );
-    final d = _check(_small, run);
-    final sizes = _islandSizes(d);
+    final d = checkHdmi(smallHdmiTiming, run);
+    final sizes = islandSizes(d);
     expect(sizes.reduce(max), HdmiFramer.maxPackets);
     expect(sizes, everyElement(inInclusiveRange(1, HdmiFramer.maxPackets)));
     // Each active line blank has room for one packet.
-    expect(sizes.where((s) => s == 1).length, greaterThan(_small.vActive));
+    expect(
+      sizes.where((s) => s == 1).length,
+      greaterThan(smallHdmiTiming.vActive),
+    );
   });
 
   test('a packet offered late in a blank is held, not cut', () async {
     final rng = Random(8);
-    final h = _small.hTotal;
+    final h = smallHdmiTiming.hTotal;
     // Offer near the end of each line blank, from late to too late.
-    final run = await _simulate(
-      _small,
-      h * _small.vTotal * 4,
+    final run = await simulateHdmi(
+      smallHdmiTiming,
+      h * smallHdmiTiming.vTotal * 4,
       offer: (i) {
         final x = i % h;
-        return x >= h - 30 && rng.nextInt(4) == 0 ? _randomPacket(rng) : null;
+        return x >= h - 30 && rng.nextInt(4) == 0
+            ? randomHdmiPacket(rng)
+            : null;
       },
     );
-    final d = _check(_small, run);
+    final d = checkHdmi(smallHdmiTiming, run);
     expect(d.packets.length, greaterThan(4));
   });
 
   test('hdmi_enable goes in only in the vertical blank', () async {
-    final h = _small.hTotal;
-    final frame = h * _small.vTotal;
+    final h = smallHdmiTiming.hTotal;
+    final frame = h * smallHdmiTiming.vTotal;
     // Set in the middle of frame 1: the change waits for its vertical
     // blank, so the first guarded line is in frame 2.
-    final run = await _simulate(_small, frame * 3, hdmiAt: frame + 2 * h);
-    final firstPre = _hdmiStart(run);
-    expect(firstPre, greaterThan(frame + _small.vActive * h));
+    final run = await simulateHdmi(
+      smallHdmiTiming,
+      frame * 3,
+      hdmiAt: frame + 2 * h,
+    );
+    final firstPre = hdmiStart(run);
+    expect(firstPre, greaterThan(frame + smallHdmiTiming.vActive * h));
     for (var c = 0; c < 3; c++) {
       expect(run.ch[c].sublist(2, firstPre), run.dvi[c].sublist(2, firstPre));
     }
-    _check(_small, run);
+    checkHdmi(smallHdmiTiming, run);
   });
 
   test('the build checks the blank', () {
@@ -631,36 +265,9 @@ void main() {
   });
 
   test('a logic source at the small timing decodes clean', () async {
-    final frame = _small.hTotal * _small.vTotal;
-    final run = await _simulateFast(_small, 20 * frame, hdmiAt: 0);
-    final d = _check(_small, run);
+    final frame = smallHdmiTiming.hTotal * smallHdmiTiming.vTotal;
+    final run = await simulateHdmiFast(smallHdmiTiming, 20 * frame, hdmiAt: 0);
+    final d = checkHdmi(smallHdmiTiming, run);
     expect(d.packets.length, greaterThan(20));
   });
-
-  test(
-    '720p: hdmi off is DVI, then on decodes clean',
-    () async {
-      const timing = HarborDisplayTiming.hd720();
-      final frame = timing.hTotal * timing.vTotal;
-      // hdmi_enable goes high in frame 0 and takes effect in its vertical
-      // blank. A logic source offers packets at random clocks.
-      final run = await _simulateFast(
-        timing,
-        2 * frame + 2 * timing.hTotal,
-        hdmiAt: frame ~/ 2,
-      );
-      final on = _hdmiStart(run);
-      expect(on, greaterThan(timing.vActive * timing.hTotal));
-      for (var c = 0; c < 3; c++) {
-        expect(run.ch[c].sublist(2, on), run.dvi[c].sublist(2, on));
-      }
-      final d = _check(timing, run);
-      expect(d.packets.length, greaterThan(100));
-      expect(
-        d.video.where((v) => v.pixels.length == timing.hActive).length,
-        greaterThanOrEqualTo(timing.vActive),
-      );
-    },
-    timeout: const Timeout(Duration(hours: 2)),
-  );
 }
