@@ -138,6 +138,121 @@ class _Run {
   var drained = 0;
 }
 
+/// A packet source in logic: a packet becomes valid when an LFSR hits 0 in
+/// its low 8 bits, and stays valid until taken. Each taken packet is the
+/// next value of a counter, spread over the header and subpackets.
+class _Source extends Module {
+  Logic get valid => output('valid');
+  Logic get header => output('header');
+  List<Logic> get subs => [for (var k = 0; k < 4; k++) output('sub$k')];
+
+  _Source(Logic clk, Logic reset, Logic ready) : super(name: 'source') {
+    clk = addInput('clk', clk);
+    reset = addInput('reset', reset);
+    ready = addInput('ready', ready);
+    addOutput('valid');
+    addOutput('header', width: 24);
+    final lfsr = Logic(name: 'lfsr', width: 16);
+    final count = Logic(name: 'count', width: 32);
+    final pending = Logic(name: 'pending');
+    final fb = lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10];
+    final take = pending & ready;
+    Sequential(clk, reset: reset, [
+      lfsr <
+          mux(
+            lfsr.eq(0),
+            Const(1, width: 16),
+            [lfsr.getRange(0, 15), fb].swizzle(),
+          ),
+      pending < (pending & ~take) | lfsr.getRange(0, 8).eq(0),
+      If(take, then: [count < count + 1]),
+    ]);
+    valid <= pending;
+    header <= count.getRange(0, 24) ^ Const(0x5A3C96, width: 24);
+    for (var k = 0; k < 4; k++) {
+      addOutput('sub$k', width: 56) <=
+          [count.getRange(0, 24), count].swizzle() ^
+              Const(0x123456789ABCD * (k + 3) & 0xFFFFFFFFFFFFFF, width: 56);
+    }
+  }
+}
+
+/// Like [_simulate] with packets from a [_Source]. It samples in a
+/// negedge listener, without an await for each clock, so it is fast enough
+/// for a full 720p frame.
+Future<_Run> _simulateFast(
+  HarborDisplayTiming timing,
+  int clocks, {
+  required int hdmiAt,
+}) async {
+  const period = 10;
+  final clk = SimpleClockGenerator(period).clk;
+  final reset = Logic(name: 'reset');
+  final en = Logic(name: 'hdmi_enable');
+  final ready = Logic(name: 'ready');
+  final source = _Source(clk, reset, ready);
+  final bench = _Bench(
+    timing,
+    clk,
+    reset,
+    en,
+    source.valid,
+    source.header,
+    source.subs,
+  );
+  ready <= bench.output('ready');
+  await bench.build();
+  await source.build();
+  reset.inject(1);
+  en.inject(0);
+  final run = _Run();
+  final refs = [TmdsReference(), TmdsReference(), TmdsReference()];
+  final pending = [
+    for (var k = 0; k < TmdsEncoder.latency; k++) [0, 0, 0],
+  ];
+  var started = false;
+  var i = 0;
+  clk.negedge.listen((_) {
+    if (!started || i >= clocks) return;
+    for (var c = 0; c < 3; c++) {
+      run.ch[c].add(bench.hdmiQ[c].value.toInt());
+    }
+    final sync = bench.hs.value.toInt() | bench.vs.value.toInt() << 1;
+    run.sync.add(sync);
+    final de = bench.de.value.toInt() == 1;
+    final rgb = bench.rgb.value.toInt();
+    final want = pending.removeAt(0);
+    for (var c = 0; c < 3; c++) {
+      run.dvi[c].add(want[c]);
+    }
+    pending.add([
+      refs[0].encode(de: de, data: rgb & 0xFF, ctrl: sync),
+      refs[1].encode(de: de, data: (rgb >> 8) & 0xFF, ctrl: 0),
+      refs[2].encode(de: de, data: rgb >> 16, ctrl: 0),
+    ]);
+    if (source.valid.value.toInt() == 1 && ready.value.toInt() == 1) {
+      if (bench.framer.active.value.toInt() == 1) {
+        run.taken.add((
+          header: source.header.value.toInt(),
+          subs: [for (final s in source.subs) s.value.toBigInt().toInt()],
+        ));
+      } else {
+        run.drained++;
+      }
+    }
+    if (i == hdmiAt) en.inject(1);
+    i++;
+  });
+  // Reset for two clocks, then release on a negedge, as in [_simulate].
+  Simulator.registerAction(period * 2 + period ~/ 2 - 1, () {
+    reset.inject(0);
+    started = true;
+  });
+  Simulator.setMaxSimTime(period * (clocks + 4));
+  await Simulator.run();
+  return run;
+}
+
 /// Runs [clocks] pixel clocks. [offer] gives the packet to offer in a clock
 /// (by clock index), or null. A packet stays offered until it is taken.
 /// [hdmiAt] is the clock where hdmi_enable goes to 1, -1 for never.
@@ -515,19 +630,24 @@ void main() {
     );
   });
 
+  test('a logic source at the small timing decodes clean', () async {
+    final frame = _small.hTotal * _small.vTotal;
+    final run = await _simulateFast(_small, 20 * frame, hdmiAt: 0);
+    final d = _check(_small, run);
+    expect(d.packets.length, greaterThan(20));
+  });
+
   test(
     '720p: hdmi off is DVI, then on decodes clean',
     () async {
       const timing = HarborDisplayTiming.hd720();
       final frame = timing.hTotal * timing.vTotal;
-      final rng = Random(9);
       // hdmi_enable goes high in frame 0 and takes effect in its vertical
-      // blank. Packets come in bursts at random clocks.
-      final run = await _simulate(
+      // blank. A logic source offers packets at random clocks.
+      final run = await _simulateFast(
         timing,
         2 * frame + 2 * timing.hTotal,
         hdmiAt: frame ~/ 2,
-        offer: (i) => rng.nextInt(400) == 0 ? _randomPacket(rng) : null,
       );
       final on = _hdmiStart(run);
       expect(on, greaterThan(timing.vActive * timing.hTotal));
@@ -541,6 +661,6 @@ void main() {
         greaterThanOrEqualTo(timing.vActive),
       );
     },
-    timeout: const Timeout(Duration(hours: 4)),
+    timeout: const Timeout(Duration(hours: 2)),
   );
 }
