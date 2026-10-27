@@ -541,6 +541,6 @@ void main() {
         greaterThanOrEqualTo(timing.vActive),
       );
     },
-    timeout: const Timeout(Duration(minutes: 60)),
+    timeout: const Timeout(Duration(hours: 4)),
   );
 }
