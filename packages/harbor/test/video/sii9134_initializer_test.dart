@@ -35,7 +35,8 @@ void main() {
     var resetLowCycles = 0;
     var previousSclOe = dut.sclOe.value.toInt();
     final risingBits = <int>[];
-    while (dut.done.value.toInt() == 0) {
+    for (var i = 0; dut.done.value.toInt() == 0; i++) {
+      if (i > 19000) fail('no done in $i clocks');
       await clk.nextPosedge;
       if (dut.resetN.value.toInt() == 0) resetLowCycles++;
       final sclOe = dut.sclOe.value.toInt();
@@ -76,7 +77,8 @@ void main() {
     await clk.nextPosedge;
     reset.inject(0);
 
-    while (dut.error.value.toInt() == 0) {
+    for (var i = 0; dut.error.value.toInt() == 0; i++) {
+      if (i > 9000) fail('no error in $i clocks');
       await clk.nextPosedge;
     }
     expect(dut.done.value.toInt(), equals(0));

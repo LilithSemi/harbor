@@ -7,6 +7,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 
 import '../peripherals/sdram_phy_ecp5_harness.dart';
 import '../peripherals/sdram_pin_model.dart';
+import 'sdram_scanout_harness.dart' show waitInitDone;
 
 /// A fabric master that the test bench drives one access at a time.
 class _BenchMaster extends BridgeModule {
@@ -275,9 +276,7 @@ class ScanoutContentionBench {
       await memClk.nextPosedge;
     }
     memReset.put(0);
-    while (sdram.output('init_done').value != LogicValue.one) {
-      await memClk.nextPosedge;
-    }
+    await waitInitDone(sdram, memClk);
     enable.put(1);
     // The display takes enable at a frame start, so wait for its first
     // fetch.

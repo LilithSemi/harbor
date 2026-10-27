@@ -227,6 +227,7 @@ Future<WaistScanResult> runWaistScanout({
   // the first frame that showed pixels.
   var shown = false;
   var prevY = -1;
+  var deCount = 0;
   pixelClk.posedge.listen((_) {
     if (top.input('enable').value != LogicValue.one || !y.value.isValid) {
       return;
@@ -234,6 +235,7 @@ Future<WaistScanResult> runWaistScanout({
     final yv = y.value.toInt();
     if (de.value == LogicValue.one) {
       shown = true;
+      deCount++;
       frame[yv * 640 + x.value.toInt()] = word.value.isValid
           ? word.value.toInt()
           : -1;
@@ -243,6 +245,10 @@ Future<WaistScanResult> runWaistScanout({
       sawUnder = false;
     } else if (prevY == timing.vActive - 1 && yv == timing.vActive) {
       frameCount++;
+      final pixels = timing.hActive * timing.vActive;
+      if (deCount != pixels) {
+        errors.add('frame $frameCount: $deCount de pixels, want $pixels');
+      }
       if (checked) {
         for (var py = 0; py < lines && errors.length < 8; py++) {
           for (var px = 0; px < 640; px++) {
@@ -256,6 +262,8 @@ Future<WaistScanResult> runWaistScanout({
       }
       if (sawUnder && frameCount > 1) underrunFrames++;
       sawUnder = false;
+      frame.clear();
+      deCount = 0;
     }
     prevY = yv;
   });
@@ -270,9 +278,7 @@ Future<WaistScanResult> runWaistScanout({
   top.input('pixel_reset').srcConnection!.inject(0);
   await fabricClk.nextNegedge;
   top.input('reset').srcConnection!.inject(0);
-  while (sdram.output('init_done').value != LogicValue.one) {
-    await memClk.nextPosedge;
-  }
+  await waitInitDone(sdram, memClk);
   s.running = true;
   final rng = Random(11);
 

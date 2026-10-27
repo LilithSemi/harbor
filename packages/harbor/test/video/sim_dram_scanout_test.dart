@@ -118,8 +118,12 @@ void main() {
       pixelReset.put(0);
       enable.put(1);
 
-      // Pixels of the frame being scanned, keyed by y * hActive + x.
-      final frame = <int, int>{};
+      // Pixels of the last counted frame, keyed by y * hActive + x.
+      var frame = <int, int>{};
+      var scan = <int, int>{};
+      var deCount = 0;
+      var shown = false;
+      final shortFrames = <String>[];
       var frames = 0;
       var underrunFrames = 0;
       var underrunCycles = 0;
@@ -134,7 +138,9 @@ void main() {
         if (enable.value != LogicValue.one || !y.value.isValid) return;
         final yv = y.value.toInt();
         if (de.value == LogicValue.one) {
-          frame[yv * hActive + x.value.toInt()] = word.value.isValid
+          shown = true;
+          deCount++;
+          scan[yv * hActive + x.value.toInt()] = word.value.isValid
               ? word.value.toInt()
               : -1;
         }
@@ -142,9 +148,18 @@ void main() {
           sawUnder = true;
           underrunCycles++;
         }
-        if (prevY == lines - 1 && yv == lines) {
+        // The frames count from the first frame that showed pixels.
+        if (prevY == lines - 1 && yv == lines && shown) {
           frames++;
+          if (deCount != hActive * lines) {
+            shortFrames.add('frame $frames: $deCount de pixels');
+          }
+          frame = scan;
+          scan = {};
+          deCount = 0;
           if (sawUnder && frames > 1) underrunFrames++;
+          sawUnder = false;
+        } else if (prevY == lines - 1 && yv == lines) {
           sawUnder = false;
         }
         prevY = yv;
@@ -176,9 +191,12 @@ void main() {
 
       Future<void> waitFrames(int n) async {
         final target = frames + n;
-        while (frames < target) {
+        final limit = (n + 3) * timing.hTotal * timing.vTotal;
+        for (var i = 0; frames < target; i++) {
+          if (i > limit) fail('no $n frames in $limit pixel clocks');
           await pixelClk.nextPosedge;
         }
+        expect(shortFrames, isEmpty);
       }
 
       int pixelAddr(int px, int py) => fbBase + py * stride + px * 4;

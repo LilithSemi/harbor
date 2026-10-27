@@ -227,8 +227,11 @@ class SdramScanoutBench {
   /// Every scanout request taken: (byte address, 16-bit words).
   final requests = <(int, int)>[];
 
-  /// Pixels of the frame being scanned, keyed by y * hActive + x.
-  final frame = <int, int>{};
+  /// Pixels of the last counted frame, keyed by y * hActive + x.
+  Map<int, int> frame = {};
+
+  /// Counted frames that did not have hActive * vActive `de` pixels.
+  final shortFrames = <String>[];
 
   /// Frames completed since start.
   int frames = 0;
@@ -430,9 +433,7 @@ class SdramScanoutBench {
       await memClk.nextPosedge;
     }
     memReset.put(0);
-    while (sdram.output('init_done').value != LogicValue.one) {
-      await memClk.nextPosedge;
-    }
+    await waitInitDone(sdram, memClk);
     enable.put(1);
     _started = true;
   }
@@ -490,12 +491,15 @@ class SdramScanoutBench {
     // the first frame that showed pixels.
     var shown = false;
     var prevY = -1;
+    var scan = <int, int>{};
+    var deCount = 0;
     pixelClk.posedge.listen((_) {
       if (enable.value != LogicValue.one || !y.value.isValid) return;
       final yv = y.value.toInt();
       if (de.value == LogicValue.one) {
         shown = true;
-        frame[yv * timing.hActive + x.value.toInt()] = word.value.isValid
+        deCount++;
+        scan[yv * timing.hActive + x.value.toInt()] = word.value.isValid
             ? word.value.toInt()
             : -1;
       }
@@ -504,6 +508,13 @@ class SdramScanoutBench {
         sawUnder = false;
       } else if (prevY == timing.vActive - 1 && yv == timing.vActive) {
         frames++;
+        final want = timing.hActive * timing.vActive;
+        if (deCount != want) {
+          shortFrames.add('frame $frames: $deCount de pixels, want $want');
+        }
+        frame = scan;
+        scan = {};
+        deCount = 0;
         if (checkFrames) {
           final bad = frameErrors();
           if (bad.isNotEmpty) badFrames.add(bad);
@@ -556,13 +567,25 @@ class SdramScanoutBench {
   }
 
   /// Waits until [n] more frames have been scanned. It fails after [n] + 3
-  /// frame times.
+  /// frame times, or when a counted frame did not show every pixel.
   Future<void> waitFrames(int n) async {
     final target = frames + n;
     final limit = (n + 3) * timing.hTotal * timing.vTotal;
     for (var i = 0; frames < target; i++) {
       if (i > limit) throw StateError('no $n frames in $limit pixel clocks');
       await pixelClk.nextPosedge;
+    }
+    if (shortFrames.isNotEmpty) throw StateError(shortFrames.join(', '));
+  }
+
+  /// Waits until [busy] is [level] on `mem_clk`. It fails after 2 frame
+  /// times.
+  Future<void> waitFetch(LogicValue level) async {
+    final limit =
+        2 * timing.hTotal * timing.vTotal * pixelPeriodPs ~/ memPeriodPs;
+    for (var i = 0; fetchBusy.value != level; i++) {
+      if (i > limit) throw StateError('busy not $level in $limit clocks');
+      await memClk.nextPosedge;
     }
   }
 
@@ -694,9 +717,7 @@ Future<void> runFabricResetDuringScanout({required int memPeriodPs}) async {
   await b.waitFrames(2);
   b.checkFrames = true;
   for (var i = 0; i < 3; i++) {
-    while (b.fetchBusy.value != LogicValue.one) {
-      await b.memClk.nextPosedge;
-    }
+    await b.waitFetch(LogicValue.one);
     for (var c = 0; c < 1000; c++) {
       await b.memClk.nextPosedge;
     }
@@ -704,9 +725,7 @@ Future<void> runFabricResetDuringScanout({required int memPeriodPs}) async {
       throw StateError('the line fetch ended before the reset');
     }
     await b.resetDuringRead(b.pixelAddr(100 * i, 1));
-    while (b.fetchBusy.value == LogicValue.one) {
-      await b.memClk.nextPosedge;
-    }
+    await b.waitFetch(LogicValue.zero);
   }
   await b.waitFrames(2);
   b.checkFrames = false;
@@ -732,4 +751,18 @@ Future<void> runFabricResetDuringScanout({required int memPeriodPs}) async {
     throw StateError('pin model: ${b.model.errors.take(4)}');
   }
   await b.stop();
+}
+
+/// Waits for `init_done` of [sdram]. It fails after [limit] clocks of
+/// [memClk].
+Future<void> waitInitDone(
+  Module sdram,
+  Logic memClk, {
+  int limit = 1 << 16,
+}) async {
+  final done = sdram.output('init_done');
+  for (var i = 0; done.value != LogicValue.one; i++) {
+    if (i > limit) throw StateError('no init_done in $limit clocks');
+    await memClk.nextPosedge;
+  }
 }
