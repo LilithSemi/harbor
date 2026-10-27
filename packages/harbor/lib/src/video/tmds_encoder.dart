@@ -135,25 +135,32 @@ class TmdsEncoder extends Module {
 
     Logic symbol = mux(deS1, dataSymbol, ctrlSymbol);
     if (mode != null && aux != null) {
-      final modeS1 = flop(clk, mode, reset: reset).named('mode_s1');
-      final auxS1 = flop(clk, aux, reset: reset).named('aux_s1');
+      // The HDMI symbol is a table look up, so it is made in stage one and
+      // stage two only selects it.
       Logic terc4Symbol = Const(terc4[15], width: 10);
       for (var v = 14; v >= 0; v--) {
-        terc4Symbol = mux(auxS1.eq(v), Const(terc4[v], width: 10), terc4Symbol);
+        terc4Symbol = mux(aux.eq(v), Const(terc4[v], width: 10), terc4Symbol);
       }
-      symbol = mux(
-        modeS1.eq(modeDvi),
-        symbol,
+      final hdmiSymbol = mux(
+        mode.eq(modeTerc4),
+        terc4Symbol,
         mux(
-          modeS1.eq(modeTerc4),
-          terc4Symbol,
-          mux(
-            modeS1.eq(modeGuard0),
-            Const(guardBand0, width: 10),
-            Const(guardBand1, width: 10),
-          ),
+          mode.eq(modeGuard0),
+          Const(guardBand0, width: 10),
+          Const(guardBand1, width: 10),
         ),
       );
+      final hdmiSel = flop(
+        clk,
+        mode.neq(modeDvi),
+        reset: reset,
+      ).named('hdmi_sel_s1');
+      final hdmiS1 = flop(
+        clk,
+        hdmiSymbol,
+        reset: reset,
+      ).named('hdmi_symbol_s1');
+      symbol = mux(hdmiSel, hdmiS1, symbol);
     }
 
     final qReg = Logic(name: 'q_reg', width: 10);
