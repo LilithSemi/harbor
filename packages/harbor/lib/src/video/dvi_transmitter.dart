@@ -15,8 +15,13 @@ import 'tmds_serializer.dart';
 ///
 /// Needs [pixelClk] (the pixel clock) and [shiftClk] at 5x, each with its own
 /// synchronized reset. [gpdi] is `{clk, red, green, blue}` from MSB: bit 3 is
-/// the clock channel, bits 2..0 are TMDS data channels 2..0. HDMI uses the same
-/// signaling as DVI (audio/data islands are a later HDMI-only extra).
+/// the clock channel, bits 2..0 are TMDS data channels 2..0.
+///
+/// [hdmiMode], [hdmiAux] and [hdmiCtl] make an HDMI transmitter, for example
+/// from [HdmiFramer]. [hdmiMode] has the [TmdsEncoder] mode of channel n in
+/// bits 2n+1..2n, [hdmiAux] its TERC4 data in bits 4n+3..4n. [hdmiCtl] is
+/// CTL3..CTL0, the control bits of channels 1 and 2. With these inputs at
+/// 0 the lanes are the same as DVI.
 class DviTransmitter extends Module {
   /// Four serialized TMDS lanes: bit3 clock, bit2 red, bit1 green, bit0 blue.
   Logic get gpdi => output('gpdi');
@@ -24,6 +29,9 @@ class DviTransmitter extends Module {
   /// The four complement lanes, in the same order as [gpdi]. Present only on a
   /// target that drives its own complements ([TmdsSerializer.needsComplement]).
   Logic get gpdiN => output('gpdi_n');
+
+  /// The 10-bit symbols of channels 0, 1 and 2 before the serializers.
+  late final List<Logic> symbols;
 
   DviTransmitter({
     required Logic pixelClk,
@@ -37,8 +45,19 @@ class DviTransmitter extends Module {
     required Logic green,
     required Logic blue,
     required HarborDeviceTarget target,
+    Logic? hdmiMode,
+    Logic? hdmiAux,
+    Logic? hdmiCtl,
     super.name = 'dvi_transmitter',
-  }) : super(definitionName: 'DviTransmitter') {
+  }) : super(
+         definitionName: hdmiMode == null
+             ? 'DviTransmitter'
+             : 'DviTransmitter_hdmi',
+       ) {
+    final hdmi = hdmiMode != null;
+    if (hdmi != (hdmiAux != null) || hdmi != (hdmiCtl != null)) {
+      throw ArgumentError('give hdmiMode, hdmiAux and hdmiCtl together');
+    }
     pixelClk = addInput('pixel_clk', pixelClk);
     shiftClk = addInput('shift_clk', shiftClk);
     pixelReset = addInput('pixel_reset', pixelReset);
@@ -49,25 +68,37 @@ class DviTransmitter extends Module {
     red = addInput('red', red, width: 8);
     green = addInput('green', green, width: 8);
     blue = addInput('blue', blue, width: 8);
+    if (hdmi) {
+      hdmiMode = addInput('hdmi_mode', hdmiMode, width: 6);
+      hdmiAux = addInput('hdmi_aux', hdmiAux!, width: 12);
+      hdmiCtl = addInput('hdmi_ctl', hdmiCtl!, width: 4);
+    }
     addOutput('gpdi', width: 4);
     final complement = TmdsSerializer.needsComplement(target);
     if (complement) {
       addOutput('gpdi_n', width: 4);
     }
 
-    Logic encode(Logic data, Logic ctrl) => TmdsEncoder(
+    Logic encode(Logic data, Logic ctrl, int n) => TmdsEncoder(
       clk: pixelClk,
       reset: pixelReset,
       de: de,
       data: data,
       ctrl: ctrl,
+      mode: hdmiMode?.getRange(2 * n, 2 * n + 2),
+      aux: hdmiAux?.getRange(4 * n, 4 * n + 4),
     ).q;
 
     // Channel 0 carries the sync signals during blanking ({c1, c0} = {vsync,
-    // hsync}), the other channels carry control 0.
-    final sym0 = encode(blue, [vsync, hsync].swizzle());
-    final sym1 = encode(green, Const(0, width: 2));
-    final sym2 = encode(red, Const(0, width: 2));
+    // hsync}). Channels 1 and 2 carry CTL1..CTL0 and CTL3..CTL2, 0 for DVI.
+    final sym0 = encode(blue, [vsync, hsync].swizzle(), 0);
+    final sym1 = encode(
+      green,
+      hdmiCtl?.getRange(0, 2) ?? Const(0, width: 2),
+      1,
+    );
+    final sym2 = encode(red, hdmiCtl?.getRange(2, 4) ?? Const(0, width: 2), 2);
+    symbols = [sym0, sym1, sym2];
 
     // The shift reset can come from a far corner of the chip (the PLL lock and
     // the reset pin). Three flops let the placer cover that distance in short
