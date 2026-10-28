@@ -91,6 +91,7 @@ export 'src/video/video_capture.dart';
 export 'src/video/dvi_transmitter.dart';
 export 'src/video/framebuffer_display.dart';
 export 'src/video/hdmi_framer.dart';
+export 'src/video/hdmi_packets.dart';
 export 'src/video/scanline_dma.dart';
 export 'src/video/tmds_encoder.dart';
 export 'src/video/tmds_serializer.dart';
