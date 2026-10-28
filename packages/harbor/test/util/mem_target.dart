@@ -255,7 +255,8 @@ class MasterTop extends BridgeModule {
 ///
 /// It answers a beat [latency] cycles after `t_stb` rises, at a falling
 /// edge, and holds `t_ack` high for one cycle. Words not written read as
-/// [fill] of their word index.
+/// [fill] of their word index. While [stall] is set it answers no beat.
+/// With [driveErr], it drives `t_err` from [err] for each answer.
 class BeatMemory {
   final Module top;
   final Logic clk;
@@ -265,9 +266,16 @@ class BeatMemory {
   final Map<int, int> words = {};
   final Logic _ack;
   final Logic _rdata;
+  final Logic? _err;
 
   /// Every beat in order as (write, byte address, data, sel).
   final List<(bool, int, int, int)> log = [];
+
+  /// Holds every beat while set.
+  var stall = false;
+
+  /// Fails every beat while set. Needs [driveErr].
+  var err = false;
 
   int _wait = 0;
 
@@ -276,18 +284,22 @@ class BeatMemory {
     this.clk, {
     this.latency = 0,
     int Function(int wordIndex)? fill,
+    bool driveErr = false,
   }) : busBytes = top.output('t_wdata').width ~/ 8,
        fill = fill ?? ((i) => 0),
        _ack = Logic(name: 'tb_t_ack'),
-       _rdata = Logic(name: 'tb_t_rdata', width: top.output('t_wdata').width) {
+       _rdata = Logic(name: 'tb_t_rdata', width: top.output('t_wdata').width),
+       _err = driveErr ? Logic(name: 'tb_t_err') : null {
     top.input('t_ack').srcConnection! <= _ack;
     top.input('t_rdata').srcConnection! <= _rdata;
+    if (_err != null) top.input('t_err').srcConnection! <= _err;
   }
 
   /// Sets the start value. Call before the simulation runs.
   void start() {
     _ack.inject(0);
     _rdata.inject(0);
+    _err?.inject(0);
     clk.negedge.listen((_) => _step());
   }
 
@@ -332,6 +344,7 @@ class BeatMemory {
   void _step() {
     if (_ack.value.toBool()) {
       _ack.inject(0);
+      _err?.inject(0);
       return;
     }
     final stb = top.output('t_stb').value;
@@ -339,6 +352,7 @@ class BeatMemory {
       _wait = 0;
       return;
     }
+    if (stall) return;
     if (_wait < latency) {
       _wait++;
       return;
@@ -347,15 +361,17 @@ class BeatMemory {
     final addr = top.output('t_addr').value.toInt();
     final we = top.output('t_we').value.toBool();
     final sel = top.output('t_sel').value.toInt();
+    final fail = _err != null && err;
     if (we) {
       final data = top.output('t_wdata').value.toBigInt().toSigned(64).toInt();
-      writeWord(addr, data, sel);
+      if (!fail) writeWord(addr, data, sel);
       log.add((true, addr, data, sel));
     } else {
       final data = readWord(addr);
       _rdata.inject(data);
       log.add((false, addr, data, sel));
     }
+    _err?.inject(fail ? 1 : 0);
     _ack.inject(1);
   }
 }
