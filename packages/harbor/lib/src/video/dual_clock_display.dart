@@ -175,10 +175,11 @@ import 'video_timing.dart';
 ///
 /// N and CTS come from [HdmiAcr] for the pixel clock of [timing], so it
 /// must be the real pixel clock. The sample FIFO pops and
-/// `audio_underrun_count` counts only while HDMI is active. The status outputs (control domain, binary, stop at
-/// 0xffff) are `audio_underrun_count` (strobes with an empty FIFO, each
-/// sends a zero sample), `hdmi_packets_missed` (clocks where a packet
-/// source missed its slot) and `hdmi_packets_dropped`.
+/// `audio_underrun_count` counts only while HDMI is active. The status
+/// outputs (control domain, binary, stop at 0xffff) are
+/// `audio_underrun_count` (strobes with an empty FIFO, each sends a zero
+/// sample), `hdmi_packets_missed` (clocks where a packet source missed its
+/// slot) and `hdmi_packets_dropped`.
 class HarborDualClockDisplay extends Module {
   /// Stereo samples in the audio FIFO of an hdmi audio build.
   static const audioFifoDepth = 32;

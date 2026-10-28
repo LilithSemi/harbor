@@ -27,8 +27,7 @@ enum HdmiAudioRate {
 /// 128 * fs / 1500 to 128 * fs / 300 that is nearest to the default N
 /// (4096, 6272 or 6144) and makes CTS an integer. If no N does, it uses
 /// the default N and CTS = round(pixelClock * N / (128 * fs)). The fs
-/// generator and the
-/// ACR packet use this same pair, so the strobe rate is
+/// generator and the ACR packet use this same pair, so the strobe rate is
 /// `pixelClock * N / (128 * CTS)`, the fs that the sink regenerates.
 abstract final class HdmiAcr {
   static const _rows = <(double, List<(int, int)>)>[
@@ -38,7 +37,7 @@ abstract final class HdmiAcr {
     (27027000, [(4096, 27027), (6272, 30030), (6144, 27027)]),
     (74250000 / 1.001, [(11648, 210938), (17836, 234375), (11648, 140625)]),
     (74250000, [(4096, 74250), (6272, 82500), (6144, 74250)]),
-    (148500000 / 1.001, [(5824, 210938), (8918, 234375), (5824, 140625)]),
+    (148500000 / 1.001, [(11648, 421875), (17836, 468750), (11648, 281250)]),
     (148500000, [(4096, 148500), (6272, 165000), (6144, 148500)]),
   ];
 
