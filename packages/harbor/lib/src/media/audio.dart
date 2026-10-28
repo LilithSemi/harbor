@@ -146,7 +146,8 @@ int _codecCapsOf(List<HarborAudioCodecFormat> hwCodecs) {
 /// software clears the bits. Play 0 empties the FIFO.
 ///
 /// A write to TX_DMA_WR or TX_DMA_RD of a value at or past TX_DMA_SIZE
-/// (other than 0) does not change the register. It sets TX_DMA_ERR bit 2.
+/// (other than 0), or a write to TX_DMA_SIZE that leaves either pointer at
+/// or past the new size, does not change the register. It sets TX_DMA_ERR bit 2.
 ///
 /// The `tx_underrun_count`, `tx_dma_error`, `tx_dma_timeout` and
 /// `tx_dma_ptr_error` outputs show TX_UNDERRUN and the TX_DMA_ERR bits.
@@ -498,13 +499,24 @@ class HarborAudioController extends BridgeModule
     final wrNew = aligned(bus.selMerge(txDmaWr, 0x40)).named('tx_dma_wr_new');
     final rdNew = aligned(bus.selMerge(txDmaRd, 0x48)).named('tx_dma_rd_new');
     Logic pastSize(Logic v) => v.gte(txDmaSize) & v.neq(0);
+    final sizeNew = aligned(
+      bus.selMerge(txDmaSize, 0x38),
+    ).named('tx_dma_size_new');
+    final badSize =
+        (writes(0x38) &
+                mux(
+                  sizeNew.eq(0),
+                  txDmaWr.neq(0) | txDmaRd.neq(0),
+                  txDmaWr.gte(sizeNew) | txDmaRd.gte(sizeNew),
+                ))
+            .named('bad_size');
     final badWr = (writes(0x40) & pastSize(wrNew)).named('bad_wr');
     final badRd = (writes(0x48) & ~play & fetchIdle & pastSize(rdNew)).named(
       'bad_rd',
     );
 
     final intSet = [
-      readFail | badWr | badRd,
+      readFail | badWr | badRd | badSize,
       Const(0, width: 2),
       underrun,
       Const(0, width: 2),
@@ -656,7 +668,9 @@ class HarborAudioController extends BridgeModule
                 CaseItem(Const(0x38, width: 12), [
                   If(
                     bus.we,
-                    then: [txDmaSize < aligned(bus.selMerge(txDmaSize, 0x38))],
+                    then: [
+                      If(~badSize, then: [txDmaSize < sizeNew]),
+                    ],
                     orElse: [bus.dataOut < txDmaSize],
                   ),
                 ]),
@@ -758,7 +772,7 @@ class HarborAudioController extends BridgeModule
           intStatus < (intStatus & ~intClear) | intSet,
           errBus < (errBus & ~errClear[0]) | readFail & ~readTimeout,
           errTimeout < (errTimeout & ~errClear[1]) | readFail & readTimeout,
-          errPtr < (errPtr & ~errClear[2]) | badWr | badRd,
+          errPtr < (errPtr & ~errClear[2]) | badWr | badRd | badSize,
           If.block([
             Iff(writes(0x98), [underruns < Const(0, width: 16)]),
             ElseIf(underrun & ~underruns.and(), [underruns < underruns + 1]),

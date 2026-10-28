@@ -275,6 +275,21 @@ void main() {
         await b.bus.write(0x40, 0x38);
         expect(await b.bus.read(0x40), 0x38);
         expect(await b.bus.read(0xA0), 0);
+        // A smaller size would leave WR (0x38) past the end.
+        for (final bad in [0, 0x38, 0x30]) {
+          await b.bus.write(0x38, bad);
+          expect(await b.bus.read(0x38), 64, reason: 'size $bad');
+        }
+        expect(await b.bus.read(0xA0), 4);
+        await b.bus.write(0xA0, 4);
+        await b.bus.write(0x38, 0x40);
+        expect(await b.bus.read(0xA0), 0);
+        // Size 0 is legal only while both pointers are 0.
+        await b.bus.write(0x40, 0);
+        await b.bus.write(0x48, 0);
+        await b.bus.write(0x38, 0);
+        expect(await b.bus.read(0x38), 0);
+        expect(await b.bus.read(0xA0), 0);
         await Simulator.endSimulation();
       });
     });
