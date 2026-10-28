@@ -41,7 +41,9 @@ class DviPatternSlave extends Module {
 ///
 /// With [hdmi] the display is an HDMI build. `btn_fire1` gives
 /// `hdmi_enable`, and an LFSR in the pixel domain offers a new packet at
-/// each take.
+/// each take. With [audio] too, the display sends its own packets. A
+/// counter on the sys clock gives the samples, `btn_fire2` and `btn_up`
+/// give `audio_fs_sel`, and the leds show the status counts.
 class DviUlx3sTop extends BridgeModule {
   late final HarborDualClockDisplay display;
 
@@ -50,10 +52,23 @@ class DviUlx3sTop extends BridgeModule {
     HarborDisplayTiming timing = const HarborDisplayTiming.vga640x480(),
     int pixelHz = 25000000,
     bool hdmi = false,
-  }) : super(hdmi ? 'HdmiUlx3sTop' : 'DviUlx3sTop', name: 'top') {
+    bool audio = false,
+  }) : super(
+         audio
+             ? 'HdmiAudioUlx3sTop'
+             : hdmi
+             ? 'HdmiUlx3sTop'
+             : 'DviUlx3sTop',
+         name: 'top',
+       ) {
+    if (audio && !hdmi) throw ArgumentError('audio needs hdmi');
     createPort('clk', PortDirection.input);
     createPort('rst_n', PortDirection.input);
     if (hdmi) createPort('btn_fire1', PortDirection.input);
+    if (audio) {
+      createPort('btn_fire2', PortDirection.input);
+      createPort('btn_up', PortDirection.input);
+    }
     addOutput('gpdi_dp', width: 4);
     addOutput('led', width: 8);
 
@@ -92,7 +107,15 @@ class DviUlx3sTop extends BridgeModule {
     );
     final ready = Logic(name: 'packet_ready');
     final lfsr = Logic(name: 'packet_lfsr', width: 32);
-    if (hdmi) {
+    final sample = Logic(name: 'sample', width: 24);
+    final sampleReady = Logic(name: 'sample_ready');
+    if (audio) {
+      Sequential(sys.clk, reset: sys.reset, [
+        If(sampleReady, then: [sample < sample + 0x1234]),
+      ]);
+    }
+    final packets = hdmi && !audio;
+    if (packets) {
       // x^32 + x^22 + x^2 + x + 1.
       final fb = lfsr[31] ^ lfsr[21] ^ lfsr[1] ^ lfsr[0];
       Sequential(pair.secondary.clk, reset: pair.secondary.reset, [
@@ -111,7 +134,22 @@ class DviUlx3sTop extends BridgeModule {
     }
     display = HarborDualClockDisplay(
       target: target,
-      timing: timing,
+      // N and CTS need the real pixel clock.
+      timing: audio
+          ? HarborDisplayTiming(
+              hActive: timing.hActive,
+              hFrontPorch: timing.hFrontPorch,
+              hSyncWidth: timing.hSyncWidth,
+              hBackPorch: timing.hBackPorch,
+              vActive: timing.vActive,
+              vFrontPorch: timing.vFrontPorch,
+              vSyncWidth: timing.vSyncWidth,
+              vBackPorch: timing.vBackPorch,
+              pixelClock: pixelHz,
+              hSyncPositive: timing.hSyncPositive,
+              vSyncPositive: timing.vSyncPositive,
+            )
+          : timing,
       pixelClk: pair.secondary.clk,
       pixelReset: pair.secondary.reset,
       shiftClk: pair.primary.clk,
@@ -124,9 +162,9 @@ class DviUlx3sTop extends BridgeModule {
       memory: memWaist,
       hdmi: hdmi,
       hdmiEnable: hdmi ? input('btn_fire1') : null,
-      hdmiPacketValid: hdmi ? Const(1) : null,
-      hdmiPacketHeader: hdmi ? lfsr.getRange(0, 24) : null,
-      hdmiPacketSubpacket: hdmi
+      hdmiPacketValid: packets ? Const(1) : null,
+      hdmiPacketHeader: packets ? lfsr.getRange(0, 24) : null,
+      hdmiPacketSubpacket: packets
           ? [
               for (var k = 0; k < 4; k++)
                 [lfsr.getRange(2 * k, 24 + 2 * k), lfsr].swizzle() ^
@@ -136,8 +174,16 @@ class DviUlx3sTop extends BridgeModule {
                     ),
             ]
           : null,
+      hdmiVic: audio ? Const(1, width: 7) : null,
+      audioFsSel: audio
+          ? [input('btn_up'), input('btn_fire2')].swizzle()
+          : null,
+      audioValid: audio ? Const(1) : null,
+      audioLeft: audio ? sample : null,
+      audioRight: audio ? ~sample : null,
     );
-    if (hdmi) ready <= display.output('hdmi_packet_ready');
+    if (packets) ready <= display.output('hdmi_packet_ready');
+    if (audio) sampleReady <= display.output('audio_ready');
     final wb = WishboneInterface(harborWishboneMemoryConfig(memWaist.config));
     HarborWishboneMemoryMaster(
       clk: sys.clk,
@@ -157,6 +203,15 @@ class DviUlx3sTop extends BridgeModule {
     wb.err! <= Const(0);
 
     output('gpdi_dp') <= display.gpdi;
-    output('led') <= [Const(0, width: 7), display.underrun].swizzle();
+    output('led') <=
+        (audio
+            ? [
+                Const(0, width: 4),
+                display.output('hdmi_packets_dropped').xor(),
+                display.output('hdmi_packets_missed').xor(),
+                display.output('audio_underrun_count').xor(),
+                display.underrun,
+              ].swizzle()
+            : [Const(0, width: 7), display.underrun].swizzle());
   }
 }

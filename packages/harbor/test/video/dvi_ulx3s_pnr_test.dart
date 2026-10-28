@@ -31,10 +31,17 @@ void main() {
     () => _placeAndRoute(hdmi: true, seeds: [1]),
     skip: _skipReason(),
   );
+
+  test(
+    'ulx3s hdmi audio top meets the 25 MHz pixel and 125 MHz shift clocks',
+    () => _placeAndRoute(hdmi: true, audio: true, seeds: [1]),
+    skip: _skipReason(),
+  );
 }
 
 Future<void> _placeAndRoute({
   required bool hdmi,
+  bool audio = false,
   required List<int> seeds,
 }) async {
   final board = HarborBoard.get('ulx3s-85f');
@@ -43,11 +50,12 @@ Future<void> _placeAndRoute({
       'clk',
       'rst_n',
       if (hdmi) 'btn_fire1',
+      if (audio) ...['btn_fire2', 'btn_up'],
       for (var i = 0; i < 4; i++) 'gpdi_dp[$i]',
       for (var i = 0; i < 8; i++) 'led[$i]',
     ],
   );
-  final top = DviUlx3sTop(target: target, hdmi: hdmi);
+  final top = DviUlx3sTop(target: target, hdmi: hdmi, audio: audio);
   await top.build();
 
   final dir = Directory.systemTemp.createTempSync('harbor_dvi_pnr_');
