@@ -6,6 +6,7 @@ import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../bus/port/memory_port.dart';
 import '../bus/port/memory_waist.dart';
+import '../bus/port/waist_arbiter.dart';
 import '../clock/cdc.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
@@ -24,7 +25,6 @@ import 'ethernet/eth_phy_mii.dart';
 import 'ethernet/eth_phy_rgmii.dart';
 import 'ethernet/eth_phy_rmii.dart';
 import 'ethernet/eth_regs.dart';
-import 'ethernet/eth_waist_arb.dart';
 
 /// Ethernet MAC with descriptor DMA.
 ///
@@ -51,7 +51,7 @@ import 'ethernet/eth_waist_arb.dart';
 /// the clock domain crossings go into it on Xilinx. See [cdcConstraints].
 ///
 /// The TX and RX DMAs share `dma`. TX requests use ID 0 and RX requests use
-/// ID 1, so the responses of the two never mix. A frame that the TX FIFO
+/// ID 2, so the responses of the two never mix. A frame that the TX FIFO
 /// drops because the TX clock is lost comes back with TX error code 4.
 ///
 /// The MAC cores and the front end reset only with `reset`. CTRL soft_reset
@@ -211,7 +211,12 @@ class HarborEthernetMac extends BridgeModule
       module: this,
       name: 'dma',
       kind: fabricKind,
-      config: waistConfig,
+      config: HarborMemoryWaistConfig(
+        addressWidth: dmaAddressWidth,
+        dataWidth: 32,
+        idWidth: 2,
+        outstanding: config.outstanding,
+      ),
       clk: input('clk'),
       reset: input('reset'),
       fabricClock: fabricClock,
@@ -436,11 +441,10 @@ class HarborEthernetMac extends BridgeModule
     );
     dmaRReady <= dmaRx.rReady;
 
-    final arb = HarborEthWaistArbiter(
+    final arb = HarborWaistArbiter(
       clk,
       dpReset,
-      tx: txW,
-      rx: rxW,
+      sources: [txW, rxW],
       out: dma.waist,
     );
 

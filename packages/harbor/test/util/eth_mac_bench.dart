@@ -393,7 +393,7 @@ class EthMacBench {
     final memConfig = HarborMemoryWaistConfig(
       addressWidth: dmaAddressWidth,
       dataWidth: 32,
-      idWidth: 1,
+      idWidth: 2,
       outstanding: 8,
     );
     final top = EthMacTop(mac, memConfig);

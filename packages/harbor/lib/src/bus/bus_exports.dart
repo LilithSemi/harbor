@@ -14,6 +14,7 @@ export 'port/memory_port.dart';
 export 'port/memory_waist.dart';
 export 'port/port_cdc.dart';
 export 'port/register_waist.dart';
+export 'port/waist_arbiter.dart';
 
 // Wishbone
 export 'wishbone/wishbone_interface.dart';
