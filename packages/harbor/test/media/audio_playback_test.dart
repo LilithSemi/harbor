@@ -149,6 +149,23 @@ Future<_Bench> _bench(
 void main() {
   tearDown(() async => Simulator.reset());
 
+  // This test runs first. In one file, each simulation runs slower than the
+  // one before it.
+  test('keeps up with a 48 kHz consumer under fabric latency', () async {
+    // A 25 MHz clock gives one sample each 520 cycles. Each read waits 60
+    // cycles in the memory.
+    final b = await _bench(HarborFabricKind.wishbone, latency: 60);
+    await b.ring(65);
+    await b.put(64);
+    await b.bus.write(0x20, 1);
+    b.period = 520;
+    await b.until(() => b.received.length == 40, cycles: 41 * 520);
+    expect(b.missed, 0);
+    b.expectInOrder(0, 40);
+    expect(b.port('tx_underrun_count'), 0);
+    await Simulator.endSimulation();
+  });
+
   for (final kind in HarborFabricKind.values) {
     group(kind.name, () {
       test('plays the ring in order and counts an underrun', () async {
@@ -231,19 +248,4 @@ void main() {
       });
     });
   }
-
-  test('keeps up with a 48 kHz consumer under fabric latency', () async {
-    // A 25 MHz clock gives one sample each 520 cycles. Each read waits 60
-    // cycles in the memory.
-    final b = await _bench(HarborFabricKind.wishbone, latency: 60);
-    await b.ring(65);
-    await b.put(64);
-    await b.bus.write(0x20, 1);
-    b.period = 520;
-    await b.until(() => b.received.length == 40, cycles: 41 * 520);
-    expect(b.missed, 0);
-    b.expectInOrder(0, 40);
-    expect(b.port('tx_underrun_count'), 0);
-    await Simulator.endSimulation();
-  });
 }
