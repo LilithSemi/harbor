@@ -105,12 +105,19 @@ void main() {
       expect(interfaces, contains('spdif'));
     });
 
-    test('DMA interface widths', () {
+    test('DMA master port and stream ports', () {
       final audio = HarborAudioController(baseAddress: 0x10010000);
-      expect(audio.dmaReadAddr.width, equals(32));
-      expect(audio.dmaReadData.width, equals(32));
-      expect(audio.dmaWriteAddr.width, equals(32));
-      expect(audio.dmaWriteData.width, equals(32));
+      expect(audio.dma.waist.config.dataWidth, equals(32));
+      expect(audio.dma.waist.config.addressWidth, equals(32));
+      expect(audio.interfaces.keys, containsAll(['bus', 'dma']));
+      expect(audio.audioLeft.width, equals(24));
+      expect(audio.audioRight.width, equals(24));
+      expect(audio.audioValid.width, equals(1));
+      expect(audio.audioReady.width, equals(1));
+      expect(audio.txUnderrunCount.width, equals(16));
+      expect(audio.dmaError.width, equals(1));
+      expect(audio.dmaTimeout.width, equals(1));
+      expect(audio.formats, equals([HarborAudioFormat.s24le]));
     });
 
     test('with sample rate converter', () {
@@ -126,10 +133,10 @@ void main() {
     test('FIFO depths', () {
       final audio = HarborAudioController(
         baseAddress: 0x10010000,
-        txFifoDepth: 512,
+        txFifoDepth: 16,
         rxFifoDepth: 512,
       );
-      expect(audio.txFifoDepth, equals(512));
+      expect(audio.txFifoDepth, equals(16));
       expect(audio.rxFifoDepth, equals(512));
     });
 
@@ -141,6 +148,13 @@ void main() {
         hwCodecs: const [HarborAudioCodecFormat.aac],
       );
       expect(a.definitionName, isNot(equals(b.definitionName)));
+      final c = HarborAudioController(baseAddress: 0x10010000, txFifoDepth: 4);
+      final d = HarborAudioController(
+        baseAddress: 0x10010000,
+        dmaTimeoutCycles: 100,
+      );
+      final names = {a, c, d}.map((m) => m.definitionName).toSet();
+      expect(names, hasLength(3));
     });
   });
 

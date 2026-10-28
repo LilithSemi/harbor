@@ -11,9 +11,10 @@ void main() {
     Future<PeripheralTestBench> bench() async {
       final audio = HarborAudioController(baseAddress: 0x10060000);
       audio.port('sdata_in').getsLogic(Const(0));
-      audio.port('dma_read_data').getsLogic(Const(0, width: 32));
-      audio.port('dma_read_valid').getsLogic(Const(0));
-      audio.port('dma_write_ack').getsLogic(Const(0));
+      audio.port('audio_ready').getsLogic(Const(0));
+      for (final p in audio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+        audio.port(p).getsLogic(Const(0, width: audio.input(p).width));
+      }
       final tb = PeripheralTestBench(audio);
       await tb.init();
       return tb;
@@ -21,10 +22,10 @@ void main() {
 
     test('a byte store changes only the selected byte', () async {
       final tb = await bench();
-      // TX_DMA_ADDR at 0x30.
-      await tb.write(0x30, 0x11223344);
-      await tb.write(0x30, 0x00AA0000, sel: 0x4);
-      expect(await tb.read(0x30), equals(0x11AA3344));
+      // CLK_CFG at 0x10.
+      await tb.write(0x10, 0x11223344);
+      await tb.write(0x10, 0x00AA0000, sel: 0x4);
+      expect(await tb.read(0x10), equals(0x11AA3344));
       // INT_ENABLE at 0x78 is one byte wide.
       await tb.write(0x78, 0x5A);
       await tb.write(0x78, 0xFF00, sel: 0x2);
@@ -34,10 +35,10 @@ void main() {
 
     test('an address above the registers does not alias one', () async {
       final tb = await bench();
-      await tb.write(0x30, 0x11223344);
-      await tb.write(0x230, 0xDEADBEEF);
-      expect(await tb.read(0x30), equals(0x11223344));
-      expect(await tb.read(0x230), equals(0));
+      await tb.write(0x10, 0x11223344);
+      await tb.write(0x210, 0xDEADBEEF);
+      expect(await tb.read(0x10), equals(0x11223344));
+      expect(await tb.read(0x210), equals(0));
       await Simulator.endSimulation();
     });
   });

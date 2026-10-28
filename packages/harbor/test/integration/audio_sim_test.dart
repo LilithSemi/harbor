@@ -13,9 +13,7 @@ void main() {
       final audio = HarborAudioController(baseAddress: 0x10060000);
 
       audio.port('sdata_in').getsLogic(Const(0));
-      audio.port('dma_read_data').getsLogic(Const(0, width: 32));
-      audio.port('dma_read_valid').getsLogic(Const(0));
-      audio.port('dma_write_ack').getsLogic(Const(0));
+      _tieOff(audio);
 
       final tb = PeripheralTestBench(audio);
       await tb.init();
@@ -32,9 +30,7 @@ void main() {
       final audio = HarborAudioController(baseAddress: 0x10060000);
 
       audio.port('sdata_in').getsLogic(Const(0));
-      audio.port('dma_read_data').getsLogic(Const(0, width: 32));
-      audio.port('dma_read_valid').getsLogic(Const(0));
-      audio.port('dma_write_ack').getsLogic(Const(0));
+      _tieOff(audio);
 
       final tb = PeripheralTestBench(audio);
       await tb.init();
@@ -51,9 +47,7 @@ void main() {
       final audio = HarborAudioController(baseAddress: 0x10060000);
 
       audio.port('sdata_in').getsLogic(Const(0));
-      audio.port('dma_read_data').getsLogic(Const(0, width: 32));
-      audio.port('dma_read_valid').getsLogic(Const(0));
-      audio.port('dma_write_ack').getsLogic(Const(0));
+      _tieOff(audio);
 
       final tb = PeripheralTestBench(audio);
       await tb.init();
@@ -70,9 +64,7 @@ void main() {
       final audio = HarborAudioController(baseAddress: 0x10060000);
 
       audio.port('sdata_in').getsLogic(Const(0));
-      audio.port('dma_read_data').getsLogic(Const(0, width: 32));
-      audio.port('dma_read_valid').getsLogic(Const(0));
-      audio.port('dma_write_ack').getsLogic(Const(0));
+      _tieOff(audio);
 
       final tb = PeripheralTestBench(audio);
       await tb.init();
@@ -89,9 +81,7 @@ void main() {
       final audio = HarborAudioController(baseAddress: 0x10060000);
 
       audio.port('sdata_in').getsLogic(Const(0));
-      audio.port('dma_read_data').getsLogic(Const(0, width: 32));
-      audio.port('dma_read_valid').getsLogic(Const(0));
-      audio.port('dma_write_ack').getsLogic(Const(0));
+      _tieOff(audio);
 
       final tb = PeripheralTestBench(audio);
       await tb.init();
@@ -104,4 +94,12 @@ void main() {
       await Simulator.endSimulation();
     });
   });
+}
+
+/// Ties the stream ready and the DMA master port inputs to 0.
+void _tieOff(HarborAudioController audio) {
+  audio.port('audio_ready').getsLogic(Const(0));
+  for (final p in audio.inputs.keys.where((p) => p.startsWith('dma_'))) {
+    audio.port(p).getsLogic(Const(0, width: audio.input(p).width));
+  }
 }
