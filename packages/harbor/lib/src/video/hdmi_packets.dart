@@ -23,8 +23,11 @@ enum HdmiAudioRate {
 ///
 /// A pixel clock within 100 ppm of a row of the HDMI 1.4 tables 7-1 to
 /// 7-3 (25.2, 27, 74.25 and 148.5 MHz, and the same clocks scaled by 1.001)
-/// gets the N and CTS of that row. Another clock gets N = 128 * fs / 1000
-/// and CTS = round(pixelClock * N / (128 * fs)). The fs generator and the
+/// gets the N and CTS of that row. Another clock gets the N in the range
+/// 128 * fs / 1500 to 128 * fs / 300 that is nearest to the default N
+/// (4096, 6272 or 6144) and makes CTS an integer. If no N does, it uses
+/// the default N and CTS = round(pixelClock * N / (128 * fs)). The fs
+/// generator and the
 /// ACR packet use this same pair, so the strobe rate is
 /// `pixelClock * N / (128 * CTS)`, the fs that the sink regenerates.
 abstract final class HdmiAcr {
@@ -54,8 +57,18 @@ abstract final class HdmiAcr {
     if (row != null) {
       (n, cts) = row.$2[rate.index];
     } else {
-      n = (unit / 1000).round();
+      n = rate.recommendedN;
       cts = (pixelClock * n + unit ~/ 2) ~/ unit;
+      var bestDistance = -1;
+      for (var m = (unit + 1499) ~/ 1500; m <= unit ~/ 300; m++) {
+        if (pixelClock * m % unit != 0) continue;
+        final d = (m - rate.recommendedN).abs();
+        if (bestDistance < 0 || d < bestDistance) {
+          bestDistance = d;
+          n = m;
+          cts = pixelClock * m ~/ unit;
+        }
+      }
     }
     if (cts < 1 || cts >= 1 << 20 || cts * 128 <= n) {
       throw ArgumentError(

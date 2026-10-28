@@ -212,13 +212,26 @@ void main() {
         expect(128 * r.hz * got.$2, e.key * got.$1);
       }
     }
-    // No row: N = 128 * fs / 1000 and CTS is rounded.
-    expect(HdmiAcr.values(25000000, HdmiAudioRate.fs44100), (5645, 25001));
+    // No row: the exact pair with N nearest to the default N.
+    expect(HdmiAcr.values(25000000, HdmiAudioRate.fs32000), (4096, 25000));
+    expect(HdmiAcr.values(25000000, HdmiAudioRate.fs44100), (7056, 31250));
     expect(HdmiAcr.values(25000000, HdmiAudioRate.fs48000), (6144, 25000));
-    expect(HdmiAcr.values(_scaledClock, HdmiAudioRate.fs48000), (6144, 252));
-    // CTS rounds to 34 and the fs error is 1.5 percent.
+    for (final r in HdmiAudioRate.values) {
+      final (n, cts) = HdmiAcr.values(25000000, r);
+      expect(128 * r.hz * cts, 25000000 * n, reason: '${r.hz}');
+    }
+    expect(HdmiAcr.values(_scaledClock, HdmiAudioRate.fs44100), (6272, 280));
+    // No exact pair: the default N and a rounded CTS.
+    const odd = 30000001;
+    for (final r in HdmiAudioRate.values) {
+      final (n, cts) = HdmiAcr.values(odd, r);
+      expect(n, r.recommendedN, reason: '${r.hz}');
+      expect(cts, (odd * n / (128 * r.hz)).round(), reason: '${r.hz}');
+      expect(128 * r.hz * cts, isNot(odd * n), reason: '${r.hz}');
+    }
+    // No exact pair, CTS rounds to 34 and the fs error is 1.5 percent.
     expect(
-      () => HdmiAcr.values(33500, HdmiAudioRate.fs32000),
+      () => HdmiAcr.values(33501, HdmiAudioRate.fs32000),
       throwsArgumentError,
     );
   });
@@ -285,11 +298,7 @@ void main() {
         });
         Simulator.setMaxSimTime(period * (_scaledClock + from + 8));
         await Simulator.run();
-        // The strobe count in T clocks is T * N / (128 * CTS) rounded down
-        // or up. It is exactly fs when that is an integer.
-        final rate = _scaledClock * n / (128 * cts);
-        expect(strobes, inInclusiveRange(rate.floor(), rate.ceil()));
-        if (rate == rate.roundToDouble()) expect(strobes, r.hz);
+        expect(strobes, r.hz, reason: '${r.hz}');
         expect(acrs, _scaledClock ~/ cts, reason: '${r.hz}');
         await Simulator.reset();
       }
@@ -308,7 +317,7 @@ void main() {
       // ACR at 252 kHz: SB1..SB3 CTS, SB4..SB6 N.
       final cases = [
         (fs: 0, vic: 16, q: 0, m: 0, avi: 0x100000005F, acr: 0x001000FC000000),
-        (fs: 1, vic: 4, q: 1, m: 1, avi: 0x040418004F, acr: 0x0D1600FC000000),
+        (fs: 1, vic: 4, q: 1, m: 1, avi: 0x040418004F, acr: 0x80180018010000),
         (fs: 2, vic: 0, q: 2, m: 2, avi: 0x000828003F, acr: 0x001800FC000000),
       ];
       for (final c in cases) {
