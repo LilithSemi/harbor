@@ -246,6 +246,37 @@ void main() {
         expect(b.port('tx_dma_timeout'), 0);
         await Simulator.endSimulation();
       });
+
+      test('a ring pointer write past the size is rejected', () async {
+        final b = await _bench(kind);
+        await b.ring(8);
+        await b.bus.write(0x78, 0x80);
+        expect(b.port('tx_dma_ptr_error'), 0);
+        await b.bus.write(0x40, 0x18);
+        expect(await b.bus.read(0x40), 0x18);
+        expect(await b.bus.read(0xA0), 0);
+        for (final bad in [64, 72, 0x1000]) {
+          await b.bus.write(0x40, bad);
+          expect(await b.bus.read(0x40), 0x18, reason: 'wr $bad');
+        }
+        expect(await b.bus.read(0xA0), 4);
+        expect(b.port('tx_dma_ptr_error'), 1);
+        expect(await b.bus.read(0x70) & 0x80, 0x80);
+        expect(b.port('interrupt'), 1);
+        await b.bus.write(0xA0, 4);
+        expect(await b.bus.read(0xA0), 0);
+        expect(b.port('tx_dma_ptr_error'), 0);
+        await b.bus.write(0x48, 0x10);
+        expect(await b.bus.read(0x48), 0x10);
+        await b.bus.write(0x48, 64);
+        expect(await b.bus.read(0x48), 0x10);
+        expect(await b.bus.read(0xA0), 4);
+        await b.bus.write(0xA0, 4);
+        await b.bus.write(0x40, 0x38);
+        expect(await b.bus.read(0x40), 0x38);
+        expect(await b.bus.read(0xA0), 0);
+        await Simulator.endSimulation();
+      });
     });
   }
 }

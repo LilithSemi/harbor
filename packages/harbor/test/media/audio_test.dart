@@ -117,7 +117,21 @@ void main() {
       expect(audio.txUnderrunCount.width, equals(16));
       expect(audio.dmaError.width, equals(1));
       expect(audio.dmaTimeout.width, equals(1));
+      expect(audio.dmaPtrError.width, equals(1));
       expect(audio.formats, equals([HarborAudioFormat.s24le]));
+    });
+
+    test('a DMA address wider than the 32-bit ring is rejected', () {
+      expect(
+        () =>
+            HarborAudioController(baseAddress: 0x10010000, dmaAddressWidth: 40),
+        throwsArgumentError,
+      );
+      expect(
+        () =>
+            HarborAudioController(baseAddress: 0x10010000, dmaAddressWidth: 32),
+        returnsNormally,
+      );
     });
 
     test('with sample rate converter', () {

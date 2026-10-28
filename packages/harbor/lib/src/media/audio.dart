@@ -128,11 +128,12 @@ int _codecCapsOf(List<HarborAudioCodecFormat> hwCodecs) {
 /// - 0x70: INT_STATUS   (W1C: bit 0 ring empty, bit 1 ring low, bit 4
 ///                        underrun, bit 7 DMA error)
 /// - 0x78: INT_ENABLE   (interrupt enable mask)
-/// - 0x80: VOLUME_L     (left channel volume, 0-255)
-/// - 0x88: VOLUME_R     (right channel volume, 0-255)
+/// - 0x80: VOLUME_L     (left channel volume, 0-255, no effect on the stream)
+/// - 0x88: VOLUME_R     (right channel volume, 0-255, no effect on the stream)
 /// - 0x90: MUTE         (bit 0: tx mute, bit 1: rx mute)
 /// - 0x98: TX_UNDERRUN  (underrun count, stops at 0xffff, a write clears)
-/// - 0xA0: TX_DMA_ERR   (W1C: bit 0 fabric error, bit 1 timeout)
+/// - 0xA0: TX_DMA_ERR   (W1C: bit 0 fabric error, bit 1 timeout,
+///                        bit 2 pointer write past TX_DMA_SIZE)
 /// - 0x100: CODEC_CTRL   (codec select, start, direction)
 /// - 0x108: CODEC_STATUS  (codec busy/done/error)
 /// - 0x110: CODEC_CAPS   (supported codecs bitmask, read-only)
@@ -144,8 +145,11 @@ int _codecCapsOf(List<HarborAudioCodecFormat> hwCodecs) {
 /// read sets a TX_DMA_ERR bit and stops the DMA at the failed frame until
 /// software clears the bits. Play 0 empties the FIFO.
 ///
-/// The `tx_underrun_count`, `tx_dma_error` and `tx_dma_timeout` outputs show
-/// TX_UNDERRUN and the TX_DMA_ERR bits.
+/// A write to TX_DMA_WR or TX_DMA_RD of a value at or past TX_DMA_SIZE
+/// (other than 0) does not change the register. It sets TX_DMA_ERR bit 2.
+///
+/// The `tx_underrun_count`, `tx_dma_error`, `tx_dma_timeout` and
+/// `tx_dma_ptr_error` outputs show TX_UNDERRUN and the TX_DMA_ERR bits.
 class HarborAudioController extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -229,6 +233,9 @@ class HarborAudioController extends BridgeModule
   /// TX_DMA_ERR bit 1, a timeout.
   Logic get dmaTimeout => output('tx_dma_timeout');
 
+  /// TX_DMA_ERR bit 2, a rejected ring pointer write.
+  Logic get dmaPtrError => output('tx_dma_ptr_error');
+
   HarborAudioController({
     required this.baseAddress,
     this.audioInterfaces = const [HarborAudioInterface.i2s],
@@ -267,6 +274,13 @@ class HarborAudioController extends BridgeModule
         'must be >= 12',
       );
     }
+    if (dmaAddressWidth < 1 || dmaAddressWidth > 32) {
+      throw ArgumentError.value(
+        dmaAddressWidth,
+        'dmaAddressWidth',
+        'must be 1 to 32, the ring address has 32 bits',
+      );
+    }
     if (txFifoDepth < 1 || txFifoDepth > 255) {
       throw RangeError.range(txFifoDepth, 1, 255, 'txFifoDepth');
     }
@@ -300,6 +314,7 @@ class HarborAudioController extends BridgeModule
     addOutput('tx_underrun_count', width: 16);
     addOutput('tx_dma_error');
     addOutput('tx_dma_timeout');
+    addOutput('tx_dma_ptr_error');
 
     final fabricClock = BusSlavePort.fabricClockInputs(
       this,
@@ -353,6 +368,7 @@ class HarborAudioController extends BridgeModule
     final underruns = Logic(name: 'tx_underruns', width: 16);
     final errBus = Logic(name: 'tx_err_bus');
     final errTimeout = Logic(name: 'tx_err_timeout');
+    final errPtr = Logic(name: 'tx_err_ptr');
 
     // Codec capabilities bitmask
     final codecCaps = _codecCapsOf(hwCodecs);
@@ -476,8 +492,19 @@ class HarborAudioController extends BridgeModule
     ]);
 
     final readFail = (readValid & readErr & ~fetchIdle).named('dma_fail');
+    final regWrite = (bus.stb & ~bus.ack & bus.we).named('reg_write');
+    Logic writes(int offset) => regWrite & regAddr.eq(Const(offset, width: 12));
+    Logic aligned(Logic v) => [v.getRange(3), Const(0, width: 3)].swizzle();
+    final wrNew = aligned(bus.selMerge(txDmaWr, 0x40)).named('tx_dma_wr_new');
+    final rdNew = aligned(bus.selMerge(txDmaRd, 0x48)).named('tx_dma_rd_new');
+    Logic pastSize(Logic v) => v.gte(txDmaSize) & v.neq(0);
+    final badWr = (writes(0x40) & pastSize(wrNew)).named('bad_wr');
+    final badRd = (writes(0x48) & ~play & fetchIdle & pastSize(rdNew)).named(
+      'bad_rd',
+    );
+
     final intSet = [
-      readFail,
+      readFail | badWr | badRd,
       Const(0, width: 2),
       underrun,
       Const(0, width: 2),
@@ -485,8 +512,6 @@ class HarborAudioController extends BridgeModule
       play & ringEmpty,
     ].swizzle().named('int_set');
 
-    final regWrite = (bus.stb & ~bus.ack & bus.we).named('reg_write');
-    Logic writes(int offset) => regWrite & regAddr.eq(Const(offset, width: 12));
     final intClear = mux(
       writes(0x70),
       bus.selMasked(0x70, 8),
@@ -494,11 +519,9 @@ class HarborAudioController extends BridgeModule
     );
     final errClear = mux(
       writes(0xA0),
-      bus.selMasked(0xA0, 2),
-      Const(0, width: 2),
+      bus.selMasked(0xA0, 3),
+      Const(0, width: 3),
     );
-    Logic aligned(Logic v) => [v.getRange(3), Const(0, width: 3)].swizzle();
-
     final status = [
       Const(0, width: 16),
       fifo.count.zeroExtend(8),
@@ -541,6 +564,7 @@ class HarborAudioController extends BridgeModule
           underruns < Const(0, width: 16),
           errBus < Const(0),
           errTimeout < Const(0),
+          errPtr < Const(0),
           mclkDiv < Const(4, width: 8),
           bclkDiv < Const(8, width: 8),
           mclkCounter < Const(0, width: 8),
@@ -639,7 +663,9 @@ class HarborAudioController extends BridgeModule
                 CaseItem(Const(0x40, width: 12), [
                   If(
                     bus.we,
-                    then: [txDmaWr < aligned(bus.selMerge(txDmaWr, 0x40))],
+                    then: [
+                      If(~badWr, then: [txDmaWr < wrNew]),
+                    ],
                     orElse: [bus.dataOut < txDmaWr],
                   ),
                 ]),
@@ -647,10 +673,7 @@ class HarborAudioController extends BridgeModule
                   If(
                     bus.we,
                     then: [
-                      If(
-                        ~play & fetchIdle,
-                        then: [txDmaRd < aligned(bus.selMerge(txDmaRd, 0x48))],
-                      ),
+                      If(~play & fetchIdle & ~badRd, then: [txDmaRd < rdNew]),
                     ],
                     orElse: [bus.dataOut < txDmaRd],
                   ),
@@ -719,7 +742,8 @@ class HarborAudioController extends BridgeModule
                 ]),
                 // TX_DMA_ERR (W1C below)
                 CaseItem(Const(0xA0, width: 12), [
-                  bus.dataOut < [errTimeout, errBus].swizzle().zeroExtend(32),
+                  bus.dataOut <
+                      [errPtr, errTimeout, errBus].swizzle().zeroExtend(32),
                 ]),
                 // CODEC_CAPS
                 CaseItem(Const(0x110, width: 12), [
@@ -734,6 +758,7 @@ class HarborAudioController extends BridgeModule
           intStatus < (intStatus & ~intClear) | intSet,
           errBus < (errBus & ~errClear[0]) | readFail & ~readTimeout,
           errTimeout < (errTimeout & ~errClear[1]) | readFail & readTimeout,
+          errPtr < (errPtr & ~errClear[2]) | badWr | badRd,
           If.block([
             Iff(writes(0x98), [underruns < Const(0, width: 16)]),
             ElseIf(underrun & ~underruns.and(), [underruns < underruns + 1]),
@@ -745,6 +770,7 @@ class HarborAudioController extends BridgeModule
     output('tx_underrun_count') <= underruns;
     output('tx_dma_error') <= errBus;
     output('tx_dma_timeout') <= errTimeout;
+    output('tx_dma_ptr_error') <= errPtr;
   }
 
   /// Sample formats of the playback ring.
