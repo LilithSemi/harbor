@@ -57,13 +57,14 @@ class _Run {
 }
 
 /// Runs [clocks] pixel clocks. [hdmi] null makes a build without hdmi,
-/// else it is the hdmi_enable value. [yuvOffset] makes a yuyv build with
-/// that CSC output offset on all channels.
+/// else it is the hdmi_enable value. [aviQ] and [aviM] are the AVI
+/// quantization and picture aspect inputs.
 Future<_Run> _simulate(
   int clocks, {
   bool? hdmi = true,
   int sourceOffAt = -1,
-  int? yuvOffset,
+  int aviQ = 0,
+  int aviM = 0,
   int vic = 1,
   int fs = 2,
 }) async {
@@ -90,15 +91,11 @@ Future<_Run> _simulate(
     update: Const(1),
     fbBase: Const(0x100, width: 32),
     memory: memory,
-    pixelFormat: yuvOffset == null
-        ? HarborPixelFormat.xrgb8888
-        : HarborPixelFormat.yuyv,
-    cscOutOffset: yuvOffset == null
-        ? null
-        : List.filled(3, Const(yuvOffset, width: 8)),
     hdmi: audio,
     hdmiEnable: audio ? Const(hdmi ? 1 : 0) : null,
     hdmiVic: audio ? Const(vic, width: 7) : null,
+    hdmiAviQ: audio ? Const(aviQ, width: 2) : null,
+    hdmiAviM: audio ? Const(aviM, width: 2) : null,
     audioFsSel: audio ? Const(fs, width: 2) : null,
     audioValid: audio ? source.valid : null,
     audioLeft: audio ? source.left : null,
@@ -196,33 +193,38 @@ void main() {
     await Simulator.reset();
   });
 
-  HarborDualClockDisplay make({bool packets = false, bool partial = false}) =>
-      HarborDualClockDisplay(
-        target: const HarborSimTarget(),
-        timing: _timing,
-        pixelClk: Logic(),
-        pixelReset: Logic(),
-        shiftClk: Logic(),
-        shiftReset: Logic(),
-        sysClk: Logic(),
-        sysReset: Logic(),
-        enable: Logic(),
-        update: Logic(),
-        fbBase: Logic(width: 32),
-        memory: HarborMemoryWaist(_memConfig),
-        hdmi: true,
-        hdmiEnable: Logic(),
-        hdmiPacketValid: packets ? Logic() : null,
-        hdmiPacketHeader: packets ? Logic(width: 24) : null,
-        hdmiPacketSubpacket: packets
-            ? [for (var k = 0; k < 4; k++) Logic(width: 56)]
-            : null,
-        hdmiVic: Logic(width: 7),
-        audioFsSel: Logic(width: 2),
-        audioValid: Logic(),
-        audioLeft: Logic(width: 24),
-        audioRight: partial ? null : Logic(width: 24),
-      );
+  HarborDualClockDisplay make({
+    bool packets = false,
+    bool partial = false,
+    HarborDisplayTiming timing = _timing,
+  }) => HarborDualClockDisplay(
+    target: const HarborSimTarget(),
+    timing: timing,
+    pixelClk: Logic(),
+    pixelReset: Logic(),
+    shiftClk: Logic(),
+    shiftReset: Logic(),
+    sysClk: Logic(),
+    sysReset: Logic(),
+    enable: Logic(),
+    update: Logic(),
+    fbBase: Logic(width: 32),
+    memory: HarborMemoryWaist(_memConfig),
+    hdmi: true,
+    hdmiEnable: Logic(),
+    hdmiPacketValid: packets ? Logic() : null,
+    hdmiPacketHeader: packets ? Logic(width: 24) : null,
+    hdmiPacketSubpacket: packets
+        ? [for (var k = 0; k < 4; k++) Logic(width: 56)]
+        : null,
+    hdmiVic: Logic(width: 7),
+    hdmiAviQ: Logic(width: 2),
+    hdmiAviM: Logic(width: 2),
+    audioFsSel: Logic(width: 2),
+    audioValid: Logic(),
+    audioLeft: Logic(width: 24),
+    audioRight: partial ? null : Logic(width: 24),
+  );
 
   test('an audio build has its own name and the audio ports', () async {
     final d = make();
@@ -233,6 +235,8 @@ void main() {
       containsAll([
         'hdmi_enable',
         'hdmi_vic',
+        'hdmi_avi_q',
+        'hdmi_avi_m',
         'audio_fs_sel',
         'audio_valid',
         'audio_left',
@@ -255,6 +259,21 @@ void main() {
     expect(() => make(partial: true), throwsArgumentError);
   });
 
+  test(
+    'an audio build at 25.175 MHz elaborates with N 7007, CTS 31250',
+    () async {
+      final timing = HarborDisplayTiming.vga640x480();
+      expect(timing.pixelClock, 25175000);
+      final d = make(timing: timing);
+      await d.build();
+      expect(d.definitionName, endsWith('_hdmi_audio_p25175000'));
+      expect(HdmiAcr.values(timing.pixelClock, HdmiAudioRate.fs44100), (
+        7007,
+        31250,
+      ));
+    },
+  );
+
   test('hdmi_enable 0 gives the lanes of a build without hdmi', () async {
     const clocks = 3 * _frame;
     final a = await _simulate(clocks, hdmi: null);
@@ -269,7 +288,7 @@ void main() {
     'every packet type decodes clean in each frame',
     () async {
       const clocks = 12 * _frame;
-      final run = await _simulate(clocks, vic: 2);
+      final run = await _simulate(clocks, vic: 2, aviQ: 2, aviM: 2);
       final (:d, :from) = _decode(run);
       const lat = TmdsEncoder.latency;
       var pixels = 0;
@@ -293,12 +312,13 @@ void main() {
         expect(inFrame.where((p) => p.type == 0x84), isNotEmpty);
       }
       for (final p in d.packets.where((p) => p.type == 0x82)) {
-        // Full range RGB, VIC 2: 0x91 + 0x08 + 0x02 = 0x9B, PB0 0x65.
-        expect(p.subpackets, [0x00000208000065, 0, 0, 0]);
+        // Q 2, M 2 (PB2 0x28), VIC 2: 0x91 + 0x28 + 0x08 + 0x02 = 0xC3,
+        // PB0 0x3D.
+        expect(p.subpackets, [0x020828003D, 0, 0, 0]);
       }
       for (final p in d.packets.where((p) => p.type == 0x84)) {
         expect(p.header, 0x0A0184);
-        expect(p.subpackets, [0x1160, 0, 0, 0]);
+        expect(p.subpackets, [0x0170, 0, 0, 0]);
       }
       // 48 kHz at 1.8 MHz: N 6144 (0x1800), CTS 1800 (0x708).
       final acr = d.packets.where((p) => p.type == 0x01).toList();
@@ -349,18 +369,19 @@ void main() {
   );
 
   test(
-    'the AVI range bits follow the CSC output offset',
+    'the AVI quantization and aspect bits follow the inputs',
     () async {
-      for (final (offset, pb3) in [(0, 0x08), (16, 0x04)]) {
-        final run = await _simulate(4 * _frame, yuvOffset: offset, vic: 4);
+      for (final (q, m) in [(0, 0), (1, 1), (2, 2)]) {
+        final run = await _simulate(4 * _frame, aviQ: q, aviM: m, vic: 4);
         await Simulator.reset();
         final (:d, from: _) = _decode(run);
         final avi = d.packets.where((p) => p.type == 0x82).toList();
         expect(avi.length, greaterThanOrEqualTo(2));
-        // 0x91 + PB3 + 0x04.
-        final check = -(0x95 + pb3) & 0xff;
+        final pb2 = m << 4 | (m == 0 ? 0 : 8);
+        final pb3 = q << 2;
+        final check = -(0x91 + pb2 + pb3 + 0x04) & 0xff;
         for (final p in avi) {
-          expect(p.subpackets[0], 0x04 << 32 | pb3 << 24 | check);
+          expect(p.subpackets[0], 0x04 << 32 | pb3 << 24 | pb2 << 16 | check);
         }
       }
     },

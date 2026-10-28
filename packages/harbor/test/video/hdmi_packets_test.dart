@@ -20,7 +20,8 @@ class _Bench extends Module {
     Logic stall,
     Logic fsSel,
     Logic vic,
-    Logic limited, {
+    Logic aviQ,
+    Logic aviM, {
     required int framePeriod,
   }) : super(name: 'bench') {
     clk = addInput('clk', clk);
@@ -29,7 +30,8 @@ class _Bench extends Module {
     stall = addInput('stall', stall);
     fsSel = addInput('fs_sel', fsSel, width: 2);
     vic = addInput('vic', vic, width: 7);
-    limited = addInput('limited', limited);
+    aviQ = addInput('avi_q', aviQ, width: 2);
+    aviM = addInput('avi_m', aviM, width: 2);
     final count = Logic(name: 'count', width: 24);
     final tick = Logic(name: 'tick', width: 16);
     final phase = Logic(name: 'phase', width: 2);
@@ -46,7 +48,9 @@ class _Bench extends Module {
       reset: reset,
       frame: tick.eq(0),
       vic: vic,
-      limited: limited,
+      aviQ: aviQ,
+      aviM: aviM,
+      active: Const(1),
       fsSel: fsSel,
       sampleValid: sourceOn,
       sampleLeft: count,
@@ -71,7 +75,8 @@ Future<_Result> _run(
   int clocks, {
   required int fs,
   int vic = 0,
-  bool limited = false,
+  int aviQ = 0,
+  int aviM = 0,
   int sourceOffAt = -1,
   int stallFrom = -1,
   int stallTo = -1,
@@ -84,7 +89,8 @@ Future<_Result> _run(
   final stall = Logic(name: 'stall');
   final sel = Logic(name: 'sel', width: 2);
   final v = Logic(name: 'v', width: 7);
-  final l = Logic(name: 'l');
+  final q = Logic(name: 'q', width: 2);
+  final m = Logic(name: 'm', width: 2);
   final bench = _Bench(
     clk,
     reset,
@@ -92,7 +98,8 @@ Future<_Result> _run(
     stall,
     sel,
     v,
-    l,
+    q,
+    m,
     framePeriod: framePeriod,
   );
   await bench.build();
@@ -101,7 +108,8 @@ Future<_Result> _run(
   stall.inject(0);
   sel.inject(fs);
   v.inject(vic);
-  l.inject(limited ? 1 : 0);
+  q.inject(aviQ);
+  m.inject(aviM);
   final s = bench.sched;
   final r = _Result();
   var started = false;
@@ -204,13 +212,33 @@ void main() {
         expect(128 * r.hz * got.$2, e.key * got.$1);
       }
     }
-    expect(HdmiAcr.values(25000000, HdmiAudioRate.fs44100), (7056, 31250));
+    // No row: N = 128 * fs / 1000 and CTS is rounded.
+    expect(HdmiAcr.values(25000000, HdmiAudioRate.fs44100), (5645, 25001));
     expect(HdmiAcr.values(25000000, HdmiAudioRate.fs48000), (6144, 25000));
-    expect(HdmiAcr.values(_scaledClock, HdmiAudioRate.fs44100), (6272, 280));
+    expect(HdmiAcr.values(_scaledClock, HdmiAudioRate.fs48000), (6144, 252));
+    // CTS rounds to 34 and the fs error is 1.5 percent.
     expect(
-      () => HdmiAcr.values(25175000, HdmiAudioRate.fs44100),
+      () => HdmiAcr.values(33500, HdmiAudioRate.fs32000),
       throwsArgumentError,
     );
+  });
+
+  test('the 1.001 clocks equal the HDMI 1.4 table rows', () {
+    // Tables 7-1 to 7-3 for the clocks divided or multiplied by 1.001.
+    final rows = {
+      25175000: [(4576, 28125), (7007, 31250), (6864, 28125)],
+      27027000: [(4096, 27027), (6272, 30030), (6144, 27027)],
+      74175824: [(11648, 210938), (17836, 234375), (11648, 140625)],
+      148351648: [(5824, 210938), (8918, 234375), (5824, 140625)],
+    };
+    for (final e in rows.entries) {
+      for (final r in HdmiAudioRate.values) {
+        final (n, cts) = HdmiAcr.values(e.key, r);
+        expect((n, cts), e.value[r.index], reason: '${e.key} ${r.hz}');
+        final ppm = (e.key * n / (128 * r.hz * cts) - 1).abs() * 1e6;
+        expect(ppm, lessThan(10), reason: '${e.key} ${r.hz}');
+      }
+    }
   });
 
   test(
@@ -257,7 +285,11 @@ void main() {
         });
         Simulator.setMaxSimTime(period * (_scaledClock + from + 8));
         await Simulator.run();
-        expect(strobes, r.hz, reason: '${r.hz}');
+        // The strobe count in T clocks is T * N / (128 * CTS) rounded down
+        // or up. It is exactly fs when that is an integer.
+        final rate = _scaledClock * n / (128 * cts);
+        expect(strobes, inInclusiveRange(rate.floor(), rate.ceil()));
+        if (rate == rate.roundToDouble()) expect(strobes, r.hz);
         expect(acrs, _scaledClock ~/ cts, reason: '${r.hz}');
         await Simulator.reset();
       }
@@ -268,36 +300,19 @@ void main() {
   test(
     'InfoFrames and ACR equal hand built CEA-861 and HDMI bytes',
     () async {
-      // AVI v2: HB 82 02 0D, PB3 Q1Q0 (01 limited, 10 full), PB4 VIC.
-      // full, VIC 16: 0x82 + 0x02 + 0x0D + 0x08 + 0x10 = 0xA9, PB0 0x57.
-      // limited, VIC 4: 0x82 + 0x02 + 0x0D + 0x04 + 0x04 = 0x99, PB0 0x67.
-      // Audio: HB 84 01 0A, PB1 0x11, PB0 0x100 - 0xA0 = 0x60.
+      // AVI v2: HB 82 02 0D, PB2 M1M0R3..R0, PB3 Q1Q0, PB4 VIC.
+      // Q 0, M 0, VIC 16: 0x91 + 0x10 = 0xA1, PB0 0x5F.
+      // Q 1, M 1 (PB2 0x18), VIC 4: 0x91 + 0x18 + 0x04 + 0x04 = 0xB1, 0x4F.
+      // Q 2, M 2 (PB2 0x28), VIC 0: 0x91 + 0x28 + 0x08 = 0xC1, PB0 0x3F.
+      // Audio: HB 84 01 0A, PB1 0x01, PB0 0x100 - 0x90 = 0x70.
       // ACR at 252 kHz: SB1..SB3 CTS, SB4..SB6 N.
       final cases = [
-        (
-          fs: 0,
-          vic: 16,
-          limited: false,
-          avi: 0x00001008000057,
-          acr: 0x001000FC000000,
-        ),
-        (
-          fs: 1,
-          vic: 4,
-          limited: true,
-          avi: 0x00000404000067,
-          acr: 0x80180018010000,
-        ),
-        (
-          fs: 2,
-          vic: 0,
-          limited: false,
-          avi: 0x00000008000067,
-          acr: 0x001800FC000000,
-        ),
+        (fs: 0, vic: 16, q: 0, m: 0, avi: 0x100000005F, acr: 0x001000FC000000),
+        (fs: 1, vic: 4, q: 1, m: 1, avi: 0x040418004F, acr: 0x0D1600FC000000),
+        (fs: 2, vic: 0, q: 2, m: 2, avi: 0x000828003F, acr: 0x001800FC000000),
       ];
       for (final c in cases) {
-        final r = await _run(8000, fs: c.fs, vic: c.vic, limited: c.limited);
+        final r = await _run(8000, fs: c.fs, vic: c.vic, aviQ: c.q, aviM: c.m);
         await Simulator.reset();
         final avi = r.packets.where((p) => p.header & 0xff == 0x82).toList();
         final aif = r.packets.where((p) => p.header & 0xff == 0x84).toList();
@@ -317,7 +332,7 @@ void main() {
         }
         for (final p in aif) {
           expect(p.header, 0x0A0184);
-          expect(p.subs, [0x1160, 0, 0, 0]);
+          expect(p.subs, [0x0170, 0, 0, 0]);
           expect(_infoSum(p), 0);
         }
         final (n, cts) = HdmiAcr.values(
@@ -347,13 +362,14 @@ void main() {
   test(
     'IEC 60958 B, channel status and parity for each fs',
     () async {
-      // IEC 60958-3 consumer channel status: bits 24..27 the fs (32 kHz
+      // IEC 60958-3 consumer channel status: bit 2 is 1 (no copyright),
+      // bits 24..27 the fs (32 kHz
       // 1100, 44.1 kHz 0000, 48 kHz 0100, bit 24 first), bit 32 for 24-bit
       // max, bits 33..35 101 for 24 bits. All other bits 0.
       const statusOnes = {
-        0: [24, 25, 32, 33, 35],
-        1: [32, 33, 35],
-        2: [25, 32, 33, 35],
+        0: [2, 24, 25, 32, 33, 35],
+        1: [2, 32, 33, 35],
+        2: [2, 25, 32, 33, 35],
       };
       for (final fs in [0, 1, 2]) {
         final r = await _run(12000, fs: fs);

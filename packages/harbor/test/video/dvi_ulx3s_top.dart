@@ -175,6 +175,8 @@ class DviUlx3sTop extends BridgeModule {
             ]
           : null,
       hdmiVic: audio ? Const(1, width: 7) : null,
+      hdmiAviQ: audio ? Const(0, width: 2) : null,
+      hdmiAviM: audio ? Const(0, width: 2) : null,
       audioFsSel: audio
           ? [input('btn_up'), input('btn_fire2')].swizzle()
           : null,

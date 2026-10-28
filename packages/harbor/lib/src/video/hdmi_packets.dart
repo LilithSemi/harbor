@@ -21,44 +21,56 @@ enum HdmiAudioRate {
 
 /// N and CTS of the audio clock regeneration (HDMI 1.4 section 7.2).
 ///
-/// For the pixel clocks of the HDMI 1.4 tables 7-1 to 7-3 (25.2, 27, 74.25
-/// and 148.5 MHz) the values come from the tables. For a different clock,
-/// N is the value nearest to [HdmiAudioRate.recommendedN] in the range of
-/// section 7.2.1 that makes CTS an integer. The pair is always exact:
-/// `128 * fs * CTS == pixelClock * N`.
+/// A pixel clock within 100 ppm of a row of the HDMI 1.4 tables 7-1 to
+/// 7-3 (25.2, 27, 74.25 and 148.5 MHz, and the same clocks scaled by 1.001)
+/// gets the N and CTS of that row. Another clock gets N = 128 * fs / 1000
+/// and CTS = round(pixelClock * N / (128 * fs)). The fs generator and the
+/// ACR packet use this same pair, so the strobe rate is
+/// `pixelClock * N / (128 * CTS)`, the fs that the sink regenerates.
 abstract final class HdmiAcr {
-  static const _table = {
-    25200000: [(4096, 25200), (6272, 28000), (6144, 25200)],
-    27000000: [(4096, 27000), (6272, 30000), (6144, 27000)],
-    74250000: [(4096, 74250), (6272, 82500), (6144, 74250)],
-    148500000: [(4096, 148500), (6272, 165000), (6144, 148500)],
-  };
+  static const _rows = <(double, List<(int, int)>)>[
+    (25200000 / 1.001, [(4576, 28125), (7007, 31250), (6864, 28125)]),
+    (25200000, [(4096, 25200), (6272, 28000), (6144, 25200)]),
+    (27000000, [(4096, 27000), (6272, 30000), (6144, 27000)]),
+    (27027000, [(4096, 27027), (6272, 30030), (6144, 27027)]),
+    (74250000 / 1.001, [(11648, 210938), (17836, 234375), (11648, 140625)]),
+    (74250000, [(4096, 74250), (6272, 82500), (6144, 74250)]),
+    (148500000 / 1.001, [(5824, 210938), (8918, 234375), (5824, 140625)]),
+    (148500000, [(4096, 148500), (6272, 165000), (6144, 148500)]),
+  ];
 
-  /// N and CTS for [rate] at [pixelClock] Hz. It throws when no N in the
-  /// range gives an integer CTS of 20 bits.
+  /// The largest fs error that [values] accepts, in ppm.
+  static const maxErrorPpm = 1000;
+
+  /// N and CTS for [rate] at [pixelClock] Hz. It throws when CTS does not
+  /// fit in 20 bits or the fs error is over [maxErrorPpm].
   static (int, int) values(int pixelClock, HdmiAudioRate rate) {
-    final row = _table[pixelClock];
-    if (row != null) return row[rate.index];
     final unit = 128 * rate.hz;
-    final low = (unit + 1499) ~/ 1500;
-    final high = unit ~/ 300;
-    (int, int)? best;
-    for (var n = low; n <= high; n++) {
-      if (pixelClock * n % unit != 0) continue;
-      final cts = pixelClock * n ~/ unit;
-      if (cts >= 1 << 20 || cts * 128 <= n) continue;
-      final d = (n - rate.recommendedN).abs();
-      if (best == null || d < (best.$1 - rate.recommendedN).abs()) {
-        best = (n, cts);
-      }
+    int n;
+    int cts;
+    final row = _rows
+        .where((r) => (pixelClock - r.$1).abs() <= r.$1 * 100e-6)
+        .firstOrNull;
+    if (row != null) {
+      (n, cts) = row.$2[rate.index];
+    } else {
+      n = (unit / 1000).round();
+      cts = (pixelClock * n + unit ~/ 2) ~/ unit;
     }
-    if (best == null) {
+    if (cts < 1 || cts >= 1 << 20 || cts * 128 <= n) {
       throw ArgumentError(
-        'no exact N and CTS for ${rate.hz} Hz audio at a pixel clock of '
-        '$pixelClock Hz',
+        'CTS $cts for ${rate.hz} Hz audio at a pixel clock of $pixelClock Hz '
+        'is out of range',
       );
     }
-    return best;
+    final ppm = (pixelClock * n / (unit * cts) - 1).abs() * 1e6;
+    if (ppm > maxErrorPpm) {
+      throw ArgumentError(
+        'the sample rate error of ${rate.hz} Hz audio at a pixel clock of '
+        '$pixelClock Hz is ${ppm.round()} ppm, the limit is $maxErrorPpm ppm',
+      );
+    }
+    return (n, cts);
   }
 }
 
@@ -68,9 +80,10 @@ abstract final class HdmiAcr {
 /// for two clocks. Then the generator starts again from 0.
 ///
 /// An accumulator adds N in each clock and subtracts 128 * CTS when it
-/// gets to that value. Each subtraction gives one [strobe]. So in
-/// `pixelClock` clocks there are exactly `fs` strobes. [acr] is high once
-/// in each CTS clocks. All values are integers, so there is no drift.
+/// gets to that value. Each subtraction gives one [strobe]. So the
+/// strobe rate is `pixelClock * N / (128 * CTS)`, as in [HdmiAcr]. [acr] is
+/// high once in each CTS clocks. All values are integers, so there is no
+/// drift.
 class HdmiAudioRateGen extends Module {
   /// One clock in each sample period.
   Logic get strobe => output('strobe');
@@ -184,9 +197,12 @@ class HdmiAudioRateGen extends Module {
 /// frame of each 192 frame block.
 ///
 /// The AVI InfoFrame (CEA-861 version 2) says RGB, no colorimetry data,
-/// [vic] and the RGB quantization range: limited when [limited] is high,
-/// else full. The Audio InfoFrame says L-PCM and 2 channels, and refers to
-/// the stream header for the sample size and the fs.
+/// [vic], the quantization range [aviQ] (Q1:Q0) and the picture aspect
+/// ratio [aviM] (M1:M0). The active format ratio R is "same as picture"
+/// when [aviM] is not 0, else 0. The Audio InfoFrame says 2 channels and
+/// refers to the stream header for the coding type, the sample size and the
+/// fs. While [active] is low, the scheduler does not pop samples and does
+/// not count underruns.
 class HdmiPacketScheduler extends Module {
   Logic get packetValid => output('packet_valid');
   Logic get packetHeader => output('packet_header');
@@ -203,19 +219,22 @@ class HdmiPacketScheduler extends Module {
   /// Audio InfoFrame header.
   static const audioInfoHeader = 0x0A0184;
 
-  /// Audio InfoFrame PB1: coding type L-PCM, 2 channels.
-  static const audioInfoPb1 = 0x11;
+  /// Audio InfoFrame PB1: CT 0 (refer to stream header), 2 channels.
+  static const audioInfoPb1 = 0x01;
 
-  /// IEC 60958-3 channel status bits that are 1 for every rate: bit 32
-  /// (24-bit maximum word length) and bits 33 and 35 (24 bits).
-  static const channelStatusWordLength = [32, 33, 35];
+  /// IEC 60958-3 channel status bits that are 1 for every rate: bit 2 (no
+  /// copyright), bit 32 (24-bit maximum word length) and bits 33 and 35
+  /// (24 bits).
+  static const channelStatusWordLength = [2, 32, 33, 35];
 
   HdmiPacketScheduler({
     required Logic clk,
     required Logic reset,
     required Logic frame,
     required Logic vic,
-    required Logic limited,
+    required Logic aviQ,
+    required Logic aviM,
+    required Logic active,
     required Logic fsSel,
     required Logic sampleValid,
     required Logic sampleLeft,
@@ -228,7 +247,9 @@ class HdmiPacketScheduler extends Module {
     reset = addInput('reset', reset);
     frame = addInput('frame', frame);
     vic = addInput('vic', vic, width: 7);
-    limited = addInput('limited', limited);
+    aviQ = addInput('avi_q', aviQ, width: 2);
+    aviM = addInput('avi_m', aviM, width: 2);
+    active = addInput('active', active);
     fsSel = addInput('fs_sel', fsSel, width: 2);
     sampleValid = addInput('sample_valid', sampleValid);
     sampleLeft = addInput('sample_left', sampleLeft, width: 24);
@@ -283,8 +304,9 @@ class HdmiPacketScheduler extends Module {
     final room = (loadAudio | count.lt(4)).named('sample_room');
     final write = (strobe & room).named('sample_write');
     final index = mux(loadAudio, Const(0, width: 3), count);
-    final left = mux(sampleValid, sampleLeft, Const(0, width: 24));
-    final right = mux(sampleValid, sampleRight, Const(0, width: 24));
+    final have = (sampleValid & active).named('sample_have');
+    final left = mux(have, sampleLeft, Const(0, width: 24));
+    final right = mux(have, sampleRight, Const(0, width: 24));
 
     Logic frameIs(int v) => frameNo.eq(Const(v, width: 8));
     var cs = channelStatusWordLength.map(frameIs).reduce((a, b) => a | b);
@@ -323,22 +345,32 @@ class HdmiPacketScheduler extends Module {
       Const(0, width: 8),
     ].swizzle();
 
-    // AVI: PB3 is the quantization range, PB4 the VIC. The other bytes
-    // are 0.
-    final pb3 = mux(limited, Const(0x04, width: 8), Const(0x08, width: 8));
+    // AVI: PB2 is M1:M0 and R3:R0, PB3 has Q1:Q0, PB4 is the VIC. The
+    // other bytes are 0.
+    final pb2 = [
+      Const(0, width: 2),
+      aviM,
+      mux(aviM.neq(0), Const(8, width: 4), Const(0, width: 4)),
+    ].swizzle().named('avi_pb2');
+    final pb3 = [
+      Const(0, width: 4),
+      aviQ,
+      Const(0, width: 2),
+    ].swizzle().named('avi_pb3');
     final pb4 = vic.zeroExtend(8);
     final aviSum = Const(
       (aviHeader & 0xff) + (aviHeader >> 8 & 0xff) + (aviHeader >> 16),
       width: 8,
     );
-    final aviCheck = (Const(0, width: 8) - (aviSum + pb3 + pb4)).named(
+    final aviCheck = (Const(0, width: 8) - (aviSum + pb2 + pb3 + pb4)).named(
       'avi_checksum',
     );
     final aviSub = [
       Const(0, width: 16),
       pb4,
       pb3,
-      Const(0, width: 16),
+      pb2,
+      Const(0, width: 8),
       aviCheck,
     ].swizzle();
     const aifSum =
@@ -446,8 +478,8 @@ class HdmiPacketScheduler extends Module {
     for (var k = 0; k < 4; k++) {
       packetSubpacket(k) <= slotSub[k];
     }
-    samplePop <= strobe & sampleValid;
-    underrun <= strobe & ~sampleValid;
+    samplePop <= strobe & have;
+    underrun <= strobe & ~sampleValid & active;
     missed <= missedNow;
   }
 }

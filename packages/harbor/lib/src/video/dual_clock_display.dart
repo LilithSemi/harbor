@@ -163,7 +163,9 @@ import 'video_timing.dart';
 /// With [audioValid] in place of the packet inputs, an [HdmiPacketScheduler]
 /// sends the packets: ACR, 2-channel L-PCM audio samples, the AVI InfoFrame
 /// and the Audio InfoFrame. The inputs are in the control domain:
-/// - `hdmi_vic` (7 bits), in the update shadow set. 0 when not known.
+/// - `hdmi_vic` (7 bits), `hdmi_avi_q` (AVI Q1:Q0, 0 is default) and
+///   `hdmi_avi_m` (AVI M1:M0 picture aspect ratio, 0 is no data), in the
+///   update shadow set. The software owns them. VIC is 0 when not known.
 /// - `audio_fs_sel`: 0 is 32 kHz, 1 is 44.1 kHz, 2 and 3 are 48 kHz. It
 ///   crosses through two flops.
 /// - `audio_valid`, `audio_left`, `audio_right` (24 bits each) and the
@@ -172,9 +174,8 @@ import 'video_timing.dart';
 ///   one sample out.
 ///
 /// N and CTS come from [HdmiAcr] for the pixel clock of [timing], so it
-/// must be the real pixel clock. The AVI InfoFrame says limited range RGB
-/// when the frame is YUV and an applied `csc_out_offset` value is not 0,
-/// else full range. The status outputs (control domain, binary, stop at
+/// must be the real pixel clock. The sample FIFO pops and
+/// `audio_underrun_count` counts only while HDMI is active. The status outputs (control domain, binary, stop at
 /// 0xffff) are `audio_underrun_count` (strobes with an empty FIFO, each
 /// sends a zero sample), `hdmi_packets_missed` (clocks where a packet
 /// source missed its slot) and `hdmi_packets_dropped`.
@@ -336,6 +337,8 @@ class HarborDualClockDisplay extends Module {
     Logic? hdmiPacketHeader,
     List<Logic>? hdmiPacketSubpacket,
     Logic? hdmiVic,
+    Logic? hdmiAviQ,
+    Logic? hdmiAviM,
     Logic? audioFsSel,
     Logic? audioValid,
     Logic? audioLeft,
@@ -403,10 +406,19 @@ class HarborDualClockDisplay extends Module {
           'together',
         );
       }
-      final audioIn = [hdmiVic, audioFsSel, audioValid, audioLeft, audioRight];
+      final audioIn = [
+        hdmiVic,
+        hdmiAviQ,
+        hdmiAviM,
+        audioFsSel,
+        audioValid,
+        audioLeft,
+        audioRight,
+      ];
       if (audioIn.any((v) => v == null) && audioIn.any((v) => v != null)) {
         throw ArgumentError(
-          'give hdmiVic, audioFsSel, audioValid, audioLeft and audioRight '
+          'give hdmiVic, hdmiAviQ, hdmiAviM, audioFsSel, audioValid, audioLeft '
+          'and audioRight '
           'together',
         );
       }
@@ -1062,6 +1074,12 @@ class HarborDualClockDisplay extends Module {
     final vic = audio
         ? shadow.add(addInput('hdmi_vic', hdmiVic!, width: 7), early: true)
         : null;
+    final aviQ = audio
+        ? shadow.add(addInput('hdmi_avi_q', hdmiAviQ!, width: 2), early: true)
+        : null;
+    final aviM = audio
+        ? shadow.add(addInput('hdmi_avi_m', hdmiAviM!, width: 2), early: true)
+        : null;
 
     // The take is in the clock before the frame start of the timing
     // generator, also with the display off.
@@ -1111,6 +1129,7 @@ class HarborDualClockDisplay extends Module {
         Logic ph;
         List<Logic> ps;
         final ready = Logic();
+        final active = audio ? Logic(name: 'hdmi_applied') : null;
         if (audio) {
           final sched = _audio(
             ctrlClk: ctrlClk,
@@ -1121,7 +1140,9 @@ class HarborDualClockDisplay extends Module {
             tx: tx,
             ty: ty,
             vic: vic!,
-            formatSel: formatSel,
+            aviQ: aviQ!,
+            aviM: aviM!,
+            active: active!,
             fsSel: audioFsSel!,
             valid: audioValid,
             left: audioLeft!,
@@ -1174,6 +1195,7 @@ class HarborDualClockDisplay extends Module {
         }
         addOutput('hdmi_active') <= act;
         ready <= f.packetReady;
+        active?.gets(f.active);
         if (hdmiPacketValid != null || audio) {
           if (!audio) addOutput('hdmi_packet_ready') <= ready;
           final dropped = Logic(name: 'hdmi_dropped', width: 16);
@@ -1232,7 +1254,9 @@ class HarborDualClockDisplay extends Module {
     required Logic tx,
     required Logic ty,
     required Logic vic,
-    required Logic? formatSel,
+    required Logic aviQ,
+    required Logic aviM,
+    required Logic active,
     required Logic fsSel,
     required Logic valid,
     required Logic left,
@@ -1265,25 +1289,6 @@ class HarborDualClockDisplay extends Module {
         harborCdcJoinReset(pixelClk, pixelReset, ctrlReset, name: 'audio_rd');
     addOutput('audio_ready') <= ~fifo.output('wr_full');
 
-    // The CSC sends limited range RGB when it adds an output offset. An
-    // RGB frame does not go through the CSC and is full range.
-    Logic limited = Const(0);
-    final c = _csc;
-    if (c != null) {
-      final offset = [
-        for (var i = 0; i < 3; i++) c.input('out_offset_$i').srcConnection!,
-      ];
-      final yuv = formats.length == 1
-          ? Const(1)
-          : [
-              for (final (i, f) in formats.indexed)
-                if (f.yuv) formatSel!.eq(i),
-            ].reduce((a, b) => a | b);
-      limited = (yuv & offset.map((o) => o.or()).reduce((a, b) => a | b)).named(
-        'hdmi_limited',
-      );
-    }
-
     final rdData = fifo.output('rd_data');
     final sched = HdmiPacketScheduler(
       clk: pixelClk,
@@ -1294,7 +1299,9 @@ class HarborDualClockDisplay extends Module {
         reset: pixelReset,
       ).named('hdmi_frame'),
       vic: vic,
-      limited: limited,
+      aviQ: aviQ,
+      aviM: aviM,
+      active: active,
       fsSel: sel,
       sampleValid: ~fifo.output('rd_empty'),
       sampleLeft: rdData.getRange(0, 24),
