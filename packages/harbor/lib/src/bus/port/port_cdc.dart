@@ -537,7 +537,8 @@ class HarborMemoryWaistCdc extends Module {
     dn.wdataValid <= wOpen & (mode | ~wdF.rdEmpty);
     dn.wdataData <= wData & (~mode).replicate(dataW);
     dn.wdataStrb <= mux(mode, Const(0, width: config.strbWidth), wStrb);
-    dn.wdataLast <= mux(mode, wBeat.eq(lenQ.popData), wLast);
+    final drainLast = Logic(name: 'w_drain_last');
+    dn.wdataLast <= mux(mode, drainLast, wLast);
     wdF.pop(dn.wdataReady & wOpen & ~mode);
     final wdFire = dn.wdataValid & dn.wdataReady;
     wdLastFire <= wdFire & dn.wdataLast;
@@ -567,7 +568,31 @@ class HarborMemoryWaistCdc extends Module {
     final reqR = reqFire & ~write;
     final reqW = reqFire & write;
 
+    // drainLast is wBeat equal to the head length, one beat early. When the
+    // head changes, wBeat is 0.
+    final ptrW = lenQ.readIndex.width;
+    final rdNext = lenQ.readIndex.eq(Const(n - 1, width: ptrW));
+    Logic second = lenQ.entries[0];
+    for (var i = n - 1; i >= 0; i--) {
+      final at = mux(
+        rdNext,
+        Const(0, width: ptrW),
+        lenQ.readIndex + 1,
+      ).eq(Const(i, width: ptrW));
+      second = mux(at, lenQ.entries[i], second);
+    }
+    final nextHead = mux(
+      lenQ.popFire & lenQ.count.gt(1),
+      second,
+      len,
+    ).named('w_next_head_len');
+    final headChange = lenQ.popFire | (lenQ.count.eq(0) & lenQ.pushFire);
+
     Sequential(fClk, reset: fReset, [
+      If.block([
+        Iff(headChange, [drainLast < nextHead.eq(0)]),
+        ElseIf(wdFire, [drainLast < (wBeat + 1).eq(lenQ.popData)]),
+      ]),
       dropped <
           dropped +
               (dn.rdataValid & dn.rdataReady & mode).zeroExtend(16) +
