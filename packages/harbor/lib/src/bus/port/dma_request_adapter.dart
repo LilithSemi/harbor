@@ -57,7 +57,8 @@ class HarborDmaRequestAdapter extends Module {
        super(
          definitionName:
              'HarborDmaRequestAdapter_a${waist.config.addressWidth}'
-             '_d${waist.config.dataWidth}_r${readAddr.width}'
+             '_d${waist.config.dataWidth}_i${waist.config.idWidth}'
+             '_r${readAddr.width}'
              '_t$timeoutCycles${writeBe == null ? '' : '_be'}',
        ) {
     final config = waist.config;
@@ -98,6 +99,12 @@ class HarborDmaRequestAdapter extends Module {
     final state = Logic(name: 'state', width: 2);
     Logic inState(int s) => state.eq(Const(s, width: 2));
 
+    // The device request waits in the p* registers. The drive registers
+    // change only when nothing is owed.
+    final pWrite = Logic(name: 'p_write');
+    final pAddr = Logic(name: 'p_addr', width: aw);
+    final pData = Logic(name: 'p_data', width: dw);
+    final pStrb = Logic(name: 'p_strb', width: config.strbWidth);
     final isWrite = Logic(name: 'is_write');
     final lastWrite = Logic(name: 'last_write');
     final addr = Logic(name: 'addr', width: aw);
@@ -150,7 +157,7 @@ class HarborDmaRequestAdapter extends Module {
     final expired = (waiting & ~moved & timer.eq(timeoutCycles - 1)).named(
       'expired',
     );
-    final startNow = (inState(sStart) & quiet).named('start_now');
+    final startNow = (inState(sStart) & quiet & ~expired).named('start_now');
     final endRead = (inState(sWait) & ~isWrite & rFire).named('end_read');
     final endWrite = (inState(sWait) & isWrite & bFire).named('end_write');
 
@@ -178,17 +185,28 @@ class HarborDmaRequestAdapter extends Module {
           If(
             readReq | writeReq,
             then: [
-              isWrite < pickWrite,
+              pWrite < pickWrite,
               lastWrite < pickWrite,
-              addr < fit(mux(pickWrite, writeAddr, readAddr)),
-              wData < writeData,
-              wStrb < be,
+              pAddr < fit(mux(pickWrite, writeAddr, readAddr)),
+              pData < writeData,
+              pStrb < be,
               state < sStart,
             ],
           ),
         ]),
         CaseItem(Const(sStart, width: 2), [
-          If(startNow, then: [reqOwe < 1, wOwe < isWrite, state < sWait]),
+          If(
+            startNow,
+            then: [
+              isWrite < pWrite,
+              addr < pAddr,
+              wData < pData,
+              wStrb < pStrb,
+              reqOwe < 1,
+              wOwe < pWrite,
+              state < sWait,
+            ],
+          ),
         ]),
         CaseItem(Const(sWait, width: 2), [
           If(
@@ -220,8 +238,8 @@ class HarborDmaRequestAdapter extends Module {
 
     final done = inState(sDone);
     addOutput('read_data', width: dw) <= rData;
-    addOutput('read_valid') <= done & ~isWrite;
-    addOutput('write_ack') <= done & isWrite;
+    addOutput('read_valid') <= done & ~pWrite;
+    addOutput('write_ack') <= done & pWrite;
     addOutput('err') <= done & errReg;
     addOutput('timeout') <= done & timeoutReg;
   }
