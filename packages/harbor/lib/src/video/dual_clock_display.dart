@@ -15,6 +15,7 @@ import 'display_output.dart';
 import 'dual_clock_scanout.dart';
 import 'dvi_transmitter.dart';
 import 'hdmi_framer.dart';
+import 'hdmi_packets.dart';
 import 'parallel_rgb_output.dart';
 import 'pixel_unpack.dart';
 import 'tmds_encoder.dart';
@@ -158,7 +159,29 @@ import 'video_timing.dart';
 /// packets accepted while HDMI is not active. It stops at 0xffff. With
 /// `hdmi_enable` at 0 the lanes are the same as a build without [hdmi].
 /// The TMDS latency does not change.
+///
+/// With [audioValid] in place of the packet inputs, an [HdmiPacketScheduler]
+/// sends the packets: ACR, 2-channel L-PCM audio samples, the AVI InfoFrame
+/// and the Audio InfoFrame. The inputs are in the control domain:
+/// - `hdmi_vic` (7 bits), in the update shadow set. 0 when not known.
+/// - `audio_fs_sel`: 0 is 32 kHz, 1 is 44.1 kHz, 2 and 3 are 48 kHz. It
+///   crosses through two flops.
+/// - `audio_valid`, `audio_left`, `audio_right` (24 bits each) and the
+///   output `audio_ready`: a stereo sample stream into a FIFO of
+///   [audioFifoDepth] samples. The sample strobe on the pixel clock takes
+///   one sample out.
+///
+/// N and CTS come from [HdmiAcr] for the pixel clock of [timing], so it
+/// must be the real pixel clock. The AVI InfoFrame says limited range RGB
+/// when the frame is YUV and an applied `csc_out_offset` value is not 0,
+/// else full range. The status outputs (control domain, binary, stop at
+/// 0xffff) are `audio_underrun_count` (strobes with an empty FIFO, each
+/// sends a zero sample), `hdmi_packets_missed` (clocks where a packet
+/// source missed its slot) and `hdmi_packets_dropped`.
 class HarborDualClockDisplay extends Module {
+  /// Stereo samples in the audio FIFO of an hdmi audio build.
+  static const audioFifoDepth = 32;
+
   /// Pixel cycles from the timing generator to the parallel outputs: one for
   /// the line buffer read and one for the output register. A build with a
   /// YUV format adds the stages of [HarborPixelUnpack] after the read and
@@ -312,6 +335,11 @@ class HarborDualClockDisplay extends Module {
     Logic? hdmiPacketValid,
     Logic? hdmiPacketHeader,
     List<Logic>? hdmiPacketSubpacket,
+    Logic? hdmiVic,
+    Logic? audioFsSel,
+    Logic? audioValid,
+    Logic? audioLeft,
+    Logic? audioRight,
     required HarborDeviceTarget target,
     super.name = 'dual_clock_display',
   }) : formats = List.unmodifiable(formats ?? [pixelFormat]),
@@ -352,7 +380,13 @@ class HarborDualClockDisplay extends Module {
              (outputType == HarborDisplayInterface.parallelRgb
                  ? '_parallelRgb'
                  : '') +
-             (hdmi ? (hdmiPacketValid == null ? '_hdmi' : '_hdmi_pkt') : ''),
+             (hdmi
+                 ? (audioValid != null
+                       ? '_hdmi_audio_p${timing.pixelClock}'
+                       : hdmiPacketValid == null
+                       ? '_hdmi'
+                       : '_hdmi_pkt')
+                 : ''),
        ) {
     requireDisplayOutputSupported(outputType);
     if (hdmi) {
@@ -369,7 +403,19 @@ class HarborDualClockDisplay extends Module {
           'together',
         );
       }
-    } else if (hdmiEnable != null || hdmiPacketValid != null) {
+      final audioIn = [hdmiVic, audioFsSel, audioValid, audioLeft, audioRight];
+      if (audioIn.any((v) => v == null) && audioIn.any((v) => v != null)) {
+        throw ArgumentError(
+          'give hdmiVic, audioFsSel, audioValid, audioLeft and audioRight '
+          'together',
+        );
+      }
+      if (audioValid != null && hdmiPacketValid != null) {
+        throw ArgumentError('an audio build has no packet inputs');
+      }
+    } else if (hdmiEnable != null ||
+        hdmiPacketValid != null ||
+        audioValid != null) {
       throw ArgumentError('give hdmi: true for the hdmi inputs');
     }
     if (timing.hTotal < 2 || timing.vActive < 1) {
@@ -1012,6 +1058,11 @@ class HarborDualClockDisplay extends Module {
     }
     pixelWord <= wordLast;
 
+    final audio = hdmi && audioValid != null;
+    final vic = audio
+        ? shadow.add(addInput('hdmi_vic', hdmiVic!, width: 7), early: true)
+        : null;
+
     // The take is in the clock before the frame start of the timing
     // generator, also with the display off.
     shadow.build(
@@ -1056,22 +1107,48 @@ class HarborDualClockDisplay extends Module {
             reset: pixelReset,
           ).named('hdmi_enable_sync$i');
         }
-        final pv = hdmiPacketValid == null
-            ? Const(0)
-            : addInput('hdmi_packet_valid', hdmiPacketValid);
-        final ph = hdmiPacketHeader == null
-            ? Const(0, width: 24)
-            : addInput('hdmi_packet_header', hdmiPacketHeader, width: 24);
-        final ps = [
-          for (var k = 0; k < 4; k++)
-            hdmiPacketSubpacket == null
-                ? Const(0, width: 56)
-                : addInput(
-                    'hdmi_packet_subpacket_$k',
-                    hdmiPacketSubpacket[k],
-                    width: 56,
-                  ),
-        ];
+        Logic pv;
+        Logic ph;
+        List<Logic> ps;
+        final ready = Logic();
+        if (audio) {
+          final sched = _audio(
+            ctrlClk: ctrlClk,
+            ctrlReset: ctrlReset,
+            pixelClk: pixelClk,
+            pixelReset: pixelReset,
+            target: target,
+            tx: tx,
+            ty: ty,
+            vic: vic!,
+            formatSel: formatSel,
+            fsSel: audioFsSel!,
+            valid: audioValid,
+            left: audioLeft!,
+            right: audioRight!,
+            ready: ready,
+          );
+          pv = sched.packetValid;
+          ph = sched.packetHeader;
+          ps = [for (var k = 0; k < 4; k++) sched.packetSubpacket(k)];
+        } else {
+          pv = hdmiPacketValid == null
+              ? Const(0)
+              : addInput('hdmi_packet_valid', hdmiPacketValid);
+          ph = hdmiPacketHeader == null
+              ? Const(0, width: 24)
+              : addInput('hdmi_packet_header', hdmiPacketHeader, width: 24);
+          ps = [
+            for (var k = 0; k < 4; k++)
+              hdmiPacketSubpacket == null
+                  ? Const(0, width: 56)
+                  : addInput(
+                      'hdmi_packet_subpacket_$k',
+                      hdmiPacketSubpacket[k],
+                      width: 56,
+                    ),
+          ];
+        }
         f = HdmiFramer(
           timing: timing,
           clk: pixelClk,
@@ -1096,8 +1173,9 @@ class HarborDualClockDisplay extends Module {
           ).named('hdmi_active_sync$i');
         }
         addOutput('hdmi_active') <= act;
-        if (hdmiPacketValid != null) {
-          addOutput('hdmi_packet_ready') <= f.packetReady;
+        ready <= f.packetReady;
+        if (hdmiPacketValid != null || audio) {
+          if (!audio) addOutput('hdmi_packet_ready') <= ready;
           final dropped = Logic(name: 'hdmi_dropped', width: 16);
           final drop = pv & ~f.active;
           dropped <=
@@ -1141,6 +1219,115 @@ class HarborDualClockDisplay extends Module {
         gpdiN <= t.gpdiN;
       }
     }
+  }
+
+  /// The audio path of an hdmi audio build: the sample FIFO from the
+  /// control domain, the [HdmiPacketScheduler] and its status outputs.
+  HdmiPacketScheduler _audio({
+    required Logic ctrlClk,
+    required Logic ctrlReset,
+    required Logic pixelClk,
+    required Logic pixelReset,
+    required HarborDeviceTarget target,
+    required Logic tx,
+    required Logic ty,
+    required Logic vic,
+    required Logic? formatSel,
+    required Logic fsSel,
+    required Logic valid,
+    required Logic left,
+    required Logic right,
+    required Logic ready,
+  }) {
+    var sel = addInput('audio_fs_sel', fsSel, width: 2);
+    for (var i = 0; i < 2; i++) {
+      sel = flop(pixelClk, sel, reset: pixelReset).named('audio_fs_sel_sync$i');
+    }
+    // Each side of the FIFO resets when either side resets.
+    final fifo = HarborCdcFifo(
+      dataWidth: 48,
+      depth: audioFifoDepth,
+      target: target,
+      blockRam: true,
+      name: 'audio_fifo',
+    );
+    fifo.input('wr_clk').srcConnection! <= ctrlClk;
+    fifo.input('wr_reset').srcConnection! <=
+        harborCdcJoinReset(ctrlClk, ctrlReset, pixelReset, name: 'audio_wr');
+    fifo.input('wr_en').srcConnection! <= addInput('audio_valid', valid);
+    fifo.input('wr_data').srcConnection! <=
+        [
+          addInput('audio_right', right, width: 24),
+          addInput('audio_left', left, width: 24),
+        ].swizzle();
+    fifo.input('rd_clk').srcConnection! <= pixelClk;
+    fifo.input('rd_reset').srcConnection! <=
+        harborCdcJoinReset(pixelClk, pixelReset, ctrlReset, name: 'audio_rd');
+    addOutput('audio_ready') <= ~fifo.output('wr_full');
+
+    // The CSC sends limited range RGB when it adds an output offset. An
+    // RGB frame does not go through the CSC and is full range.
+    Logic limited = Const(0);
+    final c = _csc;
+    if (c != null) {
+      final offset = [
+        for (var i = 0; i < 3; i++) c.input('out_offset_$i').srcConnection!,
+      ];
+      final yuv = formats.length == 1
+          ? Const(1)
+          : [
+              for (final (i, f) in formats.indexed)
+                if (f.yuv) formatSel!.eq(i),
+            ].reduce((a, b) => a | b);
+      limited = (yuv & offset.map((o) => o.or()).reduce((a, b) => a | b)).named(
+        'hdmi_limited',
+      );
+    }
+
+    final rdData = fifo.output('rd_data');
+    final sched = HdmiPacketScheduler(
+      clk: pixelClk,
+      reset: pixelReset,
+      frame: flop(
+        pixelClk,
+        tx.eq(4) & ty.eq(timing.vActive),
+        reset: pixelReset,
+      ).named('hdmi_frame'),
+      vic: vic,
+      limited: limited,
+      fsSel: sel,
+      sampleValid: ~fifo.output('rd_empty'),
+      sampleLeft: rdData.getRange(0, 24),
+      sampleRight: rdData.getRange(24, 48),
+      packetReady: ready,
+      pixelClock: timing.pixelClock,
+    );
+    fifo.input('rd_en').srcConnection! <= sched.samplePop;
+
+    Logic count(Logic event, String name) {
+      final n = Logic(name: name, width: 16);
+      n <=
+          flop(
+            pixelClk,
+            mux(n.eq(0xffff), n, n + 1),
+            en: event,
+            reset: pixelReset,
+          );
+      return _grayCross(
+        n,
+        srcClk: pixelClk,
+        srcReset: pixelReset,
+        dstClk: ctrlClk,
+        dstReset: ctrlReset,
+        name: name,
+      );
+    }
+
+    addOutput('audio_underrun_count', width: 16) <=
+        count(sched.underrun, 'audio_underrun');
+    addOutput('hdmi_packets_missed', width: 16) <=
+        count(sched.missed, 'hdmi_missed');
+    return sched;
   }
 
   /// A color conversion with its settings latched at the take. The
