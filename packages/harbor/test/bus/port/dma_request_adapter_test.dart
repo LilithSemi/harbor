@@ -303,9 +303,14 @@ void main() {
           }
           _expectBeats(b, [(false, 0x40, null), (true, 0x300, 0x44444444)]);
           expect(b.unstable, isEmpty, reason: 'timeout $t');
-          // Both orders keep working, so no handshake is owed forever.
-          await b.write(0x300, 0x55555555);
-          await b.read(0x40);
+          // A healthy request ends without an error, and a late one with a
+          // timeout.
+          final w = await b.write(0x300, 0x55555555);
+          expect(w.err, w.timeout);
+          if (!w.timeout) expect(b.mem.readWord(0x300), 0x55555555);
+          final r = await b.read(0x300);
+          expect(r.err, r.timeout);
+          if (!r.timeout) expect(r.data, 0x55555555);
           await Simulator.endSimulation();
           await Simulator.reset();
         }
@@ -345,23 +350,135 @@ void main() {
         expect((await b.read(0x300)).data, 0x55555555);
         await Simulator.endSimulation();
       });
-
-      test('a request does not start in the cycle of its timeout', () async {
-        // With one cycle of timeout, the first waiting cycle is also the
-        // last, and the fabric owes nothing.
-        final b = await _bench(kind, timeout: 1);
-        final r = await b.read(0x40);
-        expect(r.timeout, isTrue);
-        final w = await b.write(0x40, 0x1234);
-        expect(w.timeout, isTrue);
-        for (var i = 0; i < 20; i++) {
-          await b.clk.nextNegedge;
-        }
-        expect(b.mem.log, isEmpty);
-        await Simulator.endSimulation();
-      });
     });
   }
+
+  test('a timeout under 2 cycles is rejected', () {
+    expect(() => _NameProbe(1, timeout: 1), throwsArgumentError);
+    expect(() => _NameProbe(1, timeout: 2), returnsNormally);
+  });
+
+  test('a stale read request keeps its kind when a write arrives', () async {
+    final clk = SimpleClockGenerator(10).clk;
+    final reset = Logic(name: 'reset');
+    final ins = {
+      for (final n in ['rr', 'wr']) n: Logic(name: n),
+      for (final n in ['ra', 'wa', 'wd']) n: Logic(name: n, width: 32),
+      'be': Logic(name: 'be', width: 4),
+    };
+    final w = HarborMemoryWaist(_config);
+    final a = HarborDmaRequestAdapter(
+      clk: clk,
+      reset: reset,
+      waist: w,
+      readReq: ins['rr']!,
+      readAddr: ins['ra']!,
+      writeReq: ins['wr']!,
+      writeAddr: ins['wa']!,
+      writeData: ins['wd']!,
+      writeBe: ins['be'],
+      timeoutCycles: 8,
+    );
+    await a.build();
+    bool high(String n) {
+      final v = a.output(n).value;
+      return v.isValid && v.toBool();
+    }
+
+    int value(String n) => a.output(n).value.toInt();
+    for (final l in ins.values) {
+      l.inject(0);
+    }
+    // The slave holds REQ_READY low and answers nothing yet.
+    w.reqReady.inject(0);
+    w.wdataReady.inject(1);
+    w.rdataValid.inject(0);
+    w.rdataId.inject(0);
+    w.rdataData.inject(0x77);
+    w.rdataErr.inject(0);
+    w.rdataLast.inject(1);
+    w.rdataExOkay.inject(0);
+    w.wrespValid.inject(0);
+    w.wrespId.inject(0);
+    w.wrespErr.inject(0);
+    w.wrespExOkay.inject(0);
+    reset.inject(1);
+    Simulator.setMaxSimTime(1000000);
+    unawaited(Simulator.run());
+
+    // The slave side: fired request beats as (write, address), and an
+    // answer that starts the cycle after each and lasts 3 cycles.
+    final fired = <(bool, int)>[];
+    var answer = 0;
+    var hold = 0;
+    clk.negedge.listen((_) {
+      if (hold > 0 && --hold == 0) {
+        w.rdataValid.inject(0);
+        w.wrespValid.inject(0);
+      }
+      if (hold == 0 && answer != 0) {
+        w.rdataValid.inject(answer == 1 ? 1 : 0);
+        w.wrespValid.inject(answer == 2 ? 1 : 0);
+        answer = 0;
+        hold = 3;
+      }
+      if (high('m_REQ_VALID') && w.reqReady.value == LogicValue.one) {
+        fired.add((high('m_REQ_WRITE'), value('m_REQ_ADDR')));
+        answer = high('m_REQ_WRITE') ? 2 : 1;
+      }
+    });
+    await clk.nextPosedge;
+    await clk.nextPosedge;
+    reset.inject(0);
+    await clk.nextPosedge;
+
+    Future<({bool err, bool timeout})> finish(String done) async {
+      for (var i = 0; i < 200; i++) {
+        await clk.nextNegedge;
+        if (high(done)) return (err: high('err'), timeout: high('timeout'));
+      }
+      throw StateError('$done never came');
+    }
+
+    ins['ra']!.inject(0x40);
+    ins['rr']!.inject(1);
+    final r = await finish('read_valid');
+    expect(r.timeout, isTrue);
+    ins['rr']!.inject(0);
+    // The device sends a write. The stale read request must not change.
+    ins['wa']!.inject(0x80);
+    ins['wd']!.inject(0xCAFE);
+    ins['be']!.inject(0xf);
+    ins['wr']!.inject(1);
+    final seen = <(bool, int)>[];
+    final f = finish('write_ack');
+    for (var i = 0; i < 20; i++) {
+      await clk.nextNegedge;
+      if (high('m_REQ_VALID'))
+        seen.add((high('m_REQ_WRITE'), value('m_REQ_ADDR')));
+    }
+    expect((await f).timeout, isTrue);
+    ins['wr']!.inject(0);
+    expect(seen, isNotEmpty);
+    expect(seen.toSet(), {(false, 0x40)});
+    // The slave takes the stale request. It is still a read.
+    await clk.nextPosedge;
+    w.reqReady.inject(1);
+    for (var i = 0; i < 20; i++) {
+      await clk.nextNegedge;
+    }
+    expect(fired, [(false, 0x40)]);
+    // Nothing stays owed, so a new write finishes with its own data.
+    ins['wa']!.inject(0x90);
+    ins['wd']!.inject(0xBEEF);
+    ins['wr']!.inject(1);
+    final d = await finish('write_ack');
+    ins['wr']!.inject(0);
+    expect(d.timeout, isFalse);
+    expect(d.err, isFalse);
+    expect(fired.last, (true, 0x90));
+    await Simulator.endSimulation();
+  });
 
   test('the name includes the id width', () {
     String name(int idWidth) {
@@ -438,7 +555,8 @@ class _MediaTop extends BridgeModule {
 class _NameProbe extends BridgeModule {
   late final HarborDmaRequestAdapter adapter;
 
-  _NameProbe(int idWidth) : super('NameProbe$idWidth', name: 'probe') {
+  _NameProbe(int idWidth, {int timeout = 1 << 16})
+    : super('NameProbe$idWidth', name: 'probe') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     final port = HarborMemoryMasterPort.create(
@@ -462,6 +580,7 @@ class _NameProbe extends BridgeModule {
       writeReq: addInput('write_req', Logic()),
       writeAddr: addInput('write_addr', Logic(width: 32), width: 32),
       writeData: addInput('write_data', Logic(width: 32), width: 32),
+      timeoutCycles: timeout,
     );
   }
 }

@@ -64,8 +64,8 @@ class HarborDmaRequestAdapter extends Module {
     final config = waist.config;
     final dw = config.dataWidth;
     final aw = config.addressWidth;
-    if (timeoutCycles < 1) {
-      throw RangeError.value(timeoutCycles, 'timeoutCycles', 'must be >= 1');
+    if (timeoutCycles < 2) {
+      throw ArgumentError.value(timeoutCycles, 'timeoutCycles', 'must be >= 2');
     }
     if (writeAddr.width != readAddr.width) {
       throw ArgumentError('read and write addresses differ in width');
