@@ -154,7 +154,7 @@ import 'video_timing.dart';
 /// to `_3` and the `hdmi_packet_ready` output (pixel domain), see
 /// [HdmiFramer]. `hdmi_packet_ready` follows `hdmi_packet_valid`
 /// combinationally, so a source must not make valid depend on ready. The
-/// `hdmi_packets_dropped` output (control domain, gray code) counts the
+/// `hdmi_packets_dropped` output (control domain, binary) counts the
 /// packets accepted while HDMI is not active. It stops at 0xffff. With
 /// `hdmi_enable` at 0 the lanes are the same as a build without [hdmi].
 /// The TMDS latency does not change.
