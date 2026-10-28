@@ -269,9 +269,32 @@ void main() {
           expect(await b.bus.read(0xA0), 4);
           expect(b.port('tx_dma_ptr_error'), 1);
           expect(b.mem.log.where((e) => e.$2 >= newBase), isEmpty);
-          // Software clears the bit and the DMA goes on.
+          // Recovery: stop, zero the pointers, set the size, move WR, clear
+          // the bit and play.
+          await b.bus.write(0x20, 0);
+          await b.cycles(20);
+          final from = b.mem.log.length;
+          await b.bus.write(0x40, 0);
+          await b.bus.write(0x48, 0);
+          await b.bus.write(0x38, 0x80);
+          expect(await b.bus.read(0x38), 0x80);
+          for (var k = 20; k < 25; k++) {
+            final o = (k - 20) * 8;
+            b.mem.writeWord(newBase + o, 0xEE000000 | _left(k));
+            b.mem.writeWord(newBase + o + 4, 0x77000000 | _right(k));
+          }
+          await b.bus.write(0x40, 0x28);
           await b.bus.write(0xA0, 4);
-          await b.until(() => b.mem.log.any((e) => e.$2 >= newBase));
+          expect(b.port('tx_dma_ptr_error'), 0);
+          await b.bus.write(0x20, 1);
+          await b.until(() => b.received.length == 25);
+          await b.cycles(100);
+          b.expectInOrder(0, 25);
+          final reads = b.mem.log.skip(from).where((e) => !e.$1);
+          expect(reads, isNotEmpty);
+          for (final e in reads) {
+            expect(e.$2, inInclusiveRange(newBase, newBase + 0x80 - 4));
+          }
           await Simulator.endSimulation();
         },
       );
