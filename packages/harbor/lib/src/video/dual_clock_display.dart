@@ -146,10 +146,16 @@ import 'video_timing.dart';
 /// [underrun] includes the overlay planes.
 ///
 /// [hdmi] adds an [HdmiFramer] to a TMDS build. It has the
-/// `hdmi_enable` input (control domain, two flops into the pixel domain)
-/// and, with [hdmiPacketValid], the packet inputs `hdmi_packet_valid`,
-/// `hdmi_packet_header` and `hdmi_packet_subpacket_0` to `_3` and the
-/// `hdmi_packet_ready` output (pixel domain), see [HdmiFramer]. With
+/// `hdmi_enable` input (control domain). It is not in the update shadow
+/// set. It crosses through two flops and applies at the next vertical
+/// blank. The `hdmi_active` output (control domain) is the applied value.
+/// With [hdmiPacketValid], the build has the packet inputs
+/// `hdmi_packet_valid`, `hdmi_packet_header` and `hdmi_packet_subpacket_0`
+/// to `_3` and the `hdmi_packet_ready` output (pixel domain), see
+/// [HdmiFramer]. `hdmi_packet_ready` follows `hdmi_packet_valid`
+/// combinationally, so a source must not make valid depend on ready. The
+/// `hdmi_packets_dropped` output (control domain, gray code) counts the
+/// packets accepted while HDMI is not active. It stops at 0xffff. With
 /// `hdmi_enable` at 0 the lanes are the same as a build without [hdmi].
 /// The TMDS latency does not change.
 class HarborDualClockDisplay extends Module {
@@ -346,7 +352,7 @@ class HarborDualClockDisplay extends Module {
              (outputType == HarborDisplayInterface.parallelRgb
                  ? '_parallelRgb'
                  : '') +
-             (hdmi ? '_hdmi' : ''),
+             (hdmi ? (hdmiPacketValid == null ? '_hdmi' : '_hdmi_pkt') : ''),
        ) {
     requireDisplayOutputSupported(outputType);
     if (hdmi) {
@@ -1081,8 +1087,35 @@ class HarborDualClockDisplay extends Module {
           packetHeader: ph,
           packetSubpacket: ps,
         );
+        var act = f.active;
+        for (var i = 0; i < 2; i++) {
+          act = flop(
+            ctrlClk,
+            act,
+            reset: ctrlReset,
+          ).named('hdmi_active_sync$i');
+        }
+        addOutput('hdmi_active') <= act;
         if (hdmiPacketValid != null) {
           addOutput('hdmi_packet_ready') <= f.packetReady;
+          final dropped = Logic(name: 'hdmi_dropped', width: 16);
+          final drop = pv & ~f.active;
+          dropped <=
+              flop(
+                pixelClk,
+                mux(dropped.eq(0xffff), dropped, dropped + 1),
+                en: drop,
+                reset: pixelReset,
+              );
+          addOutput('hdmi_packets_dropped', width: 16) <=
+              _grayCross(
+                dropped,
+                srcClk: pixelClk,
+                srcReset: pixelReset,
+                dstClk: ctrlClk,
+                dstReset: ctrlReset,
+                name: 'hdmi_dropped',
+              );
         }
         framer = f;
       }

@@ -1,3 +1,6 @@
+@Tags(['slow'])
+library;
+
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';

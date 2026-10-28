@@ -168,7 +168,7 @@ void main() {
   test('an hdmi build has its own name and the hdmi ports', () async {
     final d = make();
     await d.build();
-    expect(d.definitionName, endsWith('_hdmi'));
+    expect(d.definitionName, endsWith('_hdmi_pkt'));
     expect(d.inputs.keys, containsAll(['hdmi_enable', 'hdmi_packet_valid']));
     expect(d.inputs.keys, contains('hdmi_packet_subpacket_3'));
     expect(d.outputs.keys, contains('hdmi_packet_ready'));
