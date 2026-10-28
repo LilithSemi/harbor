@@ -247,6 +247,35 @@ void main() {
         await Simulator.endSimulation();
       });
 
+      test(
+        'a rejected size stops a restart that would read past the new ring',
+        () async {
+          final b = await _bench(kind);
+          await b.ring(64);
+          await b.put(20);
+          await b.bus.write(0x20, 1);
+          await b.until(() => b.received.length == 20);
+          await b.bus.write(0x20, 0);
+          await b.cycles(20);
+          // The driver sets up a 0x80 byte buffer while WR is still 0xA0.
+          const newBase = _base + 0x1000;
+          await b.bus.write(0x30, newBase);
+          await b.bus.write(0x38, 0x80);
+          expect(await b.bus.read(0x38), 0x200);
+          await b.bus.write(0x40, 0x100);
+          await b.bus.write(0x48, 0);
+          await b.bus.write(0x20, 1);
+          await b.cycles(300);
+          expect(await b.bus.read(0xA0), 4);
+          expect(b.port('tx_dma_ptr_error'), 1);
+          expect(b.mem.log.where((e) => e.$2 >= newBase), isEmpty);
+          // Software clears the bit and the DMA goes on.
+          await b.bus.write(0xA0, 4);
+          await b.until(() => b.mem.log.any((e) => e.$2 >= newBase));
+          await Simulator.endSimulation();
+        },
+      );
+
       test('a ring pointer write past the size is rejected', () async {
         final b = await _bench(kind);
         await b.ring(8);
@@ -290,6 +319,13 @@ void main() {
         await b.bus.write(0x38, 0);
         expect(await b.bus.read(0x38), 0);
         expect(await b.bus.read(0xA0), 0);
+        // A size write while playing could race the pointer update.
+        await b.bus.write(0x38, 0x40);
+        await b.bus.write(0x20, 1);
+        await b.bus.write(0x38, 0x80);
+        expect(await b.bus.read(0x38), 0x40);
+        expect(await b.bus.read(0xA0), 4);
+        expect(await b.bus.read(0x08) & 0x8, 0x8);
         await Simulator.endSimulation();
       });
     });

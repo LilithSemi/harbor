@@ -148,6 +148,9 @@ int _codecCapsOf(List<HarborAudioCodecFormat> hwCodecs) {
 /// A write to TX_DMA_WR or TX_DMA_RD of a value at or past TX_DMA_SIZE
 /// (other than 0), or a write to TX_DMA_SIZE that leaves either pointer at
 /// or past the new size, does not change the register. It sets TX_DMA_ERR bit 2.
+/// A TX_DMA_SIZE write while play is 1 is also rejected. Write WR and RD to 0
+/// before a smaller SIZE. The DMA starts no fetch while any TX_DMA_ERR bit is
+/// set.
 ///
 /// The `tx_underrun_count`, `tx_dma_error`, `tx_dma_timeout` and
 /// `tx_dma_ptr_error` outputs show TX_UNDERRUN and the TX_DMA_ERR bits.
@@ -380,7 +383,7 @@ class HarborAudioController extends BridgeModule
     // Playback ring and fetch.
     final play = txCtrl[0];
     final lowLevel = txCtrl.getRange(8, 32).zeroExtend(32);
-    final halted = (errBus | errTimeout).named('tx_halted');
+    final halted = (errBus | errTimeout | errPtr).named('tx_halted');
     final ringEmpty = txDmaWr.eq(txDmaRd).named('ring_empty');
     final level = mux(
       txDmaWr.gte(txDmaRd),
@@ -411,7 +414,7 @@ class HarborAudioController extends BridgeModule
           (txDmaAddr +
                   txDmaRd +
                   mux(inRight, Const(4, width: 32), Const(0, width: 32)))
-              .slice(dmaAddressWidth <= 32 ? dmaAddressWidth - 1 : 31, 0)
+              .slice(dmaAddressWidth - 1, 0)
               .zeroExtend(dmaAddressWidth)
               .named('dma_read_addr'),
       writeReq: Const(0),
@@ -504,11 +507,12 @@ class HarborAudioController extends BridgeModule
     ).named('tx_dma_size_new');
     final badSize =
         (writes(0x38) &
-                mux(
-                  sizeNew.eq(0),
-                  txDmaWr.neq(0) | txDmaRd.neq(0),
-                  txDmaWr.gte(sizeNew) | txDmaRd.gte(sizeNew),
-                ))
+                (play |
+                    mux(
+                      sizeNew.eq(0),
+                      txDmaWr.neq(0) | txDmaRd.neq(0),
+                      txDmaWr.gte(sizeNew) | txDmaRd.gte(sizeNew),
+                    )))
             .named('bad_size');
     final badWr = (writes(0x40) & pastSize(wrNew)).named('bad_wr');
     final badRd = (writes(0x48) & ~play & fetchIdle & pastSize(rdNew)).named(
