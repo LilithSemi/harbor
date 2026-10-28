@@ -1,5 +1,6 @@
 // Bus masters on a HarborSoC of each fabric kind: the DMA controller, the
-// debug module system bus access and a line fetcher, each against an SRAM.
+// debug module system bus access, the audio controller and a line fetcher,
+// each against an SRAM.
 
 import 'dart:async';
 
@@ -13,6 +14,7 @@ import '../util/reg_bus.dart';
 const _sram = 0x80000000;
 const _dma = 0x30000000;
 const _dm = 0x30001000;
+const _audio = 0x30002000;
 
 /// A register master whose native port pins are plain `p_<PORT>` ports.
 class _Cpu extends BridgeModule {
@@ -174,6 +176,67 @@ void main() {
       for (var i = 0; i < 8; i++) {
         expect(await bus.read(_sram + 0x200 + 4 * i), _word(i));
       }
+      expect(busError.value.toInt(), 0);
+      await Simulator.endSimulation();
+    });
+
+    test('${kind.name}: the audio controller plays a ring in SRAM', () async {
+      final soc = _soc(kind);
+      final cpu = soc.addMaster(_Cpu(kind));
+      final audio = HarborAudioController(
+        baseAddress: _audio,
+        busAddressWidth: 32,
+        fabricKind: kind,
+      );
+      soc.addPeripheral(audio);
+      soc.addMaster(
+        audio,
+        busInterfaceName: 'dma',
+        memory: true,
+        outstanding: 1,
+      );
+      soc.addPeripheral(_ram(kind));
+      cpu.pullUp(soc);
+      for (final n in ['audio_valid', 'audio_left', 'audio_right']) {
+        soc.pullUpPort(audio.port(n), newPortName: n);
+      }
+      soc.pullUpPort(audio.port('audio_ready'), newPortName: 'audio_ready');
+      soc.pullUpPort(audio.port('sdata_in'), newPortName: 'sdata_in');
+      soc.input('audio_ready').srcConnection! <= Const(1);
+      soc.input('sdata_in').srcConnection! <= Const(0);
+      soc.buildFabric();
+      final busError = soc.exposeBusError();
+      final clk = SimpleClockGenerator(10).clk;
+      final bus = RegBus.attach(soc, clk, name: 'cpu', kind: kind);
+      await _start(soc, clk, [bus.idle]);
+      final got = <(int, int)>[];
+      clk.negedge.listen((_) {
+        if (soc.output('audio_valid').value.toInt() == 1) {
+          got.add((
+            soc.output('audio_left').value.toInt(),
+            soc.output('audio_right').value.toInt(),
+          ));
+        }
+      });
+
+      const ring = _sram + 0x100;
+      for (var k = 0; k < 6; k++) {
+        await bus.write(ring + 8 * k, _word(k) & 0xffffff);
+        await bus.write(ring + 8 * k + 4, _word(k + 6) & 0xffffff);
+      }
+      await bus.write(_audio + 0x30, ring);
+      await bus.write(_audio + 0x38, 8 * 8);
+      await bus.write(_audio + 0x40, 6 * 8);
+      await bus.write(_audio + 0x20, 1);
+      for (var i = 0; i < 400 && got.length < 6; i++) {
+        await clk.nextPosedge;
+      }
+      expect(got, [
+        for (var k = 0; k < 6; k++)
+          (_word(k) & 0xffffff, _word(k + 6) & 0xffffff),
+      ]);
+      expect(await bus.read(_audio + 0x48), 6 * 8);
+      expect(await bus.read(_audio + 0xA0), 0);
       expect(busError.value.toInt(), 0);
       await Simulator.endSimulation();
     });
