@@ -93,6 +93,58 @@ void main() {
     );
   });
 
+  test('a build with its own control clock has its own name', () {
+    const vga = HarborDisplayTiming.vga640x480();
+    String name({
+      required bool control,
+      List<HarborPixelFormat>? formats,
+      List<HarborPixelFormat>? overlay,
+    }) => HarborDualClockDisplay(
+      target: const HarborSimTarget(),
+      timing: vga,
+      pixelClk: Logic(),
+      pixelReset: Logic(),
+      sysClk: Logic(),
+      sysReset: Logic(),
+      controlClk: control ? Logic() : null,
+      controlReset: control ? Logic() : null,
+      enable: Logic(),
+      update: Logic(),
+      fbBase: Logic(width: 32),
+      memory: HarborMemoryWaist(_memConfig),
+      formats: formats,
+      formatSel: formats == null ? null : Logic(),
+      planeBase: [if (formats != null) Logic(width: 32)],
+      planePitch: [
+        if (formats != null) ...[Logic(width: 32), Logic(width: 32)],
+      ],
+      overlayFormats: overlay,
+      overlayEnable: overlay == null ? null : Logic(),
+      overlayBase: [if (overlay != null) Logic(width: 32)],
+      overlayPitch: [if (overlay != null) Logic(width: 32)],
+      overlaySrcX: overlay == null ? null : Logic(width: 10),
+      overlaySrcY: overlay == null ? null : Logic(width: 10),
+      overlayDstX: overlay == null ? null : Logic(width: 10),
+      overlayDstY: overlay == null ? null : Logic(width: 10),
+      overlayWidth: overlay == null ? null : Logic(width: 10),
+      overlayHeight: overlay == null ? null : Logic(width: 10),
+      overlayAlpha: overlay == null ? null : Logic(width: 8),
+      outputType: HarborDisplayInterface.parallelRgb,
+    ).definitionName;
+    final sets = <(List<HarborPixelFormat>?, List<HarborPixelFormat>?)>[
+      (null, null),
+      ([HarborPixelFormat.nv12, HarborPixelFormat.xrgb8888], null),
+      (null, [HarborPixelFormat.xrgb8888]),
+    ];
+    for (final (formats, overlay) in sets) {
+      final plain = name(control: false, formats: formats, overlay: overlay);
+      final own = name(control: true, formats: formats, overlay: overlay);
+      expect(own, isNot(plain));
+      expect(name(control: true, formats: formats, overlay: overlay), own);
+      expect(name(control: false, formats: formats, overlay: overlay), plain);
+    }
+  });
+
   test('one plane builds of two timings have their own names', () {
     String name(HarborDisplayTiming t, {bool port = false}) =>
         HarborDualClockDisplay(

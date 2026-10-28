@@ -141,6 +141,7 @@ void main() {
   HarborDualClockDisplay make({
     bool hdmi = true,
     bool packets = true,
+    int subCount = 4,
     HarborDisplayInterface out = HarborDisplayInterface.dvi,
   }) => HarborDualClockDisplay(
     target: const HarborSimTarget(),
@@ -161,7 +162,7 @@ void main() {
     hdmiPacketValid: packets ? Logic() : null,
     hdmiPacketHeader: packets ? Logic(width: 24) : null,
     hdmiPacketSubpacket: packets
-        ? [for (var k = 0; k < 4; k++) Logic(width: 56)]
+        ? [for (var k = 0; k < subCount; k++) Logic(width: 56)]
         : null,
   );
 
@@ -188,6 +189,18 @@ void main() {
       throwsArgumentError,
     );
     expect(() => make(hdmi: false), throwsArgumentError);
+    for (final n in [3, 5]) {
+      expect(
+        () => make(subCount: n),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.name,
+            'name',
+            'hdmiPacketSubpacket',
+          ),
+        ),
+      );
+    }
   });
 
   test('hdmi_enable 0 gives the lanes of a build without hdmi', () async {

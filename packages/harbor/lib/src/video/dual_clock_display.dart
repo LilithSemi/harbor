@@ -77,7 +77,11 @@ import 'video_timing.dart';
 /// `plane_underrun_count_<n>` and `overlay_underrun_count_<n>` are in the
 /// control domain. A count crosses as gray code when `control_clk` is not
 /// [sysClk]. Then a control reset alone sets a count to 0 for about two
-/// control clocks, until the count from [sysClk] arrives again.
+/// control clocks, until the count from [sysClk] arrives again. The
+/// `hdmi_packets_dropped`, `audio_underrun_count` and `hdmi_packets_missed`
+/// counts always cross as gray code from the pixel side. They also read 0
+/// for about two control clocks after a control reset without `control_clk`.
+/// A pixel reset clears them too.
 ///
 /// A pitch input is in bytes. The display ignores its low 2 bits, so a
 /// pitch is a multiple of 4. It must be at least
@@ -381,6 +385,7 @@ class HarborDualClockDisplay extends Module {
                overlayFormats,
                target,
              ) +
+             (controlClk == null ? '' : '_c') +
              (outputType == HarborDisplayInterface.parallelRgb
                  ? '_parallelRgb'
                  : '') +
@@ -405,6 +410,13 @@ class HarborDualClockDisplay extends Module {
         throw ArgumentError(
           'give hdmiPacketValid, hdmiPacketHeader and hdmiPacketSubpacket '
           'together',
+        );
+      }
+      if (hdmiPacketSubpacket != null && hdmiPacketSubpacket.length != 4) {
+        throw ArgumentError.value(
+          hdmiPacketSubpacket.length,
+          'hdmiPacketSubpacket',
+          'needs 4 subpackets',
         );
       }
       final audioIn = [
