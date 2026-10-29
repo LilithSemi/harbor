@@ -81,6 +81,8 @@
 #define HETH_ST_RX_RING_ERR BIT(3)
 #define HETH_ST_RX_CLK_LOST BIT(4)
 #define HETH_ST_TX_CLK_LOST BIT(5)
+#define HETH_ST_BUS_BAD_ID  BIT(6)
+#define HETH_ST_BUS_W_LAST  BIT(7)
 
 #define HETH_INT_TX_DONE   BIT(0)
 #define HETH_INT_RX_DONE   BIT(1)

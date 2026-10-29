@@ -59,9 +59,15 @@ abstract final class HarborEthReg {
 /// INT_STATUS and the sticky STATUS bits are write 1 to clear. An event in
 /// the same cycle as a clear wins.
 ///
+/// STATUS bits: 0 tx_running, 1 rx_running, 2 tx_ring_err, 3 rx_ring_err,
+/// 4 rx_clk_lost, 5 tx_clk_lost, 6 bus_bad_id, 7 bus_w_last.
+///
 /// STATUS tx_ring_err and rx_ring_err set on the rising edge of the DMA
 /// `ring_err`. STATUS tx_clk_lost and rx_clk_lost show the FIFO `clk_lost`,
-/// and a write 1 pulses `*_clk_lost_clear`.
+/// and a write 1 pulses `*_clk_lost_clear`. STATUS bus_bad_id and bus_w_last
+/// show the sticky `err_bad_id` and `err_w_last` of the DMA arbiter. They
+/// are read only, and the datapath reset (reset or soft_reset) clears them.
+/// Both read 0 while the fabric and the DMAs work correctly.
 ///
 /// CTRL soft_reset makes `tx_en` and `rx_en` low, so the DMAs end their
 /// frames. When both DMAs are idle and `bus_idle` is high, `soft_reset`
@@ -156,6 +162,8 @@ class HarborEthRegs extends Module {
     required Logic txClkLost,
     required Logic rxClkLost,
     required Logic rxOverflow,
+    required Logic busBadId,
+    required Logic busWLast,
     required Logic evTxFrame,
     required Logic evRxFrame,
     required Logic evRxFcs,
@@ -200,6 +208,8 @@ class HarborEthRegs extends Module {
     txClkLost = addInput('tx_clk_lost', txClkLost);
     rxClkLost = addInput('rx_clk_lost', rxClkLost);
     rxOverflow = addInput('rx_overflow', rxOverflow);
+    busBadId = addInput('bus_bad_id', busBadId);
+    busWLast = addInput('bus_w_last', busWLast);
     evTxFrame = addInput('ev_tx_frame', evTxFrame);
     evRxFrame = addInput('ev_rx_frame', evRxFrame);
     evRxFcs = addInput('ev_rx_fcs', evRxFcs);
@@ -318,7 +328,9 @@ class HarborEthRegs extends Module {
       'rx_running',
     );
     final statusRead = [
-      c(0, 26),
+      c(0, 24),
+      busWLast,
+      busBadId,
       txClkLost,
       rxClkLost,
       rxRingErrS,

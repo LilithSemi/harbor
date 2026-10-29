@@ -51,7 +51,9 @@ import 'ethernet/eth_regs.dart';
 /// the clock domain crossings go into it on Xilinx. See [cdcConstraints].
 ///
 /// The TX and RX DMAs share `dma`. TX requests use ID 0 and RX requests use
-/// ID 2, so the responses of the two never mix. A frame that the TX FIFO
+/// ID 2, so the responses of the two never mix. The outputs `arb_err_bad_id`
+/// and `arb_err_w_last` are the sticky diagnostics of the DMA arbiter (see
+/// [HarborWaistArbiter]). STATUS bits 6 and 7 show them too. A frame that the TX FIFO
 /// drops because the TX clock is lost comes back with TX error code 4.
 ///
 /// The MAC cores and the front end reset only with `reset`. CTRL soft_reset
@@ -248,6 +250,8 @@ class HarborEthernetMac extends BridgeModule
     final txClkLost = fwd('tx_clk_lost');
     final rxClkLost = fwd('rx_clk_lost');
     final rxOverflow = fwd('rx_overflow');
+    final busBadId = fwd('bus_bad_id');
+    final busWLast = fwd('bus_w_last');
     final evTx = fwd('ev_tx_frame');
     final evRx = fwd('ev_rx_frame');
     final evFcs = fwd('ev_rx_fcs');
@@ -284,6 +288,8 @@ class HarborEthernetMac extends BridgeModule
       txClkLost: txClkLost,
       rxClkLost: rxClkLost,
       rxOverflow: rxOverflow,
+      busBadId: busBadId,
+      busWLast: busWLast,
       evTxFrame: evTx,
       evRxFrame: evRx,
       evRxFcs: evFcs,
@@ -453,6 +459,10 @@ class HarborEthernetMac extends BridgeModule
     txBusy <= dmaTx.busy;
     rxBusy <= dmaRx.busy;
     busIdle <= arb.idle;
+    busBadId <= arb.errBadId;
+    busWLast <= arb.errWLast;
+    addOutput('arb_err_bad_id') <= arb.errBadId;
+    addOutput('arb_err_w_last') <= arb.errWLast;
     txRingErr <= dmaTx.ringErr;
     rxRingErr <= dmaRx.ringErr;
     txDone <= dmaTx.txDone;

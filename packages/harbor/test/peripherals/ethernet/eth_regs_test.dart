@@ -535,6 +535,40 @@ Future<void> _ringMove() async {
   await b.finish();
 }
 
+/// A frame out and its descriptor write-backs. The DMA arbiter diagnostics
+/// stay 0 on the MAC ports and in STATUS bits 6 and 7.
+Future<void> _busDiag(HarborFabricKind kind) async {
+  final b = await EthMacBench.start(
+    config: _basic(HarborEthPhy.mii),
+    link: EthLink.mii100,
+    kind: kind,
+    sysPeriod: 20,
+    loopback: false,
+  );
+  final m = b.phy! as EthMiiModel;
+  final d = EthDriver(b);
+  await d.init(ctrl: 0x1 | 0x10);
+  d.send(_frame(Random(9), 200), pieces: 2);
+  await d.kickTx();
+  final done = <EthTxDone>[];
+  await _waitFor(
+    b,
+    () async {
+      done.addAll(d.reclaimTx());
+      return done.length == 2;
+    },
+    'write-backs',
+    polls: 4000,
+  );
+  await _waitFor(b, () async => m.txFrames.isNotEmpty, 'wire', polls: 4000);
+  check(await b.read(R.status) & 0xC0, 0, reason: 'bus_bad_id, bus_w_last');
+  for (final p in ['arb_err_bad_id', 'arb_err_w_last']) {
+    check(b.top.output(p).value.toInt(), 0, reason: p);
+  }
+  check(b.mem.errors, isEmpty);
+  await b.finish();
+}
+
 Future<void> _softResetBusy() async {
   final b = await EthMacBench.start(
     config: _basic(HarborEthPhy.mii),
@@ -641,6 +675,12 @@ void main() {
   _iso('STATUS running covers the FIFO and the MACs', _running);
   _iso('rx_running waits for rx_en on the RX clock', _rxEnTail);
   _iso('a ring base write waits for the frame in flight', _ringMove);
+  for (final kind in [HarborFabricKind.wishbone, HarborFabricKind.axi4]) {
+    _iso(
+      'DMA arbiter diagnostics read 0 after traffic, ${kind.name}',
+      () => _busDiag(kind),
+    );
+  }
 
   group('top', () {
     tearDown(Simulator.reset);

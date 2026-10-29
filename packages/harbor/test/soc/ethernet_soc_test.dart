@@ -426,6 +426,11 @@ Future<void> _driverFlow(HarborFabricKind kind) async {
   await wr(HarborEthReg.ctrl, 0x50);
   check(await rd(HarborEthReg.ctrl) & 0xF3, 0x50);
   check(await rd(HarborEthReg.status) & 0xC, 0, reason: 'ring errors');
+  check(
+    await rd(HarborEthReg.status) & 0xC0,
+    0,
+    reason: 'DMA arbiter diagnostics',
+  );
 
   check(busError.value.toInt(), 0);
   phy.stop();
