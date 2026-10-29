@@ -348,6 +348,9 @@ class _Mem {
 
   /// The next read response goes out with this source index.
   int? mangleIndex;
+
+  /// The next write response goes out with this source index.
+  int? mangleBIndex;
   int cycle = 0;
 
   /// Accepted requests: (cycle, source index, write).
@@ -454,7 +457,18 @@ class _Mem {
           _r = x;
         }
       }
-      _b ??= choose(wresps);
+      if (_b == null) {
+        final x = choose(wresps);
+        final mi = mangleBIndex;
+        if (x != null && mi != null) {
+          mangleBIndex = null;
+          final low = x.id & ((1 << sw) - 1);
+          _b = _Pending(x.id, x.excl, x.addr, x.len, x.due, x.index)
+            ..outId = (mi << sw) | low;
+        } else {
+          _b = x;
+        }
+      }
       final r = _r;
       final b = _b;
       s
@@ -467,7 +481,7 @@ class _Mem {
         ..set('mem_RDATA_EXOKAY', r?.excl ?? false ? 1 : 0)
         ..set('mem_RDATA_LAST', r != null && _rBeat == r.len ? 1 : 0)
         ..set('mem_WRESP_VALID', b == null ? 0 : 1)
-        ..set('mem_WRESP_ID', b?.id ?? 0)
+        ..set('mem_WRESP_ID', b?.outId ?? b?.id ?? 0)
         ..set('mem_WRESP_ERR', 0)
         ..set('mem_WRESP_EXOKAY', b?.excl ?? false ? 1 : 0);
     });
@@ -792,6 +806,59 @@ void main() {
     expect(b.out('err_bad_id'), 1);
     expect(b.out('err_w_last'), 0);
     b.src[0].reads.clear();
+    await b.finish();
+  });
+
+  test('a write response with no source sets err_bad_id', () async {
+    final b = await _Bench.start([1, 1, 1], 3);
+    b.mem.mangleBIndex = 3;
+    b.src[0].write(len: 1);
+    await b.until(() => b.out('err_bad_id') == 1);
+    await b.s.cycles(20);
+    expect(b.src[0].done, 0);
+    expect(b.mem.busy, isFalse, reason: 'B response taken');
+    for (final x in [b.src[1], b.src[2]]) {
+      for (var k = 0; k < 8; k++) {
+        x
+          ..read()
+          ..write();
+      }
+    }
+    await b.until(() => b.src[1].done == 16 && b.src[2].done == 16);
+    expect(b.out('err_bad_id'), 1);
+    expect(b.out('err_w_last'), 0);
+    b.src[0].writes.clear();
+    await b.finish();
+  });
+
+  test('a len 0 drain goes on when the write slice is full', () async {
+    final b = await _Bench.start([1, 1], 2);
+    final o = b.src[0];
+    final sf = b.src[1];
+    o.wRate = 1;
+    b.mem.wReady = 0;
+    o.write(len: 1);
+    await b.until(() => o.todo.isEmpty && o.wq.isEmpty);
+    await b.s.cycles(4);
+    sf.stallW = 0;
+    final w = sf.write(len: 0, excl: false, track: false);
+    await b.until(() => b.mem.reqLog.any((x) => x.$2 == 1 && x.$3));
+    sf
+      ..enterGarbage()
+      ..garbage = false
+      ..stallW = null;
+    b.flush(1, true);
+    await b.s.cycles(1);
+    b.flush(1, false);
+    await b.s.cycles(10);
+    expect(b.mem.beatLog.where((x) => x.$1 == w.addr), isEmpty);
+    b.mem.wReady = 1;
+    await b.until(() => o.done == 1);
+    await b.settle();
+    _checkDrained(b, w, 0);
+    expect(b.mem.beatLog, hasLength(3));
+    expect(b.out('idle'), 1);
+    expect(b.out('idle_1'), 1);
     await b.finish();
   });
 

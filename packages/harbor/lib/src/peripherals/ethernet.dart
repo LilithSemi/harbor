@@ -53,8 +53,9 @@ import 'ethernet/eth_regs.dart';
 /// The TX and RX DMAs share `dma`. TX requests use ID 0 and RX requests use
 /// ID 2, so the responses of the two never mix. The outputs `arb_err_bad_id`
 /// and `arb_err_w_last` are the sticky diagnostics of the DMA arbiter (see
-/// [HarborWaistArbiter]). STATUS bits 6 and 7 show them too. A frame that the TX FIFO
-/// drops because the TX clock is lost comes back with TX error code 4.
+/// [HarborWaistArbiter]). STATUS bits 6 and 7 show them too. A frame that
+/// the TX FIFO drops because the TX clock is lost comes back with TX error
+/// code 4.
 ///
 /// The MAC cores and the front end reset only with `reset`. CTRL soft_reset
 /// resets the FIFOs and the DMAs after the DMAs are idle. It also restarts
