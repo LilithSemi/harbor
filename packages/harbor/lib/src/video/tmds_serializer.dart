@@ -32,6 +32,16 @@ class TmdsSerializer extends Module {
       (target.vendor == HarborFpgaVendor.vivado ||
           target.vendor == HarborFpgaVendor.openXc7);
 
+  /// The part of the definition name that follows from [target]. Targets
+  /// that build the same output register give the same tag.
+  static String targetTag(HarborDeviceTarget target) => switch (target) {
+    HarborSimTarget() => 'sim',
+    HarborFpgaTarget(vendor: HarborFpgaVendor.ecp5) => 'ecp5',
+    HarborFpgaTarget(vendor: HarborFpgaVendor.ice40) => 'ice40',
+    HarborFpgaTarget() => 'xilinx',
+    HarborAsicTarget() => 'asic',
+  };
+
   /// Serialized pin output (through the ODDR).
   Logic get q => output('q');
 
@@ -53,7 +63,7 @@ class TmdsSerializer extends Module {
     required Logic align,
     required HarborDeviceTarget target,
     super.name = 'tmds_serializer',
-  }) : super(definitionName: 'TmdsSerializer') {
+  }) : super(definitionName: 'TmdsSerializer_${targetTag(target)}') {
     shiftClk = addInput('shift_clk', shiftClk);
     reset = addInput('reset', reset);
     symbol = addInput('symbol', symbol, width: 10);

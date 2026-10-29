@@ -1493,7 +1493,6 @@ class HarborDualClockScanout extends Module {
         rdCol: cols[k],
         maxWords: allMax[k],
         blockRam: blockRam,
-        uniqueName: true,
         name: o ? 'overlay${k - planes}_lines' : 'plane${k}_lines',
       );
       rd.add(buffer.rdData);

@@ -50,9 +50,9 @@ class DviTransmitter extends Module {
     Logic? hdmiCtl,
     super.name = 'dvi_transmitter',
   }) : super(
-         definitionName: hdmiMode == null
-             ? 'DviTransmitter'
-             : 'DviTransmitter_hdmi',
+         definitionName:
+             'DviTransmitter${hdmiMode == null ? '' : '_hdmi'}'
+             '_${TmdsSerializer.targetTag(target)}',
        ) {
     final hdmi = hdmiMode != null;
     if (hdmi != (hdmiAux != null) || hdmi != (hdmiCtl != null)) {
