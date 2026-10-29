@@ -466,7 +466,8 @@ class HarborGtpPcieLane extends Module {
 /// cycles. The watchdog restarts the sequence at step 2 in two cases:
 ///
 /// - The data link is down and the LTSSM is in Detect for `linkWait` cycles.
-///   The time in other training states does not count.
+///   The time in other training states does not count, so a link that stays
+///   in Polling.Compliance is never restarted.
 /// - The physical link is up and the data link is down for `dataLinkWait`
 ///   cycles.
 ///
