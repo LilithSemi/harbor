@@ -214,7 +214,7 @@ class HarborEthernetMac extends BridgeModule
       config: HarborMemoryWaistConfig(
         addressWidth: dmaAddressWidth,
         dataWidth: 32,
-        idWidth: 2,
+        idWidth: HarborWaistArbiter.indexBits(2) + waistConfig.idWidth,
         outstanding: config.outstanding,
       ),
       clk: input('clk'),

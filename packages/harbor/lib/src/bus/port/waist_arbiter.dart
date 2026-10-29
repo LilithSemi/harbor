@@ -70,6 +70,24 @@ Logic _pick(Logic index, List<Logic> items, Logic other) {
 /// owes as beats with all strobes low. The arbiter ignores all inputs of a
 /// flushed source, so a source in reset cannot stop the other sources.
 ///
+/// `flush_<j>` goes through gates to the REQ_READY, RDATA_VALID and
+/// WRESP_VALID of source j and to the WDATA_READY of every source. Do not
+/// make a flush from these signals. Set `flush_<j>` high no later than the
+/// cycle where source j goes into reset. Source j must come out of reset
+/// before or in the cycle where `flush_<j>` goes low, because a request it
+/// shows after that cycle is taken.
+///
+/// For exclusive access, ID 0 of source i is ID `i << sw` on [out], where sw
+/// is the widest source ID. The exclusive IDs of the fabric master must
+/// include these IDs, else an exclusive access is a normal access.
+///
+/// Diagnostic outputs, which stay high until reset:
+///
+/// - `err_bad_id`: a response came back with a source index that has no
+///   source. The arbiter takes it and drops it.
+/// - `err_w_last`: the WDATA_LAST of a source beat was not the LAST that the
+///   request length gives. The arbiter uses the request length.
+///
 /// `idle` is high when nothing is in flight or waiting. `idle_<i>` is high
 /// when source i has nothing in flight, owes no write data and has no held
 /// request.
@@ -80,6 +98,15 @@ class HarborWaistArbiter extends Module {
 
   /// The idle output of source [i].
   Logic idleOf(int i) => output('idle_$i');
+
+  /// A response came back with an index that has no source.
+  Logic get errBadId => output('err_bad_id');
+
+  /// A source WDATA_LAST did not agree with its request length.
+  Logic get errWLast => output('err_w_last');
+
+  /// The bits of the source index for [n] sources.
+  static int indexBits(int n) => max(1, (n - 1).bitLength);
 
   HarborWaistArbiter(
     Logic clk,
@@ -92,7 +119,7 @@ class HarborWaistArbiter extends Module {
          definitionName: definitionNameFor(sources, out, flush != null),
        ) {
     final nSrc = sources.length;
-    final xb = max(1, (nSrc - 1).bitLength);
+    final xb = indexBits(nSrc);
     final sw = sources.isEmpty
         ? 0
         : sources.map((s) => s.config.idWidth).reduce(max);
@@ -126,6 +153,11 @@ class HarborWaistArbiter extends Module {
         'flush has ${flush.length} signals for $nSrc '
         'sources',
       );
+    }
+    for (final (i, f) in (flush ?? <Logic>[]).indexed) {
+      if (f.width != 1) {
+        throw ArgumentError.value(f.width, 'flush[$i]', 'must be 1 bit wide');
+      }
     }
 
     clk = addInput('clk', clk);
@@ -310,6 +342,8 @@ class HarborWaistArbiter extends Module {
     m.wdataLast <= wSlice.data[dw + sb];
     final wFire = (wValid & wSlice.ready).named('w_fire');
     final wLastFire = (wFire & wLastQ).named('w_last_fire');
+    final ownLast = _pick(wOwner, [for (final x in s) x.wdataLast], Const(0));
+    final badLast = (wFire & ~drain & (ownLast ^ wLastQ)).named('bad_last');
 
     // Read data and write response channels.
     final rReady = Logic(name: 'r_ready');
@@ -392,6 +426,16 @@ class HarborWaistArbiter extends Module {
     }
     final rDone = (rSlice.valid & rReady & rLast).named('r_done');
     final bDone = (bSlice.valid & bReady).named('b_done');
+    Logic known(Logic i) =>
+        nSrc == 1 << xb ? Const(1) : i.lt(Const(nSrc, width: xb));
+    final badId =
+        ((rSlice.valid & ~known(rIdx)) | (bSlice.valid & ~known(bIdx))).named(
+          'bad_id',
+        );
+    final errBadIdQ = Logic(name: 'err_bad_id_q');
+    final errWLastQ = Logic(name: 'err_w_last_q');
+    addOutput('err_bad_id') <= errBadIdQ;
+    addOutput('err_w_last') <= errWLastQ;
 
     final idleOut = addOutput('idle');
     final held = [
@@ -408,7 +452,13 @@ class HarborWaistArbiter extends Module {
     }
 
     Sequential(clk, reset: reset, [
-      inflight < inflight + cnt(reqFire) - cnt(rDone) - cnt(bDone),
+      inflight <
+          inflight +
+              cnt(reqFire) -
+              cnt(rDone & known(rIdx)) -
+              cnt(bDone & known(bIdx)),
+      If(badId, then: [errBadIdQ < 1]),
+      If(badLast, then: [errWLastQ < 1]),
       If(reqFire, then: [last < g]),
       If.block([
         Iff(reqFire & reqWrite, [

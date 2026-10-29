@@ -48,6 +48,8 @@ class _Top extends BridgeModule {
     }
     exposeWaist(this, out, 'mem', PairRole.provider);
     addOutput('idle') <= arb.idle;
+    addOutput('err_bad_id') <= arb.errBadId;
+    addOutput('err_w_last') <= arb.errWLast;
   }
 }
 
@@ -95,6 +97,9 @@ class _Src {
   /// Stop write data after this many beats of a write.
   int? stallW;
   bool garbage = false;
+
+  /// Drive WDATA_LAST wrong on the first beat of each write.
+  bool badLast = false;
   final Queue<_Req> todo = Queue();
   final Queue<_Req> wq = Queue();
   final Map<int, Queue<_Req>> reads = {};
@@ -216,7 +221,10 @@ class _Src {
         ..set(p('WDATA_VALID'), _wUp ? 1 : 0)
         ..set(p('WDATA_DATA'), w?.data[w.beat] ?? 0)
         ..set(p('WDATA_STRB'), w?.strb[w.beat] ?? 0)
-        ..set(p('WDATA_LAST'), w != null && w.beat == w.len ? 1 : 0)
+        ..set(
+          p('WDATA_LAST'),
+          w != null && ((w.beat == w.len) != (badLast && w.beat == 0)) ? 1 : 0,
+        )
         ..set(
           p('RDATA_READY'),
           reads.values.any((q) => q.isNotEmpty) && rng.nextDouble() < respRate
@@ -315,6 +323,9 @@ class _Pending {
   final int len;
   final int due;
   final int index;
+
+  /// The ID on the response when it is not [id].
+  int? outId;
   _Pending(this.id, this.excl, this.addr, this.len, this.due, this.index);
 }
 
@@ -334,6 +345,9 @@ class _Mem {
 
   /// No response goes out while this is set.
   bool hold = false;
+
+  /// The next read response goes out with this source index.
+  int? mangleIndex;
   int cycle = 0;
 
   /// Accepted requests: (cycle, source index, write).
@@ -428,7 +442,18 @@ class _Mem {
         return x;
       }
 
-      _r ??= choose(reads);
+      if (_r == null) {
+        final x = choose(reads);
+        final mi = mangleIndex;
+        if (x != null && mi != null) {
+          mangleIndex = null;
+          final low = x.id & ((1 << sw) - 1);
+          _r = _Pending(x.id, x.excl, x.addr, x.len, x.due, x.index)
+            ..outId = (mi << sw) | low;
+        } else {
+          _r = x;
+        }
+      }
       _b ??= choose(wresps);
       final r = _r;
       final b = _b;
@@ -436,7 +461,7 @@ class _Mem {
         ..set('mem_REQ_READY', rng.nextDouble() < reqReady ? 1 : 0)
         ..set('mem_WDATA_READY', rng.nextDouble() < wReady ? 1 : 0)
         ..set('mem_RDATA_VALID', r == null ? 0 : 1)
-        ..set('mem_RDATA_ID', r?.id ?? 0)
+        ..set('mem_RDATA_ID', r?.outId ?? r?.id ?? 0)
         ..set('mem_RDATA_DATA', r == null ? 0 : _rom(r.addr + 4 * _rBeat))
         ..set('mem_RDATA_ERR', 0)
         ..set('mem_RDATA_EXOKAY', r?.excl ?? false ? 1 : 0)
@@ -709,93 +734,75 @@ void main() {
     await b.finish();
   });
 
-  test('flush with write data owed sends zero strobe beats', () async {
-    final b = await _Bench.start([1, 1], 2);
-    final s0 = b.src[0];
-    final s1 = b.src[1];
-    s0.stallW = 3;
-    final w = s0.write(len: 9, excl: false, track: false);
-    await b.until(() => w.beat == 3);
-    await b.s.cycles(5);
-    b.flush(0, true);
-    s0.enterGarbage();
-    for (var k = 0; k < 6; k++) {
-      s1
-        ..write()
-        ..read();
+  for (final (ids, outId, f) in [
+    ([1, 1], 2, 0),
+    ([1, 1], 2, 1),
+    ([1, 1, 1], 3, 1),
+  ]) {
+    final tag = '${ids.length} sources, flush source $f';
+    test('$tag: flush with write data owed sends zero strobe beats', () async {
+      await _flushWrite(ids, outId, f);
+    });
+    test(
+      '$tag: responses due after flush are dropped before a new grant',
+      () async {
+        await _flushResponses(ids, outId, f);
+      },
+    );
+  }
+
+  for (final f in [0, 1]) {
+    for (final (len, k, p) in [
+      (0, 0, 1),
+      (3, 0, 2),
+      (7, 1, 1),
+      (7, 3, 2),
+      (15, 2, 1),
+    ]) {
+      test('source $f: drain of a $len beat write after $k beats '
+          'goes on after a $p cycle flush', () async {
+        await _drainAfterFlush(f, len, k, p);
+      });
     }
-    await b.until(() => s1.done == 12);
-    s0.stallW = null;
-    await b.unflush(0);
-    await b.settle();
-    final beats = [
-      for (final x in b.mem.beatLog)
-        if (x.$1 >= w.addr && x.$1 < w.addr + 0x40) x,
-    ];
-    expect(beats, hasLength(10));
-    for (var k = 0; k < 10; k++) {
-      final (a, d, st, last) = beats[k];
-      expect(a, w.addr + 4 * k);
-      expect(last, k == 9);
-      if (k < 3) {
-        expect(d, w.data[k]);
-        expect(st, w.strb[k]);
-      } else {
-        expect(st, 0, reason: 'beat $k');
+    for (final (name, delay) in [
+      ('in the handshake cycle', -1),
+      ('just after the handshake', 0),
+      ('while held', 3),
+    ]) {
+      test('source $f: flush $name drops the held request', () async {
+        await _flushHeld(f, delay);
+      });
+    }
+  }
+
+  test('a response with no source sets err_bad_id', () async {
+    final b = await _Bench.start([1, 1, 1], 3);
+    b.mem.mangleIndex = 3;
+    b.src[0].read(len: 1);
+    await b.until(() => b.out('err_bad_id') == 1);
+    expect(b.src[0].done, 0);
+    for (final x in [b.src[1], b.src[2]]) {
+      for (var k = 0; k < 6; k++) {
+        x
+          ..read()
+          ..write();
       }
     }
-    for (var k = 0; k < 10; k++) {
-      final a = w.addr + 4 * k;
-      final want = k < 3 ? _merge(_rom(a), w.data[k], w.strb[k]) : _rom(a);
-      expect(b.mem.mem[a] ?? _rom(a), want, reason: 'word $k');
-    }
-    for (final e in b.expectMem.entries) {
-      expect(b.mem.mem[e.key], e.value);
-    }
-    expect(b.out('idle'), 1);
+    await b.until(() => b.src[1].done == 12 && b.src[2].done == 12);
+    expect(b.out('err_bad_id'), 1);
+    expect(b.out('err_w_last'), 0);
+    b.src[0].reads.clear();
     await b.finish();
   });
 
-  test('responses due after flush are dropped before a new grant', () async {
-    final b = await _Bench.start([1, 1], 2, outstanding: 8);
-    final s0 = b.src[0];
-    final s1 = b.src[1];
-    b.mem.reqReady = 1;
-    for (var k = 0; k < 3; k++) {
-      s0
-        ..read(len: 2)
-        ..write(len: 1, track: false);
-    }
-    s0.reqRate = 1;
-    s0.wRate = 1;
-    b.mem.hold = true;
-    await b.until(() => b.mem.reqLog.where((x) => x.$2 == 0).length == 6);
-    await b.s.cycles(3);
-    b.flush(0, true);
-    s0.enterGarbage();
-    await b.s.cycles(2);
-    final flushCycle = b.mem.cycle;
-    await b.unflush(0);
-    final old = b.mem.reqLog.where((x) => x.$2 == 0).length;
-    s0.read(len: 1);
-    s1.read(len: 1);
-    await b.s.cycles(40);
-    expect(b.mem.reqLog.where((x) => x.$2 == 0).length, old);
-    expect(b.out('idle_0'), 0);
-    expect(b.out('idle_1'), 0);
-    b.mem.hold = false;
-    await b.until(() => s0.done == 1 && s1.done == 1);
-    await b.settle();
-    final lastOld = b.mem.doneLog
-        .where((x) => x.$2 == 0)
-        .take(old)
-        .map((x) => x.$1)
-        .reduce(max);
-    final firstNew = b.mem.reqLog.where((x) => x.$2 == 0).skip(old).first.$1;
-    expect(firstNew, greaterThan(lastOld));
-    expect(firstNew, greaterThan(flushCycle));
-    expect(b.out('idle'), 1);
-    expect(b.out('idle_0'), 1);
+  test('a wrong source WDATA_LAST sets err_w_last only', () async {
+    final b = await _Bench.start([1, 1], 2);
+    b.src[0].badLast = true;
+    final w = b.src[0].write(len: 3);
+    await b.until(() => b.src[0].done == 1);
+    expect(b.out('err_w_last'), 1);
+    expect(b.out('err_bad_id'), 0);
+    expect(b.mem.mem[w.addr], b.expectMem[w.addr]);
     await b.finish();
   });
 
@@ -818,4 +825,183 @@ void main() {
     expect(b.out('idle_1'), 1);
     await b.finish();
   });
+}
+
+Future<void> _flushWrite(List<int> ids, int outId, int f) async {
+  final b = await _Bench.start(ids, outId);
+  final sf = b.src[f];
+  final others = [
+    for (final x in b.src)
+      if (x != sf) x,
+  ];
+  sf.stallW = 3;
+  final w = sf.write(len: 9, excl: false, track: false);
+  await b.until(() => w.beat == 3);
+  await b.s.cycles(5);
+  b.flush(f, true);
+  sf.enterGarbage();
+  for (final o in others) {
+    for (var k = 0; k < 6; k++) {
+      o
+        ..write()
+        ..read();
+    }
+  }
+  await b.until(() => others.every((o) => o.done == 12));
+  sf.stallW = null;
+  await b.unflush(f);
+  await b.settle();
+  _checkDrained(b, w, 3);
+  expect(b.out('idle'), 1);
+  await b.finish();
+}
+
+/// The beats of [w] in memory: the first [sent] from the source, the rest
+/// with strobe 0, and LAST only on the last.
+void _checkDrained(_Bench b, _Req w, int sent) {
+  final n = w.len + 1;
+  final beats = [
+    for (final x in b.mem.beatLog)
+      if (x.$1 >= w.addr && x.$1 < w.addr + 0x400) x,
+  ];
+  expect(beats, hasLength(n));
+  for (var k = 0; k < n; k++) {
+    final (a, d, st, last) = beats[k];
+    expect(a, w.addr + 4 * k);
+    expect(last, k == n - 1, reason: 'LAST of beat $k');
+    if (k < sent) {
+      expect(d, w.data[k]);
+      expect(st, w.strb[k]);
+    } else {
+      expect(st, 0, reason: 'beat $k');
+    }
+    final want = k < sent ? _merge(_rom(a), w.data[k], w.strb[k]) : _rom(a);
+    expect(b.mem.mem[a] ?? _rom(a), want, reason: 'word $k');
+  }
+  for (final e in b.expectMem.entries) {
+    expect(b.mem.mem[e.key], e.value);
+  }
+  expect(b.out('err_w_last'), 0);
+  expect(b.out('err_bad_id'), 0);
+}
+
+Future<void> _flushResponses(List<int> ids, int outId, int f) async {
+  final b = await _Bench.start(ids, outId, outstanding: 8);
+  final sf = b.src[f];
+  final o = b.src[(f + 1) % ids.length];
+  b.mem.reqReady = 1;
+  for (var k = 0; k < 3; k++) {
+    sf
+      ..read(len: 2)
+      ..write(len: 1, track: false);
+  }
+  sf.reqRate = 1;
+  sf.wRate = 1;
+  b.mem.hold = true;
+  int mine() => b.mem.reqLog.where((x) => x.$2 == f).length;
+  await b.until(() => mine() == 6);
+  await b.s.cycles(3);
+  b.flush(f, true);
+  sf.enterGarbage();
+  await b.s.cycles(2);
+  final flushCycle = b.mem.cycle;
+  await b.unflush(f);
+  final old = mine();
+  sf.read(len: 1);
+  o.read(len: 1);
+  await b.s.cycles(40);
+  expect(mine(), old);
+  expect(b.out('idle_$f'), 0);
+  b.mem.hold = false;
+  await b.until(() => sf.done == 1 && o.done == 1);
+  await b.settle();
+  final lastOld = b.mem.doneLog
+      .where((x) => x.$2 == f)
+      .take(old)
+      .map((x) => x.$1)
+      .reduce(max);
+  final firstNew = b.mem.reqLog.where((x) => x.$2 == f).skip(old).first.$1;
+  expect(firstNew, greaterThan(lastOld));
+  expect(firstNew, greaterThan(flushCycle));
+  expect(b.out('idle'), 1);
+  expect(b.out('idle_$f'), 1);
+  await b.finish();
+}
+
+/// Source [f] is flushed for [p] cycles after it sent [k] beats of a write.
+/// The out side takes no write data until after the flush, so the drain
+/// goes on after flush is low.
+Future<void> _drainAfterFlush(int f, int len, int k, int p) async {
+  final b = await _Bench.start([1, 1], 2, seed: 7 * len + 3 * k + p + f);
+  final sf = b.src[f];
+  final o = b.src[1 - f];
+  sf
+    ..stallW = k
+    ..wRate = 1;
+  final w = sf.write(len: len, excl: false, track: false);
+  await b.until(
+    () => w.beat == k && b.mem.reqLog.any((x) => x.$2 == f && x.$3),
+  );
+  b.mem.wReady = 0;
+  sf
+    ..enterGarbage()
+    ..garbage = false
+    ..stallW = null;
+  b.flush(f, true);
+  await b.s.cycles(p);
+  b.flush(f, false);
+  o
+    ..write()
+    ..write()
+    ..read();
+  await b.s.cycles(10);
+  b.mem.wReady = 0.5;
+  await b.until(() => o.done == 3);
+  await b.settle();
+  _checkDrained(b, w, k);
+  expect(b.out('idle'), 1);
+  expect(b.out('idle_$f'), 1);
+  await b.finish();
+}
+
+/// Source [f] has a request in its input slice that is not granted, and
+/// flush rises [delay] cycles after its handshake. With -1, flush rises in
+/// the cycle where the source first shows the request.
+Future<void> _flushHeld(int f, int delay) async {
+  final b = await _Bench.start([1, 1], 2, seed: 11 + f + delay);
+  final sf = b.src[f];
+  final o = b.src[1 - f];
+  b.mem.reqReady = 0;
+  o
+    ..reqRate = 1
+    ..read(len: 0)
+    ..read(len: 0);
+  await b.until(() => o.todo.isEmpty);
+  await b.s.cycles(4);
+  sf.reqRate = 1;
+  sf.read(len: 0);
+  if (delay < 0) {
+    await b.s.cycles(1);
+  } else {
+    await b.until(() => sf.todo.isEmpty);
+    await b.s.cycles(delay);
+    expect(b.out('idle_$f'), 0);
+  }
+  sf
+    ..enterGarbage()
+    ..garbage = false;
+  b.flush(f, true);
+  for (var c = 0; c < 2; c++) {
+    await b.s.clk.nextPosedge;
+    expect(b.out('s${f}_REQ_READY'), 0, reason: 'REQ_READY in flush');
+    await b.s.cycles(1);
+  }
+  b.flush(f, false);
+  b.mem.reqReady = 1;
+  await b.until(() => o.done == 2);
+  await b.settle();
+  expect(b.mem.reqLog.where((x) => x.$2 == f), isEmpty);
+  expect(b.out('idle_$f'), 1);
+  expect(b.out('idle'), 1);
+  await b.finish();
 }
