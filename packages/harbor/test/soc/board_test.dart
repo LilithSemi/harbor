@@ -24,9 +24,9 @@ void main() {
     test('a perst_n pin without PULLTYPE throws', () {
       expect(perstBoard('J20 LVCMOS33').fpgaTarget, throwsArgumentError);
       expect(
-        () => HarborBoard.get('ax7203').fpgaTarget(
-          extraPins: {'x_perst_n': 'J20 LVCMOS33'},
-        ),
+        () => HarborBoard.get(
+          'ax7203',
+        ).fpgaTarget(extraPins: {'x_perst_n': 'J20 LVCMOS33'}),
         throwsArgumentError,
       );
     });

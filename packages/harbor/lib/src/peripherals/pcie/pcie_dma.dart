@@ -99,6 +99,7 @@ class HarborPcieDma extends BridgeModule {
   static const registerDebug = 0x034;
 
   static const controlEnable = 1 << 0;
+
   /// Resets the engine. In the read data or write data state, the reset
   /// waits the full [timeoutCycles] even while beats come. A host driver
   /// must poll for at least that long.

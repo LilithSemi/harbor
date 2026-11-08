@@ -397,12 +397,17 @@ class SdramMemoryPort extends Module {
     final rbPush = Logic(name: 'rb_push');
     final rbBufPop = Logic(name: 'rb_buf_pop');
     final rbBuf = _Queue('rb', clk, clr, readBeats, rbPush, tailData, rbBufPop);
-    rbBufPop <= rbPop & rbBuf.valid;
-    rbPush <= tailValid & ~(rbPop & ~rbBuf.valid);
+    // Keep the assembled beat behind the FIFO's registered valid boundary.
+    // The old empty-buffer fall-through made the consumer's pop feed back
+    // into this FIFO's write enable in the same cycle.  On ECP5 that path ran
+    // from the read buffer near the SDRAM pins to the system-side response
+    // FIFO and back, and could not close at the SDRAM clock rate.
+    rbBufPop <= rbPop;
+    rbPush <= tailValid;
     _check(clk, clr, rbPush & ~rbBuf.ready, 'read buffer pushed while full');
     final rb = (
-      valid: (rbBuf.valid | tailValid).named('rb_head_valid'),
-      data: mux(rbBuf.valid, rbBuf.data, tailData).named('rb_head'),
+      valid: rbBuf.valid.named('rb_head_valid'),
+      data: rbBuf.data.named('rb_head'),
     );
     // With one request in flight the read buffer is small, so its read mux
     // drives RDATA directly. Else a 2 entry FIFO cuts the path.

@@ -464,8 +464,7 @@ class HarborSpiFlashController extends BridgeModule
           spiClk < Const(0),
           shiftReg < Const(0, width: busWidth),
           bitCount < Const(0, width: 8),
-          spiState <
-              Const(startupClocks > 0 ? sStartup : sIdle, width: 3),
+          spiState < Const(startupClocks > 0 ? sStartup : sIdle, width: 3),
           ioDir < Const(0),
           ack < Const(0),
           datOut < Const(0, width: busWidth),

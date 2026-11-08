@@ -37,9 +37,7 @@ Future<void> _run(HarborDeviceTarget? target, List<List<int>> cases) async {
       final c = sent[k];
       expect(
         [b.red.value.toInt(), b.green.value.toInt(), b.blue.value.toInt()],
-        [
-          for (var ch = 0; ch < 3; ch++) blend255(c[ch], c[3 + ch], c[6]),
-        ],
+        [for (var ch = 0; ch < 3; ch++) blend255(c[ch], c[3 + ch], c[6])],
         reason: '$c',
       );
     }
