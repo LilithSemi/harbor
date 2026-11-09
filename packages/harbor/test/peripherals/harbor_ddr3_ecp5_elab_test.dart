@@ -80,7 +80,7 @@ void main() {
           runtimeTrainable: runtime,
         );
         await ddr.build();
-        final sv = ddr.generateSynth();
+        final sv = ddr.dumpSystemVerilog();
 
         const lanes = 2; // OrangeCrab DQS groups
         const dqBits = 8;
@@ -164,7 +164,7 @@ void main() {
       ckPeriodPs: 3333,
     );
     await ddr.build();
-    final sv = ddr.generateSynth();
+    final sv = ddr.dumpSystemVerilog();
 
     expect(count(sv, 'OSERDESE2'), greaterThan(0));
     expect(count(sv, 'IDELAYE2'), greaterThan(0));

@@ -63,7 +63,7 @@ class HarborGmParams extends BridgeModule {
     Logic neg(Logic a) => sub(sc(0), a);
     Logic sgn(Logic a) => a[_w - 1];
     Logic asrC(Logic x, int n) =>
-        n <= 0 ? x : [x[_w - 1].replicate(n), x.getRange(n, _w)].swizzle();
+        n <= 0 ? x : [x[_w - 1].replicate(n), x.getRange(n, _w)].concat();
     Logic slt(Logic a, Logic b) =>
         mux(sgn(a) ^ sgn(b), sgn(a), sub(a, b)[_w - 1]);
     Logic sle(Logic a, Logic b) => ~slt(b, a);
@@ -72,7 +72,7 @@ class HarborGmParams extends BridgeModule {
       for (var k = 1; k <= 20; k++) {
         res = mux(
           amt.eq(Const(k, width: amt.width)),
-          [x.getRange(0, _w - k), Const(0, width: k)].swizzle(),
+          [x.getRange(0, _w - k), Const(0, width: k)].concat(),
           res,
         );
       }
@@ -222,7 +222,7 @@ class HarborGmParams extends BridgeModule {
         CaseItem(st4(sType2), [nSel < Const(1, width: 6)]),
         // sSubIter: read a flag bit only when NOT cond (else 0, go quniform).
         CaseItem(st4(sSubIter), [
-          nSel < mux(subCond, Const(0, width: 6), Const(1, width: 6)),
+          nSel < mux<Logic>(subCond, Const(0, width: 6), Const(1, width: 6)),
         ]),
         CaseItem(st4(sSubFinal), [nSel < b2.getRange(0, 6)]),
         // sQuniStep: read (l-1) bits unless m<=1.
@@ -231,7 +231,7 @@ class HarborGmParams extends BridgeModule {
         ]),
         // sQuniStep2: read 1 extra bit unless qv<extra.
         CaseItem(st4(sQuniStep2), [
-          nSel < mux(qvLtExtra, Const(0, width: 6), Const(1, width: 6)),
+          nSel < mux<Logic>(qvLtExtra, Const(0, width: 6), Const(1, width: 6)),
         ]),
       ]),
     ]);
@@ -288,7 +288,7 @@ class HarborGmParams extends BridgeModule {
       // from 3 -> affine?4:0
       nt = mux(
         rTarget.eq(Const(3, width: 3)),
-        mux(isAffine, Const(4, width: 3), Const(0, width: 3)),
+        mux<Logic>(isAffine, Const(4, width: 3), Const(0, width: 3)),
         nt,
       );
       // from 4 -> 5

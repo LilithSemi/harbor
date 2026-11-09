@@ -107,7 +107,7 @@ class WishboneMemoryModel extends BridgeModule {
           newByte,
           keepByte,
         );
-        out = lane == 0 ? laneByte : [laneByte, out.slice(lo - 1, 0)].swizzle();
+        out = lane == 0 ? laneByte : [laneByte, out.slice(lo - 1, 0)].concat();
       }
       return out;
     }

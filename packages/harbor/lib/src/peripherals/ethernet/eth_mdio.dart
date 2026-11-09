@@ -109,7 +109,7 @@ class HarborEthMdio extends Module {
       reg,
       ta,
       wdata,
-    ].swizzle().named('frame_c22');
+    ].concat().named('frame_c22');
 
     var first = frame22;
     var readFrame = isRead;
@@ -123,7 +123,7 @@ class HarborEthMdio extends Module {
       final dataR = Logic(name: 'data_r', width: 16);
       first = mux(
         isC45!,
-        [ones, c(0, 2), c(0, 2), phy, devadIn!, ta, addrIn!].swizzle(),
+        [ones, c(0, 2), c(0, 2), phy, devadIn!, ta, addrIn!].concat(),
         frame22,
       ).named('frame_first');
       final secondFrame = [
@@ -134,7 +134,7 @@ class HarborEthMdio extends Module {
         devR,
         ta,
         dataR,
-      ].swizzle().named('frame_second');
+      ].concat().named('frame_second');
       // The first frame of a clause 45 access sets the address.
       readFrame = (isRead & (~c45R | second)).named('read_frame');
       c45Load.addAll([
@@ -187,7 +187,7 @@ class HarborEthMdio extends Module {
           If(
             readFrame & bit.gte(48),
             then: [
-              rd < [rd.slice(14, 0), sample].swizzle(),
+              rd < [rd.slice(14, 0), sample].concat(),
             ],
           ),
         ]),

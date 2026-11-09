@@ -225,7 +225,7 @@ class HarborFpu extends BridgeModule {
     );
     _out('in_ready', ctl.inReady);
     _out('out_valid', ctl.outValid);
-    _out('slot_valid', ctl.slotValids.rswizzle());
+    _out('slot_valid', ctl.slotValids.rconcat());
 
     Logic head(Logic data, String name) =>
         data is Const ? data : ctl.head(data, name);
@@ -315,7 +315,7 @@ class HarborFpu extends BridgeModule {
         slotTags.add(t);
       }
       _out('out_tag', t);
-      _out('slot_tag', slotTags.rswizzle());
+      _out('slot_tag', slotTags.rconcat());
     }
     for (var j = 0; j < n; j++) {
       sel = [
@@ -371,7 +371,7 @@ class HarborFpu extends BridgeModule {
       reset: reset,
       killMask: killMask,
       inValid: inValid,
-      inOp: [Const(0), isSqrt].swizzle(),
+      inOp: [Const(0), isSqrt].concat(),
       inFmt: fmt,
       inRm: rm,
       inA: a,

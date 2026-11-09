@@ -256,7 +256,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       oserdesCmd.add(os.oq);
     }
     // bit i of the word = oserdesCmd[i] (element 0 = LSB).
-    final oserdesCmdW = oserdesCmd.rswizzle().named('oserdes_cmd');
+    final oserdesCmdW = oserdesCmd.rconcat().named('oserdes_cmd');
 
     // CMD field layout (ddr3_phy.v:61-67): top 7 control bits, then BA, then ADDR.
     final cmdCsN = cmdLen - 1;
@@ -343,7 +343,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       }
     }
     output('o_controller_iserdes_data') <=
-        [for (final b in iserdesData) b!].rswizzle();
+        [for (final b in iserdesData) b!].rconcat();
 
     // --- DM (data-mask) write, one OSERDESE2 per lane, no tristate -> OBUF ---
     // Faithful to ddr3_phy.v:672-731 (HR-bank branch). DM rides CK@90 like DQ.
@@ -359,7 +359,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       );
       dmOut.add(XilinxObuf(i: os.oq, name: 'dm_obuf_$l').o);
     }
-    addOutput('o_ddr3_dm', width: lanes) <= dmOut.rswizzle();
+    addOutput('o_ddr3_dm', width: lanes) <= dmOut.rconcat();
 
     // --- toggle_dqs_q: registered i_controller_toggle_dqs (ddr3_phy.v:107,127) ---
     final toggleDqsQ = Logic(name: 'toggle_dqs_q');
@@ -430,7 +430,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       }
     }
     output('o_controller_iserdes_dqs') <=
-        [for (final b in iserdesDqs) b!].rswizzle();
+        [for (final b in iserdesDqs) b!].rconcat();
 
     // --- (e) bitslip-reference: OSERDESE2_train -> ISERDESE2_train (OFB loopback) ---
     // A pad-less fabric model of the ISERDES barrel-shift the calibration engine
@@ -469,7 +469,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       }
     }
     output('o_controller_iserdes_bitslip_reference') <=
-        [for (final b in bitslipRef) b!].rswizzle();
+        [for (final b in bitslipRef) b!].rconcat();
   }
 
   /// UberDDR3 command length = 4 (cs/ras/cas/we-ish) + 3 (odt/cke/reset) + BA +

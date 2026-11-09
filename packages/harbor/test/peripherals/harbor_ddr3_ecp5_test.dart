@@ -35,7 +35,7 @@ void main() {
         '(${runtime ? 'train=runtime' : 'train=hw'})', () async {
       final d = _ddr(runtimeTrainable: runtime);
       await d.build();
-      final sv = d.generateSynth();
+      final sv = d.dumpSystemVerilog();
       expect(sv, contains('module Ddr3PhyEcp5'));
       expect(sv, contains('DQSBUFM'));
       expect(sv, isNot(contains('IDELAYCTRL')));

@@ -502,7 +502,7 @@ class HarborRegisterFile extends BridgeModule {
         words.add(
           slices.length == 1
               ? slices.first.zeroExtend(dataWidth)
-              : slices.rswizzle().getRange(0, dataWidth),
+              : slices.rconcat().getRange(0, dataWidth),
         );
       }
 
@@ -553,7 +553,7 @@ class HarborRegisterFile extends BridgeModule {
     // An x18 write needs its byte enables in AD[1:0]. x9 is the mode that
     // silicon tests showed to work, so it stays.
     Logic toAd(Logic a) =>
-        [_blockAddr(a, blockBits, blockBits), Const(0, width: 3)].swizzle();
+        [_blockAddr(a, blockBits, blockBits), Const(0, width: 3)].concat();
     final wrAd = toAd(wrAddr);
 
     for (var r = 0; r < rdAddrs.length; r++) {
@@ -596,7 +596,7 @@ class HarborRegisterFile extends BridgeModule {
         words.add(
           slices.length == 1
               ? slices.first.zeroExtend(dataWidth)
-              : slices.rswizzle().getRange(0, dataWidth),
+              : slices.rconcat().getRange(0, dataWidth),
         );
       }
 
@@ -656,7 +656,7 @@ class HarborRegisterFile extends BridgeModule {
       Const(0, width: 1),
       _blockAddr(a, blockBits, blockBits),
       Const(0, width: 5),
-    ].swizzle().getRange(0, 16);
+    ].concat().getRange(0, 16);
     final wrAd = toAd(wrAddr);
 
     for (var r = 0; r < rdAddrs.length; r++) {
@@ -684,7 +684,7 @@ class HarborRegisterFile extends BridgeModule {
               wrData.getRange(lo, hi).zeroExtend(blockDataWidth);
           bram.input('DIPADIP').srcConnection! <= Const(0, width: 4);
           bram.input('WEA').srcConnection! <=
-              [blockWrite, blockWrite, blockWrite, blockWrite].swizzle();
+              [blockWrite, blockWrite, blockWrite, blockWrite].concat();
           bram.input('REGCEAREGCE').srcConnection! <= Const(0);
           bram.input('RSTRAMARSTRAM').srcConnection! <= Const(0);
 
@@ -703,7 +703,7 @@ class HarborRegisterFile extends BridgeModule {
 
         final word = slices.length == 1
             ? slices.first.zeroExtend(dataWidth)
-            : slices.rswizzle().getRange(0, dataWidth);
+            : slices.rconcat().getRange(0, dataWidth);
         depthWords.add(word);
       }
       final rawBram = _depthSelect(clk, r, rdAddrs[r], depthWords, blockBits);

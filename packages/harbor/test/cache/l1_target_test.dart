@@ -66,7 +66,7 @@ void main() {
             target: target,
           );
           await cache.build();
-          expect(cache.generateSynth(), contains('HarborL1DCache'));
+          expect(cache.dumpSystemVerilog(), contains('HarborL1DCache'));
         });
         for (final dualPort in [false, true]) {
           final ports = dualPort ? 'dual-port' : 'single-port';
@@ -79,7 +79,7 @@ void main() {
               target: target,
             );
             await cache.build();
-            expect(cache.generateSynth(), contains('HarborL1ICache'));
+            expect(cache.dumpSystemVerilog(), contains('HarborL1ICache'));
           });
         }
       }
@@ -94,7 +94,7 @@ void main() {
         target: target,
       );
       await cache.build();
-      expect(cache.generateSynth(), contains('HarborL1DCache'));
+      expect(cache.dumpSystemVerilog(), contains('HarborL1DCache'));
     });
   }
 }

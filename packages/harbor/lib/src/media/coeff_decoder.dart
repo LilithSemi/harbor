@@ -142,7 +142,7 @@ class HarborCoeffDecoder extends BridgeModule {
         mux(
           state.eq(Const(sBase, width: 3)),
           Const(ctxBase, width: 2),
-          mux(
+          mux<Logic>(
             state.eq(Const(sBr, width: 3)),
             Const(ctxBr, width: 2),
             Const(ctxSign, width: 2),

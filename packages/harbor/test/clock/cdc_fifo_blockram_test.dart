@@ -179,7 +179,7 @@ Future<String> _emit(_Harness h) async {
   h.wrEn.inject(0);
   h.rdEn.inject(0);
   await h.wrClk.nextPosedge;
-  final sv = h.fifo.generateSynth();
+  final sv = h.fifo.dumpSystemVerilog();
   await Simulator.endSimulation();
   return sv;
 }

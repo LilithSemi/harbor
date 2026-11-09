@@ -32,7 +32,7 @@ Logic _dHasData(Logic op) => op.eq(_accessAckData) | op.eq(5);
 Logic _respOp(Logic op) => mux(
   op.eq(TileLinkAOpcode.get.value) | op.eq(2) | op.eq(3),
   Const(_accessAckData, width: 3),
-  mux(op.eq(5), Const(_hintAck, width: 3), Const(0, width: 3)),
+  mux<Logic>(op.eq(5), Const(_hintAck, width: 3), Const(0, width: 3)),
 );
 
 // A response stream from one target, with its slave side source.
@@ -265,7 +265,7 @@ class HarborTileLinkFabric extends HarborFabricModule {
       final tgt = [...hits, ~anyOf(hits)];
       mFirst.add(first);
       mLast.add(last);
-      mFull.add(pW > 0 ? [Const(m, width: pW), src].swizzle() : src);
+      mFull.add(pW > 0 ? [Const(m, width: pW), src].concat() : src);
       mBeatData.add(beatData);
       firstReq.add([
         for (var t = 0; t < nt; t++)

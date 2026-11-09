@@ -357,7 +357,7 @@ class HarborUsbDfu extends BridgeModule {
               mux(
                 sinkErrorNow,
                 sink.error,
-                mux(
+                mux<Logic>(
                   clearFailedUsb | dnloadAbortedByClear | sinkLostNow,
                   Const(_statusErrUnknown, width: 4),
                   Const(_statusErrStalledPkt, width: 4),
@@ -381,7 +381,7 @@ class HarborUsbDfu extends BridgeModule {
                         dfuState.eq(Const(_dfuDnloadSync, width: 4)),
                         then: [
                           dfuStateNext <
-                              mux(
+                              mux<Logic>(
                                 sink.busy,
                                 Const(_dfuDnBusy, width: 4),
                                 Const(_dfuDnloadIdle, width: 4),
@@ -392,7 +392,7 @@ class HarborUsbDfu extends BridgeModule {
                         dfuState.eq(Const(_dfuManifestSync, width: 4)),
                         then: [
                           dfuStateNext <
-                              mux(
+                              mux<Logic>(
                                 sink.busy,
                                 Const(_dfuManifest, width: 4),
                                 Const(_dfuIdle, width: 4),
@@ -611,7 +611,7 @@ class HarborUsbDfu extends BridgeModule {
     final activeGetStatus = Logic(name: 'dfu_active_getstatus_q');
     final activeGetState = Logic(name: 'dfu_active_getstate_q');
 
-    final respLength = mux(
+    final respLength = mux<Logic>(
       activeGetStatus,
       Const(6, width: 3),
       Const(1, width: 3),
@@ -669,7 +669,7 @@ class HarborUsbDfu extends BridgeModule {
         (reportedState.eq(Const(_dfuDnBusy, width: 4)) |
                 reportedState.eq(Const(_dfuManifest, width: 4)))
             .named('dfu_poll_busy');
-    final pollTimeoutVal = mux(
+    final pollTimeoutVal = mux<Logic>(
       pollBusy,
       Const(pollTimeoutMs, width: 24),
       Const(0, width: 24),

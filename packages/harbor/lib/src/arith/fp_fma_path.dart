@@ -349,7 +349,7 @@ class HarborFpFmaPath extends Module {
     Logic sx(Logic v) => v.signExtend(xw1);
     Logic expSum3(Logic x, Logic y, Logic z) {
       final carry = (x & y) | (x & z) | (y & z);
-      return (x ^ y ^ z) + [carry.getRange(0, xw1 - 1), Const(0)].swizzle();
+      return (x ^ y ^ z) + [carry.getRange(0, xw1 - 1), Const(0)].concat();
     }
 
     Logic k(int v) => Const(v & ((1 << xw1) - 1), width: xw1);
@@ -361,7 +361,7 @@ class HarborFpFmaPath extends Module {
     final abc1 = [
       ((ea & eb) | (ea & ecN) | (eb & ecN)).getRange(0, xw1 - 1),
       Const(0),
-    ].swizzle();
+    ].concat();
     final d = expSum3(abc0, abc1, k(m + 5)).getRange(0, xw).named('align_diff');
     final dNeg = d[xw - 1];
     final cDom = ((dNeg | prodZero) & ~cZero).named('c_dom');
@@ -383,7 +383,7 @@ class HarborFpFmaPath extends Module {
       'sign_p': mux(forceInf | forceZero, specSign, signP),
       'eff_sub': effSub,
       'exp_top': expTop,
-      'special': [forceInf | forceZero, forceNan | forceZero].swizzle(),
+      'special': [forceInf | forceZero, forceNan | forceZero].concat(),
       'nv': nv,
       'rm': rm,
       if (formats.length > 1) 'fmt': fmtC,
@@ -430,8 +430,11 @@ class HarborFpFmaPath extends Module {
       // product modulo 2^(2pm + 1).
       final rowW = 2 * pm + 1;
       final pp = PartialProduct(pa, pb, RadixEncoder(4), name: 'booth_pp');
-      CompactRectSignExtension(pp.array).signExtend();
-      pp.generateOutputs();
+      pp.generateOutputs(
+        beforeGenerateOutputs: (array) {
+          CompactRectSignExtension(array).signExtend();
+        },
+      );
       final rows = <Logic>[];
       final shifts = <int>[];
       for (var r = 0; r < pp.rows.length; r++) {
@@ -472,7 +475,7 @@ class HarborFpFmaPath extends Module {
         for (var i = 0; i < k; i++) {
           topA = max(topA, shifts[i] + rows[i].width);
         }
-        final wA = min(rowW, topA + log2Ceil(k));
+        final wA = min(rowW, topA + k.log2Ceil);
         half = [
           ...compress(
             rows.sublist(0, k),
@@ -486,10 +489,7 @@ class HarborFpFmaPath extends Module {
         half = [
           for (var i = 0; i < rows.length; i++)
             (
-              [
-                rows[i],
-                if (shifts[i] > 0) Const(0, width: shifts[i]),
-              ].swizzle(),
+              [rows[i], if (shifts[i] > 0) Const(0, width: shifts[i])].concat(),
               shifts[i],
             ),
         ];
@@ -499,7 +499,7 @@ class HarborFpFmaPath extends Module {
         final (row, zeros) = half[i];
         final kept = cut(HarborFpCut.c2, 'pp_row$i', row.getRange(zeros));
         halfRows.add(
-          (zeros > 0 ? [kept, Const(0, width: zeros)].swizzle() : kept).named(
+          (zeros > 0 ? [kept, Const(0, width: zeros)].concat() : kept).named(
             'pp_full_row$i',
           ),
         );
@@ -554,7 +554,7 @@ class HarborFpFmaPath extends Module {
             if (at < 2 * pm) {
               parts.add(Const(0, width: 2 * pm - at));
             }
-            return parts.reversed.toList().swizzle().named('dsp_row$n');
+            return parts.reversed.toList().concat().named('dsp_row$n');
           }(),
       ];
       while (rows.length > 2) {
@@ -568,7 +568,7 @@ class HarborFpFmaPath extends Module {
               [
                 ((x & y) | (z & (x ^ y))).getRange(0, 2 * pm - 1),
                 Const(0),
-              ].swizzle(),
+              ].concat(),
             );
         }
         rows = [...next, ...rows.sublist(i)];
@@ -589,7 +589,7 @@ class HarborFpFmaPath extends Module {
     // top bit, so an unsigned compare gives the signed order.
     final lzw = w.bitLength;
     final eTop3 = ride['exp_top']!;
-    final eOff = [~eTop3[xw - 1], eTop3.getRange(0, xw - 1)].swizzle();
+    final eOff = [~eTop3[xw - 1], eTop3.getRange(0, xw - 1)].concat();
     Logic geTop(int c) => eOff.gte(Const(c + (1 << (xw - 1)), width: xw));
     ride['cap'] = harborFpSelect(ride['fmt'] ?? fmtC, [
       for (final f in formats)
@@ -612,12 +612,12 @@ class HarborFpFmaPath extends Module {
     // then add the aligned addend.
     Logic field(Logic? v) => v == null
         ? Const(0, width: 2 * p)
-        : (pm < p ? [v, Const(0, width: 2 * (p - pm))].swizzle() : v);
+        : (pm < p ? [v, Const(0, width: 2 * (p - pm))].concat() : v);
     var r0 = field(lo0);
     var r1 = field(lo1);
     if (sigA2 != null) {
       // a * 1.0 for add and sub.
-      final aOne = [Const(0), sigA2, Const(0, width: m)].swizzle();
+      final aOne = [Const(0), sigA2, Const(0, width: m)].concat();
       if (addSub1 == null) {
         r0 = aOne;
       } else {
@@ -627,23 +627,23 @@ class HarborFpFmaPath extends Module {
       }
     }
     final hiW = w - g - 2 * p;
-    final x0 = [Const(0, width: hiW), r0, Const(0, width: g)].swizzle();
+    final x0 = [Const(0, width: hiW), r0, Const(0, width: g)].concat();
     // Take the carry back out above the product.
     final x1 = [
       if (wrap != null)
-        mux(wrap, Const(1, width: hiW, fill: true), Const(0, width: hiW))
+        mux<Logic>(wrap, Const(1, width: hiW, fill: true), Const(0, width: hiW))
       else
         Const(0, width: hiW),
       r1,
       Const(0, width: g),
-    ].swizzle();
+    ].concat();
 
-    final cField = [sigC, Const(0, width: qmax)].swizzle();
+    final cField = [sigC, Const(0, width: qmax)].concat();
     final cWin = (cField >>> dSh).zeroExtend(w).named('c_aligned');
     // Addend bit j drops below the window when dSh > j + qmax.
     final stickyC = [
       for (var j = 0; j < p; j++) sigC[j] & dSh.gt(Const(j + qmax, width: dw)),
-    ].swizzle().or().named('sticky_c');
+    ].concat().or().named('sticky_c');
     final x2 = mux(ride['eff_sub']!, ~cWin, cWin);
 
     final csaSum = x0 ^ x1 ^ x2;
@@ -657,11 +657,12 @@ class HarborFpFmaPath extends Module {
     // Stage 4: the sum and the sum plus one. A subtract adds ~c, so a
     // nonnegative result needs the plus one, unless addend bits were lost.
     // A negative result is ~sum.
-    final sum0 = (sum3 + [carry3, Const(0, width: g + 1)].swizzle()).named(
+    final sum0 = (sum3 + [carry3, Const(0, width: g + 1)].concat()).named(
       'sum0',
     );
-    final sum1 = (sum3 + [carry3, Const(0, width: g), Const(1)].swizzle())
-        .named('sum1');
+    final sum1 = (sum3 + [carry3, Const(0, width: g), Const(1)].concat()).named(
+      'sum1',
+    );
     final sub = ride.remove('eff_sub')!;
     final neg = sub & sum0[w - 1];
     final mag = mux(neg, ~sum0, mux(sub & ~ride['sticky']!, sum1, sum0));
@@ -674,7 +675,7 @@ class HarborFpFmaPath extends Module {
     final cap5 = ride.remove('cap')!;
     final stop = [
       for (var j = 0; j < w; j++) cap5.eq(Const(w - 1 - j, width: lzw)),
-    ].rswizzle();
+    ].rconcat();
     final shAmt = harborFpLeadingZeros(mag4 | stop).named('norm_shift');
     final eTop = ride.remove('exp_top')!;
     final shifted = (mag4 << shAmt).named('normalized');
@@ -687,7 +688,7 @@ class HarborFpFmaPath extends Module {
       sticky,
       for (var i = 0; i < below.width; i += 4)
         below.getRange(i, min(i + 4, below.width)).or(),
-    ].swizzle();
+    ].concat();
     final expOut = eTop - shAmt.zeroExtend(xw);
     // An exact zero sum is +0, or -0 in RDN. Inf and zero specials keep the
     // sign they have.
@@ -726,7 +727,7 @@ class HarborFpFmaPath extends Module {
         cut(
           HarborFpCut.c7,
           'flags',
-          pack.flags | [nv6, Const(0, width: 4)].swizzle(),
+          pack.flags | [nv6, Const(0, width: 4)].concat(),
         );
 
     cuts = {

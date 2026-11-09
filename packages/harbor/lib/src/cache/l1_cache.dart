@@ -291,7 +291,7 @@ class HarborL1ICache extends BridgeModule {
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits + offBits);
     Logic tagOf(Logic addr) => addr.slice(addrBits - 1, tagLo);
     Logic fullTagOf(Logic addr) =>
-        ctxBits == 0 ? tagOf(addr) : [reqCtx, tagOf(addr)].swizzle();
+        ctxBits == 0 ? tagOf(addr) : [reqCtx, tagOf(addr)].concat();
     // Combined {line, word} index into the flat data RAM.
     Logic dataEntryOf(Logic addr) => (offBits + idxBits) == 0
         ? Const(0, width: 1)
@@ -457,7 +457,7 @@ class HarborL1ICache extends BridgeModule {
     } else if (idxBits == 0) {
       fillEntry = fillWord.slice(offBits - 1, 0);
     } else {
-      fillEntry = [fillIdx, fillWord.slice(offBits - 1, 0)].swizzle();
+      fillEntry = [fillIdx, fillWord.slice(offBits - 1, 0)].concat();
     }
     dataRam.input('wr_en').srcConnection! <= fillWrEn;
     dataRam.input('wr_addr').srcConnection! <= fillEntry;
@@ -862,7 +862,7 @@ class HarborL1DCache extends BridgeModule {
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits + offBits);
     Logic tagOf(Logic addr) => addr.slice(addrBits - 1, tagLo);
     Logic fullTagOf(Logic addr) =>
-        ctxBits == 0 ? tagOf(addr) : [reqCtx, tagOf(addr)].swizzle();
+        ctxBits == 0 ? tagOf(addr) : [reqCtx, tagOf(addr)].concat();
     Logic dataEntryOf(Logic addr) => (offBits + idxBits) == 0
         ? Const(0, width: 1)
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits);
@@ -1023,7 +1023,7 @@ class HarborL1DCache extends BridgeModule {
     // shift again.
     final rdShift = byteBits == 0
         ? Const(0, width: 1)
-        : [addrQ.slice(byteBits - 1, 0), Const(0, width: 3)].swizzle();
+        : [addrQ.slice(byteBits - 1, 0), Const(0, width: 3)].concat();
     final ramRead = ramLatency == 1
         ? dataRam.readData(0)
         : flop(clk, dataRam.readData(0));
@@ -1043,7 +1043,7 @@ class HarborL1DCache extends BridgeModule {
     } else if (idxBits == 0) {
       fillEntry = fillWord.slice(offBits - 1, 0);
     } else {
-      fillEntry = [fillIdx, fillWord.slice(offBits - 1, 0)].swizzle();
+      fillEntry = [fillIdx, fillWord.slice(offBits - 1, 0)].concat();
     }
     dataRam.input('wr_en').srcConnection! <= fillWrEn;
     dataRam.input('wr_addr').srcConnection! <= fillEntry;

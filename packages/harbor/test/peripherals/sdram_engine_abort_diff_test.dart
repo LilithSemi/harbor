@@ -121,8 +121,8 @@ SdramPinModel _buildModel(SdramEngineStackTop top, LogicNet dqPad) {
     dq: dqPad,
     rules: const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000),
     fpgaToSdramNs: 4.6,
-    fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-    fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+    fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+    fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
   );
 }
 

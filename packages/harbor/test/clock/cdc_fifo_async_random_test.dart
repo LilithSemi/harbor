@@ -221,7 +221,7 @@ void main() {
   test('gray pointers that cross domains are flops', () async {
     final fifo = HarborCdcFifo(dataWidth: 8, depth: 4, name: 'fifo_gray');
     await fifo.build();
-    final sv = fifo.generateSynth();
+    final sv = fifo.dumpSystemVerilog();
     // A gray pointer made from logic can glitch through codes that are more
     // than one step away while the other domain samples it.
     for (final name in ['wr_ptr_gray', 'rd_ptr_gray']) {
@@ -247,7 +247,7 @@ void main() {
       postedWrites: true,
     );
     await fifo.build();
-    final sv = gray.generateSynth() + fifo.generateSynth();
+    final sv = gray.dumpSystemVerilog() + fifo.dumpSystemVerilog();
     for (final name in ['req_gray', 'done_gray', 'head_we']) {
       expect(sv, contains(name));
       expect(

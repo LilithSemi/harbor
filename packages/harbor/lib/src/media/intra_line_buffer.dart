@@ -92,7 +92,7 @@ class HarborIntraLineBuffer extends BridgeModule {
 
     final fillRow = [
       for (var i = 0; i < 8; i++) Const(fill, width: pw),
-    ].swizzle();
+    ].concat();
 
     Sequential(clk, [
       If(

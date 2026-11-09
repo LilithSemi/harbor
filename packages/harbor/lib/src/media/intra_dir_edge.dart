@@ -146,10 +146,10 @@ class HarborIntraDirEdge extends BridgeModule {
       // Build type0.
       Logic t0;
       if (blkWh <= 8) {
-        t0 = mux(ge(56), Const(1, width: 2), Const(0, width: 2));
+        t0 = mux<Logic>(ge(56), Const(1, width: 2), Const(0, width: 2));
         s0Max = 1;
       } else if (blkWh <= 16) {
-        t0 = mux(ge(40), Const(1, width: 2), Const(0, width: 2));
+        t0 = mux<Logic>(ge(40), Const(1, width: 2), Const(0, width: 2));
         s0Max = 1;
       } else if (blkWh <= 24) {
         t0 = mux(
@@ -158,7 +158,7 @@ class HarborIntraDirEdge extends BridgeModule {
           mux(
             ge(16),
             Const(2, width: 2),
-            mux(ge(8), Const(1, width: 2), Const(0, width: 2)),
+            mux<Logic>(ge(8), Const(1, width: 2), Const(0, width: 2)),
           ),
         );
       } else if (blkWh <= 32) {
@@ -168,11 +168,11 @@ class HarborIntraDirEdge extends BridgeModule {
           mux(
             ge(4),
             Const(2, width: 2),
-            mux(ge(1), Const(1, width: 2), Const(0, width: 2)),
+            mux<Logic>(ge(1), Const(1, width: 2), Const(0, width: 2)),
           ),
         );
       } else {
-        t0 = mux(ge(1), Const(3, width: 2), Const(0, width: 2));
+        t0 = mux<Logic>(ge(1), Const(3, width: 2), Const(0, width: 2));
       }
       // Build type1.
       Logic t1;
@@ -180,20 +180,20 @@ class HarborIntraDirEdge extends BridgeModule {
         t1 = mux(
           ge(64),
           Const(2, width: 2),
-          mux(ge(40), Const(1, width: 2), Const(0, width: 2)),
+          mux<Logic>(ge(40), Const(1, width: 2), Const(0, width: 2)),
         );
         s1Max = 2;
       } else if (blkWh <= 16) {
         t1 = mux(
           ge(48),
           Const(2, width: 2),
-          mux(ge(20), Const(1, width: 2), Const(0, width: 2)),
+          mux<Logic>(ge(20), Const(1, width: 2), Const(0, width: 2)),
         );
         s1Max = 2;
       } else if (blkWh <= 24) {
-        t1 = mux(ge(4), Const(3, width: 2), Const(0, width: 2));
+        t1 = mux<Logic>(ge(4), Const(3, width: 2), Const(0, width: 2));
       } else {
-        t1 = mux(ge(1), Const(3, width: 2), Const(0, width: 2));
+        t1 = mux<Logic>(ge(1), Const(3, width: 2), Const(0, width: 2));
       }
       assert(s0Max <= 3 && s1Max <= 3);
       return mux(filterType, t1, t0);
@@ -207,7 +207,11 @@ class HarborIntraDirEdge extends BridgeModule {
       // type0 => blkWh<=16. type1 => blkWh<=8.
       final t0ok = blkWh <= 16;
       final t1ok = blkWh <= 8;
-      final okConst = mux(filterType, Const(t1ok ? 1 : 0), Const(t0ok ? 1 : 0));
+      final okConst = mux<Logic>(
+        filterType,
+        Const(t1ok ? 1 : 0),
+        Const(t0ok ? 1 : 0),
+      );
       return nz & lt40 & okConst;
     }
 
@@ -350,7 +354,7 @@ class HarborIntraDirEdge extends BridgeModule {
         final shifted = [
           biased[15].replicate(4),
           biased.getRange(4, 16),
-        ].swizzle();
+        ].concat();
         final neg = shifted[15];
         final gt255 = shifted.gt(Const(255, width: 16));
         final clipped = mux(
@@ -482,7 +486,7 @@ class HarborIntraDirEdge extends BridgeModule {
           final baseX = [
             xz2[w - 1].replicate(fracX),
             xz2.getRange(fracX, w),
-          ].swizzle().getRange(0, w);
+          ].concat().getRange(0, w);
           final xShL2 = (xz2 << ua).getRange(0, w);
           final shX = xShL2.getRange(1, 6);
           // baseX >= minBaseX (minBaseX < 0) <=> (baseX - minBaseX) >= 0.
@@ -506,7 +510,7 @@ class HarborIntraDirEdge extends BridgeModule {
           final baseY = [
             yz2[w - 1].replicate(fracY),
             yz2.getRange(fracY, w),
-          ].swizzle().getRange(0, w);
+          ].concat().getRange(0, w);
           final yShL2 = (yz2 << ul).getRange(0, w);
           final shY = yShL2.getRange(1, 6);
           final z2lIdx = (Const(off, width: w) + baseY).getRange(0, 12);
@@ -549,6 +553,6 @@ class HarborIntraDirEdge extends BridgeModule {
     }
 
     output('pred') <=
-        [for (var i = bs * bs - 1; i >= 0; i--) finalPred[i]].swizzle();
+        [for (var i = bs * bs - 1; i >= 0; i--) finalPred[i]].concat();
   }
 }

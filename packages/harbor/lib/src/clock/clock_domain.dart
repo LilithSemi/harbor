@@ -326,7 +326,7 @@ class HarborClockGenerator {
   Logic _domainReset(Logic domClk, Logic assertSrc, String name) {
     final pipe = Logic(name: '${name}RstSync', width: 2);
     Sequential(domClk, reset: assertSrc, [
-      pipe < [pipe[0], Const(1)].swizzle(),
+      pipe < [pipe[0], Const(1)].concat(),
     ]);
     return (assertSrc | ~pipe[1]).named('${name}Reset');
   }

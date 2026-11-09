@@ -504,7 +504,11 @@ class SdramEngine extends Module {
     final a10 = Const(1 << 10, width: rowW);
     final initAddr =
         init.cmdAddr |
-        mux(init.cmd.eq(SdramCommand.preAll.index), a10, Const(0, width: rowW));
+        mux<Logic>(
+          init.cmd.eq(SdramCommand.preAll.index),
+          a10,
+          Const(0, width: rowW),
+        );
     final zeroAddr = Const(0, width: rowW);
     final curAddr = mux(
       cur.hit,
@@ -739,7 +743,7 @@ class SdramEngine extends Module {
     Logic strobes(Logic Function(int b) engine, SdramCommand c) => [
       for (var b = 0; b < banks; b++)
         mux(initDonePick, engine(b), initIs(c) & init.cmdBa.eq(b)),
-    ].rswizzle();
+    ].rconcat();
     final actNext = strobes(
       (b) => (pickCurAct & cur.bank.eq(b)) | (pickLaAct & la.bank.eq(b)),
       SdramCommand.act,
@@ -846,7 +850,7 @@ class SdramEngine extends Module {
     final dqmNext = mux(
       writeIssue,
       ~wrMaskNow,
-      mux(
+      mux<Logic>(
         dqmLowNext,
         Const(0, width: dqmW),
         Const((1 << dqmW) - 1, width: dqmW),
@@ -1009,7 +1013,7 @@ class SdramEngine extends Module {
           // cke itself is not in [regs]: on a warm reset, the row may
           // still be open, so cke must stay high through [reset] and into
           // the init sequencer's own precharge, not drop at once.
-          phyCkeR < mux(warmReset, Const(1), Const(0)),
+          phyCkeR < mux<Logic>(warmReset, Const(1), Const(0)),
         ],
         orElse: [phyCkeR < init.cke],
       ),

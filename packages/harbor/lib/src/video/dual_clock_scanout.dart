@@ -450,8 +450,8 @@ class HarborDualClockScanout extends Module {
     if (port) {
       // fb_base can come from a CSR, so a scanout port forces both to whole
       // 32-bit words.
-      fbBase = [fbBase.getRange(2), Const(0, width: 2)].swizzle();
-      stride = [stride.getRange(2), Const(0, width: 2)].swizzle();
+      fbBase = [fbBase.getRange(2), Const(0, width: 2)].concat();
+      stride = [stride.getRange(2), Const(0, width: 2)].concat();
     }
     wordsPerLine = addInput('words_per_line', wordsPerLine, width: 16);
 
@@ -819,7 +819,7 @@ class HarborDualClockScanout extends Module {
     }
 
     Logic word32(Logic v) =>
-        port ? [v.getRange(2), Const(0, width: 2)].swizzle() : v;
+        port ? [v.getRange(2), Const(0, width: 2)].concat() : v;
     final base = [
       word32(addInput('fb_base', fbBase, width: 32)),
       for (var k = 1; k < planes; k++)
@@ -983,7 +983,7 @@ class HarborDualClockScanout extends Module {
       return [
         If(
           go.reduce((a, b) => a | b),
-          then: [reqToggle < ~reqToggle, reqMask < go.rswizzle()],
+          then: [reqToggle < ~reqToggle, reqMask < go.rconcat()],
         ),
         for (var k = 0; k < all; k++)
           if (lines[k] case (final f, final addr, final fill, final step))
@@ -1167,7 +1167,7 @@ class HarborDualClockScanout extends Module {
         phase <
             (early == null
                 ? Const(3, width: 2)
-                : mux(early, Const(2, width: 2), Const(3, width: 2))),
+                : mux<Logic>(early, Const(2, width: 2), Const(3, width: 2))),
       ];
     }
 
@@ -1220,7 +1220,7 @@ class HarborDualClockScanout extends Module {
         phase <
             (stay == null
                 ? Const(3, width: 2)
-                : mux(stay, Const(2, width: 2), Const(3, width: 2))),
+                : mux<Logic>(stay, Const(2, width: 2), Const(3, width: 2))),
       ];
     }
 
@@ -1376,7 +1376,7 @@ class HarborDualClockScanout extends Module {
             ~lineStart & ~firstLine & ~busy & release.reduce((a, b) => a | b),
             then: [
               reqToggle < ~reqToggle,
-              reqMask < release.rswizzle(),
+              reqMask < release.rconcat(),
               for (var k = 0; k < all; k++)
                 If(
                   release[k],
@@ -1501,7 +1501,7 @@ class HarborDualClockScanout extends Module {
     for (var k = 1; k < planes; k++) {
       output('plane_data_$k') <= rd[k];
     }
-    planeUnderrun <= underrunReg.sublist(0, planes).rswizzle();
+    planeUnderrun <= underrunReg.sublist(0, planes).rconcat();
     underrun <= underrunReg.reduce((a, b) => a | b);
     if (fmt != null) addOutput('format', width: selW) <= fmt;
     for (var k = 0; k < planes; k++) {
@@ -1513,7 +1513,7 @@ class HarborDualClockScanout extends Module {
         addOutput('overlay_underrun_count_$j', width: 16) <= uCount[planes + j];
       }
       addOutput('overlay_underrun', width: ovPlanes) <=
-          underrunReg.sublist(planes).rswizzle();
+          underrunReg.sublist(planes).rconcat();
       addOutput('overlay_on') <= ov.on;
       if (ov.format != null) {
         addOutput('overlay_frame_format', width: ov.format!.width) <=
@@ -1672,7 +1672,7 @@ class HarborDualClockScanout extends Module {
 
     Logic flag(Logic? sel, bool Function(HarborPixelFormat) f) =>
         pick(sel, (g) => Const(f(g) ? 1 : 0));
-    Logic clear0(Logic v, Logic c) => [v.getRange(1), v[0] & ~c].swizzle();
+    Logic clear0(Logic v, Logic c) => [v.getRange(1), v[0] & ~c].concat();
 
     final fmt = selIn == null ? null : Logic(name: 'ov_format', width: selW);
     final on = Logic(name: 'ov_on');
@@ -1726,7 +1726,7 @@ class HarborDualClockScanout extends Module {
         pixelClk,
         srcXe +
             wVis.zeroExtend(ew) -
-            mux(ahead, Const(0, width: ew), Const(1, width: ew)),
+            mux<Logic>(ahead, Const(0, width: ew), Const(1, width: ew)),
         reset: pixelReset,
       ).named('ov${j}_last_pixel');
       final count = pick(fmt, (f) {
@@ -1744,7 +1744,7 @@ class HarborDualClockScanout extends Module {
         pick(fmt, (f) {
           if (j >= f.planes.length) return Const(0, width: 32);
           final sh = HarborScanoutOverlay.wordShift(f, j);
-          return [(srcXe >>> sh).zeroExtend(30), Const(0, width: 2)].swizzle();
+          return [(srcXe >>> sh).zeroExtend(30), Const(0, width: 2)].concat();
         }).named('ov${j}_start_byte'),
       );
     }

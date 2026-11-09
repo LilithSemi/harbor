@@ -433,8 +433,8 @@ class SdramEngineStack {
       dq: dqPad,
       rules: rules,
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,

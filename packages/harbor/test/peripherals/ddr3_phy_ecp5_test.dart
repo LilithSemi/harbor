@@ -158,7 +158,7 @@ void main() {
         final c = _controller(p, runtimeTrainable: runtime);
         final phy = _phy(p, c, runtime: runtime);
         await phy.build();
-        final sv = phy.generateSynth();
+        final sv = phy.dumpSystemVerilog();
         const cmdPads = 4 + 3 + 3 + 13;
         expect(_count(sv, 'DQSBUFM'), greaterThanOrEqualTo(2));
         expect(sv, contains('DDRDLLA'));

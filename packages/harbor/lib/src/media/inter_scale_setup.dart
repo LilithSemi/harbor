@@ -89,7 +89,7 @@ class HarborInterScaleSetup extends BridgeModule {
     Logic sext(Logic x) {
       final n = x.width;
       if (n >= w) return x.getRange(0, w);
-      return [x[n - 1].replicate(w - n), x].swizzle();
+      return [x[n - 1].replicate(w - n), x].concat();
     }
 
     // Zero-extend an (unsigned) position to the working width.
@@ -98,7 +98,7 @@ class HarborInterScaleSetup extends BridgeModule {
     // Arithmetic (sign-propagating) right shift by [n] on a signed width-w
     // value, keeping the result width w.
     Logic asr(Logic x, int n) =>
-        [x[w - 1].replicate(n), x.getRange(n, w)].swizzle();
+        [x[w - 1].replicate(n), x.getRange(n, w)].concat();
 
     final shift = 1 - subsampling; // luma: 1, half-res: 0
 
@@ -219,7 +219,7 @@ class HarborInterScaleSetupScaled extends BridgeModule {
     Logic sext(Logic x, int width) {
       final n = x.width;
       if (n >= width) return x.getRange(0, width);
-      return [x[n - 1].replicate(width - n), x].swizzle();
+      return [x[n - 1].replicate(width - n), x].concat();
     }
 
     // Signed less-than over width [tW].
@@ -287,7 +287,7 @@ class HarborInterScaleSetupScaled extends BridgeModule {
               .getRange(0, tW);
       p = mux(slt(p, left), left, mux(slt(right, p), right, p));
       output(subOut) <= p.getRange(0, 10).zeroExtend(11); // posX & 1023
-      output(bOut) <= [p[tW - 1].replicate(10), p.getRange(10, tW)].swizzle();
+      output(bOut) <= [p[tW - 1].replicate(10), p.getRange(10, tW)].concat();
     }
 
     axis(

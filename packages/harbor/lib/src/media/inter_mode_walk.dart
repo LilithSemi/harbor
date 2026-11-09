@@ -161,7 +161,7 @@ class HarborInterModeWalk extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 
@@ -257,7 +257,7 @@ class HarborInterModeWalk extends BridgeModule {
     final isClass0 = mvClassReg.eq(Const(0, width: 4));
 
     // Context for the current component's fp / hp reads.
-    final fpBaseComp = mux(
+    final fpBaseComp = mux<Logic>(
       compReg,
       Const(cFp1, width: cw),
       Const(cFp0, width: cw),
@@ -270,20 +270,24 @@ class HarborInterModeWalk extends BridgeModule {
     final fpCtx = mux(isClass0, class0FpCtx, fpBaseComp);
     final hpCtx = mux(
       isClass0,
-      mux(compReg, Const(cClass0Hp1, width: cw), Const(cClass0Hp0, width: cw)),
-      mux(compReg, Const(cHp1, width: cw), Const(cHp0, width: cw)),
+      mux<Logic>(
+        compReg,
+        Const(cClass0Hp1, width: cw),
+        Const(cClass0Hp0, width: cw),
+      ),
+      mux<Logic>(compReg, Const(cHp1, width: cw), Const(cHp0, width: cw)),
     );
-    final signCtx = mux(
+    final signCtx = mux<Logic>(
       compReg,
       Const(cSign1, width: cw),
       Const(cSign0, width: cw),
     );
-    final classCtx = mux(
+    final classCtx = mux<Logic>(
       compReg,
       Const(cClasses1, width: cw),
       Const(cClasses0, width: cw),
     );
-    final class0Ctx = mux(
+    final class0Ctx = mux<Logic>(
       compReg,
       Const(cClass01, width: cw),
       Const(cClass00, width: cw),
@@ -485,7 +489,7 @@ class HarborInterModeWalk extends BridgeModule {
           CaseItem(Const(3, width: cw), [
             // p4 -> LAST2(2) : LAST(1)
             ref0Reg <
-                mux(
+                mux<Logic>(
                   sym.eq(Const(0, width: ec.symWidth)),
                   Const(1, width: 3),
                   Const(2, width: 3),
@@ -495,7 +499,7 @@ class HarborInterModeWalk extends BridgeModule {
           CaseItem(Const(4, width: cw), [
             // p5 -> GOLDEN(4) : LAST3(3)
             ref0Reg <
-                mux(
+                mux<Logic>(
                   sym.eq(Const(0, width: ec.symWidth)),
                   Const(3, width: 3),
                   Const(4, width: 3),
@@ -519,7 +523,7 @@ class HarborInterModeWalk extends BridgeModule {
           CaseItem(Const(5, width: cw), [
             // p6 -> ALTREF2(6) : BWDREF(5)
             ref0Reg <
-                mux(
+                mux<Logic>(
                   sym.eq(Const(0, width: ec.symWidth)),
                   Const(5, width: 3),
                   Const(6, width: 3),
@@ -677,7 +681,7 @@ class HarborInterModeWalk extends BridgeModule {
               symCnt < (symCnt + Const(1, width: 8)),
               // NEARESTMV(13) : NEARMV(14). Both take the (empty-stack) zero MV.
               modeReg <
-                  mux(
+                  mux<Logic>(
                     sym.eq(Const(0, width: ec.symWidth)),
                     Const(13, width: 5),
                     Const(14, width: 5),

@@ -176,6 +176,6 @@ class HarborIntraPred extends BridgeModule {
     // Mode constant _dc is the default branch above.
     assert(_dc == 0);
 
-    output('pred') <= outs.reversed.toList().swizzle();
+    output('pred') <= outs.reversed.toList().concat();
   }
 }

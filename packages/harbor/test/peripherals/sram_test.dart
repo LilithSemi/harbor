@@ -62,7 +62,7 @@ void main() {
         ),
       );
       await sram.build();
-      final sv = sram.generateSynth();
+      final sv = sram.dumpSystemVerilog();
       expect(sv, contains('RAMB36E1'));
       expect(sv, isNot(contains('DP16KD')));
       expect(sv, isNot(contains('SPRAM')));
@@ -75,7 +75,7 @@ void main() {
         target: const HarborFpgaTarget.ecp5(device: '25f', package: 'CABGA256'),
       );
       await sram.build();
-      final sv = sram.generateSynth();
+      final sv = sram.dumpSystemVerilog();
       expect(sv, contains('DP16KD'));
       expect(sv, isNot(contains('RAMB36E1')));
     });

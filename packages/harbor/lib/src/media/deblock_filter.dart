@@ -80,12 +80,16 @@ class HarborDeblockFilter extends BridgeModule {
       final sign = x[w - 1];
       final hi = x.getRange(7, w); // bits 7..w-1
       final inRange = hi.eq(sign.replicate(w - 7));
-      final sat = mux(sign, Const(0x80, width: 8), Const(0x7F, width: 8));
+      final sat = mux<Logic>(
+        sign,
+        Const(0x80, width: 8),
+        Const(0x7F, width: 8),
+      );
       return mux(inRange, x.getRange(0, 8), sat).signExtend(w);
     }
 
     Logic asr(Logic x, int n) =>
-        [x[w - 1].replicate(n), x.getRange(n, w)].swizzle();
+        [x[w - 1].replicate(n), x.getRange(n, w)].concat();
 
     // filter = (hev ? clamp(ps1 - qs1) : 0), then += 3*(qs0 - ps0), clamped.
     final outer = mux(
@@ -160,6 +164,6 @@ class HarborDeblockFilter extends BridgeModule {
           mux(useWide, avg(w0), f4p0),
           mux(useWide, avg(w1), f4p1),
           mux(useWide, avg(w2), p2), // op2
-        ].swizzle();
+        ].concat();
   }
 }

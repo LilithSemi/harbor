@@ -57,7 +57,7 @@ Logic countOf(List<Logic> bits, int width) =>
 List<Logic> roundRobin(String name, Logic clk, Logic reset, List<Logic> req) {
   final n = req.length;
   if (n == 1) return req;
-  final r = req.rswizzle();
+  final r = req.rconcat();
   final last = Logic(name: '${name}_rr', width: n);
   final masked = r & ~((last << 1) - 1);
   final pick = mux(masked.neq(0), masked, r);

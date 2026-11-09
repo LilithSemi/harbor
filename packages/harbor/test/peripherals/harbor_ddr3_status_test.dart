@@ -51,7 +51,7 @@ void main() {
       }
       expect(ddr.output('cal_state').width, 6);
       expect(ddr.output('cal_attempts').width, 8);
-      final sv = ddr.generateSynth();
+      final sv = ddr.dumpSystemVerilog();
       for (final n in ['init_done', 'cal_done', 'cal_failed', 'cal_state']) {
         expect(sv, matches(RegExp('output logic (\\[5:0\\] )?$n\\b')));
       }

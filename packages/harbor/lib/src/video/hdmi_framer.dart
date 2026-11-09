@@ -204,7 +204,7 @@ class HdmiFramer extends Module {
     Logic bch(Logic ecc, Logic bit) {
       final f = ecc[0] ^ bit;
       final s = ecc >>> 1;
-      return s ^ [f, Const(0, width: 5), f, f].swizzle();
+      return s ^ [f, Const(0, width: 5), f, f].concat();
     }
 
     final hdr = Logic(name: 'header_bits', width: 24);
@@ -313,10 +313,10 @@ class HdmiFramer extends Module {
       mux(data, headerBit, one),
       vsync,
       hsync,
-    ].swizzle();
-    final aux1 = [for (var k = 3; k >= 0; k--) subBit(k, 0)].swizzle();
-    final aux2 = [for (var k = 3; k >= 0; k--) subBit(k, 1)].swizzle();
-    aux <= [aux2, aux1, aux0].swizzle();
+    ].concat();
+    final aux1 = [for (var k = 3; k >= 0; k--) subBit(k, 0)].concat();
+    final aux2 = [for (var k = 3; k >= 0; k--) subBit(k, 1)].concat();
+    aux <= [aux2, aux1, aux0].concat();
 
     Logic m(int v) => Const(v, width: 2);
     final terc4 = (data | guard).named('island_terc4');
@@ -339,9 +339,9 @@ class HdmiFramer extends Module {
         mux(vg, m(TmdsEncoder.modeGuard0), m(TmdsEncoder.modeDvi)),
       ),
     );
-    mode <= [mode2, mode1, mode0].swizzle();
+    mode <= [mode2, mode1, mode0].concat();
     // Video preamble CTL3..0 = 0001, data island preamble 0101.
-    ctl <= [Const(0), pre, Const(0), vp | pre].swizzle();
+    ctl <= [Const(0), pre, Const(0), vp | pre].concat();
     active <= on;
   }
 }

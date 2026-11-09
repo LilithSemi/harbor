@@ -197,7 +197,7 @@ class HarborPartitionTreeWalk extends BridgeModule {
     Logic packCdf(List<int> icdf) => [
       for (var s = 9; s >= 0; s--)
         Const(s < icdf.length ? icdf[s] : 0, width: 16),
-    ].swizzle();
+    ].concat();
     Logic romSel(List<int> table, Logic idx, int w) {
       Logic v = Const(table.last, width: w);
       for (var i = table.length - 2; i >= 0; i--) {
@@ -254,7 +254,7 @@ class HarborPartitionTreeWalk extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 
@@ -337,9 +337,9 @@ class HarborPartitionTreeWalk extends BridgeModule {
     output('sym_count') <= symCount;
     output('chk') <= chk;
     output('above_ctx') <=
-        [for (var i = ctxN - 1; i >= 0; i--) aboveCtx[i]].swizzle();
+        [for (var i = ctxN - 1; i >= 0; i--) aboveCtx[i]].concat();
     output('left_ctx') <=
-        [for (var i = ctxN - 1; i >= 0; i--) leftCtx[i]].swizzle();
+        [for (var i = ctxN - 1; i >= 0; i--) leftCtx[i]].concat();
 
     const sIdle = 0,
         sPreload = 1,
@@ -365,7 +365,7 @@ class HarborPartitionTreeWalk extends BridgeModule {
           ecCtx < pli.getRange(0, cw),
           ecCdf < selPreloadCdf(pli),
           ecNsyms <
-              mux(
+              mux<Logic>(
                 pli.gte(Const(12, width: 5)),
                 Const(4, width: 5),
                 Const(10, width: 5),

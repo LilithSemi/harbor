@@ -160,7 +160,7 @@ class HarborKeyframeDecodeYuvVar extends BridgeModule {
     final reconLog2 = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         (l2Cap.getRange(l * 3, l * 3 + 3) - Const(2, width: 3)).getRange(0, 2),
-    ].swizzle();
+    ].concat();
     final reconYModes = ymCap;
     final reconTxTypes = ttCap;
     final reconCoeffs = [
@@ -168,13 +168,13 @@ class HarborKeyframeDecodeYuvVar extends BridgeModule {
         Const(0, width: 192 * 16),
         coeffCap.getRange(l * 64 * 16, l * 64 * 16 + 64 * 16),
       ],
-    ].swizzle();
+    ].concat();
     int posVal(int row, int col) => row | (col << miBits);
     final posNone = Const(posVal(0, 0), width: maxLeaves * 2 * miBits);
     final splitPositions = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         Const(posVal(l >> 1, l & 1), width: 2 * miBits),
-    ].swizzle();
+    ].concat();
     final reconPositions = mux(
       reconLeafCount.eq(Const(4, width: cntW)),
       splitPositions,
@@ -197,11 +197,11 @@ class HarborKeyframeDecodeYuvVar extends BridgeModule {
     final d1Positions = splitPositions;
     final d1Log2 = Const(0, width: maxLeaves * 2);
     final ym0 = ymCap.getRange(0, 4);
-    final d1YModes = [for (var l = 0; l < maxLeaves; l++) ym0].swizzle();
+    final d1YModes = [for (var l = 0; l < maxLeaves; l++) ym0].concat();
     final d1TxTypes = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         stxCap.getRange(l * 4, l * 4 + 4),
-    ].swizzle();
+    ].concat();
     final leaf0Coeffs = coeffCap.getRange(0, 64 * 16);
     Logic d1SlotCoeff(int rowOff, int colOff, int r4, int c4) {
       final slot = (rowOff * 4 + r4) * 8 + (colOff * 4 + c4);
@@ -214,9 +214,9 @@ class HarborKeyframeDecodeYuvVar extends BridgeModule {
         [
           for (var i = 15; i >= 0; i--)
             d1SlotCoeff(l >> 1, l & 1, i >> 2, i & 3),
-        ].swizzle(),
+        ].concat(),
       ],
-    ].swizzle();
+    ].concat();
 
     // mux every recon input by the depth-1 detection.
     final muxLeafCount = mux(isDepth1, d1LeafCount, reconLeafCount);
@@ -256,7 +256,7 @@ class HarborKeyframeDecodeYuvVar extends BridgeModule {
     ];
     final cflAcPacked = [
       for (var k = cN - 1; k >= 0; k--) cflAc[k],
-    ].swizzle(); // cN*cflAcBits
+    ].concat(); // cN*cflAcBits
 
     // chroma derivations (const muxes on uvModeCap).
     Logic romSel(List<int> table, Logic idx, int w) {

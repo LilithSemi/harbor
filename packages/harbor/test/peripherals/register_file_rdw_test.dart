@@ -409,7 +409,7 @@ void main() {
     for (final t in targets) {
       final rf = HarborRegisterFile(target: t);
       await rf.build();
-      final sv = rf.generateSynth();
+      final sv = rf.dumpSystemVerilog();
       expect(sv, contains('rfRdwHit_0'), reason: '$t');
       expect(sv, contains('rfRdwHit_1'), reason: '$t');
       await Simulator.reset();

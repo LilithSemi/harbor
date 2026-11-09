@@ -991,9 +991,9 @@ class HarborDualClockDisplay extends Module {
       final is565 = frameFormat == null
           ? Const(1)
           : frameFormat.eq(i565).named('is_rgb565');
-      r = mux(is565, [r5, r5.getRange(2, 5)].swizzle(), word.getRange(16, 24));
-      g = mux(is565, [g6, g6.getRange(4, 6)].swizzle(), word.getRange(8, 16));
-      b = mux(is565, [b5, b5.getRange(2, 5)].swizzle(), word.getRange(0, 8));
+      r = mux(is565, [r5, r5.getRange(2, 5)].concat(), word.getRange(16, 24));
+      g = mux(is565, [g6, g6.getRange(4, 6)].concat(), word.getRange(8, 16));
+      b = mux(is565, [b5, b5.getRange(2, 5)].concat(), word.getRange(0, 8));
     } else if (rgb565) {
       // Column 0 is the low half (bits 15..0), column 1 the high half
       // (bits 31..16): little-endian memory order.
@@ -1002,9 +1002,9 @@ class HarborDualClockDisplay extends Module {
       final r5 = half.getRange(11, 16);
       final g6 = half.getRange(5, 11);
       final b5 = half.getRange(0, 5);
-      r = [r5, r5.getRange(2, 5)].swizzle();
-      g = [g6, g6.getRange(4, 6)].swizzle();
-      b = [b5, b5.getRange(2, 5)].swizzle();
+      r = [r5, r5.getRange(2, 5)].concat();
+      g = [g6, g6.getRange(4, 6)].concat();
+      b = [b5, b5.getRange(2, 5)].concat();
     } else {
       // argb8888 behaves like xrgb8888: alpha is ignored.
       r = word.getRange(16, 24);
@@ -1120,7 +1120,7 @@ class HarborDualClockDisplay extends Module {
       // No TMDS encoder or serializer, and no shift clock: rgb/hsync/vsync/de
       // are already the registered, pixel-aligned values of the last stage
       // above, and pclk is the pixel clock forwarded through the same edge.
-      rgb <= [r2, g2, b2].swizzle();
+      rgb <= [r2, g2, b2].concat();
       pclk <=
           HarborPixelClockForward(
             clk: pixelClk,
@@ -1296,7 +1296,7 @@ class HarborDualClockDisplay extends Module {
         [
           addInput('audio_right', right, width: 24),
           addInput('audio_left', left, width: 24),
-        ].swizzle();
+        ].concat();
     fifo.input('rd_clk').srcConnection! <= pixelClk;
     fifo.input('rd_reset').srcConnection! <=
         harborCdcJoinReset(pixelClk, pixelReset, ctrlReset, name: 'audio_rd');
@@ -1591,7 +1591,7 @@ class HarborDualClockDisplay extends Module {
     for (var i = g.width - 2; i >= 0; i--) {
       bits.add(bits.last ^ g[i]);
     }
-    return bits.swizzle().named('${name}_sync');
+    return bits.concat().named('${name}_sync');
   }
 
   /// Pixel cycles from the timing generator to the outputs.
@@ -1723,7 +1723,7 @@ class _ShadowSet {
     final applied = early ? Logic(name: '${name}_applied', width: w) : null;
     _fields.add((input, shadow, applied, resetValue >> low, low));
     final v = applied ?? shadow;
-    return low == 0 ? v : [v, Const(0, width: low)].swizzle();
+    return low == 0 ? v : [v, Const(0, width: low)].concat();
   }
 
   void build({

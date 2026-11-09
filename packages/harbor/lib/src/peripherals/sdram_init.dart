@@ -90,14 +90,18 @@ class SdramInitSequencer extends Module {
     // next value.
     output('done_next') <= ~reset & st.eq(stDone);
 
-    Const nopCode() => Const(SdramCommand.nop.index, width: 3);
+    Logic nopCode() => Const(SdramCommand.nop.index, width: 3);
 
     Sequential(clk, [
       If(
         reset,
         then: [
           st <
-              mux(warm, Const(stWarmPre, width: 4), Const(stPowerUp, width: 4)),
+              mux<Logic>(
+                warm,
+                Const(stWarmPre, width: 4),
+                Const(stPowerUp, width: 4),
+              ),
           counter < Const(0, width: counterWidth),
           refreshesLeft < Const(cycles.initRefreshes, width: refreshWidth),
           cmdReg < nopCode(),
@@ -105,7 +109,7 @@ class SdramInitSequencer extends Module {
           cmdBaReg < Const(0, width: bankBits),
           // A warm reset keeps cke high through the precharge below; a
           // real power-on starts with cke low, unchanged.
-          ckeReg < mux(warm, Const(1), Const(0)),
+          ckeReg < mux<Logic>(warm, Const(1), Const(0)),
           doneReg < Const(0),
         ],
         orElse: [

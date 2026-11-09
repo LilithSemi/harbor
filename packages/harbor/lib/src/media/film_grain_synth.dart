@@ -161,7 +161,7 @@ class HarborFilmGrainSynth extends BridgeModule {
       Logic build(int k) {
         if (k == 0) return x;
         if (k >= w) return x[w - 1].replicate(w);
-        return [x[w - 1].replicate(k), x.getRange(k, w)].swizzle();
+        return [x[w - 1].replicate(k), x.getRange(k, w)].concat();
       }
 
       Logic v = build(0);
@@ -206,7 +206,7 @@ class HarborFilmGrainSynth extends BridgeModule {
     // LFSR one step: returns (nextReg16, gaussIdx11 = next>>5).
     List<Logic> lfsrStep(Logic r) {
       final b = (r[0] ^ r[1] ^ r[3] ^ r[12]);
-      final next = [b, r.getRange(1, 16)].swizzle(); // {b, r[15:1]}
+      final next = [b, r.getRange(1, 16)].concat(); // {b, r[15:1]}
       final idx = next.getRange(5, 16); // next >> 5, 11 bits
       return [next, idx];
     }
@@ -238,7 +238,7 @@ class HarborFilmGrainSynth extends BridgeModule {
         bus.getRange(s * grainW, s * grainW + grainW);
     // shift newVal into slot 0, dropping the oldest slot.
     Logic shiftIn(Logic bus, Logic newVal, int n) =>
-        [bus.getRange(0, (n - 1) * grainW), newVal].swizzle();
+        [bus.getRange(0, (n - 1) * grainW), newVal].concat();
 
     // FSM
     const sIdle = 0,
@@ -316,7 +316,7 @@ class HarborFilmGrainSynth extends BridgeModule {
       final sr = (sum + rnd).getRange(0, 32);
       return shift == 0
           ? sr
-          : [sr[31].replicate(shift), sr.getRange(shift, 32)].swizzle();
+          : [sr[31].replicate(shift), sr.getRange(shift, 32)].concat();
     }
 
     // Cross term = cross_coeff * avgLuma, for a given chroma coeff bus.

@@ -1,15 +1,22 @@
 name: harbor
 description: "ROHD extensions for physical implementation: ASIC tapeout flows, FPGA build support, and reusable components."
 version: 0.0.1
+publish_to: none
 repository: https://github.com/LilithSemi/harbor
 resolution: workspace
 environment:
   sdk: ^3.11.2
 dependencies:
   meta: ^1.16.0
-  rohd: ^0.6.8
-  rohd_bridge: ^0.2.2
-  rohd_hcl: ^0.2.1
+  rohd: ^0.7.0
+  rohd_bridge: ^0.3.0
+  # The published 0.3.0 archive omits the `confapp` workspace member declared
+  # in its pubspec, which breaks `dart test` on the second run. The tagged git
+  # release contains it.
+  rohd_hcl:
+    git:
+      url: https://github.com/intel/rohd-hcl
+      ref: v0.3.0
 dev_dependencies:
-  rohd_vf: ^0.6.0
+  rohd_vf: ^0.7.0
   test: ^1.25.0

@@ -26,7 +26,7 @@ void main() {
       target: ecp5Target,
     );
     await sdram.build();
-    final sv = sdram.generateSynth();
+    final sv = sdram.dumpSystemVerilog();
 
     expect(sv, contains('module HarborSdram'));
     expect(count(sv, 'OFS1P3BX'), equals(53));
@@ -109,7 +109,7 @@ void main() {
       target: const HarborSimTarget(topCell: 'top', frequency: 50000000),
     );
     await sdram.build();
-    final sv = sdram.generateSynth();
+    final sv = sdram.dumpSystemVerilog();
 
     expect(sv, contains('harbor_sim_dram'));
     final dramLine = sv.split('\n').firstWhere((l) => l.contains('sim_dram('));

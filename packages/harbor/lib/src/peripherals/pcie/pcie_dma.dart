@@ -506,7 +506,7 @@ class HarborPcieDma extends BridgeModule {
       mux(
         be[2],
         Const(2, width: 2),
-        mux(be[3], Const(3, width: 2), Const(0, width: 2)),
+        mux<Logic>(be[3], Const(3, width: 2), Const(0, width: 2)),
       ),
     ),
   );
@@ -520,7 +520,7 @@ class HarborPcieDma extends BridgeModule {
       mux(
         be[1],
         Const(2, width: 2),
-        mux(be[0], Const(3, width: 2), Const(0, width: 2)),
+        mux<Logic>(be[0], Const(3, width: 2), Const(0, width: 2)),
       ),
     ),
   );
@@ -700,9 +700,9 @@ class HarborPcieDma extends BridgeModule {
     // The record DWs. They do not change while the record is sent.
     final recWords = [
       dCookie,
-      [phase, Const(0, width: 23), code].swizzle(),
+      [phase, Const(0, width: 23), code].concat(),
       done,
-      [dSrc[16], Const(0, width: 15), dSrc.slice(15, 0)].swizzle(),
+      [dSrc[16], Const(0, width: 15), dSrc.slice(15, 0)].concat(),
     ];
 
     // BAR0 completion.
@@ -834,7 +834,7 @@ class HarborPcieDma extends BridgeModule {
     ).named('reg_w_be');
     final wMask = [
       for (var b = 3; b >= 0; b--) wBe[b].replicate(8),
-    ].swizzle().named('reg_w_mask');
+    ].concat().named('reg_w_mask');
     Logic writes(int dw) => wEn & wPort.eq(Const(dw, width: 10));
     Logic merge(Logic old) =>
         (old & ~wMask.slice(old.width - 1, 0)) |
@@ -853,7 +853,7 @@ class HarborPcieDma extends BridgeModule {
       halted,
       // Busy means a descriptor is in the engine.
       ~inState(sIdle),
-    ].swizzle().named('status');
+    ].concat().named('status');
     final regValue = Logic(name: 'reg_value', width: 32);
     final Logic? infoWord;
     if (infoWords.isNotEmpty) {
@@ -882,7 +882,7 @@ class HarborPcieDma extends BridgeModule {
         reg(registerCaps, Const(caps, width: 32)),
         reg(
           registerControl,
-          [both ? selReq : Const(0), resetReq, enable].swizzle(),
+          [both ? selReq : Const(0), resetReq, enable].concat(),
         ),
         reg(registerStatus, status),
         reg(registerIrqCause, cause),
@@ -915,7 +915,7 @@ class HarborPcieDma extends BridgeModule {
 
     // Queue storage. An entry is DWs 0 to 6 of a descriptor and its source.
     Logic pack(List<Logic> d, Logic src) {
-      final local64 = [d[3], d[2]].swizzle();
+      final local64 = [d[3], d[2]].concat();
       final localHigh = aw == 64 ? Const(0) : local64.slice(63, aw).or();
       return [
         src,
@@ -926,7 +926,7 @@ class HarborPcieDma extends BridgeModule {
         local64.slice(aw - 1, 0),
         d[1],
         d[0],
-      ].swizzle();
+      ].concat();
     }
 
     final commit = fifoSource ? writes(registerPushCommit ~/ 4) : Const(0);
@@ -934,7 +934,7 @@ class HarborPcieDma extends BridgeModule {
     final fPush = Logic(name: 'f_push');
     final push = (fifoPush | fPush).named('q_push');
     Logic? fifoData = fifoSource
-        ? pack(stage, [Const(0), pushSeq].swizzle())
+        ? pack(stage, [Const(0), pushSeq].concat())
         : null;
     Logic? fetchData;
     if (ringSource) {
@@ -942,7 +942,7 @@ class HarborPcieDma extends BridgeModule {
         // The slot of descriptor k is the head when it goes in.
         final d = pack(
           fBuf.sublist(8 * k, 8 * k + 7),
-          [Const(1), descHead].swizzle(),
+          [Const(1), descHead].concat(),
         );
         fetchData = fetchData == null
             ? d
@@ -1084,7 +1084,7 @@ class HarborPcieDma extends BridgeModule {
           p.gte(lane0.zeroExtend(13)) & p.lt(lane0.zeroExtend(13) + dLenDw);
       strobes.add(inRange.replicate(4));
     }
-    final strb = strobes.rswizzle().named('d_strb');
+    final strb = strobes.rconcat().named('d_strb');
     // A beat that the port has not taken stays on the port unchanged, also
     // when the transfer stops. The beats after it that are owed have
     // strobes 0 and data 0.
@@ -1100,7 +1100,7 @@ class HarborPcieDma extends BridgeModule {
           tags.rdData.slice(8 * b + 7, 8 * b),
           Const(0, width: 8),
         ),
-    ].swizzle().named('w_live_data');
+    ].concat().named('w_live_data');
     final liveStrb = mux(ownW, strb, Const(0, width: strb.width));
     final liveLast = mux(ownW, burstLeft.eq(1), wOwe.eq(1));
     mem.wdataValid <= wLive | wHold;
@@ -1182,29 +1182,29 @@ class HarborPcieDma extends BridgeModule {
 
     // Engine TX: memory write of pkt_dw DWs from buf, from lane0 on.
     final is4 = pktAddr.slice(63, 32).or();
-    final hdrDws = mux(is4, Const(4, width: 12), Const(3, width: 12));
+    final hdrDws = mux<Logic>(is4, Const(4, width: 12), Const(3, width: 12));
     final eHdr = [
       [
         mux(
           pktRead,
-          mux(is4, Const(0x20, width: 8), Const(0x00, width: 8)),
-          mux(is4, Const(0x60, width: 8), Const(0x40, width: 8)),
+          mux<Logic>(is4, Const(0x20, width: 8), Const(0x00, width: 8)),
+          mux<Logic>(is4, Const(0x60, width: 8), Const(0x40, width: 8)),
         ),
         Const(0, width: 14),
         pktDw.slice(9, 0),
-      ].swizzle(),
+      ].concat(),
       [
         completerId,
         pktTag,
-        mux(pktDw.gt(1), Const(0xf, width: 4), Const(0, width: 4)),
+        mux<Logic>(pktDw.gt(1), Const(0xf, width: 4), Const(0, width: 4)),
         Const(0xf, width: 4),
-      ].swizzle(),
+      ].concat(),
       mux(
         is4,
         pktAddr.slice(63, 32),
-        [pktAddr.slice(31, 2), Const(0, width: 2)].swizzle(),
+        [pktAddr.slice(31, 2), Const(0, width: 2)].concat(),
       ),
-      [pktAddr.slice(31, 2), Const(0, width: 2)].swizzle(),
+      [pktAddr.slice(31, 2), Const(0, width: 2)].concat(),
     ];
     final eTotal =
         (hdrDws + mux(pktRead, Const(0, width: 12), pktDw.zeroExtend(12)))
@@ -1244,16 +1244,16 @@ class HarborPcieDma extends BridgeModule {
     // BAR0 completion TX.
     final cHdr = [
       [
-        mux(cDw.eq(0), Const(0x0a, width: 8), Const(0x4a, width: 8)),
+        mux<Logic>(cDw.eq(0), Const(0x0a, width: 8), Const(0x4a, width: 8)),
         Const(0, width: 1),
         cTc,
         Const(0, width: 6),
         cAttr,
         Const(0, width: 2),
         cDw.zeroExtend(10),
-      ].swizzle(),
-      [completerId, cStatus, Const(0, width: 1), cByteCount].swizzle(),
-      [cReqId, cTag, Const(0, width: 1), cLowAddr].swizzle(),
+      ].concat(),
+      [completerId, cStatus, Const(0, width: 1), cByteCount].concat(),
+      [cReqId, cTag, Const(0, width: 1), cLowAddr].concat(),
     ];
     // A beat shows when the reads have filled its payload lanes.
     final cTotal = (Const(3, width: 6) + cDw).named('c_total');
@@ -1278,18 +1278,18 @@ class HarborPcieDma extends BridgeModule {
 
     // Fetch TX: a memory read of f_count descriptors.
     final fIs4 = fAddr.slice(63, 32).or();
-    final fAddrLow = [fAddr.slice(31, 2), Const(0, width: 2)].swizzle();
+    final fAddrLow = [fAddr.slice(31, 2), Const(0, width: 2)].concat();
     final fHdr = [
       [
-        mux(fIs4, Const(0x20, width: 8), Const(0x00, width: 8)),
+        mux<Logic>(fIs4, Const(0x20, width: 8), Const(0x00, width: 8)),
         Const(0, width: 14),
-        [fCount, Const(0, width: 3)].swizzle().zeroExtend(10),
-      ].swizzle(),
-      [completerId, fTag, Const(0xff, width: 8)].swizzle(),
+        [fCount, Const(0, width: 3)].concat().zeroExtend(10),
+      ].concat(),
+      [completerId, fTag, Const(0xff, width: 8)].concat(),
       mux(fIs4, fAddr.slice(63, 32), fAddrLow),
       fAddrLow,
     ];
-    final fTotal = mux(fIs4, Const(4, width: 3), Const(3, width: 3));
+    final fTotal = mux<Logic>(fIs4, Const(4, width: 3), Const(3, width: 3));
     final fLanes = <Logic>[];
     final fKeep = <Logic>[];
     for (var i = 0; i < n; i++) {
@@ -1312,7 +1312,7 @@ class HarborPcieDma extends BridgeModule {
       mux(
         cValid,
         Const(1, width: 2),
-        mux(fValid, Const(2, width: 2), Const(0, width: 2)),
+        mux<Logic>(fValid, Const(2, width: 2), Const(0, width: 2)),
       ),
     ).named('tx_pick');
     final pickCpl = pick.eq(1);
@@ -1326,14 +1326,14 @@ class HarborPcieDma extends BridgeModule {
     txs.data <=
         harborBitMux(
           pickCpl,
-          cLanes.rswizzle(),
-          harborBitMux(pickFetch, fLanes.rswizzle(), eLanes.rswizzle()),
+          cLanes.rconcat(),
+          harborBitMux(pickFetch, fLanes.rconcat(), eLanes.rconcat()),
         );
     txs.keep <=
         mux(
           pickCpl,
-          cKeep.rswizzle(),
-          mux(pickFetch, fKeep.rswizzle(), eKeep.rswizzle()),
+          cKeep.rconcat(),
+          mux(pickFetch, fKeep.rconcat(), eKeep.rconcat()),
         );
     txs.last <= mux(pickCpl, cLast, mux(pickFetch, fLast, eLast));
     final recEnd = inState(sRecTx) & eLast & pick.eq(0);
@@ -1341,7 +1341,7 @@ class HarborPcieDma extends BridgeModule {
         [
           recEnd & ~code.eq(0),
           recEnd & code.eq(0) & dFlags[1],
-        ].swizzle().zeroExtend(HarborPcieStream.userWidth);
+        ].concat().zeroExtend(HarborPcieStream.userWidth);
     final txFire = txs.valid & txs.ready;
     debug <=
         [
@@ -1355,7 +1355,7 @@ class HarborPcieDma extends BridgeModule {
           iBusy,
           dState,
           state,
-        ].swizzle();
+        ].concat();
     addOutput('debug', width: 32) <= debug;
     if (resetMemoryOnEngineReset) {
       Sequential(clk, [_memReset < engReset], reset: reset);
@@ -1514,13 +1514,13 @@ class HarborPcieDma extends BridgeModule {
       mux(
         tlpPoisoned(header),
         Const(errorPoisoned, width: 8),
-        mux(fBad, Const(errorLength, width: 8), Const(0, width: 8)),
+        mux<Logic>(fBad, Const(errorLength, width: 8), Const(0, width: 8)),
       ),
     ).named('f_code');
     final fGood = (fRsv & fCode.eq(0)).named('f_good');
     final fBeat = (fInPkt & rxFire & fInWait).named('f_beat');
     final fCnt = mux(fLeft.lt(n), fLeft.slice(2, 0), Const(n, width: 3));
-    final fWant = [fCount, Const(0, width: 3)].swizzle();
+    final fWant = [fCount, Const(0, width: 3)].concat();
     final fExpired = (fInWait & fGot.lt(fWant) & fTimer.eq(timeoutCycles - 1))
         .named('f_expired');
     if (ringSource) {
@@ -1530,7 +1530,7 @@ class HarborPcieDma extends BridgeModule {
           fInWait &
               ~halted &
               fPushed.lt(fCount) &
-              fGot.gte([fPushed + 1, Const(0, width: 3)].swizzle());
+              fGot.gte([fPushed + 1, Const(0, width: 3)].concat());
     } else {
       fPush <= Const(0);
     }
@@ -1561,7 +1561,7 @@ class HarborPcieDma extends BridgeModule {
               fTag < tags.reservedTag,
               fT < 0,
               fGot < 0,
-              fRemReg < [fN, Const(0, width: 5)].swizzle().zeroExtend(13),
+              fRemReg < [fN, Const(0, width: 5)].concat().zeroExtend(13),
               fExpReg < fetchAddr.slice(6, 0),
               fPushed < 0,
               fTimer < 0,
@@ -1654,7 +1654,7 @@ class HarborPcieDma extends BridgeModule {
       Const(0, width: causeLineShift - 2),
       errSet,
       doneSet,
-    ].swizzle();
+    ].concat();
     // A cause event after the last IRQ_CAUSE read is fresh. A W1C does not
     // clear a fresh bit, so the handler cannot clear an event it has not
     // read. For a line, the event is its rising edge.
@@ -1668,7 +1668,7 @@ class HarborPcieDma extends BridgeModule {
       Const(0, width: causeLineShift - 2),
       errSet,
       doneSet,
-    ].swizzle();
+    ].concat();
     // A read clears the fresh bits only in the bytes it reads. A zero length
     // read (first byte enable 0) reads nothing.
     final rBe = mux(
@@ -1681,7 +1681,7 @@ class HarborPcieDma extends BridgeModule {
             .named('irq_cause_read');
     final readBits = [
       for (var i = 3; i >= 0; i--) (causeRead & rBe[i]).replicate(8),
-    ].swizzle().slice(causeWidth - 1, 0).named('irq_cause_read_bits');
+    ].concat().slice(causeWidth - 1, 0).named('irq_cause_read_bits');
     final freshNext = ((fresh & ~readBits) | events).named('irq_fresh_next');
     final clears = mux(
       writes(registerIrqCause ~/ 4),
@@ -1733,10 +1733,10 @@ class HarborPcieDma extends BridgeModule {
           for (var i = irqLines - 1; i >= 0; i--)
             split & pend[causeLineShift + i] & ~irqGapBits[causeLineShift + i],
           mux(split, pend[0] | pend[1], pend.or()) & ~gap0,
-        ].swizzle();
+        ].concat();
 
     // Completion request capture.
-    final aByte = [hdrDw.slice(4, 0), Const(0, width: 2)].swizzle();
+    final aByte = [hdrDw.slice(4, 0), Const(0, width: 2)].concat();
     final fe = _firstSet(hdrFirstBe);
     final tailTrim = _lastTrim(mux(hdrLen.eq(1), hdrFirstBe, hdrLastBe));
     final zeroLen = hdrLen.eq(1) & hdrFirstBe.eq(0);
@@ -1826,17 +1826,14 @@ class HarborPcieDma extends BridgeModule {
                     cplBase.slice(63, 32),
                     merge(cplBase.slice(31, 0)).slice(31, 4),
                     Const(0, width: 4),
-                  ].swizzle(),
+                  ].concat(),
             ],
           ),
           If(
             writes(registerCplBaseHigh ~/ 4) & cplWritable,
             then: [
               cplBase <
-                  [
-                    merge(cplBase.slice(63, 32)),
-                    cplBase.slice(31, 0),
-                  ].swizzle(),
+                  [merge(cplBase.slice(63, 32)), cplBase.slice(31, 0)].concat(),
             ],
           ),
           If(
@@ -1863,7 +1860,7 @@ class HarborPcieDma extends BridgeModule {
                       descBase.slice(63, 32),
                       merge(descBase.slice(31, 0)).slice(31, 5),
                       Const(0, width: 5),
-                    ].swizzle(),
+                    ].concat(),
               ],
             ),
             If(
@@ -1873,7 +1870,7 @@ class HarborPcieDma extends BridgeModule {
                     [
                       merge(descBase.slice(63, 32)),
                       descBase.slice(31, 0),
-                    ].swizzle(),
+                    ].concat(),
               ],
             ),
             If(writes(registerDescSize ~/ 4), then: [descLog < merge(descLog)]),
@@ -2029,7 +2026,7 @@ class HarborPcieDma extends BridgeModule {
                     dFlags < 0,
                     done < 0,
                     // The slot where the fetch failed.
-                    dSrc < [Const(1), descHead].swizzle(),
+                    dSrc < [Const(1), descHead].concat(),
                     code < fErr,
                     state < sRecWait,
                   ]),
@@ -2178,7 +2175,7 @@ class HarborPcieDma extends BridgeModule {
                       mux(
                         tags.err,
                         tags.errCode.zeroExtend(8),
-                        mux(
+                        mux<Logic>(
                           wrespErr,
                           Const(errorFabric, width: 8),
                           Const(errorFabricTimeout, width: 8),
@@ -2292,7 +2289,7 @@ class HarborPcieDma extends BridgeModule {
                   txT < 0,
                   txBase <
                       Const(0, width: idxW) -
-                          mux(
+                          mux<Logic>(
                             recAddr.slice(63, 32).or(),
                             Const(4, width: idxW),
                             Const(3, width: idxW),

@@ -31,7 +31,7 @@ class HarborBitReader extends BridgeModule {
 
     // Big-endian stream vector: byte 0 is the most-significant byte, so stream
     // bit (totalBits-1) is byte0 bit7 = AV1 stream bit 0.
-    final stream = [for (var i = 0; i < maxBytes; i++) byte(i)].swizzle();
+    final stream = [for (var i = 0; i < maxBytes; i++) byte(i)].concat();
 
     final off = input('bit_offset');
     final n = input('n');

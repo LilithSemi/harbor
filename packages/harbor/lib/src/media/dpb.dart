@@ -321,9 +321,9 @@ class HarborDpbControl extends BridgeModule {
         ),
     ]);
 
-    output('slot_valid') <= slotValid.rswizzle();
-    output('slot_order_hints') <= slotOh.rswizzle();
-    output('slot_handles') <= slotHandle.rswizzle();
+    output('slot_valid') <= slotValid.rconcat();
+    output('slot_order_hints') <= slotOh.rconcat();
+    output('slot_handles') <= slotHandle.rconcat();
 
     // Reference selection: slot = ref_frame_idx[sel_ref - LAST]. sel_ref is
     // LAST..ALTREF (1..7), the remap entry is 3 bits at (sel_ref - 1) * 3.

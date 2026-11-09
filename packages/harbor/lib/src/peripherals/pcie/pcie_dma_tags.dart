@@ -304,7 +304,7 @@ class HarborPcieDmaTags extends Module {
       mux(
         tlpPoisoned(header),
         Const(codePoisoned, width: 3),
-        mux(bad, Const(codeLength, width: 3), Const(0, width: 3)),
+        mux<Logic>(bad, Const(codeLength, width: 3), Const(0, width: 3)),
       ),
     ).named('cpl_code');
     final cplErr = cplHeader & hit & ~cplCode.eq(0);
@@ -352,7 +352,7 @@ class HarborPcieDmaTags extends Module {
     final pktFinal = Logic(name: 'pkt_final');
     final beatWrite = (rxFire & inPkt).named('beat_write');
     final hdrStart =
-        ([sel, Const(0, width: sLog)].swizzle() +
+        ([sel, Const(0, width: sLog)].concat() +
                 selRecv.slice(sLog + 1, 2).zeroExtend(gw))
             .named('hdr_start');
     // The address, data and count use the header strobe, not the check.
@@ -368,7 +368,7 @@ class HarborPcieDmaTags extends Module {
     final wEn = (cplGood | beatWrite).named('w_en');
     final startLow = start.slice(bLog - 1, 0);
     final startHigh = (start >> bLog).slice(bankAw - 1, 0);
-    final rdStart = ([rdSlot, Const(0, width: sLog)].swizzle() + rdIndex).named(
+    final rdStart = ([rdSlot, Const(0, width: sLog)].concat() + rdIndex).named(
       'rd_start',
     );
     final rdLow = rdStart.slice(bLog - 1, 0);
@@ -400,7 +400,11 @@ class HarborPcieDmaTags extends Module {
         bankEn < ~reset & wEn & l.zeroExtend(3).lt(wCount),
         bankAddr <
             startHigh +
-                mux(cb.lt(startLow), Const(1), Const(0)).zeroExtend(bankAw),
+                mux<Logic>(
+                  cb.lt(startLow),
+                  Const(1),
+                  Const(0),
+                ).zeroExtend(bankAw),
         bankLane < l,
       ]);
       final bankData = _laneMux(
@@ -417,7 +421,8 @@ class HarborPcieDmaTags extends Module {
         wrAddr: bankAddr,
         wrData: bankData,
         rdAddr:
-            rdHigh + mux(cb.lt(rdLow), Const(1), Const(0)).zeroExtend(bankAw),
+            rdHigh +
+            mux<Logic>(cb.lt(rdLow), Const(1), Const(0)).zeroExtend(bankAw),
         name: 'reorder_$b',
       );
       bankOut.add(ram.rdData);
@@ -426,7 +431,7 @@ class HarborPcieDmaTags extends Module {
         [
           for (var l = dpb - 1; l >= 0; l--)
             (rot + Const(l, width: bLog)).selectFrom(bankOut),
-        ].swizzle();
+        ].concat();
 
     final completes = (cplGood & bc13.eq(len13)).named('cpl_completes');
     final rsvMoved = Logic(name: 'rsv_moved');

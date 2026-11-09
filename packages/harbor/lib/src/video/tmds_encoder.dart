@@ -78,7 +78,7 @@ class TmdsEncoder extends Module {
     for (var i = 1; i < 8; i++) {
       qm.add(mux(useXnor, ~(qm[i - 1] ^ data[i]), qm[i - 1] ^ data[i]));
     }
-    final qmLowNext = [for (var i = 7; i >= 0; i--) qm[i]].swizzle();
+    final qmLowNext = [for (var i = 7; i >= 0; i--) qm[i]].concat();
 
     final deS1 = Logic(name: 'de_s1');
     final ctrlS1 = Logic(name: 'ctrl_s1', width: 2);
@@ -114,7 +114,7 @@ class TmdsEncoder extends Module {
       mux(invert, ~qmLow, qmLow),
     );
     final dataQ9 = mux(balanced, ~qm8, invert);
-    final dataSymbol = [dataQ9, qm8, dataLow].swizzle();
+    final dataSymbol = [dataQ9, qm8, dataLow].concat();
 
     // Disparity updates (two's complement, modular add is fine here).
     final balCnt = mux(qm8, cnt + (n1e - n0e), cnt + (n0e - n1e));
@@ -123,13 +123,17 @@ class TmdsEncoder extends Module {
     final dataCnt = mux(balanced, balCnt, mux(invert, invCnt, nonInvCnt));
 
     // Control symbols, selected by {c1, c0}.
-    final ctrlSymbol = mux(
+    final ctrlSymbol = mux<Logic>(
       ctrlS1.eq(0),
       Const(0x354, width: 10),
       mux(
         ctrlS1.eq(1),
         Const(0x0AB, width: 10),
-        mux(ctrlS1.eq(2), Const(0x154, width: 10), Const(0x2AB, width: 10)),
+        mux<Logic>(
+          ctrlS1.eq(2),
+          Const(0x154, width: 10),
+          Const(0x2AB, width: 10),
+        ),
       ),
     );
 
@@ -144,7 +148,7 @@ class TmdsEncoder extends Module {
       final hdmiSymbol = mux(
         mode.eq(modeTerc4),
         terc4Symbol,
-        mux(
+        mux<Logic>(
           mode.eq(modeGuard0),
           Const(guardBand0, width: 10),
           Const(guardBand1, width: 10),

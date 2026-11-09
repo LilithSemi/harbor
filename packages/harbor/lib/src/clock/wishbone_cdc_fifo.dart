@@ -229,7 +229,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
           input('s_adr'),
           input('s_dat_w'),
           input('s_sel'),
-        ].swizzle();
+        ].concat();
 
     final respEmpty = respFifo.output('rd_empty');
     final respPop = (pending & ~respEmpty).named('resp_pop');
@@ -340,7 +340,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
       respFifo.input('wr_en').srcConnection! <= respPush;
       respFifo.input('wr_data').srcConnection! <=
           (useErr
-              ? [input('m_err'), input('m_dat_r')].swizzle()
+              ? [input('m_err'), input('m_dat_r')].concat()
               : input('m_dat_r'));
 
       Sequential(mClk, [
@@ -393,7 +393,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
           serving,
           ackReg,
           pending,
-        ].swizzle();
+        ].concat();
   }
 
   /// The master side of [registerMaster]. The bus outputs are flops loaded
@@ -451,7 +451,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
             then: [
               respReg <
                   (useErr
-                      ? [input('m_err'), input('m_dat_r')].swizzle()
+                      ? [input('m_err'), input('m_dat_r')].concat()
                       : input('m_dat_r')),
             ],
           ),

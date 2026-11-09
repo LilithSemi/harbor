@@ -195,7 +195,7 @@ class HarborKeyframeDecodeTileYuvTile extends BridgeModule {
             0,
             2,
           ),
-      ].swizzle();
+      ].concat();
       final reconYModes = ymCap;
       final reconTxTypes = ttCap;
       final reconCoeffs = [
@@ -203,13 +203,13 @@ class HarborKeyframeDecodeTileYuvTile extends BridgeModule {
           Const(0, width: 192 * 16),
           coeffCap.getRange(l * 64 * 16, l * 64 * 16 + 64 * 16),
         ],
-      ].swizzle();
+      ].concat();
       int posVal(int row, int col) => row | (col << miBits);
       final posNone = Const(posVal(0, 0), width: maxLeaves * 2 * miBits);
       final posSplit = [
         for (var l = maxLeaves - 1; l >= 0; l--)
           Const(posVal(l >> 1, l & 1), width: 2 * miBits),
-      ].swizzle();
+      ].concat();
       final reconPositions = mux(
         reconLeafCount.eq(Const(4, width: cntW)),
         posSplit,
@@ -271,12 +271,12 @@ class HarborKeyframeDecodeTileYuvTile extends BridgeModule {
     Logic lumaBottomRow(Logic fr) => [
       for (var c = f - 1; c >= 0; c--)
         fr.getRange((7 * f + c) * 8, (7 * f + c) * 8 + 8),
-    ].swizzle();
+    ].concat();
     // right column: frame[(r*f + 7)] for r = 0..7.
     Logic lumaRightCol(Logic fr) => [
       for (var rr = f - 1; rr >= 0; rr--)
         fr.getRange((rr * f + (f - 1)) * 8, (rr * f + (f - 1)) * 8 + 8),
-    ].swizzle();
+    ].concat();
     // bottom-right luma pixel: frame[(7*f + 7)].
     Logic lumaBrPixel(Logic fr) =>
         fr.getRange((7 * f + (f - 1)) * 8, (7 * f + (f - 1)) * 8 + 8);
@@ -289,7 +289,7 @@ class HarborKeyframeDecodeTileYuvTile extends BridgeModule {
           ((cBs - 1) * cBs + cc) * 8,
           ((cBs - 1) * cBs + cc) * 8 + 8,
         ),
-    ].swizzle();
+    ].concat();
     // right column (col cBs-1, rows 0..cBs-1).
     Logic chromaRightCol(Logic recon) => [
       for (var rr = cBs - 1; rr >= 0; rr--)
@@ -297,7 +297,7 @@ class HarborKeyframeDecodeTileYuvTile extends BridgeModule {
           (rr * cBs + (cBs - 1)) * 8,
           (rr * cBs + (cBs - 1)) * 8 + 8,
         ),
-    ].swizzle();
+    ].concat();
     // bottom-right chroma pixel (row cBs-1, col cBs-1).
     Logic chromaBrPixel(Logic recon) => recon.getRange(
       ((cBs - 1) * cBs + (cBs - 1)) * 8,
@@ -377,9 +377,7 @@ class HarborKeyframeDecodeTileYuvTile extends BridgeModule {
               return ((a + b + cc2 + d) << 1).getRange(0, cflAcBits);
             })(),
       ];
-      final cflAcPacked = [
-        for (var k = cN - 1; k >= 0; k--) cflAc[k],
-      ].swizzle();
+      final cflAcPacked = [for (var k = cN - 1; k >= 0; k--) cflAc[k]].concat();
 
       final cd = chromaDerive(uvModeCap);
 

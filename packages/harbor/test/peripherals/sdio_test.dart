@@ -1390,7 +1390,7 @@ void main() {
         target: spartan7,
       );
       await sdio.build();
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, contains('IDELAYE2')); // input-delay tuning tap
       expect(sv, isNot(contains('DELAYG'))); // no Lattice primitive
       expect(sv, isNot(contains('IDDR'))); // SDR104 is not DDR
@@ -1403,7 +1403,7 @@ void main() {
         target: ecp5,
       );
       await sdio.build();
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, contains('DELAYG'));
       expect(sv, isNot(contains('IDELAYE2')));
     });
@@ -1415,7 +1415,7 @@ void main() {
         target: spartan7,
       );
       await sdio.build();
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, contains('IDELAYE2'));
       expect(sv, contains('IDDR')); // DDR capture gearing
     });
@@ -1427,7 +1427,7 @@ void main() {
         target: spartan7,
       );
       await sdio.build();
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, isNot(contains('IDELAYE2')));
       expect(sv, isNot(contains('IDDR')));
     });
@@ -1456,7 +1456,7 @@ void main() {
       // The ADMA master is a Wishbone memory master interface.
       expect(() => sdio.interface('dma'), returnsNormally);
 
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, contains('inout wire sd_cmd')); // bidirectional pad
       expect(sv, contains('inout wire sd_dat0')); // per-lane pads
       expect(sv, contains('inout wire sd_dat3'));

@@ -98,7 +98,7 @@ class HarborPlic extends BridgeModule
       laneCount,
       (l) => Logic(name: 'plic_dat_out_$l', width: 32),
     );
-    bus.dataOut <= datOut.rswizzle();
+    bus.dataOut <= datOut.rconcat();
 
     int laneOf(int off) => (off % busBytes) ~/ 4;
     Logic addrHit(int off) => addr.eq(Const(off - (off % busBytes), width: 26));
@@ -202,7 +202,7 @@ class HarborPlic extends BridgeModule
                           src--
                         )
                           pending[src],
-                      ].swizzle().zeroExtend(32),
+                      ].concat().zeroExtend(32),
                 ],
               ),
 
@@ -237,7 +237,7 @@ class HarborPlic extends BridgeModule
                                 src--
                               )
                                 enable[ctx][src],
-                            ].swizzle().zeroExtend(32),
+                            ].concat().zeroExtend(32),
                       ],
                     ),
                   ],

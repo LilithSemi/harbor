@@ -105,7 +105,7 @@ class HarborKeyframeDecodeVar extends BridgeModule {
     final reconLog2 = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         (l2Cap.getRange(l * 3, l * 3 + 3) - Const(2, width: 3)).getRange(0, 2),
-    ].swizzle();
+    ].concat();
 
     // y_modes / tx_types: direct copy (4 leaves x 4 bits).
     final reconYModes = ymCap;
@@ -118,7 +118,7 @@ class HarborKeyframeDecodeVar extends BridgeModule {
         Const(0, width: 192 * 16),
         coeffCap.getRange(l * 64 * 16, l * 64 * 16 + 64 * 16),
       ],
-    ].swizzle();
+    ].concat();
 
     // positions: const-mux by leaf_count. leaf_count == 1 -> only leaf 0 at
     // mi (0,0). leaf_count == 4 -> leaf l at mi (l>>1, l&1). Each slot is
@@ -127,7 +127,7 @@ class HarborKeyframeDecodeVar extends BridgeModule {
     final splitPositions = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         Const(posVal(l >> 1, l & 1), width: 2 * miBits),
-    ].swizzle();
+    ].concat();
     final nonePositions = Const(posVal(0, 0), width: maxLeaves * 2 * miBits);
     final reconPositions = mux(
       reconLeafCount.eq(Const(1, width: cntW)),
@@ -158,13 +158,13 @@ class HarborKeyframeDecodeVar extends BridgeModule {
     // its OWN sub-block tx_type from leaf_sub_txtypes[l*4 +: 4], so a non-uniform
     // depth-1 leaf is bit-exact (no replication of a single tx_type).
     final ym0 = ymCap.getRange(0, 4);
-    final d1YModes = [for (var l = 0; l < maxLeaves; l++) ym0].swizzle();
+    final d1YModes = [for (var l = 0; l < maxLeaves; l++) ym0].concat();
     // swizzle list index 0 = MSB. Emit leaf 3 down to 0 so leaf l lands at
     // [l*4 +: 4], matching the recon's tx_types packing and stxCap's layout.
     final d1TxTypes = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         stxCap.getRange(l * 4, l * 4 + 4),
-    ].swizzle();
+    ].concat();
     // coeffs: de-interleave the 64-slot of leaf 0 into four 16-coeff 4x4-raster
     // blocks. recon leaf l (rowOff = l>>1, colOff = l&1) coeff (r4*4 + c4) =
     // slot64[(rowOff*4 + r4)*8 + (colOff*4 + c4)]. Pack each into the low 16 of
@@ -183,9 +183,9 @@ class HarborKeyframeDecodeVar extends BridgeModule {
         [
           for (var i = 15; i >= 0; i--)
             d1SlotCoeff(l >> 1, l & 1, i >> 2, i & 3),
-        ].swizzle(),
+        ].concat(),
       ],
-    ].swizzle();
+    ].concat();
 
     // mux every recon input by the depth-1 detection.
     final muxLeafCount = mux(isDepth1, d1LeafCount, reconLeafCount);

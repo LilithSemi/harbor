@@ -139,7 +139,7 @@ class HarborPixelUnpack extends Module {
             mux(i[0], byte(w, 3), byte(w, 2)),
             mux(i[0], byte(w, 1), byte(w, 0)),
           );
-    Logic up8(Logic v) => [v, Const(0, width: 2)].swizzle();
+    Logic up8(Logic v) => [v, Const(0, width: 2)].concat();
     Logic hi10(Logic w, int half) => w.getRange(16 * half + 6, 16 * half + 16);
 
     // Y, then Cb and Cr of C[k], then Cb and Cr of C[k + 1].
@@ -203,9 +203,9 @@ class HarborPixelUnpack extends Module {
       final g6 = half.getRange(5, 11);
       final b5 = half.getRange(0, 5);
       return [
-        [r5, r5.getRange(2, 5)].swizzle(),
-        [g6, g6.getRange(4, 6)].swizzle(),
-        [b5, b5.getRange(2, 5)].swizzle(),
+        [r5, r5.getRange(2, 5)].concat(),
+        [g6, g6.getRange(4, 6)].concat(),
+        [b5, b5.getRange(2, 5)].concat(),
       ];
     }
 

@@ -547,7 +547,7 @@ void main() {
       expect(sdram.outstanding, kind == HarborFabricKind.wishbone ? 1 : 8);
       await soc.build();
       expect(
-        soc.generateSynth(),
+        soc.dumpSystemVerilog(),
         contains(
           kind == HarborFabricKind.wishbone
               ? 'SdramWishbonePort'

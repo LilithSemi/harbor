@@ -48,7 +48,7 @@ class HdmiBench extends Module {
     final r = byte(x);
     final g = byte(y);
     final b = r ^ (g << 3);
-    rgb = [r, g, b].swizzle();
+    rgb = [r, g, b].concat();
     framer = HdmiFramer(
       timing: timing,
       clk: clk,
@@ -66,7 +66,7 @@ class HdmiBench extends Module {
     );
     addOutput('ready') <= framer.packetReady;
     final ctrl = [
-      [vs, hs].swizzle(),
+      [vs, hs].concat(),
       framer.ctl.getRange(0, 2),
       framer.ctl.getRange(2, 4),
     ];
@@ -135,7 +135,7 @@ class HdmiSource extends Module {
           mux(
             lfsr.eq(0),
             Const(1, width: 16),
-            [lfsr.getRange(0, 15), fb].swizzle(),
+            [lfsr.getRange(0, 15), fb].concat(),
           ),
       pending < (pending & ~take) | lfsr.getRange(0, 8).eq(0),
       If(take, then: [count < count + 1]),
@@ -144,7 +144,7 @@ class HdmiSource extends Module {
     header <= count.getRange(0, 24) ^ Const(0x5A3C96, width: 24);
     for (var k = 0; k < 4; k++) {
       addOutput('sub$k', width: 56) <=
-          [count.getRange(0, 24), count].swizzle() ^
+          [count.getRange(0, 24), count].concat() ^
               Const(0x123456789ABCD * (k + 3) & 0xFFFFFFFFFFFFFF, width: 56);
     }
   }

@@ -30,7 +30,7 @@ void main() {
       blue: Logic(name: 'blue', width: 8),
     );
     await tx.build();
-    final sv = tx.generateSynth();
+    final sv = tx.dumpSystemVerilog();
 
     expect(tx.gpdi.width, equals(4));
     expect('TmdsEncoder'.allMatches(sv).length, greaterThanOrEqualTo(3));

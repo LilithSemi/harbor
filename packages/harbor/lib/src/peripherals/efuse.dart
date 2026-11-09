@@ -398,7 +398,7 @@ class HarborEfuseDevice extends BridgeModule
                         errorFlag,
                         doneFlag,
                         busy,
-                      ].swizzle(),
+                      ].concat(),
                   // Clear done/error on read
                   If(
                     ~bus.we,

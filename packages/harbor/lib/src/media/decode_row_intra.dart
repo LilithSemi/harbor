@@ -75,13 +75,13 @@ class HarborDecodeRowIntra extends BridgeModule {
     final firstCol = gc.eq(Const(0, width: gcW));
     final aboveBus = [
       for (var i = 0; i < 8; i++) Const(128, width: 8),
-    ].swizzle();
+    ].concat();
     final leftBus = [
       for (var i = 7; i >= 0; i--)
         (i < 4
             ? mux(firstCol, Const(128, width: 8), leftCol[i])
             : Const(128, width: 8)),
-    ].swizzle();
+    ].concat();
     rec.input('above').srcConnection! <= aboveBus;
     rec.input('left').srcConnection! <= leftBus;
     rec.input('above_left').srcConnection! <= Const(128, width: 8);
@@ -140,7 +140,7 @@ class HarborDecodeRowIntra extends BridgeModule {
     ]);
 
     output('frame') <=
-        [for (var i = fw * 4 - 1; i >= 0; i--) frame[i]].swizzle();
+        [for (var i = fw * 4 - 1; i >= 0; i--) frame[i]].concat();
     output('done') <= state.eq(Const(fDone, width: 2));
   }
 }

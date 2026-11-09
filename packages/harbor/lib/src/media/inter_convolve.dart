@@ -167,7 +167,7 @@ class HarborInterConvolve extends BridgeModule {
       if (n == 0) {
         return x;
       }
-      return [x[w - 1].replicate(n), x.getRange(n, w)].swizzle();
+      return [x[w - 1].replicate(n), x.getRange(n, w)].concat();
     }
 
     // Add a constant (possibly negative) bias, low w bits.
@@ -280,6 +280,6 @@ class HarborInterConvolve extends BridgeModule {
       }
     }
     // Pack index y*width + x LSB-first.
-    output('pred') <= outParts.reversed.toList().swizzle();
+    output('pred') <= outParts.reversed.toList().concat();
   }
 }

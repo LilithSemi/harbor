@@ -568,7 +568,7 @@ class HarborSpiController extends BridgeModule
                                 dmaWord.getRange((b + 1) * 8, busDataWidth),
                               rxData,
                               if (b > 0) dmaWord.getRange(0, b * 8),
-                            ].swizzle(),
+                            ].concat(),
                         }, defaultValue: dmaWord),
                     dmaByteIdx < (dmaByteIdx + Const(1, width: byteIdxWidth)),
                     dmaLen < (dmaLen - Const(1, width: 32)),

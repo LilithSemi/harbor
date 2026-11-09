@@ -221,7 +221,7 @@ void main() {
     test('generated SV holds only port connections', () async {
       final wrap = _Wrap(() => Ecp5Ofs1p3bx(d: Logic(), sclk: Logic()).q);
       await wrap.build();
-      final sv = wrap.generateSynth();
+      final sv = wrap.dumpSystemVerilog();
       expect(onlyPortConnections(sv, 'OFS1P3BX'), isTrue);
       expect(sv, isNot(contains('module OFS1P3BX')));
     });
@@ -245,7 +245,7 @@ void main() {
     test('generated SV holds only port connections', () async {
       final wrap = _Wrap(() => Ecp5Ifs1p3bx(d: Logic(), sclk: Logic()).q);
       await wrap.build();
-      final sv = wrap.generateSynth();
+      final sv = wrap.dumpSystemVerilog();
       expect(onlyPortConnections(sv, 'IFS1P3BX'), isTrue);
       expect(sv, isNot(contains('module IFS1P3BX')));
     });
@@ -294,7 +294,7 @@ void main() {
     test('generated SV holds only port connections', () async {
       final wrap = _Wrap(() => Ecp5Ofs1p3dx(d: Logic(), sclk: Logic()).q);
       await wrap.build();
-      final sv = wrap.generateSynth();
+      final sv = wrap.dumpSystemVerilog();
       expect(onlyPortConnections(sv, 'OFS1P3DX'), isTrue);
       expect(sv, isNot(contains('module OFS1P3DX')));
     });
@@ -351,7 +351,7 @@ void main() {
         ).q,
       );
       await wrap.build();
-      final sv = wrap.generateSynth();
+      final sv = wrap.dumpSystemVerilog();
       expect(onlyPortConnections(sv, 'ODDRX1F'), isTrue);
       expect(sv, isNot(contains('module ODDRX1F')));
     });
@@ -398,7 +398,7 @@ void main() {
         () => Ecp5Iddrx1f(sclk: Logic(), rst: Const(0), d: Logic()).q0,
       );
       await wrap.build();
-      final sv = wrap.generateSynth();
+      final sv = wrap.dumpSystemVerilog();
       expect(onlyPortConnections(sv, 'IDDRX1F'), isTrue);
       expect(sv, isNot(contains('module IDDRX1F')));
     });

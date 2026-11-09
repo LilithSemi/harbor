@@ -806,7 +806,7 @@ void main() {
       expect(d.overlayUnpack, isNull);
       expect(d.pipelineDelay, f.yuv ? 9 : 2);
       expect(
-        d.generateSynth().replaceAll('overlay_present', ''),
+        d.dumpSystemVerilog().replaceAll('overlay_present', ''),
         isNot(contains('overlay')),
       );
     }

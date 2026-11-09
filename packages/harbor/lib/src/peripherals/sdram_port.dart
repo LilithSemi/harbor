@@ -347,7 +347,7 @@ class SdramArbiter extends Module {
     ].reduce((x, y) => x | y);
     final headValid = pickByHead([for (final c in clients) c.wrValid]);
     final headWord = pickByHead([
-      for (final c in clients) [c.wrMask, c.wrData].swizzle(),
+      for (final c in clients) [c.wrMask, c.wrData].concat(),
     ]);
 
     final load = (wqValid[0] & notFull & headValid).named('wr_load');
@@ -653,7 +653,7 @@ class SdramPortSlice extends Module {
     a.wrMask <= qWord[0].getRange(16, 18);
     final push = c.wrValid & wrReady;
     final pop = a.wrReady;
-    final word = [c.wrMask, c.wrData].swizzle();
+    final word = [c.wrMask, c.wrData].concat();
     final v0 = mux(pop, qValid[1], qValid[0]);
     final v1 = mux(pop, Const(0), qValid[1]);
     final w0 = mux(pop, qWord[1], qWord[0]);

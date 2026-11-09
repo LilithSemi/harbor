@@ -497,9 +497,9 @@ class HarborUsbController extends BridgeModule
       numEndpoints,
       (i) => (setupDoneUsb[i] & epControlUsb[i]).named('setup_clear_$i'),
     );
-    pe.input('out_ep_control').srcConnection! <= epControlUsb.rswizzle();
-    pe.input('out_ep_stall').srcConnection! <= stallOutUsb.rswizzle();
-    pe.input('in_ep_stall').srcConnection! <= stallInUsb.rswizzle();
+    pe.input('out_ep_control').srcConnection! <= epControlUsb.rconcat();
+    pe.input('out_ep_stall').srcConnection! <= stallOutUsb.rconcat();
+    pe.input('in_ep_stall').srcConnection! <= stallInUsb.rconcat();
 
     // ==================================================================
     // Shared byte-path FIFOs.
@@ -577,8 +577,8 @@ class HarborUsbController extends BridgeModule
       numEndpoints,
       (i) => (outReqBits[i] & popHasData).named('out_get_bit_$i'),
     );
-    pe.input('out_ep_req').srcConnection! <= outReqBits.rswizzle();
-    pe.input('out_ep_data_get').srcConnection! <= outGetBits.rswizzle();
+    pe.input('out_ep_req').srcConnection! <= outReqBits.rconcat();
+    pe.input('out_ep_data_get').srcConnection! <= outGetBits.rconcat();
 
     final releaseBits = List.generate(
       numEndpoints,
@@ -589,7 +589,7 @@ class HarborUsbController extends BridgeModule
                   tagUsb[i].eq(opPayloadUsb.getRange(0, 4)))
               .named('out_release_$i'),
     );
-    pe.input('out_ep_release').srcConnection! <= releaseBits.rswizzle();
+    pe.input('out_ep_release').srcConnection! <= releaseBits.rconcat();
 
     // Bytes of each endpoint popped from the push FIFO since its last
     // commit or flush. A commit or flush waits until this equals the count
@@ -617,7 +617,7 @@ class HarborUsbController extends BridgeModule
         'in_data_done_$i',
       ),
     );
-    pe.input('in_ep_data_done').srcConnection! <= inDataDoneBits.rswizzle();
+    pe.input('in_ep_data_done').srcConnection! <= inDataDoneBits.rconcat();
 
     // A flush waits until its bytes left the push FIFO and no IN
     // transaction on the endpoint is in progress. Its bytes drop meanwhile.
@@ -635,7 +635,7 @@ class HarborUsbController extends BridgeModule
         'in_flush_$i',
       ),
     );
-    pe.input('in_ep_flush').srcConnection! <= inFlushBits.rswizzle();
+    pe.input('in_ep_flush').srcConnection! <= inFlushBits.rconcat();
 
     // EP_CFG write payload: [0]/[1] toggle reset OUT/IN, [2]/[3] stall
     // set OUT/IN, [4] type is control, [5]/[6] stall clear OUT/IN.
@@ -664,17 +664,17 @@ class HarborUsbController extends BridgeModule
                   (opPayloadUsb[1] | (cfgClrIn & ~cfgControl)))
               .named('in_toggle_reset_$i'),
     );
-    pe.input('out_ep_toggle_reset').srcConnection! <= outToggleBits.rswizzle();
-    pe.input('in_ep_toggle_reset').srcConnection! <= inToggleBits.rswizzle();
+    pe.input('out_ep_toggle_reset').srcConnection! <= outToggleBits.rconcat();
+    pe.input('in_ep_toggle_reset').srcConnection! <= inToggleBits.rconcat();
 
     // Combinational: it fires while out_ep_data still holds the popped
     // byte, one cycle before the get address moves on.
     // An EP_CFG read returns both stall bits from one usb-domain cycle.
     final cfgReadFire = opState.eq(Const(_uCfgReadSt, width: 4));
     final stallPair = [
-      selectByEp(stallInUsb.rswizzle(), opEpUsb),
-      selectByEp(stallOutUsb.rswizzle(), opEpUsb),
-    ].swizzle().named('stall_pair');
+      selectByEp(stallInUsb.rconcat(), opEpUsb),
+      selectByEp(stallOutUsb.rconcat(), opEpUsb),
+    ].concat().named('stall_pair');
     final outRetPushEn =
         (opState.eq(Const(_uPopCapture, width: 4)) | cfgReadFire).named(
           'out_ret_push_en',
@@ -914,8 +914,8 @@ class HarborUsbController extends BridgeModule
                   inHeadEp.eq(Const(i, width: epIdxWidth)))
               .named('in_req_bit_$i'),
     );
-    pe.input('in_ep_req').srcConnection! <= inReqBits.rswizzle();
-    pe.input('in_ep_data_put').srcConnection! <= inReqBits.rswizzle();
+    pe.input('in_ep_req').srcConnection! <= inReqBits.rconcat();
+    pe.input('in_ep_data_put').srcConnection! <= inReqBits.rconcat();
     final inEpDataLanes = List.generate(
       numEndpoints,
       (i) => mux(
@@ -924,7 +924,7 @@ class HarborUsbController extends BridgeModule
         Const(0, width: 8),
       ),
     );
-    pe.input('in_ep_data').srcConnection! <= inEpDataLanes.rswizzle();
+    pe.input('in_ep_data').srcConnection! <= inEpDataLanes.rconcat();
 
     // ==================================================================
     // Bus-domain register decode.
@@ -974,7 +974,7 @@ class HarborUsbController extends BridgeModule
     // Decode uses only the address bits inside the 0x400 window. An offset
     // in the window past the last register reads 0 and ignores writes.
     final windowAddr = bus.addr.getRange(0, _windowBits).named('window_addr');
-    Const regAddr(int offset) => Const(offset, width: _windowBits);
+    Logic regAddr(int offset) => Const(offset, width: _windowBits);
     final freshAccess = (bus.stb & ~bus.ack & ~opBusy).named('fresh_access');
 
     final inDonePrev = List.generate(
@@ -994,7 +994,7 @@ class HarborUsbController extends BridgeModule
         return ackedBus[bit - 16] & ~inDonePrev[bit - 16];
       }
       return Const(0);
-    }).rswizzle().named('int_event_set_mask');
+    }).rconcat().named('int_event_set_mask');
     final isIntStatusWrite =
         (freshAccess & bus.we & windowAddr.eq(regAddr(_intStatusAddr))).named(
           'is_int_status_write',
@@ -1008,7 +1008,7 @@ class HarborUsbController extends BridgeModule
         return flushDoneBus & opEpBus.eq(Const(bit - 16, width: epIdxWidth));
       }
       return Const(0);
-    }).rswizzle().named('in_flush_clear_mask');
+    }).rconcat().named('in_flush_clear_mask');
     final intStatusNext = Logic(name: 'int_status_next', width: 32);
     Combinational([
       intStatusNext < ((intStatus | eventSetMask) & ~flushClearMask),
@@ -1028,7 +1028,7 @@ class HarborUsbController extends BridgeModule
     for (var i = 0; i < numEndpoints; i++) {
       cfgEnType = mux(
         opEpBus.eq(Const(i, width: epIdxWidth)),
-        [epTypeBus[i], epEnableBus[i]].swizzle(),
+        [epTypeBus[i], epEnableBus[i]].concat(),
         cfgEnType,
       );
     }
@@ -1039,7 +1039,7 @@ class HarborUsbController extends BridgeModule
             .named('cfg_read_value');
 
     final ctrlNext = bus
-        .selMerge([ctrlConnect, ctrlEnable].swizzle(), _ctrlAddr)
+        .selMerge([ctrlConnect, ctrlEnable].concat(), _ctrlAddr)
         .named('ctrl_next');
     // EP_CFG bits [2:0] keep their value in a byte SEL does not select.
     // Bits [8:3] act on 1, so an unselected byte reads as 0 and does nothing.
@@ -1047,7 +1047,7 @@ class HarborUsbController extends BridgeModule
       for (var i = 0; i < numEndpoints; i++)
         bus
             .selMerge(
-              [epTypeBus[i], epEnableBus[i]].swizzle(),
+              [epTypeBus[i], epEnableBus[i]].concat(),
               _epBase + i * _epStride + _cfgOff,
             )
             .named('ep_cfg_keep_$i'),
@@ -1232,7 +1232,7 @@ class HarborUsbController extends BridgeModule
                                         cfgAct[i][3],
                                         cfgAct[i][6],
                                         cfgAct[i][5],
-                                      ].swizzle(),
+                                      ].concat(),
                                   opReqToggleBus < ~opReqToggleBus,
                                 ],
                                 orElse: [bus.ack < Const(1)],
@@ -1323,7 +1323,7 @@ class HarborUsbController extends BridgeModule
                                         [
                                           Const(i, width: epIdxWidth),
                                           bus.dataIn.getRange(0, 8),
-                                        ].swizzle(),
+                                        ].concat(),
                                     inPushedBus[i] <
                                         inPushedBus[i] + Const(1, width: 8),
                                     bus.ack < Const(1),

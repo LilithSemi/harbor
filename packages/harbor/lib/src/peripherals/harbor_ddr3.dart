@@ -897,7 +897,7 @@ struct DramStore {
                 ctrl.calFailed ?? Const(0),
                 ctrl.calState.eq(Ddr3Controller.calStateDone) & ctrl.initDone,
                 ctrl.initDone,
-              ].swizzle(),
+              ].concat(),
         ],
       ),
     ]);
@@ -927,7 +927,7 @@ struct DramStore {
     hs.input('src_clk').srcConnection! <= ddrClk;
     hs.input('src_reset').srcConnection! <= ddrReset;
     hs.input('src_data').srcConnection! <=
-        [ctrl.calStarts, ctrl.calState].swizzle();
+        [ctrl.calStarts, ctrl.calState].concat();
     hs.input('src_valid').srcConnection! <= Const(1);
     hs.input('dst_clk').srcConnection! <= clk;
     hs.input('dst_reset').srcConnection! <= reset;

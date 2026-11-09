@@ -448,7 +448,7 @@ void _buildWishboneMemoryMasterFast(
   b.cti! <=
       mux(
         cBurstMode,
-        mux(last, Const(_ctiEnd, width: 3), Const(_ctiIncr, width: 3)),
+        mux<Logic>(last, Const(_ctiEnd, width: 3), Const(_ctiIncr, width: 3)),
         Const(_ctiClassic, width: 3),
       );
   b.bte! <= Const(0, width: 2);
@@ -699,7 +699,7 @@ void _buildWishboneMemoryMasterQueued(
   b.cti! <=
       mux(
         cBurstMode,
-        mux(last, Const(_ctiEnd, width: 3), Const(_ctiIncr, width: 3)),
+        mux<Logic>(last, Const(_ctiEnd, width: 3), Const(_ctiIncr, width: 3)),
         Const(_ctiClassic, width: 3),
       );
   b.bte! <= Const(0, width: 2);

@@ -131,7 +131,7 @@ class HarborCflPredict extends BridgeModule {
     final signU = mux(
       ge6,
       Const(2, width: 2),
-      mux(ge3, Const(1, width: 2), Const(0, width: 2)),
+      mux<Logic>(ge3, Const(1, width: 2), Const(0, width: 2)),
     );
     // signV = jp1 - 3*signU. signU in 0..2 so 3*signU in {0,3,6}.
     final threeSignU =
@@ -201,7 +201,7 @@ class HarborCflPredict extends BridgeModule {
       outParts.add(clipped);
     }
 
-    output('pred') <= outParts.reversed.toList().swizzle();
+    output('pred') <= outParts.reversed.toList().concat();
   }
 
   static int _log2(int v) {

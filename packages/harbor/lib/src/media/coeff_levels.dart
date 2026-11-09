@@ -1700,14 +1700,14 @@ class HarborCoeffLevels extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 
     Logic packCdf(List<int> icdf) => [
       for (var s = maxSyms - 1; s >= 0; s--)
         Const(s < icdf.length ? icdf[s] : 0, width: 16),
-    ].swizzle();
+    ].concat();
     Logic romSel(List<int> table, Logic idx, int w) {
       Logic v = Const(table.last, width: w);
       for (var i = table.length - 2; i >= 0; i--) {
@@ -1825,8 +1825,8 @@ class HarborCoeffLevels extends BridgeModule {
     output('levels_out') <=
         [
           for (var pos = n - 1; pos >= 0; pos--) levels[paddedIdx(pos)],
-        ].swizzle();
-    output('coeffs') <= [for (var i = n - 1; i >= 0; i--) coeffs[i]].swizzle();
+        ].concat();
+    output('coeffs') <= [for (var i = n - 1; i >= 0; i--) coeffs[i]].concat();
 
     // Dequantizer (combinational): drives the current phase-B coefficient.
     final deq = HarborDequant(bitDepth: 8, name: 'deq');
@@ -1891,7 +1891,7 @@ class HarborCoeffLevels extends BridgeModule {
     cc.input('tx_class').srcConnection! <=
         (readTxType ? classReg : Const(txClass, width: 2));
     cc.input('levels').srcConnection! <=
-        [for (var i = bufLen - 1; i >= 0; i--) levels[i]].swizzle();
+        [for (var i = bufLen - 1; i >= 0; i--) levels[i]].concat();
     final baseEobCtx = cc.output('base_eob_ctx'); // 0..3
     final base2dCtx = cc.output('base_ctx_2d'); // 0..25
     final baseGenCtx = cc.output('base_ctx_gen'); // 0..40
@@ -1921,7 +1921,11 @@ class HarborCoeffLevels extends BridgeModule {
         ? mux(class2dRt, base2dPath, baseFlatFor(baseGenCtx))
         : (class2d ? base2dPath : baseFlatFor(baseGenCtx));
     final baseFlat = mux(isEobMinus1, baseEobFlat(), nonEob1Base);
-    final baseNsyms = mux(isEobMinus1, Const(3, width: 5), Const(4, width: 5));
+    final baseNsyms = mux<Logic>(
+      isEobMinus1,
+      Const(3, width: 5),
+      Const(4, width: 5),
+    );
     // Flat od_ec ctx for the current br decode.
     final br2dPath = mux(isC0, brGenCtx.zeroExtend(cw), br2dCtx.zeroExtend(cw));
     final nonEob1Br = readTxType
@@ -2008,7 +2012,7 @@ class HarborCoeffLevels extends BridgeModule {
           // 2D class uses eob_pt ctx 1, the 1D classes use ctx 80 (readTxType).
           ecCtx <
               (readTxType
-                  ? mux(
+                  ? mux<Logic>(
                       class2dRt,
                       Const(_ctxEobPt, width: cw),
                       Const(_ctxEobPt1d, width: cw),
@@ -2061,7 +2065,7 @@ class HarborCoeffLevels extends BridgeModule {
         CaseItem(Const(sPbSignDec, width: 6), [
           ecDecode < Const(1),
           ecCtx <
-              mux(
+              mux<Logic>(
                 isC0pb,
                 Const(_ctxDcSign, width: cw),
                 Const(_ctxBypass, width: cw),
@@ -2260,7 +2264,7 @@ class HarborCoeffLevels extends BridgeModule {
                   mux(
                     sym.eq(Const(2, width: ec.symWidth)),
                     Const(2, width: 2),
-                    mux(
+                    mux<Logic>(
                       sym.eq(Const(3, width: ec.symWidth)),
                       Const(1, width: 2),
                       Const(0, width: 2),

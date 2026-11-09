@@ -370,7 +370,7 @@ class HarborPcieController extends BridgeModule
 
     final mAck = input('pcie_m_ack');
     final mRdata = input('pcie_m_rdata');
-    final tlpBase = [tlpAddrHi, tlpAddrLo].swizzle().named('tlp_base');
+    final tlpBase = [tlpAddrHi, tlpAddrLo].concat().named('tlp_base');
     // Data-buffer read mux for the next beat and for software reads.
     Logic dbufAt(Logic idx) {
       Logic v = Const(0, width: 32);
@@ -827,7 +827,7 @@ class HarborPcieController extends BridgeModule
                       tlpTag < (tlpTag + Const(1, width: 8)),
                       msiBusy < Const(0),
                       hdr0 <
-                          (mux(
+                          (mux<Logic>(
                                     bus.dataIn[1],
                                     Const(0x40, width: 32),
                                     Const(0x00, width: 32),
@@ -839,7 +839,7 @@ class HarborPcieController extends BridgeModule
                               Const(0xFF, width: 32),
                       hdr2 < (tlpAddrLo & Const(0xFFFFFFFC, width: 32)),
                       tlpState <
-                          mux(
+                          mux<Logic>(
                             bus.dataIn[1],
                             Const(tWrite, width: 2),
                             Const(tRead, width: 2),

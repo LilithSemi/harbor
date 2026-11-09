@@ -188,7 +188,7 @@ class HarborKeyframeDecodeYuv16 extends BridgeModule {
     ];
     final cflAcPacked = [
       for (var k = cN - 1; k >= 0; k--) cflAc[k],
-    ].swizzle(); // cN*cflAcBits
+    ].concat(); // cN*cflAcBits
 
     // chroma derivations (const muxes on uvModeCap).
     Logic romSel(List<int> table, Logic idx, int w) {

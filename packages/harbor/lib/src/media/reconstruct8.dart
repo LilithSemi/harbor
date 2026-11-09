@@ -36,7 +36,7 @@ class HarborReconstruct8 extends BridgeModule {
       return (level(i).signExtend(32) * q).getRange(0, 16);
     }
 
-    final deqPacked = [for (var i = 63; i >= 0; i--) deq(i)].swizzle();
+    final deqPacked = [for (var i = 63; i >= 0; i--) deq(i)].concat();
 
     final idct = HarborInverseDct8(name: 'idct8');
     addSubModule(idct);

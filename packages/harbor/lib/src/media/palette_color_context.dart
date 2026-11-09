@@ -105,6 +105,6 @@ class HarborPaletteColorContext extends BridgeModule {
       ctx = mux(hash.eq(Const(h, width: 6)), Const(v, width: 3), ctx);
     }
     output('ctx') <= ctx;
-    output('color_order') <= [for (var k = 7; k >= 0; k--) order[k]].swizzle();
+    output('color_order') <= [for (var k = 7; k >= 0; k--) order[k]].concat();
   }
 }

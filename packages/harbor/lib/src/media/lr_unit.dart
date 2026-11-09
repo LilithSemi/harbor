@@ -83,7 +83,7 @@ class HarborLrUnit extends BridgeModule {
           for (var r = 0; r < 7; r++)
             for (var c = 0; c < 7; c++) padAt(i + r, j + c),
         ];
-        wf.input('region').srcConnection! <= win.reversed.toList().swizzle();
+        wf.input('region').srcConnection! <= win.reversed.toList().concat();
         wf.input('h0').srcConnection! <= input('h0');
         wf.input('h1').srcConnection! <= input('h1');
         wf.input('h2').srcConnection! <= input('h2');
@@ -106,6 +106,6 @@ class HarborLrUnit extends BridgeModule {
       }
     }
 
-    output('out') <= outParts.reversed.toList().swizzle();
+    output('out') <= outParts.reversed.toList().concat();
   }
 }

@@ -150,7 +150,7 @@ class SdramMemoryPort extends Module {
       clr,
       n,
       reqFire & ~w.reqWrite,
-      [w.reqId, w.reqLen].rswizzle(),
+      [w.reqId, w.reqLen].rconcat(),
       rdQPop,
       ahead: ahead,
       pushOf: (b) => on(b[fRv] && !b[fRw], w.reqReady),
@@ -392,7 +392,7 @@ class SdramMemoryPort extends Module {
     final rHalf = Logic(name: 'rd_half');
     final rLo = Logic(name: 'rd_lo', width: 16);
     final tailValid = (rdIn & rHalf).named('rd_tail_valid');
-    final tailData = [rLo, rdInData].rswizzle();
+    final tailData = [rLo, rdInData].rconcat();
     final rbPop = Logic(name: 'rb_pop');
     final rbPush = Logic(name: 'rb_push');
     final rbBufPop = Logic(name: 'rb_buf_pop');
@@ -476,7 +476,7 @@ class SdramMemoryPort extends Module {
     // buffer word is one LUT.
     final wbSel = Logic(name: 'wb_wr_sel', width: writeBeats);
     Logic oneHot(Logic idx) =>
-        [for (var i = writeBeats - 1; i >= 0; i--) idx.eq(i)].swizzle();
+        [for (var i = writeBeats - 1; i >= 0; i--) idx.eq(i)].concat();
     Sequential(clk, [
       wrespCnt < ahead(wrespNext),
       wbSel <
@@ -492,7 +492,7 @@ class SdramMemoryPort extends Module {
                   [
                     wbSel.getRange(0, writeBeats - 1),
                     wbSel[writeBeats - 1],
-                  ].swizzle(),
+                  ].concat(),
                   wbSel,
                 ),
               ),
@@ -502,7 +502,7 @@ class SdramMemoryPort extends Module {
         If(
           wPush & wbSel[i],
           then: [
-            wbData[i] < [w.wdataData, strb].rswizzle(),
+            wbData[i] < [w.wdataData, strb].rconcat(),
           ],
         ),
       If(hLoad, then: [hBeat < beat]),
@@ -552,8 +552,8 @@ class SdramMemoryPort extends Module {
       If(
         issue,
         then: [
-          qAddr < [sAddr.getRange(2, memAW), Const(0)].swizzle(),
-          qWords < [kReg, Const(0)].swizzle().zeroExtend(port.wordsWidth),
+          qAddr < [sAddr.getRange(2, memAW), Const(0)].concat(),
+          qWords < [kReg, Const(0)].concat().zeroExtend(port.wordsWidth),
         ],
       ),
       If(
@@ -584,7 +584,7 @@ class SdramMemoryPort extends Module {
                         sBurst,
                         sWrapLen,
                       ),
-                    ].swizzle()
+                    ].concat()
               else
                 sAddr < _next(sAddr, kReg, sSize, sBurst, sWrapLen),
               sLeft < sLeft - kReg.zeroExtend(lenW),
@@ -664,7 +664,7 @@ class SdramMemoryPort extends Module {
     final wrap2 = burst.eq(HarborMemoryBurst.wrap.value) & wrapLen.eq(1);
     final cap = mux(
       wrap2,
-      mux(addr[2], Const(1, width: 3), Const(2, width: 3)),
+      mux<Logic>(addr[2], Const(1, width: 3), Const(2, width: 3)),
       toBlock,
     );
     // left < cap - 1, with cap at most 4.
@@ -687,12 +687,12 @@ class SdramMemoryPort extends Module {
     final sizeMask = mux(
       size.eq(0),
       Const(0, width: w),
-      mux(size.eq(1), Const(1, width: w), Const(3, width: w)),
+      mux<Logic>(size.eq(1), Const(1, width: w), Const(3, width: w)),
     );
     final step = mux(
       size.gte(2),
-      [k, Const(0, width: 2)].swizzle().zeroExtend(w),
-      mux(size.eq(1), Const(2, width: w), Const(1, width: w)),
+      [k, Const(0, width: 2)].concat().zeroExtend(w),
+      mux<Logic>(size.eq(1), Const(2, width: w), Const(1, width: w)),
     );
     final incr = (addr & ~sizeMask) + step;
     final shift = mux(size.gte(2), Const(2, width: 2), size.getRange(0, 2));
@@ -735,7 +735,7 @@ class SdramMemoryPort extends Module {
     final [id, len] = harborUnpack(req, [idW, lenW]);
     final pLast = pBeat.eq(len);
     final w = inData.width + idW + 1;
-    final inBeat = [inData, id, pLast].swizzle();
+    final inBeat = [inData, id, pLast].concat();
     final oV = Logic(name: 'rd_out_valid_r');
     final sV = Logic(name: 'rd_out_spill_valid');
     final oD = Logic(name: 'rd_out_r', width: w);
@@ -761,7 +761,7 @@ class SdramMemoryPort extends Module {
                 pLast,
                 then: [
                   pBeat < 0,
-                  pSel < [pSel.getRange(0, d - 1), pSel[d - 1]].swizzle(),
+                  pSel < [pSel.getRange(0, d - 1), pSel[d - 1]].concat(),
                 ],
                 orElse: [pBeat < pBeat + 1],
               ),
@@ -935,7 +935,7 @@ class _Queue {
     final full = Logic(name: '${name}_full');
     final sel = Logic(name: '${name}_wr_sel', width: d);
     final rSel = Logic(name: '${name}_rd_sel', width: d);
-    Logic rotate(Logic x) => [x.getRange(0, d - 1), x[d - 1]].swizzle();
+    Logic rotate(Logic x) => [x.getRange(0, d - 1), x[d - 1]].concat();
     Logic emptyOf(Logic pu, Logic po) =>
         reset | (~pu & mux(empty, Const(1), po & one));
     Logic fullOf(Logic pu, Logic po) =>

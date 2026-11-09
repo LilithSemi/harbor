@@ -1,6 +1,5 @@
 import 'package:rohd/rohd.dart';
-import 'package:rohd_hcl/rohd_hcl.dart'
-    show Axi4ReadInterface, Axi4WriteInterface;
+import 'package:rohd_hcl/rohd_hcl.dart' show Axi4ReadCluster, Axi4WriteCluster;
 
 import '../wishbone/wishbone_interface.dart';
 
@@ -47,8 +46,8 @@ Logic axiSizeFromSel(Logic sel, int sizeWidth) {
 class WishboneToAxi4Bridge extends Module {
   WishboneToAxi4Bridge(
     WishboneInterface wb,
-    Axi4ReadInterface axiRead,
-    Axi4WriteInterface axiWrite, {
+    Axi4ReadCluster axiRead,
+    Axi4WriteCluster axiWrite, {
     required Logic clk,
     required Logic reset,
     super.name = 'wb2axi4',
@@ -86,15 +85,19 @@ class WishboneToAxi4Bridge extends Module {
     final wdatReg = Logic(name: 'wdat_reg', width: wb.config.dataWidth);
     final selReg = Logic(name: 'sel_reg', width: wb.sel.width);
 
-    final rErr = axiRead.rResp != null ? axiRead.rResp!.or() : Const(0);
-    final bErr = axiWrite.bResp != null ? axiWrite.bResp!.or() : Const(0);
+    final rErr = axiRead.rIntf.resp != null
+        ? axiRead.rIntf.resp!.or()
+        : Const(0);
+    final bErr = axiWrite.bIntf.resp != null
+        ? axiWrite.bIntf.resp!.or()
+        : Const(0);
 
-    final awSettled = (awValidReg & axiWrite.awReady) | ~awValidReg;
-    final wSettled = (wValidReg & axiWrite.wReady) | ~wValidReg;
+    final awSettled = (awValidReg & axiWrite.awIntf.ready) | ~awValidReg;
+    final wSettled = (wValidReg & axiWrite.wIntf.ready) | ~wValidReg;
     final writeAddrDataDone = awSettled & wSettled & (awValidReg | wValidReg);
 
-    final rFire = rWaitReg & axiRead.rValid;
-    final bFire = bWaitReg & axiWrite.bValid;
+    final rFire = rWaitReg & axiRead.rIntf.valid;
+    final bFire = bWaitReg & axiWrite.bIntf.valid;
 
     Sequential(clkIn, reset: resetIn, [
       ackReg < Const(0),
@@ -117,11 +120,11 @@ class WishboneToAxi4Bridge extends Module {
       If(busy & ~wb.cyc, then: [pendingLive < Const(0)]),
 
       If(
-        arValidReg & axiRead.arReady,
+        arValidReg & axiRead.arIntf.ready,
         then: [arValidReg < Const(0), rWaitReg < Const(1)],
       ),
-      If(awValidReg & axiWrite.awReady, then: [awValidReg < Const(0)]),
-      If(wValidReg & axiWrite.wReady, then: [wValidReg < Const(0)]),
+      If(awValidReg & axiWrite.awIntf.ready, then: [awValidReg < Const(0)]),
+      If(wValidReg & axiWrite.wIntf.ready, then: [wValidReg < Const(0)]),
       If(writeAddrDataDone, then: [bWaitReg < Const(1)]),
 
       If(
@@ -136,7 +139,7 @@ class WishboneToAxi4Bridge extends Module {
                 then: [errReg < Const(1)],
                 orElse: [
                   ackReg < Const(1),
-                  datReg < axiRead.rData.getRange(0, wb.config.dataWidth),
+                  datReg < axiRead.rIntf.data.getRange(0, wb.config.dataWidth),
                 ],
               ),
             ],
@@ -159,49 +162,52 @@ class WishboneToAxi4Bridge extends Module {
 
     // Wishbone -> AXI4 Read (AR channel). Issued once per cycle and held
     // until accepted, not re-pulsed every cycle CYC & STB are asserted.
-    axiRead.arValid <= arValidReg;
-    axiRead.arAddr <= adrReg.zeroExtend(axiRead.addrWidth);
-    axiRead.arProt <= Const(0, width: 3);
-    if (axiRead.arId != null) {
-      axiRead.arId! <= Const(0, width: axiRead.idWidth);
+    axiRead.arIntf.valid <= arValidReg;
+    axiRead.arIntf.addr <= adrReg.zeroExtend(axiRead.arIntf.addrWidth);
+    axiRead.arIntf.prot <= Const(0, width: 3);
+    if (axiRead.arIntf.id != null) {
+      axiRead.arIntf.id! <= Const(0, width: axiRead.arIntf.idWidth);
     }
-    if (axiRead.arLen != null) {
-      axiRead.arLen! <= Const(0, width: axiRead.lenWidth); // single beat
+    if (axiRead.arIntf.len != null) {
+      axiRead.arIntf.len! <=
+          Const(0, width: axiRead.arIntf.lenWidth); // single beat
     }
-    if (axiRead.arSize != null) {
-      axiRead.arSize! <= axiSizeFromSel(selReg, 3);
+    if (axiRead.arIntf.size != null) {
+      axiRead.arIntf.size! <= axiSizeFromSel(selReg, 3);
     }
-    if (axiRead.arBurst != null) {
-      axiRead.arBurst! <= Const(1, width: 2); // INCR
+    if (axiRead.arIntf.burst != null) {
+      axiRead.arIntf.burst! <= Const(1, width: 2); // INCR
     }
 
     // AXI4 Read -> Wishbone (R channel). Only ready while actually waiting.
-    axiRead.rReady <= rWaitReg;
+    axiRead.rIntf.ready <= rWaitReg;
 
     // Wishbone -> AXI4 Write (AW + W channels), each held until accepted.
-    axiWrite.awValid <= awValidReg;
-    axiWrite.awAddr <= adrReg.zeroExtend(axiWrite.addrWidth);
-    axiWrite.awProt <= Const(0, width: 3);
-    if (axiWrite.awId != null) {
-      axiWrite.awId! <= Const(0, width: axiWrite.idWidth);
+    axiWrite.awIntf.valid <= awValidReg;
+    axiWrite.awIntf.addr <= adrReg.zeroExtend(axiWrite.awIntf.addrWidth);
+    axiWrite.awIntf.prot <= Const(0, width: 3);
+    if (axiWrite.awIntf.id != null) {
+      axiWrite.awIntf.id! <= Const(0, width: axiWrite.awIntf.idWidth);
     }
-    if (axiWrite.awLen != null) {
-      axiWrite.awLen! <= Const(0, width: axiWrite.lenWidth);
+    if (axiWrite.awIntf.len != null) {
+      axiWrite.awIntf.len! <= Const(0, width: axiWrite.awIntf.lenWidth);
     }
-    if (axiWrite.awSize != null) {
-      axiWrite.awSize! <= axiSizeFromSel(selReg, 3);
+    if (axiWrite.awIntf.size != null) {
+      axiWrite.awIntf.size! <= axiSizeFromSel(selReg, 3);
     }
-    if (axiWrite.awBurst != null) {
-      axiWrite.awBurst! <= Const(1, width: 2);
+    if (axiWrite.awIntf.burst != null) {
+      axiWrite.awIntf.burst! <= Const(1, width: 2);
     }
 
-    axiWrite.wData <= wdatReg.zeroExtend(axiWrite.dataWidth);
-    axiWrite.wStrb <= selReg.zeroExtend(axiWrite.strbWidth);
-    axiWrite.wLast <= Const(1);
-    axiWrite.wValid <= wValidReg;
+    axiWrite.wIntf.data <= wdatReg.zeroExtend(axiWrite.wIntf.dataWidth);
+    axiWrite.wIntf.strb <= selReg.zeroExtend(axiWrite.wIntf.strbWidth);
+    if (axiWrite.wIntf.last != null) {
+      axiWrite.wIntf.last! <= Const(1);
+    }
+    axiWrite.wIntf.valid <= wValidReg;
 
     // AXI4 Write -> Wishbone (B channel). Only ready while actually waiting.
-    axiWrite.bReady <= bWaitReg;
+    axiWrite.bIntf.ready <= bWaitReg;
 
     // Wishbone ACK/ERR: one termination per cycle, mutually exclusive, and
     // gated by CYC & STB so a stray pulse can never land on an unrelated

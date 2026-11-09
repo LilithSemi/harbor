@@ -759,7 +759,7 @@ void main() {
     test('linkWait 0 builds no watchdog logic', () async {
       final off = build(0);
       await off.build();
-      final sv = off.generateSynth();
+      final sv = off.dumpSystemVerilog();
       expect(off.definitionName, 'HarborGtpPciePhy_X1_Pipe1');
       for (final name in [
         'hard_link_up',
@@ -1099,7 +1099,7 @@ void main() {
           lanes: lanes,
         );
         await phy.build();
-        final sv = phy.generateSynth();
+        final sv = phy.dumpSystemVerilog();
         expect(count(sv, 'MMCME2_ADV'), 1);
         expect(count(sv, 'BUFG'), 3);
         String param(String name) {

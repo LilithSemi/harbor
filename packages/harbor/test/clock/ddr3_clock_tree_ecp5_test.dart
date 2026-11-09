@@ -38,7 +38,7 @@ void main() {
       sourceHz: 48000000,
     );
     await wrap.build();
-    final sv = wrap.generateSynth();
+    final sv = wrap.dumpSystemVerilog();
 
     expect('EHXPLLL'.allMatches(sv).length, equals(1));
     expect(sv, contains('CLKOS_ENABLE'));
@@ -72,7 +72,7 @@ void main() {
       sourceHz: 48000000,
     );
     await wrap.build();
-    final sv = wrap.generateSynth();
+    final sv = wrap.dumpSystemVerilog();
 
     expect(sv, contains('.CLKI_DIV(${sol.clkiDiv})'));
     expect(sv, contains('.CLKFB_DIV(${sol.clkfbDiv})'));
@@ -108,7 +108,7 @@ void main() {
         sourceHz: 48000000,
       );
       await wrap.build();
-      final sv = wrap.generateSynth();
+      final sv = wrap.dumpSystemVerilog();
 
       // Read back the emitted PLL parameters: what the hardware actually
       // sees, independent of the formula that set them.

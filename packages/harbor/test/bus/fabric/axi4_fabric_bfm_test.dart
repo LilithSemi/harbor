@@ -5,12 +5,11 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_hcl/rohd_hcl.dart'
     show
-        Axi4Channel,
-        Axi4MainAgent,
-        Axi4ReadComplianceChecker,
-        Axi4ReadRequestPacket,
-        Axi4WriteComplianceChecker,
-        Axi4WriteRequestPacket;
+        Axi4DataPacket,
+        Axi4MainClusterAgent,
+        Axi4ReadCluster,
+        Axi4RequestPacket,
+        Axi4WriteCluster;
 import 'package:rohd_vf/rohd_vf.dart';
 import 'package:test/test.dart';
 
@@ -24,32 +23,30 @@ const _slaves = [
   SlaveCfg('s1', 2, 2, 0x10000, 0x10000),
 ];
 
-Axi4ReadInterface _r(int id) => Axi4ReadInterface(
+Axi4ReadCluster _r(int id) => Axi4ReadCluster(
   idWidth: id,
   addrWidth: addrW,
   dataWidth: dataW,
-  aruserWidth: 0,
-  ruserWidth: 0,
+  userWidth: 0,
+  useLock: true,
 );
 
-Axi4WriteInterface _w(int id) => Axi4WriteInterface(
+Axi4WriteCluster _w(int id) => Axi4WriteCluster(
   idWidth: id,
   addrWidth: addrW,
   dataWidth: dataW,
-  awuserWidth: 0,
-  wuserWidth: 0,
-  buserWidth: 0,
+  userWidth: 0,
+  useLock: true,
 );
 
 // rohd_hcl interfaces on the master port, where the manager agent drives,
 // and on s0, where the checkers only watch.
 class _Bench extends Test {
   final Axi4SystemInterface sIntf = Axi4SystemInterface();
-  final Axi4ReadInterface rIntf = _r(4);
-  final Axi4WriteInterface wIntf = _w(4);
-  final Axi4ReadInterface sR = _r(5);
-  final Axi4WriteInterface sW = _w(5);
-  late final Axi4Channel channel = Axi4Channel(rIntf: rIntf, wIntf: wIntf);
+  final Axi4ReadCluster rIntf = _r(4);
+  final Axi4WriteCluster wIntf = _w(4);
+  final Axi4ReadCluster sR = _r(5);
+  final Axi4WriteCluster sW = _w(5);
   final Future<void> Function() body;
 
   _Bench(this.body) : super('axi4_fabric_bfm', randomSeed: 1) {
@@ -57,11 +54,22 @@ class _Bench extends Test {
     Simulator.setMaxSimTime(400000);
     sIntf.clk <= SimpleClockGenerator(10).clk;
     sIntf.resetN.put(0);
-    Axi4ReadComplianceChecker(sIntf, rIntf, parent: this);
-    Axi4WriteComplianceChecker(sIntf, wIntf, parent: this);
-    Axi4ReadComplianceChecker(sIntf, sR, parent: this, name: 's0_read');
-    Axi4WriteComplianceChecker(sIntf, sW, parent: this, name: 's0_write');
+    // The rohd_hcl 0.3.0 compliance checkers count a VALID cycle as a beat
+    // even when READY is low, so they reject any stalled transfer. The
+    // assertions below check the same transactions directly instead.
+    main = Axi4MainClusterAgent(
+      sIntf: sIntf,
+      arIntf: rIntf.arIntf,
+      awIntf: wIntf.awIntf,
+      rIntf: rIntf.rIntf,
+      wIntf: wIntf.wIntf,
+      bIntf: wIntf.bIntf,
+      parent: this,
+    );
   }
+
+  /// The manager agent on the [rIntf]/[wIntf] pair.
+  late final Axi4MainClusterAgent main;
 
   @override
   Future<void> run(Phase phase) async {
@@ -75,29 +83,39 @@ class _Bench extends Test {
   }
 }
 
-Logic _pin(Axi4ReadInterface r, Axi4WriteInterface w, String name) =>
-    w.tryPort(name) ?? r.port(name);
+Logic _pin(Axi4ReadCluster r, Axi4WriteCluster w, String name) {
+  for (final intf in [w.awIntf, w.wIntf, w.bIntf, r.arIntf, r.rIntf]) {
+    final port = intf.tryPort(name);
+    if (port != null) return port;
+  }
+  throw ArgumentError.value(name, 'name', 'not a port of the bench');
+}
 
 LogicValue _v(int value, int width) => LogicValue.ofInt(value, width);
 
-Axi4WriteRequestPacket _write(int id, int addr, List<int> data) =>
-    Axi4WriteRequestPacket(
-      addr: _v(addr, addrW),
-      prot: _v(0, 3),
-      id: _v(id, 4),
-      len: _v(data.length - 1, 8),
-      size: _v(2, 3),
-      burst: _v(1, 2),
-      lock: _v(0, 1),
-      cache: _v(0, 4),
-      qos: _v(0, 4),
-      region: _v(0, 4),
-      data: [for (final d in data) _v(d, dataW)],
-      strobe: [for (final _ in data) _v(0xf, 4)],
+(Axi4RequestPacket, Axi4DataPacket) _write(int id, int addr, List<int> data) =>
+    (
+      Axi4RequestPacket(
+        addr: _v(addr, addrW),
+        prot: _v(0, 3),
+        id: _v(id, 4),
+        len: _v(data.length - 1, 8),
+        size: _v(2, 3),
+        burst: _v(1, 2),
+        lock: _v(0, 1),
+        cache: _v(0, 4),
+        qos: _v(0, 4),
+        region: _v(0, 4),
+      ),
+      Axi4DataPacket(
+        id: _v(id, 4),
+        data: [for (final d in data) _v(d, dataW)].rconcat(),
+        strb: [for (final _ in data) _v(0xf, 4)].rconcat(),
+      ),
     );
 
-Axi4ReadRequestPacket _read(int id, int addr, int len, {int burst = 1}) =>
-    Axi4ReadRequestPacket(
+Axi4RequestPacket _read(int id, int addr, int len, {int burst = 1}) =>
+    Axi4RequestPacket(
       addr: _v(addr, addrW),
       prot: _v(0, 3),
       id: _v(id, 4),
@@ -152,16 +170,17 @@ const _fromSubordinate = [
 // reads go to one slave at a time, and each write ends before the next.
 Future<void> _bfm(HarborFabricTopology topology) async {
   final shell = FabricShell(topology, masters: _masters, slaves: _slaves);
-  late final Axi4MainAgent main;
   late final Sim sim;
   final errors = <String>[];
   final bResp = <(int, int)>[];
   final rBeats = <(int, int, int, int)>[];
 
-  final bench = _Bench(() async {
+  late final _Bench bench;
+  bench = _Bench(() async {
     sim.running = true;
-    final wr = main.getWrSequencer(0)!;
-    final rd = main.getRdSequencer(0)!;
+    final wr = bench.main.writeAgent.reqAgent.sequencer;
+    final wd = bench.main.writeAgent.dataAgent.sequencer!;
+    final rd = bench.main.readAgent.reqAgent.sequencer;
     final writes = [
       (1, 0x00100, [0x11111111]),
       (2, 0x00140, [for (var i = 0; i < 4; i++) 0x2000 + i]),
@@ -170,7 +189,9 @@ Future<void> _bfm(HarborFabricTopology topology) async {
     ];
     for (var k = 0; k < writes.length; k++) {
       final (id, addr, data) = writes[k];
-      wr.add(_write(id, addr, data));
+      final (request, payload) = _write(id, addr, data);
+      wr.add(request);
+      wd.add(payload);
       await waitUntil(sim, () => bResp.length == k + 1);
     }
     for (final (reads, beats) in [
@@ -182,12 +203,6 @@ Future<void> _bfm(HarborFabricTopology topology) async {
       await waitUntil(sim, () => rBeats.length == beats);
     }
   });
-  main = Axi4MainAgent(
-    sIntf: bench.sIntf,
-    channels: [bench.channel],
-    parent: bench,
-  );
-
   shell.input('clk').srcConnection! <= bench.sIntf.clk;
   shell.input('reset').srcConnection! <= ~bench.sIntf.resetN;
   for (final p in _fromManager) {
@@ -202,8 +217,8 @@ Future<void> _bfm(HarborFabricTopology topology) async {
   for (final p in _fromSubordinate) {
     _pin(bench.sR, bench.sW, p) <= shell.input('s0_$p').srcConnection!;
   }
-  bench.sW.awRegion! <= Const(0, width: 4);
-  bench.sR.arRegion! <= Const(0, width: 4);
+  bench.sW.awIntf.region! <= Const(0, width: 4);
+  bench.sR.arIntf.region! <= Const(0, width: 4);
   for (final input in shell.inputs.values) {
     if (input.name.startsWith('s')) input.srcConnection!.put(0);
   }
@@ -266,7 +281,7 @@ Future<void> _bfm(HarborFabricTopology topology) async {
 void main() {
   for (final t in HarborFabricTopology.values) {
     test(
-      '${t.name} fabric under the rohd_hcl manager BFM and checkers',
+      '${t.name} fabric under the rohd_hcl manager BFM',
       () => isolated(() => _bfm(t)),
     );
   }

@@ -396,7 +396,7 @@ class HarborWishboneCdcBridge extends BridgeModule {
           serving, // [2]
           ackReg, // [1] s_ack
           busy, // [0]
-        ].swizzle();
+        ].concat();
   }
 }
 

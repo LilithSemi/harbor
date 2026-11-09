@@ -231,9 +231,9 @@ class HarborMemoryWaistCdc extends Module {
     Logic nonZero(Logic c) => ~c.eq(Const(0, width: c.width));
     final fifos = [reqF, wdF, rdF, wrF];
     addOutput('debug_empty', width: 4) <=
-        [for (final q in fifos.reversed) q.rdEmpty].swizzle();
+        [for (final q in fifos.reversed) q.rdEmpty].concat();
     addOutput('debug_full', width: 4) <=
-        [for (final q in fifos.reversed) q.wrFull].swizzle();
+        [for (final q in fifos.reversed) q.wrFull].concat();
 
     if (slave) {
       // Fabric side: the requester. The queues hold what is in flight, so
@@ -728,7 +728,7 @@ class HarborWaistCdcFifo extends Module {
 
     final pw = depth.bitLength;
     Logic gray(Logic b) => b ^ (b >>> 1);
-    Logic rotate(Logic x) => [x.getRange(0, depth - 1), x[depth - 1]].swizzle();
+    Logic rotate(Logic x) => [x.getRange(0, depth - 1), x[depth - 1]].concat();
     Logic pick(Logic sel, List<Logic> v) => [
       for (var i = 0; i < depth; i++) v[i] & sel[i].replicate(width),
     ].reduce((a, b) => a | b);
@@ -747,7 +747,7 @@ class HarborWaistCdcFifo extends Module {
     // Full: the write gray equals the read gray with the top 2 bits
     // inverted.
     Logic fullAt(Logic g) => g.eq(
-      [~rdGraySync.getRange(pw - 2), rdGraySync.getRange(0, pw - 2)].swizzle(),
+      [~rdGraySync.getRange(pw - 2), rdGraySync.getRange(0, pw - 2)].concat(),
     );
     // Registers that hold the pointer plus one and its gray code.
     final wrPtr1 = Logic(name: 'wr_ptr_1', width: pw);

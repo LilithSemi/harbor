@@ -416,7 +416,7 @@ class HarborMediaEngine extends BridgeModule
     final tmp = [for (var i = 0; i < 64; i++) Logic(name: 'tmp_$i', width: 32)];
 
     // Signed helpers operating on w-bit two's-complement values.
-    Logic sx(Logic v) => [v[v.width - 1].replicate(w - v.width), v].swizzle();
+    Logic sx(Logic v) => [v[v.width - 1].replicate(w - v.width), v].concat();
     Logic constW(int c) => Const(c & ((1 << w) - 1), width: w);
     Logic busToAddr(Logic d) => dmaAddrWidth <= 32
         ? d.getRange(0, dmaAddrWidth)
@@ -424,7 +424,7 @@ class HarborMediaEngine extends BridgeModule
     Logic addrToBus(Logic a) =>
         dmaAddrWidth >= 32 ? a.getRange(0, 32) : a.zeroExtend(32);
     Logic ashr(Logic v, int s) =>
-        [v[w - 1].replicate(s), v.getRange(s, w)].swizzle();
+        [v[w - 1].replicate(s), v.getRange(s, w)].concat();
     Logic rshift(Logic v) => ashr(
       (v + Const(1 << (dctShift - 1), width: w)).getRange(0, w),
       dctShift,
@@ -450,14 +450,14 @@ class HarborMediaEngine extends BridgeModule
       'ac_q',
     );
     Logic deqLoad(Logic sample, {required bool isDc}) {
-      final s32 = [sample[15].replicate(16), sample].swizzle();
+      final s32 = [sample[15].replicate(16), sample].concat();
       final scaled = (s32 * (isDc ? dcQ : acQ).zeroExtend(32)).getRange(0, 16);
       return mux(dirReg & deqEnReg, scaled, sample);
     }
 
     // Runtime-DC variant (the DC position is data-driven under the AV1 scan).
     Logic deqLoadR(Logic sample, Logic isDc) {
-      final s32 = [sample[15].replicate(16), sample].swizzle();
+      final s32 = [sample[15].replicate(16), sample].concat();
       final scaled = (s32 * mux(isDc, dcQ, acQ).zeroExtend(32)).getRange(0, 16);
       return mux(dirReg & deqEnReg, scaled, sample);
     }
@@ -520,7 +520,11 @@ class HarborMediaEngine extends BridgeModule
       for (var k = 0; k < 8; k++)
         mux(size8, matSel[7 - k], k < 4 ? matSel[3 - k] : Const(0, width: w)),
     ];
-    final idScale = mux(size8, Const(8192, width: w), Const(5793, width: w));
+    final idScale = mux<Logic>(
+      size8,
+      Const(8192, width: w),
+      Const(5793, width: w),
+    );
     final idtxSel = [
       for (var k = 0; k < 8; k++) rshift((coreIn[k] * idScale).getRange(0, w)),
     ];
@@ -537,7 +541,7 @@ class HarborMediaEngine extends BridgeModule
     final w8 = [
       for (var j = 7; j >= 0; j--)
         selByIdx([for (var b = 0; b < 8; b++) blk[b * 8 + j]], beatCnt),
-    ].swizzle();
+    ].concat();
     final w4lo = [
       blk[11],
       blk[10],
@@ -547,7 +551,7 @@ class HarborMediaEngine extends BridgeModule
       blk[2],
       blk[1],
       blk[0],
-    ].swizzle();
+    ].concat();
     final w4hi = [
       blk[27],
       blk[26],
@@ -557,14 +561,14 @@ class HarborMediaEngine extends BridgeModule
       blk[18],
       blk[17],
       blk[16],
-    ].swizzle();
+    ].concat();
 
     // 2D frame-buffer write path. Each beat carries one block row (beatCnt = row
     // index) to its raster address: frame width = blkCols*N samples, so block
     // (br,bc) row r sits at dst + ((br*N+r)*strideSamples + bc*N) * 2 bytes. A
     // 4x4 row is half a beat, placed in the low or high half (byte-enable) by
     // column parity.
-    final nSamp = mux(size8, Const(8, width: 16), Const(4, width: 16));
+    final nSamp = mux<Logic>(size8, Const(8, width: 16), Const(4, width: 16));
     final strideSamples =
         ((blkColsM1.zeroExtend(16) + Const(1, width: 16)) * nSamp).getRange(
           0,
@@ -590,17 +594,17 @@ class HarborMediaEngine extends BridgeModule
     final w4row = [
       for (var j = 3; j >= 0; j--)
         selByIdx([for (var b = 0; b < 4; b++) blk[b * 8 + j]], beatCnt),
-    ].swizzle(); // one 4x4 row (4 samples, 64 bits)
+    ].concat(); // one 4x4 row (4 samples, 64 bits)
     final bcOdd = bcReg[0];
     final data2D = mux(
       size8,
       w8,
-      mux(bcOdd, [w4row, Const(0, width: 64)].swizzle(), w4row.zeroExtend(128)),
+      mux(bcOdd, [w4row, Const(0, width: 64)].concat(), w4row.zeroExtend(128)),
     );
     final be2D = mux(
       size8,
       Const(0xFFFF, width: 16),
-      mux(bcOdd, Const(0xFF00, width: 16), Const(0x00FF, width: 16)),
+      mux<Logic>(bcOdd, Const(0xFF00, width: 16), Const(0x00FF, width: 16)),
     );
 
     // real reference-frame gather. Patch base (samples) = block origin
@@ -618,7 +622,7 @@ class HarborMediaEngine extends BridgeModule
     final alignedCol = [
       patchBaseX.getRange(3, 16),
       Const(0, width: 3),
-    ].swizzle(); // & ~7
+    ].concat(); // & ~7
     // The low bits of the unsigned product of the two's-complement operands
     // equal the signed product (mod 2^32), so the offset is correct for
     // negative patchBaseY / alignedCol too.
@@ -742,7 +746,7 @@ class HarborMediaEngine extends BridgeModule
         (tiledReg & decModeReg & ((inStore & ~bcReg.eq(blkColsM1)) | inNewRow));
     coeffDec.input('stall').srcConnection! <= inEntRefill;
     coeffDec.input('num_coeffs').srcConnection! <=
-        mux(
+        mux<Logic>(
           size8,
           Const(64, width: coeffDec.posWidth),
           Const(16, width: coeffDec.posWidth),
@@ -753,8 +757,8 @@ class HarborMediaEngine extends BridgeModule
       coeffDec.input('stream').srcConnection! <= beatA.getRange(64, 128);
     coeffDec.input('bytes_in').srcConnection! <=
         (useOdEc
-            ? [feedByte0, feedByte1, feedByte2].swizzle()
-            : [feedByte0, feedByte1].swizzle());
+            ? [feedByte0, feedByte1, feedByte2].concat()
+            : [feedByte0, feedByte1].concat());
     coeffDec.input('coeff_addr').srcConnection! <=
         posLin.getRange(0, coeffDec.posWidth);
     final coeffBytePop = coeffDec.output('byte_pop');
@@ -769,13 +773,13 @@ class HarborMediaEngine extends BridgeModule
     addSubModule(lineBuf);
     final blockBottom = mux(
       sizeReg,
-      [for (var c = 7; c >= 0; c--) blk[56 + c].getRange(0, 8)].swizzle(),
-      [for (var c = 7; c >= 0; c--) blk[24 + c].getRange(0, 8)].swizzle(),
+      [for (var c = 7; c >= 0; c--) blk[56 + c].getRange(0, 8)].concat(),
+      [for (var c = 7; c >= 0; c--) blk[24 + c].getRange(0, 8)].concat(),
     );
     final blockRight = mux(
       sizeReg,
-      [for (var r = 7; r >= 0; r--) blk[r * 8 + 7].getRange(0, 8)].swizzle(),
-      [for (var r = 7; r >= 0; r--) blk[r * 8 + 3].getRange(0, 8)].swizzle(),
+      [for (var r = 7; r >= 0; r--) blk[r * 8 + 7].getRange(0, 8)].concat(),
+      [for (var r = 7; r >= 0; r--) blk[r * 8 + 3].getRange(0, 8)].concat(),
     );
     lineBuf.input('clk').srcConnection! <= input('clk');
     lineBuf.input('reset').srcConnection! <= reset;
@@ -803,7 +807,7 @@ class HarborMediaEngine extends BridgeModule
     intraPred.input('above_left').srcConnection! <=
         mux(tiledReg, lineBuf.output('above_left'), nbrA.getRange(0, 8));
     intraPred.input('residual').srcConnection! <=
-        [for (var i = 63; i >= 0; i--) blk[i]].swizzle();
+        [for (var i = 63; i >= 0; i--) blk[i]].concat();
     final reconOut = intraPred.output('recon');
 
     // Inter predictor: the reference beats concatenate low-beat-first into the
@@ -817,12 +821,12 @@ class HarborMediaEngine extends BridgeModule
     // strided reference-frame reads.
     final refBeatPatch = [
       for (var i = refBeatCount - 1; i >= 0; i--) refBeat[i],
-    ].swizzle().getRange(0, patchBits);
+    ].concat().getRange(0, patchBits);
     interPred.input('ref_patch').srcConnection! <=
         (interpTaps == 2
             ? mux(
                 realGatherReg,
-                [for (var i = 80; i >= 0; i--) patchPx[i]].swizzle(),
+                [for (var i = 80; i >= 0; i--) patchPx[i]].concat(),
                 refBeatPatch,
               )
             : refBeatPatch);
@@ -832,20 +836,22 @@ class HarborMediaEngine extends BridgeModule
       interPred.input('filter_type').srcConnection! <= filterTypeReg;
     }
     interPred.input('residual').srcConnection! <=
-        [for (var i = 63; i >= 0; i--) blk[i]].swizzle();
+        [for (var i = 63; i >= 0; i--) blk[i]].concat();
     final interReconOut = interPred.output('recon');
 
     // Bytes per block in memory: 4x4 = 16 samples x 2B = 32, 8x8 = 64 x 2 = 128.
-    final blockBytes = mux(
+    final blockBytes = mux<Logic>(
       sizeReg,
       Const(128, width: dmaAddrWidth),
       Const(32, width: dmaAddrWidth),
     );
 
-    final entIdx = [entRow, entCol].swizzle().named('ent_idx');
+    final entIdx = [entRow, entCol].concat().named('ent_idx');
     final entLast =
-        (entRow.eq(mux(size8, Const(7, width: 3), Const(3, width: 3))) &
-                entCol.eq(mux(size8, Const(7, width: 3), Const(3, width: 3))))
+        (entRow.eq(mux<Logic>(size8, Const(7, width: 3), Const(3, width: 3))) &
+                entCol.eq(
+                  mux<Logic>(size8, Const(7, width: 3), Const(3, width: 3)),
+                ))
             .named('ent_last');
 
     Sequential(clk, [
@@ -1191,7 +1197,7 @@ class HarborMediaEngine extends BridgeModule
                             mux(
                               sessCtrl[i][4],
                               Const(stBitLoad, width: 5),
-                              mux(
+                              mux<Logic>(
                                 sessCtrl[i][7],
                                 Const(stNewRow, width: 5),
                                 Const(stRead, width: 5),
@@ -1298,7 +1304,9 @@ class HarborMediaEngine extends BridgeModule
                   ],
                 ),
               If(
-                passIdx.eq(mux(size8, Const(7, width: 3), Const(3, width: 3))),
+                passIdx.eq(
+                  mux<Logic>(size8, Const(7, width: 3), Const(3, width: 3)),
+                ),
                 then: [
                   passIdx < Const(0, width: 3),
                   engState < Const(stCols, width: 5),
@@ -1317,7 +1325,9 @@ class HarborMediaEngine extends BridgeModule
                   ],
                 ),
               If(
-                passIdx.eq(mux(size8, Const(7, width: 3), Const(3, width: 3))),
+                passIdx.eq(
+                  mux<Logic>(size8, Const(7, width: 3), Const(3, width: 3)),
+                ),
                 then: [
                   beatCnt < Const(0, width: 3),
                   // Intra prediction fetches neighbours, inter prediction
@@ -1595,7 +1605,7 @@ class HarborMediaEngine extends BridgeModule
                       dmaWriteReqReg < Const(0),
                       // Tiled mode stores the block edges and loops, else done.
                       engState <
-                          mux(
+                          mux<Logic>(
                             tiledReg,
                             Const(stStore, width: 5),
                             Const(stDone, width: 5),
@@ -1620,7 +1630,7 @@ class HarborMediaEngine extends BridgeModule
                         (sessFramesDone[i] + Const(1, width: 32)),
                     sessBytesDone[i] <
                         (sessBytesDone[i] +
-                            mux(
+                            mux<Logic>(
                               size8,
                               Const(128, width: 32),
                               Const(32, width: 32),
@@ -1726,7 +1736,7 @@ class HarborMediaEngine extends BridgeModule
                 orElse: [
                   If(
                     entCol.eq(
-                      mux(size8, Const(7, width: 3), Const(3, width: 3)),
+                      mux<Logic>(size8, Const(7, width: 3), Const(3, width: 3)),
                     ),
                     then: [
                       entCol < Const(0, width: 3),

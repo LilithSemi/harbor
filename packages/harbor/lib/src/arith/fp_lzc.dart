@@ -9,7 +9,7 @@ Logic harborFpLeadingZeros(Logic x) {
   while (n < x.width + 1) {
     n *= 2;
   }
-  final padded = [x, Const(1, width: n - x.width, fill: true)].swizzle();
+  final padded = [x, Const(1, width: n - x.width, fill: true)].concat();
 
   // Returns the zero flag and the count of a power of two wide slice.
   (Logic, Logic?) count(Logic v) {
@@ -20,7 +20,7 @@ Logic harborFpLeadingZeros(Logic x) {
     final (zh, ch) = count(v.getRange(half, v.width));
     final (zl, cl) = count(v.getRange(0, half));
     final low = ch == null ? null : mux(zh, cl!, ch);
-    return (zh & zl, low == null ? zh : [zh, low].swizzle());
+    return (zh & zl, low == null ? zh : [zh, low].concat());
   }
 
   return count(padded).$2!;

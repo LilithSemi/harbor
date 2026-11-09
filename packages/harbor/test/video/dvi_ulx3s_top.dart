@@ -28,7 +28,7 @@ class DviPatternSlave extends Module {
     final word = adr.getRange(2, 26);
     Sequential(clk, reset: reset, [
       ack < cyc & stb & ~ack,
-      datR < [word.getRange(0, 8), word ^ (word >>> 5)].swizzle(),
+      datR < [word.getRange(0, 8), word ^ (word >>> 5)].concat(),
     ]);
   }
 }
@@ -126,7 +126,7 @@ class DviUlx3sTop extends BridgeModule {
                 mux(
                   lfsr.eq(0),
                   Const(1, width: 32),
-                  [lfsr.getRange(0, 31), fb].swizzle(),
+                  [lfsr.getRange(0, 31), fb].concat(),
                 ),
           ],
         ),
@@ -167,7 +167,7 @@ class DviUlx3sTop extends BridgeModule {
       hdmiPacketSubpacket: packets
           ? [
               for (var k = 0; k < 4; k++)
-                [lfsr.getRange(2 * k, 24 + 2 * k), lfsr].swizzle() ^
+                [lfsr.getRange(2 * k, 24 + 2 * k), lfsr].concat() ^
                     Const(
                       0x5A5A5A5A5A5A5A * (k + 1) & 0xFFFFFFFFFFFFFF,
                       width: 56,
@@ -177,9 +177,7 @@ class DviUlx3sTop extends BridgeModule {
       hdmiVic: audio ? Const(1, width: 7) : null,
       hdmiAviQ: audio ? Const(0, width: 2) : null,
       hdmiAviM: audio ? Const(0, width: 2) : null,
-      audioFsSel: audio
-          ? [input('btn_up'), input('btn_fire2')].swizzle()
-          : null,
+      audioFsSel: audio ? [input('btn_up'), input('btn_fire2')].concat() : null,
       audioValid: audio ? Const(1) : null,
       audioLeft: audio ? sample : null,
       audioRight: audio ? ~sample : null,
@@ -213,7 +211,7 @@ class DviUlx3sTop extends BridgeModule {
                 display.output('hdmi_packets_missed').xor(),
                 display.output('audio_underrun_count').xor(),
                 display.underrun,
-              ].swizzle()
-            : [Const(0, width: 7), display.underrun].swizzle());
+              ].concat()
+            : [Const(0, width: 7), display.underrun].concat());
   }
 }

@@ -80,7 +80,7 @@ void main() {
       sourceHz: 100000000,
     );
     await wrap.build();
-    final sv = wrap.generateSynth();
+    final sv = wrap.dumpSystemVerilog();
 
     // One PLLE2, UberDDR3-proven openXC7 form (INTERNAL compensation, feedback
     // wired directly with no BUFG).
@@ -118,7 +118,7 @@ void main() {
       dqsPhaseDeg: 135.0,
     );
     await wrap.build();
-    final sv = wrap.generateSynth();
+    final sv = wrap.dumpSystemVerilog();
     expect(sv, contains('.CLKOUT4_PHASE(135.0)'));
   });
 
@@ -131,7 +131,7 @@ void main() {
           sourceHz: 100000000,
         );
         await wrap.build();
-        final sv = wrap.generateSynth();
+        final sv = wrap.dumpSystemVerilog();
         // No spare CLKOUT5 is configured -> byte-identical to the pre-gearbox tree.
         expect(sv, isNot(contains('.CLKOUT5_DIVIDE(')));
         // The sequencer clock IS CK/4 at gearRatio 1.
@@ -148,7 +148,7 @@ void main() {
           ddrGearRatio: 2,
         );
         await wrap.build();
-        final sv = wrap.generateSynth();
+        final sv = wrap.dumpSystemVerilog();
         final c = wrap.clocks;
         // ignore: avoid_print
         print(

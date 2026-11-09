@@ -72,7 +72,7 @@ void main() {
   test('default config: rising-edge capture counts', () async {
     final phy = build();
     await phy.build();
-    final sv = phy.generateSynth();
+    final sv = phy.dumpSystemVerilog();
 
     // 22 non-dq output flops minus cke (moved to OFS1P3DX) + 16 dq data +
     // 16 dq oe = 53.
@@ -149,7 +149,7 @@ endmodule
       ),
     );
     await phy.build();
-    final sv = phy.generateSynth();
+    final sv = phy.dumpSystemVerilog();
 
     expect(count(sv, 'IDDRX1F'), equals(16));
     expect(count(sv, 'IFS1P3BX'), equals(0));
@@ -159,7 +159,7 @@ endmodule
       'delayf.Z -> ifs1p3bx.D', () async {
     final phy = build(phy: const HarborSdramPhyConfig(dqDelayTaps: 10));
     await phy.build();
-    final sv = phy.generateSynth();
+    final sv = phy.dumpSystemVerilog();
 
     expect(count(sv, 'DELAYF'), equals(16));
 

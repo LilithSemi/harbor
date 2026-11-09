@@ -733,8 +733,8 @@ class HarborIntMulDiv extends Module {
         final newProd = (p + mux(bit, mc, Const(0, width: 2 * width))).named(
           'mul_prod_step',
         );
-        final newMcand = [mc.getRange(0, 2 * width - 1), Const(0)].swizzle();
-        final newMplier = [Const(0), mp.getRange(1, width)].swizzle();
+        final newMcand = [mc.getRange(0, 2 * width - 1), Const(0)].concat();
+        final newMplier = [Const(0), mp.getRange(1, width)].concat();
         return (newProd, newMcand, newMplier);
       }
 
@@ -856,8 +856,8 @@ class HarborIntMulDiv extends Module {
         if (tagW > 0) inTag!,
         if (!shareRecurrence) nextSeq,
         wantsRemainderOp,
-      ].swizzle();
-      final divOpSel = mux(
+      ].concat();
+      final divOpSel = mux<Logic>(
         signedDivOp,
         Const(HarborDivSqrtOp.divSigned.index, width: 2),
         Const(HarborDivSqrtOp.divUnsigned.index, width: 2),
@@ -969,9 +969,9 @@ class HarborIntMulDiv extends Module {
           (mulMode == null ? selMul & mulOutValid : selDiv & divOutValid);
     }
     inReady <= inReadyVal;
-    slotValid <= [...mulSlotValids, ...divSlotValids].rswizzle();
+    slotValid <= [...mulSlotValids, ...divSlotValids].rconcat();
     if (tagW > 0) {
-      slotTag <= [...mulSlotTags, ...divSlotTags].rswizzle();
+      slotTag <= [...mulSlotTags, ...divSlotTags].rconcat();
     }
   }
 

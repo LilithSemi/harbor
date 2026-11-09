@@ -71,7 +71,7 @@ class HarborReadArbiter extends Module {
     final rrE = rr.zeroExtend(rpW);
     final rp = [
       for (var i = 0; i < n; i++)
-        mux(
+        mux<Logic>(
           rr.lte(Const(i, width: idxW)),
           Const(i, width: rpW) - rrE,
           Const(i + n, width: rpW) - rrE,

@@ -176,7 +176,7 @@ class UsbDfuRamSink extends BridgeModule {
       );
     });
     final isEndEntry = (pushEnd & ~pushByte).named('is_end_entry');
-    final wrData = [isEndEntry, dfu.data].swizzle();
+    final wrData = [isEndEntry, dfu.data].concat();
 
     fifo.input('wr_clk').srcConnection! <= usbClk;
     fifo.input('wr_reset').srcConnection! <= usbReset;
@@ -280,7 +280,7 @@ class UsbDfuRamSink extends BridgeModule {
               .named('dat_placed');
     final wordBase32 = bytesPerWord == 1
         ? byteOff
-        : [byteOff.slice(31, wordShift), Const(0, width: wordShift)].swizzle();
+        : [byteOff.slice(31, wordShift), Const(0, width: wordShift)].concat();
     final wordBase = busAddressWidth >= 32
         ? wordBase32.zeroExtend(busAddressWidth)
         : wordBase32.slice(busAddressWidth - 1, 0);
@@ -401,7 +401,7 @@ class UsbDfuRamSink extends BridgeModule {
                               adrReg < adrNext,
                               datReg < datPlaced,
                               selReg < selMask,
-                              wrSub < [busWdataFire, busReqFire].swizzle(),
+                              wrSub < [busWdataFire, busReqFire].concat(),
                               fsm < Const(stWrite, width: 3),
                             ],
                           ),
@@ -413,7 +413,7 @@ class UsbDfuRamSink extends BridgeModule {
               ),
             ]),
             CaseItem(Const(stWrite, width: 3), [
-              wrSub < wrSub | [busWdataFire, busReqFire].swizzle(),
+              wrSub < wrSub | [busWdataFire, busReqFire].concat(),
               If(
                 busWrespFire,
                 then: [
@@ -510,7 +510,7 @@ class UsbDfuRamSink extends BridgeModule {
     errIsWriteSync.input('async_in').srcConnection! <= errIsWriteBus;
     errIsWriteSync.input('dst_clk').srcConnection! <= usbClk;
     errIsWriteSync.input('dst_reset').srcConnection! <= usbReset;
-    final errCodeUsb = mux(
+    final errCodeUsb = mux<Logic>(
       errIsWriteSync.output('sync_out'),
       Const(_errWrite, width: 4),
       Const(_errAddress, width: 4),
@@ -723,9 +723,9 @@ class UsbDfuFlashSink extends BridgeModule {
     final tag = mux(
       pushEnd,
       Const(2, width: 2),
-      mux(pushBlockDone, Const(1, width: 2), Const(0, width: 2)),
+      mux<Logic>(pushBlockDone, Const(1, width: 2), Const(0, width: 2)),
     );
-    final wrData = [tag, dfu.data].swizzle();
+    final wrData = [tag, dfu.data].concat();
 
     fifo.input('wr_clk').srcConnection! <= usbClk;
     fifo.input('wr_reset').srcConnection! <= usbReset;
@@ -1024,7 +1024,7 @@ class UsbDfuFlashSink extends BridgeModule {
                   [
                     pageStart.slice(addrWidth - 1, sectorShift),
                     Const(0, width: sectorShift),
-                  ].swizzle(),
+                  ].concat(),
               lenReg < Const(0, width: 9),
               If(
                 wrBusy,
@@ -1156,7 +1156,7 @@ class UsbDfuFlashSink extends BridgeModule {
       'err_usb_pulse',
     );
     dfu.error <=
-        mux(errUsbPulse, Const(_errWrite, width: 4), Const(0, width: 4));
+        mux<Logic>(errUsbPulse, Const(_errWrite, width: 4), Const(0, width: 4));
 
     // clearAck: bus -> USB, the mirror image of `clear`. Tells the device
     // the drain above has finished and new DNLOAD data is safe to accept.

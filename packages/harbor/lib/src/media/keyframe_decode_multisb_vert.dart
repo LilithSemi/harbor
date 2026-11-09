@@ -131,7 +131,7 @@ class HarborKeyframeDecodeMultiSbVert extends BridgeModule {
             0,
             2,
           ),
-      ].swizzle();
+      ].concat();
       final reconYModes = ymCap;
       final reconTxTypes = ttCap;
       // coeffs: each leaf's low-16 coeffs into the low 16 of a 256-coeff slot.
@@ -140,14 +140,14 @@ class HarborKeyframeDecodeMultiSbVert extends BridgeModule {
           Const(0, width: 192 * 16),
           coeffCap.getRange(l * 64 * 16, l * 64 * 16 + 64 * 16),
         ],
-      ].swizzle();
+      ].concat();
       // positions: SPLIT layout, leaf l at mi (l>>1, l&1). slot [l*4 +: 4],
       // miRow low miBits, miCol high miBits.
       int posVal(int row, int col) => row | (col << miBits);
       final reconPositions = [
         for (var l = maxLeaves - 1; l >= 0; l--)
           Const(posVal(l >> 1, l & 1), width: 2 * miBits),
-      ].swizzle();
+      ].concat();
       return (
         leafCount: reconLeafCount,
         positions: reconPositions,
@@ -198,7 +198,7 @@ class HarborKeyframeDecodeMultiSbVert extends BridgeModule {
     final sb0Bottom = [
       for (var c = f - 1; c >= 0; c--)
         frame0.getRange((7 * f + c) * 8, (7 * f + c) * 8 + 8),
-    ].swizzle();
+    ].concat();
 
     // recon SB1 (sb_r = 2 mi units below, above = SB0 bottom row)
     final recon1 = HarborIntraReconWalk(

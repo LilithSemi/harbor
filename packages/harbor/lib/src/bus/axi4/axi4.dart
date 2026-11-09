@@ -4,7 +4,7 @@
 /// convenience configuration and missing arbiter/decoder components.
 library;
 
-export 'package:rohd_hcl/src/interfaces/axi4.dart';
+export 'package:rohd_hcl/src/interfaces/amba/amba4/axi4.dart';
 
 export 'axi4_config.dart';
 export 'axi4_exclusive.dart';

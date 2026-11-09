@@ -168,7 +168,7 @@ class HarborFilmGrainApply extends BridgeModule {
       Logic build(int k) {
         if (k == 0) return x;
         if (k >= vw) return x[vw - 1].replicate(vw);
-        return [x[vw - 1].replicate(k), x.getRange(k, vw)].swizzle();
+        return [x[vw - 1].replicate(k), x.getRange(k, vw)].concat();
       }
 
       Logic v = build(0);
@@ -201,7 +201,7 @@ class HarborFilmGrainApply extends BridgeModule {
     // block offsets (combinational from seed)
     List<Logic> lfsrStep(Logic r) {
       final b = r[0] ^ r[1] ^ r[3] ^ r[12];
-      final next = [b, r.getRange(1, 16)].swizzle();
+      final next = [b, r.getRange(1, 16)].concat();
       return [next];
     }
 
@@ -244,12 +244,12 @@ class HarborFilmGrainApply extends BridgeModule {
     // Overlap blend helpers (a = neighbour/above, b = current).
     Logic blend2(Logic a, Logic b, Logic pos0) {
       // pos0=1 => weight (27a+17b). Else (17a+27b). Then >>5, clamp grain range.
-      final aw = mux(pos0, Const(27, width: 32), Const(17, width: 32));
-      final bw = mux(pos0, Const(17, width: 32), Const(27, width: 32));
+      final aw = mux<Logic>(pos0, Const(27, width: 32), Const(17, width: 32));
+      final bw = mux<Logic>(pos0, Const(17, width: 32), Const(27, width: 32));
       final s =
           (aw * a.signExtend(32) + bw * b.signExtend(32) + Const(16, width: 32))
               .getRange(0, 32);
-      final sh = [s[31].replicate(5), s.getRange(5, 32)].swizzle();
+      final sh = [s[31].replicate(5), s.getRange(5, 32)].concat();
       return clampS(sh, grainMin, grainMax).getRange(0, grainW);
     }
 
@@ -259,7 +259,7 @@ class HarborFilmGrainApply extends BridgeModule {
                   Const(22, width: 32) * b.signExtend(32) +
                   Const(16, width: 32))
               .getRange(0, 32);
-      final sh = [s[31].replicate(5), s.getRange(5, 32)].swizzle();
+      final sh = [s[31].replicate(5), s.getRange(5, 32)].concat();
       return clampS(sh, grainMin, grainMax).getRange(0, grainW);
     }
 
@@ -277,7 +277,7 @@ class HarborFilmGrainApply extends BridgeModule {
     final outCrBus = Logic(name: 'out_cr_bus', width: nChromaPx * pxW);
 
     Logic shiftPx(Logic bus, Logic v, int n) =>
-        [bus.getRange(0, (n - 1) * pxW), v.getRange(0, pxW)].swizzle();
+        [bus.getRange(0, (n - 1) * pxW), v.getRange(0, pxW)].concat();
 
     // block indices for luma pixel (yR,xR): by=Y>>5, bx=X>>5, li=Y&31, lj=X&31.
     Logic bY() => yR.getRange(5, 16);
@@ -500,7 +500,7 @@ class HarborFilmGrainApply extends BridgeModule {
           (avgLuma * lumaMult.signExtend(32) +
                   mult.signExtend(32) * rec.zeroExtend(32))
               .getRange(0, 32);
-      final t2 = [t1[31].replicate(6), t1.getRange(6, 32)].swizzle();
+      final t2 = [t1[31].replicate(6), t1.getRange(6, 32)].concat();
       final idx = clampS((t2 + offset).getRange(0, 32), 0, chromaClampHi);
       final scale = scaleOf(lut, idx.getRange(0, 16));
       return applyPix(rec, scale, grainCval(tmpl), minC, maxC);

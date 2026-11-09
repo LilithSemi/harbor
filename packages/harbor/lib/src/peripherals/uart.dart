@@ -158,7 +158,7 @@ class HarborUart extends BridgeModule
       ]);
       // The lane in the word, plus the word-select address bit on a 32-bit
       // bus. A 64-bit bus holds all 8 registers in one word.
-      addr = laneBits >= 3 ? wrLane : [bus.addr[2], wrLane].swizzle();
+      addr = laneBits >= 3 ? wrLane : [bus.addr[2], wrLane].concat();
       final laneData = Logic(name: 'uart_dat_in', width: 8);
       Combinational([
         laneData < Const(0, width: 8),
@@ -218,7 +218,7 @@ class HarborUart extends BridgeModule
     // Baud rate
     final baudCount = Logic(name: 'baud_count', width: 16);
     final baudTick = Logic(name: 'baud_tick');
-    final divisor = [dlm, dll].swizzle();
+    final divisor = [dlm, dll].concat();
     baudTick <=
         baudCount.eq(Const(0, width: 16)) & divisor.neq(Const(0, width: 16));
 
@@ -301,7 +301,7 @@ class HarborUart extends BridgeModule
       Logic regIndex(int s) => switch ((word, slotBits)) {
         (null, _) => Const(s, width: 3),
         (final w?, 0) => w,
-        (final w?, _) => [w, Const(s, width: slotBits)].swizzle(),
+        (final w?, _) => [w, Const(s, width: slotBits)].concat(),
       };
       final used = slots < 8 ? slots : 8;
       final slotValue = [
@@ -320,7 +320,7 @@ class HarborUart extends BridgeModule
       final rbrWord = word == null ? Const(1) : word.eq(0);
       readItems = [
         datOutW <
-            slotValue.reversed.toList().swizzle().zeroExtend(bus.dataOut.width),
+            slotValue.reversed.toList().concat().zeroExtend(bus.dataOut.width),
         If(~dlab & rbrWord & bus.sel[0], then: [rxReady < Const(0)]),
       ];
       writeItems = [
@@ -347,11 +347,11 @@ class HarborUart extends BridgeModule
       ];
     } else {
       // Every register of the addressed word is returned in its lane.
-      final word0 = regValue.sublist(0, 4).reversed.toList().swizzle();
-      final word1 = regValue.sublist(4).reversed.toList().swizzle();
+      final word0 = regValue.sublist(0, 4).reversed.toList().concat();
+      final word1 = regValue.sublist(4).reversed.toList().concat();
       if (lanes >= 8) {
         readItems = [
-          datOutW < [word1, word0].swizzle().zeroExtend(bus.dataOut.width),
+          datOutW < [word1, word0].concat().zeroExtend(bus.dataOut.width),
           If(~dlab & bus.sel[0], then: [rxReady < Const(0)]),
         ];
       } else {
@@ -438,7 +438,7 @@ class HarborUart extends BridgeModule
             ~txBusy & txHoldingFull,
             then: [
               txShift <
-                  [Const(1, width: 1), txHolding, Const(0, width: 1)].swizzle(),
+                  [Const(1, width: 1), txHolding, Const(0, width: 1)].concat(),
               txBusy < Const(1),
               txCount < Const(0, width: 4),
               txHoldingFull < Const(0),
@@ -462,7 +462,7 @@ class HarborUart extends BridgeModule
                   rxBits < Const(0, width: 4),
                   // Half a bit period, to land mid-start for validation.
                   rxBaud <
-                      [Const(0, width: 1), divisor.getRange(1, 16)].swizzle(),
+                      [Const(0, width: 1), divisor.getRange(1, 16)].concat(),
                 ],
               ),
             ],
@@ -488,7 +488,7 @@ class HarborUart extends BridgeModule
                         then: [
                           // Data bits 1..8: insert at the top and shift down,
                           // so the first (LSB-first) bit ends at bit 0.
-                          rxShift < [rxSyncB, rxShift.getRange(1, 8)].swizzle(),
+                          rxShift < [rxSyncB, rxShift.getRange(1, 8)].concat(),
                           rxBits < (rxBits + Const(1, width: 4)),
                         ],
                         orElse: [

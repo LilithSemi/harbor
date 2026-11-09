@@ -209,16 +209,14 @@ class SdramPhyEcp5 extends SdramPhyBase {
     oBa <=
         [
           for (var i = 0; i < bankBits; i++) ofsData(ba[i], 'ba_ofs_$i'),
-        ].rswizzle();
+        ].rconcat();
     oAddr <=
         [
           for (var i = 0; i < config.rowWidth; i++)
             ofsData(addr[i], 'addr_ofs_$i'),
-        ].rswizzle();
+        ].rconcat();
     oDqm <=
-        [
-          for (var i = 0; i < dqmBits; i++) ofs(dqm[i], 'dqm_ofs_$i'),
-        ].rswizzle();
+        [for (var i = 0; i < dqmBits; i++) ofs(dqm[i], 'dqm_ofs_$i')].rconcat();
 
     oClk <= Ecp5Oddrx1f(sclk: clk, d0: Const(0), d1: Const(1), rst: Const(0)).q;
 
@@ -272,7 +270,7 @@ class SdramPhyEcp5 extends SdramPhyBase {
     // adds no register of its own: the capture register above already
     // free-runs every cycle, so readLatency alone (not more fabric here)
     // accounts for reading the bit it holds a cycle (or more) later.
-    var capturedBus = captured.rswizzle();
+    var capturedBus = captured.rconcat();
     for (var c = 0; c < _phyConfig.captureCycles - 1; c++) {
       capturedBus = flop(clk, capturedBus, reset: reset);
     }
