@@ -962,13 +962,15 @@ const _ax7203 = HarborBoard(
 /// `xilinx_kc705` platform, and each group is marked "LiteX". Where the two
 /// disagree, the Xilinx file wins.
 ///
-/// Banks 12 to 18 run at 2.5 V and banks 32 to 34 run at 1.5 V. The DDR3
-/// pins are SSTL15. The `MGT` pin-map marker suppresses an invalid IOSTANDARD
+/// Banks 14 and 15 are fixed at 2.5 V. Banks 12, 13, 16, 17 and 18 are on
+/// VADJ, which is 2.5 V by default and can be 1.8 V or 3.3 V, so their
+/// LVCMOS25 pins assume the default. Banks 32 to 34 run at 1.5 V. The DDR3
+/// pins are SSTL15 (UG810 Table 1-3). The `MGT` pin-map marker suppresses an invalid IOSTANDARD
 /// property on transceiver and reference-clock pads.
 ///
 /// This preset lists the pads for later DDR3, PCIe x8, GMII Ethernet, HDMI
-/// and SFP work. The reset button is active high, so `reset` connects to the
-/// SoC `reset` port directly.
+/// and SFP work. The reset button is active high. A `HarborSoC` with clock
+/// domains takes an active-low `reset_n`, so a top must invert `reset`.
 const _kc705 = HarborBoard(
   name: 'kc705',
   vendor: HarborFpgaVendor.openXc7,
@@ -979,7 +981,9 @@ const _kc705 = HarborBoard(
   clockNPortName: 'clk_n',
   progCommand: 'openFPGALoader -b kc705 \$(TOP).bit',
   pins: {
-    // SYSCLK 200 MHz LVDS oscillator on the bank 33 MRCC pair (Xilinx).
+    // SYSCLK 200 MHz oscillator on the bank 33 MRCC pair. DIFF_SSTL15 is from
+    // part0_pins.xml. UG810 Table 1-9 says LVDS. Both are valid on a 1.5 V
+    // bank.
     'clk': 'AD12 DIFF_SSTL15',
     'clk_n': 'AD11 DIFF_SSTL15',
     // CPU_RESET push button, active high (Xilinx). The SoC `reset` port is
@@ -1087,15 +1091,14 @@ const _kc705 = HarborBoard(
     'i2c_scl': 'K21 LVCMOS25',
     'i2c_sda': 'L21 LVCMOS25',
     'i2c_mux_reset_n': 'P23 LVCMOS25',
-    // SFP cage, quad 117 channel 2. TX is Xilinx. The Xilinx file names G3 the
-    // RX positive pad and G4 the RX negative pad, which is the reverse of the
-    // FPGA RXP and RXN pins, so the lane must invert RX polarity. The
-    // 125 MHz oscillator is MGTREFCLK0 of quad 117 (Xilinx name SGMIICLK_Q0).
+    // SFP cage, quad 117 channel 2 (UG810 Table 1-14). On boards before
+    // Rev 1.1 the RX pair is swapped on the SFP+ connector. The 125 MHz
+    // oscillator is MGTREFCLK0 of quad 117 (Xilinx name SGMIICLK_Q0).
     // TX_DISABLE and LOS use LVCMOS25 from LiteX. The Xilinx file lists LVDS.
     'sfp_txp': 'H2 MGT',
     'sfp_txn': 'H1 MGT',
-    'sfp_rxp': 'G3 MGT',
-    'sfp_rxn': 'G4 MGT',
+    'sfp_rxp': 'G4 MGT',
+    'sfp_rxn': 'G3 MGT',
     'sfp_refclk_p': 'G8 MGT',
     'sfp_refclk_n': 'G7 MGT',
     'sfp_tx_disable': 'Y20 LVCMOS25',
@@ -1107,7 +1110,8 @@ const _kc705 = HarborBoard(
     'si5324_clkin_n': 'W28 LVDS_25',
     'si5324_rst_n': 'AE20 LVCMOS25',
     'si5324_int_n': 'AG24 LVCMOS25',
-    // ADV7511 HDMI transmitter, all LiteX. Banks 17 and 18 are 2.5 V.
+    // ADV7511 HDMI transmitter, all LiteX. hdmi_d[0] to hdmi_d[17] go to the
+    // ADV7511 D8 to D25 inputs (UG810 Table 1-21).
     'hdmi_clk': 'K18 LVCMOS25',
     'hdmi_de': 'H17 LVCMOS25',
     'hdmi_hsync': 'J18 LVCMOS25',
@@ -1144,6 +1148,12 @@ const _kc705 = HarborBoard(
     'sdram_cas_n': 'AC11 SSTL15',
     'sdram_we_n': 'AE9 SSTL15',
     'sdram_odt': 'AD8 SSTL15',
+    // Second rank of the SODIMM (UG810 Table 1-4).
+    'sdram_ck[1]': 'AE11 DIFF_SSTL15',
+    'sdram_ck_n[1]': 'AF11 DIFF_SSTL15',
+    'sdram_cke[1]': 'AE10 SSTL15',
+    'sdram_cs_n[1]': 'AE8 SSTL15',
+    'sdram_odt[1]': 'AC10 SSTL15',
     'sdram_reset_n': 'AK3 LVCMOS15',
     'sdram_ba[0]': 'AH9 SSTL15',
     'sdram_ba[1]': 'AG9 SSTL15',
