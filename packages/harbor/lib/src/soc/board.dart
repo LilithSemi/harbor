@@ -965,8 +965,8 @@ const _ax7203 = HarborBoard(
 /// Banks 14 and 15 are fixed at 2.5 V. Banks 12, 13, 16, 17 and 18 are on
 /// VADJ, which is 2.5 V by default and can be 1.8 V or 3.3 V, so their
 /// LVCMOS25 pins assume the default. Banks 32 to 34 run at 1.5 V. The DDR3
-/// pins are SSTL15 (UG810 Table 1-3). The `MGT` pin-map marker suppresses an invalid IOSTANDARD
-/// property on transceiver and reference-clock pads.
+/// pins are SSTL15 (UG810 Table 1-3). The `MGT` pin-map marker suppresses an
+/// invalid IOSTANDARD property on transceiver and reference-clock pads.
 ///
 /// This preset lists the pads for later DDR3, PCIe x8, GMII Ethernet, HDMI
 /// and SFP work. The reset button is active high. A `HarborSoC` with clock
@@ -986,8 +986,8 @@ const _kc705 = HarborBoard(
     // bank.
     'clk': 'AD12 DIFF_SSTL15',
     'clk_n': 'AD11 DIFF_SSTL15',
-    // CPU_RESET push button, active high (Xilinx). The SoC `reset` port is
-    // active high too, so the pin goes to it with no inversion.
+    // CPU_RESET push button, active high (Xilinx). A top must invert it for
+    // the active-low `reset_n` port of a HarborSoC.
     'reset': 'AB7 LVCMOS15',
     // CP2103 USB-UART. The sites are Xilinx and LVCMOS25 is LiteX.
     'uart_tx': 'K24 LVCMOS25',
@@ -1140,15 +1140,15 @@ const _kc705 = HarborBoard(
     // DDR3 SODIMM, all LiteX. Banks 32, 33 and 34 are 1.5 V. DQ and DQS use
     // SSTL15 with IN_TERM, the same choice as the AX7203 preset, because the
     // open flow has no DCI.
-    'sdram_ck': 'AG10 DIFF_SSTL15',
-    'sdram_ck_n': 'AH10 DIFF_SSTL15',
-    'sdram_cke': 'AF10 SSTL15',
-    'sdram_cs_n': 'AC12 SSTL15',
+    'sdram_ck[0]': 'AG10 DIFF_SSTL15',
+    'sdram_ck_n[0]': 'AH10 DIFF_SSTL15',
+    'sdram_cke[0]': 'AF10 SSTL15',
+    'sdram_cs_n[0]': 'AC12 SSTL15',
     'sdram_ras_n': 'AD9 SSTL15',
     'sdram_cas_n': 'AC11 SSTL15',
     'sdram_we_n': 'AE9 SSTL15',
-    'sdram_odt': 'AD8 SSTL15',
-    // Second rank of the SODIMM (UG810 Table 1-4).
+    'sdram_odt[0]': 'AD8 SSTL15',
+    // Rank 1 of the SODIMM (UG810 Table 1-4).
     'sdram_ck[1]': 'AE11 DIFF_SSTL15',
     'sdram_ck_n[1]': 'AF11 DIFF_SSTL15',
     'sdram_cke[1]': 'AE10 SSTL15',

@@ -211,6 +211,11 @@ class HarborSoC extends BridgeModule {
   /// Board oscillator rate for the Xilinx DDR3 clock tree.
   double? _xilinxSourceClkMhz;
 
+  /// Whether the SoC builds the Xilinx DDR3 clock tree. The PLL clock net
+  /// naming, its keep attribute and its nextpnr scripts all follow this one
+  /// check, so a DDR3 build keeps its own clock script and RTL.
+  late final bool _hasDdr3ClockTree;
+
   /// Clock net name to MHz for each Xilinx PLL domain that has no DDR3 tree.
   final Map<String, double> _xilinxPllClockMhz = {};
 
@@ -363,6 +368,7 @@ class HarborSoC extends BridgeModule {
     // crossed reads (the creek boot coin-flip). Two independent PLLs drift, so
     // the crossing is genuinely async. Both PLLs source one shared input BUFG so
     // openXC7 accepts two PLLs on the pin's single clock-capable route.
+    _hasDdr3ClockTree = xilinxDdr3Tree != null;
     final ddrSpec = xilinxDdr3Tree;
     ({Logic coreClk, Logic locked, double coreMhz})? corePll;
     if (ddrSpec != null) {
@@ -447,7 +453,7 @@ class HarborSoC extends BridgeModule {
         final domain = _clockGen.createDomain(
           clkConfig,
           namePllClock:
-              xilinxDdr3Tree == null &&
+              !_hasDdr3ClockTree &&
               t is HarborFpgaTarget &&
               t.vendor == HarborFpgaVendor.openXc7,
         );
@@ -1471,8 +1477,7 @@ class HarborSoC extends BridgeModule {
           );
         }
       }
-      if (fileContents.name == name &&
-          !peripherals.any((p) => p is HarborDdr3)) {
+      if (fileContents.name == name && !_hasDdr3ClockTree) {
         for (final clockNet in _xilinxPllClockMhz.keys) {
           final declaration = RegExp(
             '^logic $clockNet;\\s*\$',
@@ -1690,7 +1695,7 @@ class HarborSoC extends BridgeModule {
               t.vendor == HarborFpgaVendor.openXc7 &&
               !t.useHimbaechel &&
               _xilinxPllClockMhz.isNotEmpty &&
-              !peripherals.any((p) => p is HarborDdr3);
+              !_hasDdr3ClockTree;
           File('$path/Makefile').writeAsStringSync(
             t.generateMakefile(name, pllClockScript: pllScript),
           );
@@ -1760,7 +1765,7 @@ class HarborSoC extends BridgeModule {
                 );
               }
             }
-            if (ddr == null && _xilinxPllClockMhz.isNotEmpty) {
+            if (!_hasDdr3ClockTree && _xilinxPllClockMhz.isNotEmpty) {
               if (t.useHimbaechel) {
                 // Himbächel can lack Python hooks, so the XDC carries the rate.
                 final xdc = File('$path/$name.${t.constraintExtension}');
