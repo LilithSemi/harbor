@@ -441,17 +441,19 @@ class HarborSoC extends BridgeModule {
         _clockDomains[sec.name] = shared.secondary;
         _clockDomains[clkConfig.name] = shared.primary;
       } else {
-        final domain = _clockGen.createDomain(clkConfig);
-        _clockDomains[clkConfig.name] = domain;
         final t = target;
-        if (t is HarborFpgaTarget &&
-            (t.vendor == HarborFpgaVendor.openXc7 ||
-                t.vendor == HarborFpgaVendor.vivado) &&
-            !clkConfig.isPrimary &&
-            clkConfig.frequency != clkConfig.sourceFrequency) {
-          _xilinxPllClockMhz['${clkConfig.name}_clk'] =
-              clkConfig.frequency / 1e6;
-        }
+        // A design with the DDR3 clock tree has its own clock script, so its
+        // generated RTL stays as it was.
+        final domain = _clockGen.createDomain(
+          clkConfig,
+          namePllClock:
+              xilinxDdr3Tree == null &&
+              t is HarborFpgaTarget &&
+              t.vendor == HarborFpgaVendor.openXc7,
+        );
+        _clockDomains[clkConfig.name] = domain;
+        final pll = domain.pllClock;
+        if (pll != null) _xilinxPllClockMhz[pll.net] = pll.hz / 1e6;
       }
     }
   }
@@ -1469,10 +1471,20 @@ class HarborSoC extends BridgeModule {
           );
         }
       }
-      if (fileContents.name == name) {
+      if (fileContents.name == name &&
+          !peripherals.any((p) => p is HarborDdr3)) {
         for (final clockNet in _xilinxPllClockMhz.keys) {
+          final declaration = RegExp(
+            '^logic $clockNet;\\s*\$',
+            multiLine: true,
+          );
+          if (!declaration.hasMatch(contents)) {
+            throw StateError(
+              'Generated top RTL is missing the PLL clock net $clockNet.',
+            );
+          }
           contents = contents.replaceFirst(
-            RegExp('^logic $clockNet;\\s*\$', multiLine: true),
+            declaration,
             '(* keep = 1 *) logic $clockNet;',
           );
         }
@@ -1674,7 +1686,14 @@ class HarborSoC extends BridgeModule {
           File(
             '$path/synth.tcl',
           ).writeAsStringSync(t.generateYosysTcl(name, svFiles: svFiles));
-          File('$path/Makefile').writeAsStringSync(t.generateMakefile(name));
+          final pllScript =
+              t.vendor == HarborFpgaVendor.openXc7 &&
+              !t.useHimbaechel &&
+              _xilinxPllClockMhz.isNotEmpty &&
+              !peripherals.any((p) => p is HarborDdr3);
+          File('$path/Makefile').writeAsStringSync(
+            t.generateMakefile(name, pllClockScript: pllScript),
+          );
 
           // OpenOCD config, auto-emitted when the SoC has a JTAG debug master.
           final jtag = masters.whereType<HarborJtagDebug>();
@@ -1756,7 +1775,7 @@ class HarborSoC extends BridgeModule {
                 xdc.writeAsStringSync(lines.toString());
               } else {
                 Directory('$path/support/nextpnr').createSync(recursive: true);
-                File('$path/support/nextpnr/clocks.py').writeAsStringSync(
+                File('$path/support/nextpnr/pll_clocks.py').writeAsStringSync(
                   t.generatePllClockConstraintPy(_xilinxPllClockMhz),
                 );
               }

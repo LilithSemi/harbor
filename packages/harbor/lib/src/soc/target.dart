@@ -772,21 +772,18 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     return buf.toString();
   }
 
-  /// Generates `support/nextpnr/clocks.py` for a design with PLL clocks and no
-  /// DDR3 tree. Each net in [mhzByNet] gets an `addClock` at its real rate,
-  /// because nextpnr gives a clock that comes from a MMCM and a BUFG a
-  /// default 12 MHz target.
+  /// Generates `support/nextpnr/pll_clocks.py` for a design with PLL clocks
+  /// and no DDR3 tree. Each net in [mhzByNet] gets an `addClock` at its real
+  /// rate, because nextpnr gives a clock that comes from a MMCM and a BUFG a
+  /// default 12 MHz target. A failed `addClock` stops the build.
   String generatePllClockConstraintPy(Map<String, double> mhzByNet) {
     final buf = StringBuffer('for net, mhz in [\n');
     for (final e in mhzByNet.entries) {
       buf.writeln("    ('${e.key}', ${e.value.toStringAsFixed(2)}),");
     }
     buf.writeln(']:');
-    buf.writeln('    try:');
-    buf.writeln('        ctx.addClock(net, mhz)');
-    buf.writeln("        print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
-    buf.writeln('    except Exception as e:');
-    buf.writeln("        print('ADDCLOCK %s FAILED: %s' % (net, e))");
+    buf.writeln('    ctx.addClock(net, mhz)');
+    buf.writeln("    print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
     return buf.toString();
   }
 
@@ -809,7 +806,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   }
 
   /// Generates a complete Makefile for the FPGA build flow.
-  String generateMakefile(String topCell) {
+  ///
+  /// With [pllClockScript], an openXC7 Makefile also takes
+  /// `support/nextpnr/pll_clocks.py` as a `--pre-pack` script. That script
+  /// has no `--timing-allow-fail`, so a missed clock fails the build.
+  String generateMakefile(String topCell, {bool pllClockScript = false}) {
     final buf = StringBuffer();
     buf.writeln('# Auto-generated Makefile for $name');
     buf.writeln('TOP = $topCell');
@@ -954,8 +955,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       );
       buf.writeln('# bitstream when the aggressive target is not met.');
       buf.writeln(
-        'PREPACK := \$(if \$(wildcard support/nextpnr/clocks.py),'
-        '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
+        pllClockScript
+            ? 'PREPACK := \$(if \$(wildcard support/nextpnr/pll_clocks.py),'
+                  '--pre-pack support/nextpnr/pll_clocks.py,)'
+            : 'PREPACK := \$(if \$(wildcard support/nextpnr/clocks.py),'
+                  '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
       );
       buf.writeln();
       buf.writeln('pnr: \$(TOP).fasm');

@@ -246,6 +246,10 @@ class HarborClockDomain {
   /// The achieved frequency in Hz when a PLL tolerance was used, else null.
   final double? achievedFrequencyHz;
 
+  /// The named net of the Xilinx MMCM clock and the rate it really runs at,
+  /// or null when the domain was not asked to name it.
+  final ({String net, double hz})? pllClock;
+
   const HarborClockDomain({
     required this.config,
     required this.clk,
@@ -254,6 +258,7 @@ class HarborClockDomain {
     this.frequencySelect,
     this.simPort,
     this.achievedFrequencyHz,
+    this.pllClock,
   });
 
   /// The domain name.
@@ -379,7 +384,10 @@ class HarborClockGenerator {
     return domain;
   }
 
-  HarborClockDomain createDomain(HarborClockConfig config) {
+  HarborClockDomain createDomain(
+    HarborClockConfig config, {
+    bool namePllClock = false,
+  }) {
     if (config.isPrimary) {
       final domain = HarborClockDomain(
         config: config,
@@ -426,7 +434,7 @@ class HarborClockGenerator {
 
     switch (t) {
       case HarborFpgaTarget():
-        return _createFpgaPll(config, sourceFreq, t);
+        return _createFpgaPll(config, sourceFreq, t, namePllClock);
       case HarborAsicTarget():
         return _createAsicPll(config, sourceFreq);
       case HarborSimTarget():
@@ -462,6 +470,7 @@ class HarborClockGenerator {
     HarborClockConfig config,
     int sourceFreq,
     HarborFpgaTarget fpga,
+    bool namePllClock,
   ) {
     switch (fpga.vendor) {
       case HarborFpgaVendor.ice40:
@@ -470,7 +479,7 @@ class HarborClockGenerator {
         return _createEcp5Pll(config, sourceFreq);
       case HarborFpgaVendor.vivado:
       case HarborFpgaVendor.openXc7:
-        return _createXilinxPll(config, sourceFreq);
+        return _createXilinxPll(config, sourceFreq, namePllClock: namePllClock);
     }
   }
 
@@ -1194,7 +1203,11 @@ class HarborClockGenerator {
     return (primary: primary, secondary: secondary);
   }
 
-  HarborClockDomain _createXilinxPll(HarborClockConfig config, int sourceFreq) {
+  HarborClockDomain _createXilinxPll(
+    HarborClockConfig config,
+    int sourceFreq, {
+    bool namePllClock = false,
+  }) {
     final periodNs = 1e9 / sourceFreq;
     // MMCM: fout = fin * CLKFBOUT_MULT_F / (DIVCLK_DIVIDE * CLKOUT0_DIVIDE_F).
     // The VCO (fin*M/D) MUST land in 600-1200 MHz or the MMCM never locks. The
@@ -1250,12 +1263,20 @@ class HarborClockGenerator {
     final lockHold = (~lockCnt[17]).named('${config.name}_mmcmLockHold');
 
     // A stable name lets the generated nextpnr clock script find this net.
-    final domClk = bufg.output('O').named('${config.name}_clk');
+    final domClk = namePllClock
+        ? bufg.output('O').named('${config.name}_clk')
+        : bufg.output('O');
     final domain = HarborClockDomain(
       config: config,
       clk: domClk,
       reset: _domainReset(domClk, inputReset | lockHold, config.name),
       locked: mmcm.output('LOCKED'),
+      pllClock: namePllClock
+          ? (
+              net: '${config.name}_clk',
+              hz: sourceFreq * mult / (divClk * outDiv),
+            )
+          : null,
     );
     _domains.add(domain);
     return domain;
