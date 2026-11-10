@@ -35,8 +35,8 @@ Future<void> _run({
     blockRam: blockRam,
     name: 'fifo_rand',
   );
-  final wrClk = SimpleClockGenerator(wrPeriod).clk;
-  final rdClk = SimpleClockGenerator(rdPeriod).clk;
+  final wrClk = SimpleClockGenerator(wrPeriod + (wrPeriod & 1)).clk;
+  final rdClk = SimpleClockGenerator(rdPeriod + (rdPeriod & 1)).clk;
   final wrReset = Logic(name: 'wr_reset_in');
   final rdReset = Logic(name: 'rd_reset_in');
   final wrData = Logic(name: 'wr_data_in', width: dw);

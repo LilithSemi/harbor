@@ -122,8 +122,10 @@ Future<WaistScanResult> runWaistScanout({
   );
   final memHz = 1000000000000 ~/ memPeriodPs;
   final top = _WaistScanTop(kind, config, timing, memHz: memHz);
-  final fabricClk = SimpleClockGenerator(fabricPeriodPs).clk;
-  final memClk = SimpleClockGenerator(memPeriodPs).clk;
+  final fabricClk = SimpleClockGenerator(
+    fabricPeriodPs + (fabricPeriodPs & 1),
+  ).clk;
+  final memClk = SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
   final pixelClk = SimpleClockGenerator(39722).clk;
   for (final input in top.inputs.values) {
     if (!input.name.endsWith('clk')) {

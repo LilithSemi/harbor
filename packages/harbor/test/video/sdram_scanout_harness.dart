@@ -338,9 +338,9 @@ class SdramScanoutBench {
     );
     soc.buildFabric();
 
-    sysClk = SimpleClockGenerator(sysPeriodPs).clk;
-    memClk = SimpleClockGenerator(memPeriodPs).clk;
-    pixelClk = SimpleClockGenerator(pixelPeriodPs).clk;
+    sysClk = SimpleClockGenerator(sysPeriodPs + (sysPeriodPs & 1)).clk;
+    memClk = SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
+    pixelClk = SimpleClockGenerator(pixelPeriodPs + (pixelPeriodPs & 1)).clk;
 
     soc.input('clk').srcConnection! <= sysClk;
     soc.input('reset').srcConnection! <= sysReset;

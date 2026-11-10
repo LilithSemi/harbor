@@ -850,7 +850,7 @@ class HarborSpiFlashController extends BridgeModule
               wrCsN < Const(0),
               wrBitCount < Const(0, width: 8),
               wrShift <
-                  mux(
+                  mux<Logic>(
                     wrOpL,
                     Const(cmdProgram << 24, width: 32),
                     Const(cmdErase << 24, width: 32),

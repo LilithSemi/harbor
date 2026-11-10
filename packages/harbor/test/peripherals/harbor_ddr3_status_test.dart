@@ -74,7 +74,7 @@ Future<void> _fastSimOrder(int ddrPeriod) async {
   {
     final ddr = _ddr(target: _artix, fastSim: true);
     final clk = SimpleClockGenerator(10).clk;
-    final ddrClk = SimpleClockGenerator(ddrPeriod).clk;
+    final ddrClk = SimpleClockGenerator(ddrPeriod + (ddrPeriod & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final ddrReset = Logic(name: 'ddr_reset')..inject(1);
     ddr.input('clk').srcConnection! <= clk;

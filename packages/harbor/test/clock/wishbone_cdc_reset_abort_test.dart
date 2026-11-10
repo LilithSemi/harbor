@@ -29,9 +29,9 @@ class Rig {
   /// Every m-side cycle start.
   final starts = <int>[];
 
-  Rig(this.dut, {int sPeriod = 10, int mPeriod = 7})
-    : sClk = SimpleClockGenerator(sPeriod).clk,
-      mClk = SimpleClockGenerator(mPeriod).clk {
+  Rig(this.dut, {int sPeriod = 10, int mPeriod = 8})
+    : sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk,
+      mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk {
     dut.input('s_clk').srcConnection! <= sClk;
     dut.input('s_reset').srcConnection! <= sReset;
     dut.input('s_cyc').srcConnection! <= sCyc;

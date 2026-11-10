@@ -87,6 +87,115 @@ void main() {
       expect(target.vendor, equals(HarborFpgaVendor.openXc7));
       expect(target.constraintExtension, equals('xdc'));
     });
+
+    test(
+      'clock constraints bind oscillator and explicit core net separately',
+      () {
+        const target = HarborFpgaTarget.spartan7(
+          device: 'xc7s50',
+          package: 'csga324',
+          useOpenXc7: true,
+        );
+
+        final at25MHz = target.generateClockConstraintPy(
+          coreClkMhz: 25,
+          coreClockNet: 'core_clk',
+          sourceClockNet: 'sysosc_clk',
+          sourceClkMhz: 100,
+          ddrCtrlMhz: 100,
+        );
+        expect(at25MHz, contains("('sysosc_clk', 100.00)"));
+        expect(at25MHz, contains("('core_clk', 35.00)"));
+        expect(at25MHz, isNot(contains("('sysosc_clk', 35.00)")));
+
+        final at3333MHz = target.generateClockConstraintPy(
+          coreClkMhz: 33.333333,
+          coreClockNet: 'core_clk',
+          sourceClockNet: 'sysosc_clk',
+          sourceClkMhz: 100,
+          ddrCtrlMhz: 100,
+        );
+        expect(at3333MHz, contains("('sysosc_clk', 100.00)"));
+        expect(at3333MHz, contains("('core_clk', 46.67)"));
+        expect(at3333MHz, isNot(contains("('sysosc_clk', 46.67)")));
+      },
+    );
+
+    test('default Yosys mapping keeps the standard Xilinx command', () {
+      const target = HarborFpgaTarget.spartan7(
+        device: 'xc7s50',
+        package: 'csga324',
+        useOpenXc7: true,
+      );
+      final result = target.generateYosysTcl('TopCell');
+      expect(
+        result,
+        equals(
+          [
+            '# Auto-generated Yosys synthesis for spartan7-xc7s50',
+            '# Target: xilinx (xc7s50)',
+            '',
+            'read_verilog -sv rtl/*.sv',
+            'hierarchy -top TopCell',
+            'synth_xilinx -top TopCell -flatten',
+            'write_json TopCell.json',
+            'stat',
+            '',
+          ].join('\n'),
+        ),
+      );
+    });
+
+    test('xilinxLut6Cost emits the staged LUT6 mapping flow in order', () {
+      const target = HarborFpgaTarget.spartan7(
+        device: 'xc7s50',
+        package: 'csga324',
+        useOpenXc7: true,
+        xilinxLut6Cost: 3,
+      );
+      final result = target.generateYosysTcl('TopCell');
+      final expectedSequence = [
+        'synth_xilinx -top TopCell -flatten -run begin:map_luts',
+        'select -assert-any =LUT6',
+        'setattr -mod -set abc9_lut 3 =LUT6',
+        'select -assert-any =LUT6 =A:abc9_lut=3 %i',
+        'opt_expr -mux_undef -noclkinv',
+        'abc9 -maxlut 6',
+        'clean',
+        'xilinx_srl -fixed -minlen 3',
+        'techmap -map +/xilinx/lut_map.v -map +/xilinx/cells_map.v -D LUT_WIDTH=6',
+        'xilinx_dffopt',
+        'opt_lut_ins -tech xilinx',
+        'synth_xilinx -top TopCell -run finalize:',
+        'write_json TopCell.json',
+      ];
+      var lastIndex = -1;
+      for (final command in expectedSequence) {
+        final index = result.indexOf(command);
+        expect(index, greaterThan(lastIndex), reason: command);
+        lastIndex = index;
+      }
+      expect(result, isNot(contains('synth_xilinx -top TopCell -flatten\n')));
+    });
+
+    test('xilinxLut6Cost must be positive', () {
+      expect(
+        () => HarborFpgaTarget.spartan7(
+          device: 'xc7s50',
+          package: 'csga324',
+          xilinxLut6Cost: 0,
+        ),
+        throwsA(isA<AssertionError>()),
+      );
+      expect(
+        () => HarborFpgaTarget.spartan7(
+          device: 'xc7s50',
+          package: 'csga324',
+          xilinxLut6Cost: -1,
+        ),
+        throwsA(isA<AssertionError>()),
+      );
+    });
   });
 
   group('HarborFpgaTarget.artix7', () {

@@ -159,7 +159,7 @@ Future<HdmiRun> simulateHdmiFast(
   required int hdmiAt,
 }) async {
   const period = 10;
-  final clk = SimpleClockGenerator(period).clk;
+  final clk = SimpleClockGenerator(period + (period & 1)).clk;
   final reset = Logic(name: 'reset');
   final en = Logic(name: 'hdmi_enable');
   final ready = Logic(name: 'ready');

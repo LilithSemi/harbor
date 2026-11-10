@@ -93,7 +93,7 @@ Future<void> ddr3RandomBursts(
   final div = Logic(name: 'div', width: 2);
   Sequential(ck, reset: divInit, [div < div + 1]);
   final ddrClk = div[1];
-  final fabricClk = SimpleClockGenerator(fabricPeriod).clk;
+  final fabricClk = SimpleClockGenerator(fabricPeriod + (fabricPeriod & 1)).clk;
 
   for (final input in top.inputs.values) {
     if (!{'clk', 'ddr_clk', 'ddr_ck_fast'}.contains(input.name)) {

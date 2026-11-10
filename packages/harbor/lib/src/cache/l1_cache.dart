@@ -5,13 +5,14 @@ import '../peripherals/register_file.dart';
 import '../soc/target.dart';
 import 'cache_config.dart';
 
-/// Largest L1 tag store, in bits, that stays in flops. One iCE40 block RAM
-/// holds 4096 bits. A tag store of this size or smaller stays in flops.
+/// Largest L1 tag store, in bits, that stays in flops on small Lattice FPGAs.
+/// Xilinx uses block RAM even below this limit: wide tag read muxes and reset
+/// fanout are expensive routing resources on a dense 7-series design.
 const harborL1TagFlopBits = 4096;
 
-/// Line tag store of an L1 cache. Its read latency is 1 on every target. A
-/// store of up to [harborL1TagFlopBits] bits uses flops, a larger one uses the
-/// block RAM of the target.
+/// Line tag store of an L1 cache. Its read latency is 1 on every target.
+/// Xilinx stores use block RAM. Other targets use flops up to
+/// [harborL1TagFlopBits] bits and block RAM above that limit.
 class _L1TagStore {
   final HarborRegisterFile ram;
   final Logic _clk;
@@ -30,7 +31,10 @@ class _L1TagStore {
          parent,
          clk,
          reset,
-         lines * width > harborL1TagFlopBits ? target : null,
+         target?.blockRam == HarborBlockRam.ramb ||
+                 lines * width > harborL1TagFlopBits
+             ? target
+             : null,
          lines: lines,
          width: width,
          readPorts: readPorts,
@@ -48,6 +52,7 @@ class _L1TagStore {
     required String name,
   }) : _latency = HarborRegisterFile.blockRamReadLatency(target) ?? 1,
        ram = HarborRegisterFile(
+         useXilinxSdp72: true,
          numEntries: lines,
          dataWidth: width,
          numReadPorts: readPorts,
@@ -344,6 +349,7 @@ class HarborL1ICache extends BridgeModule {
     // 0, so one flop after it gives the same timing.
     final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
     final dataRam = HarborRegisterFile(
+      useXilinxSdp72: true,
       numEntries: numLines * lineWords,
       dataWidth: xlen,
       numReadPorts: dualPort ? 2 : 1,
@@ -913,6 +919,7 @@ class HarborL1DCache extends BridgeModule {
 
     final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
     final dataRam = HarborRegisterFile(
+      useXilinxSdp72: true,
       numEntries: numLines * lineWords,
       dataWidth: xlen,
       numReadPorts: 1,
@@ -1050,6 +1057,23 @@ class HarborL1DCache extends BridgeModule {
     dataRam.input('wr_data').srcConnection! <= memRdata;
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
+    // Fill completion, acknowledged stores, and miss-victim invalidation are
+    // mutually exclusive FSM events. Select their index/value once so the
+    // per-line valid bank needs only one equality decoder instead of three.
+    final fillValidSet = (fillWrEn & fillWord.eq(lastWord)).named(
+      'fillValidSet',
+    );
+    final storeValidClear = (storing & memDone & memValid & storeInv).named(
+      'storeValidClear',
+    );
+    final validUpdateEn = (fillValidSet | storeValidClear | loadMiss).named(
+      'validUpdateEn',
+    );
+    final validUpdateIdx = mux(
+      fillValidSet,
+      fillIdx,
+      mux(storeValidClear, storeIdx, idxOf(addrQ)),
+    ).named('validUpdateIdx');
     tagRam.ram.input('wr_en').srcConnection! <=
         fillWrEn & fillWord.eq(lastWord);
     tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
@@ -1074,6 +1098,18 @@ class HarborL1DCache extends BridgeModule {
           drain < 0,
         ],
         orElse: [
+          If(
+            validUpdateEn,
+            then: [
+              ...List.generate(
+                numLines,
+                (l) => If(
+                  validUpdateIdx.eq(l),
+                  then: [lineValid[l] < fillValidSet],
+                ),
+              ),
+            ],
+          ),
           // Invalidate every line even while an uncached read or write-through
           // store is finishing. Those operations cannot be cancelled safely:
           // their side effects may already have happened. Keep their state and
@@ -1122,16 +1158,7 @@ class HarborL1DCache extends BridgeModule {
                         then: [
                           If(
                             fillWord.eq(lastWord),
-                            then: [
-                              memEnR < 0,
-                              filling < 0,
-                              fillSettle < 1,
-                              ...List.generate(
-                                numLines,
-                                (l) =>
-                                    If(fillIdx.eq(l), then: [lineValid[l] < 1]),
-                              ),
-                            ],
+                            then: [memEnR < 0, filling < 0, fillSettle < 1],
                             orElse: [
                               fillWord < fillWord + 1,
                               memAddrR <
@@ -1175,13 +1202,6 @@ class HarborL1DCache extends BridgeModule {
                               memWeR < 0,
                               storing < 0,
                               storeDone < 1,
-                              ...List.generate(
-                                numLines,
-                                (l) => If(
-                                  storeInv & storeIdx.eq(l),
-                                  then: [lineValid[l] < 0],
-                                ),
-                              ),
                             ],
                           ),
                           // Faulting store: end it, leave the resident line
@@ -1284,13 +1304,6 @@ class HarborL1DCache extends BridgeModule {
                                       // A fault after an earlier refill beat
                                       // must not leave the victim's old tag
                                       // pointing at partially overwritten data.
-                                      ...List.generate(
-                                        numLines,
-                                        (l) => If(
-                                          idxOf(addrQ).eq(l),
-                                          then: [lineValid[l] < 0],
-                                        ),
-                                      ),
                                       memEnR < 1,
                                       memWeR < 0,
                                       // Read a FULL word per fill beat. wordBytes

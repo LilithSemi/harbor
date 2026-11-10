@@ -103,7 +103,7 @@ class HarborFilmGrainScale extends BridgeModule {
     }
 
     // Clamp bounds selected by clip_legal / is_chroma (bd8).
-    final lo = mux(
+    final lo = mux<Logic>(
       clipLegal,
       Const(16, width: wWork), // legal min: 16 for both luma and chroma.
       Const(0, width: wWork),

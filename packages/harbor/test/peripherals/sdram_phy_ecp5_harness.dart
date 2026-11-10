@@ -185,7 +185,7 @@ Future<SdramPhyEcp5RunResult> runSdramPhyEcp5Case({
 }) async {
   const bank = 0, row = 0;
   final config = sdramPhyTestConfig;
-  final clk = SimpleClockGenerator(periodPs).clk;
+  final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
   final reset = Logic(name: 'reset')..inject(0);
   final driver = SdramPhyEcp5Driver(clk);
   final dqPad = LogicNet(name: 'dq_pad', width: config.dataWidth);

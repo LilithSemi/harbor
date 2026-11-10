@@ -69,6 +69,12 @@ class HarborRegisterFile extends BridgeModule {
   /// other entry.
   final bool reservedZero;
 
+  /// Opt in to the 64-bit-wide RAMB36E1 simple-dual-port backend for Xilinx
+  /// register files with one write port, one bank, and at most 64 data bits.
+  /// Each read port gets one 72-bit SDP block instead of two x36 TDP blocks.
+  /// The default stays on the existing x36 backend until users select it.
+  final bool useXilinxSdp72;
+
   /// Read latency in cycles: 0 = combinational/mid-cycle read (flop array,
   /// iCE40 negedge EBR), 1 = registered full-cycle read (ECP5 posedge EBR). A
   /// non-zero latency keeps the read off the combinational ALU path (timing)
@@ -163,6 +169,8 @@ class HarborRegisterFile extends BridgeModule {
     HarborDeviceTarget? target,
     int numWritePorts,
     int numBanks,
+    int dataWidth,
+    bool useXilinxSdp72,
   ) {
     if (target is! HarborFpgaTarget) return 'flop';
     switch (target.vendor) {
@@ -172,7 +180,8 @@ class HarborRegisterFile extends BridgeModule {
         return 'ecp5';
       case HarborFpgaVendor.vivado:
       case HarborFpgaVendor.openXc7:
-        return (numWritePorts == 1 && numBanks == 1) ? 'xilinx' : 'flop';
+        if (numWritePorts != 1 || numBanks != 1) return 'flop';
+        return useXilinxSdp72 && dataWidth <= 64 ? 'xilinxSdp72' : 'xilinx';
     }
   }
 
@@ -184,6 +193,7 @@ class HarborRegisterFile extends BridgeModule {
     this.numBanks = 1,
     this.writeBufferDepth = 0,
     this.reservedZero = true,
+    this.useXilinxSdp72 = false,
     HarborDeviceTarget? target,
     int? forceReadLatency,
     String? name,
@@ -211,7 +221,13 @@ class HarborRegisterFile extends BridgeModule {
                _defaultReadLatency(target, numWritePorts, numBanks),
            writeBufferDepth: writeBufferDepth,
            reservedZero: reservedZero,
-           backend: _backendName(target, numWritePorts, numBanks),
+           backend: _backendName(
+             target,
+             numWritePorts,
+             numBanks,
+             dataWidth,
+             useXilinxSdp72,
+           ),
          ),
          name: name ?? 'regfile',
        ) {
@@ -281,6 +297,7 @@ class HarborRegisterFile extends BridgeModule {
             target.vendor == HarborFpgaVendor.openXc7) &&
         numWritePorts == 1 &&
         numBanks == 1;
+    final isXilinxSdp72 = isXilinxBram && useXilinxSdp72 && dataWidth <= 64;
 
     if ((isIce40Ebr || isEcp5Ebr) && (numWritePorts != 1 || numBanks != 1)) {
       // Banked multi-write EBR is project_hdl_dualissue Phase 2.
@@ -309,6 +326,16 @@ class HarborRegisterFile extends BridgeModule {
       } else {
         _buildEcp5Ebr(clk, rdAddrs, rdDatas, wrEns[0], wrAddrs[0], wrDatas[0]);
       }
+      wrReadys[0] <= ~reset;
+    } else if (isXilinxSdp72) {
+      _buildXilinxSdp72(
+        clk,
+        rdAddrs,
+        rdDatas,
+        wrEns[0],
+        wrAddrs[0],
+        wrDatas[0],
+      );
       wrReadys[0] <= ~reset;
     } else if (isXilinxBram) {
       _buildXilinxBram(clk, rdAddrs, rdDatas, wrEns[0], wrAddrs[0], wrDatas[0]);
@@ -621,6 +648,105 @@ class HarborRegisterFile extends BridgeModule {
           rdAddrs[r].eq(Const(0, width: addrWidth)),
           readLatency,
           'rfEbrX0_$r',
+        );
+        rdDatas[r] <= mux(isX0, Const(0, width: dataWidth), raw);
+      } else {
+        rdDatas[r] <= raw;
+      }
+    }
+  }
+
+  /// Opt-in Xilinx 7-series RAMB36E1 simple-dual-port storage. One 72-bit
+  /// block stores each word (64 data bits plus eight unused parity bits), so
+  /// one block serves each read replica. Port A reads and port B writes. This
+  /// preserves the one-cycle synchronous-read latency of the x36 backend.
+  void _buildXilinxSdp72(
+    Logic clk,
+    List<Logic> rdAddrs,
+    List<Logic> rdDatas,
+    Logic wrEn,
+    Logic wrAddr,
+    Logic wrData,
+  ) {
+    if (dataWidth < 1 || dataWidth > 64) {
+      throw ArgumentError(
+        'RAMB36E1 SDP72 register files require dataWidth in 1..64 '
+        '(got $dataWidth).',
+      );
+    }
+
+    // A RAMB36E1 in SDP72 mode has 512 words, with the word-address field in
+    // ADDR[14:6]. Keep the low six pins zero; the packer ties pin 15 high.
+    const blockBits = 9;
+    final depthBlocks = _depthBlocks(blockBits);
+    Logic toAd(Logic a) => [
+      Const(0, width: 1),
+      _blockAddr(a, blockBits, blockBits),
+      Const(0, width: 6),
+    ].concat().getRange(0, 16);
+
+    final wrAd = toAd(wrAddr);
+    final paddedWrite = wrData.zeroExtend(64);
+    final enabledBytes = (dataWidth + 7) ~/ 8;
+
+    for (var r = 0; r < rdAddrs.length; r++) {
+      final rdAd = toAd(rdAddrs[r]);
+      final depthWords = <Logic>[];
+
+      for (var d = 0; d < depthBlocks; d++) {
+        final blockWrite = _depthWrite(wrEn, wrAddr, d, blockBits);
+        final bram = XilinxRamb36e1(
+          name: 'rf_sdp72_r${r}_d$d',
+          ramMode: 'SDP',
+          readWidthA: 72,
+          writeWidthA: 0,
+          readWidthB: 0,
+          writeWidthB: 72,
+        );
+        addSubModule(bram);
+
+        // SDP x72 maps the read port to A and write port to B. The 64 data
+        // bits span DIADI/DIBDI and DOADO/DOBDO; the parity pins carry zeros.
+        bram.input('CLKARDCLK').srcConnection! <= clk;
+        bram.input('ENARDEN').srcConnection! <= Const(1);
+        bram.input('ADDRARDADDR').srcConnection! <= rdAd;
+        bram.input('WEA').srcConnection! <= Const(0, width: 4);
+        bram.input('REGCEAREGCE').srcConnection! <= Const(0);
+        bram.input('RSTRAMARSTRAM').srcConnection! <= Const(0);
+        bram.input('DIADI').srcConnection! <= paddedWrite.getRange(0, 32);
+        bram.input('DIPADIP').srcConnection! <= Const(0, width: 4);
+
+        bram.input('CLKBWRCLK').srcConnection! <= clk;
+        bram.input('ENBWREN').srcConnection! <= blockWrite;
+        bram.input('ADDRBWRADDR').srcConnection! <= wrAd;
+        bram.input('WEBWE').srcConnection! <=
+            [
+              for (var lane = 0; lane < 8; lane++)
+                lane < enabledBytes ? blockWrite : Const(0),
+            ].rconcat();
+        bram.input('REGCEB').srcConnection! <= Const(0);
+        bram.input('RSTRAMB').srcConnection! <= Const(0);
+        bram.input('DIBDI').srcConnection! <= paddedWrite.getRange(32, 64);
+        bram.input('DIPBDIP').srcConnection! <= Const(0, width: 4);
+
+        final readWord = [
+          bram.output('DOADO'),
+          bram.output('DOBDO'),
+        ].rconcat().getRange(0, 64);
+        depthWords.add(readWord.getRange(0, dataWidth));
+      }
+
+      final rawBram = _depthSelect(clk, r, rdAddrs[r], depthWords, blockBits);
+      // SDP read/write collisions are implementation-defined at the RAM
+      // outputs. The existing write-first bypass keeps Harbor semantics.
+      final raw = _rdwBypass(clk, r, wrEn, wrAddr, wrData, rdAddrs[r], rawBram);
+
+      if (reservedZero) {
+        final isX0 = _registerN(
+          clk,
+          rdAddrs[r].eq(Const(0, width: addrWidth)),
+          readLatency,
+          'rfSdp72X0_$r',
         );
         rdDatas[r] <= mux(isX0, Const(0, width: dataWidth), raw);
       } else {

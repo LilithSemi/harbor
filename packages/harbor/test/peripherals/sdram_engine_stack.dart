@@ -371,7 +371,7 @@ class SdramEngineStack {
   }
 
   Future<void> start() async {
-    clk = SimpleClockGenerator(periodPs).clk;
+    clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
     final dqPad = LogicNet(name: 'dq_pad', width: 16);
     reset.inject(1);
     for (final iface in portIfaces) {

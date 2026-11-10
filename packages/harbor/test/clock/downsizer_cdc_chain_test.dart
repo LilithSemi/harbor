@@ -36,8 +36,12 @@ void main() {
       name: 'cdc',
     );
 
-    final sClk = SimpleClockGenerator(sPeriod).clk; // slow (core) domain
-    final mClk = SimpleClockGenerator(mPeriod).clk; // fast (DDR) domain
+    final sClk = SimpleClockGenerator(
+      sPeriod + (sPeriod & 1),
+    ).clk; // slow (core) domain
+    final mClk = SimpleClockGenerator(
+      mPeriod + (mPeriod & 1),
+    ).clk; // fast (DDR) domain
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
 
@@ -198,7 +202,7 @@ void main() {
   );
 
   test('back-to-back 64-bit traffic, near-equal clocks', () async {
-    await runChain(sPeriod: 10, mPeriod: 11);
+    await runChain(sPeriod: 10, mPeriod: 12);
   });
 
   test('paced (paceCycles=32) back-to-back 64-bit traffic', () async {

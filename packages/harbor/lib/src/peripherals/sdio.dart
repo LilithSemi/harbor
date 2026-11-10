@@ -95,6 +95,10 @@ class HarborSdioConfig with HarborPrettyString {
   /// firmware can override this default and calibrate against a known pattern.
   final bool sampleReadOnFall;
 
+  /// Invert the physical card-detect input before exposing STATUS[0].
+  /// Some sockets assert their detect switch low when a card is inserted.
+  final bool cardDetectActiveLow;
+
   const HarborSdioConfig({
     this.maxBusWidth = HarborSdioBusWidth.four,
     this.maxSpeed = HarborSdioSpeed.highSpeed,
@@ -104,6 +108,7 @@ class HarborSdioConfig with HarborPrettyString {
     this.maxFrequency = 50000000,
     this.maxIoFunctions = 0,
     this.sampleReadOnFall = false,
+    this.cardDetectActiveLow = false,
   });
 
   /// SD card controller (standard 4-bit, up to high speed).
@@ -115,7 +120,8 @@ class HarborSdioConfig with HarborPrettyString {
       supports1v8 = false,
       maxFrequency = 50000000,
       maxIoFunctions = 0,
-      sampleReadOnFall = false;
+      sampleReadOnFall = false,
+      cardDetectActiveLow = false;
 
   /// SDIO WiFi/BT controller (4-bit, high speed, I/O functions).
   ///
@@ -128,7 +134,8 @@ class HarborSdioConfig with HarborPrettyString {
       supports1v8 = false,
       maxFrequency = 50000000,
       maxIoFunctions = 2,
-      sampleReadOnFall = false;
+      sampleReadOnFall = false,
+      cardDetectActiveLow = false;
 
   /// SD 3.0 UHS-I controller with full SDIO support.
   const HarborSdioConfig.uhs()
@@ -139,7 +146,8 @@ class HarborSdioConfig with HarborPrettyString {
       supports1v8 = true,
       maxFrequency = 208000000,
       maxIoFunctions = 7,
-      sampleReadOnFall = false;
+      sampleReadOnFall = false,
+      cardDetectActiveLow = false;
 
   /// eMMC controller (8-bit, HS200).
   const HarborSdioConfig.emmc()
@@ -150,12 +158,14 @@ class HarborSdioConfig with HarborPrettyString {
       supports1v8 = true,
       maxFrequency = 200000000,
       maxIoFunctions = 0,
-      sampleReadOnFall = false;
+      sampleReadOnFall = false,
+      cardDetectActiveLow = false;
 
   @override
   String toString() =>
       'HarborSdioConfig(${maxBusWidth.width}-bit, ${maxSpeed.name}, '
-      '${maxFrequency ~/ 1000000} MHz)';
+      '${maxFrequency ~/ 1000000} MHz'
+      '${cardDetectActiveLow ? ', active-low CD' : ''})';
 
   @override
   String toPrettyString([
@@ -167,6 +177,7 @@ class HarborSdioConfig with HarborPrettyString {
     buf.writeln('${c}busWidth: ${maxBusWidth.width}-bit,');
     buf.writeln('${c}speed: ${maxSpeed.name},');
     buf.writeln('${c}maxFrequency: ${maxFrequency ~/ 1000000} MHz,');
+    if (cardDetectActiveLow) buf.writeln('${c}cardDetectActiveLow,');
     if (supportsIo) buf.writeln('${c}SDIO I/O,');
     if (supportsEmmc) buf.writeln('${c}eMMC,');
     if (supports1v8) buf.writeln('${c}1.8V signaling,');
@@ -359,6 +370,7 @@ class HarborSdioController extends BridgeModule
            'bw${config.maxBusWidth.width}',
            'sp${config.maxSpeed.name}',
            'sf${config.sampleReadOnFall}',
+           if (config.cardDetectActiveLow) 'cdlow',
            if (target is HarborFpgaTarget) 'tg${target.vendor.name}',
            if (ownPads) 'pads',
            'ma$dmaAddressWidth',
@@ -438,6 +450,7 @@ class HarborSdioController extends BridgeModule
         ? (bus.reset | dmaPort.reset).named('core_reset')
         : bus.reset;
     final cardDetect = input('sd_cd');
+    final cardPresent = config.cardDetectActiveLow ? ~cardDetect : cardDetect;
     // Raw CMD-in source: the inout pad's captured value (ownPads) or the split
     // input port. CMD stays SDR even in HS400, so it only gets input-delay tune.
     final cmdInRaw = ownPads ? _sdCmdInInt! : input('sd_cmd_in');
@@ -585,6 +598,9 @@ class HarborSdioController extends BridgeModule
     final statWaitCnt = Logic(name: 'dat_stat_wait', width: 16);
     final busyW = writeBusyTimeout.bitLength;
     final busyCnt = Logic(name: 'dat_busy_wait', width: busyW);
+    // Keep the write-data start at least two SD clock cycles after the
+    // command response end, even when the first DMA/PIO word is already ready.
+    final wrNwrCnt = Logic(name: 'dat_wr_nwr_count', width: 2);
 
     // ADMA. It bridges memory to the DAT word handshake: on a card read it
     // writes the RX FIFO words to memory, on a card write it reads words into
@@ -1030,7 +1046,6 @@ class HarborSdioController extends BridgeModule
           dataReg < Const(0, width: 32),
           dataValid < Const(0),
           rxCount < Const(0, width: rxPtrW + 1),
-          for (final w in rxFifo) w < Const(0, width: 32),
           byteInWord < Const(0, width: 2),
           wrNeedFill < Const(0),
           busWidthSel < Const(0, width: 2),
@@ -1039,6 +1054,7 @@ class HarborSdioController extends BridgeModule
           busySeen < Const(0),
           statWaitCnt < Const(0, width: 16),
           busyCnt < Const(0, width: busyW),
+          wrNwrCnt < Const(0, width: 2),
           dmaMode < Const(0),
           admaState < Const(aIdle, width: 3),
           descPtr < Const(0, width: 32),
@@ -1134,7 +1150,7 @@ class HarborSdioController extends BridgeModule
                       state < Const(sRecv, width: 2),
                       respShift < Const(0, width: 136),
                       respCnt <
-                          mux(
+                          mux<Logic>(
                             cmdRespType.eq(Const(2, width: 2)),
                             Const(
                               135,
@@ -1150,6 +1166,14 @@ class HarborSdioController extends BridgeModule
                         then: [
                           state < Const(sIdle, width: 2),
                           busy < Const(0),
+                          // A PIO card-write word may have been loaded before
+                          // CMD24. If the card never starts a response, the
+                          // data FSM never consumes it; discard it so it
+                          // cannot become the first word of a later transfer.
+                          If(
+                            cmdDataPresent & ~cmdDataDir & ~dmaMode,
+                            then: [dataValid < Const(0)],
+                          ),
                           intStatus <
                               (intStatus | Const(intCmdTimeout, width: 8)),
                         ],
@@ -1184,7 +1208,10 @@ class HarborSdioController extends BridgeModule
                           If(
                             cmdDataDir,
                             then: [datState < Const(dRWait, width: 4)],
-                            orElse: [datState < Const(dWStart, width: 4)],
+                            orElse: [
+                              datState < Const(dWStart, width: 4),
+                              wrNwrCnt < Const(2, width: 2),
+                            ],
                           ),
                         ],
                         orElse: [busy < Const(0)],
@@ -1367,16 +1394,22 @@ class HarborSdioController extends BridgeModule
               // WRITE: drive the start bit once the CPU has provided data.
               CaseItem(Const(dWStart, width: 4), [
                 If(
-                  sdFall & dataValid,
-                  then: [
-                    datOeReg < Const(1),
-                    datOutReg <
-                        Const(0, width: maxW), // start bit (all lanes 0)
-                    byteShift < dataReg.getRange(0, 8),
-                    bitsInByte < Const(8, width: 4),
-                    byteInWord < Const(0, width: 2),
-                    wrNeedFill < Const(0),
-                    datState < Const(dWrite, width: 4),
+                  sdFall & wrNwrCnt.gt(Const(1, width: 2)),
+                  then: [wrNwrCnt < (wrNwrCnt - Const(1, width: 2))],
+                  orElse: [
+                    If(
+                      sdFall & dataValid,
+                      then: [
+                        datOeReg < Const(1),
+                        datOutReg <
+                            Const(0, width: maxW), // start bit (all lanes 0)
+                        byteShift < dataReg.getRange(0, 8),
+                        bitsInByte < Const(8, width: 4),
+                        byteInWord < Const(0, width: 2),
+                        wrNeedFill < Const(0),
+                        datState < Const(dWrite, width: 4),
+                      ],
+                    ),
                   ],
                 ),
               ]),
@@ -1571,6 +1604,7 @@ class HarborSdioController extends BridgeModule
                             for (final c in crc16) c < Const(0, width: 16),
                             byteInWord < Const(0, width: 2),
                             datState < Const(dWStart, width: 4),
+                            wrNwrCnt < Const(2, width: 2),
                           ],
                         ),
                       ],
@@ -1864,7 +1898,7 @@ class HarborSdioController extends BridgeModule
                 // a CMD write.
                 CaseItem(Const(0x01, width: 9), [
                   bus.dataOut <
-                      cardDetect.zeroExtend(dw) |
+                      cardPresent.zeroExtend(dw) |
                           ((busy | dmaInFlight).zeroExtend(dw) <<
                               Const(8, width: 32)) |
                           (mux(
@@ -1983,7 +2017,11 @@ class HarborSdioController extends BridgeModule
                     // reads back the holding register.
                     orElse: [
                       bus.dataOut <
-                          mux(cmdDataDir, rxHead, dataReg).zeroExtend(dw),
+                          mux(
+                            cmdDataDir,
+                            mux(rxEmpty, Const(0, width: 32), rxHead),
+                            dataReg,
+                          ).zeroExtend(dw),
                     ],
                   ),
                 ]),

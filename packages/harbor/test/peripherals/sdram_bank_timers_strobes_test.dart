@@ -34,7 +34,7 @@ class _Harness {
   );
 
   static Future<_Harness> build(HarborSdramCycles cycles) async {
-    final clk = SimpleClockGenerator(cycles.tCkPs).clk;
+    final clk = SimpleClockGenerator(cycles.tCkPs + (cycles.tCkPs & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final banks = cycles.config.banks;
     final act = Logic(name: 'act', width: banks)..inject(0);
@@ -276,7 +276,7 @@ void main() {
         clockHz: 125000000,
       );
       final banks = cycles.config.banks;
-      final clk = SimpleClockGenerator(cycles.tCkPs).clk;
+      final clk = SimpleClockGenerator(cycles.tCkPs + (cycles.tCkPs & 1)).clk;
       final reset = Logic(name: 'reset')..inject(1);
       final act = Logic(name: 'act', width: banks)..inject(0);
       final pre = Logic(name: 'pre', width: banks)..inject(0);

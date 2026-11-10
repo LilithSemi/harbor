@@ -131,8 +131,10 @@ class SdramPortBench {
       exclusive: exclusive,
       link: link,
     );
-    final fabricClk = SimpleClockGenerator(fabricPeriodPs).clk;
-    final memClk = SimpleClockGenerator(memPeriodPs).clk;
+    final fabricClk = SimpleClockGenerator(
+      fabricPeriodPs + (fabricPeriodPs & 1),
+    ).clk;
+    final memClk = SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
     for (final input in top.inputs.values) {
       if (!{'clk', 'mem_clk'}.contains(input.name)) {
         input.srcConnection!.put(input.name.endsWith('reset') ? 1 : 0);

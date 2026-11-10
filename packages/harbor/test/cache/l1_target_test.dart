@@ -23,7 +23,8 @@ void main() {
   for (final MapEntry(key: name, value: target) in _targets.entries) {
     // 256 lines with a 12-bit index and offset: the tag store holds
     // 256 * (reqAddrBits - 12) bits.
-    for (final (reqAddrBits, inRam) in [(28, false), (29, true)]) {
+    for (final reqAddrBits in [28, 29]) {
+      final inRam = name == 'Xilinx' || reqAddrBits == 29;
       test('$name ${256 * (reqAddrBits - 12)}-bit I-cache tag store '
           '${inRam ? 'uses block RAM' : 'stays in flops'}', () async {
         final cache = HarborL1ICache(
@@ -33,12 +34,12 @@ void main() {
           target: target,
         );
         await cache.build();
-        expect(256 * (reqAddrBits - 12) > harborL1TagFlopBits, inRam);
         expect(_tagBlocks(cache, 'l1i_tags') > 0, inRam);
       });
     }
 
-    for (final (size, inRam) in [(4096, false), (16384, true)]) {
+    for (final size in [4096, 16384]) {
+      final inRam = name == 'Xilinx' || size == 16384;
       test('$name $size-byte RV32 D-cache tag store '
           '${inRam ? 'uses block RAM' : 'stays in flops'}', () async {
         final cache = HarborL1DCache(
@@ -53,6 +54,33 @@ void main() {
       });
     }
   }
+
+  test('Delta RV64 tiny I/D tag stores use Xilinx block RAM', () async {
+    final target = HarborFpgaTarget.spartan7(
+      device: 'xc7s50',
+      package: 'csga324',
+      useOpenXc7: true,
+      useHimbaechel: true,
+    );
+    final icache = HarborL1ICache(
+      config: HarborL1iCacheConfig(size: 64, ways: 1, lineSize: 8),
+      xlen: 64,
+      reqAddrBits: 64,
+      target: target,
+    );
+    final dcache = HarborL1DCache(
+      config: HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
+      xlen: 64,
+      reqAddrBits: 64,
+      physicalAddresses: true,
+      memFaultIn: Logic(),
+      target: target,
+    );
+    await icache.build();
+    await dcache.build();
+    expect(_tagBlocks(icache, 'l1i_tags'), greaterThan(0));
+    expect(_tagBlocks(dcache, 'l1d_tags'), greaterThan(0));
+  });
 
   for (final MapEntry(key: name, value: target) in _targets.entries) {
     for (final xlen in [32, 64]) {

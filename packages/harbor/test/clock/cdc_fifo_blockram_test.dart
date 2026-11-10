@@ -76,8 +76,8 @@ Future<_Harness> _build({
     blockRam: blockRam,
     name: 'fifo_bram',
   );
-  final wrClk = SimpleClockGenerator(wrPeriod).clk;
-  final rdClkFree = SimpleClockGenerator(rdPeriod).clk;
+  final wrClk = SimpleClockGenerator(wrPeriod + (wrPeriod & 1)).clk;
+  final rdClkFree = SimpleClockGenerator(rdPeriod + (rdPeriod & 1)).clk;
   final rdRun = Logic(name: 'rd_run');
   // Gated read clock. The gate only ever changes while the free clock is low
   // (see [_stopReadClock]), so stopping or starting it makes no runt pulse.

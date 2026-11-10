@@ -291,7 +291,7 @@ void main() {
       expect(soc.fabric!.foldError, isNull);
 
       final clk = SimpleClockGenerator(10).clk;
-      final periphClk = SimpleClockGenerator(17).clk;
+      final periphClk = SimpleClockGenerator(18).clk;
       final reset = Logic(name: 'reset')..inject(1);
       soc.input('clk').srcConnection! <= clk;
       soc.input('periph_clk').srcConnection! <= periphClk;

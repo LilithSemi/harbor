@@ -20,7 +20,7 @@ void main() {
       const HarborSdramConfig.as4c16m16sb6(),
       clockHz: 125000000,
     );
-    final clk = SimpleClockGenerator(cycles.tCkPs).clk;
+    final clk = SimpleClockGenerator(cycles.tCkPs + (cycles.tCkPs & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final cmd = Logic(name: 'cmd', width: 3)..inject(0);
     final cmdBank = Logic(name: 'cmd_bank', width: cycles.config.bankBits)

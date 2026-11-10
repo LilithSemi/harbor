@@ -295,13 +295,16 @@ class _Bench {
   /// [statusBusy] on DAT0: by default an accepted CRC status and a short
   /// busy. The last value stays on DAT0. Returns the DAT groups taken.
   Future<List<int>> cardWrite({
-    List<int> statusBusy = const [0, 0, 1, 0, 0, 1],
+    List<int> statusBusy = const [0, 0, 1, 0, 1, 0, 1],
+    int? requiredDataGroups,
   }) async {
     final resp = _resp48();
     var sawCmd = false, sawDat = false, ri = 0, si = 0;
     final captured = <int>[];
+    var endBitObserved = false;
     var prevClk = top.output('sd_clk').value.toInt();
-    for (var i = 0; i < 40000; i++) {
+    final maxCycles = requiredDataGroups == null ? 40000 : 200000;
+    for (var i = 0; i < maxCycles; i++) {
       await clk.nextPosedge;
       final cmdSending = top.output('sd_cmd_oe').value.toInt() == 1;
       if (cmdSending) sawCmd = true;
@@ -313,10 +316,20 @@ class _Bench {
         ri++;
       }
       if (prevClk == 0 && sdClk == 1 && datDriving) {
-        captured.add(top.output('sd_dat_out').value.toInt() & 0xF);
+        final group = top.output('sd_dat_out').value.toInt() & 0xF;
+        captured.add(group);
+        if (requiredDataGroups != null &&
+            captured.length == requiredDataGroups + 1 &&
+            group == 0xF) {
+          endBitObserved = true;
+        }
       }
       prevClk = sdClk;
-      if (sawDat && !datDriving && sdClk == 0 && si < statusBusy.length) {
+      if (sawDat &&
+          !datDriving &&
+          sdClk == 0 &&
+          si < statusBusy.length &&
+          (requiredDataGroups == null || endBitObserved)) {
         datIn.inject(0xE | statusBusy[si]);
         si++;
       }
@@ -506,6 +519,65 @@ void main() {
       });
     }
   }
+
+  test('card accepts a block only after a driven DAT end bit', () async {
+    final b = _Bench(HarborFabricKind.wishbone, 64);
+    await b.start();
+    const word = 0x12345678;
+    b.write32(0x2000, word);
+    await b.wr(_blkSize, 4);
+    await b.wr(_admaAddr, 0x2000);
+    await b.wr(_cmd, _cmdWrite);
+    final expected = _fourBitBlock([word]);
+    final got = await b.cardWrite(requiredDataGroups: expected.length);
+    final status = await b.rd(_intStatus);
+    b.checkShapes();
+    await Simulator.endSimulation();
+    expect(got, hasLength(expected.length + 1));
+    expect(got.sublist(0, expected.length), expected);
+    expect(got.last, 0xF, reason: 'DAT end bit must be actively driven');
+    expect(status & (_dataDone | _writeErr), _dataDone);
+  });
+
+  test('accepted block completes without a busy pulse', () async {
+    final b = _Bench(HarborFabricKind.wishbone, 64, writeBusyTimeout: 64);
+    await b.start();
+    const word = 0x12345678;
+    b.write32(0x2000, word);
+    await b.wr(_blkSize, 4);
+    await b.wr(_admaAddr, 0x2000);
+    await b.wr(_cmd, _cmdWrite);
+    final expected = _fourBitBlock([word]);
+    final got = await b.cardWrite(
+      requiredDataGroups: expected.length,
+      statusBusy: const [0, 0, 1, 0, 1], // start, accepted status, end; no busy
+    );
+    final status = await b.rd(_intStatus);
+    b.checkShapes();
+    await Simulator.endSimulation();
+    expect(got.sublist(0, expected.length), expected);
+    expect(got.last, 0xF, reason: 'DAT end bit was not driven');
+    expect(status & (_dataDone | _writeErr), _dataDone);
+  });
+
+  test('accepted status with a malformed low end bit is rejected', () async {
+    final b = _Bench(HarborFabricKind.wishbone, 64, writeBusyTimeout: 64);
+    await b.start();
+    const word = 0x12345678;
+    b.write32(0x2000, word);
+    await b.wr(_blkSize, 4);
+    await b.wr(_admaAddr, 0x2000);
+    await b.wr(_cmd, _cmdWrite);
+    final expected = _fourBitBlock([word]);
+    await b.cardWrite(
+      requiredDataGroups: expected.length,
+      statusBusy: const [0, 0, 1, 0, 0], // malformed token end=0
+    );
+    final status = await b.rd(_intStatus);
+    b.checkShapes();
+    await Simulator.endSimulation();
+    expect(status & (_dataDone | _writeErr), _dataDone | _writeErr);
+  });
 
   for (final (name, answer, addr) in [
     ('a rejected block with no busy', [0, 1, 0, 1, 1, 1, 1], _errBase),

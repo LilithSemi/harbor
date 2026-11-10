@@ -68,8 +68,8 @@ Future<void> _run({
   (int, int) clocks = (20, 4),
 }) async {
   final ovCsc = csc ?? HarborCscCoefficients.bt601Limited;
-  final pixelClk = SimpleClockGenerator(clocks.$1).clk;
-  final sysClk = SimpleClockGenerator(clocks.$2).clk;
+  final pixelClk = SimpleClockGenerator(clocks.$1 + (clocks.$1 & 1)).clk;
+  final sysClk = SimpleClockGenerator(clocks.$2 + (clocks.$2 & 1)).clk;
   final pixelReset = Logic(name: 'pixel_reset');
   final sysReset = Logic(name: 'sys_reset');
   final memory = port ? null : HarborMemoryWaist(_memConfig);

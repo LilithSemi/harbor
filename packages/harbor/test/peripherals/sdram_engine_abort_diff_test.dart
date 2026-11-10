@@ -152,7 +152,7 @@ void main() {
       reason: 'fpgaToSdramNs must land inside the capture window',
     );
 
-    final clk = SimpleClockGenerator(periodPs).clk;
+    final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
     final reset = Logic(name: 'reset');
 
     // The one abort schedule this test controls. [dIn] is the D input of

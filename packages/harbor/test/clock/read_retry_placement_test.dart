@@ -56,8 +56,8 @@ void main() {
       name: 'rr',
     );
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
 

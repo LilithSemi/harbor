@@ -46,8 +46,8 @@ void main() {
     const halfBit = shiftPeriod ~/ 2;
     // The pixel reset goes low on this falling edge of both clocks.
     const pixelRelease = 3 * pixelPeriod;
-    final pixelClk = SimpleClockGenerator(pixelPeriod).clk;
-    final shiftClk = SimpleClockGenerator(shiftPeriod).clk;
+    final pixelClk = SimpleClockGenerator(pixelPeriod + (pixelPeriod & 1)).clk;
+    final shiftClk = SimpleClockGenerator(shiftPeriod + (shiftPeriod & 1)).clk;
     final pixelReset = Logic(name: 'pixel_reset');
     final shiftReset = Logic(name: 'shift_reset');
     final de = Logic(name: 'de');

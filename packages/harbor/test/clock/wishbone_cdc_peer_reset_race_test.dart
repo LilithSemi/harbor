@@ -18,10 +18,10 @@ void main() {
     const dw = 32;
     final dut = HarborWishboneCdcBridge(addressWidth: aw, dataWidth: dw);
 
-    const sPeriod = 33;
+    const sPeriod = 34;
     const mPeriod = 10;
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
     final sCyc = Logic(name: 's_cyc');
