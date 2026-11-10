@@ -1249,10 +1249,12 @@ class HarborClockGenerator {
     ]);
     final lockHold = (~lockCnt[17]).named('${config.name}_mmcmLockHold');
 
+    // A stable name lets the generated nextpnr clock script find this net.
+    final domClk = bufg.output('O').named('${config.name}_clk');
     final domain = HarborClockDomain(
       config: config,
-      clk: bufg.output('O'),
-      reset: _domainReset(bufg.output('O'), inputReset | lockHold, config.name),
+      clk: domClk,
+      reset: _domainReset(domClk, inputReset | lockHold, config.name),
       locked: mmcm.output('LOCKED'),
     );
     _domains.add(domain);

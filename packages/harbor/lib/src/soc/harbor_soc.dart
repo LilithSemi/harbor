@@ -211,6 +211,9 @@ class HarborSoC extends BridgeModule {
   /// Board oscillator rate for the Xilinx DDR3 clock tree.
   double? _xilinxSourceClkMhz;
 
+  /// Clock net name to MHz for each Xilinx PLL domain that has no DDR3 tree.
+  final Map<String, double> _xilinxPllClockMhz = {};
+
   final String acpiOemId;
   final String acpiOemTableId;
 
@@ -438,7 +441,17 @@ class HarborSoC extends BridgeModule {
         _clockDomains[sec.name] = shared.secondary;
         _clockDomains[clkConfig.name] = shared.primary;
       } else {
-        _clockDomains[clkConfig.name] = _clockGen.createDomain(clkConfig);
+        final domain = _clockGen.createDomain(clkConfig);
+        _clockDomains[clkConfig.name] = domain;
+        final t = target;
+        if (t is HarborFpgaTarget &&
+            (t.vendor == HarborFpgaVendor.openXc7 ||
+                t.vendor == HarborFpgaVendor.vivado) &&
+            !clkConfig.isPrimary &&
+            clkConfig.frequency != clkConfig.sourceFrequency) {
+          _xilinxPllClockMhz['${clkConfig.name}_clk'] =
+              clkConfig.frequency / 1e6;
+        }
       }
     }
   }
@@ -1456,6 +1469,14 @@ class HarborSoC extends BridgeModule {
           );
         }
       }
+      if (fileContents.name == name) {
+        for (final clockNet in _xilinxPllClockMhz.keys) {
+          contents = contents.replaceFirst(
+            RegExp('^logic $clockNet;\\s*\$', multiLine: true),
+            '(* keep = 1 *) logic $clockNet;',
+          );
+        }
+      }
       File('$rtlPath/$fileName').writeAsStringSync(contents);
       filelist.writeln('./rtl/$fileName');
     }
@@ -1717,6 +1738,26 @@ class HarborSoC extends BridgeModule {
                     sourceClkMhz: sourceMhz,
                     ddrCtrlMhz: ddrCtrlMhz,
                   ),
+                );
+              }
+            }
+            if (ddr == null && _xilinxPllClockMhz.isNotEmpty) {
+              if (t.useHimbaechel) {
+                // Himbächel can lack Python hooks, so the XDC carries the rate.
+                final xdc = File('$path/$name.${t.constraintExtension}');
+                final lines = StringBuffer(xdc.readAsStringSync());
+                for (final e in _xilinxPllClockMhz.entries) {
+                  lines.writeln(
+                    'create_clock -period '
+                    '${(1000 / e.value).toStringAsFixed(3)} '
+                    '[get_nets ${e.key}]',
+                  );
+                }
+                xdc.writeAsStringSync(lines.toString());
+              } else {
+                Directory('$path/support/nextpnr').createSync(recursive: true);
+                File('$path/support/nextpnr/clocks.py').writeAsStringSync(
+                  t.generatePllClockConstraintPy(_xilinxPllClockMhz),
                 );
               }
             }

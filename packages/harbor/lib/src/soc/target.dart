@@ -772,6 +772,24 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     return buf.toString();
   }
 
+  /// Generates `support/nextpnr/clocks.py` for a design with PLL clocks and no
+  /// DDR3 tree. Each net in [mhzByNet] gets an `addClock` at its real rate,
+  /// because nextpnr gives a clock that comes from a MMCM and a BUFG a
+  /// default 12 MHz target.
+  String generatePllClockConstraintPy(Map<String, double> mhzByNet) {
+    final buf = StringBuffer('for net, mhz in [\n');
+    for (final e in mhzByNet.entries) {
+      buf.writeln("    ('${e.key}', ${e.value.toStringAsFixed(2)}),");
+    }
+    buf.writeln(']:');
+    buf.writeln('    try:');
+    buf.writeln('        ctx.addClock(net, mhz)');
+    buf.writeln("        print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
+    buf.writeln('    except Exception as e:');
+    buf.writeln("        print('ADDCLOCK %s FAILED: %s' % (net, e))");
+    return buf.toString();
+  }
+
   /// Generates the nextpnr-xilinx `--pre-route` BEL-placement diagnostic
   /// (`support/nextpnr/show_bels.py`) for the openXC7 DDR3 flow. It prints
   /// where the train SERDES landed after placement so a bad pin is visible.
