@@ -8,7 +8,7 @@ environment:
   sdk: ^3.11.2
 dependencies:
   meta: ^1.16.0
-  rohd: ^0.7.0
+  rohd: ^0.7.1
   rohd_bridge: ^0.3.0
   # The published 0.3.0 archive omits the `confapp` workspace member declared
   # in its pubspec, which breaks `dart test` on the second run. The tagged git

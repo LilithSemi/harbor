@@ -221,10 +221,10 @@ packages:
     dependency: transitive
     description:
       name: rohd
-      sha256: bb311a435a1520b28540b50dc5e0bdb5d44fd54d046bb03044cb175dfedbd268
+      sha256: "87030b36f34000edec092948ecf72c885c4c9dc7c91b75dc25f068a34425dcca"
       url: "https://pub.dev"
     source: hosted
-    version: "0.7.0"
+    version: "0.7.1"
   rohd_bridge:
     dependency: transitive
     description:
