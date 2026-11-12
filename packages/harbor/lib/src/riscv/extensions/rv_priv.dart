@@ -10,6 +10,9 @@ final rvPriv = RiscVExtension(
   name: 'Priv',
   key: null,
   misaBit: null,
+  // The privileged architecture is not an extension name the device tree
+  // binding knows. Its instructions arrive with supervisor or user mode.
+  hasDtName: false,
   operations: [
     // sret, mret and wfi have no operands, so all 32 bits are fixed. sret and
     // wfi share funct7 0x08 and differ only in rs2.

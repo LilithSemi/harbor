@@ -126,6 +126,67 @@ class RiscVIsaConfig {
     return buf.toString();
   }
 
+  /// Single-letter order the device tree binding accepts, which also fixes
+  /// where a named Z extension sorts: after the letter it extends.
+  static const _dtLetterOrder = 'imafdqcbkjpvh';
+
+  /// The base ISA for `riscv,isa-base`, or null when the hart has no I base.
+  /// The binding defines a value only for `rv32i` and `rv64i`.
+  String? get dtIsaBase =>
+      extensions.any((e) => e.key == 'I') ? 'rv${mxlen.size}i' : null;
+
+  /// Extension names for `riscv,isa-extensions`, lowercase and in canonical
+  /// order. Zcd needs Zca, so a hart that has both C and Zcd reports Zca as
+  /// well, which the binding requires.
+  List<String> get dtIsaExtensions {
+    final names = <String>{};
+    for (final e in extensions) {
+      final dt = e.dtName;
+      if (dt != null) names.add(dt);
+    }
+    if (names.contains('zcd') && names.contains('c')) names.add('zca');
+    final letters = names.where((n) => n.length == 1).toList()
+      ..sort((a, b) => _dtLetterRank(a).compareTo(_dtLetterRank(b)));
+    final named = names.where((n) => n.length > 1).toList()
+      ..sort(_dtNamedOrder);
+    return [...letters, ...named];
+  }
+
+  /// The deprecated `riscv,isa` string, e.g. `rv64imafdc_zicsr_zifencei`. ACPI
+  /// carries the same string in its RHCT table, where it is the only ISA
+  /// report an OS gets, so it has to name every extension.
+  ///
+  /// The binding's pattern requires `ima` before the optional letters, so a
+  /// hart without M or A cannot be written in this form at all. The string
+  /// stays honest about what the hart has and [dtIsaExtensions] carries the
+  /// same answer in the form that has no such limit.
+  String get dtIsaString {
+    final base = dtIsaBase;
+    if (base == null) return 'rv${mxlen.size}';
+    final exts = dtIsaExtensions;
+    final letters = exts.where((e) => e.length == 1 && e != 'i').join();
+    final named = exts.where((e) => e.length > 1).map((e) => '_$e').join();
+    return '$base$letters$named';
+  }
+
+  static int _dtLetterRank(String name) {
+    final i = _dtLetterOrder.indexOf(name[0]);
+    return i < 0 ? _dtLetterOrder.length : i;
+  }
+
+  /// Named extensions group by their first letter, Z then S then H then X, and
+  /// a Z extension then sorts by the letter it extends.
+  static int _dtNamedOrder(String a, String b) {
+    const groups = 'zshx';
+    final ga = groups.indexOf(a[0]) < 0 ? groups.length : groups.indexOf(a[0]);
+    final gb = groups.indexOf(b[0]) < 0 ? groups.length : groups.indexOf(b[0]);
+    if (ga != gb) return ga.compareTo(gb);
+    if (a[0] == 'z' && a[1] != b[1]) {
+      return _dtLetterRank(a[1]).compareTo(_dtLetterRank(b[1]));
+    }
+    return a.compareTo(b);
+  }
+
   /// Combined misa register value for all extensions.
   int get misaValue {
     var value = mxlen.misa;
