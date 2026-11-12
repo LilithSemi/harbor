@@ -326,7 +326,15 @@ class HarborDeviceTreeGenerator {
         buf.writeln('            device_type = "cpu";');
         buf.writeln('            compatible = "riscv";');
         buf.writeln('            reg = <0x${cpu.hartId.toRadixString(16)}>;');
+        // riscv,isa is deprecated and cannot name an extension past the
+        // single letters in every case, so the isa-base and isa-extensions
+        // pair goes out with it. An OS reads the pair first.
         buf.writeln('            riscv,isa = "${cpu.isa}";');
+        if (cpu.isaBase != null && cpu.isaExtensions.isNotEmpty) {
+          buf.writeln('            riscv,isa-base = "${cpu.isaBase}";');
+          final list = cpu.isaExtensions.map((e) => '"$e"').join(', ');
+          buf.writeln('            riscv,isa-extensions = $list;');
+        }
         if (cpu.mmu != null) {
           buf.writeln('            mmu-type = "${cpu.mmu}";');
         }

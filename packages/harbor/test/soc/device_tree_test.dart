@@ -42,6 +42,55 @@ void main() {
       expect(dts, contains('clock-frequency'));
     });
 
+    test('emits the isa-base and isa-extensions pair', () {
+      final dts = HarborDeviceTreeGenerator(
+        model: 'Test SoC',
+        compatible: 'test,soc-v1',
+        cpus: [
+          HarborCpu(
+            hartId: 0,
+            isa: 'rv64imafdc_zicsr_zifencei_sstc',
+            isaBase: 'rv64i',
+            isaExtensions: const [
+              'i',
+              'm',
+              'a',
+              'f',
+              'd',
+              'c',
+              'zicsr',
+              'zifencei',
+              'sstc',
+            ],
+            mmu: 'riscv,sv39',
+          ),
+        ],
+        peripherals: [HarborClint(baseAddress: 0x02000000)],
+      ).generate();
+
+      expect(dts, contains('riscv,isa-base = "rv64i"'));
+      expect(
+        dts,
+        contains(
+          'riscv,isa-extensions = "i", "m", "a", "f", "d", "c", '
+          '"zicsr", "zifencei", "sstc";',
+        ),
+      );
+    });
+
+    test('leaves the pair out when the caller gives no extension list', () {
+      final dts = HarborDeviceTreeGenerator(
+        model: 'Test SoC',
+        compatible: 'test,soc-v1',
+        cpus: [HarborCpu(hartId: 0, isa: 'rv64imac')],
+        peripherals: [HarborClint(baseAddress: 0x02000000)],
+      ).generate();
+
+      expect(dts, contains('riscv,isa = "rv64imac"'));
+      expect(dts, isNot(contains('riscv,isa-base')));
+      expect(dts, isNot(contains('riscv,isa-extensions')));
+    });
+
     test('emits a device_type=memory root node for RAM spans', () {
       final dts = HarborDeviceTreeGenerator(
         model: 'Mem SoC',
