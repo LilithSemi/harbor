@@ -464,9 +464,12 @@ class HarborSdioController extends BridgeModule
     // Raw CMD-in source: the inout pad's captured value (ownPads) or the split
     // input port. CMD stays SDR even in HS400, so it only gets input-delay tune.
     final cmdInRaw = ownPads ? _sdCmdInInt! : input('sd_cmd_in');
-    final cmdIn = _uhsTuned
+    final cmdInConditioned = _uhsTuned
         ? _uhsConditionBit(cmdInRaw, 'cmd', ddr: false)
         : cmdInRaw;
+    // Every pad input goes through one flop, so no logic reads a pad
+    // directly. The sampling strobes below are late by the same cycle.
+    final cmdIn = flop(input('clk'), cmdInConditioned).named('cmd_in_q');
 
     // CMD FSM states.
     const sIdle = 0;
@@ -614,6 +617,8 @@ class HarborSdioController extends BridgeModule
     // Keep the write-data start at least two SD clock cycles after the
     // command response end, even when the first DMA/PIO word is already ready.
     final wrNwrCnt = Logic(name: 'dat_wr_nwr_count', width: 2);
+    // DAT0 was high at the last sample edge, so the card is not busy.
+    final wrLineFree = Logic(name: 'dat_wr_line_free');
 
     // ADMA. It bridges memory to the DAT word handshake: on a card read it
     // writes the RX FIFO words to memory, on a card write it reads words into
@@ -723,11 +728,18 @@ class HarborSdioController extends BridgeModule
     // and the clock resumes. This is SD-native flow control (the host may stop
     // SDCLK mid-block), so DMA lands correctly regardless of memory latency, with
     // no startup word drops, and the descriptor/bounce can live in ordinary DRAM.
+    // A word in the push stage still counts as taken: the strobe is one cycle
+    // behind the SD clock edge it belongs to.
+    final rxPushNow = Logic(name: 'rx_push_now');
+    final rxFullSoon =
+        (rxFull |
+                (rxPushNow & rxCount.eq(Const(rxDepth - 1, width: rxPtrW + 1))))
+            .named('rx_full_soon');
     final datDmaStall =
         (dmaMode &
                 cmdDataDir &
                 datState.eq(Const(dRead, width: 4)) &
-                rxFull &
+                rxFullSoon &
                 ~sdClkReg)
             .named('dat_dma_stall');
     // Write backpressure, the mirror of the read stall above. The serializer
@@ -748,18 +760,26 @@ class HarborSdioController extends BridgeModule
     // strobe) MUST share this so the byte counter and the FIFO push stay in
     // lockstep. Rising is the default, falling shifts the sample half a period
     // later for round-trip margin.
-    final readEdge = mux(sampleFall, sdFall, sdRise).named('read_edge');
+    // The strobes are one cycle late, as the input flops are, so the logic
+    // sees each pad value at the edge it was sampled on.
+    final readEdge = flop(
+      clk,
+      mux(sampleFall, sdFall, sdRise),
+      reset: reset,
+    ).named('read_edge');
+    final respEdge = flop(clk, sdRise, reset: reset).named('resp_edge');
 
     // Receive combinationals, hoisted out of the DAT engine below so the RX FIFO
     // push condition can share them: the lane group sampled this SD clock, the
     // byte it completes, and whether it completes one.
     final rawDatIn = ownPads ? _sdDatInInt! : input('sd_dat_in');
-    final datIn = _uhsTuned
+    final datInConditioned = _uhsTuned
         ? [
             for (var l = 0; l < maxW; l++)
               _uhsConditionBit(rawDatIn[l], 'dat$l', ddr: _uhsDdr),
           ].rconcat()
         : rawDatIn;
+    final datIn = flop(clk, datInConditioned).named('dat_in_q');
 
     final rdGroup = (datIn & laneMask).named('dat_rd_group');
     final rdFull = ((byteShift << laneCount) | rdGroup.zeroExtend(8))
@@ -777,6 +797,7 @@ class HarborSdioController extends BridgeModule
                 byteDone &
                 byteInWord.eq(Const(3, width: 2)))
             .named('rx_push');
+    rxPushNow <= rxPush;
     final rxWord = [asmB0, asmB1, asmB2, rdFull].rconcat().named('rx_word');
 
     // One register access per bus cycle. ACK is a single-cycle pulse, so a
@@ -1070,6 +1091,7 @@ class HarborSdioController extends BridgeModule
           statWaitCnt < Const(0, width: 16),
           busyCnt < Const(0, width: busyW),
           wrNwrCnt < Const(0, width: 2),
+          wrLineFree < Const(1),
           dmaMode < Const(0),
           admaState < Const(aIdle, width: 3),
           descPtr < Const(0, width: 32),
@@ -1157,7 +1179,7 @@ class HarborSdioController extends BridgeModule
             // Hunt for the response start bit, with an NCR timeout.
             CaseItem(Const(sWait, width: 2), [
               If(
-                sdRise,
+                respEdge,
                 then: [
                   If(
                     ~cmdIn,
@@ -1201,7 +1223,7 @@ class HarborSdioController extends BridgeModule
             // Shift the response in on rising edges, capture on the last bit.
             CaseItem(Const(sRecv, width: 2), [
               If(
-                sdRise,
+                respEdge,
                 then: [
                   respShift < respNext,
                   respCnt < (respCnt - Const(1, width: 8)),
@@ -1226,6 +1248,7 @@ class HarborSdioController extends BridgeModule
                             orElse: [
                               datState < Const(dWStart, width: 4),
                               wrNwrCnt < Const(2, width: 2),
+                              wrLineFree < Const(1),
                             ],
                           ),
                         ],
@@ -1414,6 +1437,7 @@ class HarborSdioController extends BridgeModule
                   orElse: [
                     // A card that turns busy late holds DAT0 low. Wait it out
                     // instead of driving the start bit onto a busy line.
+                    If(readEdge, then: [wrLineFree < datIn[0]]),
                     If(
                       readEdge & ~datIn[0],
                       then: [
@@ -1421,8 +1445,9 @@ class HarborSdioController extends BridgeModule
                         busyCnt < Const(0, width: busyW),
                       ],
                     ),
+                    // The line was high at the last sample edge.
                     If(
-                      sdFall & dataValid & ~(readEdge & ~datIn[0]),
+                      sdFall & dataValid & wrLineFree & ~(readEdge & ~datIn[0]),
                       then: [
                         datOeReg < Const(1),
                         datOutReg <
@@ -1635,6 +1660,7 @@ class HarborSdioController extends BridgeModule
                       then: [
                         datState < Const(dWStart, width: 4),
                         wrNwrCnt < Const(2, width: 2),
+                        wrLineFree < Const(1),
                       ],
                       orElse: [
                         If(
@@ -1693,6 +1719,7 @@ class HarborSdioController extends BridgeModule
                             byteInWord < Const(0, width: 2),
                             datState < Const(dWStart, width: 4),
                             wrNwrCnt < Const(2, width: 2),
+                            wrLineFree < Const(1),
                           ],
                         ),
                       ],
