@@ -190,7 +190,7 @@ class Ddr3MemoryPort extends Module {
         lo,
         mux(burst.eq(HarborMemoryBurst.wrap.value), wrapNext, incr),
       );
-      return aw > lw ? [a.getRange(lw), nlo].swizzle() : nlo;
+      return aw > lw ? [a.getRange(lw), nlo].concat() : nlo;
     }
 
     Logic lane(Logic word, Logic idx) => rB == 0
@@ -332,7 +332,7 @@ class Ddr3MemoryPort extends Module {
           If(
             issue & aIdx.eq(i),
             then: [
-              ringInfo[i] < (rB > 0 ? [sK, sIdx].swizzle() : sK),
+              ringInfo[i] < (rB > 0 ? [sK, sIdx].concat() : sK),
             ],
           ),
           If(chAck & kIdx.eq(i), then: [ringData[i] < ctrlData]),
@@ -496,7 +496,7 @@ class Ddr3MemoryPort extends Module {
               mux(
                 g[0],
                 Const(0, width: 4),
-                [indexOf(rGrant, 3), Const(1)].swizzle(),
+                [indexOf(rGrant, 3), Const(1)].concat(),
               ),
         ],
       ),
@@ -600,10 +600,10 @@ class Ddr3MemoryPort extends Module {
     ];
     final mergedData = [
       for (var l = ratio - 1; l >= 0; l--) mux(hit[l], w.wdataData, accData[l]),
-    ].swizzle();
+    ].concat();
     final mergedSel = [
       for (var l = ratio - 1; l >= 0; l--) mux(hit[l], beatSel, accSel[l]),
-    ].swizzle();
+    ].concat();
     wqPush <= beat & lastBeat;
     wqData <= harborPack([wordAddr(aAddr), mergedData, mergedSel, aLast]);
 

@@ -130,9 +130,9 @@ class HarborFpMiscPath extends Module {
       final ub = HarborFpUnpack(config, fmt: fmt, operand: b, name: 'unpack_b');
       final ew = ua.exponentWidth;
 
-      Logic flipMsb(Logic x) => [~x[ew - 1], x.getRange(0, ew - 1)].swizzle();
-      final keyA = [flipMsb(ua.exponent), ua.significand].swizzle();
-      final keyB = [flipMsb(ub.exponent), ub.significand].swizzle();
+      Logic flipMsb(Logic x) => [~x[ew - 1], x.getRange(0, ew - 1)].concat();
+      final keyA = [flipMsb(ua.exponent), ua.significand].concat();
+      final keyB = [flipMsb(ub.exponent), ub.significand].concat();
       final magLt = keyA.lt(keyB);
       final magEq = keyA.eq(keyB);
       final magGt = ~magLt & ~magEq;
@@ -189,7 +189,7 @@ class HarborFpMiscPath extends Module {
         cmpBit = mux(anyNan, Const(0), cmpBit);
         final anyCmp = anyOf(cmpOps);
         resultOut = mux(anyCmp, cmpBit.zeroExtend(opW), resultOut);
-        flagsOut = mux(anyCmp, [cmpNv, Const(0, width: 4)].swizzle(), flagsOut);
+        flagsOut = mux(anyCmp, [cmpNv, Const(0, width: 4)].concat(), flagsOut);
       }
 
       if (minMaxOps.isNotEmpty) {
@@ -229,7 +229,7 @@ class HarborFpMiscPath extends Module {
                 BigInt.one << (f.mantissaWidth - 1),
                 width: f.mantissaWidth,
               ),
-            ].swizzle().zeroExtend(opW),
+            ].concat().zeroExtend(opW),
         ]);
         final minMaxResult = mux(resultIsNan, canonicalNan, propagated);
 
@@ -237,7 +237,7 @@ class HarborFpMiscPath extends Module {
         resultOut = mux(anyMinMax, minMaxResult, resultOut);
         flagsOut = mux(
           anyMinMax,
-          [nvMinMax, Const(0, width: 4)].swizzle(),
+          [nvMinMax, Const(0, width: 4)].concat(),
           flagsOut,
         );
       }
@@ -266,7 +266,7 @@ class HarborFpMiscPath extends Module {
       final b7 = uaRaw.isInf & ~signA;
       final b8 = uaRaw.isSnan;
       final b9 = uaRaw.isNan & ~uaRaw.isSnan;
-      final classMask = [b9, b8, b7, b6, b5, b4, b3, b2, b1, b0].swizzle();
+      final classMask = [b9, b8, b7, b6, b5, b4, b3, b2, b1, b0].concat();
       resultOut = mux(
         isOp(HarborFpOp.classify),
         classMask.zeroExtend(opW),
@@ -286,7 +286,7 @@ class HarborFpMiscPath extends Module {
         if (ops.contains(HarborFpOp.sgnj)) {
           sign = mux(isOp(HarborFpOp.sgnj), sB, sign);
         }
-        return [sign, rest].swizzle().zeroExtend(opW);
+        return [sign, rest].concat().zeroExtend(opW);
       }
 
       final sgnjResult = harborFpSelect(fmt, [

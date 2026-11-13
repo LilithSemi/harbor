@@ -38,7 +38,9 @@ void main() {
     () async {
       const clocks = 12 * _frame;
       const pixelPeriod = 14;
-      final pixelClk = SimpleClockGenerator(pixelPeriod).clk;
+      final pixelClk = SimpleClockGenerator(
+        pixelPeriod + (pixelPeriod & 1),
+      ).clk;
       final sysClk = SimpleClockGenerator(6).clk;
       final pixelReset = Logic(name: 'pixel_reset');
       final sysReset = Logic(name: 'sys_reset');

@@ -467,7 +467,7 @@ void main() {
       promisc: Logic(),
     );
     await dut.build();
-    final sv = dut.generateSynth();
+    final sv = dut.dumpSystemVerilog();
     expect(sv, contains('module HarborEthMacRx_Hash_Promisc'));
     expect(sv, contains('module HarborEthRxFilter_Hash_Promisc'));
     expect(sv, contains('module HarborCdcSync_S2_W48'));

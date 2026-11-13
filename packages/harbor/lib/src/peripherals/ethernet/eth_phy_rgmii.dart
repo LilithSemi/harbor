@@ -170,7 +170,7 @@ class HarborEthPhyRgmii extends Module {
     final nib = Logic(name: 'tx_nib');
     final atLim = Logic(name: 'tx_at_lim');
     final strobe = Logic(name: 'tx_strobe_r');
-    final lim = mux(mid, Const(4, width: 6), Const(49, width: 6));
+    final lim = mux<Logic>(mid, Const(4, width: 6), Const(49, width: 6));
     final step = (fast | atLim).named('tx_step');
     final atLimNext = (~step & (div + 1).eq(lim)).named('tx_at_lim_next');
     final fastNext = mux(strobe, tSpeed.eq(2), fast).named('tx_fast_next');
@@ -219,11 +219,11 @@ class HarborEthPhyRgmii extends Module {
     // Half clock index in the nibble: 2 * div on the rise, one more on the
     // fall. The clock is high from half [hi] to half [lo], and the control
     // pin changes to `en ^ er` at half [sw].
-    final hRise = [div, Const(0)].swizzle().named('tx_h_rise');
-    final hFall = [div, Const(1)].swizzle().named('tx_h_fall');
-    final hi = mux(mid, Const(2, width: 7), Const(20, width: 7));
-    final lo = mux(mid, Const(7, width: 7), Const(70, width: 7));
-    final sw = mux(mid, Const(5, width: 7), Const(50, width: 7));
+    final hRise = [div, Const(0)].concat().named('tx_h_rise');
+    final hFall = [div, Const(1)].concat().named('tx_h_fall');
+    final hi = mux<Logic>(mid, Const(2, width: 7), Const(20, width: 7));
+    final lo = mux<Logic>(mid, Const(7, width: 7), Const(70, width: 7));
+    final sw = mux<Logic>(mid, Const(5, width: 7), Const(50, width: 7));
     final enEr = (enR ^ erR).named('tx_en_er');
     final nibble = mux(nib, byteR.slice(7, 4), byteR.slice(3, 0));
 
@@ -265,7 +265,7 @@ class HarborEthPhyRgmii extends Module {
         [
           for (var i = 0; i < 4; i++)
             oddr(tclk, tRst, dD1[i], dD2[i], 'txd_oddr_$i'),
-        ].rswizzle();
+        ].rconcat();
     txCtlOut <= oddr(tclk, tRst, cD1, cD2, 'tx_ctl_oddr');
     if (config.txClockShift) {
       // One register on the shifted clock, so the ODDR inputs come from
@@ -344,8 +344,8 @@ class HarborEthPhyRgmii extends Module {
     }
 
     final rx = [for (var i = 0; i < 4; i++) iddr(rxdPin[i], 'rxd_$i')];
-    final rxR = rx.map((e) => e.$1).toList().rswizzle().named('rx_r');
-    final rxF = rx.map((e) => e.$2).toList().rswizzle().named('rx_f');
+    final rxR = rx.map((e) => e.$1).toList().rconcat().named('rx_r');
+    final rxF = rx.map((e) => e.$2).toList().rconcat().named('rx_f');
     final (ctlR, ctlF) = iddr(rxCtlPin, 'rx_ctl');
     final dv = ctlR.named('rx_dv_pin');
     final er = (ctlR ^ ctlF).named('rx_er_pin');
@@ -361,7 +361,7 @@ class HarborEthPhyRgmii extends Module {
     final gDv = Logic(name: 'rx_g_dv');
     final gEr = Logic(name: 'rx_g_er');
     Sequential(rclk, [
-      gData < [rxF, rxR].swizzle(),
+      gData < [rxF, rxR].concat(),
       gDv < dv & rFast,
       gEr < er & rFast,
     ], reset: rRst);

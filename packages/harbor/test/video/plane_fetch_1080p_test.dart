@@ -13,7 +13,7 @@ const _hTotal = 2200;
 
 // The memory runs at 150 MHz. Its first beat comes 24 cycles (160 ns)
 // after a take, then one 32-bit beat each cycle: 600 MB/s peak.
-const _sysPs = 6667;
+const _sysPs = 6668;
 const _latency = 24;
 
 const _y = 0x01000000;
@@ -22,8 +22,8 @@ const _c = 0x02000000;
 /// Scans [lines] luma lines of [format] after a frame start and three
 /// blank lines. Checks every word that the read side gives back.
 Future<void> _scan(HarborPixelFormat format, {int lines = 6}) async {
-  final pixelClk = SimpleClockGenerator(_pixelPs).clk;
-  final sysClk = SimpleClockGenerator(_sysPs).clk;
+  final pixelClk = SimpleClockGenerator(_pixelPs + (_pixelPs & 1)).clk;
+  final sysClk = SimpleClockGenerator(_sysPs + (_sysPs & 1)).clk;
   final pixelReset = Logic(name: 'pixel_reset');
   final sysReset = Logic(name: 'sys_reset');
   final frameStart = Logic(name: 'frame_start');

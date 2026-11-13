@@ -223,6 +223,6 @@ class HarborSuperresUpscale extends BridgeModule {
     }
 
     output('out') <=
-        [for (var i = upW * height - 1; i >= 0; i--) outSlices[i]].swizzle();
+        [for (var i = upW * height - 1; i >= 0; i--) outSlices[i]].concat();
   }
 }

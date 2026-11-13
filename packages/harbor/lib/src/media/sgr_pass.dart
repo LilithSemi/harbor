@@ -127,14 +127,14 @@ class HarborSgrPass extends BridgeModule {
         }
         // full pass: mode 0. fast pass: mode 1 on even rows, mode 2 on odd.
         final mode = !fast ? 0 : (i.isEven ? 1 : 2);
-        cs.input('aw').srcConnection! <= aw.reversed.toList().swizzle();
-        cs.input('bw').srcConnection! <= bw.reversed.toList().swizzle();
+        cs.input('aw').srcConnection! <= aw.reversed.toList().concat();
+        cs.input('bw').srcConnection! <= bw.reversed.toList().concat();
         cs.input('center').srcConnection! <= bodyPx(i, j);
         cs.input('mode').srcConnection! <= Const(mode, width: 2);
         fltParts.add(cs.output('flt'));
       }
     }
 
-    output('flt') <= fltParts.reversed.toList().swizzle();
+    output('flt') <= fltParts.reversed.toList().concat();
   }
 }

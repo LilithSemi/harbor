@@ -165,6 +165,13 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// vendors ignore it.
   final bool ecp5Autoname;
 
+  /// Optional cost for the open-XC7 Xilinx LUT6 cells during ABC9 mapping.
+  ///
+  /// When set, Yosys maps the design into 6-input LUTs without MUXF7/MUXF8
+  /// cells, and this positive value overrides the LUT6 area cost used by
+  /// ABC9. Null keeps the standard `synth_xilinx` flow unchanged.
+  final int? xilinxLut6Cost;
+
   /// Whether this FPGA supports eFuse OTP storage.
   ///
   /// ECP5 and Xilinx 7-series have eFuse support for user data and
@@ -218,8 +225,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.speedGrade = '1',
     this.progCommand,
     this.ecp5Autoname = false,
+    this.xilinxLut6Cost,
     this.useHimbaechel = false,
-  }) : assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
+  }) : assert(xilinxLut6Cost == null || xilinxLut6Cost > 0),
+       assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
        _xilinxFamily = null;
 
   /// iCE40 UP5K target using Yosys + nextpnr-ice40.
@@ -237,7 +246,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
        clockNPortName = null,
        speedGrade = '1',
        useHimbaechel = false,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Lattice ECP5 target using Yosys + nextpnr-ecp5.
   const HarborFpgaTarget.ecp5({
@@ -254,7 +264,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
        clockNPortName = null,
        speedGrade = '1',
        useHimbaechel = false,
-       _xilinxFamily = null;
+       _xilinxFamily = null,
+       xilinxLut6Cost = null;
 
   /// Xilinx Spartan-7 target using Vivado or openXC7.
   ///
@@ -272,12 +283,14 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
+    this.xilinxLut6Cost,
   }) : name = 'spartan7-$device',
        vendor = useOpenXc7 || useHimbaechel
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.spartan7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       assert(xilinxLut6Cost == null || xilinxLut6Cost > 0);
 
   /// Xilinx Artix-7 target using Vivado or openXC7.
   ///
@@ -300,7 +313,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.artix7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Xilinx Kintex-7 target using Vivado or openXC7.
   ///
@@ -323,7 +337,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.kintex7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Yosys synthesis target string for this FPGA family.
   String get _yosysSynthTarget => switch (vendor) {
@@ -428,7 +443,32 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         // has caused unrelated issues before, so it is NOT used here. De-congest
         // that path a targeted way instead (register-duplicate s2_bank with a
         // synth-flow keep, or floorplan the controller).
-        buf.writeln('synth_xilinx -top $topCell -flatten');
+        final lut6Cost = xilinxLut6Cost;
+        if (lut6Cost == null) {
+          buf.writeln('synth_xilinx -top $topCell -flatten');
+        } else {
+          // This staged flow lets ABC9 run before Xilinx LUT mapping. The
+          // abc9_lut cell attribute supplies the custom LUT6 cost. Keep the
+          // `=LUT6` selector on setattr: ordinary selection patterns exclude
+          // library modules and would leave their mapping cost unchanged.
+          buf.writeln(
+            'synth_xilinx -top $topCell -flatten -run begin:map_luts',
+          );
+          buf.writeln('select -assert-any =LUT6');
+          buf.writeln('setattr -mod -set abc9_lut $lut6Cost =LUT6');
+          buf.writeln('select -assert-any =LUT6 =A:abc9_lut=$lut6Cost %i');
+          buf.writeln('opt_expr -mux_undef -noclkinv');
+          buf.writeln('abc9 -maxlut 6');
+          buf.writeln('clean');
+          buf.writeln('xilinx_srl -fixed -minlen 3');
+          buf.writeln(
+            'techmap -map +/xilinx/lut_map.v -map +/xilinx/cells_map.v '
+            '-D LUT_WIDTH=6',
+          );
+          buf.writeln('xilinx_dffopt');
+          buf.writeln('opt_lut_ins -tech xilinx');
+          buf.writeln('synth_xilinx -top $topCell -run finalize:');
+        }
         buf.writeln('write_json $topCell.json');
     }
 
@@ -680,22 +720,28 @@ class HarborFpgaTarget extends HarborDeviceTarget {
 
   /// Generates the nextpnr-xilinx `--pre-pack` clock over-constraint
   /// (`support/nextpnr/clocks.py`). nextpnr-xilinx does not propagate the XDC
-  /// `create_clock` through a PLLE2/MMCM or BUFG, so every derived clock (the
-  /// core net `O`, the DDR controller net `ddr_clk`) reaches the timing engine
-  /// UNCONSTRAINED - zero margin, setup-only, single-corner. addClock at a rate
-  /// ABOVE the real one restores a timing budget: it drives timing-aware
+  /// `create_clock` through a PLLE2/MMCM or BUFG, so the named oscillator/core
+  /// aliases and DDR controller net reach the timing engine UNCONSTRAINED -
+  /// zero margin, setup-only, single-corner. addClock restores a timing budget:
+  /// the core and DDR are added ABOVE their real rates, while the source is
+  /// added at its actual rate. This drives timing-aware
   /// placement/routing to prioritise these paths and surfaces true silicon
   /// margin as an honest WNS. The core is over-constrained modestly (it already
   /// runs well under its routing ceiling); the DDR controller carries the larger
   /// margin because it is far more slack-critical per cycle.
   String generateClockConstraintPy({
     required double coreClkMhz,
+    required String coreClockNet,
+    required String sourceClockNet,
+    required double sourceClkMhz,
     required double ddrCtrlMhz,
   }) {
     final coreTarget = (coreClkMhz * 1.4);
     final ddrTarget = (ddrCtrlMhz * 1.25);
     final buf = StringBuffer();
-    buf.writeln('# --pre-pack over-constraint for the PLL/BUFG-derived clocks');
+    buf.writeln(
+      '# --pre-pack over-constraint for source and PLL/BUFG-derived clocks',
+    );
     buf.writeln(
       '# that nextpnr-xilinx leaves UNCONSTRAINED (create_clock does',
     );
@@ -706,7 +752,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     );
     buf.writeln('for net, mhz in [');
     buf.writeln(
-      "    ('O', ${coreTarget.toStringAsFixed(2)}),"
+      "    ('$sourceClockNet', ${sourceClkMhz.toStringAsFixed(2)}),"
+      '  # board oscillator, real ~${sourceClkMhz.toStringAsFixed(1)} MHz',
+    );
+    buf.writeln(
+      "    ('$coreClockNet', ${coreTarget.toStringAsFixed(2)}),"
       '  # core, real ~${coreClkMhz.toStringAsFixed(1)} MHz',
     );
     buf.writeln(

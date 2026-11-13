@@ -221,7 +221,7 @@ class HarborFramebufferDisplay extends Module {
       blue <= bReg;
       x <= reg(tx, 'prgb_x');
       y <= reg(ty, 'prgb_y');
-      rgb <= [rReg, gReg, bReg].swizzle();
+      rgb <= [rReg, gReg, bReg].concat();
       de <= deReg;
       hsync <= hsyncReg;
       vsync <= vsyncReg;

@@ -213,7 +213,7 @@ class HarborEthDmaRx extends Module {
 
     final mask = [
       for (var i = iw - 1; i >= 0; i--) ringSize.gt(Const(i, width: 4)),
-    ].swizzle().named('ring_mask');
+    ].concat().named('ring_mask');
     final base = (ringBase & ~Const(config.descBytes - 1, width: aw)).named(
       'ring_base_aligned',
     );
@@ -225,8 +225,8 @@ class HarborEthDmaRx extends Module {
 
     final own = dw2[31];
     final size = dw2.getRange(0, 16);
-    final dAddr = [dw1, dw0].swizzle().getRange(0, aw).named('d_addr');
-    final fits = aw < 64 ? ~[dw1, dw0].swizzle().getRange(aw).or() : Const(1);
+    final dAddr = [dw1, dw0].concat().getRange(0, aw).named('d_addr');
+    final fits = aw < 64 ? ~[dw1, dw0].concat().getRange(aw).or() : Const(1);
     final aligned = (dAddr.getRange(0, 2).eq(0) & fits).named('d_aligned');
     // The buffer checks are flops, set when word 2 of the descriptor comes,
     // so the evaluation starts from flops.
@@ -278,7 +278,8 @@ class HarborEthDmaRx extends Module {
           bufAddr,
           mux(
             inState(_writeBack),
-            descAddr + mux(wbBeat, Const(8, width: aw), Const(12, width: aw)),
+            descAddr +
+                mux<Logic>(wbBeat, Const(8, width: aw), Const(12, width: aw)),
             descAddr,
           ),
         );
@@ -286,7 +287,7 @@ class HarborEthDmaRx extends Module {
         mux(
           inState(_data),
           (beats - 1).getRange(0, lenW),
-          mux(
+          mux<Logic>(
             inState(_writeBack),
             Const(0, width: lenW),
             Const(2, width: lenW),
@@ -339,7 +340,7 @@ class HarborEthDmaRx extends Module {
             .named('word_over');
     final strb = [
       for (var i = 3; i >= 0; i--) put.gt(Const(i, width: 3)),
-    ].swizzle().named('word_strb');
+    ].concat().named('word_strb');
 
     final word3 = [
       Const(0, width: 7),
@@ -350,7 +351,7 @@ class HarborEthDmaRx extends Module {
       Const(1),
       Const(1),
       count,
-    ].swizzle().named('word3');
+    ].concat().named('word3');
     m.wdataValid <= beatValid | (inState(_writeBack) & wbData);
     m.wdataData <=
         mux(
@@ -361,7 +362,7 @@ class HarborEthDmaRx extends Module {
     m.wdataStrb <=
         mux(
           inState(_writeBack),
-          mux(wbBeat, Const(0x8, width: 4), Const(0xf, width: 4)),
+          mux<Logic>(wbBeat, Const(0x8, width: 4), Const(0xf, width: 4)),
           mux(pad | stopW, Const(0, width: 4), strb),
         );
     m.wdataLast <= ~inState(_data) | beatsLeft.eq(1);
@@ -390,7 +391,11 @@ class HarborEthDmaRx extends Module {
           mux(
             bigErr,
             Const(errOversize, width: 3),
-            mux(status[1], Const(errRunt, width: 3), Const(errOk, width: 3)),
+            mux<Logic>(
+              status[1],
+              Const(errRunt, width: 3),
+              Const(errOk, width: 3),
+            ),
           ),
         ),
       ),

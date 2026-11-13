@@ -78,7 +78,7 @@ class HarborTileGroupParse extends BridgeModule {
     final headerFlag = byte0[7]; // MSB-first bit 0
 
     // little-endian tile_size_minus_1 of tile_size_bytes bytes at bpos.
-    final posShift = [bpos, Const(0, width: 3)].swizzle(); // bpos*8
+    final posShift = [bpos, Const(0, width: 3)].concat(); // bpos*8
     final posView = (bytesIn >>> posShift.zeroExtend(totalBits)).getRange(
       0,
       32,
@@ -192,8 +192,8 @@ class HarborTileGroupParse extends BridgeModule {
     output('unsupported') <= state.eq(st(sUnsupported));
     output('tile_count') <= tileCount;
     output('tile_offsets') <=
-        [for (var i = maxTiles - 1; i >= 0; i--) offsets[i]].swizzle();
+        [for (var i = maxTiles - 1; i >= 0; i--) offsets[i]].concat();
     output('tile_sizes') <=
-        [for (var i = maxTiles - 1; i >= 0; i--) sizes[i]].swizzle();
+        [for (var i = maxTiles - 1; i >= 0; i--) sizes[i]].concat();
   }
 }

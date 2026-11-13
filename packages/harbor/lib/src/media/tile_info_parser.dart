@@ -86,12 +86,12 @@ class HarborTileInfoParser extends BridgeModule {
       shr((miRows + Const(31, width: 32)).getRange(0, 32), 5),
       shr((miRows + Const(15, width: 32)).getRange(0, 32), 4),
     );
-    final maxTileWidthSb = mux(
+    final maxTileWidthSb = mux<Logic>(
       use128,
       Const(32, width: 32),
       Const(64, width: 32),
     );
-    final maxTileAreaSb = mux(
+    final maxTileAreaSb = mux<Logic>(
       use128,
       Const(576, width: 32),
       Const(2304, width: 32),

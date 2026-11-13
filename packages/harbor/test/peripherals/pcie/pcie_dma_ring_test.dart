@@ -730,7 +730,7 @@ void main() {
         endpointConfig: const HarborPcieEndpointConfig(msiVectors: 8),
       );
       await dma.build();
-      final sv = dma.generateSynth();
+      final sv = dma.dumpSystemVerilog();
       expect(sv, contains('desc_head'));
       expect(sv, fifo ? contains('sel_active') : isNot(contains('push_0')));
       Simulator.reset();

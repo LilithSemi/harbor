@@ -187,7 +187,7 @@ void main() {
       ],
     );
     await f.build();
-    final sv = f.generateSynth();
+    final sv = f.dumpSystemVerilog();
     expect(sv, isNot(contains('s0_held_grant')));
     expect(sv, contains('s1_held_grant'));
   });
@@ -685,7 +685,7 @@ void main() {
             ],
           );
           await shell.build();
-          final sv = shell.generateSynth();
+          final sv = shell.dumpSystemVerilog();
           must(
             sv,
             contains(
@@ -714,7 +714,7 @@ void main() {
           masters: const [...masters3, MasterCfg('m3', 1, 2, lite: true)],
         );
         await shell.build();
-        final sv = shell.generateSynth();
+        final sv = shell.dumpSystemVerilog();
         must(sv, contains('module HarborAxi4Fabric'));
       }),
     );
@@ -736,7 +736,7 @@ void main() {
           ],
         );
         await shell.build();
-        final sv = shell.generateSynth();
+        final sv = shell.dumpSystemVerilog();
         must(sv, contains('module HarborAxi4Fabric'));
         must(sv, contains('s0_r1_ARVALID'));
         must(sv, contains('s0_r1_RREADY'));

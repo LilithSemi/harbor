@@ -424,7 +424,7 @@ class HarborFpEstimate extends Module {
     final isInf = st['is_inf'];
 
     Logic word(Logic sign, Logic expBits, Logic mantField) =>
-        [sign, expBits, mantField].swizzle().zeroExtend(opW);
+        [sign, expBits, mantField].concat().zeroExtend(opW);
     Logic infWord(HarborFpFormat f, Logic sign) => word(
       sign,
       Const(1, width: f.exponentWidth, fill: true),
@@ -453,7 +453,7 @@ class HarborFpEstimate extends Module {
           of ?? Const(0),
           uf ?? Const(0),
           (of ?? Const(0)) | (uf ?? Const(0)),
-        ].swizzle();
+        ].concat();
 
     Logic resultOut = Const(0, width: opW);
     Logic flagsOut = Const(0, width: 5);
@@ -469,7 +469,7 @@ class HarborFpEstimate extends Module {
       final flushes = <Logic>[];
       // Signed `te < c`. With the top bit flipped, an unsigned compare
       // gives the signed order.
-      final teOff = [~te6[cw - 1], te6.getRange(0, cw - 1)].swizzle();
+      final teOff = [~te6[cw - 1], te6.getRange(0, cw - 1)].concat();
       Logic teLt(int c) => ~teOff.gte(Const(c + (1 << (cw - 1)), width: cw));
       for (final f in formats) {
         final m = f.mantissaWidth;
@@ -489,7 +489,7 @@ class HarborFpEstimate extends Module {
           Const(m + 1, width: shiftW),
           rawShift,
         );
-        final subMant = ([Const(1), fracOf(f)].swizzle() >>> subShift).getRange(
+        final subMant = ([Const(1), fracOf(f)].concat() >>> subShift).getRange(
           0,
           m,
         );
@@ -584,7 +584,7 @@ class HarborFpEstimate extends Module {
     }
 
     // NV comes from stage 1.
-    flagsOut = flagsOut | [st['nv'], Const(0, width: 4)].swizzle();
+    flagsOut = flagsOut | [st['nv'], Const(0, width: 4)].concat();
     st.ride.clear();
     st
       ..['result'] = resultOut

@@ -48,7 +48,7 @@ class HarborSbWalk extends BridgeModule {
     final rowEnd = input('mi_row_end');
 
     // MI per superblock side: 32 (128x128) or 16 (64x64).
-    final sbMi = mux(use128, Const(32, width: mw), Const(16, width: mw));
+    final sbMi = mux<Logic>(use128, Const(32, width: mw), Const(16, width: mw));
 
     final state = Logic(name: 'state', width: 2);
     final sbRow = Logic(name: 'sb_row', width: mw);

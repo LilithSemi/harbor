@@ -422,9 +422,9 @@ class HarborDivSqrtRecurrence extends Module {
       }
     }
     void slotsOut(List<Logic> valids, List<Logic> Function() tags) {
-      slotValid <= valids.rswizzle();
+      slotValid <= valids.rconcat();
       if (tagW > 0) {
-        slotTag <= tags().rswizzle();
+        slotTag <= tags().rconcat();
       }
     }
 
@@ -438,7 +438,7 @@ class HarborDivSqrtRecurrence extends Module {
 
     // Puts [v] at the top of a [width] bit field.
     Logic top(Logic v, int width) =>
-        width > v.width ? [v, zero(width - v.width)].swizzle() : v;
+        width > v.width ? [v, zero(width - v.width)].concat() : v;
 
     // Selects a value for the op of [s]. [fpDiv], [fpSqrt] and [integer] map
     // a format index or a narrow flag to the value.
@@ -528,7 +528,7 @@ class HarborDivSqrtRecurrence extends Module {
           inits.add((
             isDivOp!,
             sigA.zeroExtend(rw),
-            [sigB, Const(0)].swizzle().zeroExtend(dw),
+            [sigB, Const(0)].concat().zeroExtend(dw),
             xw > 0 ? zero(xw) : null,
           ));
         }
@@ -540,11 +540,11 @@ class HarborDivSqrtRecurrence extends Module {
           nv.add(ua.isSnan | negative);
           dz.add(Const(0));
           sign.add(ua.sign);
-          exp.add([expA[ew - 1], expA.getRange(1)].swizzle());
+          exp.add([expA[ew - 1], expA.getRange(1)].concat());
           // An odd exponent puts one more radicand bit above the point.
           final rad = mux(
             expA[0],
-            [sigA, Const(0)].swizzle(),
+            [sigA, Const(0)].concat(),
             sigA.zeroExtend(p + 1),
           );
           inits.add((
@@ -641,29 +641,26 @@ class HarborDivSqrtRecurrence extends Module {
       Logic? term;
       if (hasDiv || hasInt) {
         final d = s['d']!.zeroExtend(rw);
-        r2 = [
-          r.getRange(0, rw - 1),
-          x == null ? Const(0) : x[xw - 1],
-        ].swizzle();
+        r2 = [r.getRange(0, rw - 1), x == null ? Const(0) : x[xw - 1]].concat();
         term = mux(neg, d, ~d);
       }
       if (hasSqrt) {
         final qz = q.zeroExtend(rw - 2);
-        final r4 = [r.getRange(0, rw - 2), x!.getRange(xw - 2)].swizzle();
-        final t4 = [mux(neg, qz, ~qz), Const(3, width: 2)].swizzle();
+        final r4 = [r.getRange(0, rw - 2), x!.getRange(xw - 2)].concat();
+        final t4 = [mux(neg, qz, ~qz), Const(3, width: 2)].concat();
         r2 = r2 == null ? r4 : mux(sqrt, r4, r2);
         term = term == null ? t4 : mux(sqrt, t4, term);
       }
       final cin = ~sqrt & ~neg;
-      final sum = ([r2!, Const(1)].swizzle() + [term!, cin].swizzle())
+      final sum = ([r2!, Const(1)].concat() + [term!, cin].concat())
           .getRange(1)
           .named('r_step$i');
       out['r'] = sum;
-      out['q'] = [q.getRange(0, n - 1), ~sum[rw - 1]].swizzle();
+      out['q'] = [q.getRange(0, n - 1), ~sum[rw - 1]].concat();
       if (x != null) {
-        final x1 = [x.getRange(0, xw - 1), Const(0)].swizzle();
+        final x1 = [x.getRange(0, xw - 1), Const(0)].concat();
         out['x'] = hasSqrt
-            ? mux(sqrt, [x.getRange(0, xw - 2), zero(2)].swizzle(), x1)
+            ? mux(sqrt, [x.getRange(0, xw - 2), zero(2)].concat(), x1)
             : x1;
       }
       return out;
@@ -681,7 +678,7 @@ class HarborDivSqrtRecurrence extends Module {
         fix = s['d']!.zeroExtend(rw);
       }
       if (hasSqrt) {
-        final f2 = [q, Const(1)].swizzle().zeroExtend(rw);
+        final f2 = [q, Const(1)].concat().zeroExtend(rw);
         fix = fix == null ? f2 : mux(sqrt, f2, fix);
       }
       final add = mux(neg, fix!, zero(rw));
@@ -695,7 +692,7 @@ class HarborDivSqrtRecurrence extends Module {
       if (hasFp) {
         // An op with fewer steps than [n] has its result bits lower in q.
         Logic at(int c) =>
-            c == n ? q : [q.getRange(0, c), zero(n - c)].swizzle();
+            c == n ? q : [q.getRange(0, c), zero(n - c)].concat();
         final qa = mode == HarborFpDivMode.pipelined
             ? q
             : perOp(
@@ -716,7 +713,7 @@ class HarborDivSqrtRecurrence extends Module {
             : below(n - p - 2);
         // r + add is zero when each bit of r ^ add equals the carry into it,
         // and that carry is r | add of the bit below.
-        final carries = [(r | add).getRange(0, rw - 1), Const(0)].swizzle();
+        final carries = [(r | add).getRange(0, rw - 1), Const(0)].concat();
         final remNz = (r ^ add ^ carries).or().named('rem_nz');
         final round = HarborFpRound(
           fp,
@@ -763,7 +760,7 @@ class HarborDivSqrtRecurrence extends Module {
         });
         fpResult = pack.result.zeroExtend(inW);
         out['flags'] =
-            pack.flags | [s['nv']!, s['dz']!, Const(0, width: 3)].swizzle();
+            pack.flags | [s['nv']!, s['dz']!, Const(0, width: 3)].concat();
       }
       if (hasInt) {
         final ri = s['rem']!.getRange(0, w);
@@ -921,7 +918,7 @@ class HarborDivSqrtRecurrence extends Module {
         for (final key in const ['r', 'q', 'x'])
           if (s.containsKey(key)) key,
       ];
-      final bus = lastBus ?? [for (final key in keys) s[key]!].rswizzle();
+      final bus = lastBus ?? [for (final key in keys) s[key]!].rconcat();
       final cell = _HarborRecurStep(
         bus,
         {if (s.containsKey('d')) 'd': s['d']!, if (hasSqrt) 'op': s['op']!},
@@ -932,7 +929,7 @@ class HarborDivSqrtRecurrence extends Module {
             inner[key] = state.getRange(at, at += s[key]!.width);
           }
           final out = step(inner, 0);
-          return [for (final key in keys) out[key]!].rswizzle();
+          return [for (final key in keys) out[key]!].rconcat();
         },
         definitionName: '${definitionName}_Step',
       );

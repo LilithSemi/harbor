@@ -261,7 +261,7 @@ class HarborCdefFrame extends BridgeModule {
                   for (var wr = 11; wr >= 0; wr--)
                     for (var wc = 11; wc >= 0; wc--)
                       srcY(blkRow + wr - 2, blkCol + wc - 2),
-                ].swizzle();
+                ].concat();
             blk.input('pri').srcConnection! <= yPri;
             blk.input('sec').srcConnection! <= ySec;
             blk.input('pri_damp').srcConnection! <= yDamp;
@@ -308,7 +308,7 @@ class HarborCdefFrame extends BridgeModule {
                           for (var dr = 4; dr >= 0; dr--)
                             for (var dc = 4; dc >= 0; dc--)
                               src(chBlkRow + i + dr - 2, chBlkCol + j + dc - 2),
-                        ].swizzle();
+                        ].concat();
                     f.input('dir').srcConnection! <= chDir;
                     f.input('pri').srcConnection! <= uvPri;
                     f.input('sec').srcConnection! <= uvSec!;
@@ -326,12 +326,12 @@ class HarborCdefFrame extends BridgeModule {
     }
 
     output('out_y') <=
-        [for (var i = lumaW * lumaH - 1; i >= 0; i--) gridY[i]].swizzle();
+        [for (var i = lumaW * lumaH - 1; i >= 0; i--) gridY[i]].concat();
     if (haveChroma) {
       output('out_u') <=
-          [for (var i = chW * chH - 1; i >= 0; i--) gridU[i]].swizzle();
+          [for (var i = chW * chH - 1; i >= 0; i--) gridU[i]].concat();
       output('out_v') <=
-          [for (var i = chW * chH - 1; i >= 0; i--) gridV[i]].swizzle();
+          [for (var i = chW * chH - 1; i >= 0; i--) gridV[i]].concat();
     }
   }
 }

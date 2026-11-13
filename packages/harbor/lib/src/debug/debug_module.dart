@@ -199,7 +199,7 @@ class HarborDebugModule extends BridgeModule
       // byte offset [lane] (the low 2 bits of the address) within the word.
       Logic selFor(Logic size, Logic lane) {
         final byteSel = Const(1, width: 4) << lane;
-        final halfSel = mux(
+        final halfSel = mux<Logic>(
           lane[1],
           Const(0xc, width: 4),
           Const(0x3, width: 4),
@@ -216,8 +216,8 @@ class HarborDebugModule extends BridgeModule
       Logic replicateFor(Logic size, Logic data) {
         final byteVal = data.getRange(0, 8);
         final halfVal = data.getRange(0, 16);
-        final byteRep = [byteVal, byteVal, byteVal, byteVal].swizzle();
-        final halfRep = [halfVal, halfVal].swizzle();
+        final byteRep = [byteVal, byteVal, byteVal, byteVal].concat();
+        final halfRep = [halfVal, halfVal].concat();
         return mux(
           size.eq(Const(2, width: 2)),
           data,
@@ -259,7 +259,7 @@ class HarborDebugModule extends BridgeModule
       Logic sizeBytesFor(Logic size) => mux(
         size.eq(Const(2, width: 2)),
         Const(4, width: 32),
-        mux(
+        mux<Logic>(
           size.eq(Const(1, width: 2)),
           Const(2, width: 32),
           Const(1, width: 32),
@@ -276,7 +276,7 @@ class HarborDebugModule extends BridgeModule
         required Logic data,
       }) {
         final lane = addr.getRange(0, 2);
-        final wordAddr = [addr.getRange(2), Const(0, width: 2)].swizzle();
+        final wordAddr = [addr.getRange(2), Const(0, width: 2)].concat();
         final size2 = sbAccess.getRange(0, 2);
         final sizeValid = sbAccess.lt(Const(3, width: 3));
         final misaligned = mux(
@@ -327,7 +327,7 @@ class HarborDebugModule extends BridgeModule
         Const(1), // sbaccess32
         Const(1), // sbaccess16
         Const(1), // sbaccess8
-      ].swizzle();
+      ].concat();
 
       sbResetAssigns.addAll([
         sbBusy < Const(0),
@@ -562,7 +562,7 @@ class HarborDebugModule extends BridgeModule
           Const(1), // [5] hasresethaltreq
           Const(0), // [4] confstrptrvalid
           Const(3, width: 4), // [3:0] version = 3
-        ].swizzle();
+        ].concat();
 
     // Hart control defaults
     for (var i = 0; i < numHarts; i++) {

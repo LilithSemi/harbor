@@ -33,7 +33,7 @@ class _ExpConst {
   _ExpConst(Logic exponent, this.dec) : bw = exponent.width + 1 {
     ex = exponent.signExtend(bw);
     // With the top bit flipped, an unsigned compare gives the signed order.
-    _off = [~ex[bw - 1], ex.getRange(0, bw - 1)].swizzle();
+    _off = [~ex[bw - 1], ex.getRange(0, bw - 1)].concat();
   }
 
   int get _mask => (1 << bw) - 1;
@@ -326,7 +326,7 @@ class HarborFpPack extends Module {
     final inf = m['inf']!;
     final zero = m['zero']!;
 
-    Logic word(List<Logic> fields) => fields.swizzle().zeroExtend(outW);
+    Logic word(List<Logic> fields) => fields.concat().zeroExtend(outW);
 
     final words = <Logic>[];
     for (final f in formats) {
@@ -375,7 +375,7 @@ class HarborFpPack extends Module {
     final of = ~special & overflow;
     final uf = ~special & ~overflow & ((m['tiny']! & inexact) | flush);
     final nx = ~special & (inexact | overflow | flush);
-    flags <= [Const(0, width: 2), of, uf, nx].swizzle();
+    flags <= [Const(0, width: 2), of, uf, nx].concat();
   }
 
   static String _definitionName(HarborFpuConfig config) {

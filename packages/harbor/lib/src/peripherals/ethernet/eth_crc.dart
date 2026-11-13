@@ -10,7 +10,7 @@ Logic harborEthCrcByte(Logic crc32, Logic byte) {
   assert(byte.width == 8, 'byte must be 8 bits');
   var c = crc32 ^ byte.zeroExtend(32);
   for (var i = 0; i < 8; i++) {
-    final shifted = [Const(0), c.slice(31, 1)].swizzle();
+    final shifted = [Const(0), c.slice(31, 1)].concat();
     c = mux(c[0], shifted ^ Const(0xEDB88320, width: 32), shifted);
   }
   return c;

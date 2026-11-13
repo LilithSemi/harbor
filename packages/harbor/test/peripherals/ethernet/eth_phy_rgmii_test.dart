@@ -643,7 +643,7 @@ void main() {
     test('a shared IDELAYCTRL needs no clk200', () async {
       final phy = make(_artix, taps: 26, idelayCtrl: false);
       await phy.build();
-      final sv = phy.generateSynth();
+      final sv = phy.dumpSystemVerilog();
       expect(sv, contains('IDELAYE2'));
       expect(sv, isNot(contains('IDELAYCTRL')));
     });
@@ -664,7 +664,7 @@ void main() {
     test('Xilinx SystemVerilog has the cells and no sim body', () async {
       final phy = make(_artix, taps: 26, clk200: true);
       await phy.build();
-      final sv = phy.generateSynth();
+      final sv = phy.dumpSystemVerilog();
       for (final cell in [
         'ODDR',
         'IDDR',
@@ -693,7 +693,7 @@ void main() {
     test('ECP5 SystemVerilog has the cells', () async {
       final phy = make(_ecp5, taps: 40);
       await phy.build();
-      final sv = phy.generateSynth();
+      final sv = phy.dumpSystemVerilog();
       for (final cell in ['ODDRX1F', 'IDDRX1F', 'DELAYG']) {
         expect(
           sv,

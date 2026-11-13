@@ -185,7 +185,7 @@ Future<SdramPhyEcp5RunResult> runSdramPhyEcp5Case({
 }) async {
   const bank = 0, row = 0;
   final config = sdramPhyTestConfig;
-  final clk = SimpleClockGenerator(periodPs).clk;
+  final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
   final reset = Logic(name: 'reset')..inject(0);
   final driver = SdramPhyEcp5Driver(clk);
   final dqPad = LogicNet(name: 'dq_pad', width: config.dataWidth);
@@ -211,8 +211,8 @@ Future<SdramPhyEcp5RunResult> runSdramPhyEcp5Case({
   await sdramPhy.build();
 
   final bbs = _sdramPhyDqBbs(sdramPhy, config.dataWidth);
-  final fpgaDqOe = [for (final bb in bbs) ~bb.input('T')].rswizzle();
-  final fpgaDqOut = [for (final bb in bbs) bb.input('I')].rswizzle();
+  final fpgaDqOe = [for (final bb in bbs) ~bb.input('T')].rconcat();
+  final fpgaDqOut = [for (final bb in bbs) bb.input('I')].rconcat();
 
   final rules = const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000);
   final model = SdramPinModel(

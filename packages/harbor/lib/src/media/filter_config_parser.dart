@@ -49,7 +49,7 @@ class HarborFilterConfigParser extends BridgeModule {
     // Big-endian stream view of the whole buffer (byte 0 is the MSB).
     final gStream = [
       for (var i = 0; i < bufBytes; i++) bytesIn.getRange(i * 8, i * 8 + 8),
-    ].swizzle();
+    ].concat();
 
     // 128-bit LSB-first window starting at global bit [B]: shift the stream up
     // by B, take the top 128 bits, then byte-reverse into LSB-first order.
@@ -60,7 +60,7 @@ class HarborFilterConfigParser extends BridgeModule {
       );
       return [
         for (var i = 0; i < 16; i++) shifted.getRange(i * 8, i * 8 + 8),
-      ].swizzle();
+      ].concat();
     }
 
     final numPlanes = input('num_planes');

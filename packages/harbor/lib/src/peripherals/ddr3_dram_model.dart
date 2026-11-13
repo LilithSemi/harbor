@@ -157,7 +157,7 @@ class Ddr3DramModel extends Module {
               bitslip[l],
               then: [
                 // rotate left by one (barrel): {ref[6:0], ref[7]}.
-                ref < [ref.getRange(0, 7), ref[7]].swizzle(),
+                ref < [ref.getRange(0, 7), ref[7]].concat(),
               ],
             ),
           ],
@@ -165,7 +165,7 @@ class Ddr3DramModel extends Module {
       ]);
       refs.add(ref);
     }
-    output('o_controller_iserdes_bitslip_reference') <= refs.rswizzle();
+    output('o_controller_iserdes_bitslip_reference') <= refs.rconcat();
   }
 
   /// Decode the command stream: MPR mode toggles on an MRS-to-MR3 command, a
@@ -245,7 +245,7 @@ class Ddr3DramModel extends Module {
         reset,
         then: [pipe < Const(0, width: pipeLen + 1)],
         orElse: [
-          pipe < [pipe.getRange(0, pipeLen), readStrobe].swizzle(),
+          pipe < [pipe.getRange(0, pipeLen), readStrobe].concat(),
         ],
       ),
     ]);
@@ -274,8 +274,8 @@ class Ddr3DramModel extends Module {
         ],
         orElse: [
           // capture the write data three cycles after the command.
-          wrPending < [wrPending.getRange(0, 2), writeStrobe].swizzle(),
-          wrIndex < [wrIndex.getRange(0, 2), wrAddrBit].swizzle(),
+          wrPending < [wrPending.getRange(0, 2), writeStrobe].concat(),
+          wrIndex < [wrIndex.getRange(0, 2), wrAddrBit].concat(),
           If(
             wrPending[2],
             then: [
@@ -309,7 +309,11 @@ class Ddr3DramModel extends Module {
     // MPR reads present the windowed pattern. BIST reads hold (or gate) their
     // memory word.
     output('o_controller_iserdes_data') <=
-        mux(mpr, mux(dataValid, mprWord, Const(0, width: dq * 8)), bistData);
+        mux(
+          mpr,
+          mux<Logic>(dataValid, mprWord, Const(0, width: dq * 8)),
+          bistData,
+        );
 
     // DQS: model the read strobe the controller deserializes into dqs_store over
     // the 5 collect cycles. Per lane, present the byte slices of the 40-bit word
@@ -337,7 +341,7 @@ class Ddr3DramModel extends Module {
     final dqsWord = [
       for (var l = 0; l < lanes; l++)
         _laneDqsByte(taps[l], pipe, laneDqsBoundaryOffset[l]),
-    ].rswizzle();
+    ].rconcat();
     output('o_controller_iserdes_dqs') <= dqsWord;
   }
 
@@ -358,13 +362,13 @@ class Ddr3DramModel extends Module {
         reset,
         then: [track < Const(0, width: depth)],
         orElse: [
-          track < [track.getRange(0, depth - 1), readStrobe].swizzle(),
+          track < [track.getRange(0, depth - 1), readStrobe].concat(),
         ],
       ),
     ]);
     final inWindow = [
       for (var k = 0; k < readWindowCycles; k++) track[readWindowStart + k],
-    ].swizzle().or();
+    ].concat().or();
     return mux(inWindow, readHold, ~readHold);
   }
 

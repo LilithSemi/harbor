@@ -51,7 +51,7 @@ class HarborPartitionSymbol extends BridgeModule {
     Logic packCdf(List<int> icdf) => [
       for (var s = nsyms - 1; s >= 0; s--)
         Const(s < icdf.length ? icdf[s] : 0, width: 16),
-    ].swizzle();
+    ].concat();
     // Select the CDF row for the runtime ctx (0..3) from the 4-context table.
     Logic selCdf() {
       Logic v = packCdf(table[3]);
@@ -97,7 +97,7 @@ class HarborPartitionSymbol extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 

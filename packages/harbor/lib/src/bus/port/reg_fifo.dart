@@ -160,7 +160,7 @@ class HarborRegFifo {
 }
 
 /// Packs [fields] into one bus, first field in the low bits.
-Logic harborPack(List<Logic> fields) => fields.rswizzle();
+Logic harborPack(List<Logic> fields) => fields.rconcat();
 
 /// Splits [bus] back into fields of [widths], first field in the low bits.
 List<Logic> harborUnpack(Logic bus, List<int> widths) {

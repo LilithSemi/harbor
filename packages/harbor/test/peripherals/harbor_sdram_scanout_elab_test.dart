@@ -35,7 +35,7 @@ void main() {
     );
     await s.build();
     expectScanPorts(s);
-    final sv = s.generateSynth();
+    final sv = s.dumpSystemVerilog();
     expect(sv, contains('scan0_in_flight'));
     expect(sv, contains('scan0_req_valid'));
     expect(sv, contains('scan_reset'));
@@ -96,7 +96,7 @@ void main() {
       await s.build();
       expectScanPorts(s);
       expect(s.busWaitBound, HarborSdram.bestEffortWaitBound(s.cycles, 3) + 1);
-      final sv = s.generateSynth();
+      final sv = s.dumpSystemVerilog();
       for (final n in [
         'scan0_rq_valid_s1',
         'scan0_rd_valid_s1',

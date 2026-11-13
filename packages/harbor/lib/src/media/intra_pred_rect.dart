@@ -363,6 +363,6 @@ class HarborIntraPredRect extends BridgeModule {
       }
     }
 
-    output('pred') <= outs.reversed.toList().swizzle();
+    output('pred') <= outs.reversed.toList().concat();
   }
 }

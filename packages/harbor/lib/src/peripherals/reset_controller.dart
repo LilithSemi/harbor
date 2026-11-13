@@ -124,7 +124,7 @@ class HarborResetController extends BridgeModule
     systemReset <= resetActive | por;
     domainResets <=
         domainRstReg |
-            [for (var i = 0; i < domainCount; i++) resetActive].swizzle();
+            [for (var i = 0; i < domainCount; i++) resetActive].concat();
     resetCause <= cause;
 
     Sequential(clk, [
@@ -217,7 +217,7 @@ class HarborResetController extends BridgeModule
                         Const(0, width: 23),
                         resetActive,
                         cause,
-                      ].swizzle().zeroExtend(32),
+                      ].concat().zeroExtend(32),
                 ]),
                 CaseItem(Const(0x10, width: 12), [
                   If(

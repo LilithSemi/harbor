@@ -200,10 +200,10 @@ class HarborCryptoUnit extends BridgeModule {
     for (var b = 0; b < 8; b++) {
       final byte = rs1.getRange(b * 8, (b + 1) * 8);
       // Reverse bits within the byte: bit0->bit7, bit1->bit6, ...
-      final reversed = <Logic>[for (var i = 0; i < 8; i++) byte[i]].swizzle();
+      final reversed = <Logic>[for (var i = 0; i < 8; i++) byte[i]].concat();
       brev8Bytes.add(reversed);
     }
-    brev8Result <= brev8Bytes.reversed.toList().swizzle();
+    brev8Result <= brev8Bytes.reversed.toList().concat();
 
     // === Zbkc: clmul, carry-less multiply (lower 64 bits) ===
     // clmul(a, b) = XOR of (a << i) for each bit i where b[i] is set
@@ -234,7 +234,7 @@ class HarborCryptoUnit extends BridgeModule {
       final inRange = ~rs2.getRange(i * 8 + 3, (i + 1) * 8).or();
       xperm8Bytes.add(mux(inRange, byte_, Const(0, width: 8)));
     }
-    xperm8Result <= xperm8Bytes.swizzle();
+    xperm8Result <= xperm8Bytes.concat();
 
     // === Zbkx: xperm4, nibble-granularity lookup ===
     final xperm4Result = Logic(name: 'xperm4_result', width: 64);
@@ -251,7 +251,7 @@ class HarborCryptoUnit extends BridgeModule {
       }
       xperm4Nibbles.add(nibble);
     }
-    xperm4Result <= xperm4Nibbles.swizzle();
+    xperm4Result <= xperm4Nibbles.concat();
 
     // === Zkne: AES encrypt, SubBytes on 4 bytes of rs2 ===
     // aes64es: apply S-box to bytes, no MixColumns
@@ -261,7 +261,7 @@ class HarborCryptoUnit extends BridgeModule {
         _buildSboxLookup(rs2.getRange(i * 8, (i + 1) * 8), _aesSbox),
       );
     }
-    final aesEncResult = aesEncBytes.swizzle();
+    final aesEncResult = aesEncBytes.concat();
 
     // === Zknd: AES decrypt, InvSubBytes on 4 bytes of rs2 ===
     final aesDecBytes = <Logic>[];
@@ -270,7 +270,7 @@ class HarborCryptoUnit extends BridgeModule {
         _buildSboxLookup(rs2.getRange(i * 8, (i + 1) * 8), _aesInvSbox),
       );
     }
-    final aesDecResult = aesDecBytes.swizzle();
+    final aesDecResult = aesDecBytes.concat();
 
     // === Zknh: SHA-256 sigma/sum functions ===
     // sha256sig0(x) = ROTR(x,7) ^ ROTR(x,18) ^ SHR(x,3)

@@ -159,7 +159,7 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
     required bool signed,
     required int width,
   }) {
-    final v = msbFirst.swizzle();
+    final v = msbFirst.concat();
     return signed ? v.signExtend(xlen) : v.zeroExtend(xlen);
   }
 
@@ -194,7 +194,7 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
         b(3),
         b(2),
         Const(0, width: 12),
-      ].swizzle().signExtend(xlen);
+      ].concat().signExtend(xlen);
     case RvcImm.ciLwsp:
       // uimm[7:6|5|4:2] high->low, then 2 low zeros.
       return [
@@ -202,7 +202,7 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
         b(12), // [5]
         b(6), b(5), b(4), // [4:2]
         Const(0, width: 2),
-      ].swizzle().zeroExtend(xlen);
+      ].concat().zeroExtend(xlen);
     case RvcImm.ciAddi16sp:
       // imm[9|8:7|6|5|4] high->low, then 4 low zeros.
       return [
@@ -212,14 +212,14 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
         b(2), // [5]
         b(6), // [4]
         Const(0, width: 4),
-      ].swizzle().signExtend(xlen);
+      ].concat().signExtend(xlen);
     case RvcImm.cssSwsp:
       // uimm[7:6|5:2] high->low, then 2 low zeros.
       return [
         b(8), b(7), // [7:6]
         b(12), b(11), b(10), b(9), // [5:2]
         Const(0, width: 2),
-      ].swizzle().zeroExtend(xlen);
+      ].concat().zeroExtend(xlen);
     case RvcImm.ciwAddi4spn:
       // uimm[9:6|5:4|3|2] high->low, then 2 low zeros.
       return [
@@ -228,7 +228,7 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
         b(5), // [3]
         b(6), // [2]
         Const(0, width: 2),
-      ].swizzle().zeroExtend(xlen);
+      ].concat().zeroExtend(xlen);
     case RvcImm.clwsw:
       // uimm[6|5:3|2] high->low, then 2 low zeros.
       return [
@@ -236,14 +236,14 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
         b(12), b(11), b(10), // [5:3]
         b(6), // [2]
         Const(0, width: 2),
-      ].swizzle().zeroExtend(xlen);
+      ].concat().zeroExtend(xlen);
     case RvcImm.cldsd:
       // uimm[7:6|5:3] high->low, then 3 low zeros.
       return [
         b(6), b(5), // [7:6]
         b(12), b(11), b(10), // [5:3]
         Const(0, width: 3),
-      ].swizzle().zeroExtend(xlen);
+      ].concat().zeroExtend(xlen);
     case RvcImm.ciLdsp:
       // uimm[8:6|5|4:3] high->low, then 3 low zeros.
       return [
@@ -251,14 +251,14 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
         b(12), // [5]
         b(6), b(5), // [4:3]
         Const(0, width: 3),
-      ].swizzle().zeroExtend(xlen);
+      ].concat().zeroExtend(xlen);
     case RvcImm.cssSdsp:
       // uimm[8:6|5:3] high->low, then 3 low zeros.
       return [
         b(9), b(8), b(7), // [8:6]
         b(12), b(11), b(10), // [5:3]
         Const(0, width: 3),
-      ].swizzle().zeroExtend(xlen);
+      ].concat().zeroExtend(xlen);
     case RvcImm.cj:
       return [
         b(12),
@@ -273,7 +273,7 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
         b(4),
         b(3),
         Const(0, width: 1),
-      ].swizzle().signExtend(xlen);
+      ].concat().signExtend(xlen);
     case RvcImm.cb:
       return [
         b(12),
@@ -285,6 +285,6 @@ Logic rvcImmLogic(RvcImm kind, Logic instr, int xlen) {
         b(4),
         b(3),
         Const(0, width: 1),
-      ].swizzle().signExtend(xlen);
+      ].concat().signExtend(xlen);
   }
 }

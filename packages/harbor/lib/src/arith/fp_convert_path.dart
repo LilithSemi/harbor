@@ -272,7 +272,7 @@ class HarborFpConvertPath extends Module {
     final kind = mux(
       fromInt,
       Const(0, width: 2),
-      [ua.isInf | ua.isZero, ua.isNan | ua.isZero].swizzle(),
+      [ua.isInf | ua.isZero, ua.isNan | ua.isZero].concat(),
     );
     st
       ..['rm'] = ops.contains(HarborFpOp.cvtModWD)
@@ -301,7 +301,7 @@ class HarborFpConvertPath extends Module {
     final expS = ua.exponent.signExtend(sw);
     // Signed compares with constants. With the top bit flipped, an unsigned
     // compare gives the signed order.
-    final expOff = [~expS[sw - 1], expS.getRange(0, sw - 1)].swizzle();
+    final expOff = [~expS[sw - 1], expS.getRange(0, sw - 1)].concat();
     Logic expGe(int c) => expOff.gte(Const(c + (1 << (sw - 1)), width: sw));
     // The value is significand * 2^(exponent - m), so it is an integer when
     // the exponent is at least m.
@@ -314,7 +314,7 @@ class HarborFpConvertPath extends Module {
         ..['shift'] = mux(
           tooBig,
           Const(0, width: shW),
-          mux(
+          mux<Logic>(
             ~expGe(-2),
             Const(kw + 1, width: shW),
             Const((kw - 1) & ((1 << shW) - 1), width: shW) -
@@ -343,7 +343,7 @@ class HarborFpConvertPath extends Module {
       final f = st.ride.remove('field')!;
       final tooBig = st.ride.remove('too_big')!;
       final useKept = st.ride.remove('use_kept')!;
-      final placed = [f.getRange(0, p), Const(0, width: tw - p)].swizzle();
+      final placed = [f.getRange(0, p), Const(0, width: tw - p)].concat();
       final shift = st.ride.remove('shift')!;
       final shifted = (placed >>> shift).named('aligned');
       final kept = shifted.getRange(gw, tw);
@@ -352,7 +352,7 @@ class HarborFpConvertPath extends Module {
       final lost = [
         for (var i = 0; i < p; i++)
           f[i] & shift.gte(Const(i + kw + 2 - p, width: shift.width)),
-      ].swizzle().or();
+      ].concat().or();
       final keptLow = kept.getRange(0, min(kw, aw)).zeroExtend(aw);
       final keptHigh = kw > aw ? kept.getRange(aw, kw).or() : Const(0);
       st
@@ -388,7 +388,7 @@ class HarborFpConvertPath extends Module {
       // A magnitude kept + rUp is above limit when kept is above it, or
       // equal with a round up.
       Logic above(BigInt Function(bool neg) limit) {
-        final l = mux(
+        final l = mux<Logic>(
           st['sign'],
           Const(limit(true), width: aw),
           Const(limit(false), width: aw),
@@ -425,7 +425,7 @@ class HarborFpConvertPath extends Module {
         final sel = isOp(HarborFpOp.fpToInt);
         nv = nv | (sel & bad);
         nx = mux(sel, ~bad & inexact, nx);
-        intKind = mux(sel & bad, [Const(1), sign & ~nan].swizzle(), intKind);
+        intKind = mux(sel & bad, [Const(1), sign & ~nan].concat(), intKind);
       }
       if (ops.contains(HarborFpOp.cvtModWD)) {
         final oor = above(
@@ -519,7 +519,7 @@ class HarborFpConvertPath extends Module {
         exponent: st.ride.remove('exp')!,
         significand: aw >= sigW
             ? val.getRange(aw - sigW)
-            : [val, Const(0, width: sigW - aw)].swizzle(),
+            : [val, Const(0, width: sigW - aw)].concat(),
         sticky: aw > sigW ? val.getRange(0, aw - sigW).or() : Const(0),
         forceNan: kindIs(1),
         forceInf: kindIs(2),
@@ -543,7 +543,7 @@ class HarborFpConvertPath extends Module {
     }
     st.pass(HarborFpCut.c6);
 
-    final opFlags = [st['nv'], Const(0, width: 3), st['nx']].swizzle();
+    final opFlags = [st['nv'], Const(0, width: 3), st['nx']].concat();
     Logic resultOut = hasIntOut
         ? st['val'].zeroExtend(resultW)
         : Const(0, width: resultW);

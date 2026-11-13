@@ -72,7 +72,7 @@ class HarborMaskBlend extends BridgeModule {
     }
 
     // Pack pixel (i,j) at index i*width + j, LSB-first row-major.
-    output('out') <= pixels.reversed.toList().swizzle();
+    output('out') <= pixels.reversed.toList().concat();
   }
 
   // Build-time constant mask producers. These generate the per-pixel mask grids

@@ -317,7 +317,7 @@ class HarborWishboneDownsizer extends Module {
                           state < Const(4, width: 3),
                         ],
                         orElse: [
-                          datRReg < [mDatR, rdLo].swizzle(),
+                          datRReg < [mDatR, rdLo].concat(),
                           ackReg < Const(1),
                           mCycReg < Const(0),
                           hiSel < Const(0),

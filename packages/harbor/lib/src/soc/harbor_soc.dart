@@ -208,6 +208,9 @@ class HarborSoC extends BridgeModule {
   /// nextpnr `--pre-pack` addClock over-constraint can be emitted at build time.
   double? _xilinxCoreClkMhz;
 
+  /// Board oscillator rate for the Xilinx DDR3 clock tree.
+  double? _xilinxSourceClkMhz;
+
   final String acpiOemId;
   final String acpiOemTableId;
 
@@ -362,7 +365,9 @@ class HarborSoC extends BridgeModule {
     if (ddrSpec != null) {
       final sharedIn = addSubModule(XilinxBufg(name: 'sysosc_bufg'));
       sharedIn.input('I').srcConnection! <= _boardClk;
-      final shared = sharedIn.output('O');
+      // Stable aliases keep timing constraints independent of duplicate BUFG
+      // port-name disambiguation in the generated RTL (O, O_0, ...).
+      final shared = sharedIn.output('O').named('sysosc_clk');
       // Decoupled core PLL off the shared input. The DDR tree no longer emits
       // its CLKOUT5 core clock.
       corePll = buildXilinxCorePll(
@@ -372,6 +377,7 @@ class HarborSoC extends BridgeModule {
         coreClkHz: ddrSpec.coreClkHz,
       );
       _xilinxCoreClkMhz = corePll.coreMhz;
+      _xilinxSourceClkMhz = ddrSpec.sourceHz / 1e6;
       xilinxDdr3Clocks = buildXilinxDdr3ClockTree(
         this,
         source: shared,
@@ -407,9 +413,12 @@ class HarborSoC extends BridgeModule {
         final combinedLocked = ddrLocked == null
             ? corePll.locked
             : (corePll.locked & ddrLocked).named('core_ddr_pll_locked');
+        // Give the PLL-derived BUFG output a stable name for generated timing
+        // constraints. ROHD otherwise disambiguates output ports as O/O_0.
+        final coreClk = corePll.coreClk.named('core_clk');
         _clockDomains[clkConfig.name] = _clockGen.createDomainFromClock(
           clkConfig,
-          corePll.coreClk,
+          coreClk,
           locked: combinedLocked,
         );
         continue;
@@ -1427,6 +1436,26 @@ class HarborSoC extends BridgeModule {
             'assign w1 = w0;\n'
             'endmodule\n';
       }
+      if (fileContents.name == name && _xilinxSourceClkMhz != null) {
+        // These clock aliases otherwise disappear in Yosys because they are
+        // only consumed as clocks. Keep the actual BUFG output nets named so
+        // the nextpnr addClock hook can target mapped nets reliably.
+        for (final clockNet in ['sysosc_clk', 'core_clk', 'ddr_clk']) {
+          final declaration = RegExp(
+            '^logic $clockNet;\\s*\$',
+            multiLine: true,
+          );
+          if (!declaration.hasMatch(contents)) {
+            throw StateError(
+              'Generated top RTL is missing preserved clock net $clockNet.',
+            );
+          }
+          contents = contents.replaceFirst(
+            declaration,
+            '(* keep = 1 *) logic $clockNet;',
+          );
+        }
+      }
       File('$rtlPath/$fileName').writeAsStringSync(contents);
       filelist.writeln('./rtl/$fileName');
     }
@@ -1670,6 +1699,7 @@ class HarborSoC extends BridgeModule {
               // margin show up as an honest WNS. --timing-allow-fail keeps a
               // bitstream written when the aggressive target is not met.
               final coreMhz = _xilinxCoreClkMhz;
+              final sourceMhz = _xilinxSourceClkMhz;
               // The over-constraint targets the `ddr_clk` net = the controller
               // LOGIC clock (controllerClk), which is CK/8 at gearRatio 2 and
               // CK/4 at gearRatio 1. Use controllerClkMhz (the realised logic
@@ -1677,11 +1707,14 @@ class HarborSoC extends BridgeModule {
               // CK/4). At gearRatio 1 the two are equal, so this is byte-
               // identical for the legacy path.
               final ddrCtrlMhz = xilinxDdr3Clocks?.controllerClkMhz;
-              if (coreMhz != null && ddrCtrlMhz != null) {
+              if (coreMhz != null && sourceMhz != null && ddrCtrlMhz != null) {
                 Directory('$path/support/nextpnr').createSync(recursive: true);
                 File('$path/support/nextpnr/clocks.py').writeAsStringSync(
                   t.generateClockConstraintPy(
                     coreClkMhz: coreMhz,
+                    coreClockNet: 'core_clk',
+                    sourceClockNet: 'sysosc_clk',
+                    sourceClkMhz: sourceMhz,
                     ddrCtrlMhz: ddrCtrlMhz,
                   ),
                 );

@@ -167,7 +167,7 @@ class HarborWishboneFabric extends HarborFabricModule {
           a.sel,
           a.cti ?? Const(0, width: 3),
           a.bte ?? Const(0, width: 2),
-        ].rswizzle(),
+        ].rconcat(),
     ];
     final hit = [
       for (var m = 0; m < nm; m++)

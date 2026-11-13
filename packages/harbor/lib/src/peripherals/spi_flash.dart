@@ -454,7 +454,7 @@ class HarborSpiFlashController extends BridgeModule
     // address in the high byte), so reverse to the little-endian bus word.
     Logic byteSwap(Logic w) => [
       for (var i = 0; i < busBytes; i++) w.getRange(i * 8, i * 8 + 8),
-    ].swizzle();
+    ].concat();
 
     Sequential(clk, [
       If(
@@ -850,7 +850,7 @@ class HarborSpiFlashController extends BridgeModule
               wrCsN < Const(0),
               wrBitCount < Const(0, width: 8),
               wrShift <
-                  mux(
+                  mux<Logic>(
                     wrOpL,
                     Const(cmdProgram << 24, width: 32),
                     Const(cmdErase << 24, width: 32),
@@ -1098,8 +1098,8 @@ class HarborSpiFlashController extends BridgeModule
       final ioWidth = config.mode == HarborSpiFlashMode.quad ? 4 : 2;
       final ioOut = config.mode == HarborSpiFlashMode.quad
           ? [Const(1), Const(1), Const(0), mosiBit]
-                .swizzle() // {D3,D2,D1,D0}
-          : [Const(0), mosiBit].swizzle(); // dual {D1,D0}
+                .concat() // {D3,D2,D1,D0}
+          : [Const(0), mosiBit].concat(); // dual {D1,D0}
       // Drive all lines together (outputs when driveOut, inputs otherwise).
       if (ownPads) {
         // Own the pad: drive the inout `spi_io` through one bus tristate (synth

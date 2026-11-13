@@ -107,7 +107,7 @@ class WishboneMemoryModel extends BridgeModule {
           newByte,
           keepByte,
         );
-        out = lane == 0 ? laneByte : [laneByte, out.slice(lo - 1, 0)].swizzle();
+        out = lane == 0 ? laneByte : [laneByte, out.slice(lo - 1, 0)].concat();
       }
       return out;
     }
@@ -601,7 +601,7 @@ Future<(RamSinkHarness, UsbTestHost)> buildRamSinkHarness({
   int loadBase = 0,
   int words = 128,
   int usbClkPeriod = 10,
-  int busClkPeriod = 37,
+  int busClkPeriod = 38,
   int ackDelay = 0,
   HarborFabricKind kind = HarborFabricKind.wishbone,
   int clearWatchdogLimit = HarborUsbDfu.defaultClearWatchdogLimit,
@@ -616,8 +616,8 @@ Future<(RamSinkHarness, UsbTestHost)> buildRamSinkHarness({
     clearWatchdogLimit: clearWatchdogLimit,
   );
 
-  final usbClk = SimpleClockGenerator(usbClkPeriod).clk;
-  final busClk = SimpleClockGenerator(busClkPeriod).clk;
+  final usbClk = SimpleClockGenerator(usbClkPeriod + (usbClkPeriod & 1)).clk;
+  final busClk = SimpleClockGenerator(busClkPeriod + (busClkPeriod & 1)).clk;
   final usbReset = Logic(name: 'usb_reset');
   final busReset = Logic(name: 'bus_reset');
   final dp = Logic(name: 'dp');
@@ -676,7 +676,7 @@ Future<(FlashSinkHarness, UsbTestHost)> buildFlashSinkHarness({
   int errorOnOp = 0,
   int rejectOnReq = 0,
   int usbClkPeriod = 10,
-  int busClkPeriod = 37,
+  int busClkPeriod = 38,
   int clearWatchdogLimit = HarborUsbDfu.defaultClearWatchdogLimit,
   int maxSimTime = 40000000,
 }) async {
@@ -689,8 +689,8 @@ Future<(FlashSinkHarness, UsbTestHost)> buildFlashSinkHarness({
     clearWatchdogLimit: clearWatchdogLimit,
   );
 
-  final usbClk = SimpleClockGenerator(usbClkPeriod).clk;
-  final busClk = SimpleClockGenerator(busClkPeriod).clk;
+  final usbClk = SimpleClockGenerator(usbClkPeriod + (usbClkPeriod & 1)).clk;
+  final busClk = SimpleClockGenerator(busClkPeriod + (busClkPeriod & 1)).clk;
   final usbReset = Logic(name: 'usb_reset');
   final busReset = Logic(name: 'bus_reset');
   final dp = Logic(name: 'dp');
@@ -757,7 +757,7 @@ buildRamSinkHarnessWithBusControl({
   int loadBase = 0,
   int words = 128,
   int usbClkPeriod = 10,
-  int busClkPeriod = 37,
+  int busClkPeriod = 38,
   int ackDelay = 0,
   int clearWatchdogLimit = HarborUsbDfu.defaultClearWatchdogLimit,
   int maxSimTime = 80000000,
@@ -770,8 +770,8 @@ buildRamSinkHarnessWithBusControl({
     clearWatchdogLimit: clearWatchdogLimit,
   );
 
-  final usbClk = SimpleClockGenerator(usbClkPeriod).clk;
-  final busClk = SimpleClockGenerator(busClkPeriod).clk;
+  final usbClk = SimpleClockGenerator(usbClkPeriod + (usbClkPeriod & 1)).clk;
+  final busClk = SimpleClockGenerator(busClkPeriod + (busClkPeriod & 1)).clk;
   final usbReset = Logic(name: 'usb_reset');
   final busReset = Logic(name: 'bus_reset');
   final dp = Logic(name: 'dp');
@@ -832,7 +832,7 @@ buildFlashSinkHarnessWithBusControl({
   int errorOnOp = 0,
   int rejectOnReq = 0,
   int usbClkPeriod = 10,
-  int busClkPeriod = 37,
+  int busClkPeriod = 38,
   int clearWatchdogLimit = HarborUsbDfu.defaultClearWatchdogLimit,
   int maxSimTime = 40000000,
 }) async {
@@ -845,8 +845,8 @@ buildFlashSinkHarnessWithBusControl({
     clearWatchdogLimit: clearWatchdogLimit,
   );
 
-  final usbClk = SimpleClockGenerator(usbClkPeriod).clk;
-  final busClk = SimpleClockGenerator(busClkPeriod).clk;
+  final usbClk = SimpleClockGenerator(usbClkPeriod + (usbClkPeriod & 1)).clk;
+  final busClk = SimpleClockGenerator(busClkPeriod + (busClkPeriod & 1)).clk;
   final usbReset = Logic(name: 'usb_reset');
   final busReset = Logic(name: 'bus_reset');
   final dp = Logic(name: 'dp');

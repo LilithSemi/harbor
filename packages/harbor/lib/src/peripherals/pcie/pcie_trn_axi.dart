@@ -84,7 +84,7 @@ class HarborPcieTrnAxi extends Module {
     final swappedRx = [
       trnRxData.slice(31, 0),
       trnRxData.slice(63, 32),
-    ].swizzle();
+    ].concat();
     final eofLocation =
         (trnRxEof.zeroExtend(5) << Const(4, width: 5)) |
         (trnRxRem[0].zeroExtend(5) << Const(2, width: 5)) |
@@ -118,7 +118,7 @@ class HarborPcieTrnAxi extends Module {
                 then: [
                   rxDataReg < swappedRx,
                   rxKeepReg <
-                      mux(
+                      mux<Logic>(
                         trnRxRem[0],
                         Const(0xff, width: 8),
                         Const(0x0f, width: 8),
@@ -157,7 +157,7 @@ class HarborPcieTrnAxi extends Module {
     final swappedTx = [
       txDataReg.slice(31, 0),
       txDataReg.slice(63, 32),
-    ].swizzle();
+    ].concat();
 
     addOutput('tx_ready') <= acceptTx & linkUp & ~trnTxCfgReq;
     addOutput('tx_idle') <= ~txValidReg & ~txInPacket;

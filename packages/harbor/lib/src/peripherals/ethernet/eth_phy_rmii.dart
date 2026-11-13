@@ -142,7 +142,7 @@ class HarborEthPhyRmii extends Module {
               If(
                 valid,
                 then: [
-                  buf < [pData, buf.slice(5, 2)].swizzle(),
+                  buf < [pData, buf.slice(5, 2)].concat(),
                   idx < mux(lastPair, Const(0, width: 2), idx + 1),
                   If(sfdPair, then: [locked < 1]),
                   acc < mux(lastPair, Const(0), acc | pEr),
@@ -155,7 +155,7 @@ class HarborEthPhyRmii extends Module {
                 pCrs & pData.eq(1),
                 then: [
                   inFrame < 1,
-                  buf < [pData, buf.slice(5, 2)].swizzle(),
+                  buf < [pData, buf.slice(5, 2)].concat(),
                   idx < 1,
                   acc < pEr,
                   locked < 0,
@@ -174,7 +174,7 @@ class HarborEthPhyRmii extends Module {
 
     final idleCnt = Logic(name: 'rx_idle_cnt', width: 6);
     final idleLast = idleCnt.gte(
-      mux(fast, Const(3, width: 6), Const(39, width: 6)),
+      mux<Logic>(fast, Const(3, width: 6), Const(39, width: 6)),
     );
     Sequential(
       clk,
@@ -189,7 +189,7 @@ class HarborEthPhyRmii extends Module {
       clk,
       rst,
       byteIn: inFrame & tick & valid & lastPair,
-      byteData: [pData, buf].swizzle(),
+      byteData: [pData, buf].concat(),
       byteEr: acc | pEr,
       frameEnd: frameEnd,
       dribble: idx.neq(0),

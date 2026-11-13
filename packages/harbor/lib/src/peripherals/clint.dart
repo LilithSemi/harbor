@@ -101,7 +101,7 @@ class HarborClint extends BridgeModule
       laneCount,
       (l) => Logic(name: 'clint_dat_out_$l', width: 32),
     );
-    bus.dataOut <= datOut.rswizzle();
+    bus.dataOut <= datOut.rconcat();
 
     int laneOf(int off) => (off % busBytes) ~/ 4;
     Logic addrHit(int off) => addr.eq(Const(off - (off % busBytes), width: 16));
@@ -211,7 +211,7 @@ class HarborClint extends BridgeModule
                             wrData(0x4000 + i * 8),
                             mtimecmp[i].getRange(0, 32),
                           ),
-                        ].swizzle(),
+                        ].concat(),
                   ],
                 ),
                 If(

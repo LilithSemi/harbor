@@ -61,7 +61,7 @@ Future<void> _placeAndRoute({
   final dir = Directory.systemTemp.createTempSync('harbor_dvi_pnr_');
   addTearDown(() => dir.deleteSync(recursive: true));
   final d = dir.path;
-  File('$d/top.sv').writeAsStringSync(top.generateSynth());
+  File('$d/top.sv').writeAsStringSync(top.dumpSystemVerilog());
   File('$d/synth.ys').writeAsStringSync(
     target.generateYosysTcl(top.definitionName, svFiles: ['top.sv']),
   );

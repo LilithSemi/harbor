@@ -83,11 +83,11 @@ class SdramWishbonePort extends Module {
     final evenWordAddr = [
       wordAddrRaw.getRange(1, wordAddrWidth),
       Const(0),
-    ].swizzle();
+    ].concat();
 
     final loData = datW.getRange(0, 16);
     final loMask = sel.getRange(0, 2);
-    final hiWord = [sel.getRange(2, 4), datW.getRange(16, 32)].swizzle();
+    final hiWord = [sel.getRange(2, 4), datW.getRange(16, 32)].concat();
 
     // Phase sequencing, bookkeeping only: nothing downstream reads these
     // bits directly, they only pick which dedicated register loads next.
@@ -126,7 +126,7 @@ class SdramWishbonePort extends Module {
     output('ack_pulse') <= ackReg;
     output('dat_r') <= datRReg;
 
-    Const st(int p) => Const(p, width: 3);
+    Logic st(int p) => Const(p, width: 3);
 
     final committed =
         phase.eq(st(pWr0)) |
@@ -260,7 +260,7 @@ class SdramWishbonePort extends Module {
               If(
                 port.rdValid & port.rdLast,
                 then: [
-                  datRReg < [port.rdData, loWordReg].swizzle(),
+                  datRReg < [port.rdData, loWordReg].concat(),
                 ],
               ),
             ]),

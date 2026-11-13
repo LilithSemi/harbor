@@ -61,7 +61,7 @@ void main() {
     expect(slave.outstanding, 8);
     expect(fabric.masters.map((m) => m.readChannel), [null, null, 0]);
     await soc.build();
-    final sv = soc.generateSynth();
+    final sv = soc.dumpSystemVerilog();
     expect(sv, contains('bus_r1_ARVALID'));
   });
 

@@ -42,7 +42,7 @@ int _log2(int v) => v.bitLength - 1;
 
 Logic _counter(String name, int max) => Logic(name: name, width: max.bitLength);
 
-Const _op(int v) => Const(v, width: 3);
+Logic _op(int v) => Const(v, width: 3);
 
 // TileLink 1.8 opcodes the UH ports use beyond the TL-UL enums.
 const _arithmeticData = 2;

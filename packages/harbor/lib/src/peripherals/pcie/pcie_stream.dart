@@ -156,8 +156,8 @@ Logic tlpAddress(PcieHeader header) {
   final dw3 = header.slice(127, 96);
   return mux(
     tlpIs4Dw(header),
-    [dw2, dw3.slice(31, 2), Const(0, width: 2)].swizzle(),
-    [Const(0, width: 32), dw2.slice(31, 2), Const(0, width: 2)].swizzle(),
+    [dw2, dw3.slice(31, 2), Const(0, width: 2)].concat(),
+    [Const(0, width: 32), dw2.slice(31, 2), Const(0, width: 2)].concat(),
   );
 }
 
@@ -185,7 +185,7 @@ Logic tlpSwapBytes(Logic dword) => [
   dword.slice(15, 8),
   dword.slice(23, 16),
   dword.slice(31, 24),
-].swizzle();
+].concat();
 
 /// Collects the 128 bit header of each packet on a [HarborPcieStream].
 ///
@@ -253,7 +253,7 @@ class HarborPcieHeaderCapture extends Module {
     final Logic atHeader;
     final Logic payload;
     if (width == 64) {
-      head = [data, low!].swizzle();
+      head = [data, low!].concat();
       atHeader = beat.eq(1);
       payload = data.slice(63, 32);
     } else {

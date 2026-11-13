@@ -422,7 +422,7 @@ void main() {
       // clkosDiv is set, so that text is present in both cases.
       expect(h.domain.clk.name, equals('CLKOS'));
       await h.build();
-      final sv = h.generateSynth();
+      final sv = h.dumpSystemVerilog();
       expect(sv, contains('CLKOS_ENABLE'));
       expect(sv, contains('CLKOS_DIV(10)'));
       expect(sv, contains('CLKOS_CPHASE(9)'));
@@ -434,7 +434,7 @@ void main() {
       final h = _SingleClkHarness(48000000, 24000000);
       expect(h.domain.clk.name, equals('CLKOP'));
       await h.build();
-      final sv = h.generateSynth();
+      final sv = h.dumpSystemVerilog();
       expect(sv, isNot(contains('CLKOS_ENABLE')));
     });
   });

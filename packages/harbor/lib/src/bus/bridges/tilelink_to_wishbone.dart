@@ -107,7 +107,7 @@ class TileLinkToWishboneBridge extends Module {
 
     // Wishbone -> TileLink Channel D, held until D_READY.
     tl.dValid <= respValid;
-    tl.dOpcode <= mux(respWe, Const(0, width: 3), Const(1, width: 3));
+    tl.dOpcode <= mux<Logic>(respWe, Const(0, width: 3), Const(1, width: 3));
     tl.dParam <= Const(0, width: 2);
     tl.dSize <= respSize;
     tl.dSource <= respSource;

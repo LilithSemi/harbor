@@ -231,9 +231,9 @@ class HarborMemoryWaistCdc extends Module {
     Logic nonZero(Logic c) => ~c.eq(Const(0, width: c.width));
     final fifos = [reqF, wdF, rdF, wrF];
     addOutput('debug_empty', width: 4) <=
-        [for (final q in fifos.reversed) q.rdEmpty].swizzle();
+        [for (final q in fifos.reversed) q.rdEmpty].concat();
     addOutput('debug_full', width: 4) <=
-        [for (final q in fifos.reversed) q.wrFull].swizzle();
+        [for (final q in fifos.reversed) q.wrFull].concat();
 
     if (slave) {
       // Fabric side: the requester. The queues hold what is in flight, so
@@ -537,8 +537,7 @@ class HarborMemoryWaistCdc extends Module {
     dn.wdataValid <= wOpen & (mode | ~wdF.rdEmpty);
     dn.wdataData <= wData & (~mode).replicate(dataW);
     dn.wdataStrb <= mux(mode, Const(0, width: config.strbWidth), wStrb);
-    final drainLast = Logic(name: 'w_drain_last');
-    dn.wdataLast <= mux(mode, drainLast, wLast);
+    dn.wdataLast <= mux(mode, wBeat.eq(lenQ.popData), wLast);
     wdF.pop(dn.wdataReady & wOpen & ~mode);
     final wdFire = dn.wdataValid & dn.wdataReady;
     wdLastFire <= wdFire & dn.wdataLast;
@@ -568,31 +567,7 @@ class HarborMemoryWaistCdc extends Module {
     final reqR = reqFire & ~write;
     final reqW = reqFire & write;
 
-    // drainLast is wBeat equal to the head length, one beat early. When the
-    // head changes, wBeat is 0.
-    final ptrW = lenQ.readIndex.width;
-    final rdNext = lenQ.readIndex.eq(Const(n - 1, width: ptrW));
-    Logic second = lenQ.entries[0];
-    for (var i = n - 1; i >= 0; i--) {
-      final at = mux(
-        rdNext,
-        Const(0, width: ptrW),
-        lenQ.readIndex + 1,
-      ).eq(Const(i, width: ptrW));
-      second = mux(at, lenQ.entries[i], second);
-    }
-    final nextHead = mux(
-      lenQ.popFire & lenQ.count.gt(1),
-      second,
-      len,
-    ).named('w_next_head_len');
-    final headChange = lenQ.popFire | (lenQ.count.eq(0) & lenQ.pushFire);
-
     Sequential(fClk, reset: fReset, [
-      If.block([
-        Iff(headChange, [drainLast < nextHead.eq(0)]),
-        ElseIf(wdFire, [drainLast < (wBeat + 1).eq(lenQ.popData)]),
-      ]),
       dropped <
           dropped +
               (dn.rdataValid & dn.rdataReady & mode).zeroExtend(16) +
@@ -728,10 +703,21 @@ class HarborWaistCdcFifo extends Module {
 
     final pw = depth.bitLength;
     Logic gray(Logic b) => b ^ (b >>> 1);
-    Logic rotate(Logic x) => [x.getRange(0, depth - 1), x[depth - 1]].swizzle();
-    Logic pick(Logic sel, List<Logic> v) => [
-      for (var i = 0; i < depth; i++) v[i] & sel[i].replicate(width),
-    ].reduce((a, b) => a | b);
+    Logic rotate(Logic x) => [x.getRange(0, depth - 1), x[depth - 1]].concat();
+    Logic pickBinary(Logic sel, List<Logic> v) {
+      var level = List<Logic>.from(v);
+      var bit = 0;
+      while (level.length > 1) {
+        final next = <Logic>[];
+        for (var i = 0; i < level.length; i += 2) {
+          next.add(mux(sel[bit], level[i + 1], level[i]));
+        }
+        level = next;
+        bit++;
+      }
+      return level.single;
+    }
+
     final mem = [
       for (var i = 0; i < depth; i++) Logic(name: 'mem_$i', width: width),
     ];
@@ -747,7 +733,7 @@ class HarborWaistCdcFifo extends Module {
     // Full: the write gray equals the read gray with the top 2 bits
     // inverted.
     Logic fullAt(Logic g) => g.eq(
-      [~rdGraySync.getRange(pw - 2), rdGraySync.getRange(0, pw - 2)].swizzle(),
+      [~rdGraySync.getRange(pw - 2), rdGraySync.getRange(0, pw - 2)].concat(),
     );
     // Registers that hold the pointer plus one and its gray code.
     final wrPtr1 = Logic(name: 'wr_ptr_1', width: pw);
@@ -790,19 +776,19 @@ class HarborWaistCdcFifo extends Module {
     // edges before the empty flag falls, so the head holds it by then.
     final rdPtr = Logic(name: 'rd_ptr', width: pw);
     final rdEmpty = Logic(name: 'rd_empty_reg');
-    final rdSel = Logic(name: 'rd_sel', width: depth);
     final head = Logic(name: 'rd_head', width: width);
     final wrGraySync0 = Logic(name: 'wr_gray_sync0', width: pw);
     final wrGraySync = Logic(name: 'wr_ptr_gray_sync', width: pw);
     final rdPtr1 = Logic(name: 'rd_ptr_1', width: pw);
     final rdGray1 = Logic(name: 'rd_ptr_gray_1', width: pw);
-    final rdSel1 = rotate(rdSel);
     final pop = (trustRead ? rdEn : rdEn & ~rdEmpty).named('rd_pop');
+    final rdSelectPtr = mux(pop, rdPtr1, rdPtr);
+    final rdSelectSlot = rdSelectPtr.getRange(0, pw - 1);
     final emptyNext = mux(pop, rdGray1.eq(wrGraySync), rdGray.eq(wrGraySync));
     addOutput('rd_empty_pop') <= rdReset | rdGray1.eq(wrGraySync);
     addOutput('rd_empty_hold') <= rdReset | rdGray.eq(wrGraySync);
     Sequential(rdClk, [
-      head < mux(pop, pick(rdSel1, mem), pick(rdSel, mem)),
+      head < pickBinary(rdSelectSlot, mem),
       If(
         rdReset,
         then: [
@@ -811,7 +797,6 @@ class HarborWaistCdcFifo extends Module {
           rdPtr1 < 1,
           rdGray1 < 1,
           rdEmpty < 1,
-          rdSel < 1,
           wrGraySync0 < 0,
           wrGraySync < 0,
         ],
@@ -823,7 +808,6 @@ class HarborWaistCdcFifo extends Module {
           rdPtr1 < mux(pop, rdPtr1 + 1, rdPtr1),
           rdGray1 < mux(pop, gray(rdPtr1 + 1), rdGray1),
           rdEmpty < emptyNext,
-          rdSel < mux(pop, rdSel1, rdSel),
         ],
       ),
     ]);

@@ -331,7 +331,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
         mux(
           be[2],
           Const(2, width: 2),
-          mux(be[3], Const(3, width: 2), Const(0, width: 2)),
+          mux<Logic>(be[3], Const(3, width: 2), Const(0, width: 2)),
         ),
       ),
     );
@@ -346,7 +346,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
         mux(
           tailBe[1],
           Const(2, width: 2),
-          mux(tailBe[0], Const(3, width: 2), Const(0, width: 2)),
+          mux<Logic>(tailBe[0], Const(3, width: 2), Const(0, width: 2)),
         ),
       ),
     );
@@ -361,7 +361,11 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     final aDw = hBarOff.slice(11, 2).zeroExtend(12);
 
     // Completion split.
-    final rcbDw = mux(rcb128, Const(32, width: 12), Const(16, width: 12));
+    final rcbDw = mux<Logic>(
+      rcb128,
+      Const(32, width: 12),
+      Const(16, width: 12),
+    );
     final mpsCode = mux(
       maxPayload.gt(Const(maxCode, width: 3)),
       Const(maxCode, width: 3),
@@ -424,13 +428,13 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     }
     mem.wdataValid <= inState(sWdata);
     // Bytes with no strobe are driven 0.
-    final strb = strobes.rswizzle();
-    final raw = [for (var l = dpb - 1; l >= 0; l--) window[l]].swizzle();
+    final strb = strobes.rconcat();
+    final raw = [for (var l = dpb - 1; l >= 0; l--) window[l]].concat();
     mem.wdataData <=
         [
           for (var b = beatBytes - 1; b >= 0; b--)
             mux(strb[b], raw.slice(8 * b + 7, 8 * b), Const(0, width: 8)),
-        ].swizzle();
+        ].concat();
     mem.wdataStrb <= strb;
     mem.wdataLast <= burstLeft.eq(1);
     final wFire = mem.wdataValid & mem.wdataReady;
@@ -442,26 +446,26 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     // TX side.
     final cplData = cplStatus.eq(0);
     final dw0 = [
-      mux(cplData, Const(0x4a, width: 8), Const(0x0a, width: 8)),
+      mux<Logic>(cplData, Const(0x4a, width: 8), Const(0x0a, width: 8)),
       Const(0, width: 1),
       hTc,
       Const(0, width: 6),
       hAttr,
       Const(0, width: 2),
       mux(cplData, cDw.slice(9, 0), Const(0, width: 10)),
-    ].swizzle();
+    ].concat();
     final dw1 = [
       completerId,
       cplStatus,
       Const(0, width: 1),
       rdRemaining.slice(11, 0),
-    ].swizzle();
+    ].concat();
     final dw2 = [
       hReqId,
       hTag,
       Const(0, width: 1),
       rdStart.slice(6, 0),
-    ].swizzle();
+    ].concat();
     // The packet length in DWs is a register, loaded when the engine goes
     // to the TX state.
     final totalDw = Logic(name: 'tx_total', width: 12);
@@ -479,8 +483,8 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       txKeep.add(live.replicate(4));
     }
     final txLast = (txT + n).gte(totalDw);
-    txs.data <= txLanes.rswizzle();
-    txs.keep <= txKeep.rswizzle();
+    txs.data <= txLanes.rconcat();
+    txs.keep <= txKeep.rconcat();
     txs.last <= txLast;
     // With more than 3 lanes the first beat has payload. The buffer can
     // write that payload in the last cycle before the TX state, so the
@@ -520,7 +524,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       wrCount: mux(
         inRdata,
         Const(dpb, width: 3),
-        mux(hdrWrite, Const(1, width: 3), Const(n, width: 3)),
+        mux<Logic>(hdrWrite, Const(1, width: 3), Const(n, width: 3)),
       ),
       wrLanes: [
         for (var k = 0; k < banks; k++)
@@ -599,7 +603,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                   hBarOff < addrComb.slice(barBits - 1, 0),
                   rxBase <
                       lane0Comb.zeroExtend(idxW) +
-                          mux(
+                          mux<Logic>(
                             tlpIs4Dw(header),
                             Const(0, width: idxW),
                             Const(1, width: idxW),
@@ -662,7 +666,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                   beatsLeft < beatsLeft - burst.slice(11, 0),
                   curAddr < curAddr + (burst.zeroExtend(aw) << sizeLog),
                   state <
-                      mux(
+                      mux<Logic>(
                         opWrite,
                         Const(sWdata, width: 3),
                         Const(sRdata, width: 3),
@@ -705,7 +709,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                         beatsLeft.eq(0) | fabErr | mem.rdataErr,
                         then: [
                           cplStatus <
-                              mux(
+                              mux<Logic>(
                                 fabErr | mem.rdataErr,
                                 Const(statusCa, width: 3),
                                 Const(0, width: 3),

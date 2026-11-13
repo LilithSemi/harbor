@@ -143,11 +143,11 @@ class HarborKeyframeDecodeTile16Seq extends BridgeModule {
     Logic bottomRow(Logic fr) => [
       for (var c = f - 1; c >= 0; c--)
         fr.getRange(((f - 1) * f + c) * 8, ((f - 1) * f + c) * 8 + 8),
-    ].swizzle();
+    ].concat();
     Logic rightCol(Logic fr) => [
       for (var rr = f - 1; rr >= 0; rr--)
         fr.getRange((rr * f + (f - 1)) * 8, (rr * f + (f - 1)) * 8 + 8),
-    ].swizzle();
+    ].concat();
     Logic brPixel(Logic fr) => fr.getRange(
       ((f - 1) * f + (f - 1)) * 8,
       ((f - 1) * f + (f - 1)) * 8 + 8,
@@ -193,7 +193,7 @@ class HarborKeyframeDecodeTile16Seq extends BridgeModule {
       }
     }
     output('frame') <=
-        [for (var i = tilePix.length - 1; i >= 0; i--) tilePix[i]].swizzle();
+        [for (var i = tilePix.length - 1; i >= 0; i--) tilePix[i]].concat();
 
     // sequencing FSM (mirrors HarborKeyframeDecodeTile).
     final sIdle = 0;

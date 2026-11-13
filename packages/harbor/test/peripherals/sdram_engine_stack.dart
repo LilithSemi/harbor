@@ -371,7 +371,7 @@ class SdramEngineStack {
   }
 
   Future<void> start() async {
-    clk = SimpleClockGenerator(periodPs).clk;
+    clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
     final dqPad = LogicNet(name: 'dq_pad', width: 16);
     reset.inject(1);
     for (final iface in portIfaces) {
@@ -433,8 +433,8 @@ class SdramEngineStack {
       dq: dqPad,
       rules: rules,
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,

@@ -83,7 +83,7 @@ class HarborWienerHorz extends BridgeModule {
     final shifted = [
       pre[w - 1].replicate(round0),
       pre.getRange(round0, w),
-    ].swizzle();
+    ].concat();
     final neg = shifted[w - 1];
     final tooBig = ~neg & shifted.gt(Const(clampLimit - 1, width: w));
     output('mid') <=
@@ -154,7 +154,7 @@ class HarborWienerVert extends BridgeModule {
     final shifted = [
       pre[w - 1].replicate(round1),
       pre.getRange(round1, w),
-    ].swizzle();
+    ].concat();
     final neg = shifted[w - 1];
     final tooBig = ~neg & shifted.gt(Const(hi, width: w));
     output('out') <=
@@ -196,7 +196,7 @@ class HarborWienerFilter2D extends BridgeModule {
       final h = HarborWienerHorz(bd: bd, name: 'wh_$r');
       addSubModule(h);
       h.input('line').srcConnection! <=
-          [for (var c = 6; c >= 0; c--) px(r, c)].swizzle();
+          [for (var c = 6; c >= 0; c--) px(r, c)].concat();
       h.input('t0').srcConnection! <= input('h0');
       h.input('t1').srcConnection! <= input('h1');
       h.input('t2').srcConnection! <= input('h2');
@@ -206,7 +206,7 @@ class HarborWienerFilter2D extends BridgeModule {
     // Vertical pass over the 7 intermediates.
     final v = HarborWienerVert(bd: bd, name: 'wv');
     addSubModule(v);
-    v.input('col').srcConnection! <= mid.reversed.toList().swizzle();
+    v.input('col').srcConnection! <= mid.reversed.toList().concat();
     v.input('t0').srcConnection! <= input('v0');
     v.input('t1').srcConnection! <= input('v1');
     v.input('t2').srcConnection! <= input('v2');

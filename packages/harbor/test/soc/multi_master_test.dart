@@ -214,7 +214,7 @@ void main() {
           }
           await soc.build();
           // Also exercise RTL generation, not only ROHD evaluation.
-          final rtl = soc.generateSynth();
+          final rtl = soc.dumpSystemVerilog();
           Simulator.setMaxSimTime(10000);
           unawaited(Simulator.run());
           try {
@@ -270,7 +270,7 @@ void main() {
     soc.buildFabric();
     await soc.build();
 
-    final sv = soc.generateSynth();
+    final sv = soc.dumpSystemVerilog();
     expect(sv, contains('HarborWishboneFabric'));
     expect((soc.fabric! as HarborWishboneFabric).masters.map((m) => m.name), [
       'm_a',
@@ -291,7 +291,7 @@ void main() {
     soc.buildFabric();
     await soc.build();
 
-    final sv = soc.generateSynth();
+    final sv = soc.dumpSystemVerilog();
     expect(sv, contains('HarborWishboneFabric'));
     expect((soc.fabric! as HarborWishboneFabric).grant!.width, 1);
   });
@@ -375,7 +375,7 @@ void main() {
 
     await soc.build();
     // The register slice must actually be in the netlist.
-    expect(soc.generateSynth(), contains('WishboneRegisterStage'));
+    expect(soc.dumpSystemVerilog(), contains('WishboneRegisterStage'));
 
     Simulator.setMaxSimTime(2000000);
     unawaited(Simulator.run());

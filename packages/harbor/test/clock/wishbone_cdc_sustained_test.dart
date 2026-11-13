@@ -27,8 +27,8 @@ void main() {
     const dw = 32;
     final dut = HarborWishboneCdcBridge(addressWidth: aw, dataWidth: dw);
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
 
@@ -130,7 +130,7 @@ void main() {
   // targets. (Kept fast + few to avoid runner wall-clock flakiness.)
   for (final ratio in const [
     (s: 20, m: 6),
-    (s: 10, m: 11),
+    (s: 10, m: 12),
     (s: 14, m: 6),
     (s: 10, m: 10), // mesochronous: identical frequency (the creek case)
     (s: 12, m: 12),

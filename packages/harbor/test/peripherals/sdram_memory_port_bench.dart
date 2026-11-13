@@ -131,8 +131,10 @@ class SdramPortBench {
       exclusive: exclusive,
       link: link,
     );
-    final fabricClk = SimpleClockGenerator(fabricPeriodPs).clk;
-    final memClk = SimpleClockGenerator(memPeriodPs).clk;
+    final fabricClk = SimpleClockGenerator(
+      fabricPeriodPs + (fabricPeriodPs & 1),
+    ).clk;
+    final memClk = SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
     for (final input in top.inputs.values) {
       if (!{'clk', 'mem_clk'}.contains(input.name)) {
         input.srcConnection!.put(input.name.endsWith('reset') ? 1 : 0);
@@ -168,8 +170,8 @@ class SdramPortBench {
       dq: top.inOutSource('sdram_dq') as LogicNet,
       rules: const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000),
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,

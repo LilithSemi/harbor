@@ -88,7 +88,7 @@ class HarborIntraEdgeFilter extends BridgeModule {
       out.add(byte);
     }
 
-    output('out') <= out.reversed.toList().swizzle();
+    output('out') <= out.reversed.toList().concat();
   }
 
   /// Active edge length, fixed at build time.
@@ -166,7 +166,7 @@ class HarborIntraEdgeUpsample extends BridgeModule {
       final shifted = [
         biased[w - 1].replicate(4),
         biased.getRange(4, w),
-      ].swizzle();
+      ].concat();
       // clip to [0, 255].
       final neg = shifted[w - 1];
       final gt255 = shifted.gt(Const(255, width: w));
@@ -182,7 +182,7 @@ class HarborIntraEdgeUpsample extends BridgeModule {
       out[2 * i + 2] = inp(i + 2);
     }
 
-    output('out') <= out.map((e) => e!).toList().reversed.toList().swizzle();
+    output('out') <= out.map((e) => e!).toList().reversed.toList().concat();
   }
 
   /// Edge length being upsampled, fixed at build time.

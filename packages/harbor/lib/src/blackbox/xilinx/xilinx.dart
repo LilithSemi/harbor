@@ -462,9 +462,14 @@ XilinxDdr3Clocks buildXilinxDdr3ClockTree(
   // fails to route on nextpnr-xilinx ("Failed to route arc of net CLKOUTx").
   // Every PLL output therefore stays on its own global BUFG.
   // CK/4 SERDES/CLKDIV clock (also the sequencer clock at gearRatio 1).
-  final ctrlNet = bufOut('CLKOUT1', 'ctrl');
+  final ctrlNet = bufOut(
+    'CLKOUT1',
+    'ctrl',
+  ).named(geared ? 'ddr_ck4_clk' : 'ddr_clk');
   // CK/8 controller-logic clock on the spare CLKOUT5, only when geared.
-  final ctrlGearNet = geared ? bufOut('CLKOUT5', 'ctrlgear') : null;
+  final ctrlGearNet = geared
+      ? bufOut('CLKOUT5', 'ctrlgear').named('ddr_clk')
+      : null;
   return XilinxDdr3Clocks(
     ddrCk: bufOut('CLKOUT0', 'ck'),
     controller: ctrlNet,
@@ -793,6 +798,7 @@ class XilinxIobufds extends BridgeModule {
 /// Xilinx 7-series RAMB36E1: 36Kbit block RAM.
 class XilinxRamb36e1 extends BridgeModule {
   XilinxRamb36e1({
+    String ramMode = 'TDP',
     int readWidthA = 36,
     int writeWidthA = 36,
     int readWidthB = 36,
@@ -822,6 +828,7 @@ class XilinxRamb36e1 extends BridgeModule {
     createPort('DOBDO', PortDirection.output, width: 32);
     createPort('DOPBDOP', PortDirection.output, width: 4);
 
+    createParameter('RAM_MODE', '"$ramMode"');
     createParameter('READ_WIDTH_A', '$readWidthA');
     createParameter('WRITE_WIDTH_A', '$writeWidthA');
     createParameter('READ_WIDTH_B', '$readWidthB');

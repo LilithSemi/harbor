@@ -19,7 +19,7 @@ Logic _grayToBin(Logic g) {
   for (var i = n - 2; i >= 0; i--) {
     bits[i] = bits[i + 1]! ^ g[i];
   }
-  return bits.reversed.map((b) => b!).toList().swizzle();
+  return bits.reversed.map((b) => b!).toList().concat();
 }
 
 Logic _byteOf(Logic word, Logic idx) => mux(
@@ -379,7 +379,7 @@ class HarborEthTxFrameFifo extends Module {
         fBin < _grayToBin(fGrayS1),
         full < usedNow.gte(words - 1),
         freeR <
-            mux(
+            mux<Logic>(
               usedNow.gte(words - 1),
               Const(0, width: pw),
               Const(words - 1, width: pw) - usedNow,
@@ -434,7 +434,7 @@ class HarborEthTxFrameFifo extends Module {
       wrClk: sysClk,
       wrEn: store,
       wrAddr: wPtr.getRange(0, aw),
-      wrData: [wLast, mux(wLast, wBytes, Const(0, width: 2)), wData].swizzle(),
+      wrData: [wLast, mux(wLast, wBytes, Const(0, width: 2)), wData].concat(),
       rdClk: txClk,
       rdReset: txRst,
       rdEn: fetch,
@@ -668,8 +668,8 @@ class HarborEthRxFrameFifo extends Module {
       mux(inLast, inStatus, Const(0, width: 8)),
       inLast,
       mux(inLast, bi + 1, Const(0, width: 2)),
-      lanes.reversed.toList().swizzle(),
-    ].swizzle().named('w_word');
+      lanes.reversed.toList().concat(),
+    ].concat().named('w_word');
     final wPtrNext = mux(
       overflow,
       wStart,
@@ -689,7 +689,7 @@ class HarborEthRxFrameFifo extends Module {
           If(
             take,
             then: [
-              acc < lanes.sublist(0, 3).reversed.toList().swizzle(),
+              acc < lanes.sublist(0, 3).reversed.toList().concat(),
               bi < bi + 1,
             ],
           ),
@@ -802,7 +802,7 @@ class HarborEthRxFrameFifo extends Module {
       xLast,
       mux(rAbort, Const(0, width: 2), q0.getRange(32, 34)),
       mux(rAbort, Const(0, width: 32), q0.getRange(0, 32)),
-    ].swizzle().named('x_word');
+    ].concat().named('x_word');
     final xTake = (xValid & sReady).named('x_take');
 
     Sequential(sysClk, [

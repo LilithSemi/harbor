@@ -78,6 +78,7 @@ class _FakeSdCard {
   /// Echo this 32-bit value in the response argument field instead of the
   /// received argument, to prove RESP0 tracks the card, not a CMD_ARG loopback.
   int? forceRespArg;
+  bool holdLastDrivenBitOnRelease = false;
 
   _FakeSdCard(this.dut, this.cmdIn);
 
@@ -95,6 +96,7 @@ class _FakeSdCard {
   Future<void> run(Logic clk) async {
     var prevClk = 0;
     var prevOe = 0;
+    var lastDrivenBit = 1;
     var collecting = false;
     final cmdBits = <int>[];
     var responding = false;
@@ -108,9 +110,10 @@ class _FakeSdCard {
       final cmdOut = _bit(dut.output('sd_cmd_out'));
       final rise = prevClk == 0 && sclk == 1;
       final fall = prevClk == 1 && sclk == 0;
+      final released = prevOe == 1 && oe == 0;
 
       // Command RX: hunt for the start bit, then collect on rising edges while
-      // the host drives CMD (the end bit is not sampled: cmdOe drops with it).
+      // the host drives CMD, including the end bit before CMD is released.
       if (oe == 1 && rise) {
         if (!collecting) {
           if (cmdOut == 0) {
@@ -123,7 +126,7 @@ class _FakeSdCard {
       }
 
       // Host released CMD: decode the 47 collected bits and arm the response.
-      if (prevOe == 1 && oe == 0 && collecting && !responding) {
+      if (released && collecting && !responding) {
         if (cmdBits.length >= 47) {
           final f = cmdBits.sublist(0, 47);
           gotIndex = _fromBits(f.sublist(2, 8));
@@ -140,8 +143,16 @@ class _FakeSdCard {
         cmdBits.clear();
       }
 
+      // Model a weak CMD pullup/line capacitance: after the host releases CMD
+      // on the final falling edge, retain its last driven value until the next
+      // falling edge. This exposes false response-start detection when CRC7's
+      // final bit is zero.
+      if (released && holdLastDrivenBitOnRelease) {
+        cmdIn.inject(lastDrivenBit);
+      }
+
       // Drive the response on falling edges (host samples on the next rise).
-      if (responding && fall) {
+      if (responding && fall && !(released && holdLastDrivenBitOnRelease)) {
         if (gap > 0) {
           gap--;
           cmdIn.inject(1);
@@ -155,6 +166,7 @@ class _FakeSdCard {
 
       prevClk = sclk;
       prevOe = oe;
+      if (oe == 1) lastDrivenBit = cmdOut;
     }
   }
 }
@@ -267,6 +279,27 @@ void main() {
         equals(0x00ff8000),
         reason: 'RESP0 is the card-driven response argument',
       );
+
+      card.stop = true;
+      await Simulator.endSimulation();
+    });
+
+    test('CMD response survives a delayed weak-pullup release', () async {
+      final (tb, card, _) = await _bringUp();
+      card
+        ..forceRespArg = 0x00000900
+        ..holdLastDrivenBitOnRelease = true;
+
+      // For CMD17 these arguments produce opposite CRC7 LSB values. A stale
+      // low final CRC bit can be mistaken for the response start bit.
+      for (final arg in [0, 1]) {
+        await tb.write(_cmdArg, arg);
+        await tb.write(_cmd, _cmdWord(17, _respShort));
+        final status = await _waitCommand(tb);
+        expect(status & _stBusy, equals(0), reason: 'CMD17 arg=$arg completes');
+        expect(card.gotCrcOk, isTrue, reason: 'CMD17 arg=$arg CRC7 is valid');
+        expect(await tb.read(_resp0), equals(0x900), reason: 'arg=$arg');
+      }
 
       card.stop = true;
       await Simulator.endSimulation();

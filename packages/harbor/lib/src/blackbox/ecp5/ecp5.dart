@@ -33,7 +33,7 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 // [latency] counts SCLK groups from the fabric cycle that holds D to the
 // group it goes out in (minimum 2).
 Logic _x2Out(Logic eclk, Logic sclk, List<Logic> d, int latency, String name) {
-  Logic word = d.rswizzle();
+  Logic word = d.rconcat();
   for (var i = 0; i < latency - 1; i++) {
     final r = Logic(name: '${name}_sim_hold$i', width: 4);
     Sequential(sclk, [r < word]);
@@ -44,7 +44,7 @@ Logic _x2Out(Logic eclk, Logic sclk, List<Logic> d, int latency, String name) {
   // The word for the whole group is taken at beat 0, since SCLK (and so the
   // last SCLK register) moves just after that ECLK edge.
   final cur = Logic(name: '${name}_sim_cur', width: 4);
-  final phase = [prev, sclk ^ prev].swizzle();
+  final phase = [prev, sclk ^ prev].concat();
   Sequential.multi(
     [eclk],
     [
@@ -611,9 +611,9 @@ class Ecp5Dp16kd extends BridgeModule {
         oce: input('OCE$p'),
         we: input('WE$p'),
         rst: input('RST$p'),
-        cs: [for (var i = 2; i >= 0; i--) input('CS$p$i')].swizzle(),
-        ad: [for (var i = 13; i >= 0; i--) input('AD$p$i')].swizzle(),
-        di: [for (var i = 17; i >= 0; i--) input('DI$p$i')].swizzle(),
+        cs: [for (var i = 2; i >= 0; i--) input('CS$p$i')].concat(),
+        ad: [for (var i = 13; i >= 0; i--) input('AD$p$i')].concat(),
+        di: [for (var i = 17; i >= 0; i--) input('DI$p$i')].concat(),
         dout: [for (var i = 0; i < 18; i++) output('DO$p$i')],
         width: isA ? dataWidthA : dataWidthB,
         outReg: (isA ? regModeA : regModeB) == 'OUTREG',
@@ -634,10 +634,10 @@ class Ecp5Dp16kd extends BridgeModule {
   }
 
   /// Port A read data as a bus.
-  Logic get doA => [for (var i = 17; i >= 0; i--) output('DOA$i')].swizzle();
+  Logic get doA => [for (var i = 17; i >= 0; i--) output('DOA$i')].concat();
 
   /// Port B read data as a bus.
-  Logic get doB => [for (var i = 17; i >= 0; i--) output('DOB$i')].swizzle();
+  Logic get doB => [for (var i = 17; i >= 0; i--) output('DOB$i')].concat();
 
   /// Packs one DP16KD block's contents into the 64 INITVAL_xx words expected by
   /// [Ecp5Dp16kd]'s `initVals`. [words] is the per-block 18-bit value at each
@@ -705,7 +705,7 @@ class Ecp5InitRom extends Module {
     // x18 addressing: the word index sits in AD[13:4]. AD[1:0] are the byte
     // enables of a write, so the write port drives them high.
     Logic toAd(Logic a, int byteEnables) =>
-        [a.zeroExtend(ebrAddrBits - 4), Const(byteEnables, width: 4)].swizzle();
+        [a.zeroExtend(ebrAddrBits - 4), Const(byteEnables, width: 4)].concat();
     final rdAd = toAd(rdAddr, 0);
     final wrAd = hasWrite ? toAd(wrAddr!, 3) : Const(0, width: ebrAddrBits);
 
@@ -747,7 +747,7 @@ class Ecp5InitRom extends Module {
     rd <=
         (slices.length == 1
             ? slices.first.zeroExtend(width)
-            : slices.rswizzle().getRange(0, width));
+            : slices.rconcat().getRange(0, width));
   }
 }
 
@@ -1181,9 +1181,9 @@ class Ecp5Dqsbufm extends BridgeModule {
   Logic get dqsw270 => output('DQSW270');
   // Per-bit pointers swizzled LSB-first into a 3-bit bus ({RDPNTR2..0}).
   Logic get rdpntr =>
-      [output('RDPNTR2'), output('RDPNTR1'), output('RDPNTR0')].swizzle();
+      [output('RDPNTR2'), output('RDPNTR1'), output('RDPNTR0')].concat();
   Logic get wrpntr =>
-      [output('WRPNTR2'), output('WRPNTR1'), output('WRPNTR0')].swizzle();
+      [output('WRPNTR2'), output('WRPNTR1'), output('WRPNTR0')].concat();
   Logic get datavalid => output('DATAVALID');
   Logic get burstdet => output('BURSTDET');
 
@@ -1286,7 +1286,7 @@ class Ecp5Dqsbufm extends BridgeModule {
       burst.put(0);
     });
     final readIn = read0 | read1;
-    final selIn = [rcs2, rcs1, rcs0].swizzle();
+    final selIn = [rcs2, rcs1, rcs0].concat();
     int? lastEclkRise;
     int? tck;
     eclk.posedge.listen((_) {
@@ -1515,7 +1515,7 @@ class Ecp5Iddrx2dqa extends BridgeModule {
     // outside it is inverted, so a misplaced READ pulse returns wrong data.
     // Each 4-beat group is handed to SCLK on the SCLK edge, oldest in Q0,
     // then delayed to _iddrx2dqaLatency groups.
-    final valid = [rdpntr2, rdpntr1, rdpntr0].swizzle().eq(0);
+    final valid = [rdpntr2, rdpntr1, rdpntr0].concat().eq(0);
     final sample = mux(valid, d, ~d);
     final sr = [for (var k = 0; k < 4; k++) Logic(name: '${name}_sim_sr$k')];
     Sequential.multi(
@@ -1523,7 +1523,7 @@ class Ecp5Iddrx2dqa extends BridgeModule {
       [sr[0] < sample, for (var k = 1; k < 4; k++) sr[k] < sr[k - 1]],
       negedgeTriggers: [eclk],
     );
-    Logic group = [sr[0], sr[1], sr[2], sr[3]].swizzle();
+    Logic group = [sr[0], sr[1], sr[2], sr[3]].concat();
     for (var i = 0; i < _iddrx2dqaLatency; i++) {
       final r = Logic(name: '${name}_sim_grp$i', width: 4);
       Sequential(sclk, [r < group]);
@@ -1738,7 +1738,7 @@ class Ecp5DdrClockTree extends Module with SystemVerilog {
     // the clean 0 -> 1 transition the FSM's edge detector needs.
     final lockShift = Logic(name: 'dll_lock_model', width: 3);
     Sequential(sclkO, reset: reset, [
-      lockShift < [lockShift.getRange(0, 2), Const(1)].swizzle(),
+      lockShift < [lockShift.getRange(0, 2), Const(1)].concat(),
     ]);
     lockO <= lockShift[2];
   }
@@ -1826,7 +1826,7 @@ $dllaBlock''';
 /// operand. The sim body follows the cell with REG_PIPELINE off.
 class Ecp5Mult18x18d extends BridgeModule {
   /// The 36-bit product.
-  Logic get p => [for (var i = 35; i >= 0; i--) output('P$i')].swizzle();
+  Logic get p => [for (var i = 35; i >= 0; i--) output('P$i')].concat();
 
   Ecp5Mult18x18d({
     required Logic clk,
@@ -1871,8 +1871,8 @@ class Ecp5Mult18x18d extends BridgeModule {
     // sim-only: the emitted SV has only the ports.
     final clk0 = input('CLK0');
     Logic reg(Logic v) => flop(clk0, v, en: input('CE0'), reset: input('RST0'));
-    final ar = reg([for (var i = 17; i >= 0; i--) input('A$i')].swizzle());
-    final br = reg([for (var i = 17; i >= 0; i--) input('B$i')].swizzle());
+    final ar = reg([for (var i = 17; i >= 0; i--) input('A$i')].concat());
+    final br = reg([for (var i = 17; i >= 0; i--) input('B$i')].concat());
     final pr = reg(ext(ar, signedA, 36) * ext(br, signedB, 36));
     for (var i = 0; i < 36; i++) {
       output('P$i') <= pr[i];

@@ -355,9 +355,9 @@ class HarborScanoutFetcher extends Module {
     final any2 = Logic(name: 'any_s2');
     final fill2 = Logic(name: 'fill_s2');
 
-    final startAddr = [addr1, Const(0, width: 2)].swizzle().named('start_addr');
+    final startAddr = [addr1, Const(0, width: 2)].concat().named('start_addr');
     // The first request runs to the end of its group.
-    final total = [words1, Const(0)].swizzle().named('total');
+    final total = [words1, Const(0)].concat().named('total');
     final toGroupEnd =
         (Const(maxBurst, width: lw) -
                 startAddr.getRange(1, 1 + burstBits).zeroExtend(lw))
@@ -428,7 +428,7 @@ class HarborScanoutFetcher extends Module {
           If(
             take,
             then: [
-              addr < addr + [len, Const(0)].swizzle().zeroExtend(32),
+              addr < addr + [len, Const(0)].concat().zeroExtend(32),
               len <
                   mux(
                     leftBig,
@@ -450,7 +450,7 @@ class HarborScanoutFetcher extends Module {
                 odd,
                 then: [
                   wrEnReg < Const(1),
-                  wrDataReg < [rdDataReg, low].swizzle(),
+                  wrDataReg < [rdDataReg, low].concat(),
                   wrIdxReg < idx,
                   idx < idx + 1,
                 ],

@@ -2729,7 +2729,7 @@ void main() {
       final wbe = eng.output('dma_write_be');
       final mask = [
         for (var byte = 15; byte >= 0; byte--) wbe[byte].replicate(8),
-      ].swizzle();
+      ].concat();
       eng.input('dma_write_ack').srcConnection! <= wreq;
       Sequential(clk, [
         If(
@@ -3309,7 +3309,7 @@ void main() {
       final wbe = eng.output('dma_write_be');
       final mask = [
         for (var byte = 15; byte >= 0; byte--) wbe[byte].replicate(8),
-      ].swizzle();
+      ].concat();
       eng.input('dma_write_ack').srcConnection! <= wreq;
       Sequential(clk, [
         If(

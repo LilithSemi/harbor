@@ -130,7 +130,7 @@ class HarborInterPredictor extends BridgeModule {
 
     Logic constW(int c) => Const(c & ((1 << wdt) - 1), width: wdt);
     Logic asr(Logic v, int s) =>
-        [v[wdt - 1].replicate(s), v.getRange(s, wdt)].swizzle();
+        [v[wdt - 1].replicate(s), v.getRange(s, wdt)].concat();
     Logic roundShift(Logic v) =>
         asr((v + Const(1 << (shift - 1), width: wdt)).getRange(0, wdt), shift);
 
@@ -204,7 +204,7 @@ class HarborInterPredictor extends BridgeModule {
         input('residual').getRange(i * 16, i * 16 + 16),
     ];
     Logic recon(Logic pred, Logic resi) {
-      final sum = (pred + [resi[15].replicate(wdt - 16), resi].swizzle())
+      final sum = (pred + [resi[15].replicate(wdt - 16), resi].concat())
           .getRange(0, wdt);
       final neg = sum[wdt - 1];
       final tooBig = ~neg & sum.gt(Const(maxVal, width: wdt));
@@ -221,6 +221,6 @@ class HarborInterPredictor extends BridgeModule {
         outs[r * 8 + c] = recon(interp[r][c], res[r * 8 + c]);
       }
     }
-    output('recon') <= [for (var i = 63; i >= 0; i--) outs[i]].swizzle();
+    output('recon') <= [for (var i = 63; i >= 0; i--) outs[i]].concat();
   }
 }

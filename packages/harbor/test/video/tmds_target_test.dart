@@ -25,7 +25,7 @@ void main() {
   test('a simulation uses plain logic, not a vendor cell', () async {
     final ser = build(const HarborSimTarget());
     await ser.build();
-    final sv = ser.generateSynth();
+    final sv = ser.dumpSystemVerilog();
     expect(
       sv,
       contains('HarborDdrOutput'),
@@ -44,7 +44,7 @@ void main() {
   test('an ECP5 build uses the Lattice cell and one pin per lane', () async {
     final ser = build(ecp5);
     await ser.build();
-    expect(ser.generateSynth(), contains('ODDRX1F'));
+    expect(ser.dumpSystemVerilog(), contains('ODDRX1F'));
     // LVCMOS33D makes the complement in the pad, so the design drives one pin.
     expect(() => ser.qn, throwsA(anything));
   });
@@ -52,7 +52,7 @@ void main() {
   test('an Arty build uses the Xilinx cell and drives both pins', () async {
     final ser = build(arty);
     await ser.build();
-    final sv = ser.generateSynth();
+    final sv = ser.dumpSystemVerilog();
     expect(sv, contains('ODDR'));
     expect(sv, isNot(contains('ODDRX1F')));
 

@@ -171,7 +171,11 @@ class HarborEntropyDecoder extends BridgeModule {
     final pop = mux(
       room.gte(Const(16, width: 7)),
       Const(2, width: 2),
-      mux(room.gte(Const(8, width: 7)), Const(1, width: 2), Const(0, width: 2)),
+      mux<Logic>(
+        room.gte(Const(8, width: 7)),
+        Const(1, width: 2),
+        Const(0, width: 2),
+      ),
     ).named('byte_pop_v');
     final byte0 = input('bytes_in').getRange(8, 16);
     final byte1 = input('bytes_in').getRange(0, 8);
@@ -204,7 +208,11 @@ class HarborEntropyDecoder extends BridgeModule {
     final speed = mux(
       curN.lt(Const(2, width: 5)),
       Const(0, width: 2),
-      mux(curN.lt(Const(4, width: 5)), Const(1, width: 2), Const(2, width: 2)),
+      mux<Logic>(
+        curN.lt(Const(4, width: 5)),
+        Const(1, width: 2),
+        Const(2, width: 2),
+      ),
     ).named('speed');
     final rate =
         (Const(3, width: 4) +

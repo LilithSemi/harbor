@@ -605,7 +605,7 @@ class HarborFrameHeaderParse extends BridgeModule {
     final bit0 = rv.getRange(0, 1);
     final nextPos = reader.output('next_offset');
     // su(7): sign-extend the 7-bit field to 8 bits two's complement.
-    final su7 = [rv.getRange(6, 7), rv.getRange(0, 7)].swizzle();
+    final su7 = [rv.getRange(6, 7), rv.getRange(0, 7)].concat();
     // lr_type remap[lr_type] = [NONE, SWITCHABLE=3, WIENER=1, SGRPROJ=2].
     final lrType2 = rv.getRange(0, 2);
     final lrRemapped = mux(
@@ -614,7 +614,7 @@ class HarborFrameHeaderParse extends BridgeModule {
       mux(
         lrType2.eq(Const(1, width: 2)),
         Const(3, width: 2),
-        mux(
+        mux<Logic>(
           lrType2.eq(Const(2, width: 2)),
           Const(1, width: 2),
           Const(2, width: 2),
@@ -659,12 +659,12 @@ class HarborFrameHeaderParse extends BridgeModule {
     Logic minL(Logic a, Logic b) => mux(a.lt(b), a, b);
     Logic maxL(Logic a, Logic b) => mux(a.gt(b), a, b);
 
-    final maxTileWidthSb = mux(
+    final maxTileWidthSb = mux<Logic>(
       seqUse128,
       Const(32, width: 32),
       Const(64, width: 32),
     );
-    final maxTileAreaSb = mux(
+    final maxTileAreaSb = mux<Logic>(
       seqUse128,
       Const(576, width: 32),
       Const(2304, width: 32),
@@ -778,9 +778,9 @@ class HarborFrameHeaderParse extends BridgeModule {
     output('loop_filter_sharpness') <= rLfSharp;
     output('loop_filter_delta_enabled') <= rLfDeltaEnabled;
     output('loop_filter_ref_deltas') <=
-        [for (var i = 7; i >= 0; i--) lfRefD[i]].swizzle();
+        [for (var i = 7; i >= 0; i--) lfRefD[i]].concat();
     output('loop_filter_mode_deltas') <=
-        [for (var i = 1; i >= 0; i--) lfModeD[i]].swizzle();
+        [for (var i = 1; i >= 0; i--) lfModeD[i]].concat();
 
     // all_lossless: superres off => upscaledWidth == frameWidth, so == lossless.
     final allLossless = codedLossless & rFrameWidth.eq(rUpscaledWidth);
@@ -794,15 +794,15 @@ class HarborFrameHeaderParse extends BridgeModule {
     output('cdef_damping_minus3') <= rCdefDamping;
     output('cdef_bits') <= rCdefBits;
     output('cdef_y_pri_strength') <=
-        [for (var i = 7; i >= 0; i--) cdefYpri[i]].swizzle();
+        [for (var i = 7; i >= 0; i--) cdefYpri[i]].concat();
     output('cdef_y_sec_strength') <=
-        [for (var i = 7; i >= 0; i--) cdefYsec[i]].swizzle();
+        [for (var i = 7; i >= 0; i--) cdefYsec[i]].concat();
     output('cdef_uv_pri_strength') <=
-        [for (var i = 7; i >= 0; i--) cdefUvpri[i]].swizzle();
+        [for (var i = 7; i >= 0; i--) cdefUvpri[i]].concat();
     output('cdef_uv_sec_strength') <=
-        [for (var i = 7; i >= 0; i--) cdefUvsec[i]].swizzle();
+        [for (var i = 7; i >= 0; i--) cdefUvsec[i]].concat();
     output('frame_restoration_type') <=
-        [for (var i = 2; i >= 0; i--) frameRestType[i]].swizzle();
+        [for (var i = 2; i >= 0; i--) frameRestType[i]].concat();
     output('uses_lr') <= rUsesLr;
     output('lr_size_0') <= rLrSize0;
     output('lr_size_1') <= lrSize1;
@@ -816,7 +816,7 @@ class HarborFrameHeaderParse extends BridgeModule {
     output('ref_frame_idx') <=
         [
           for (var i = 0; i < 7; i++) rRefIdx.getRange(i * 3, i * 3 + 3),
-        ].swizzle();
+        ].concat();
     output('allow_high_precision_mv') <= rHighPrecMv;
     output('is_filter_switchable') <= rIsFilterSw;
     output('interpolation_filter') <= rInterpFilter;
@@ -987,7 +987,7 @@ class HarborFrameHeaderParse extends BridgeModule {
               rShowFrame < Const(1),
               rShowable < Const(0),
               rRefresh <
-                  mux(
+                  mux<Logic>(
                     shownFrameType.eq(Const(keyFrame, width: 2)),
                     Const(0xff, width: 8),
                     Const(0, width: 8),
@@ -1867,7 +1867,7 @@ class HarborFrameHeaderParse extends BridgeModule {
                   mux(
                     rLrUnitShift.eq(Const(0, width: 2)),
                     Const(64, width: 9),
-                    mux(
+                    mux<Logic>(
                       rLrUnitShift.eq(Const(1, width: 2)),
                       Const(128, width: 9),
                       Const(256, width: 9),
@@ -1892,7 +1892,8 @@ class HarborFrameHeaderParse extends BridgeModule {
             ]),
             CaseItem(sc(sTxModeRead), [
               // tx_mode_select ? TX_MODE_SELECT(2) : TX_MODE_LARGEST(1).
-              rTxMode < mux(bit0, Const(2, width: 2), Const(1, width: 2)),
+              rTxMode <
+                  mux<Logic>(bit0, Const(2, width: 2), Const(1, width: 2)),
               pos < nextPos,
               If(
                 rIntra,

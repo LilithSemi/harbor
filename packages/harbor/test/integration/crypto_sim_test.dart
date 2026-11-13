@@ -17,9 +17,9 @@ class CryptoTB extends Module {
     final brev8Bytes = <Logic>[];
     for (var b = 0; b < 8; b++) {
       final byte = rs1.getRange(b * 8, (b + 1) * 8);
-      brev8Bytes.add([for (var i = 0; i < 8; i++) byte[i]].swizzle());
+      brev8Bytes.add([for (var i = 0; i < 8; i++) byte[i]].concat());
     }
-    final brev8Out = brev8Bytes.reversed.toList().swizzle();
+    final brev8Out = brev8Bytes.reversed.toList().concat();
 
     // clmul
     Logic clmulAcc = Const(0, width: 64);
@@ -44,7 +44,7 @@ class CryptoTB extends Module {
       final inR = ~rs2.getRange(i * 8 + 3, (i + 1) * 8).or();
       xp8.add(mux(inR, b, Const(0, width: 8)));
     }
-    final xp8Out = xp8.swizzle();
+    final xp8Out = xp8.concat();
 
     // AES S-box (byte 0 of rs2)
     const sbox = [

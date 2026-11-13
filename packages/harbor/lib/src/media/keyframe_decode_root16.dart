@@ -115,7 +115,7 @@ class HarborKeyframeDecodeRoot16 extends BridgeModule {
     final reconLog2 = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         (l2Cap.getRange(l * 3, l * 3 + 3) - Const(2, width: 3)).getRange(0, 2),
-    ].swizzle();
+    ].concat();
 
     // y_modes / tx_types: direct copy (4 leaves x 4 bits).
     final reconYModes = ymCap;
@@ -128,7 +128,7 @@ class HarborKeyframeDecodeRoot16 extends BridgeModule {
         Const(0, width: 192 * 16),
         coeffCap.getRange(l * 64 * 16, l * 64 * 16 + 64 * 16),
       ],
-    ].swizzle();
+    ].concat();
 
     // positions: the four 8x8 leaves of a 16x16 SPLIT root, in DFS = raster
     // order, at MI (row (l>>1)*2, col (l&1)*2). Each slot is [l*2*miBits +:
@@ -137,7 +137,7 @@ class HarborKeyframeDecodeRoot16 extends BridgeModule {
     final reconPositions = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         Const(posVal((l >> 1) * 2, (l & 1) * 2), width: 2 * miBits),
-    ].swizzle();
+    ].concat();
 
     recon.input('clk').srcConnection! <= clk;
     recon.input('reset').srcConnection! <= reset;

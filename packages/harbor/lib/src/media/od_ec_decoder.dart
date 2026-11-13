@@ -118,7 +118,7 @@ class HarborOdEcDecoder extends BridgeModule {
 
     // combinational refill: XOR up to three bytes at s = 8 - cnt, -8, -16.
     ({Logic dif, Logic cnt, Logic pop}) refill(Logic dif, Logic cnt) {
-      final s0 = (Const(8, width: 9) - [cnt[7], cnt].swizzle()).getRange(0, 9);
+      final s0 = (Const(8, width: 9) - [cnt[7], cnt].concat()).getRange(0, 9);
       final s1 = (s0 - Const(8, width: 9)).getRange(0, 9);
       final s2 = (s0 - Const(16, width: 9)).getRange(0, 9);
       final l0 = ~s0[8];
@@ -132,7 +132,7 @@ class HarborOdEcDecoder extends BridgeModule {
       final newDif = (dif ^ sh(b0, s0, l0) ^ sh(b1, s1, l1) ^ sh(b2, s2, l2));
       final pop = (l0.zeroExtend(2) + l1.zeroExtend(2) + l2.zeroExtend(2))
           .getRange(0, 2);
-      final newCnt = (cnt + [pop, Const(0, width: 3)].swizzle().zeroExtend(8))
+      final newCnt = (cnt + [pop, Const(0, width: 3)].concat().zeroExtend(8))
           .getRange(0, 8);
       return (dif: newDif, cnt: newCnt, pop: pop);
     }
@@ -177,8 +177,10 @@ class HarborOdEcDecoder extends BridgeModule {
       selV((symFinal - Const(1, width: symWidth)).getRange(0, symWidth)),
     );
     final rNew = (uSym - vSym).getRange(0, 16);
-    final difDec = (difReg - [vSym, Const(0, width: w - 16)].swizzle())
-        .getRange(0, w);
+    final difDec = (difReg - [vSym, Const(0, width: w - 16)].concat()).getRange(
+      0,
+      w,
+    );
 
     Logic ilog(Logic x) {
       Logic n = Const(0, width: 5);
@@ -194,10 +196,7 @@ class HarborOdEcDecoder extends BridgeModule {
                 Const(1, width: w))
             .getRange(0, w);
     final rngShift = (rNew.zeroExtend(16) << d).getRange(0, 16);
-    final cntAfter = (winCnt - [d[4], d].swizzle().zeroExtend(8)).getRange(
-      0,
-      8,
-    );
+    final cntAfter = (winCnt - [d[4], d].concat().zeroExtend(8)).getRange(0, 8);
     final needRefill = cntAfter[7];
     final decRefill = refill(difShift, cntAfter);
 
@@ -205,7 +204,7 @@ class HarborOdEcDecoder extends BridgeModule {
     final speed = mux(
       curNsyms.lt(Const(2, width: 5)),
       Const(0, width: 2),
-      mux(
+      mux<Logic>(
         curNsyms.lt(Const(4, width: 5)),
         Const(1, width: 2),
         Const(2, width: 2),
@@ -219,7 +218,7 @@ class HarborOdEcDecoder extends BridgeModule {
             .getRange(0, 4);
     final adaptedCdf = <Logic>[];
     for (var s = 0; s < maxSyms; s++) {
-      final toward = mux(
+      final toward = mux<Logic>(
         Const(s, width: symWidth).lt(symFinal),
         Const(32768, width: 16),
         Const(0, width: 16),

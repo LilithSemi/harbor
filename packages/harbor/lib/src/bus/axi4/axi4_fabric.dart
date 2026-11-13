@@ -430,7 +430,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
         tgt.add(~anyOf(hits));
         final tgtIdx = indexOf(tgt, tW);
         final full = pW > 0
-            ? [Const(m, width: pW), hid.zeroExtend(maxId)].swizzle()
+            ? [Const(m, width: pW), hid.zeroExtend(maxId)].concat()
             : hid.zeroExtend(maxId);
         final ok = _Tracker(
           '${mn}_${d.toLowerCase()}_order',

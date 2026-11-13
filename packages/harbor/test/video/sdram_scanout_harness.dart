@@ -338,9 +338,9 @@ class SdramScanoutBench {
     );
     soc.buildFabric();
 
-    sysClk = SimpleClockGenerator(sysPeriodPs).clk;
-    memClk = SimpleClockGenerator(memPeriodPs).clk;
-    pixelClk = SimpleClockGenerator(pixelPeriodPs).clk;
+    sysClk = SimpleClockGenerator(sysPeriodPs + (sysPeriodPs & 1)).clk;
+    memClk = SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
+    pixelClk = SimpleClockGenerator(pixelPeriodPs + (pixelPeriodPs & 1)).clk;
 
     soc.input('clk').srcConnection! <= sysClk;
     soc.input('reset').srcConnection! <= sysReset;
@@ -409,8 +409,8 @@ class SdramScanoutBench {
       dq: sdram.inOutSource('sdram_dq') as LogicNet,
       rules: const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000),
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,

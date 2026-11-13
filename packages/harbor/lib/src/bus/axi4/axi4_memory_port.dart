@@ -392,7 +392,7 @@ class HarborAxi4MemorySlave extends Module {
     Const(Axi4RespField.slvErr.value, width: Axi4Interface.respWidth),
     exOkay == null
         ? Const(Axi4RespField.okay.value, width: Axi4Interface.respWidth)
-        : mux(
+        : mux<Logic>(
             exOkay,
             Const(Axi4RespField.exOkay.value, width: Axi4Interface.respWidth),
             Const(Axi4RespField.okay.value, width: Axi4Interface.respWidth),

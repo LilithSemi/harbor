@@ -239,6 +239,7 @@ HarborSoC _soc(
   HarborFpgaTarget target, {
   bool withDdr = true,
   bool withEth = true,
+  int ddrGearRatio = 1,
 }) {
   final soc = HarborSoC(
     name: 'Ax7203Soc',
@@ -253,10 +254,11 @@ HarborSoC _soc(
         providedByDdr3Tree: true,
       ),
     ],
-    xilinxDdr3Tree: const XilinxDdr3TreeSpec(
+    xilinxDdr3Tree: XilinxDdr3TreeSpec(
       sourceHz: 200000000,
       ddrCkHz: 400000000,
       coreClkHz: 100000000,
+      ddrGearRatio: ddrGearRatio,
     ),
   );
   final uart = soc.addPeripheral(HarborUart(baseAddress: 0x10000000));
@@ -371,7 +373,34 @@ void main() {
     final target = board.fpgaTarget(useHimbaechel: true);
     await _soc(target, withEth: false).generateAll(dir);
 
-    expect(File('${dir.path}/support/nextpnr/clocks.py').existsSync(), isTrue);
+    final clocks = File(
+      '${dir.path}/support/nextpnr/clocks.py',
+    ).readAsStringSync();
+    expect(clocks, contains("('sysosc_clk', 200.00)"));
+    expect(clocks, contains("('core_clk', 140.00)"));
+    final generatedRtl = Directory('${dir.path}/rtl')
+        .listSync(recursive: true)
+        .whereType<File>()
+        .where((file) => file.path.endsWith('.sv'))
+        .map((file) => file.readAsStringSync())
+        .join('\n');
+    expect(generatedRtl, contains('sysosc_clk'));
+    expect(generatedRtl, contains('core_clk'));
+    expect(generatedRtl, contains('(* keep = 1 *) logic sysosc_clk;'));
+    expect(generatedRtl, contains('(* keep = 1 *) logic core_clk;'));
+    expect(generatedRtl, contains('(* keep = 1 *) logic ddr_clk;'));
+    expect(
+      generatedRtl,
+      matches(RegExp(r'coreclk_bufg\s*\([^;]*\.O\(core_clk\)')),
+    );
+    expect(
+      generatedRtl,
+      matches(RegExp(r'sysosc_bufg\s*\([^;]*\.O\(sysosc_clk\)')),
+    );
+    expect(
+      generatedRtl,
+      matches(RegExp(r'ddr3clk_ctrl_bufg\s*\([^;]*\.O\(ddr_clk\)')),
+    );
     expect(
       File('${dir.path}/support/nextpnr/constraints.py').existsSync(),
       isFalse,
@@ -385,6 +414,35 @@ void main() {
     ).readAsLinesSync().singleWhere((line) => line.contains(' ck_oddr('));
     expect(ckOddr, contains('.R(sync_rst)'));
     expect(ckOddr, isNot(contains('.S(')));
+  });
+
+  test('geared DDR constraints name the CK/8 controller BUFG output', () async {
+    final dir = Directory.systemTemp.createTempSync('harbor_ax7203_gear2_');
+    addTearDown(() async {
+      dir.deleteSync(recursive: true);
+      await Simulator.reset();
+    });
+    final target = board.fpgaTarget(useHimbaechel: true);
+    await _soc(target, withEth: false, ddrGearRatio: 2).generateAll(dir);
+
+    final generatedRtl = Directory('${dir.path}/rtl')
+        .listSync(recursive: true)
+        .whereType<File>()
+        .where((file) => file.path.endsWith('.sv'))
+        .map((file) => file.readAsStringSync())
+        .join('\n');
+    expect(
+      generatedRtl,
+      matches(RegExp(r'ddr3clk_ctrlgear_bufg\s*\([^;]*\.O\(ddr_clk\)')),
+    );
+    expect(
+      generatedRtl,
+      matches(RegExp(r'ddr3clk_ctrl_bufg\s*\([^;]*\.O\(ddr_ck4_clk\)')),
+    );
+    final clocks = File(
+      '${dir.path}/support/nextpnr/clocks.py',
+    ).readAsStringSync();
+    expect(clocks, contains("('ddr_clk', 62.50)"));
   });
 
   test('one leg of the differential clock binds both', () {

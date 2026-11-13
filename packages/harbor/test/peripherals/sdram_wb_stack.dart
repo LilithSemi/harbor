@@ -107,8 +107,10 @@ class SdramWbStack {
   List<String> get errors => model.errors;
 
   Future<void> start() async {
-    sysClk = SimpleClockGenerator(sysPeriodPs).clk;
-    memClk = busClockSync ? sysClk : SimpleClockGenerator(memPeriodPs).clk;
+    sysClk = SimpleClockGenerator(sysPeriodPs + (sysPeriodPs & 1)).clk;
+    memClk = busClockSync
+        ? sysClk
+        : SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
 
     cyc = Logic(name: 'wb_cyc');
     we = Logic(name: 'wb_we');
@@ -191,8 +193,8 @@ class SdramWbStack {
       dq: sdram.inOutSource('sdram_dq') as LogicNet,
       rules: rules,
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,

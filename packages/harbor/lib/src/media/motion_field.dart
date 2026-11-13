@@ -322,7 +322,7 @@ class HarborMotionField extends BridgeModule {
     // outputs
     output('done') <= st.eq(Const(sDone, width: stW));
     Logic pack(List<Logic> g) =>
-        [for (var i = g.length - 1; i >= 0; i--) g[i]].swizzle();
+        [for (var i = g.length - 1; i >= 0; i--) g[i]].concat();
     output('tpl_valid') <= pack(gValid);
     output('tpl_mvrow') <= pack(gRow);
     output('tpl_mvcol') <= pack(gCol);

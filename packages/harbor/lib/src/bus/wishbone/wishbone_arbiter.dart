@@ -153,7 +153,7 @@ Logic harborWishboneGrant({
 }) {
   final numMasters = requests.length;
   final cap = maxGrantCycles;
-  final requestsVec = requests.rswizzle().named('${prefix}requests');
+  final requestsVec = requests.rconcat().named('${prefix}requests');
 
   // A master that lost the grant to the cap stays out of arbitration until
   // another master takes the grant.
@@ -178,7 +178,7 @@ Logic harborWishboneGrant({
 
   // The grant is a register. A combinational grant would put arbitration,
   // address decode and the slave ACK in one long path.
-  final grantVec = grantSignals.rswizzle();
+  final grantVec = grantSignals.rconcat();
   final heldReg = Logic(name: '${prefix}held_grant', width: numMasters);
   final heldReqVec = (heldReg & requestsVec).named('${prefix}held_req');
   final heldValid = heldReqVec.or().named('${prefix}held_valid');

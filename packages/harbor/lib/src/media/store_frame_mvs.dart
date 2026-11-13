@@ -117,7 +117,7 @@ class HarborStoreFrameMvs extends BridgeModule {
       colOut.add(mux(valid1, c1, mux(valid0, c0, Const(0, width: 16))));
     }
     Logic pack(List<Logic> g) =>
-        [for (var i = g.length - 1; i >= 0; i--) g[i]].swizzle();
+        [for (var i = g.length - 1; i >= 0; i--) g[i]].concat();
     output('ref_grid') <= pack(refOut);
     output('mv_row') <= pack(rowOut);
     output('mv_col') <= pack(colOut);

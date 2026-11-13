@@ -75,7 +75,7 @@ class Ddr3Ecp5StatusRun {
     final div = Logic(name: 'div', width: 2);
     Sequential(ck, reset: divInit, [div < div + 1]);
     final ddrClk = div[1];
-    final clk = SimpleClockGenerator(clkPeriod).clk;
+    final clk = SimpleClockGenerator(clkPeriod + (clkPeriod & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final ddrReset = Logic(name: 'ddr_reset')..inject(1);
     ddr.input('clk').srcConnection! <= clk;

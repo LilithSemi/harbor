@@ -30,8 +30,8 @@ void main() {
     );
     final cdc = HarborWishboneCdcBridge(addressWidth: aw, dataWidth: 32);
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
 
@@ -190,6 +190,6 @@ void main() {
     await run(sPeriod: 20, mPeriod: 6);
   });
   test('sub-word streaming writes, near-equal clocks', () async {
-    await run(sPeriod: 10, mPeriod: 11);
+    await run(sPeriod: 10, mPeriod: 12);
   });
 }

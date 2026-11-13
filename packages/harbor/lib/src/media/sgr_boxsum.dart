@@ -81,7 +81,7 @@ class HarborSgrBoxsum extends BridgeModule {
     }
 
     // Pack position (i,j) at index i*width + j, LSB-first.
-    output('bsum') <= bParts.reversed.toList().swizzle();
-    output('asum') <= aParts.reversed.toList().swizzle();
+    output('bsum') <= bParts.reversed.toList().concat();
+    output('asum') <= aParts.reversed.toList().concat();
   }
 }

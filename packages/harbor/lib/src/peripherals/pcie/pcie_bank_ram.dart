@@ -129,7 +129,7 @@ class HarborPcieWindowBuffer {
     Logic low(Logic s) => s.slice(bLog - 1, 0);
     Logic bankAddr(Logic s, Logic cb) =>
         s.slice(bLog + aw - 1, bLog) +
-        mux(cb.lt(low(s)), Const(1), Const(0)).zeroExtend(aw);
+        mux<Logic>(cb.lt(low(s)), Const(1), Const(0)).zeroExtend(aw);
 
     final cw = wrCount.width > bLog ? wrCount.width : bLog + 1;
     final lanes = [

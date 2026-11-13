@@ -1834,13 +1834,13 @@ void main() {
 
     test('mul-only build: generated SV has no divider', () async {
       final dut = await onlyDut(width: 32, mulMode: _pipelined, divMode: null);
-      final sv = dut.generateSynth();
+      final sv = dut.dumpSystemVerilog();
       expect(sv, isNot(contains('HarborDivSqrtRecurrence')));
     });
 
     test('div-only build: generated SV has no multiplier', () async {
       final dut = await onlyDut(width: 32, mulMode: null, divMode: _divIter);
-      final sv = dut.generateSynth();
+      final sv = dut.dumpSystemVerilog();
       // Strip /* ... */ comments first: ROHD writes the file header and
       // every swizzle's bit range that way, and both use '*'.
       final code = sv.replaceAll(RegExp(r'/\*.*?\*/', dotAll: true), '');

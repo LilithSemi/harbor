@@ -315,9 +315,12 @@ class MultiSim {
   late final Sim b;
 
   MultiSim(this.dut, this.ratio) {
-    fabric = Sim(dut, clk: SimpleClockGenerator(ratio.fabric).clk);
-    a = Sim(dut, clk: SimpleClockGenerator(ratio.a).clk);
-    b = Sim(dut, clk: SimpleClockGenerator(ratio.b).clk);
+    fabric = Sim(
+      dut,
+      clk: SimpleClockGenerator(ratio.fabric + (ratio.fabric & 1)).clk,
+    );
+    a = Sim(dut, clk: SimpleClockGenerator(ratio.a + (ratio.a & 1)).clk);
+    b = Sim(dut, clk: SimpleClockGenerator(ratio.b + (ratio.b & 1)).clk);
     _hookPulses();
   }
 

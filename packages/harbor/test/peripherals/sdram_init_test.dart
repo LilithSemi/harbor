@@ -74,7 +74,7 @@ Future<void> _runTrace(int clockHz) async {
     const HarborSdramConfig.as4c16m16sb6(),
     clockHz: clockHz,
   );
-  final clk = SimpleClockGenerator(cycles.tCkPs).clk;
+  final clk = SimpleClockGenerator(cycles.tCkPs + (cycles.tCkPs & 1)).clk;
   final reset = Logic(name: 'reset')..inject(1);
   final dut = SdramInitSequencer(cycles, clk: clk, reset: reset);
   await dut.build();
@@ -122,7 +122,7 @@ void main() {
       const HarborSdramConfig.as4c16m16sb6(),
       clockHz: 125000000,
     );
-    final clk = SimpleClockGenerator(cycles.tCkPs).clk;
+    final clk = SimpleClockGenerator(cycles.tCkPs + (cycles.tCkPs & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final dut = SdramInitSequencer(cycles, clk: clk, reset: reset);
     await dut.build();

@@ -511,7 +511,7 @@ class HarborEthernetMac extends BridgeModule
         .named('tx_fifo_not_empty');
     final hold = Logic(name: 'tx_fifo_hold', width: 3);
     Sequential(clk, reset: reset, [
-      hold < [hold.getRange(0, 2), notEmpty].swizzle(),
+      hold < [hold.getRange(0, 2), notEmpty].concat(),
     ]);
     txPathBusy <=
         notEmpty | hold.or() | _sync('tx_phy_busy', txPhyBusy, clk, reset);

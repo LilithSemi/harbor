@@ -166,7 +166,7 @@ class HarborEthMacRx extends Module {
       oversize,
       cnt.lt(Const(minFrameBytes, width: 11)),
       crc.neq(Const(crcResidue, width: 32)),
-    ].swizzle().named('status');
+    ].concat().named('status');
 
     List<Conditional> endFrame() => [
       If(

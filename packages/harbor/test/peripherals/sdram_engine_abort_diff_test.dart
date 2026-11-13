@@ -121,8 +121,8 @@ SdramPinModel _buildModel(SdramEngineStackTop top, LogicNet dqPad) {
     dq: dqPad,
     rules: const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000),
     fpgaToSdramNs: 4.6,
-    fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-    fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+    fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+    fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
   );
 }
 
@@ -152,7 +152,7 @@ void main() {
       reason: 'fpgaToSdramNs must land inside the capture window',
     );
 
-    final clk = SimpleClockGenerator(periodPs).clk;
+    final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
     final reset = Logic(name: 'reset');
 
     // The one abort schedule this test controls. [dIn] is the D input of

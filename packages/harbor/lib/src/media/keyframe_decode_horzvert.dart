@@ -126,13 +126,13 @@ class HarborKeyframeDecodeHorzVert extends BridgeModule {
     final isLeaf1 = leaf;
     final py = mux(
       isHorz,
-      mux(isLeaf1, Const(4, width: 4), Const(0, width: 4)),
+      mux<Logic>(isLeaf1, Const(4, width: 4), Const(0, width: 4)),
       Const(0, width: 4),
     );
     final px = mux(
       isHorz,
       Const(0, width: 4),
-      mux(isLeaf1, Const(4, width: 4), Const(0, width: 4)),
+      mux<Logic>(isLeaf1, Const(4, width: 4), Const(0, width: 4)),
     );
 
     // have_above / have_left for THIS leaf. Block-edge availability comes from
@@ -217,9 +217,9 @@ class HarborKeyframeDecodeHorzVert extends BridgeModule {
     pred84.input('have_above').srcConnection! <= haveA;
     pred84.input('have_left').srcConnection! <= haveL;
     pred84.input('above').srcConnection! <=
-        [for (var i = 8 - 1; i >= 0; i--) aboveSel[i]].swizzle();
+        [for (var i = 8 - 1; i >= 0; i--) aboveSel[i]].concat();
     pred84.input('left').srcConnection! <=
-        [for (var i = 4 - 1; i >= 0; i--) leftSel[i]].swizzle();
+        [for (var i = 4 - 1; i >= 0; i--) leftSel[i]].concat();
     pred84.input('above_left').srcConnection! <= cornerSel;
 
     // 4x8 (VERT): above = 4 wide, left = 8 high.
@@ -229,9 +229,9 @@ class HarborKeyframeDecodeHorzVert extends BridgeModule {
     pred48.input('have_above').srcConnection! <= haveA;
     pred48.input('have_left').srcConnection! <= haveL;
     pred48.input('above').srcConnection! <=
-        [for (var i = 4 - 1; i >= 0; i--) aboveSel[i]].swizzle();
+        [for (var i = 4 - 1; i >= 0; i--) aboveSel[i]].concat();
     pred48.input('left').srcConnection! <=
-        [for (var i = 8 - 1; i >= 0; i--) leftSel[i]].swizzle();
+        [for (var i = 8 - 1; i >= 0; i--) leftSel[i]].concat();
     pred48.input('above_left').srcConnection! <= cornerSel;
 
     // rect inverse transforms: one per (kind, tx_type).
@@ -315,7 +315,7 @@ class HarborKeyframeDecodeHorzVert extends BridgeModule {
         sDone = 6;
     final st = Logic(name: 'st', width: 3);
     output('done') <= st.eq(Const(sDone, width: 3));
-    output('frame') <= [for (var i = nPix - 1; i >= 0; i--) frame[i]].swizzle();
+    output('frame') <= [for (var i = nPix - 1; i >= 0; i--) frame[i]].concat();
 
     Combinational([
       walkStart < Const(0),

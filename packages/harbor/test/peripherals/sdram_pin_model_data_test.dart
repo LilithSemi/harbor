@@ -92,7 +92,7 @@ int _ceilCycles(double ns, int periodPs) => (ns * 1000 / periodPs).ceil();
   bool withFpgaSignals = true,
 }) {
   const rules = SdramModelRules.as4c16m16sb6();
-  final clk = SimpleClockGenerator(periodPs).clk;
+  final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
   final d = _Driver(clk);
   final model = SdramPinModel(
     clk: clk,
@@ -193,7 +193,7 @@ void main() {
 
   Future<void> runCase(int periodPs, int cl, int mrsWord) async {
     const rules = SdramModelRules.as4c16m16sb6();
-    final clk = SimpleClockGenerator(periodPs).clk;
+    final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
     final d = _Driver(clk);
     final model = SdramPinModel(
       clk: clk,
@@ -312,7 +312,7 @@ void main() {
     const rules = SdramModelRules.as4c16m16sb6();
     const periodPs = 8000;
     const cl = 3;
-    final clk = SimpleClockGenerator(periodPs).clk;
+    final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
     final d = _Driver(clk);
     final model = SdramPinModel(
       clk: clk,
@@ -545,7 +545,7 @@ void main() {
     () async {
       const rules = SdramModelRules.as4c16m16sb6();
       const periodPs = 8000;
-      final clk = SimpleClockGenerator(periodPs).clk;
+      final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
       final d = _Driver(clk);
       final model = SdramPinModel(
         clk: clk,
@@ -607,7 +607,7 @@ void main() {
       const rules = SdramModelRules.as4c16m16sb6();
       const periodPs = 8000;
       const policyPeriodPs = 2000000; // 2000ns.
-      final clk = SimpleClockGenerator(periodPs).clk;
+      final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
       final d = _Driver(clk);
       final model = SdramPinModel(
         clk: clk,

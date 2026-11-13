@@ -35,8 +35,8 @@ Future<void> _run({
     blockRam: blockRam,
     name: 'fifo_rand',
   );
-  final wrClk = SimpleClockGenerator(wrPeriod).clk;
-  final rdClk = SimpleClockGenerator(rdPeriod).clk;
+  final wrClk = SimpleClockGenerator(wrPeriod + (wrPeriod & 1)).clk;
+  final rdClk = SimpleClockGenerator(rdPeriod + (rdPeriod & 1)).clk;
   final wrReset = Logic(name: 'wr_reset_in');
   final rdReset = Logic(name: 'rd_reset_in');
   final wrData = Logic(name: 'wr_data_in', width: dw);
@@ -221,7 +221,7 @@ void main() {
   test('gray pointers that cross domains are flops', () async {
     final fifo = HarborCdcFifo(dataWidth: 8, depth: 4, name: 'fifo_gray');
     await fifo.build();
-    final sv = fifo.generateSynth();
+    final sv = fifo.dumpSystemVerilog();
     // A gray pointer made from logic can glitch through codes that are more
     // than one step away while the other domain samples it.
     for (final name in ['wr_ptr_gray', 'rd_ptr_gray']) {
@@ -247,7 +247,7 @@ void main() {
       postedWrites: true,
     );
     await fifo.build();
-    final sv = gray.generateSynth() + fifo.generateSynth();
+    final sv = gray.dumpSystemVerilog() + fifo.dumpSystemVerilog();
     for (final name in ['req_gray', 'done_gray', 'head_we']) {
       expect(sv, contains(name));
       expect(

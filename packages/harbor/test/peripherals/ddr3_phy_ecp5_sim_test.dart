@@ -34,7 +34,7 @@ class _Bench {
     // The write data changes every CK/4 tick.
     final tick = Logic(name: 'tick', width: 8);
     Sequential(ctrlClk, [tick < tick + 1], reset: divInit);
-    data = [for (var i = 0; i < p.wbDataBits ~/ 8; i++) tick].swizzle();
+    data = [for (var i = 0; i < p.wbDataBits ~/ 8; i++) tick].concat();
     dm = dmWord ?? Const(0, width: p.wbSelBits);
 
     final cmdLen = 4 + 3 + p.baBits + p.rowBits;

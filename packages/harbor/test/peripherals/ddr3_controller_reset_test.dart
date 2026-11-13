@@ -44,7 +44,7 @@ void main() {
         rstN: Logic(name: 'rstn'),
       );
       await dut.build();
-      final sv = dut.generateSynth();
+      final sv = dut.dumpSystemVerilog();
       for (final port in [
         'o_phy_cmd',
         'o_phy_reset',

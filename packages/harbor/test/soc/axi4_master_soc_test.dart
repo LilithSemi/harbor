@@ -184,8 +184,8 @@ Future<SdramPinModel> _bootSdram(
     dq: soc.inOutSource('sdram_dq') as LogicNet,
     rules: const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000),
     fpgaToSdramNs: fpgaToSdramNs,
-    fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-    fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+    fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+    fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
     refreshPolicy: SdramRefreshPolicy(
       maxPostponed: sdram.cycles.maxPostponed,
       maxPulledIn: sdram.cycles.maxPulledIn,
