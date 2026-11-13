@@ -191,7 +191,9 @@ class HarborSdioConfig with HarborPrettyString {
 /// Register map (each register in its own 8-byte slot; the byte-addressed fabric
 /// decodes byte-offset >> 3, so these byte offsets map to indices 0,1,2,...):
 /// - 0x00: CTRL      ([0] enable, [5:4] bus width, [8] sample edge, [9] DAT
-///   reset, write 1)
+///   reset, write 1. It also stops a command in flight. Wait for STATUS[8] to
+///   clear before the buffer is used again, since memory writes already sent
+///   still finish.)
 /// - 0x08: STATUS    ([0] card detect, [8] busy, [9] data ready)
 /// - 0x10: CLK_DIV   (clock divider)
 /// - 0x18: CMD       (command index + argument trigger)
@@ -207,7 +209,9 @@ class HarborSdioConfig with HarborPrettyString {
 /// - 0x68: INT_ENABLE (interrupt enable)
 /// - 0x70: ADMA_ADDR  (DMA buffer address, or descriptor table base)
 /// - 0x78: DATA_TIMEOUT (SD clocks a card read waits for a block start bit,
-///   0 is off, reset 4194304)
+///   0 is off, reset 4194304). A timeout on a PIO read raises only the
+///   timeout bit, there is no data-done. A DMA read adds data-done once the
+///   ADMA has drained.
 ///
 /// CMD bits: [5:0] index, [7:6] response type (0 none, 1 short, 2 long R2,
 /// 3 short+busy), [8] data present, [9] direction (0 write, 1 read), [10] use
@@ -328,7 +332,8 @@ class HarborSdioController extends BridgeModule
   /// low. A card that does not has no busy phase.
   static const writeNoBusyClocks = 4;
 
-  /// The reset value of DATA_TIMEOUT: 4194304 SD clocks, 168 ms at 25 MHz.
+  /// The reset value of DATA_TIMEOUT: 4194304 SD clocks. A 25 MHz system clock
+  /// gives at most a 12.5 MHz SD clock, so this is at least 335 ms.
   static const defaultDataTimeout = 1 << 22;
 
   // With [ownPads], the FSM's CMD/DAT input signals come from the inout pads;
@@ -482,6 +487,7 @@ class HarborSdioController extends BridgeModule
     const sSend = 1;
     const sWait = 2;
     const sRecv = 3;
+    const sEnd = 4; // hold the end bit for one SD clock
 
     // INT_STATUS bits.
     const intCmdDone = 0x01;
@@ -516,7 +522,7 @@ class HarborSdioController extends BridgeModule
     final sdClkReg = Logic(name: 'sd_clk_reg');
 
     // CMD engine state.
-    final state = Logic(name: 'cmd_state', width: 2);
+    final state = Logic(name: 'cmd_state', width: 3);
     final cmdShift = Logic(name: 'cmd_shift', width: 48);
     final cmdCnt = Logic(name: 'cmd_cnt', width: 7);
     final cmdOut = Logic(name: 'cmd_out');
@@ -1075,7 +1081,7 @@ class HarborSdioController extends BridgeModule
           busy < Const(0),
           divCount < Const(0, width: 16),
           sdClkReg < Const(0),
-          state < Const(sIdle, width: 2),
+          state < Const(sIdle, width: 3),
           cmdShift < Const(0, width: 48),
           cmdCnt < Const(0, width: 7),
           cmdOut < Const(1), // CMD idles high
@@ -1157,46 +1163,53 @@ class HarborSdioController extends BridgeModule
           // CMD engine.
           Case(state, [
             // Serialize the command, MSB-first, one bit per SD falling edge.
-            CaseItem(Const(sSend, width: 2), [
+            CaseItem(Const(sSend, width: 3), [
               If(
                 sdFall,
                 then: [
                   cmdOut < cmdShift[47],
                   cmdShift < [cmdShift.getRange(0, 47), Const(0)].concat(),
                   cmdCnt < (cmdCnt - Const(1, width: 7)),
+                  // The last bit is the end bit. Keep it driven for one more
+                  // SD clock, so a pad with a slow pull-up reads it high.
                   If(
                     cmdCnt.eq(Const(1, width: 7)),
+                    then: [state < Const(sEnd, width: 3)],
+                  ),
+                ],
+              ),
+            ]),
+            CaseItem(Const(sEnd, width: 3), [
+              If(
+                sdFall,
+                then: [
+                  cmdOe < Const(0),
+                  If(
+                    cmdRespType.eq(Const(0, width: 2)),
+                    // No response expected: the command is done.
                     then: [
-                      If(
-                        cmdRespType.eq(Const(0, width: 2)),
-                        // No response expected: command done, release the line.
-                        then: [
-                          state < Const(sIdle, width: 2),
-                          busy < Const(0),
-                          cmdOe < Const(0),
-                          intStatus < (intStatus | Const(intCmdDone, width: 9)),
-                        ],
-                        // Wait for the card to drive the response.
-                        orElse: [
-                          state < Const(sWait, width: 2),
-                          cmdOe < Const(0),
-                          toCnt < Const(0, width: 16),
-                        ],
-                      ),
+                      state < Const(sIdle, width: 3),
+                      busy < Const(0),
+                      intStatus < (intStatus | Const(intCmdDone, width: 9)),
+                    ],
+                    // Wait for the card to drive the response.
+                    orElse: [
+                      state < Const(sWait, width: 3),
+                      toCnt < Const(0, width: 16),
                     ],
                   ),
                 ],
               ),
             ]),
             // Hunt for the response start bit, with an NCR timeout.
-            CaseItem(Const(sWait, width: 2), [
+            CaseItem(Const(sWait, width: 3), [
               If(
                 respEdge,
                 then: [
                   If(
                     ~cmdIn,
                     then: [
-                      state < Const(sRecv, width: 2),
+                      state < Const(sRecv, width: 3),
                       respShift < Const(0, width: 136),
                       respCnt <
                           mux<Logic>(
@@ -1213,7 +1226,7 @@ class HarborSdioController extends BridgeModule
                       If(
                         toCnt.eq(Const(respTimeout, width: 16)),
                         then: [
-                          state < Const(sIdle, width: 2),
+                          state < Const(sIdle, width: 3),
                           busy < Const(0),
                           // A PIO card-write word may have been loaded before
                           // CMD24. If the card never starts a response, the
@@ -1233,7 +1246,7 @@ class HarborSdioController extends BridgeModule
               ),
             ]),
             // Shift the response in on rising edges, capture on the last bit.
-            CaseItem(Const(sRecv, width: 2), [
+            CaseItem(Const(sRecv, width: 3), [
               If(
                 respEdge,
                 then: [
@@ -1242,7 +1255,7 @@ class HarborSdioController extends BridgeModule
                   If(
                     respCnt.eq(Const(1, width: 8)),
                     then: [
-                      state < Const(sIdle, width: 2),
+                      state < Const(sIdle, width: 3),
                       intStatus < (intStatus | Const(intCmdDone, width: 9)),
                       // Hand off to the data engine when the command carries a
                       // data phase, otherwise the command is done.
@@ -1357,7 +1370,7 @@ class HarborSdioController extends BridgeModule
                         dataTimeoutCnt < (dataTimeoutCnt + Const(1, width: 24)),
                         If(
                           dataTimeout.neq(Const(0, width: 24)) &
-                              dataTimeoutCnt.eq(
+                              dataTimeoutCnt.gte(
                                 dataTimeout - Const(1, width: 24),
                               ),
                           then: [
@@ -2052,6 +2065,11 @@ class HarborSdioController extends BridgeModule
                               wrNeedFill < Const(0),
                               byteInWord < Const(0, width: 2),
                               busy < Const(0),
+                              // A command that waits for its answer stops
+                              // too, so a late card answer starts nothing.
+                              state < Const(sIdle, width: 3),
+                              cmdOe < Const(0),
+                              cmdOut < Const(1),
                             ],
                           ),
                         ],
@@ -2113,7 +2131,7 @@ class HarborSdioController extends BridgeModule
                           cmdOut < Const(1),
                           cmdOe < Const(1),
                           busy < Const(1),
-                          state < Const(sSend, width: 2),
+                          state < Const(sSend, width: 3),
                           // Start every data phase with an empty RX FIFO, so
                           // a word left by an earlier transfer cannot shift
                           // the new block.

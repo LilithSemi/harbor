@@ -100,4 +100,29 @@ void main() {
       await Simulator.endSimulation();
     },
   );
+
+  test('lowering DATA_TIMEOUT below the running count ends the wait', () async {
+    final b = AdmaBench(
+      HarborFabricKind.wishbone,
+      64,
+      sampleFall: true,
+      errBase: 0x1000000,
+    );
+    await b.start();
+    Simulator.setMaxSimTime(40000000);
+    await b.wr(_dataTimeout, 0);
+    await b.wr(admaBlkSize, 8);
+    await b.wr(_blkCount, 2);
+    await b.wr(admaAdmaAddr, 0x10000);
+    await b.wr(admaCmd, _cmd18);
+    await b.cardReadBlocks([_block(0x55550000)], cycles: 1000);
+    expect(await b.rd(admaIntStatus) & _timeoutBit, 0);
+    await b.wr(_dataTimeout, 16);
+    await b.clk.nextPosedge;
+    for (var i = 0; i < 200; i++) {
+      await b.clk.nextPosedge;
+    }
+    expect(await b.rd(admaIntStatus) & _timeoutBit, _timeoutBit);
+    await Simulator.endSimulation();
+  });
 }

@@ -288,6 +288,7 @@ class AdmaBench {
     bool launchOnRise = true,
     int stopAfterBits = -1,
     int cycles = 0,
+    bool cmdAlreadySent = false,
   }) async {
     final resp = admaResp48();
     final stream = <int>[
@@ -298,7 +299,7 @@ class AdmaBench {
       ]) ...[...admaFourBitBlock(w), 0xF, for (var i = 0; i < nac; i++) 0xF],
     ];
     final total = resp.length + stream.length;
-    var sawDrive = false, idx = 0;
+    var sawDrive = cmdAlreadySent, idx = 0;
     var prevHigh = top.output('sd_clk').value.toInt() == 1;
     for (var i = 0; i < 4000000; i++) {
       await clk.nextPosedge;
@@ -328,6 +329,42 @@ class AdmaBench {
       }
     }
     if (cycles == 0) fail('the card read never finished');
+  }
+
+  /// Answers a command with [frame] on CMD, for [cycles] system clocks. The
+  /// line behaves like a pad with a slow pull-up: while the controller drives
+  /// it the pad follows, and after the controller releases it the pad keeps
+  /// the last driven level for [hold] SD clocks, then reads high. The card
+  /// starts the frame [ncr] SD clocks after that.
+  Future<void> cardRespond(
+    List<int> frame, {
+    int hold = 3,
+    int ncr = 2,
+    int cycles = 3000,
+  }) async {
+    var seen = false, edges = 0, idx = 0, lastLevel = 1;
+    var prevHigh = top.output('sd_clk').value.toInt() == 1;
+    for (var i = 0; i < cycles; i++) {
+      await clk.nextPosedge;
+      final sending = top.output('sd_cmd_oe').value.toInt() == 1;
+      final high = top.output('sd_clk').value.toInt() == 1;
+      final rise = high && !prevHigh;
+      prevHigh = high;
+      if (sending) {
+        seen = true;
+        lastLevel = top.output('sd_cmd_out').value.toInt();
+        cmdIn.inject(lastLevel);
+      } else if (seen && rise) {
+        edges++;
+        if (edges <= hold) {
+          cmdIn.inject(lastLevel);
+        } else if (edges > hold + ncr && idx < frame.length) {
+          cmdIn.inject(frame[idx++]);
+        } else {
+          cmdIn.inject(1);
+        }
+      }
+    }
   }
 
   /// Answers the command, then takes [blocks] blocks of [blkBytes] bytes from
