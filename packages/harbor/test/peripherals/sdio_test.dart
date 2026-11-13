@@ -569,8 +569,8 @@ void main() {
       // and CRC all correspond to this transfer.
       await busWrite(_data, freshWord);
       final dataBits = _wordBitsMsb(freshWord);
-      // The current controller releases DAT with the end bit; capture the
-      // start, payload, and CRC driven before that release.
+      // The controller drives the end bit after the CRC. Compare the start,
+      // payload, and CRC only.
       final expectedWrite = [0, ...dataBits, ..._crc16(dataBits)];
       const status = [0, 0, 1, 0, 1, 0, 1];
       var statusIndex = 0;
@@ -755,7 +755,7 @@ void main() {
 
       final resp = _resp48(0);
       final dataBits = _wordBitsMsb(word);
-      // start + 32 data + 16 CRC (the end bit is driven with OE already low).
+      // start + 32 data + 16 CRC. The end bit follows and is not compared.
       final expected = [0, ...dataBits, ..._crc16(dataBits)];
       // Card CRC status token (010 = accepted) and its end bit, then busy-low
       // then busy-high.

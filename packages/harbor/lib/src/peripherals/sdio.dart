@@ -321,6 +321,10 @@ class HarborSdioController extends BridgeModule
   /// The default [writeBusyTimeout]: 0.67 s at 25 MHz.
   static const defaultWriteBusyTimeout = 1 << 24;
 
+  /// SD clocks after a write status token in which the card must pull DAT0
+  /// low. A card that does not has no busy phase.
+  static const writeNoBusyClocks = 4;
+
   // With [ownPads], the FSM's CMD/DAT input signals come from the inout pads;
   // held here so the late pad wiring can drive them.
   Logic? _sdCmdInInt;
@@ -357,7 +361,6 @@ class HarborSdioController extends BridgeModule
          'dmaBurstBeats must be 1 to 256',
        ),
        assert(dmaWriteBatch >= 1, 'dmaWriteBatch must be at least 1'),
-       assert(writeBusyTimeout >= 1, 'writeBusyTimeout must be at least 1'),
        assert(dmaOutstanding >= 1, 'dmaOutstanding must be at least 1'),
        super(
          harborStableDefinitionName('HarborSdioController', [
@@ -385,6 +388,13 @@ class HarborSdioController extends BridgeModule
          ]),
          name: name ?? 'sdio',
        ) {
+    if (writeBusyTimeout <= writeNoBusyClocks) {
+      throw ArgumentError.value(
+        writeBusyTimeout,
+        'writeBusyTimeout',
+        'must be larger than $writeNoBusyClocks SD clocks',
+      );
+    }
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -520,6 +530,7 @@ class HarborSdioController extends BridgeModule
     const dWBusy = 10; // write: wait out card programming (DAT0 busy)
     const dWEndHold = 11; // write: hold the end bit for one SD clock
     const dWStatEnd = 12; // write: check the end bit of the CRC status token
+    const dWLate = 13; // write: wait for a card that turned busy late
 
     const intDataDone = 0x02;
     const intDataReq = 0x04;
@@ -1401,8 +1412,17 @@ class HarborSdioController extends BridgeModule
                   sdFall & wrNwrCnt.gt(Const(1, width: 2)),
                   then: [wrNwrCnt < (wrNwrCnt - Const(1, width: 2))],
                   orElse: [
+                    // A card that turns busy late holds DAT0 low. Wait it out
+                    // instead of driving the start bit onto a busy line.
                     If(
-                      sdFall & dataValid,
+                      readEdge & ~datIn[0],
+                      then: [
+                        datState < Const(dWLate, width: 4),
+                        busyCnt < Const(0, width: busyW),
+                      ],
+                    ),
+                    If(
+                      sdFall & dataValid & ~(readEdge & ~datIn[0]),
                       then: [
                         datOeReg < Const(1),
                         datOutReg <
@@ -1521,7 +1541,7 @@ class HarborSdioController extends BridgeModule
               // WRITE: hunt for the CRC status token start bit on DAT0.
               CaseItem(Const(dWStatWait, width: 4), [
                 If(
-                  sdRise,
+                  readEdge,
                   then: [
                     If(
                       ~datIn[0],
@@ -1551,7 +1571,7 @@ class HarborSdioController extends BridgeModule
               // WRITE: capture the 3-bit CRC status (010 == accepted).
               CaseItem(Const(dWStat, width: 4), [
                 If(
-                  sdRise,
+                  readEdge,
                   then: [
                     statShift < [statShift.getRange(0, 2), datIn[0]].concat(),
                     statCnt < (statCnt - Const(1, width: 2)),
@@ -1584,7 +1604,7 @@ class HarborSdioController extends BridgeModule
               // WRITE: the end bit of the CRC status token must be high.
               CaseItem(Const(dWStatEnd, width: 4), [
                 If(
-                  sdRise,
+                  readEdge,
                   then: [
                     If(
                       datIn[0],
@@ -1603,12 +1623,41 @@ class HarborSdioController extends BridgeModule
                   ],
                 ),
               ]),
+              // WRITE: DAT0 went low after the busy window closed. Wait for
+              // the card to release it, then start the block again.
+              CaseItem(Const(dWLate, width: 4), [
+                If(
+                  readEdge,
+                  then: [
+                    busyCnt < (busyCnt + Const(1, width: busyW)),
+                    If(
+                      datIn[0],
+                      then: [
+                        datState < Const(dWStart, width: 4),
+                        wrNwrCnt < Const(2, width: 2),
+                      ],
+                      orElse: [
+                        If(
+                          busyCnt.eq(Const(writeBusyTimeout, width: busyW)),
+                          then: [
+                            datState < Const(dIdle, width: 4),
+                            busy < Const(0),
+                            intStatus <
+                                (intStatus |
+                                    Const(intWriteErr | intDataDone, width: 8)),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ]),
               // WRITE: wait out programming. The card pulls DAT0 low (busy)
               // within four SD clocks of the token, then releases it high when
               // done. A card that never pulls it low has no busy phase.
               CaseItem(Const(dWBusy, width: 4), [
                 If(
-                  sdRise,
+                  readEdge,
                   then: [
                     If(~datIn[0], then: [busySeen < Const(1)]),
                     If(

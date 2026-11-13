@@ -272,27 +272,54 @@ class AdmaBench {
 
   /// Answers the command, then sends [words] as one 4-bit block. Returns
   /// when data-done raises the interrupt.
-  Future<void> cardRead(List<int> words) async {
+  Future<void> cardRead(List<int> words) => cardReadBlocks([words]);
+
+  /// Answers the command, then sends each of [blocks] with an end bit and
+  /// [nac] idle clocks after every block. A card on an open-ended read keeps
+  /// sending after the last block the host asked for, so [extra] more blocks
+  /// follow. The card launches each DAT and CMD bit just after the SD clock
+  /// edge picked by [launchOnRise], so a host that samples on the other edge
+  /// sees a value that is stable for half a clock. Returns when the transfer
+  /// ends.
+  Future<void> cardReadBlocks(
+    List<List<int>> blocks, {
+    int extra = 0,
+    int nac = 2,
+    bool launchOnRise = true,
+    int stopAfterBits = -1,
+  }) async {
     final resp = admaResp48();
-    final stream = admaFourBitBlock(words);
+    final stream = <int>[
+      for (final w in [
+        ...blocks,
+        for (var k = 0; k < extra; k++)
+          [for (var i = 0; i < blocks[0].length; i++) 0xE0000000 + i],
+      ]) ...[...admaFourBitBlock(w), 0xF, for (var i = 0; i < nac; i++) 0xF],
+    ];
     final total = resp.length + stream.length;
     var sawDrive = false, idx = 0;
-    var prevLow = top.output('sd_clk').value.toInt() == 0;
-    for (var i = 0; i < 40000; i++) {
+    var prevHigh = top.output('sd_clk').value.toInt() == 1;
+    for (var i = 0; i < 4000000; i++) {
       await clk.nextPosedge;
       final sending = top.output('sd_cmd_oe').value.toInt() == 1;
       if (sending) sawDrive = true;
-      final low = top.output('sd_clk').value.toInt() == 0;
-      if (sawDrive && !sending && low && !prevLow && idx < total) {
-        if (idx < resp.length) {
-          cmdIn.inject(resp[idx]);
-        } else {
-          datIn.inject(stream[idx - resp.length]);
+      final high = top.output('sd_clk').value.toInt() == 1;
+      final edge = launchOnRise ? (high && !prevHigh) : (!high && prevHigh);
+      if (edge) {
+        if (sawDrive && !sending && idx < total) {
+          if (idx < resp.length) {
+            cmdIn.inject(resp[idx]);
+          } else if (stopAfterBits < 0 || idx - resp.length < stopAfterBits) {
+            datIn.inject(stream[idx - resp.length]);
+          } else {
+            datIn.inject(0xF);
+          }
+          idx++;
+        } else if (idx == total) {
+          datIn.inject(0xF);
         }
-        idx++;
       }
-      if (idx == total && low && !prevLow) datIn.inject(0xF);
-      prevLow = low;
+      prevHigh = high;
       if (irq.value.toInt() == 1) {
         await clk.nextNegedge;
         return;
@@ -301,36 +328,123 @@ class AdmaBench {
     fail('the card read never finished');
   }
 
-  /// Answers the command, then sends each of [blocks] back to back.. Returns when the transfer ends.
-  Future<void> cardReadBlocks(List<List<int>> blocks) async {
+  /// Answers the command, then takes [blocks] blocks of [blkBytes] bytes from
+  /// the controller. After each block the card sends the CRC status token
+  /// [token], then idles high for [busyDelay] SD clocks, then holds DAT0 low
+  /// for [busyLen] SD clocks (0 is a card with no busy phase). Card outputs
+  /// change [lag] system clocks after the SD clock edge picked by
+  /// [launchOnRise]. With [noisyOtherEdge] DAT is wrong for one clock around
+  /// the other SD clock edge, as a line is while it changes. Returns the
+  /// DAT groups taken per block, including the
+  /// end bit when the controller drives it.
+  /// Rises where the controller drove DAT while the card model held it busy.
+  int busyConflicts = 0;
+
+  Future<List<List<int>>> cardWriteBlocks(
+    int blocks,
+    int blkBytes, {
+    List<int> token = const [0, 0, 1, 0, 1],
+    int busyDelay = 0,
+    int busyLen = 3,
+    int lag = 0,
+    bool launchOnRise = true,
+    bool noisyOtherEdge = false,
+  }) async {
+    var lastDat = 0xF;
+    void drive(int v) {
+      lastDat = v;
+      datIn.inject(v);
+    }
+
     final resp = admaResp48();
-    final stream = <int>[for (final w in blocks) ...admaFourBitBlock(w)];
-    final total = resp.length + stream.length;
-    var sawDrive = false, idx = 0;
-    var prevLow = top.output('sd_clk').value.toInt() == 0;
-    for (var i = 0; i < 4000000; i++) {
+    final taken = <List<int>>[];
+    var cur = <int>[];
+    var sawDrive = false, respIdx = 0, phase = 0, wait = 2, step = 0;
+    var prevHigh = top.output('sd_clk').value.toInt() == 1;
+    var sinceEdge = 1 << 20;
+    var pendingEdge = false;
+    var cardBusy = false;
+    for (var i = 0; i < 30000; i++) {
       await clk.nextPosedge;
       final sending = top.output('sd_cmd_oe').value.toInt() == 1;
       if (sending) sawDrive = true;
-      final low = top.output('sd_clk').value.toInt() == 0;
-      var injected = false;
-      if (sawDrive && !sending && low && !prevLow && idx < total) {
-        injected = true;
-        if (idx < resp.length) {
-          cmdIn.inject(resp[idx]);
-        } else {
-          datIn.inject(stream[idx - resp.length]);
-        }
-        idx++;
+      final datDriving = top.output('sd_dat_oe').value.toInt() == 1;
+      final high = top.output('sd_clk').value.toInt() == 1;
+      final rise = high && !prevHigh;
+      final launch = launchOnRise ? rise : (!high && prevHigh);
+      final other = launchOnRise ? (!high && prevHigh) : rise;
+      prevHigh = high;
+      if (noisyOtherEdge && other && phase >= 1) {
+        datIn.inject(~lastDat & 0xF);
       }
-      if (idx == total && low && !prevLow && !injected) datIn.inject(0xF);
-      prevLow = low;
-      if (irq.value.toInt() == 1) {
+      if (rise && datDriving && cardBusy) busyConflicts++;
+      if (rise && datDriving) {
+        cur.add(top.output('sd_dat_out').value.toInt() & 0xF);
+      }
+      if (!datDriving && cur.isNotEmpty && phase == 1) {
+        taken.add(cur);
+        cur = <int>[];
+        phase = 2;
+        wait = 2;
+        step = 0;
+      }
+      if (launch) {
+        if (noisyOtherEdge) datIn.inject(lastDat);
+        sinceEdge = 0;
+        pendingEdge = true;
+      } else {
+        sinceEdge++;
+      }
+      if (!(pendingEdge && sinceEdge == lag)) {
+        if (irq.value.toInt() == 1 && taken.length == blocks) {
+          await clk.nextNegedge;
+          return taken;
+        }
+        continue;
+      }
+      pendingEdge = false;
+      if (phase == 0) {
+        if (sawDrive && !sending) {
+          if (respIdx < resp.length) {
+            cmdIn.inject(resp[respIdx++]);
+          }
+          if (respIdx == resp.length) phase = 1;
+        }
+      } else if (phase == 2) {
+        if (wait > 0) {
+          wait--;
+        } else if (step < token.length) {
+          drive(0xE | token[step++]);
+        } else {
+          final k = step - token.length;
+          if (k < busyDelay) {
+            drive(0xF);
+          } else if (k < busyDelay + busyLen) {
+            drive(0xE);
+            cardBusy = true;
+          } else {
+            drive(0xF);
+            cardBusy = false;
+            if (taken.length < blocks) {
+              phase = 1;
+            } else {
+              phase = 3;
+            }
+          }
+          step++;
+        }
+      }
+      if (irq.value.toInt() == 1 && taken.length == blocks) {
         await clk.nextNegedge;
-        return;
+        return taken;
       }
     }
-    fail('the card read never finished');
+    Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+    fail(
+      'the card write never finished: phase $phase step $step '
+      'blocks ${taken.length} datState ${sig('dat_state').value} '
+      'blockLeft ${sig('dat_block_left').value}',
+    );
   }
 
   /// Answers the command, takes the block the controller sends, then sends
