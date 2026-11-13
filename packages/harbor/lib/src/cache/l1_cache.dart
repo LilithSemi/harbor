@@ -156,6 +156,17 @@ class HarborL1ICache extends BridgeModule {
   Logic get respValid => output('resp_valid');
   Logic get miss => output('miss');
 
+  /// Performance events for one cycle.
+  ///
+  /// [perfAccess] is how many lookups the cache answered this cycle, so it is
+  /// 2 bits wide on a dual-port cache where both ports can hit together, and 1
+  /// bit otherwise. [perfMiss] counts the line fills those lookups caused.
+  ///
+  /// [miss] is not a count: it stays high for the whole miss, so it measures
+  /// stall cycles instead.
+  Logic get perfAccess => output('perf_access');
+  Logic get perfMiss => output('perf_miss');
+
   /// Second lookup port (present only when [dualPort]).
   Logic get reqAddr1 => input('req_addr1');
   Logic get reqValid1 => input('req_valid1');
@@ -227,6 +238,10 @@ class HarborL1ICache extends BridgeModule {
     addOutput('resp_fault');
     addOutput('resp_fault_is_access');
     addOutput('miss');
+    // Both ports can hit in the same cycle, so the access event is a count,
+    // not a pulse.
+    addOutput('perf_access', width: dualPort ? 2 : 1);
+    addOutput('perf_miss');
     if (dualPort) {
       createPort('req_addr1', PortDirection.input, width: xlen);
       createPort('req_valid1', PortDirection.input);
@@ -448,6 +463,15 @@ class HarborL1ICache extends BridgeModule {
     respFault <= faultHeld;
     respFaultIsAccess <= faultHeld & ~faultIsPage;
     miss <= miss0;
+    // A served lookup gives one hit pulse, so hits count accesses. Two ports
+    // that hit together are two accesses, which a single pulse would lose. A
+    // fill starts on the first cycle of a miss, the cycle `filling` is still
+    // low, so that edge counts misses once each.
+    perfAccess <=
+        (dualPort
+            ? (hit.zeroExtend(2) + hit1.zeroExtend(2)).named('perfAccessCount')
+            : hit);
+    perfMiss <= wantFill & ~filling;
     if (dualPort) {
       respData1 <= ramRead(1);
       respValid1 <= hit1;
@@ -717,6 +741,14 @@ class HarborL1DCache extends BridgeModule {
   Logic get miss => output('miss');
   Logic get busy => output('busy');
 
+  /// Performance event pulses, one cycle each, for cacheable traffic.
+  ///
+  /// [perfAccess] counts lookups the cache answered and [perfMiss] counts the
+  /// line fills they caused. [miss] is not a count: it stays high for the whole
+  /// miss, so it measures stall cycles instead.
+  Logic get perfAccess => output('perf_access');
+  Logic get perfMiss => output('perf_miss');
+
   /// Whole-cache flush.
   Logic get flush => input('flush');
 
@@ -779,6 +811,8 @@ class HarborL1DCache extends BridgeModule {
     addOutput('resp_fault_is_access');
     addOutput('miss');
     addOutput('busy');
+    addOutput('perf_access');
+    addOutput('perf_miss');
     // Word-granular memory port.
     addOutput('mem_en');
     addOutput('mem_we');
@@ -1040,6 +1074,11 @@ class HarborL1DCache extends BridgeModule {
     respFaultIsAccess <= faultDone & ~faultIsPage;
     miss <= loadMiss;
     busy <= (filling | storing | bypassing | drain);
+    // Cacheable traffic only, so perfMiss over perfAccess is the miss rate.
+    // An uncacheable access bypasses the line store and never looks a tag up,
+    // so bypassDone is left out.
+    perfAccess <= loadHit | storeDone;
+    perfMiss <= loadMiss & ~filling;
 
     final fillWrEn = (filling & memDone & memValid & ~flush & ~reset).named(
       'fillWrEn',
