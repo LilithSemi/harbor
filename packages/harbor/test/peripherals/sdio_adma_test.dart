@@ -160,6 +160,10 @@ class _Bench {
 
   /// SD clocks the controller waits for the end of a card's busy.
   final int writeBusyTimeout;
+  final int burstBeats;
+  final int writeBatch;
+  final bool sampleFall;
+  final int errBase;
   late final HarborSdioController sdio;
   late final _SdioMemTop top;
   late final Sim sim;
@@ -176,6 +180,10 @@ class _Bench {
     this.dmaOutstanding = 4,
     this.stall = 0.3,
     this.writeBusyTimeout = HarborSdioController.defaultWriteBusyTimeout,
+    this.burstBeats = 8,
+    this.writeBatch = 4,
+    this.sampleFall = false,
+    this.errBase = _errBase,
   });
 
   int get busBytes => dataWidth ~/ 8;
@@ -187,7 +195,9 @@ class _Bench {
       baseAddress: 0x60000000,
       fabricKind: kind,
       dmaDataWidth: dataWidth,
-      dmaBurstBeats: 8,
+      config: HarborSdioConfig(sampleReadOnFall: sampleFall),
+      dmaBurstBeats: burstBeats,
+      dmaWriteBatch: writeBatch,
       dmaOutstanding: dmaOutstanding,
       writeBusyTimeout: writeBusyTimeout,
     );
@@ -213,7 +223,7 @@ class _Bench {
       outstanding: dmaOutstanding,
       busBytes: busBytes,
       errors: errors,
-      errBase: _errBase,
+      errBase: errBase,
       stall: stall,
     );
     await sim.start();
@@ -282,6 +292,38 @@ class _Bench {
         idx++;
       }
       if (idx == total && low && !prevLow) datIn.inject(0xF);
+      prevLow = low;
+      if (irq.value.toInt() == 1) {
+        await clk.nextNegedge;
+        return;
+      }
+    }
+    fail('the card read never finished');
+  }
+
+  /// Answers the command, then sends each of [blocks] back to back.. Returns when the transfer ends.
+  Future<void> cardReadBlocks(List<List<int>> blocks) async {
+    final resp = _resp48();
+    final stream = <int>[for (final w in blocks) ..._fourBitBlock(w)];
+    final total = resp.length + stream.length;
+    var sawDrive = false, idx = 0;
+    var prevLow = top.output('sd_clk').value.toInt() == 0;
+    for (var i = 0; i < 4000000; i++) {
+      await clk.nextPosedge;
+      final sending = top.output('sd_cmd_oe').value.toInt() == 1;
+      if (sending) sawDrive = true;
+      final low = top.output('sd_clk').value.toInt() == 0;
+      var injected = false;
+      if (sawDrive && !sending && low && !prevLow && idx < total) {
+        injected = true;
+        if (idx < resp.length) {
+          cmdIn.inject(resp[idx]);
+        } else {
+          datIn.inject(stream[idx - resp.length]);
+        }
+        idx++;
+      }
+      if (idx == total && low && !prevLow && !injected) datIn.inject(0xF);
       prevLow = low;
       if (irq.value.toInt() == 1) {
         await clk.nextNegedge;
@@ -674,4 +716,45 @@ void main() {
     );
     await Simulator.endSimulation();
   });
+
+  for (final (n, stall) in [(16, 0.7), (32, 0.97), (128, 0.0)]) {
+    {
+      test(
+        'direct DMA CMD18 reads $n blocks, memory stall $stall',
+        () async {
+          final b = _Bench(
+            HarborFabricKind.wishbone,
+            64,
+            dmaOutstanding: 1,
+            stall: stall,
+            burstBeats: 1,
+            sampleFall: true,
+            errBase: 0x1000000,
+          );
+          await b.start();
+          Simulator.setMaxSimTime(400000000);
+          final blocks = [
+            for (var k = 0; k < n; k++)
+              [for (var i = 0; i < 128; i++) (k << 20) + 0x10000 + i * 0x101],
+          ];
+          await b.wr(_blkSize, 512);
+          await b.wr(0x58, n);
+          await b.wr(_admaAddr, 0x10000);
+          await b.wr(_cmd, 18 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
+          await b.cardReadBlocks(blocks);
+          var bad = 0;
+          for (var k = 0; k < n; k++) {
+            for (var i = 0; i < 128; i++) {
+              if (b.read32(0x10000 + k * 512 + i * 4) != blocks[k][i]) bad++;
+            }
+          }
+          final st = await b.rd(_intStatus);
+        expect(bad, 0);
+          expect(st & 0x78, 0);
+          await Simulator.endSimulation();
+        },
+        timeout: const Timeout(Duration(minutes: 20)),
+      );
+    }
+  }
 }

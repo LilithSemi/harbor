@@ -615,7 +615,9 @@ class HarborSdioController extends BridgeModule
     final admaState = Logic(name: 'adma_state', width: 3);
     final descPtr = Logic(name: 'adma_desc_ptr', width: 32);
     final descAddr = Logic(name: 'adma_addr', width: 32);
-    final descBytes = Logic(name: 'adma_bytes', width: 16);
+    // Wide enough for BLK_COUNT * BLK_SIZE on a direct transfer.
+    const descBytesW = 28;
+    final descBytes = Logic(name: 'adma_bytes', width: descBytesW);
     final descEnd = Logic(name: 'adma_end');
     final admaBase = Logic(name: 'adma_base', width: 32);
     final fetchHi = Logic(name: 'adma_fetch_hi');
@@ -844,7 +846,7 @@ class HarborSdioController extends BridgeModule
     // beats of two words. Otherwise a beat carries one word in its addressed
     // half.
     final packTarget = dmaDataWidth == 64
-        ? (~descAddr[2] & descBytes.gte(Const(8, width: 16))).named(
+        ? (~descAddr[2] & descBytes.gte(Const(8, width: descBytesW))).named(
             'dma_pack_target',
           )
         : Const(0);
@@ -868,7 +870,7 @@ class HarborSdioController extends BridgeModule
         .named('dma_w_room');
     final issueWrite =
         (admaState.eq(Const(aMemWrite, width: 3)) &
-                descBytes.neq(Const(0, width: 16)) &
+                descBytes.neq(Const(0, width: descBytesW)) &
                 ~wActive &
                 ~reqValid &
                 wRoom &
@@ -878,7 +880,7 @@ class HarborSdioController extends BridgeModule
 
     // Beats of the request: the fewest of the burst cap, the words ready, the
     // descriptor bytes left and the beats to the next 4 KB boundary.
-    const cw = 17;
+    const cw = descBytesW + 1;
     Logic min2(Logic a, Logic b) => mux(a.lt(b), a, b);
     final to4k =
         (Const(4096, width: cw) - descAddr.getRange(0, 12).zeroExtend(cw))
@@ -915,7 +917,7 @@ class HarborSdioController extends BridgeModule
       bytesLeft.gt(wrBytes),
       bytesLeft - wrBytes,
       Const(0, width: cw),
-    ).getRange(0, 16).named('dma_bytes_after');
+    ).getRange(0, descBytesW).named('dma_bytes_after');
 
     // Reads go out only when no write is in flight.
     final fetchAddr =
@@ -1059,7 +1061,7 @@ class HarborSdioController extends BridgeModule
           admaState < Const(aIdle, width: 3),
           descPtr < Const(0, width: 32),
           descAddr < Const(0, width: 32),
-          descBytes < Const(0, width: 16),
+          descBytes < Const(0, width: descBytesW),
           descEnd < Const(0),
           admaBase < Const(0, width: 32),
           fetchHi < Const(0),
@@ -1718,7 +1720,7 @@ class HarborSdioController extends BridgeModule
                   If(
                     fetchHi,
                     then: [
-                      descBytes < rdWord.getRange(0, 16),
+                      descBytes < rdWord.getRange(0, 16).zeroExtend(descBytesW),
                       descEnd < rdWord[31],
                       fetchHi < Const(0),
                       admaState < Const(aNext, width: 3),
@@ -1750,9 +1752,9 @@ class HarborSdioController extends BridgeModule
                   descAddr < (descAddr + Const(4, width: 32)),
                   descBytes <
                       mux(
-                        descBytes.gt(Const(4, width: 16)),
-                        descBytes - Const(4, width: 16),
-                        Const(0, width: 16),
+                        descBytes.gt(Const(4, width: descBytesW)),
+                        descBytes - Const(4, width: descBytesW),
+                        Const(0, width: descBytesW),
                       ),
                   admaState < Const(aNext, width: 3),
                 ],
@@ -1789,7 +1791,7 @@ class HarborSdioController extends BridgeModule
                   descAddr < (descAddr + wrBytes.zeroExtend(32)),
                   descBytes < bytesAfter,
                   If(
-                    bytesAfter.eq(Const(0, width: 16)),
+                    bytesAfter.eq(Const(0, width: descBytesW)),
                     then: [admaState < Const(aNext, width: 3)],
                   ),
                 ],
@@ -1804,7 +1806,7 @@ class HarborSdioController extends BridgeModule
             ]),
             CaseItem(Const(aNext, width: 3), [
               If(
-                descBytes.eq(Const(0, width: 16)),
+                descBytes.eq(Const(0, width: descBytesW)),
                 then: [
                   If(
                     descEnd,
@@ -1964,8 +1966,8 @@ class HarborSdioController extends BridgeModule
                                 orElse: [
                                   descAddr < admaBase,
                                   descBytes <
-                                      (blkCount * blkSize.zeroExtend(16))
-                                          .getRange(0, 16),
+                                      (blkCount.zeroExtend(descBytesW) *
+                                          blkSize.zeroExtend(descBytesW)),
                                   descEnd < Const(1),
                                   If(
                                     bus.dataIn[9],
