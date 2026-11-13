@@ -518,6 +518,8 @@ class HarborSdioController extends BridgeModule
     const dWStatWait = 8; // write: hunt for the CRC status token start bit
     const dWStat = 9; // write: capture the 3-bit CRC status
     const dWBusy = 10; // write: wait out card programming (DAT0 busy)
+    const dWEndHold = 11; // write: hold the end bit for one SD clock
+    const dWStatEnd = 12; // write: check the end bit of the CRC status token
 
     const intDataDone = 0x02;
     const intDataReq = 0x04;
@@ -1495,13 +1497,21 @@ class HarborSdioController extends BridgeModule
                   ],
                 ),
               ]),
-              // WRITE the end bit, then release the line for the card's
-              // CRC-status token.
+              // WRITE the end bit and keep it driven for one SD clock.
               CaseItem(Const(dWEnd, width: 4), [
                 If(
                   sdFall,
                   then: [
                     datOutReg < laneMask, // end bit (1 on active lanes)
+                    datState < Const(dWEndHold, width: 4),
+                  ],
+                ),
+              ]),
+              // Release the line for the card's CRC-status token.
+              CaseItem(Const(dWEndHold, width: 4), [
+                If(
+                  sdFall,
+                  then: [
                     datOeReg < Const(0),
                     datState < Const(dWStatWait, width: 4),
                     statWaitCnt < Const(0, width: 16),
@@ -1562,7 +1572,7 @@ class HarborSdioController extends BridgeModule
                                 (intStatus |
                                     Const(intWriteErr | intDataDone, width: 8)),
                           ],
-                          orElse: [datState < Const(dWBusy, width: 4)],
+                          orElse: [datState < Const(dWStatEnd, width: 4)],
                         ),
                         busySeen < Const(0),
                         busyCnt < Const(0, width: busyW),
@@ -1571,13 +1581,40 @@ class HarborSdioController extends BridgeModule
                   ],
                 ),
               ]),
-              // WRITE: wait out programming. The card pulls DAT0 low (busy),
-              // then releases it high when done.
+              // WRITE: the end bit of the CRC status token must be high.
+              CaseItem(Const(dWStatEnd, width: 4), [
+                If(
+                  sdRise,
+                  then: [
+                    If(
+                      datIn[0],
+                      then: [
+                        datState < Const(dWBusy, width: 4),
+                        statCnt < Const(3, width: 2),
+                      ],
+                      orElse: [
+                        datState < Const(dIdle, width: 4),
+                        busy < Const(0),
+                        intStatus <
+                            (intStatus |
+                                Const(intWriteErr | intDataDone, width: 8)),
+                      ],
+                    ),
+                  ],
+                ),
+              ]),
+              // WRITE: wait out programming. The card pulls DAT0 low (busy)
+              // within four SD clocks of the token, then releases it high when
+              // done. A card that never pulls it low has no busy phase.
               CaseItem(Const(dWBusy, width: 4), [
                 If(
                   sdRise,
                   then: [
                     If(~datIn[0], then: [busySeen < Const(1)]),
+                    If(
+                      statCnt.neq(Const(0, width: 2)),
+                      then: [statCnt < (statCnt - Const(1, width: 2))],
+                    ),
                     busyCnt < (busyCnt + Const(1, width: busyW)),
                     If(
                       busyCnt.eq(Const(writeBusyTimeout, width: busyW)),
@@ -1590,7 +1627,7 @@ class HarborSdioController extends BridgeModule
                       ],
                     ),
                     If(
-                      busySeen & datIn[0],
+                      (busySeen | statCnt.eq(Const(0, width: 2))) & datIn[0],
                       then: [
                         If(
                           blockLeft.eq(Const(1, width: 16)),

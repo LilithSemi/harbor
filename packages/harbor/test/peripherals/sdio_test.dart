@@ -572,7 +572,7 @@ void main() {
       // The current controller releases DAT with the end bit; capture the
       // start, payload, and CRC driven before that release.
       final expectedWrite = [0, ...dataBits, ..._crc16(dataBits)];
-      const status = [0, 0, 1, 0, 0, 1];
+      const status = [0, 0, 1, 0, 1, 0, 1];
       var statusIndex = 0;
       var sawData = false;
       final captured = <int>[];
@@ -757,8 +757,9 @@ void main() {
       final dataBits = _wordBitsMsb(word);
       // start + 32 data + 16 CRC (the end bit is driven with OE already low).
       final expected = [0, ...dataBits, ..._crc16(dataBits)];
-      // Card CRC status token (010 = accepted), then busy-low then busy-high.
-      const statusBusy = [0, 0, 1, 0, 0, 1];
+      // Card CRC status token (010 = accepted) and its end bit, then busy-low
+      // then busy-high.
+      const statusBusy = [0, 0, 1, 0, 1, 0, 1];
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
       var sdRiseCount = 0;
@@ -917,7 +918,7 @@ void main() {
 
       final resp = _resp48(0);
       final expected = _fourBitStream(word); // start + data + CRC, end excluded
-      const statusBusy = [0, 0, 1, 0, 0, 1]; // status token on DAT0, then busy
+      const statusBusy = [0, 0, 1, 0, 1, 0, 1]; // status token on DAT0, then busy
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
       final captured = <int>[];
@@ -1018,7 +1019,7 @@ void main() {
       final resp = _resp48(0);
       final dataBits = _wordBitsMsb(word);
       final expected = [0, ...dataBits, ..._crc16(dataBits)];
-      const statusBusy = [0, 0, 1, 0, 0, 1];
+      const statusBusy = [0, 0, 1, 0, 1, 0, 1];
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
       final captured = <int>[];
@@ -1564,7 +1565,7 @@ void main() {
       final resp = _resp48(0);
       final dataBits = [..._wordBitsMsb(w0), ..._wordBitsMsb(w1)];
       final expected = [0, ...dataBits, ..._crc16(dataBits)];
-      const statusBusy = [0, 0, 1, 0, 0, 1];
+      const statusBusy = [0, 0, 1, 0, 1, 0, 1];
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
       final captured = <int>[];
