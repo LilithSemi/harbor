@@ -379,8 +379,10 @@ class SdramMemoryPort extends Module {
 
     // --- read data back ---
     // The port read data can come from far away, so it goes into a register
-    // stage first. The beat in that stage is the tail of the read buffer:
-    // while the buffer is empty it is the head, so no cycle is added.
+    // stage first. Each assembled beat goes through one more register on
+    // its way into the read buffer, so the buffer can be far from the port.
+    // These stages need no room check: the read credits count each beat
+    // from its request until it leaves on RDATA.
     final rdIn = Logic(name: 'rd_in');
     final rdInData = Logic(name: 'rd_in_data', width: 16);
     final clrLate = Logic(name: 'clear_late');
@@ -395,22 +397,49 @@ class SdramMemoryPort extends Module {
     final tailData = [rLo, rdInData].rconcat();
     final rbPop = Logic(name: 'rb_pop');
     final rbPush = Logic(name: 'rb_push');
+    final rbPushData = Logic(name: 'rb_push_data', width: 32);
     final rbBufPop = Logic(name: 'rb_buf_pop');
-    final rbBuf = _Queue('rb', clk, clr, readBeats, rbPush, tailData, rbBufPop);
-    // Keep the assembled beat behind the FIFO's registered valid boundary.
-    // The old empty-buffer fall-through made the consumer's pop feed back
-    // into this FIFO's write enable in the same cycle.  On ECP5 that path ran
-    // from the read buffer near the SDRAM pins to the system-side response
-    // FIFO and back, and could not close at the SDRAM clock rate.
+    final rbBuf = _Queue(
+      'rb',
+      clk,
+      clr,
+      readBeats,
+      rbPush,
+      rbPushData,
+      rbBufPop,
+    );
+    Sequential(clk, [rbPush < tailValid & ~clr, rbPushData < tailData]);
     rbBufPop <= rbPop;
-    rbPush <= tailValid;
     _check(clk, clr, rbPush & ~rbBuf.ready, 'read buffer pushed while full');
     final rb = (
       valid: rbBuf.valid.named('rb_head_valid'),
       data: rbBuf.data.named('rb_head'),
     );
     // With one request in flight the read buffer is small, so its read mux
-    // drives RDATA directly. Else a 2 entry FIFO cuts the path.
+    // drives RDATA directly. Else a popped beat goes through a register into
+    // a 2 entry output FIFO. The read buffer pops on a count of free output
+    // entries, and a registered copy of the RDATA fire gives entries back,
+    // so no waist net gets to the read buffer in the same cycle.
+    final midValid = Logic(name: 'rd_mid_valid');
+    final midData = Logic(name: 'rd_mid', width: 32);
+    final outFire = Logic(name: 'rd_out_fire');
+    if (!direct) {
+      final outCredit = Logic(name: 'rd_out_credit', width: 2);
+      final outRet = Logic(name: 'rd_out_ret');
+      rbPop <= rb.valid & outCredit.neq(0);
+      Sequential(clk, [
+        If(rbPop, then: [midData < rb.data]),
+        If(
+          clr,
+          then: [midValid < 0, outRet < 0, outCredit < 2],
+          orElse: [
+            midValid < rbPop,
+            outRet < outFire,
+            outCredit < outCredit - rbPop.zeroExtend(2) + outRet.zeroExtend(2),
+          ],
+        ),
+      ]);
+    }
     final Logic outValid, outData;
     if (direct) {
       rbPop <= rb.valid & w.rdataReady;
@@ -422,11 +451,12 @@ class SdramMemoryPort extends Module {
         clk: clk,
         reset: clr,
         depth: 2,
-        pushValid: rb.valid,
-        pushData: rb.data,
+        pushValid: midValid,
+        pushData: midData,
         popReady: w.rdataReady,
       );
-      rbPop <= out.pushFire;
+      _check(clk, clr, midValid & ~out.pushReady, 'read output FIFO full');
+      outFire <= out.popFire;
       outValid = out.popValid;
       outData = out.popData;
     } else {
@@ -450,14 +480,15 @@ class SdramMemoryPort extends Module {
       final rdRegs = _rdOut(
         clk,
         clr,
-        rb.valid,
-        rb.data,
+        midValid,
+        midData,
         w.rdataReady,
         rdQ.entries,
         idW,
         lenW,
       );
-      rbPop <= rdRegs.pushFire;
+      _check(clk, clr, midValid & ~rdRegs.pushFire, 'read output FIFO full');
+      outFire <= rdRegs.popFire;
       rLast = rdRegs.last;
       outValid <= rdRegs.valid;
       outData <= rdRegs.data;
