@@ -280,13 +280,14 @@ class AdmaBench {
   /// follow. The card launches each DAT and CMD bit just after the SD clock
   /// edge picked by [launchOnRise], so a host that samples on the other edge
   /// sees a value that is stable for half a clock. Returns when the transfer
-  /// ends.
+  /// ends, or after [cycles] system clocks when that is not 0.
   Future<void> cardReadBlocks(
     List<List<int>> blocks, {
     int extra = 0,
     int nac = 2,
     bool launchOnRise = true,
     int stopAfterBits = -1,
+    int cycles = 0,
   }) async {
     final resp = admaResp48();
     final stream = <int>[
@@ -320,12 +321,13 @@ class AdmaBench {
         }
       }
       prevHigh = high;
-      if (irq.value.toInt() == 1) {
+      if (cycles > 0 && i == cycles) return;
+      if (cycles == 0 && irq.value.toInt() == 1) {
         await clk.nextNegedge;
         return;
       }
     }
-    fail('the card read never finished');
+    if (cycles == 0) fail('the card read never finished');
   }
 
   /// Answers the command, then takes [blocks] blocks of [blkBytes] bytes from
@@ -545,7 +547,7 @@ Future<void> checkDirectCmd18(int n, double stall) async {
   await b.wr(0x58, n);
   await b.wr(admaAdmaAddr, 0x10000);
   await b.wr(admaCmd, 18 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
-  await b.cardReadBlocks(blocks);
+  await b.cardReadBlocks(blocks, extra: 2);
   var bad = 0;
   for (var k = 0; k < n; k++) {
     for (var i = 0; i < 128; i++) {

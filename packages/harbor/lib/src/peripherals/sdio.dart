@@ -190,7 +190,8 @@ class HarborSdioConfig with HarborPrettyString {
 ///
 /// Register map (each register in its own 8-byte slot; the byte-addressed fabric
 /// decodes byte-offset >> 3, so these byte offsets map to indices 0,1,2,...):
-/// - 0x00: CTRL      (enable, bus width, speed mode, reset)
+/// - 0x00: CTRL      ([0] enable, [5:4] bus width, [8] sample edge, [9] DAT
+///   reset, write 1)
 /// - 0x08: STATUS    ([0] card detect, [8] busy, [9] data ready)
 /// - 0x10: CLK_DIV   (clock divider)
 /// - 0x18: CMD       (command index + argument trigger)
@@ -205,13 +206,15 @@ class HarborSdioConfig with HarborPrettyString {
 /// - 0x60: INT_STATUS (interrupt status, write-1-to-clear)
 /// - 0x68: INT_ENABLE (interrupt enable)
 /// - 0x70: ADMA_ADDR  (DMA buffer address, or descriptor table base)
+/// - 0x78: DATA_TIMEOUT (SD clocks a card read waits for a block start bit,
+///   0 is off, reset 4194304)
 ///
 /// CMD bits: [5:0] index, [7:6] response type (0 none, 1 short, 2 long R2,
 /// 3 short+busy), [8] data present, [9] direction (0 write, 1 read), [10] use
 /// ADMA DMA, [11] ADMA_ADDR is a descriptor table. INT_STATUS bits (each
 /// write-1-to-clear): [0] cmd-done, [1] data-done, [2] data-request,
 /// [3] data-CRC-error, [4] cmd-timeout, [5] write-error, [6] RX overrun,
-/// [7] ADMA error.
+/// [7] ADMA error, [8] data timeout.
 ///
 /// DMA: with CMD[10] set and CMD[11] clear, ADMA_ADDR is the buffer address
 /// and BLK_COUNT * BLK_SIZE is its length. With CMD[11] set, ADMA_ADDR points
@@ -324,6 +327,9 @@ class HarborSdioController extends BridgeModule
   /// SD clocks after a write status token in which the card must pull DAT0
   /// low. A card that does not has no busy phase.
   static const writeNoBusyClocks = 4;
+
+  /// The reset value of DATA_TIMEOUT: 4194304 SD clocks, 168 ms at 25 MHz.
+  static const defaultDataTimeout = 1 << 22;
 
   // With [ownPads], the FSM's CMD/DAT input signals come from the inout pads;
   // held here so the late pad wiring can drive them.
@@ -500,8 +506,11 @@ class HarborSdioController extends BridgeModule
     final resp = List.generate(4, (i) => Logic(name: 'resp$i', width: 32));
     final blkSize = Logic(name: 'blk_size', width: 12);
     final blkCount = Logic(name: 'blk_count', width: 16);
-    final intStatus = Logic(name: 'int_status', width: 8);
-    final intEnable = Logic(name: 'int_enable', width: 8);
+    // SD clocks a card read waits for a block start bit. 0 turns it off.
+    final dataTimeout = Logic(name: 'data_timeout', width: 24);
+    final dataTimeoutCnt = Logic(name: 'data_timeout_cnt', width: 24);
+    final intStatus = Logic(name: 'int_status', width: 9);
+    final intEnable = Logic(name: 'int_enable', width: 9);
     final busy = Logic(name: 'busy');
     final divCount = Logic(name: 'div_count', width: 16);
     final sdClkReg = Logic(name: 'sd_clk_reg');
@@ -540,6 +549,7 @@ class HarborSdioController extends BridgeModule
     const intDataCrcErr = 0x08;
     const intWriteErr = 0x20; // card reported a write/CRC-status error
     const intRxOverrun = 0x40; // a received word was dropped (RX FIFO full)
+    const intDataTimeout = 0x100; // no block start bit within DATA_TIMEOUT
 
     final maxW = config.maxBusWidth.width;
     final datState = Logic(name: 'dat_state', width: 4);
@@ -1019,7 +1029,7 @@ class HarborSdioController extends BridgeModule
       output('sd_dat_out') <= datOutReg;
       output('sd_dat_oe') <= datOeReg;
     }
-    final intView = (intStatus | (admaErr.zeroExtend(8) << 7)).named(
+    final intView = (intStatus | (admaErr.zeroExtend(9) << 7)).named(
       'int_view',
     );
     interrupt <= (intView & intEnable).or();
@@ -1058,8 +1068,10 @@ class HarborSdioController extends BridgeModule
           for (var i = 0; i < 4; i++) resp[i] < Const(0, width: 32),
           blkSize < Const(512, width: 12),
           blkCount < Const(1, width: 16),
-          intStatus < Const(0, width: 8),
-          intEnable < Const(0, width: 8),
+          dataTimeout < Const(defaultDataTimeout, width: 24),
+          dataTimeoutCnt < Const(0, width: 24),
+          intStatus < Const(0, width: 9),
+          intEnable < Const(0, width: 9),
           busy < Const(0),
           divCount < Const(0, width: 16),
           sdClkReg < Const(0),
@@ -1162,7 +1174,7 @@ class HarborSdioController extends BridgeModule
                           state < Const(sIdle, width: 2),
                           busy < Const(0),
                           cmdOe < Const(0),
-                          intStatus < (intStatus | Const(intCmdDone, width: 8)),
+                          intStatus < (intStatus | Const(intCmdDone, width: 9)),
                         ],
                         // Wait for the card to drive the response.
                         orElse: [
@@ -1212,7 +1224,7 @@ class HarborSdioController extends BridgeModule
                             then: [dataValid < Const(0)],
                           ),
                           intStatus <
-                              (intStatus | Const(intCmdTimeout, width: 8)),
+                              (intStatus | Const(intCmdTimeout, width: 9)),
                         ],
                       ),
                     ],
@@ -1231,12 +1243,13 @@ class HarborSdioController extends BridgeModule
                     respCnt.eq(Const(1, width: 8)),
                     then: [
                       state < Const(sIdle, width: 2),
-                      intStatus < (intStatus | Const(intCmdDone, width: 8)),
+                      intStatus < (intStatus | Const(intCmdDone, width: 9)),
                       // Hand off to the data engine when the command carries a
                       // data phase, otherwise the command is done.
                       If(
                         cmdDataPresent,
                         then: [
+                          dataTimeoutCnt < Const(0, width: 24),
                           byteCnt < blkSize.zeroExtend(13),
                           blockLeft < blkCount,
                           for (final c in crc16) c < Const(0, width: 16),
@@ -1337,6 +1350,32 @@ class HarborSdioController extends BridgeModule
                     bitsInByte < Const(8, width: 4),
                     byteShift < Const(0, width: 8),
                   ],
+                  orElse: [
+                    If(
+                      readEdge,
+                      then: [
+                        dataTimeoutCnt < (dataTimeoutCnt + Const(1, width: 24)),
+                        If(
+                          dataTimeout.neq(Const(0, width: 24)) &
+                              dataTimeoutCnt.eq(
+                                dataTimeout - Const(1, width: 24),
+                              ),
+                          then: [
+                            datState < Const(dIdle, width: 4),
+                            intStatus <
+                                (intStatus | Const(intDataTimeout, width: 9)),
+                            // A DMA read ends when the ADMA has landed what
+                            // the card sent, as on a normal end.
+                            If(
+                              dmaMode,
+                              then: [dmaTailWait < Const(1)],
+                              orElse: [busy < Const(0)],
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ]),
               // READ data, [laneCount] bits per clock, CRC16 per lane.
@@ -1359,7 +1398,7 @@ class HarborSdioController extends BridgeModule
                           // into the RX FIFO by the block below, off `rxPush`.
                           CaseItem(Const(3, width: 2), [
                             intStatus <
-                                (intStatus | Const(intDataReq, width: 8)),
+                                (intStatus | Const(intDataReq, width: 9)),
                           ]),
                         ]),
                         byteInWord < (byteInWord + Const(1, width: 2)),
@@ -1396,13 +1435,13 @@ class HarborSdioController extends BridgeModule
                             (intStatus |
                                 mux<Logic>(
                                   crcBad,
-                                  Const(intDataCrcErr, width: 8),
-                                  Const(0, width: 8),
+                                  Const(intDataCrcErr, width: 9),
+                                  Const(0, width: 9),
                                 ) |
                                 mux<Logic>(
                                   blockLeft.eq(Const(1, width: 16)) & ~dmaMode,
-                                  Const(intDataDone, width: 8),
-                                  Const(0, width: 8),
+                                  Const(intDataDone, width: 9),
+                                  Const(0, width: 9),
                                 )),
                         If(
                           blockLeft.eq(Const(1, width: 16)),
@@ -1421,6 +1460,7 @@ class HarborSdioController extends BridgeModule
                             byteCnt < blkSize.zeroExtend(13),
                             for (final c in crc16) c < Const(0, width: 16),
                             byteInWord < Const(0, width: 2),
+                            dataTimeoutCnt < Const(0, width: 24),
                             datState < Const(dRWait, width: 4),
                           ],
                         ),
@@ -1488,7 +1528,7 @@ class HarborSdioController extends BridgeModule
                             crcBitCnt < Const(16, width: 5),
                             dataValid < Const(0),
                             intStatus <
-                                (intStatus | Const(intDataReq, width: 8)),
+                                (intStatus | Const(intDataReq, width: 9)),
                             datState < Const(dWCrc, width: 4),
                           ],
                           orElse: [
@@ -1503,7 +1543,7 @@ class HarborSdioController extends BridgeModule
                                 dataValid < Const(0),
                                 wrNeedFill < Const(1),
                                 intStatus <
-                                    (intStatus | Const(intDataReq, width: 8)),
+                                    (intStatus | Const(intDataReq, width: 9)),
                               ],
                               orElse: [byteShift < nextByte],
                             ),
@@ -1585,7 +1625,7 @@ class HarborSdioController extends BridgeModule
                             busy < Const(0),
                             intStatus <
                                 (intStatus |
-                                    Const(intWriteErr | intDataDone, width: 8)),
+                                    Const(intWriteErr | intDataDone, width: 9)),
                           ],
                         ),
                       ],
@@ -1615,7 +1655,7 @@ class HarborSdioController extends BridgeModule
                             busy < Const(0),
                             intStatus <
                                 (intStatus |
-                                    Const(intWriteErr | intDataDone, width: 8)),
+                                    Const(intWriteErr | intDataDone, width: 9)),
                           ],
                           orElse: [datState < Const(dWStatEnd, width: 4)],
                         ),
@@ -1642,7 +1682,7 @@ class HarborSdioController extends BridgeModule
                         busy < Const(0),
                         intStatus <
                             (intStatus |
-                                Const(intWriteErr | intDataDone, width: 8)),
+                                Const(intWriteErr | intDataDone, width: 9)),
                       ],
                     ),
                   ],
@@ -1670,7 +1710,7 @@ class HarborSdioController extends BridgeModule
                             busy < Const(0),
                             intStatus <
                                 (intStatus |
-                                    Const(intWriteErr | intDataDone, width: 8)),
+                                    Const(intWriteErr | intDataDone, width: 9)),
                           ],
                         ),
                       ],
@@ -1698,7 +1738,7 @@ class HarborSdioController extends BridgeModule
                         busy < Const(0),
                         intStatus <
                             (intStatus |
-                                Const(intWriteErr | intDataDone, width: 8)),
+                                Const(intWriteErr | intDataDone, width: 9)),
                       ],
                     ),
                     If(
@@ -1710,7 +1750,7 @@ class HarborSdioController extends BridgeModule
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
                             intStatus <
-                                (intStatus | Const(intDataDone, width: 8)),
+                                (intStatus | Const(intDataDone, width: 9)),
                           ],
                           orElse: [
                             blockLeft < (blockLeft - Const(1, width: 16)),
@@ -1757,7 +1797,7 @@ class HarborSdioController extends BridgeModule
                 ),
           If(
             rxPush & rxFull & ~rxPop,
-            then: [intStatus < (intStatus | Const(intRxOverrun, width: 8))],
+            then: [intStatus < (intStatus | Const(intRxOverrun, width: 9))],
           ),
           // count' = count + (1 if pushed) - (words popped)
           rxCount <
@@ -1807,7 +1847,7 @@ class HarborSdioController extends BridgeModule
             then: [
               dmaTailWait < Const(0),
               busy < Const(0),
-              intStatus < (intStatus | Const(intDataDone, width: 8)),
+              intStatus < (intStatus | Const(intDataDone, width: 9)),
             ],
           ),
 
@@ -1995,7 +2035,26 @@ class HarborSdioController extends BridgeModule
                       // round-trip margin at speed.
                       If(
                         bus.selAny(0x01, 1),
-                        then: [sampleFall < bus.dataIn[8]],
+                        then: [
+                          sampleFall < bus.dataIn[8],
+                          // [9] DAT reset: a write of 1 stops the data engine,
+                          // empties the RX FIFO and parks the ADMA walker.
+                          // Memory accesses already sent still finish.
+                          If(
+                            bus.dataIn[9],
+                            then: [
+                              datState < Const(dIdle, width: 4),
+                              datOeReg < Const(0),
+                              rxCount < Const(0, width: rxPtrW + 1),
+                              dmaTailWait < Const(0),
+                              admaState < Const(aIdle, width: 3),
+                              dataValid < Const(0),
+                              wrNeedFill < Const(0),
+                              byteInWord < Const(0, width: 2),
+                              busy < Const(0),
+                            ],
+                          ),
+                        ],
                       ),
                     ],
                     orElse: [
@@ -2161,9 +2220,9 @@ class HarborSdioController extends BridgeModule
                   If(
                     bus.we,
                     then: [
-                      intStatus < (intStatus & ~bus.selMasked(0x60, 8)),
+                      intStatus < (intStatus & ~bus.selMasked(0x60, 9)),
                       admaErr <
-                          ((admaErr | dmaFault) & ~bus.selMasked(0x60, 8)[7]),
+                          ((admaErr | dmaFault) & ~bus.selMasked(0x60, 9)[7]),
                     ],
                     orElse: [bus.dataOut < intView.zeroExtend(dw)],
                   ),
@@ -2174,6 +2233,15 @@ class HarborSdioController extends BridgeModule
                     bus.we,
                     then: [intEnable < bus.selMerge(intEnable, 0x68)],
                     orElse: [bus.dataOut < intEnable.zeroExtend(dw)],
+                  ),
+                ]),
+                // 0x78: DATA_TIMEOUT, SD clocks a card read waits for a block
+                // start bit. 0 turns it off.
+                CaseItem(Const(0x0F, width: 9), [
+                  If(
+                    bus.we,
+                    then: [dataTimeout < bus.selMerge(dataTimeout, 0x78)],
+                    orElse: [bus.dataOut < dataTimeout.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x70: ADMA_ADDR (descriptor table base for DMA transfers).
