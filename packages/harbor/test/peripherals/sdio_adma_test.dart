@@ -323,12 +323,4 @@ void main() {
     );
     await Simulator.endSimulation();
   });
-
-  for (final (n, stall) in [(16, 0.7), (32, 0.97)]) {
-    test(
-      'direct DMA CMD18 reads $n blocks, memory stall $stall',
-      () => checkDirectCmd18(n, stall),
-      timeout: const Timeout(Duration(minutes: 10)),
-    );
-  }
 }

@@ -159,27 +159,30 @@ void laneTests(HarborFabricKind kind) {
     // next compare and expect the pending line to drop. If it does not drop,
     // the M-mode relay sets STIP again as soon as it returns and the hart takes
     // the same trap forever.
-    test('64-bit bus: re-arming a passed compare deasserts the timer', () async {
-      await setUpDut(dataWidth: 64);
+    test(
+      '64-bit bus: re-arming a passed compare deasserts the timer',
+      () async {
+        await setUpDut(dataWidth: 64);
 
-      await coreWrite(0x4000, 8, BigInt.from(0x10));
-      await waitTicks(40);
-      expect(
-        clint.output('timer_irq_0').value.toInt(),
-        equals(1),
-        reason: 'a passed compare must assert the timer',
-      );
+        await coreWrite(0x4000, 8, BigInt.from(0x10));
+        await waitTicks(40);
+        expect(
+          clint.output('timer_irq_0').value.toInt(),
+          equals(1),
+          reason: 'a passed compare must assert the timer',
+        );
 
-      await coreWrite(0x4000, 8, BigInt.one << 40);
-      await clk.nextPosedge;
-      expect(
-        clint.output('timer_irq_0').value.toInt(),
-        equals(0),
-        reason: 'a future compare must deassert the timer',
-      );
+        await coreWrite(0x4000, 8, BigInt.one << 40);
+        await clk.nextPosedge;
+        expect(
+          clint.output('timer_irq_0').value.toInt(),
+          equals(0),
+          reason: 'a future compare must deassert the timer',
+        );
 
-      await Simulator.endSimulation();
-    });
+        await Simulator.endSimulation();
+      },
+    );
 
     test('64-bit bus: mtimecmp reads back in the correct lanes', () async {
       await setUpDut(dataWidth: 64);

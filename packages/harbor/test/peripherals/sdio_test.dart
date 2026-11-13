@@ -918,7 +918,15 @@ void main() {
 
       final resp = _resp48(0);
       final expected = _fourBitStream(word); // start + data + CRC, end excluded
-      const statusBusy = [0, 0, 1, 0, 1, 0, 1]; // status token on DAT0, then busy
+      const statusBusy = [
+        0,
+        0,
+        1,
+        0,
+        1,
+        0,
+        1,
+      ]; // status token on DAT0, then busy
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
       final captured = <int>[];
