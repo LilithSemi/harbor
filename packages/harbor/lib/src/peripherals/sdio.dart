@@ -1147,6 +1147,13 @@ class HarborSdioController extends BridgeModule
           CaseItem(Const(i, width: 4), [readWord < readValues[i]]),
       ]),
     ]);
+    // INT_STATUS bits a write clears in this cycle.
+    final intClear =
+        ((busAccess & bus.we & regIndex.eq(Const(0x0C, width: 9))).replicate(
+                  9,
+                ) &
+                bus.selMasked(0x60, 9))
+            .named('int_clear');
     final readHit = (~bus.we & regIndex.getRange(4).eq(Const(0, width: 5)))
         .named('reg_read_hit');
 
@@ -1240,6 +1247,11 @@ class HarborSdioController extends BridgeModule
           bus.dataOut < Const(0, width: dw),
         ],
         orElse: [
+          // INT_STATUS write-1-to-clear. It comes before every event that
+          // sets a bit, so a set in the same cycle wins.
+          for (var i = 0; i < 9; i++)
+            If(intClear[i], then: [intBits[i] < Const(0)]),
+          If(intClear[7], then: [admaErr < Const(0)]),
           bus.ack < Const(0),
           bus.dataOut < Const(0, width: dw),
 
@@ -2220,21 +2232,8 @@ class HarborSdioController extends BridgeModule
                 CaseItem(Const(0x0B, width: 9), [
                   If(bus.we, then: [blkCount < bus.selMerge(blkCount, 0x58)]),
                 ]),
-                // 0x60: INT_STATUS (write-1-to-clear).
-                CaseItem(Const(0x0C, width: 9), [
-                  If(
-                    bus.we,
-                    then: [
-                      for (var i = 0; i < 9; i++)
-                        If(
-                          bus.selMasked(0x60, 9)[i],
-                          then: [intBits[i] < Const(0)],
-                        ),
-                      admaErr <
-                          ((admaErr | dmaFault) & ~bus.selMasked(0x60, 9)[7]),
-                    ],
-                  ),
-                ]),
+                // 0x60: INT_STATUS (write-1-to-clear) is cleared at the top
+                // of this block, by [intClear].
                 // 0x68: INT_ENABLE.
                 CaseItem(Const(0x0D, width: 9), [
                   If(bus.we, then: [intEnable < bus.selMerge(intEnable, 0x68)]),

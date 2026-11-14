@@ -474,6 +474,44 @@ void main() {
       await busWrite(_intStatus, 0x1FF);
     }
 
+    // Sends a command with no response and writes [clear] to INT_STATUS in
+    // the cycle that sets cmd-done. Returns INT_STATUS after it.
+    Future<int> clearAsCmdDoneSets(int clear) async {
+      await setUpDut();
+      Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+      await busWrite(_cmd, 0);
+      var hit = false;
+      for (var i = 0; i < 400 && !hit; i++) {
+        await clk.nextPosedge;
+        // cmd-done sets at the next edge: the end bit held its SD clock.
+        if (sig('cmd_state').value.toInt() == 4 &&
+            sig('sd_fall').value.toInt() == 1) {
+          adr.inject(_intStatus);
+          mosi.inject(clear);
+          we.inject(1);
+          stb.inject(1);
+          hit = true;
+        }
+      }
+      expect(hit, isTrue);
+      await clk.nextPosedge;
+      expect(sig('cmd_state').value.toInt(), 0);
+      stb.inject(0);
+      we.inject(0);
+      await clk.nextPosedge;
+      return busRead(_intStatus);
+    }
+
+    test('cmd-done set wins over its own clear in the same cycle', () async {
+      expect(await clearAsCmdDoneSets(0x01) & 0x01, 0x01);
+      await Simulator.endSimulation();
+    });
+
+    test('cmd-done set survives a clear of another bit in its cycle', () async {
+      expect(await clearAsCmdDoneSets(0x10) & 0x01, 0x01);
+      await Simulator.endSimulation();
+    });
+
     test('RESP0-3 follow the type of the last response', () async {
       await setUpDut();
       const words = [0x11112222, 0x33334444, 0x55556666, 0x77778888];
