@@ -1427,8 +1427,10 @@ class HarborAxi4Fabric extends HarborFabricModule {
       ]);
     }
 
-    // The fabric fires AW or AR at a slave with 1 request in flight only
-    // when nothing is in flight, so both never come in one cycle.
+    // AW and AR share one entry. The outstanding limit lets a request in
+    // only when nothing is in flight, and then the preferRead turn lets only
+    // one of AW and AR fire in that cycle.
+    _checkInSim(c, r, aw.valid & ar.valid, '$p: AW and AR in one cycle');
     final done = Logic(name: '${p}_lite_done');
     final req = HarborRegFifo(
       name: '${p}_req',
@@ -1527,6 +1529,25 @@ class HarborAxi4Fabric extends HarborFabricModule {
       ]),
     ]);
     return (req.popValid & ~isW, wF.popValid);
+  }
+
+  // Stops the simulation when [bad] is high at a [clk] edge out of reset.
+  // The generated RTL does not use [bad].
+  static void _checkInSim(Logic clk, Logic reset, Logic bad, String what) {
+    clk.glitch.listen((args) {
+      if (LogicValue.isPosedge(
+            args.previousValue,
+            args.newValue,
+            ignoreInvalid: true,
+          ) &&
+          reset.value == LogicValue.zero &&
+          bad.value == LogicValue.one) {
+        Simulator.throwException(
+          Exception('AXI4 fabric: $what'),
+          StackTrace.current,
+        );
+      }
+    });
   }
 
   // Bits below which the addresses of [range] differ. The bits above are

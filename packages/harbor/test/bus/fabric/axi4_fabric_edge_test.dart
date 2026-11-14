@@ -114,6 +114,36 @@ Future<void> _liteTimeout(HarborFabricTopology t) async {
   must(b.errors, isEmpty);
 }
 
+// One master sends AW and another sends AR to the same AXI4-Lite slave in
+// the same cycle, many times. The fabric must let only one of them into the
+// shared request entry each time, so every access ends with the right data.
+Future<void> _liteSameCycle(HarborFabricTopology t) async {
+  final b = await Bench.start(
+    t,
+    stall: 0,
+    masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 2, 4)],
+    slaves: const [SlaveCfg('sL', 0, 1, 0x10000, 0x1000, lite: true)],
+  );
+  final m0 = b.managers['m0']!;
+  final m1 = b.managers['m1']!;
+  final sL = b.memories['sL']!;
+  final writes = <Burst>[];
+  for (var round = 0; round < 8; round++) {
+    final x = wr(1, 0x10000 + round * busBytes, 0);
+    writes.add(x);
+    m0.write(x);
+    m1.read(rd(1, 0x10800 + round * busBytes, 0));
+    await b.drain();
+  }
+  await b.sim.stop();
+  checkAll(b, writes: writes);
+  must(sL.awOrder.length, 8);
+  must(sL.arOrder.length, 8);
+  must(m0.bResp.map((x) => x.$2).toSet(), {0});
+  must(m1.rBeats.map((x) => x.$3).toSet(), {0});
+  must(b.busError(), 0);
+}
+
 void main() {
   const long = Timeout(Duration(minutes: 5));
   for (final t in HarborFabricTopology.values) {
@@ -121,6 +151,11 @@ void main() {
       test(
         'slaves see the full address or offset at region edges',
         () => isolated(() => _addressRebuild(t)),
+        timeout: long,
+      );
+      test(
+        'AW and AR to one AXI4-Lite slave in the same cycle',
+        () => isolated(() => _liteSameCycle(t)),
         timeout: long,
       );
       test(
