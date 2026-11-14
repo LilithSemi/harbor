@@ -102,7 +102,7 @@ class _Remap {
             cnt[i] +
                 (issue & slot[i]).zeroExtend(w) -
                 (done & doneSlot[i]).zeroExtend(w),
-        If(issue & slot[i], then: [fid[i] < f]),
+        fid[i] < harborLoad(fid[i], issue & slot[i], f),
       ],
     ]);
   }
@@ -156,7 +156,8 @@ class _Tracker {
             cnt[i] +
                 (issue & mux(hasMatch, match[i], free[i])).zeroExtend(cw) -
                 (done & doneMatch[i]).zeroExtend(cw),
-        If(issue & ~hasMatch & free[i], then: [ids[i] < id, tgts[i] < target]),
+        ids[i] < harborLoad(ids[i], issue & ~hasMatch & free[i], id),
+        tgts[i] < harborLoad(tgts[i], issue & ~hasMatch & free[i], target),
       ],
     ]);
     return _Tracker._(ok.named('${name}_ok'));
@@ -494,7 +495,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
                 tFire[t][1].zeroExtend(cw) -
                 bDone[t].zeroExtend(cw) -
                 rDone[t].zeroExtend(cw),
-        If(lastOne & awWant & arWant, then: [preferRead < ~preferRead]),
+        preferRead < preferRead ^ (lastOne & awWant & arWant),
       ]);
     }
 
@@ -1213,7 +1214,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
     rd.last <= beat.eq(len);
     Sequential(c, reset: r, [
       wDone < wDone + (w.valid & w.last).zeroExtend(cw) - b.fire.zeroExtend(cw),
-      If(rd.fire, then: [beat < mux(rd.last, Const(0, width: lenW), beat + 1)]),
+      beat <
+          (beat + rd.fire.zeroExtend(lenW)) &
+              ~(rd.fire & rd.last).replicate(lenW),
     ]);
   }
 
@@ -1547,18 +1550,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
     s.awReady <= bFire;
     s.arReady <= rFire & s.rLast;
 
+    // These flags take no flop enable, so they share the common control
+    // set.
     Sequential(c, reset: r, [
-      If.block([
-        Iff(done, [aSent < 0, wSent < 0, beat < 0]),
-        Else([
-          If(
-            (l.awValid & l.awReady) | (l.arValid & l.arReady),
-            then: [aSent < 1],
-          ),
-          If(s.wValid & s.wReady & s.wLast, then: [wSent < 1]),
-          If(rFire, then: [beat < beat + 1]),
-        ]),
-      ]),
+      aSent <
+          ~done & (aSent | (l.awValid & l.awReady) | (l.arValid & l.arReady)),
+      wSent < ~done & (wSent | (s.wValid & s.wReady & s.wLast)),
+      beat < (beat + rFire.zeroExtend(lenW)) & ~done.replicate(lenW),
     ]);
     return (req.popValid & ~isW, wF.popValid);
   }

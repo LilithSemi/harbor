@@ -15,6 +15,15 @@ Logic harborBitMux(Logic control, Logic d1, Logic d0) {
   return out;
 }
 
+/// [d] when [load] is high, else [q], as plain logic. A register that takes
+/// it as its next value has no flop enable, so it shares the control set of
+/// the other flops on its clock and reset. A register of a few flops with
+/// an enable of its own takes a slice for itself.
+Logic harborLoad(Logic q, Logic load, Logic d) {
+  final l = load.replicate(q.width);
+  return (d & l) | (q & ~l);
+}
+
 /// A small FIFO built in the current module.
 ///
 /// With [HarborRegFifo.bypassWhenEmpty] off (the default), [pushReady] and
@@ -152,33 +161,43 @@ class HarborRegFifo {
       storedData = data;
       // resetEntries also resets the data registers, so popData is never X
       // before the first push. Off by default to save the reset fanout.
+      // Entries under 4 bits take no flop enable.
       Sequential(clk, reset: resetEntries ? reset : null, [
         for (var i = 0; i < depth; i++)
-          If(
-            pushFire & wr.eq(Const(i, width: ptrWidth)),
-            then: [e[i] < pushData],
-          ),
+          if (width < 4)
+            e[i] <
+                harborLoad(
+                  e[i],
+                  pushFire & wr.eq(Const(i, width: ptrWidth)),
+                  pushData,
+                )
+          else
+            If(
+              pushFire & wr.eq(Const(i, width: ptrWidth)),
+              then: [e[i] < pushData],
+            ),
       ]);
     }
     final popData = bypassWhenEmpty
         ? harborBitMux(empty, pushData, storedData)
         : storedData;
 
-    Logic next(Logic p) => depth == 1 << ptrWidth
-        ? p + 1
-        : mux(
-            p.eq(Const(depth - 1, width: ptrWidth)),
-            Const(0, width: ptrWidth),
-            p + 1,
-          );
+    // The pointers and the count take no flop enable, so they share the
+    // control set of the other flops on this clock and reset.
+    Logic step(Logic p, Logic go) {
+      final inc = p + go.zeroExtend(ptrWidth);
+      if (depth == 1 << ptrWidth) return inc;
+      final wrap = go & p.eq(Const(depth - 1, width: ptrWidth));
+      return inc & ~wrap.replicate(ptrWidth);
+    }
 
     Sequential(clk, reset: reset, [
-      If(pushFire, then: [wr < next(wr)]),
-      If(popFire, then: [rd < next(rd)]),
-      If.block([
-        Iff(pushFire & ~popFire, [count < count + 1]),
-        ElseIf(popFire & ~pushFire, [count < count - 1]),
-      ]),
+      wr < step(wr, pushFire),
+      rd < step(rd, popFire),
+      count <
+          count +
+              pushFire.zeroExtend(countWidth) -
+              popFire.zeroExtend(countWidth),
     ]);
 
     return HarborRegFifo._(

@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:rohd/rohd.dart';
 
 import 'bus.dart';
+import 'port/reg_fifo.dart' show harborLoad;
 
 /// Width that holds 0 to [maxValue].
 int widthOf(int maxValue) => max(1, maxValue.bitLength);
@@ -62,9 +63,7 @@ List<Logic> roundRobin(String name, Logic clk, Logic reset, List<Logic> req) {
   final masked = r & ~((last << 1) - 1);
   final pick = mux(masked.neq(0), masked, r);
   final g = (pick & (~pick + 1)).named('${name}_grant');
-  Sequential(clk, reset: reset, [
-    If(r.neq(0), then: [last < g]),
-  ]);
+  Sequential(clk, reset: reset, [last < harborLoad(last, r.neq(0), g)]);
   return [for (var i = 0; i < n; i++) g[i]];
 }
 
