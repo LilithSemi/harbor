@@ -654,15 +654,15 @@ class HarborL1ICache extends BridgeModule {
     respFaultIsAccess <= faultHeld & ~faultIsPage;
     miss <= miss0;
     // A served lookup gives one hit pulse, so hits count accesses. Two ports
-    // that hit together are two accesses, which a single pulse would lose. A
-    // fill starts on the first cycle of a miss, the cycle `filling` is still
-    // low, so that edge counts misses once each.
+    // that hit together are two accesses, which a single pulse would lose.
+    // perfMiss pulses on the cycle a fill starts, so it counts each miss once,
+    // also while a flush or a drain holds the fill off.
     perfAccess <=
         (dualPort
             ? (hit.zeroExtend(2) + hit1.zeroExtend(2)).named('perfAccessCount')
             : hit);
     final fillStart = (wantFill & ~drain & ~flush & ~reset).named('fillStart');
-    perfMiss <= wantFill & ~filling;
+    perfMiss <= fillStart;
     if (dualPort) {
       respData1 <= ramRead(1);
       respValid1 <= hit1;

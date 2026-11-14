@@ -186,4 +186,28 @@ void main() {
       await b.end();
     }
   });
+
+  test('perf_miss pulses once per fill while a drain holds a miss', () async {
+    final b = _Bench(latency: 12);
+    await b.start();
+    try {
+      const addr = _base + 0x40;
+      b.perfMisses = 0;
+      b.reqAddr[0].inject(addr);
+      b.reqValid[0].inject(1);
+      while (b.reads == 0) {
+        await b.step();
+      }
+      await b.step();
+      b.flush.inject(1);
+      await b.step();
+      b.flush.inject(0);
+      // The drain waits out the abandoned read, longer than the sweep.
+      expect(await b.fetch(0, addr), addr);
+      expect(b.reads, 2);
+      expect(b.perfMisses, 2);
+    } finally {
+      await b.end();
+    }
+  });
 }
