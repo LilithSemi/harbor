@@ -278,9 +278,9 @@ class HarborMemoryMasterPort {
   /// [HarborMemorySlavePort.create]. AXI4 gives a full AXI4 manager, TileLink a
   /// TL-UH master and Wishbone a master with registered feedback bursts.
   ///
-  /// [usedAddressWidth] is the number of low address bits the device can
-  /// set. The bits above it must be zero. The AXI4 master then stores only
-  /// the low bits. The other kinds ignore it.
+  /// [busAddressWidth] makes the AXI4 address wider than the waist address
+  /// in [config]. The bus address is the waist address with zeros above it.
+  /// Only AXI4 takes a [busAddressWidth] other than the waist width.
   static HarborMemoryMasterPort create({
     required BridgeModule module,
     required String name,
@@ -290,8 +290,18 @@ class HarborMemoryMasterPort {
     required Logic reset,
     HarborFabricClock? fabricClock,
     int? cdcDepth,
-    int? usedAddressWidth,
+    int? busAddressWidth,
   }) {
+    if (busAddressWidth != null &&
+        busAddressWidth != config.addressWidth &&
+        (kind != HarborFabricKind.axi4 ||
+            busAddressWidth < config.addressWidth)) {
+      throw ArgumentError.value(
+        busAddressWidth,
+        'busAddressWidth',
+        'must be the waist width, or wider on AXI4',
+      );
+    }
     final waist = HarborMemoryWaist(config);
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
       final inner = create(
@@ -301,7 +311,7 @@ class HarborMemoryMasterPort {
         config: config,
         clk: fabricClock.clk,
         reset: fabricClock.reset,
-        usedAddressWidth: usedAddressWidth,
+        busAddressWidth: busAddressWidth,
       );
       final cdc = HarborMemoryWaistCdc(
         fabricClk: fabricClock.clk,
@@ -326,7 +336,7 @@ class HarborMemoryMasterPort {
     switch (kind) {
       case HarborFabricKind.axi4:
         final ref = module.addInterface(
-          _axi4(config),
+          _axi4(config, addressWidth: busAddressWidth),
           name: name,
           role: PairRole.provider,
         );
@@ -335,7 +345,6 @@ class HarborMemoryMasterPort {
           reset: reset,
           waist: waist,
           axi: ref.internalInterface!,
-          usedAddressWidth: usedAddressWidth,
           name: '${name}_axi4',
         );
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);
@@ -394,8 +403,9 @@ void harborAddCdcDebug(
       or0(cdc?.debugDropped, 16);
 }
 
-Axi4Interface _axi4(HarborMemoryWaistConfig config) => Axi4Interface(
-  addressWidth: config.addressWidth,
-  dataWidth: config.dataWidth,
-  idWidth: config.idWidth,
-);
+Axi4Interface _axi4(HarborMemoryWaistConfig config, {int? addressWidth}) =>
+    Axi4Interface(
+      addressWidth: addressWidth ?? config.addressWidth,
+      dataWidth: config.dataWidth,
+      idWidth: config.idWidth,
+    );

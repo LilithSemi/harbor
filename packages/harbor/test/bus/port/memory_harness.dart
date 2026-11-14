@@ -95,10 +95,10 @@ class MemMasterShell extends BridgeModule {
   MemMasterShell(
     HarborMemoryWaistConfig config, {
     HarborFabricKind kind = HarborFabricKind.axi4,
-    int? usedAddressWidth,
+    int? busAddressWidth,
   }) : super(
          'MemTestMasterShell_${kind.name}_${_cfgName(config)}'
-         '${usedAddressWidth == null ? '' : '_u$usedAddressWidth'}',
+         '${busAddressWidth == null ? '' : '_b$busAddressWidth'}',
          name: 'shell',
        ) {
     createPort('clk', PortDirection.input);
@@ -110,7 +110,7 @@ class MemMasterShell extends BridgeModule {
       config: config,
       clk: input('clk'),
       reset: input('reset'),
-      usedAddressWidth: usedAddressWidth,
+      busAddressWidth: busAddressWidth,
     );
     exposeWaist(this, mem.waist, 'mem', PairRole.consumer);
   }

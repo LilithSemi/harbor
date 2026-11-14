@@ -458,15 +458,20 @@ class HarborSdioController extends BridgeModule
       module: this,
       name: 'dma',
       kind: fabricKind,
+      // The ADMA makes 32-bit addresses. On a wider AXI4 bus the waist stays
+      // 32 bits and the port puts zeros above it.
       config: HarborMemoryWaistConfig(
-        addressWidth: dmaAddressWidth,
+        addressWidth:
+            fabricKind == HarborFabricKind.axi4 && dmaAddressWidth > 32
+            ? 32
+            : dmaAddressWidth,
         dataWidth: dmaDataWidth,
         outstanding: dmaOutstanding,
       ),
       clk: input('clk'),
       reset: input('reset'),
       fabricClock: fabricClock,
-      usedAddressWidth: dmaAddressWidth > 32 ? 32 : null,
+      busAddressWidth: dmaAddressWidth,
     );
 
     final clk = input('clk');
@@ -1040,9 +1045,9 @@ class HarborSdioController extends BridgeModule
     mw.reqId <= Const(0, width: mw.config.idWidth);
     mw.reqWrite <= reqWrite;
     mw.reqAddr <=
-        (dmaAddressWidth <= 32
-            ? reqAddr.getRange(0, dmaAddressWidth)
-            : reqAddr.zeroExtend(dmaAddressWidth));
+        (mw.config.addressWidth <= 32
+            ? reqAddr.getRange(0, mw.config.addressWidth)
+            : reqAddr.zeroExtend(mw.config.addressWidth));
     mw.reqLen <= reqLen;
     mw.reqSize <= reqSize;
     mw.reqBurst <= Const(HarborMemoryBurst.incr.value, width: 2);

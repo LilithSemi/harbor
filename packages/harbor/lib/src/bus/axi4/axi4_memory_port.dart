@@ -19,9 +19,6 @@ void _checkMatch(Axi4Interface axi, HarborMemoryWaistConfig config) {
 
 int _log2(int v) => v.bitLength - 1;
 
-bool _narrowAddress(HarborMemoryWaistConfig config, int? used) =>
-    used != null && used < config.addressWidth;
-
 Logic _counter(String name, int max) => Logic(name: name, width: max.bitLength);
 
 /// An AXI4 subordinate in front of a memory slave waist.
@@ -607,32 +604,30 @@ class HarborAxi4MemorySlaveReadOnly extends Module {
 /// them, and uses only the IDs that get a slot from the fabric master's
 /// `exclusiveIds`.
 ///
-/// A device whose addresses fit in fewer bits than the bus sets
-/// `usedAddressWidth`. The AW and AR FIFOs then keep only those bits, and
-/// AWADDR and ARADDR are zero above them.
+/// The AXI4 address can be wider than the waist address. AWADDR and ARADDR
+/// are then the waist address with zeros above it, and the AW and AR FIFOs
+/// keep only the waist bits.
 class HarborAxi4MemoryMaster extends Module {
   HarborAxi4MemoryMaster({
     required Logic clk,
     required Logic reset,
     required HarborMemoryWaist waist,
     required Axi4Interface axi,
-    int? usedAddressWidth,
     super.name = 'axi4_memory_master',
   }) : super(
          definitionName:
              'HarborAxi4MemoryMaster_a${waist.config.addressWidth}'
              '_d${waist.config.dataWidth}_i${waist.config.idWidth}'
              '_n${waist.config.outstanding}'
-             '${_narrowAddress(waist.config, usedAddressWidth) ? '_u$usedAddressWidth' : ''}',
+             '${axi.addressWidth > waist.config.addressWidth ? '_b${axi.addressWidth}' : ''}',
        ) {
     final config = waist.config;
-    _checkMatch(axi, config);
-    if (usedAddressWidth != null &&
-        (usedAddressWidth < 1 || usedAddressWidth > config.addressWidth)) {
-      throw ArgumentError.value(
-        usedAddressWidth,
-        'usedAddressWidth',
-        'must be 1 to ${config.addressWidth}',
+    if (axi.addressWidth < config.addressWidth ||
+        axi.dataWidth != config.dataWidth ||
+        axi.idWidth != config.idWidth) {
+      throw ArgumentError(
+        'AXI4 widths (addr ${axi.addressWidth}, data ${axi.dataWidth}, '
+        'id ${axi.idWidth}) do not fit $config',
       );
     }
     final c = addInput('clk', clk);
@@ -644,10 +639,7 @@ class HarborAxi4MemoryMaster extends Module {
 
     final n = config.outstanding;
     final idW = config.idWidth;
-    // The request FIFOs keep only the address bits the master can set.
-    final addrW = _narrowAddress(config, usedAddressWidth)
-        ? usedAddressWidth!
-        : config.addressWidth;
+    final addrW = config.addressWidth;
     final dataW = config.dataWidth;
     final strbW = config.strbWidth;
     const lenW = Axi4Interface.lenWidth;
@@ -659,7 +651,7 @@ class HarborAxi4MemoryMaster extends Module {
     final reqFire = Logic(name: 'req_fire');
     final reqData = harborPack([
       m.reqId,
-      m.reqAddr.getRange(0, addrW),
+      m.reqAddr,
       m.reqLen,
       m.reqSize,
       m.reqBurst,
@@ -702,7 +694,7 @@ class HarborAxi4MemoryMaster extends Module {
     );
     a.awValid <= awF.popValid;
     a.awId <= awId;
-    a.awAddr <= awAddr.zeroExtend(config.addressWidth);
+    a.awAddr <= awAddr.zeroExtend(axi.addressWidth);
     a.awLen <= awLen;
     a.awSize <= awSize;
     a.awBurst <= awBurst;
@@ -715,7 +707,7 @@ class HarborAxi4MemoryMaster extends Module {
     );
     a.arValid <= arF.popValid;
     a.arId <= arId;
-    a.arAddr <= arAddr.zeroExtend(config.addressWidth);
+    a.arAddr <= arAddr.zeroExtend(axi.addressWidth);
     a.arLen <= arLen;
     a.arSize <= arSize;
     a.arBurst <= arBurst;
