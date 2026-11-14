@@ -647,6 +647,99 @@ void main() {
       await Simulator.endSimulation();
     });
 
+    // Sends a short response and then [stream] on DAT, in the background.
+    // The future ends when the last group is out.
+    Future<void> card(List<int> stream, {int gap = 0}) async {
+      final all = [..._resp48(0), for (var i = 0; i < gap; i++) 0xF, ...stream];
+      var sawDrive = false;
+      var idx = 0;
+      while (idx < all.length) {
+        await clk.nextPosedge;
+        final sending = cmdOe.value.toInt() == 1;
+        if (sending) sawDrive = true;
+        if (sawDrive && !sending && sdClk.value.toInt() == 0) {
+          if (idx < 48) {
+            cmdIn.inject(all[idx]);
+          } else {
+            datIn.inject(all[idx]);
+          }
+          idx++;
+        }
+      }
+    }
+
+    Future<void> cycles(int n) async {
+      for (var i = 0; i < n; i++) {
+        await clk.nextPosedge;
+      }
+    }
+
+    test(
+      'a DAT reset in a PIO read empties the ring for the next read',
+      () async {
+        await setUpDut(fifoDepth: 8);
+        Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+        final first = [for (var i = 0; i < 8; i++) 0x11000000 + i];
+        await busWrite(_blkSize, 32);
+        await busWrite(_ctrl, 0x01 | (1 << 4));
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+        final c1 = card([..._fourBitWords(first), 0xF]);
+        while (sig('rx_fifo_count').value.toInt() < 5) {
+          await clk.nextPosedge;
+        }
+        for (var i = 0; i < 3; i++) {
+          expect(await busRead(_data), first[i]);
+        }
+        expect(sig('rx_fifo_rd').value.toInt(), isNot(0));
+        // DAT reset in the middle of the block.
+        await busWrite(_ctrl, 0x01 | (1 << 4) | (1 << 9));
+        expect(sig('rx_fifo_count').value.toInt(), 0);
+        expect(await busRead(_status) & (1 << 9), 0);
+        await c1;
+        datIn.inject(0xF);
+        await cycles(40);
+
+        final second = [0x22220000, 0x22221111];
+        await busWrite(_blkSize, 8);
+        await busWrite(_intEnable, 0x02);
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+        await card([..._fourBitWords(second), 0xF]);
+        for (var i = 0; i < 200 && irq.value.toInt() == 0; i++) {
+          await clk.nextPosedge;
+        }
+        expect(await busRead(_intStatus) & 0x0A, 0x02);
+        expect([await busRead(_data), await busRead(_data)], second);
+        expect(await busRead(_status) & (1 << 9), 0);
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('DATA_TIMEOUT 0 waits for the start bit with no timeout, and '
+        'STATUS[15:12] shows the DAT state', () async {
+      await setUpDut();
+      const word = 0xABCD1234;
+      await busWrite(0x78, 0);
+      await busWrite(_blkSize, 4);
+      await busWrite(_intEnable, 0x102);
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      datIn.inject(0xF);
+      expect((await busRead(_status) >> 12) & 0xF, 0);
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      // The card waits 3000 SD clocks before its start bit.
+      final c = card([..._fourBitStream(word), 0xF], gap: 3000);
+      await cycles(3000);
+      expect(irq.value.toInt(), 0);
+      expect((await busRead(_status) >> 12) & 0xF, 1); // block start hunt
+      await c;
+      for (var i = 0; i < 200 && irq.value.toInt() == 0; i++) {
+        await clk.nextPosedge;
+      }
+      expect(await busRead(_intStatus) & 0x10A, 0x02);
+      expect((await busRead(_status) >> 12) & 0xF, 0);
+      expect(await busRead(_data), word);
+      await Simulator.endSimulation();
+    });
+
     test('RESP0-3 follow the type of the last response', () async {
       await setUpDut();
       const words = [0x11112222, 0x33334444, 0x55556666, 0x77778888];

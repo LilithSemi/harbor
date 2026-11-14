@@ -1126,8 +1126,8 @@ class HarborSdioController extends BridgeModule
       cardPresent.zeroExtend(32) |
           ((busy | dmaInFlight).zeroExtend(32) << 8) |
           (mux(cmdDataDir, ~rxEmpty, dataValid).zeroExtend(32) << 9) |
-          // The DAT engine state. This read also stops yosys from making
-          // the engine a new FSM, which costs about 330 LUTs more.
+          // [15:12] the DAT engine state, for diagnostics. A read of the
+          // state as data also stops yosys from making the engine a new FSM.
           (datState.zeroExtend(32) << 12),
       clkDiv.zeroExtend(32),
       cmdIndex.zeroExtend(32) | (cmdRespType.zeroExtend(32) << 6),
