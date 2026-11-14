@@ -515,7 +515,14 @@ class HarborSdioController extends BridgeModule
     // SD clocks a card read waits for a block start bit. 0 turns it off.
     final dataTimeout = Logic(name: 'data_timeout', width: 24);
     final dataTimeoutCnt = Logic(name: 'data_timeout_cnt', width: 24);
-    final intStatus = Logic(name: 'int_status', width: 9);
+    // INT_STATUS, one register per bit. Events in the same cycle that set
+    // different bits all latch.
+    final intBits = [for (var i = 0; i < 9; i++) Logic(name: 'int_status_$i')];
+    final intStatus = intBits.rconcat().named('int_status');
+    List<Conditional> setInt(int mask) => [
+      for (var i = 0; i < 9; i++)
+        if ((mask >> i) & 1 == 1) intBits[i] < Const(1),
+    ];
     final intEnable = Logic(name: 'int_enable', width: 9);
     final busy = Logic(name: 'busy');
     final divCount = Logic(name: 'div_count', width: 16);
@@ -1076,7 +1083,7 @@ class HarborSdioController extends BridgeModule
           blkCount < Const(1, width: 16),
           dataTimeout < Const(defaultDataTimeout, width: 24),
           dataTimeoutCnt < Const(0, width: 24),
-          intStatus < Const(0, width: 9),
+          for (final b in intBits) b < Const(0),
           intEnable < Const(0, width: 9),
           busy < Const(0),
           divCount < Const(0, width: 16),
@@ -1190,7 +1197,7 @@ class HarborSdioController extends BridgeModule
                     then: [
                       state < Const(sIdle, width: 3),
                       busy < Const(0),
-                      intStatus < (intStatus | Const(intCmdDone, width: 9)),
+                      ...setInt(intCmdDone),
                     ],
                     // Wait for the card to drive the response.
                     orElse: [
@@ -1236,8 +1243,7 @@ class HarborSdioController extends BridgeModule
                             cmdDataPresent & ~cmdDataDir & ~dmaMode,
                             then: [dataValid < Const(0)],
                           ),
-                          intStatus <
-                              (intStatus | Const(intCmdTimeout, width: 9)),
+                          ...setInt(intCmdTimeout),
                         ],
                       ),
                     ],
@@ -1256,7 +1262,7 @@ class HarborSdioController extends BridgeModule
                     respCnt.eq(Const(1, width: 8)),
                     then: [
                       state < Const(sIdle, width: 3),
-                      intStatus < (intStatus | Const(intCmdDone, width: 9)),
+                      ...setInt(intCmdDone),
                       // Hand off to the data engine when the command carries a
                       // data phase, otherwise the command is done.
                       If(
@@ -1375,8 +1381,7 @@ class HarborSdioController extends BridgeModule
                               ),
                           then: [
                             datState < Const(dIdle, width: 4),
-                            intStatus <
-                                (intStatus | Const(intDataTimeout, width: 9)),
+                            ...setInt(intDataTimeout),
                             // A DMA read ends when the ADMA has landed what
                             // the card sent, as on a normal end.
                             If(
@@ -1409,10 +1414,7 @@ class HarborSdioController extends BridgeModule
                           CaseItem(Const(2, width: 2), [asmB2 < rdFull]),
                           // Byte 3 completes a word. The word itself is pushed
                           // into the RX FIFO by the block below, off `rxPush`.
-                          CaseItem(Const(3, width: 2), [
-                            intStatus <
-                                (intStatus | Const(intDataReq, width: 9)),
-                          ]),
+                          CaseItem(Const(3, width: 2), [...setInt(intDataReq)]),
                         ]),
                         byteInWord < (byteInWord + Const(1, width: 2)),
                         byteCnt < (byteCnt - Const(1, width: 13)),
@@ -1439,23 +1441,14 @@ class HarborSdioController extends BridgeModule
                     If(
                       crcBitCnt.eq(Const(1, width: 5)),
                       then: [
-                        // Latch CRC-error and (on the final block) data-done in
-                        // ONE intStatus write. Two separate `intStatus < ...`
-                        // assignments race under last-write-wins, so a CRC error
-                        // on the final block was silently dropped by the later
-                        // data-done write.
-                        intStatus <
-                            (intStatus |
-                                mux<Logic>(
-                                  crcBad,
-                                  Const(intDataCrcErr, width: 9),
-                                  Const(0, width: 9),
-                                ) |
-                                mux<Logic>(
-                                  blockLeft.eq(Const(1, width: 16)) & ~dmaMode,
-                                  Const(intDataDone, width: 9),
-                                  Const(0, width: 9),
-                                )),
+                        // Each interrupt bit is its own register, so the CRC
+                        // error and the data-done of the final block both
+                        // latch in the same cycle.
+                        If(crcBad, then: setInt(intDataCrcErr)),
+                        If(
+                          blockLeft.eq(Const(1, width: 16)) & ~dmaMode,
+                          then: setInt(intDataDone),
+                        ),
                         If(
                           blockLeft.eq(Const(1, width: 16)),
                           then: [
@@ -1540,8 +1533,7 @@ class HarborSdioController extends BridgeModule
                               crcShift[l] < crcNextWr[l],
                             crcBitCnt < Const(16, width: 5),
                             dataValid < Const(0),
-                            intStatus <
-                                (intStatus | Const(intDataReq, width: 9)),
+                            ...setInt(intDataReq),
                             datState < Const(dWCrc, width: 4),
                           ],
                           orElse: [
@@ -1555,8 +1547,7 @@ class HarborSdioController extends BridgeModule
                               then: [
                                 dataValid < Const(0),
                                 wrNeedFill < Const(1),
-                                intStatus <
-                                    (intStatus | Const(intDataReq, width: 9)),
+                                ...setInt(intDataReq),
                               ],
                               orElse: [byteShift < nextByte],
                             ),
@@ -1636,9 +1627,7 @@ class HarborSdioController extends BridgeModule
                             // No token: treat as a write error and finish.
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
-                            intStatus <
-                                (intStatus |
-                                    Const(intWriteErr | intDataDone, width: 9)),
+                            ...setInt(intWriteErr | intDataDone),
                           ],
                         ),
                       ],
@@ -1666,9 +1655,7 @@ class HarborSdioController extends BridgeModule
                           then: [
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
-                            intStatus <
-                                (intStatus |
-                                    Const(intWriteErr | intDataDone, width: 9)),
+                            ...setInt(intWriteErr | intDataDone),
                           ],
                           orElse: [datState < Const(dWStatEnd, width: 4)],
                         ),
@@ -1693,9 +1680,7 @@ class HarborSdioController extends BridgeModule
                       orElse: [
                         datState < Const(dIdle, width: 4),
                         busy < Const(0),
-                        intStatus <
-                            (intStatus |
-                                Const(intWriteErr | intDataDone, width: 9)),
+                        ...setInt(intWriteErr | intDataDone),
                       ],
                     ),
                   ],
@@ -1721,9 +1706,7 @@ class HarborSdioController extends BridgeModule
                           then: [
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
-                            intStatus <
-                                (intStatus |
-                                    Const(intWriteErr | intDataDone, width: 9)),
+                            ...setInt(intWriteErr | intDataDone),
                           ],
                         ),
                       ],
@@ -1749,9 +1732,7 @@ class HarborSdioController extends BridgeModule
                       then: [
                         datState < Const(dIdle, width: 4),
                         busy < Const(0),
-                        intStatus <
-                            (intStatus |
-                                Const(intWriteErr | intDataDone, width: 9)),
+                        ...setInt(intWriteErr | intDataDone),
                       ],
                     ),
                     If(
@@ -1762,8 +1743,7 @@ class HarborSdioController extends BridgeModule
                           then: [
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
-                            intStatus <
-                                (intStatus | Const(intDataDone, width: 9)),
+                            ...setInt(intDataDone),
                           ],
                           orElse: [
                             blockLeft < (blockLeft - Const(1, width: 16)),
@@ -1808,10 +1788,7 @@ class HarborSdioController extends BridgeModule
                   rxWord,
                   rxShifted(i),
                 ),
-          If(
-            rxPush & rxFull & ~rxPop,
-            then: [intStatus < (intStatus | Const(intRxOverrun, width: 9))],
-          ),
+          If(rxPush & rxFull & ~rxPop, then: [...setInt(intRxOverrun)]),
           // count' = count + (1 if pushed) - (words popped)
           rxCount <
               (rxCount +
@@ -1860,7 +1837,7 @@ class HarborSdioController extends BridgeModule
             then: [
               dmaTailWait < Const(0),
               busy < Const(0),
-              intStatus < (intStatus | Const(intDataDone, width: 9)),
+              ...setInt(intDataDone),
             ],
           ),
 
@@ -2238,7 +2215,11 @@ class HarborSdioController extends BridgeModule
                   If(
                     bus.we,
                     then: [
-                      intStatus < (intStatus & ~bus.selMasked(0x60, 9)),
+                      for (var i = 0; i < 9; i++)
+                        If(
+                          bus.selMasked(0x60, 9)[i],
+                          then: [intBits[i] < Const(0)],
+                        ),
                       admaErr <
                           ((admaErr | dmaFault) & ~bus.selMasked(0x60, 9)[7]),
                     ],
