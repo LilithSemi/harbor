@@ -569,11 +569,37 @@ class Ddr3MemoryPort extends Module {
     final accSel = [
       for (var l = 0; l < ratio; l++) Logic(name: 'wa_sel$l', width: strbW),
     ];
-    final (aIdx, aK) = chunk(aAddr, aLeft, aSize, aBurst, aWrap);
-    final aLast = aLeft.zeroExtend(lenW + 1).lt(aK.zeroExtend(lenW + 1));
+    // Flops hold the beat count and the last flag of the current command.
+    // They change on the same edges as the state, so no chunk logic is on
+    // the WDATA ready path.
+    final aK = Logic(name: 'wa_k', width: kw);
+    final aLast = Logic(name: 'wa_last');
+    final bs = strbW.bitLength - 1;
+    final aIdx = rB > 0 ? aAddr.getRange(bs, bs + rB) : Const(0);
     final lastBeat = (aJ + 1).eq(aK).named('wa_cmd_end');
     final laneIdx = rB > 0 ? (aIdx + aJ.getRange(0, rB)) : Const(0);
     final head = harborUnpack(wrReq.data, [aw, lenW, sizeW, burstW]);
+    (Logic, Logic) kAndLast(
+      Logic a,
+      Logic left,
+      Logic size,
+      Logic burst,
+      Logic wrapLen,
+    ) {
+      final (_, k) = chunk(a, left, size, burst, wrapLen);
+      return (k, left.zeroExtend(lenW + 1).lt(k.zeroExtend(lenW + 1)));
+    }
+
+    final nAddr = next(aAddr, aK, aSize, aBurst, aWrap).named('wa_next_addr');
+    final nLeft = (aLeft - aK.zeroExtend(lenW)).named('wa_next_left');
+    final (loadK, loadLast) = kAndLast(
+      head[0],
+      head[1],
+      head[2],
+      head[3],
+      head[1],
+    );
+    final (stepK, stepLast) = kAndLast(nAddr, nLeft, aSize, aBurst, aWrap);
     aLoad <= ~aValid & wrReq.valid & ~clr;
 
     final take = Logic(name: 'wq_take');
@@ -631,14 +657,13 @@ class Ddr3MemoryPort extends Module {
           aSize < head[2],
           aBurst < head[3],
           aWrap < head[1],
+          aK < loadK,
+          aLast < loadLast,
         ],
         orElse: [
           If(
             beat & lastBeat,
-            then: [
-              aAddr < next(aAddr, aK, aSize, aBurst, aWrap),
-              aLeft < aLeft - aK.zeroExtend(lenW),
-            ],
+            then: [aAddr < nAddr, aLeft < nLeft, aK < stepK, aLast < stepLast],
           ),
         ],
       ),
