@@ -277,6 +277,10 @@ class HarborMemoryMasterPort {
   /// the waist in front of it. [fabricClock] and [cdcDepth] work as for
   /// [HarborMemorySlavePort.create]. AXI4 gives a full AXI4 manager, TileLink a
   /// TL-UH master and Wishbone a master with registered feedback bursts.
+  ///
+  /// [usedAddressWidth] is the number of low address bits the device can
+  /// set. The bits above it must be zero. The AXI4 master then stores only
+  /// the low bits. The other kinds ignore it.
   static HarborMemoryMasterPort create({
     required BridgeModule module,
     required String name,
@@ -286,6 +290,7 @@ class HarborMemoryMasterPort {
     required Logic reset,
     HarborFabricClock? fabricClock,
     int? cdcDepth,
+    int? usedAddressWidth,
   }) {
     final waist = HarborMemoryWaist(config);
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
@@ -296,6 +301,7 @@ class HarborMemoryMasterPort {
         config: config,
         clk: fabricClock.clk,
         reset: fabricClock.reset,
+        usedAddressWidth: usedAddressWidth,
       );
       final cdc = HarborMemoryWaistCdc(
         fabricClk: fabricClock.clk,
@@ -329,6 +335,7 @@ class HarborMemoryMasterPort {
           reset: reset,
           waist: waist,
           axi: ref.internalInterface!,
+          usedAddressWidth: usedAddressWidth,
           name: '${name}_axi4',
         );
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);

@@ -27,7 +27,8 @@ class _Bench {
     double stall = 0.3,
     double axiStall = 0.3,
     double errorRate = 0,
-  }) : sim = Sim(MemMasterShell(config)),
+    int? usedAddressWidth,
+  }) : sim = Sim(MemMasterShell(config, usedAddressWidth: usedAddressWidth)),
        rng = Random(seed) {
     req = WaistRequester(
       sim,
@@ -112,6 +113,7 @@ Future<_Bench> _random(
   double idle = 0.2,
   double stall = 0.3,
   double axiStall = 0.3,
+  int? usedAddressWidth,
 }) async {
   final b = _Bench(
     config,
@@ -121,6 +123,7 @@ Future<_Bench> _random(
     stall: stall,
     axiStall: axiStall,
     errorRate: 0.05,
+    usedAddressWidth: usedAddressWidth,
   );
   await b.start();
   for (var i = 0; i < count; i++) {
@@ -145,6 +148,28 @@ void main() {
 
   test('random IDs against a memory that reorders IDs', () async {
     await _random(c32, seed: 11);
+  });
+
+  test('a master with 16 used address bits on a 64-bit bus', () async {
+    const c64 = HarborMemoryWaistConfig(
+      addressWidth: 64,
+      dataWidth: 32,
+      idWidth: 4,
+      outstanding: 4,
+    );
+    final b = await _random(c64, seed: 13, usedAddressWidth: 16);
+    final master = b.sim.dut.subModules.whereType<HarborAxi4MemoryMaster>();
+    expect(master.single.definitionName, endsWith('_u16'));
+    expect(
+      () => HarborAxi4MemoryMaster(
+        clk: Logic(),
+        reset: Logic(),
+        waist: HarborMemoryWaist(c64),
+        axi: Axi4Interface(addressWidth: 64, dataWidth: 32, idWidth: 4),
+        usedAddressWidth: 65,
+      ),
+      throwsArgumentError,
+    );
   });
 
   test('one ID per direction keeps N requests in flight', () async {
