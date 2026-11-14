@@ -366,10 +366,6 @@ class HarborSdioController extends BridgeModule
          'dmaDataWidth must be 32 or 64',
        ),
        assert(
-         rxFifoDepth >= 2 && (rxFifoDepth & (rxFifoDepth - 1)) == 0,
-         'rxFifoDepth must be a power of two, at least 2',
-       ),
-       assert(
          dmaBurstBeats >= 1 && dmaBurstBeats <= 256,
          'dmaBurstBeats must be 1 to 256',
        ),
@@ -401,6 +397,13 @@ class HarborSdioController extends BridgeModule
          ]),
          name: name ?? 'sdio',
        ) {
+    if (rxFifoDepth < 2 || (rxFifoDepth & (rxFifoDepth - 1)) != 0) {
+      throw ArgumentError.value(
+        rxFifoDepth,
+        'rxFifoDepth',
+        'must be a power of two, at least 2',
+      );
+    }
     if (writeBusyTimeout <= writeNoBusyClocks) {
       throw ArgumentError.value(
         writeBusyTimeout,

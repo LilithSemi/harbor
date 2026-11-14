@@ -144,6 +144,17 @@ void main() {
   });
 
   group('HarborSdioController', () {
+    test('rxFifoDepth must be a power of two, at least 2', () {
+      for (final depth in [0, 1, 12]) {
+        expect(
+          () => HarborSdioController(baseAddress: 0, rxFifoDepth: depth),
+          throwsA(
+            isA<ArgumentError>().having((e) => e.name, 'name', 'rxFifoDepth'),
+          ),
+        );
+      }
+    });
+
     test('creates with SD config', () {
       final sdio = HarborSdioController(baseAddress: 0x60000000);
       expect(sdio.bus, isNotNull);
@@ -1335,59 +1346,66 @@ void main() {
     // exactly the regime where an unguarded push wraps the write pointer over
     // unread entries and the transfer returns a mix of old and new words. Every
     // word must come back exactly once, in order, with no overrun reported.
-    test('an ADMA read is byte-stable when the FIFO is pressed full', () async {
-      // 11 distinct words through a 4-deep FIFO, memory acking far slower than
-      // the SD side fills, so the FIFO sits at its limit for most of the block.
-      final words = [for (var i = 0; i < 11; i++) 0x1000_0000 + i * 0x11111];
+    for (final depth in [4, 8, 32]) {
+      test('an ADMA read is byte-stable when a $depth-word FIFO is pressed '
+          'full', () async {
+        // 11 distinct words through the FIFO, memory acking far slower than
+        // the SD side fills, so the FIFO sits at its limit for most of the block.
+        final words = [for (var i = 0; i < 11; i++) 0x1000_0000 + i * 0x11111];
 
-      // Descriptor at word 0/1; the buffer is word 5 (byte 0x14), so 11 words
-      // land in 5..15 without running off the 16-word model.
-      await setUpDut(
-        dmaMem: [0x14, 0x80000000 | (11 * 4)],
-        ackDelay: 150,
-        fifoDepth: 4,
-      );
-      await busWrite(_blkSize, words.length * 4);
-      await busWrite(_intEnable, 0x12);
-      await busWrite(_admaAddr, 0x14);
-      await busWrite(_cmdArg, 0);
-      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
+        // Descriptor at word 0/1; the buffer is word 5 (byte 0x14), so 11 words
+        // land in 5..15 without running off the 16-word model.
+        await setUpDut(
+          dmaMem: [0x14, 0x80000000 | (11 * 4)],
+          ackDelay: 150,
+          fifoDepth: depth,
+        );
+        await busWrite(_blkSize, words.length * 4);
+        await busWrite(_intEnable, 0x12);
+        await busWrite(_admaAddr, 0x14);
+        await busWrite(_cmdArg, 0);
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
 
-      final resp = _resp48(0);
-      final dataBits = [for (final w in words) ..._wordBitsMsb(w)];
-      final datStream = [0, ...dataBits, ..._crc16(dataBits)];
-      final total = resp.length + datStream.length;
+        final resp = _resp48(0);
+        final dataBits = [for (final w in words) ..._wordBitsMsb(w)];
+        final datStream = [0, ...dataBits, ..._crc16(dataBits)];
+        final total = resp.length + datStream.length;
 
-      var sawDrive = false, idx = 0;
-      var prevSdLow = sdClk.value.toInt() == 0;
-      for (var i = 0; i < 200000; i++) {
-        await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
-        if (sending) sawDrive = true;
-        final sdLow = sdClk.value.toInt() == 0;
-        if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
-          if (idx < resp.length) {
-            cmdIn.inject(resp[idx]);
-          } else {
-            datIn.inject(datStream[idx - resp.length]);
+        var sawDrive = false, idx = 0;
+        var prevSdLow = sdClk.value.toInt() == 0;
+        for (var i = 0; i < 200000; i++) {
+          await clk.nextPosedge;
+          final sending = cmdOe.value.toInt() == 1;
+          if (sending) sawDrive = true;
+          final sdLow = sdClk.value.toInt() == 0;
+          if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
+            if (idx < resp.length) {
+              cmdIn.inject(resp[idx]);
+            } else {
+              datIn.inject(datStream[idx - resp.length]);
+            }
+            idx++;
           }
-          idx++;
+          prevSdLow = sdLow;
+          if (irq.value.toInt() == 1) break;
         }
-        prevSdLow = sdLow;
-        if (irq.value.toInt() == 1) break;
-      }
 
-      final status = await busRead(_intStatus);
-      expect(status & 0x02, equals(0x02)); // data-done
-      expect(status & 0x08, equals(0)); // no CRC error
-      expect(status & 0x40, equals(0), reason: 'RX FIFO overran');
-      // Every word landed exactly once and in order. A wrapped write pointer
-      // shows up here as a repeated or skipped word, not as a CRC error.
-      for (var i = 0; i < words.length; i++) {
-        expect(mem(5 + i), equals(words[i]), reason: 'word $i came back wrong');
-      }
-      await Simulator.endSimulation();
-    });
+        final status = await busRead(_intStatus);
+        expect(status & 0x02, equals(0x02)); // data-done
+        expect(status & 0x08, equals(0)); // no CRC error
+        expect(status & 0x40, equals(0), reason: 'RX FIFO overran');
+        // Every word landed exactly once and in order. A wrapped write pointer
+        // shows up here as a repeated or skipped word, not as a CRC error.
+        for (var i = 0; i < words.length; i++) {
+          expect(
+            mem(5 + i),
+            equals(words[i]),
+            reason: 'word $i came back wrong',
+          );
+        }
+        await Simulator.endSimulation();
+      });
+    }
 
     /// Runs one ADMA card-read of [words] and returns how many memory beats and
     /// full-width beats reached the memory.
