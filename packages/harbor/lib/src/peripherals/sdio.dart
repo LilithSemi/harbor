@@ -9,6 +9,7 @@ import '../bus/bus_slave_port.dart';
 import '../bus/port/memory_port.dart';
 import '../bus/port/memory_waist.dart';
 import '../bus/port/port_cdc.dart';
+import '../bus/port/reg_fifo.dart' show HarborFifoRam;
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -602,22 +603,36 @@ class HarborSdioController extends BridgeModule
     // could no longer arrive, leaving its bus request asserted.
     final rxDepth = rxFifoDepth;
     final rxPtrW = (rxDepth - 1).bitLength;
-    final rxFifo = [
-      for (var i = 0; i < rxDepth; i++) Logic(name: 'rx_fifo_$i', width: 32),
-    ];
+    final rxRd = Logic(name: 'rx_fifo_rd', width: rxPtrW);
+    final rxWr = Logic(name: 'rx_fifo_wr', width: rxPtrW);
+    final rxWrEn = Logic(name: 'rx_fifo_wr_en');
+    final rxWrData = Logic(name: 'rx_fifo_wr_data', width: 32);
     final rxCount = Logic(name: 'rx_fifo_count', width: rxPtrW + 1);
     final rxEmpty = rxCount.eq(Const(0, width: rxPtrW + 1)).named('rx_empty');
     final rxFull = rxCount
         .eq(Const(rxDepth, width: rxPtrW + 1))
         .named('rx_full');
-    // Shift FIFO: the head is always at index 0. On a pop the whole array
-    // shifts down toward index 0 by the number of words retired, and a push
-    // writes at the tail, so the head reads need no muxes.
-    //
-    // [rxHead] is the oldest word. [rxHead2] is the second oldest, which a
-    // full 64-bit beat carries together with [rxHead].
-    final rxHead = rxFifo[0].named('rx_head');
-    final rxHead2 = rxFifo[1].named('rx_head2');
+    // The words are in a RAM with an asynchronous read, which is distributed
+    // RAM on Xilinx and ECP5. [rxHead] is the oldest word. [rxHead2] is the
+    // second oldest, which a full 64-bit beat carries together with
+    // [rxHead]. It reads a second copy of the RAM at the next index.
+    HarborFifoRam rxRam(String ramName, Logic rdAddr) => HarborFifoRam(
+      name: ramName,
+      clk: clk,
+      wrEn: rxWrEn,
+      wrAddr: rxWr,
+      wrData: rxWrData,
+      rdAddr: rdAddr,
+      depth: rxDepth,
+      zeroInit: false,
+    );
+    final rxHead = rxRam('rx_ram', rxRd).rdData.named('rx_head');
+    final rxHead2 = dmaDataWidth == 64
+        ? rxRam(
+            'rx_ram2',
+            (rxRd + 1).named('rx_fifo_rd2'),
+          ).rdData.named('rx_head2')
+        : rxHead;
 
     // Write: set when the serializer has consumed all four bytes of the holding
     // register and needs the NEXT word before it can shift again. The SD clock
@@ -867,8 +882,7 @@ class HarborSdioController extends BridgeModule
     final rxPop2Ok = (rxPopAdma2 & rxCount.gte(Const(2, width: rxPtrW + 1)))
         .named('rx_pop2_ok');
     final rxPop1Ok = (rxPop & ~rxEmpty & ~rxPop2Ok).named('rx_pop1_ok');
-    // Shift-FIFO update helpers (see the sequential RX FIFO block). A pop
-    // shifts the whole array down toward index 0 by this many words.
+    // Words that leave the RX FIFO this cycle.
     final rxPopCount = mux(
       rxPop2Ok,
       Const(2, width: rxPtrW + 1),
@@ -878,25 +892,8 @@ class HarborSdioController extends BridgeModule
         Const(0, width: rxPtrW + 1),
       ),
     );
-    // Tail slot a push writes, after the same-cycle shift has moved it. It
-    // equals the new occupancy before the push (count minus popped words).
-    final rxTailIdx = (rxCount - rxPopCount).named('rx_tail_idx');
-    // Value slot i takes after the shift. Out-of-range shift sources hold the
-    // current value; those slots are always past the new valid range, so the
-    // held value is unused (a tail insert or the next push overwrites it).
-    Logic rxShifted(int i) {
-      if (i + 2 < rxDepth) {
-        return mux(
-          rxPop2Ok,
-          rxFifo[i + 2],
-          mux(rxPop1Ok, rxFifo[i + 1], rxFifo[i]),
-        );
-      }
-      if (i + 1 < rxDepth) {
-        return mux(rxPop1Ok, rxFifo[i + 1], rxFifo[i]);
-      }
-      return rxFifo[i];
-    }
+    rxWrEn <= rxPushOk;
+    rxWrData <= rxWord;
 
     // Card-read write requests. A request covers only words already in the
     // RX FIFO, so its write data never waits on the card. On a 64-bit port a
@@ -1108,6 +1105,8 @@ class HarborSdioController extends BridgeModule
           dataReg < Const(0, width: 32),
           dataValid < Const(0),
           rxCount < Const(0, width: rxPtrW + 1),
+          rxRd < Const(0, width: rxPtrW),
+          rxWr < Const(0, width: rxPtrW),
           byteInWord < Const(0, width: 2),
           wrNeedFill < Const(0),
           busWidthSel < Const(0, width: 2),
@@ -1764,16 +1763,9 @@ class HarborSdioController extends BridgeModule
             ]);
           }(),
 
-          // RX FIFO update, shift-FIFO discipline. Push and pop can land in the
-          // same cycle, so the count moves by the net of the two and both the
-          // shift and the tail insert must compose.
-          //
-          // On a pop the whole array shifts down toward index 0 by the number
-          // of words retired (1 or 2). The head therefore stays at index 0 and
-          // the four reads above need no muxes. On a push the new word goes at
-          // the tail, which the same-cycle shift has already moved to index
-          // (count - popped). That slot holds a word that is beyond the old
-          // valid range, so the tail insert overwrites it with no conflict.
+          // RX FIFO update. Push and pop can land in the same cycle, so the
+          // count moves by the net of the two. A push writes the RAM at
+          // [rxWr], a pop moves [rxRd] past the words it retires.
           //
           // The push is GATED on the FIFO having room. An ungated push past the
           // last slot would overwrite an entry nobody has read yet, so the
@@ -1782,13 +1774,8 @@ class HarborSdioController extends BridgeModule
           // `rx_fifo_count` is wide enough to hold depth+1, so one overflow
           // made `rx_full` compare false again and released the clock stall,
           // letting the corruption run away. Drop the word and say so instead.
-          for (var i = 0; i < rxDepth; i++)
-            rxFifo[i] <
-                mux(
-                  rxPushOk & rxTailIdx.eq(Const(i, width: rxPtrW + 1)),
-                  rxWord,
-                  rxShifted(i),
-                ),
+          rxWr < (rxWr + rxPushOk.zeroExtend(rxPtrW)),
+          rxRd < (rxRd.zeroExtend(rxPtrW + 1) + rxPopCount).getRange(0, rxPtrW),
           If(rxPush & rxFull & ~rxPop, then: [...setInt(intRxOverrun)]),
           // count' = count + (1 if pushed) - (words popped)
           rxCount <
@@ -2037,6 +2024,8 @@ class HarborSdioController extends BridgeModule
                               datState < Const(dIdle, width: 4),
                               datOeReg < Const(0),
                               rxCount < Const(0, width: rxPtrW + 1),
+                              rxRd < Const(0, width: rxPtrW),
+                              rxWr < Const(0, width: rxPtrW),
                               dmaTailWait < Const(0),
                               admaState < Const(aIdle, width: 3),
                               dataValid < Const(0),
@@ -2118,7 +2107,11 @@ class HarborSdioController extends BridgeModule
                           // the new block.
                           If(
                             bus.dataIn[8],
-                            then: [rxCount < Const(0, width: rxPtrW + 1)],
+                            then: [
+                              rxCount < Const(0, width: rxPtrW + 1),
+                              rxRd < Const(0, width: rxPtrW),
+                              rxWr < Const(0, width: rxPtrW),
+                            ],
                           ),
                           // Start the ADMA at command issue, so its first
                           // memory access overlaps the command and response.
