@@ -17,10 +17,19 @@ class _Shell extends Module {
     required bool inPlace,
   }) : super(name: 'shell') {
     final clk = addInput('clk', Logic());
-    final reset = addInput('reset', Logic());
-    final pushValid = addInput('push_valid', Logic());
-    final pushData = addInput('push_data', Logic(width: width), width: width);
-    final popReady = addInput('pop_ready', Logic());
+    // Every input goes through a flop, so the FIFO inputs change in the
+    // same tick as the clock edge, as they do behind real logic.
+    Logic flop(String name, int w) {
+      final q = Logic(name: '${name}_q', width: w);
+      Sequential(clk, [q < addInput(name, Logic(width: w), width: w)]);
+      addOutput('${name}_q', width: w) <= q;
+      return q;
+    }
+
+    final reset = flop('reset', 1);
+    final pushValid = flop('push_valid', 1);
+    final pushData = flop('push_data', width);
+    final popReady = flop('pop_ready', 1);
     fifo = HarborRegFifo(
       name: 'q',
       clk: clk,
@@ -36,6 +45,7 @@ class _Shell extends Module {
     addOutput('push_ready') <= fifo.pushReady;
     addOutput('pop_valid') <= fifo.popValid;
     addOutput('pop_data', width: width) <= fifo.popData;
+    addOutput('count', width: fifo.count.width) <= fifo.count;
   }
 }
 
@@ -55,7 +65,8 @@ bool _isRam(HarborRegFifo f) {
 
 // Random pushes, pops and data against a reference queue. Inputs change at
 // the negative edge, and each positive edge checks the values just before
-// it.
+// it. With [xStart], reset and push valid are X for the first edges. With
+// [midReset], reset comes again while the FIFO holds entries.
 Future<void> _run({
   required int seed,
   required int depth,
@@ -63,6 +74,8 @@ Future<void> _run({
   bool bypass = false,
   bool resetEntries = false,
   bool inPlace = false,
+  bool xStart = false,
+  bool midReset = false,
 }) async {
   final rng = Random(seed);
   final dut = _Shell(
@@ -84,9 +97,14 @@ Future<void> _run({
   final pushValid = dut.input('push_valid').srcConnection!;
   final pushData = dut.input('push_data').srcConnection!;
   final popReady = dut.input('pop_ready').srcConnection!;
+  final resetQ = dut.output('reset_q');
+  final pushValidQ = dut.output('push_valid_q');
+  final pushDataQ = dut.output('push_data_q');
+  final popReadyQ = dut.output('pop_ready_q');
   final pushReady = dut.output('push_ready');
   final popValid = dut.output('pop_valid');
   final popData = dut.output('pop_data');
+  final count = dut.output('count');
 
   final ref = Queue<LogicValue>();
   final errors = <String>[];
@@ -94,15 +112,24 @@ Future<void> _run({
   var pops = 0;
   Simulator.setMaxSimTime(200000);
   unawaited(Simulator.run());
-  reset.inject(1);
-  pushValid.inject(0);
+  reset.inject(xStart ? LogicValue.x : LogicValue.one);
+  pushValid.inject(xStart ? LogicValue.x : LogicValue.zero);
   popReady.inject(0);
   pushData.inject(0);
+  if (xStart) {
+    for (var i = 0; i < 3; i++) {
+      await clk.nextPosedge;
+    }
+    await clk.nextNegedge;
+    reset.inject(1);
+    pushValid.inject(0);
+  }
   for (var i = 0; i < 3; i++) {
     await clk.nextPosedge;
   }
   await clk.nextNegedge;
   reset.inject(0);
+  var midResetSeen = false;
 
   final pushRate = 0.2 + 0.8 * rng.nextDouble();
   final popRate = 0.2 + 0.8 * rng.nextDouble();
@@ -114,17 +141,37 @@ Future<void> _run({
             width,
           )
         : LogicValue.ofInt(rng.nextInt(1 << min(width, 31)), width);
-    pushValid.inject(rng.nextDouble() < pushRate ? 1 : 0);
-    popReady.inject(rng.nextDouble() < popRate ? 1 : 0);
+    // Before the mid-run reset, fill the FIFO.
+    final fill = midReset && cycle >= 680 && cycle < 700;
+    reset.inject(midReset && cycle >= 700 && cycle < 703 ? 1 : 0);
+    pushValid.inject(fill || rng.nextDouble() < pushRate ? 1 : 0);
+    popReady.inject(!fill && rng.nextDouble() < popRate ? 1 : 0);
     pushData.inject(full);
     await clk.nextPosedge;
 
-    final pv = pushValid.previousValue!.toBool();
-    final pd = pushData.previousValue!;
-    final pr = popReady.previousValue!.toBool();
+    final rst = resetQ.previousValue!;
+    final pv = pushValidQ.previousValue!.toBool();
+    final pd = pushDataQ.previousValue!;
+    final pr = popReadyQ.previousValue!.toBool();
     final ready = pushReady.previousValue!;
     final valid = popValid.previousValue!;
     final data = popData.previousValue!;
+    final cnt = count.previousValue!;
+    if (rst != LogicValue.zero) {
+      // This edge resets the FIFO.
+      if (midReset && cycle >= 700 && !midResetSeen) {
+        midResetSeen = true;
+        if (ref.length != depth) {
+          errors.add('cycle $cycle: reset found ${ref.length} entries');
+        }
+      }
+      ref.clear();
+      await clk.nextNegedge;
+      continue;
+    }
+    if (cnt != LogicValue.ofInt(ref.length, cnt.width)) {
+      errors.add('cycle $cycle: count $cnt, want ${ref.length}');
+    }
     final wantReady = ref.length < depth;
     final pushFire = pv && wantReady;
     final through = bypass && ref.isEmpty && pushFire;
@@ -141,6 +188,8 @@ Future<void> _run({
         errors.add('cycle $cycle: pop_data $data, want $head');
       }
     }
+    // With resetEntries, a stale head while pop_valid is low after a reset
+    // must not be X either.
     if (resetEntries && !data.isValid) {
       errors.add('cycle $cycle: pop_data $data has X');
     }
@@ -159,6 +208,7 @@ Future<void> _run({
   await Simulator.simulationEnded;
   await Simulator.reset();
   expect(errors, isEmpty);
+  if (midReset) expect(midResetSeen, isTrue);
   expect(pushes, greaterThan(100));
   expect(pops, greaterThan(100));
 }
@@ -190,6 +240,29 @@ void main() {
         }
       }
     }
+  }
+
+  for (final depth in [2, 4]) {
+    for (final resetEntries in [false, true]) {
+      test('depth $depth resetEntries $resetEntries, reset mid-run', () {
+        return _run(
+          seed: 11 + depth,
+          depth: depth,
+          width: 40,
+          resetEntries: resetEntries,
+          midReset: true,
+        );
+      });
+    }
+    test('depth $depth resetEntries true, X reset and push valid at start', () {
+      return _run(
+        seed: 21 + depth,
+        depth: depth,
+        width: 40,
+        resetEntries: true,
+        xStart: true,
+      );
+    });
   }
 
   test('inPlace keeps flop entries', () async {

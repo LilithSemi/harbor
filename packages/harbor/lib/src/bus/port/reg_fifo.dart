@@ -263,7 +263,10 @@ class _FifoRam extends Module with SystemVerilog {
     rdAddr.glitch.listen((_) => read());
     clk.posedge.listen((_) {
       final we = wrEn.previousValue ?? wrEn.value;
-      if (we == LogicValue.zero) return;
+      // With zeroInit, an X enable writes nothing, as `if (wr_en)` does in
+      // the SystemVerilog. The X comes from reset or a push valid that is
+      // X before the first edges, and the entries must stay known.
+      if (we == LogicValue.zero || (zeroInit && !we.isValid)) return;
       final wa = wrAddr.previousValue ?? wrAddr.value;
       if (we == LogicValue.one && wa.isValid && wa.toInt() < depth) {
         cells[wa.toInt()] = wrData.previousValue ?? wrData.value;
@@ -271,7 +274,14 @@ class _FifoRam extends Module with SystemVerilog {
         // An X enable or address can write any entry.
         cells.fillRange(0, depth, unknown);
       }
-      unawaited(Simulator.clkStable.first.then((_) => read()));
+      // The read waits for clkStable, so a flop that samples rd_data at this
+      // edge takes the value from before the edge. When the simulation
+      // ends first, the stream has no element and no read is needed.
+      unawaited(
+        Simulator.clkStable.first
+            .then((_) => read())
+            .catchError((_) {}, test: (e) => e is StateError),
+      );
     });
   }
 
