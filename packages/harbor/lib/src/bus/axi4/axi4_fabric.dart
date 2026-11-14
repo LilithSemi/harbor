@@ -4,6 +4,7 @@ import 'package:rohd/rohd.dart';
 import 'package:rohd_hcl/rohd_hcl.dart' show Axi4RespField;
 
 import '../../arith/fpu_config.dart' show harborStableDefinitionName;
+import '../bus.dart' show BusAddressRange;
 import '../fabric.dart';
 import '../fabric_util.dart';
 import '../port/fabric_kind.dart';
@@ -164,9 +165,13 @@ class _Tracker {
 
 /// An AXI4 fabric. Build it with [HarborFabric.build].
 ///
-/// - Each master port takes AW, AR and W into 2 entry FIFOs, and each slave
-///   port drives AW, AR and W from 2 entry FIFOs. B and R reach a master
-///   through 2 entry FIFOs.
+/// - Each master port takes AW, AR and W into 2 entry FIFOs, and each full
+///   AXI4 slave port drives AW, AR and W from 2 entry FIFOs. An AXI4-Lite
+///   slave port drives AW or AR from one shared entry and W from one entry.
+///   B and R reach a master through 2 entry FIFOs.
+/// - The FIFOs keep only the address bits that change inside a slave
+///   region. A slave still sees the full address, or its offset in the
+///   region.
 /// - A slave sees the master index on top of the master ID. A slave with
 ///   fewer ID bits gets IDs remapped: each full ID in flight holds one slave
 ///   ID, and a request waits when no slave ID is free.
@@ -182,7 +187,8 @@ class _Tracker {
 /// Ports can be [Axi4Interface] or [Axi4LiteInterface]:
 /// - An AXI4-Lite master sends ID 0, LEN 0, full width SIZE and INCR.
 /// - An AXI4-Lite slave has 1 request in flight, and the fabric keeps the
-///   ID. Its `outstanding` must be 1. A burst or a narrow access to it gets SLVERR on every beat.
+///   ID. Its `outstanding` must be 1. A burst or a narrow access to it gets
+///   SLVERR on every beat.
 ///
 /// Decode uses the start address of a burst only. A full AXI4 slave must
 /// accept any burst that starts in its region, so a full slave region under
@@ -305,10 +311,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
     final ma = [for (final m in masters) _masterPort(m)];
     final sa = <Axi4Interface>[];
+    final sLite = <Axi4LiteInterface?>[];
     for (final s in slaves) {
-      sa.add(_slavePort(c, r, s));
+      final (a, l) = _slavePort(s);
+      sa.add(a);
+      sLite.add(l);
       for (var k = 1; k < s.readChannels; k++) {
         sa.add(_slaveReadPort(s, k));
+        sLite.add(null);
       }
     }
     final tName = [
@@ -325,26 +335,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
     ];
     final tRemap = [for (var t = 0; t < nt; t++) tIdW[t] < fullIdWidth];
 
-    const restFields = [
-      'ADDR',
-      'LEN',
-      'SIZE',
-      'BURST',
-      'LOCK',
-      'CACHE',
-      'PROT',
-      'QOS',
-    ];
-    final restWidths = [
-      addrW,
-      Axi4Interface.lenWidth,
-      Axi4Interface.sizeWidth,
-      Axi4Interface.burstWidth,
+    // Requests keep only the address bits that differ inside the widest
+    // slave region. A slave path adds back the bits its region fixes.
+    final innerW = slaves.fold(
       1,
-      Axi4Interface.cacheWidth,
-      Axi4Interface.protWidth,
-      Axi4Interface.qosWidth,
-    ];
+      (w, s) => max(w, _regionBits(s.range, addrW)),
+    );
+    final restWidths = _restWidths(innerW);
     final restW = restWidths.reduce((a, b) => a + b);
     final rPayW = dataW + Axi4Interface.respWidth;
     const bPayW = Axi4Interface.respWidth;
@@ -399,6 +396,23 @@ class HarborAxi4Fabric extends HarborFabricModule {
       req.add([]);
       for (var dir = 0; dir < 2; dir++) {
         final d = dir == 0 ? 'AW' : 'AR';
+        // Decode comes before the FIFO, so the FIFO holds the target and
+        // the low address bits in place of the full address.
+        final addr = a.port('${d}ADDR');
+        final hits = [
+          for (final s in slaves)
+            masters[m].reaches(s.name) ? inRange(addr, s.range) : Const(0),
+        ];
+        // AW always targets channel 0. AR targets this master's assigned
+        // channel at the slave it hits.
+        final tgtIn = <Logic>[];
+        for (var s = 0; s < ns; s++) {
+          final chan = dir == 0 ? 0 : max(0, chanOf[s][m]);
+          for (var k = 0; k < chCount[s]; k++) {
+            tgtIn.add(k == chan ? hits[s] : Const(0));
+          }
+        }
+        tgtIn.add(~anyOf(hits));
         final f = HarborRegFifo(
           name: '${mn}_${d.toLowerCase()}',
           clk: c,
@@ -407,28 +421,19 @@ class HarborAxi4Fabric extends HarborFabricModule {
           pushValid: a.port('${d}VALID'),
           pushData: harborPack([
             a.port('${d}ID'),
-            for (final x in restFields) a.port('$d$x'),
+            indexOf(tgtIn, tW),
+            addr.getRange(0, innerW),
+            for (final x in _restFields.skip(1)) a.port('$d$x'),
           ]),
           popReady: mPop[m][dir],
         );
         a.port('${d}READY') <= f.pushReady;
-        final [hid, rest] = harborUnpack(f.popData, [a.idWidth, restW]);
-        final addr = rest.getRange(0, addrW);
-        final hits = [
-          for (final s in slaves)
-            masters[m].reaches(s.name) ? inRange(addr, s.range) : Const(0),
-        ];
-        // AW always targets channel 0. AR targets this master's assigned
-        // channel at the slave it hits.
-        final tgt = <Logic>[];
-        for (var s = 0; s < ns; s++) {
-          final chan = dir == 0 ? 0 : max(0, chanOf[s][m]);
-          for (var k = 0; k < chCount[s]; k++) {
-            tgt.add(k == chan ? hits[s] : Const(0));
-          }
-        }
-        tgt.add(~anyOf(hits));
-        final tgtIdx = indexOf(tgt, tW);
+        final [hid, tgtIdx, rest] = harborUnpack(f.popData, [
+          a.idWidth,
+          tW,
+          restW,
+        ]);
+        final tgt = decodeIndex(tgtIdx, nt);
         final full = pW > 0
             ? [Const(m, width: pW), hid.zeroExtend(maxId)].concat()
             : hid.zeroExtend(maxId);
@@ -671,6 +676,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
         r,
         p: tName[t],
         s: sa[t],
+        lite: sLite[t],
         outstanding: tN[t],
         timeout: slaves[tSlave[t]].timeout,
         aw: tReq[t][0],
@@ -684,7 +690,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
         b: bResp[t],
         rd: rResp[t],
         addrW: addrW,
-        base: slaves[tSlave[t]].base,
+        innerW: innerW,
+        range: slaves[tSlave[t]].range,
+        offset: slaves[tSlave[t]].offset,
       );
       if (x != null) dead.add(x);
     }
@@ -701,7 +709,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
       wReady: wReady[nst],
       b: bResp[nst],
       rd: rResp[nst],
-      addrW: addrW,
+      innerW: innerW,
       dataW: dataW,
     );
     output('bus_error') <= anyOf(dead);
@@ -806,6 +814,15 @@ class HarborAxi4Fabric extends HarborFabricModule {
   // AW, AR and W FIFOs to one slave, and the timeout guard when the slave
   // has a timeout. Returns the guard's cut off flag.
   //
+  // The FIFOs keep only the address bits that change in the slave region.
+  // The slave sees the full address, or its offset in the region.
+  //
+  // An AXI4-Lite slave [lite] has 1 request in flight. Its AW and AR share
+  // one entry, which stays until the response ends, and its W has one
+  // entry. [s] then only carries the handshakes and responses for the
+  // guard. A burst or a narrow access gets SLVERR on every beat without the
+  // slave.
+  //
   // The guard keeps a record of each request in flight. When the slave owes
   // something and shows no progress for `timeout` cycles, the guard cuts it
   // off until reset: it ends every request in flight and every later one
@@ -816,6 +833,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     Logic r, {
     required String p,
     required Axi4Interface s,
+    required Axi4LiteInterface? lite,
     required int outstanding,
     required int timeout,
     required _Req aw,
@@ -829,91 +847,106 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required _Resp b,
     required _Resp rd,
     required int addrW,
-    required int base,
+    required int innerW,
+    required BusAddressRange range,
+    required bool offset,
   }) {
     final guard = timeout > 0;
     final dead = guard ? Logic(name: '${p}_cut_off') : Const(0);
-    final reqWidths = [
-      s.idWidth,
-      addrW,
-      Axi4Interface.lenWidth,
-      Axi4Interface.sizeWidth,
-      Axi4Interface.burstWidth,
-      1,
-      Axi4Interface.cacheWidth,
-      Axi4Interface.protWidth,
-      Axi4Interface.qosWidth,
-    ];
-    const reqFields = [
-      'ID',
-      'ADDR',
-      'LEN',
-      'SIZE',
-      'BURST',
-      'LOCK',
-      'CACHE',
-      'PROT',
-      'QOS',
-    ];
-    final fifos = <HarborRegFifo>[];
-    for (final (d, x, sid, ready) in [
-      ('AW', aw, awSid, awReady),
-      ('AR', ar, arSid, arReady),
-    ]) {
-      final valid = Logic(name: '${p}_${d.toLowerCase()}_pop');
-      final f = HarborRegFifo(
-        name: '${p}_${d.toLowerCase()}',
+    final k = _regionBits(range, addrW);
+    final restWidths = _restWidths(innerW);
+    Logic slaveAddr(Logic low) => _slaveAddr(low, range, offset, addrW);
+    final Logic arPending;
+    final Logic wPending;
+    if (lite == null) {
+      final fifos = <HarborRegFifo>[];
+      for (final (d, x, sid, ready) in [
+        ('AW', aw, awSid, awReady),
+        ('AR', ar, arSid, arReady),
+      ]) {
+        final valid = Logic(name: '${p}_${d.toLowerCase()}_pop');
+        final [addr, ...more] = harborUnpack(x.rest, restWidths);
+        final f = HarborRegFifo(
+          name: '${p}_${d.toLowerCase()}',
+          clk: c,
+          reset: r,
+          depth: 2,
+          pushValid: x.valid & ~dead,
+          pushData: harborPack([sid, addr.getRange(0, k), ...more]),
+          popReady: s.port('${d}READY') & valid,
+          resetEntries: true,
+        );
+        final [id, low, ...fields] = harborUnpack(f.popData, [
+          s.idWidth,
+          k,
+          ...restWidths.skip(1),
+        ]);
+        s.port('${d}ID') <= id;
+        s.port('${d}ADDR') <= slaveAddr(low);
+        for (var i = 1; i < _restFields.length; i++) {
+          s.port('$d${_restFields[i]}') <= fields[i - 1];
+        }
+        // A cut off slave never sees the requests still queued for it.
+        valid <=
+            cutValid(
+              '${p}_${d.toLowerCase()}',
+              c,
+              r,
+              f.popValid,
+              s.port('${d}READY'),
+              dead,
+            );
+        s.port('${d}VALID') <= valid;
+        ready <= f.pushReady | dead;
+        fifos.add(f);
+      }
+      arPending = fifos[1].popValid;
+      final wValid = Logic(name: '${p}_w_pop');
+      final wF = HarborRegFifo(
+        name: '${p}_w',
         clk: c,
         reset: r,
         depth: 2,
-        pushValid: x.valid & ~dead,
-        pushData: harborPack([sid, x.rest]),
-        popReady: s.port('${d}READY') & valid,
+        pushValid: w.valid & ~dead,
+        pushData: w.data,
+        popReady: s.wReady & wValid,
         resetEntries: true,
       );
-      final fields = harborUnpack(f.popData, reqWidths);
-      for (var i = 0; i < reqFields.length; i++) {
-        s.port('$d${reqFields[i]}') <=
-            (reqFields[i] == 'ADDR' && base != 0
-                ? fields[i] - Const(base, width: addrW)
-                : fields[i]);
-      }
-      // A cut off slave never sees the requests still queued for it.
-      valid <=
-          cutValid(
-            '${p}_${d.toLowerCase()}',
-            c,
-            r,
-            f.popValid,
-            s.port('${d}READY'),
-            dead,
-          );
-      s.port('${d}VALID') <= valid;
-      ready <= f.pushReady | dead;
-      fifos.add(f);
+      wValid <= cutValid('${p}_w', c, r, wF.popValid, s.wReady, dead);
+      final [wData, wStrb, wLast] = harborUnpack(wF.popData, [
+        s.dataWidth,
+        s.dataWidth ~/ 8,
+        1,
+      ]);
+      s.wValid <= wValid;
+      s.wData <= wData;
+      s.wStrb <= wStrb;
+      s.wLast <= wLast;
+      wReady <= wF.pushReady | dead;
+      wPending = wF.popValid;
+    } else {
+      final pending = _litePath(
+        c,
+        r,
+        p: p,
+        s: s,
+        l: lite,
+        aw: aw,
+        awSid: awSid,
+        ar: ar,
+        arSid: arSid,
+        w: w,
+        awReady: awReady,
+        arReady: arReady,
+        wReady: wReady,
+        dead: dead,
+        k: k,
+        restWidths: restWidths,
+        slaveAddr: slaveAddr,
+      );
+      arPending = pending.$1;
+      wPending = pending.$2;
     }
-    final wValid = Logic(name: '${p}_w_pop');
-    final wF = HarborRegFifo(
-      name: '${p}_w',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: w.valid & ~dead,
-      pushData: w.data,
-      popReady: s.wReady & wValid,
-      resetEntries: true,
-    );
-    wValid <= cutValid('${p}_w', c, r, wF.popValid, s.wReady, dead);
-    final [wData, wStrb, wLast] = harborUnpack(wF.popData, [
-      s.dataWidth,
-      s.dataWidth ~/ 8,
-      1,
-    ]);
-    s.wValid <= wValid;
-    s.wData <= wData;
-    s.wStrb <= wStrb;
-    s.wLast <= wLast;
-    wReady <= wF.pushReady | dead;
 
     if (!guard) {
       b.valid <= s.bValid;
@@ -1004,8 +1037,8 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
     // A new record counts the records of the same ID and direction ahead
     // of it. A record that ends lets the others of its ID move up.
-    final awLen = aw.rest.getRange(addrW, addrW + lenW);
-    final arLen = ar.rest.getRange(addrW, addrW + lenW);
+    final awLen = aw.rest.getRange(innerW, innerW + lenW);
+    final arLen = ar.rest.getRange(innerW, innerW + lenW);
     final awAhead = countOf([
       for (var i = 0; i < n; i++)
         ev[i] & isW[i] & gid[i].eq(awSid) & ~bDoneOh[i],
@@ -1043,8 +1076,8 @@ class HarborAxi4Fabric extends HarborFabricModule {
     // from the slave restarts the timer.
     final busy =
         anyOf([for (var i = 0; i < n; i++) ev[i] & (~isW[i] | wdone[i])]) |
-        fifos[1].popValid |
-        wF.popValid;
+        arPending |
+        wPending;
     final progress =
         (s.awValid & s.awReady) |
         (s.arValid & s.arReady) |
@@ -1106,7 +1139,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required Logic wReady,
     required _Resp b,
     required _Resp rd,
-    required int addrW,
+    required int innerW,
     required int dataW,
   }) {
     const lenW = Axi4Interface.lenWidth;
@@ -1127,7 +1160,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
       reset: r,
       depth: errorOutstanding,
       pushValid: ar.valid,
-      pushData: harborPack([arSid, ar.rest.getRange(addrW, addrW + lenW)]),
+      pushData: harborPack([arSid, ar.rest.getRange(innerW, innerW + lenW)]),
       popReady: rd.fire & rd.last,
     );
     arReady <= arF.pushReady;
@@ -1286,13 +1319,16 @@ class HarborAxi4Fabric extends HarborFabricModule {
     return a;
   }
 
-  // The slave port as AXI4. An AXI4-Lite slave sits behind [_liteSlave].
-  Axi4Interface _slavePort(Logic c, Logic r, HarborFabricSlave s) {
+  // The slave port as AXI4. For an AXI4-Lite slave, the AXI4 side only
+  // carries handshakes and responses, and the slave path drives the port.
+  (Axi4Interface, Axi4LiteInterface?) _slavePort(HarborFabricSlave s) {
     final i = s.interface;
     String uniq(String n) => '${s.name}_$n';
     if (i is Axi4Interface) {
-      return i.clone()
-        ..pairConnectIO(this, i, PairRole.provider, uniquify: uniq);
+      return (
+        i.clone()..pairConnectIO(this, i, PairRole.provider, uniquify: uniq),
+        null,
+      );
     }
     final l = (i as Axi4LiteInterface).clone()
       ..pairConnectIO(this, i, PairRole.provider, uniquify: uniq);
@@ -1301,8 +1337,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
       dataWidth: l.dataWidth,
       idWidth: fullIdWidth,
     );
-    _liteSlave(c, r, p: s.name, a: a, l: l);
-    return a;
+    return (a, l);
   }
 
   // A read-only target for channel [k] (k >= 1) of slave [s]. Presented
@@ -1352,89 +1387,199 @@ class HarborAxi4Fabric extends HarborFabricModule {
   static Logic _fullSize(int dataW) =>
       Const((dataW ~/ 8).bitLength - 1, width: Axi4Interface.sizeWidth);
 
-  // Drives the AXI4-Lite slave [l] from the AXI4 side [a] of a slave path
-  // with 1 request in flight. It keeps the ID, and answers a burst or a
-  // narrow access with SLVERR on every beat without the slave.
-  static void _liteSlave(
+  // Serves the AXI4-Lite slave [l] for a slave path, and drives the
+  // handshakes and responses on [s]. Returns the AR and W pending flags for
+  // the guard.
+  static (Logic, Logic) _litePath(
     Logic c,
     Logic r, {
     required String p,
-    required Axi4Interface a,
+    required Axi4Interface s,
     required Axi4LiteInterface l,
+    required _Req aw,
+    required Logic awSid,
+    required _Req ar,
+    required Logic arSid,
+    required _WBeat w,
+    required Logic awReady,
+    required Logic arReady,
+    required Logic wReady,
+    required Logic dead,
+    required int k,
+    required List<int> restWidths,
+    required Logic Function(Logic) slaveAddr,
   }) {
     const lenW = Axi4Interface.lenWidth;
-    final held = Logic(name: '${p}_lite_held');
-    final isW = Logic(name: '${p}_lite_write');
-    final bad = Logic(name: '${p}_lite_bad');
-    final id = Logic(name: '${p}_lite_id', width: a.idWidth);
-    final len = Logic(name: '${p}_lite_len', width: lenW);
-    final addr = Logic(name: '${p}_lite_addr', width: a.addressWidth);
-    final prot = Logic(name: '${p}_lite_prot', width: Axi4Interface.protWidth);
+    const protW = Axi4Interface.protWidth;
+    final size = _fullSize(s.dataWidth);
+    final slvErr = _resp(Axi4RespField.slvErr);
+    Logic entry(_Req x, Logic sid) {
+      final [addr, len, sz, _, _, _, prot, _] = harborUnpack(
+        x.rest,
+        restWidths,
+      );
+      return harborPack([
+        sid,
+        addr.getRange(0, k),
+        len,
+        len.neq(0) | sz.neq(size),
+        prot,
+      ]);
+    }
+
+    // The fabric fires AW or AR at a slave with 1 request in flight only
+    // when nothing is in flight, so both never come in one cycle.
+    final done = Logic(name: '${p}_lite_done');
+    final req = HarborRegFifo(
+      name: '${p}_req',
+      clk: c,
+      reset: r,
+      depth: 1,
+      pushValid: (aw.valid | ar.valid) & ~dead,
+      pushData: harborPack([
+        mux(aw.valid, entry(aw, awSid), entry(ar, arSid)),
+        aw.valid,
+      ]),
+      popReady: done,
+      resetEntries: true,
+    );
+    awReady <= req.pushReady | dead;
+    arReady <= req.pushReady | dead;
+    final [id, low, len, bad, prot, isW] = harborUnpack(req.popData, [
+      s.idWidth,
+      k,
+      lenW,
+      1,
+      protW,
+      1,
+    ]);
+    // A cut off slave never sees a request it was not shown.
+    final held = cutValid('${p}_req', c, r, req.popValid, done, dead);
+
+    final wValid = Logic(name: '${p}_w_pop');
+    final wF = HarborRegFifo(
+      name: '${p}_w',
+      clk: c,
+      reset: r,
+      depth: 1,
+      pushValid: w.valid & ~dead,
+      pushData: w.data,
+      popReady: s.wReady & wValid,
+      resetEntries: true,
+    );
+    wValid <= cutValid('${p}_w', c, r, wF.popValid, s.wReady, dead);
+    final [wData, wStrb, wLast] = harborUnpack(wF.popData, [
+      s.dataWidth,
+      s.dataWidth ~/ 8,
+      1,
+    ]);
+    wReady <= wF.pushReady | dead;
+
     final aSent = Logic(name: '${p}_lite_a_sent');
     final wSent = Logic(name: '${p}_lite_w_sent');
     final beat = Logic(name: '${p}_lite_beat', width: lenW);
-    final size = _fullSize(a.dataWidth);
-    final slvErr = _resp(Axi4RespField.slvErr);
-
-    final takeAw = a.awValid & ~held;
-    final takeAr = a.arValid & ~held & ~a.awValid;
-    a.awReady <= ~held;
-    a.arReady <= ~held & ~a.awValid;
-
     final good = held & ~bad;
-    final wr = held & isW;
-    final rd = held & ~isW;
+    final addr = slaveAddr(low);
     l.awValid <= good & isW & ~aSent;
     l.awAddr <= addr;
     l.awProt <= prot;
     l.arValid <= good & ~isW & ~aSent;
     l.arAddr <= addr;
     l.arProt <= prot;
-    l.wValid <= good & isW & ~wSent & a.wValid;
-    l.wData <= a.wData;
-    l.wStrb <= a.wStrb;
-    a.wReady <= wr & ~wSent & (bad | l.wReady);
+    l.wValid <= good & isW & ~wSent & wValid;
+    l.wData <= wData;
+    l.wStrb <= wStrb;
 
-    a.bValid <= wr & mux(bad, wSent, l.bValid);
-    a.bId <= id;
-    a.bResp <= mux(bad, slvErr, l.bResp);
-    l.bReady <= good & isW & a.bReady;
-    a.rValid <= rd & (bad | l.rValid);
-    a.rId <= id;
-    a.rData <= mux(bad, Const(0, width: a.dataWidth), l.rData);
-    a.rResp <= mux(bad, slvErr, l.rResp);
-    a.rLast <= ~bad | beat.eq(len);
-    l.rReady <= good & ~isW & a.rReady;
+    s.awValid <= held & isW;
+    s.arValid <= held & ~isW;
+    s.wValid <= wValid;
+    s.wLast <= wLast;
+    s.wReady <= held & isW & ~wSent & (bad | l.wReady);
+    s.bValid <= held & isW & mux(bad, wSent, l.bValid);
+    s.bId <= id;
+    s.bResp <= mux(bad, slvErr, l.bResp);
+    l.bReady <= good & isW & s.bReady;
+    s.rValid <= held & ~isW & (bad | l.rValid);
+    s.rId <= id;
+    s.rData <= mux(bad, Const(0, width: s.dataWidth), l.rData);
+    s.rResp <= mux(bad, slvErr, l.rResp);
+    s.rLast <= ~bad | beat.eq(len);
+    l.rReady <= good & ~isW & s.rReady;
+    final bFire = s.bValid & s.bReady;
+    final rFire = s.rValid & s.rReady;
+    done <= bFire | (rFire & s.rLast);
+    // The entry leaves when its response ends, so the guard sees the AW or
+    // AR handshake then.
+    s.awReady <= bFire;
+    s.arReady <= rFire & s.rLast;
 
-    Logic badOf(String d) =>
-        a.port('${d}LEN').neq(0) | a.port('${d}SIZE').neq(size);
-    final rFire = a.rValid & a.rReady;
     Sequential(c, reset: r, [
       If.block([
-        Iff(takeAw | takeAr, [
-          held < 1,
-          isW < takeAw,
-          id < mux(takeAw, a.awId, a.arId),
-          len < mux(takeAw, a.awLen, a.arLen),
-          addr < mux(takeAw, a.awAddr, a.arAddr),
-          prot < mux(takeAw, a.awProt, a.arProt),
-          bad < mux(takeAw, badOf('AW'), badOf('AR')),
-          aSent < 0,
-          wSent < 0,
-          beat < 0,
-        ]),
-        ElseIf((a.bValid & a.bReady) | (rFire & a.rLast), [held < 0]),
+        Iff(done, [aSent < 0, wSent < 0, beat < 0]),
         Else([
           If(
             (l.awValid & l.awReady) | (l.arValid & l.arReady),
             then: [aSent < 1],
           ),
-          If(a.wValid & a.wReady & a.wLast, then: [wSent < 1]),
+          If(s.wValid & s.wReady & s.wLast, then: [wSent < 1]),
           If(rFire, then: [beat < beat + 1]),
         ]),
       ]),
     ]);
+    return (req.popValid & ~isW, wF.popValid);
   }
+
+  // Bits below which the addresses of [range] differ. The bits above are
+  // the same for every address in it.
+  static int _regionBits(BusAddressRange range, int addrW) {
+    final first = BigInt.from(range.start);
+    final last = first + BigInt.from(range.size) - BigInt.one;
+    return min(addrW, max(1, (first ^ last).bitLength));
+  }
+
+  // The address a slave sees for an address in [range] with low bits [low]:
+  // the full address, or the offset from the start of [range] when
+  // [offset] is set.
+  static Logic _slaveAddr(
+    Logic low,
+    BusAddressRange range,
+    bool offset,
+    int addrW,
+  ) {
+    final k = low.width;
+    final start = BigInt.from(range.start);
+    if (offset) {
+      final startLow = start & ((BigInt.one << k) - BigInt.one);
+      final off = startLow == BigInt.zero
+          ? low
+          : low - Const(startLow, width: k);
+      return off.zeroExtend(addrW);
+    }
+    if (k >= addrW) return low;
+    return [Const(start >> k, width: addrW - k), low].concat();
+  }
+
+  static const _restFields = [
+    'ADDR',
+    'LEN',
+    'SIZE',
+    'BURST',
+    'LOCK',
+    'CACHE',
+    'PROT',
+    'QOS',
+  ];
+
+  static List<int> _restWidths(int addrW) => [
+    addrW,
+    Axi4Interface.lenWidth,
+    Axi4Interface.sizeWidth,
+    Axi4Interface.burstWidth,
+    1,
+    Axi4Interface.cacheWidth,
+    Axi4Interface.protWidth,
+    Axi4Interface.qosWidth,
+  ];
 
   static String _definitionName(
     HarborFabricTopology topology,

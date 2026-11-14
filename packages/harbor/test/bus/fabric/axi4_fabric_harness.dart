@@ -51,6 +51,9 @@ class SlaveCfg {
   /// Read channels on this slave: 1 is the full port alone, 2 or more adds
   /// read-only ports.
   final int readChannels;
+
+  /// The slave sees addresses minus [base].
+  final bool offset;
   const SlaveCfg(
     this.name,
     this.idWidth,
@@ -60,7 +63,11 @@ class SlaveCfg {
     this.timeout = 0,
     this.lite = false,
     this.readChannels = 1,
+    this.offset = false,
   });
+
+  /// The address this slave sees for [addr].
+  int see(int addr) => offset ? addr - base : addr;
 }
 
 PairInterface _intf(int idWidth, bool lite) => lite
@@ -154,6 +161,7 @@ class FabricShell extends BridgeModule {
           timeout: s.timeout,
           memory: !s.lite,
           readInterfaces: readIntfs,
+          offset: s.offset,
         ),
       );
     }
@@ -328,8 +336,9 @@ class Bench {
   void checkRegions() {
     for (final s in slaveCfgs) {
       final m = memories[s.name]!;
+      final lo = s.see(s.base);
       for (final x in [...m.awOrder, ...m.arOrder]) {
-        if (x.addr < s.base || x.addr >= s.base + s.size) {
+        if (x.addr < lo || x.addr >= lo + s.size) {
           errors.add('${s.name} got $x outside its region');
         }
       }
