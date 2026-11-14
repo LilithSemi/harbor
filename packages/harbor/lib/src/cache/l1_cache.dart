@@ -76,7 +76,8 @@ class _L1TagStore {
 
 /// Line valid bits in a RAM with one write port and asynchronous read ports.
 /// Synthesis maps it to LUT RAM, so the valid bits need no per-line enable.
-/// Cells start at X, as in SystemVerilog.
+/// Cells start at X, as in SystemVerilog. The simulation model samples the
+/// write port on the rising clock edge, before the flops change.
 class _L1ValidRam extends Module with SystemVerilog {
   final int width;
   final int depth;
@@ -167,9 +168,12 @@ endmodule''';
 /// A reset or a flush starts a sweep that writes zero to each word, one word
 /// per cycle. The sweep ends [sweepCycles] cycles after the last reset or
 /// flush cycle. While [sweeping] is high the cache must answer no lookup and
-/// must not set a valid bit. The one update port sets or clears the bit of one line with a
-/// read, modify and write of its word. A reset, a flush or a sweep drops the
-/// update.
+/// must not set a valid bit.
+///
+/// The one update port sets or clears the bit of one line. The update goes
+/// into flops and writes the next cycle, with a read, modify and write of its
+/// word, so the cache must answer no lookup in the cycle after an update. A
+/// reset, a flush or a sweep drops the update.
 class _L1ValidBits {
   /// High while the sweep runs.
   final Logic sweeping = Logic(name: 'validSweeping');
@@ -206,6 +210,9 @@ class _L1ValidBits {
         bitBits == 0 ? word[0] : word[idx.slice(bitBits - 1, 0)];
 
     final clear = (reset | flush).named('validClear');
+    final updEnQ = Logic(name: 'validUpdEnQ');
+    final updIdxQ = Logic(name: 'validUpdIdxQ', width: updateIdx.width);
+    final updValueQ = Logic(name: 'validUpdValueQ');
     final sweepIdx = Logic(name: 'validSweepIdx', width: addrWidth);
     final wrEn = Logic(name: 'validWrEn');
     final wrAddr = Logic(name: 'validWrAddr', width: addrWidth);
@@ -217,7 +224,7 @@ class _L1ValidBits {
       wrEn: wrEn,
       wrAddr: wrAddr,
       wrData: wrData,
-      rdAddr: [...lookups.map(wordOf), wordOf(updateIdx)],
+      rdAddr: [...lookups.map(wordOf), wordOf(updIdxQ)],
     );
     for (var i = 0; i < lookups.length; i++) {
       bits.valid.add(bitOf(lookups[i], ram.rdData(i)));
@@ -226,21 +233,24 @@ class _L1ValidBits {
     final old = ram.rdData(lookups.length);
     final mask = bitBits == 0
         ? Const(1)
-        : (Const(1, width: width) << updateIdx.slice(bitBits - 1, 0));
-    wrEn <= ~clear & (bits.sweeping | updateEn);
-    wrAddr <= mux(bits.sweeping, sweepIdx, wordOf(updateIdx));
+        : (Const(1, width: width) << updIdxQ.slice(bitBits - 1, 0));
+    wrEn <= ~clear & (bits.sweeping | updEnQ);
+    wrAddr <= mux(bits.sweeping, sweepIdx, wordOf(updIdxQ));
     wrData <=
         mux(
           bits.sweeping,
           Const(0, width: width),
-          mux(updateValue, old | mask, old & ~mask),
+          mux(updValueQ, old | mask, old & ~mask),
         );
 
     Sequential(clk, [
+      updIdxQ < updateIdx,
+      updValueQ < updateValue,
       If(
         clear,
-        then: [bits.sweeping < 1, sweepIdx < 0],
+        then: [bits.sweeping < 1, sweepIdx < 0, updEnQ < 0],
         orElse: [
+          updEnQ < updateEn,
           If(
             bits.sweeping,
             then: [
@@ -651,6 +661,7 @@ class HarborL1ICache extends BridgeModule {
         (dualPort
             ? (hit.zeroExtend(2) + hit1.zeroExtend(2)).named('perfAccessCount')
             : hit);
+    final fillStart = (wantFill & ~drain & ~flush & ~reset).named('fillStart');
     perfMiss <= wantFill & ~filling;
     if (dualPort) {
       respData1 <= ramRead(1);
@@ -684,7 +695,7 @@ class HarborL1ICache extends BridgeModule {
     final fillValidSet = (fillWrEn & fillWord.eq(lastWord)).named(
       'fillValidSet',
     );
-    validUpdateEn <= fillValidSet | (wantFill & ~drain);
+    validUpdateEn <= fillValidSet | fillStart;
     validUpdateIdx <= mux(fillValidSet, fillIdx, idxOf(fillAddr));
     validUpdateValue <= fillValidSet;
 
@@ -1267,8 +1278,9 @@ class HarborL1DCache extends BridgeModule {
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
     // Fill completion, acknowledged stores, and miss-victim invalidation are
-    // mutually exclusive FSM events. Select their index/value once so the
-    // per-line valid bank needs only one equality decoder instead of three.
+    // mutually exclusive FSM events, so they share the one valid update port.
+    // Each one is followed by a cycle with no lookup (fillSettle, storeDone or
+    // filling), which the registered update needs.
     fillValidSet <= fillWrEn & fillWord.eq(lastWord);
     final storeValidClear = (storing & memDone & memValid & storeInv).named(
       'storeValidClear',
