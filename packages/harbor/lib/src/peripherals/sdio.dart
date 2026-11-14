@@ -1150,6 +1150,14 @@ class HarborSdioController extends BridgeModule
           CaseItem(Const(i, width: 4), [readWord < readValues[i]]),
       ]),
     ]);
+    // The card did not answer the command in time.
+    final cmdTimeoutNow =
+        (state.eq(Const(sWait, width: 3)) &
+                respEdge &
+                cmdIn &
+                toCnt.eq(Const(respTimeout, width: 16)))
+            .named('cmd_timeout_now');
+
     // INT_STATUS bits a write clears in this cycle.
     final intClear =
         ((busAccess & bus.we & regIndex.eq(Const(0x0C, width: 9))).replicate(
@@ -2048,7 +2056,12 @@ class HarborSdioController extends BridgeModule
             ]),
           ]),
           // An error response stops the walker. Writes already sent finish.
-          If(dmaFault, then: [admaState < Const(aIdle, width: 3)]),
+          // A command with no response stops it too, so a later PIO
+          // transfer finds no DMA work left.
+          If(
+            dmaFault | cmdTimeoutNow,
+            then: [admaState < Const(aIdle, width: 3)],
+          ),
           // A parked walker in a DMA card write feeds zero words, so the
           // serializer reaches the end of the block count.
           If(
@@ -2165,10 +2178,12 @@ class HarborSdioController extends BridgeModule
                           state < Const(sSend, width: 3),
                           // Start every data phase with an empty RX FIFO, so
                           // a word left by an earlier transfer cannot shift
-                          // the new block.
+                          // the new block, and with a parked walker. A DMA
+                          // command below starts the walker again.
                           If(
                             bus.dataIn[8],
                             then: [
+                              admaState < Const(aIdle, width: 3),
                               rxCount < Const(0, width: rxPtrW + 1),
                               rxRd < Const(0, width: rxPtrW),
                               rxWr < Const(0, width: rxPtrW),

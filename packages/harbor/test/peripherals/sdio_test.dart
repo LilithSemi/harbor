@@ -598,6 +598,55 @@ void main() {
       await Simulator.endSimulation();
     });
 
+    test('a DMA command that times out leaves no ADMA work for PIO', () async {
+      await setUpDut();
+      Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+      await busWrite(_blkSize, 4);
+      await busWrite(_admaAddr, 0x40);
+      // A direct DMA read. The card never answers.
+      cmdIn.inject(1);
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
+      for (var i = 0; i < 6000; i++) {
+        await clk.nextPosedge;
+        if (irq.value.toInt() == 1) break;
+      }
+      expect(await busRead(_intStatus) & 0x10, 0x10);
+      await busWrite(_intStatus, 0x1FF);
+      expect(sig('adma_state').value.toInt(), 0);
+
+      // A PIO read of one word. No DMA request may go out.
+      var dmaReqs = 0;
+      final sub = clk.posedge.listen((_) {
+        if (sig('dma_req_valid').value.toInt() == 1) dmaReqs++;
+      });
+      const word = 0x600DF00D;
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      final stream = [..._resp48(0), ..._fourBitStream(word), 0xF];
+      var sawDrive = false;
+      var idx = 0;
+      for (var i = 0; i < 6000 && idx < stream.length; i++) {
+        await clk.nextPosedge;
+        final sending = cmdOe.value.toInt() == 1;
+        if (sending) sawDrive = true;
+        if (sawDrive && !sending && sdClk.value.toInt() == 0) {
+          if (idx < 48) {
+            cmdIn.inject(stream[idx]);
+          } else {
+            datIn.inject(stream[idx]);
+          }
+          idx++;
+        }
+      }
+      for (var i = 0; i < 50; i++) {
+        await clk.nextPosedge;
+      }
+      await sub.cancel();
+      expect(dmaReqs, 0);
+      expect(await busRead(_data), word);
+      await Simulator.endSimulation();
+    });
+
     test('RESP0-3 follow the type of the last response', () async {
       await setUpDut();
       const words = [0x11112222, 0x33334444, 0x55556666, 0x77778888];
