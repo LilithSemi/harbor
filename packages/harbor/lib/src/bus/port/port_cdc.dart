@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:rohd/rohd.dart';
 
 import '../../clock/cdc.dart';
@@ -660,11 +662,13 @@ class _Fifo {
 /// A gray pointer FIFO between two clocks, for a waist crossing whose two
 /// sides can sit far from the logic that uses them.
 ///
-/// It has the cycle timing of a flop array [HarborCdcFifo]. The outputs are
-/// flops: `rd_data` is a head register that holds the entry at the read
-/// pointer. `wr_full_push` and `wr_full_hold` give the next full flag with
-/// and without a push, and `rd_empty_pop` and `rd_empty_hold` the next empty
-/// flag with and without a pop. With `trustWrite` or `trustRead`, the user
+/// It has the cycle timing of a flop array [HarborCdcFifo]. The entries are
+/// in a RAM with an asynchronous read port, which is distributed RAM on
+/// Xilinx and ECP5. The outputs are flops: `rd_data` is a head register
+/// that holds the entry at the read pointer. `wr_full_push` and
+/// `wr_full_hold` give the next full flag with and without a push, and
+/// `rd_empty_pop` and `rd_empty_hold` the next empty flag with and without a
+/// pop. With `trustWrite` or `trustRead`, the user
 /// gives that enable only when the FIFO can take it. Each side makes its next state for both values of its enable
 /// ahead, so `wr_en` and `rd_en` only select one.
 class HarborWaistCdcFifo extends Module {
@@ -703,31 +707,11 @@ class HarborWaistCdcFifo extends Module {
 
     final pw = depth.bitLength;
     Logic gray(Logic b) => b ^ (b >>> 1);
-    Logic rotate(Logic x) => [x.getRange(0, depth - 1), x[depth - 1]].concat();
-    Logic pickBinary(Logic sel, List<Logic> v) {
-      var level = List<Logic>.from(v);
-      var bit = 0;
-      while (level.length > 1) {
-        final next = <Logic>[];
-        for (var i = 0; i < level.length; i += 2) {
-          next.add(mux(sel[bit], level[i + 1], level[i]));
-        }
-        level = next;
-        bit++;
-      }
-      return level.single;
-    }
-
-    final mem = [
-      for (var i = 0; i < depth; i++) Logic(name: 'mem_$i', width: width),
-    ];
-
     // Write side.
     final wrPtr = Logic(name: 'wr_ptr', width: pw);
     final rdGray = Logic(name: 'rd_ptr_gray', width: pw);
     final wrGray = Logic(name: 'wr_ptr_gray', width: pw);
     final wrFull = Logic(name: 'wr_full_reg');
-    final wrSel = Logic(name: 'wr_sel', width: depth);
     final rdGraySync0 = Logic(name: 'rd_gray_sync0', width: pw);
     final rdGraySync = Logic(name: 'rd_ptr_gray_sync', width: pw);
     // Full: the write gray equals the read gray with the top 2 bits
@@ -743,8 +727,6 @@ class HarborWaistCdcFifo extends Module {
     addOutput('wr_full_push') <= ~wrReset & fullAt(wrGray1);
     addOutput('wr_full_hold') <= ~wrReset & fullAt(wrGray);
     Sequential(wrClk, [
-      for (var i = 0; i < depth; i++)
-        If(push & wrSel[i], then: [mem[i] < wrData]),
       If(
         wrReset,
         then: [
@@ -753,7 +735,6 @@ class HarborWaistCdcFifo extends Module {
           wrPtr1 < 1,
           wrGray1 < 1,
           wrFull < 0,
-          wrSel < 1,
           rdGraySync0 < 0,
           rdGraySync < 0,
         ],
@@ -765,7 +746,6 @@ class HarborWaistCdcFifo extends Module {
           wrPtr1 < mux(push, wrPtr1 + 1, wrPtr1),
           wrGray1 < mux(push, gray(wrPtr1 + 1), wrGray1),
           wrFull < fullNext,
-          wrSel < mux(push, rotate(wrSel), wrSel),
         ],
       ),
     ]);
@@ -784,11 +764,20 @@ class HarborWaistCdcFifo extends Module {
     final pop = (trustRead ? rdEn : rdEn & ~rdEmpty).named('rd_pop');
     final rdSelectPtr = mux(pop, rdPtr1, rdPtr);
     final rdSelectSlot = rdSelectPtr.getRange(0, pw - 1);
+    final mem = _CdcRam(
+      wrClk,
+      width: width,
+      depth: depth,
+      wrEn: push,
+      wrAddr: wrPtr.getRange(0, pw - 1),
+      wrData: wrData,
+      rdAddr: rdSelectSlot,
+    );
     final emptyNext = mux(pop, rdGray1.eq(wrGraySync), rdGray.eq(wrGraySync));
     addOutput('rd_empty_pop') <= rdReset | rdGray1.eq(wrGraySync);
     addOutput('rd_empty_hold') <= rdReset | rdGray.eq(wrGraySync);
     Sequential(rdClk, [
-      head < pickBinary(rdSelectSlot, mem),
+      head < mem.rdData,
       If(
         rdReset,
         then: [
@@ -814,4 +803,87 @@ class HarborWaistCdcFifo extends Module {
     addOutput('rd_empty') <= rdEmpty;
     addOutput('rd_data', width: width) <= head;
   }
+}
+
+/// The entries of a [HarborWaistCdcFifo]: one write port on the write clock
+/// and an asynchronous read port. The read side samples the read data only
+/// into its head register, and only uses an entry after its pointer crossed.
+class _CdcRam extends Module with SystemVerilog {
+  final int width;
+  final int depth;
+  final int addrWidth;
+
+  Logic get rdData => output('rd_data');
+
+  _CdcRam(
+    Logic clk, {
+    required this.width,
+    required this.depth,
+    required Logic wrEn,
+    required Logic wrAddr,
+    required Logic wrData,
+    required Logic rdAddr,
+  }) : addrWidth = (depth - 1).bitLength,
+       super(
+         name: 'mem',
+         definitionName: 'HarborWaistCdcRam_${width}x$depth',
+         reserveDefinitionName: true,
+       ) {
+    clk = addInput('clk', clk);
+    wrEn = addInput('wr_en', wrEn);
+    wrAddr = addInput('wr_addr', wrAddr, width: addrWidth);
+    wrData = addInput('wr_data', wrData, width: width);
+    rdAddr = addInput('rd_addr', rdAddr, width: addrWidth);
+    final out = Logic(name: 'rd_out', width: width);
+    addOutput('rd_data', width: width) <= out;
+
+    final unknown = LogicValue.filled(width, LogicValue.x);
+    final cells = List<LogicValue>.filled(depth, unknown);
+    void read() {
+      final a = rdAddr.value;
+      out.put(a.isValid ? cells[a.toInt()] : unknown);
+    }
+
+    read();
+    rdAddr.glitch.listen((_) => read());
+    clk.glitch.listen((event) {
+      if (event.previousValue != LogicValue.zero ||
+          event.newValue != LogicValue.one) {
+        return;
+      }
+      final we = wrEn.value;
+      if (!we.isValid) {
+        // An X enable can write any entry, so all of them become X.
+        cells.fillRange(0, depth, unknown);
+      } else if (we.toBool()) {
+        final wa = wrAddr.value;
+        if (wa.isValid) {
+          cells[wa.toInt()] = wrData.value;
+        } else {
+          cells.fillRange(0, depth, unknown);
+        }
+      } else {
+        return;
+      }
+      unawaited(Simulator.clkStable.first.then((_) => read()));
+    });
+  }
+
+  @override
+  String? definitionVerilog(String definitionType) =>
+      '''
+module $definitionType (
+  input logic clk,
+  input logic wr_en,
+  input logic [${addrWidth - 1}:0] wr_addr,
+  input logic [${width - 1}:0] wr_data,
+  input logic [${addrWidth - 1}:0] rd_addr,
+  output logic [${width - 1}:0] rd_data
+);
+  logic [${width - 1}:0] mem [0:${depth - 1}];
+  always_ff @(posedge clk) begin
+    if (wr_en) mem[wr_addr] <= wr_data;
+  end
+  assign rd_data = mem[rd_addr];
+endmodule''';
 }
