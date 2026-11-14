@@ -169,6 +169,9 @@ class _Tracker {
 ///   AXI4 slave port drives AW, AR and W from 2 entry FIFOs. An AXI4-Lite
 ///   slave port drives AW or AR from one shared entry and W from one entry.
 ///   B and R reach a master through 2 entry FIFOs.
+/// - A fabric with one slave has no master FIFOs. The slave FIFOs are its
+///   one request stage, so AWREADY, ARREADY and WREADY to a master follow
+///   its VALID in the same cycle.
 /// - The FIFOs keep only the address bits that change inside a slave
 ///   region. A slave still sees the full address, or its offset in the
 ///   region.
@@ -303,6 +306,8 @@ class HarborAxi4Fabric extends HarborFabricModule {
     fullIdWidth = fullIdWidthOf(masters);
     final tW = indexWidth(nt);
     final mW = indexWidth(nm);
+    // With one slave, the slave FIFOs are the only request stage.
+    final pass = ns == 1;
 
     // The read channel each master uses at each slave, by master index.
     final chanOf = [
@@ -413,22 +418,22 @@ class HarborAxi4Fabric extends HarborFabricModule {
           }
         }
         tgtIn.add(~anyOf(hits));
-        final f = HarborRegFifo(
+        final f = _stage(
+          pass,
           name: '${mn}_${d.toLowerCase()}',
           clk: c,
           reset: r,
-          depth: 2,
-          pushValid: a.port('${d}VALID'),
-          pushData: harborPack([
+          valid: a.port('${d}VALID'),
+          data: harborPack([
             a.port('${d}ID'),
             indexOf(tgtIn, tW),
             addr.getRange(0, innerW),
             for (final x in _restFields.skip(1)) a.port('$d$x'),
           ]),
-          popReady: mPop[m][dir],
+          ready: a.port('${d}READY'),
+          pop: mPop[m][dir],
         );
-        a.port('${d}READY') <= f.pushReady;
-        final [hid, tgtIdx, rest] = harborUnpack(f.popData, [
+        final [hid, tgtIdx, rest] = harborUnpack(f.data, [
           a.idWidth,
           tW,
           restW,
@@ -454,7 +459,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
         mTgtIdx[m].add(tgtIdx);
         req[m].add([
           for (var t = 0; t < nt; t++)
-            f.popValid &
+            f.valid &
                 ok &
                 tgt[t] &
                 inReady[t][dir] &
@@ -575,23 +580,21 @@ class HarborAxi4Fabric extends HarborFabricModule {
     // and a target takes beats from the masters of its AWs in order.
     final wReady = [for (var t = 0; t < nt; t++) Logic()];
     final wPop = [for (var m = 0; m < nm; m++) Logic()];
-    final wHead = <HarborRegFifo>[];
-    for (var m = 0; m < nm; m++) {
-      final a = ma[m];
-      final f = HarborRegFifo(
-        name: '${masters[m].name}_w',
-        clk: c,
-        reset: r,
-        depth: 2,
-        pushValid: a.wValid,
-        pushData: harborPack([a.wData, a.wStrb, a.wLast]),
-        popReady: wPop[m],
-      );
-      a.wReady <= f.pushReady;
-      wHead.add(f);
-    }
-    final wData = [for (final f in wHead) f.popData];
-    final wLast = [for (final f in wHead) f.popData[-1]];
+    final wHead = [
+      for (var m = 0; m < nm; m++)
+        _stage(
+          pass,
+          name: '${masters[m].name}_w',
+          clk: c,
+          reset: r,
+          valid: ma[m].wValid,
+          data: harborPack([ma[m].wData, ma[m].wStrb, ma[m].wLast]),
+          ready: ma[m].wReady,
+          pop: wPop[m],
+        ),
+    ];
+    final wData = [for (final f in wHead) f.data];
+    final wLast = [for (final f in wHead) f.data[-1]];
     final tBeat = <_WBeat>[];
     if (topology == HarborFabricTopology.crossbar) {
       final xfer = [
@@ -623,7 +626,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
         );
         for (var m = 0; m < nm; m++) {
           xfer[m][t] <=
-              wHead[m].popValid &
+              wHead[m].valid &
                   routes[m].popValid &
                   routes[m].popData.eq(Const(t, width: tW)) &
                   src.popValid &
@@ -654,7 +657,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
       final tOh = decodeIndex(th, nt);
       final xfer =
           (order.popValid &
-                  pick(mOh, [for (final f in wHead) f.popValid]) &
+                  pick(mOh, [for (final f in wHead) f.valid]) &
                   pick(tOh, wReady))
               .named('bus_w_xfer');
       final data = pick(mOh, wData);
@@ -809,6 +812,35 @@ class HarborAxi4Fabric extends HarborFabricModule {
         }
       }
     }
+  }
+
+  // The request stage of a master channel: a 2 entry FIFO, or with [pass]
+  // the port itself, whose READY is then [pop].
+  static ({Logic valid, Logic data}) _stage(
+    bool pass, {
+    required String name,
+    required Logic clk,
+    required Logic reset,
+    required Logic valid,
+    required Logic data,
+    required Logic ready,
+    required Logic pop,
+  }) {
+    if (pass) {
+      ready <= pop;
+      return (valid: valid, data: data);
+    }
+    final f = HarborRegFifo(
+      name: name,
+      clk: clk,
+      reset: reset,
+      depth: 2,
+      pushValid: valid,
+      pushData: data,
+      popReady: pop,
+    );
+    ready <= f.pushReady;
+    return (valid: f.popValid, data: f.popData);
   }
 
   // AW, AR and W FIFOs to one slave, and the timeout guard when the slave
