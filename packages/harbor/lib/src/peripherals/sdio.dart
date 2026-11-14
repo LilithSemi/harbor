@@ -466,6 +466,7 @@ class HarborSdioController extends BridgeModule
       clk: input('clk'),
       reset: input('reset'),
       fabricClock: fabricClock,
+      usedAddressWidth: dmaAddressWidth > 32 ? 32 : null,
     );
 
     final clk = input('clk');
@@ -511,12 +512,25 @@ class HarborSdioController extends BridgeModule
     final cmdRespType = Logic(name: 'cmd_resp_type', width: 2);
     final cmdDataPresent = Logic(name: 'cmd_data_present');
     final cmdDataDir = Logic(name: 'cmd_data_dir');
-    final resp = List.generate(4, (i) => Logic(name: 'resp$i', width: 32));
+    // Bits [127:0] of the last response frame, and whether it was an R2.
+    // RESP0-3 read from them. A short response puts its 32-bit payload, frame
+    // bits [39:8], in RESP0 and reads 0 in RESP1-3.
+    final respRaw = Logic(name: 'resp_raw', width: 128);
+    final respLong = Logic(name: 'resp_long');
+    final resp = [
+      mux(respLong, respRaw.getRange(0, 32), respRaw.getRange(8, 40)),
+      for (var i = 1; i < 4; i++)
+        respRaw.getRange(32 * i, 32 * i + 32) & respLong.replicate(32),
+    ];
     final blkSize = Logic(name: 'blk_size', width: 12);
     final blkCount = Logic(name: 'blk_count', width: 16);
     // SD clocks a card read waits for a block start bit. 0 turns it off.
     final dataTimeout = Logic(name: 'data_timeout', width: 24);
     final dataTimeoutCnt = Logic(name: 'data_timeout_cnt', width: 24);
+    final dataTimeoutNext =
+        (dataTimeoutCnt.zeroExtend(25) + Const(1, width: 25)).named(
+          'data_timeout_next',
+        );
     // INT_STATUS, one register per bit. Events in the same cycle that set
     // different bits all latch.
     final intBits = [for (var i = 0; i < 9; i++) Logic(name: 'int_status_$i')];
@@ -853,6 +867,9 @@ class HarborSdioController extends BridgeModule
         (holdServed ? bus.stb & ~bus.ack & ~busServed : bus.stb & ~bus.ack)
             .named('bus_access');
 
+    // Register index: the byte offset >> 3 in the 0x1000 window.
+    final regIndex = bus.windowAddr(0x1000).getRange(3).named('reg_index');
+
     // Pop strobes. The ADMA retires its word or words on the WDATA handshake.
     // The CPU retires one by reading DATA during a card read. A walker that
     // has parked during a DMA card read drops the words that are left, so a
@@ -864,7 +881,7 @@ class HarborSdioController extends BridgeModule
                 ~bus.we &
                 cmdDataDir &
                 ~rxEmpty &
-                bus.windowAddr(0x1000).getRange(3).eq(Const(0x09, width: 9)) &
+                regIndex.eq(Const(0x09, width: 9)) &
                 bus.selAny(0x48, 4))
             .named('rx_pop_cpu');
     final rxPopDrop =
@@ -936,26 +953,40 @@ class HarborSdioController extends BridgeModule
     // Beats of the request: the fewest of the burst cap, the words ready, the
     // descriptor bytes left and the beats to the next 4 KB boundary.
     const cw = descBytesW + 1;
-    Logic min2(Logic a, Logic b) => mux(a.lt(b), a, b);
+    // The fewest of the burst cap and [terms]. A term with a bit set above
+    // the width of the cap is larger than the cap and cannot win, so each
+    // compare is only as wide as the cap.
+    Logic minCap(List<Logic> terms) {
+      final w = dmaBurstBeats.bitLength;
+      Logic m = Const(dmaBurstBeats, width: w);
+      for (final t in terms) {
+        final fits = t.getRange(w).eq(Const(0, width: t.width - w));
+        final low = t.getRange(0, w);
+        m = mux(fits & low.lt(m), low, m);
+      }
+      return m.zeroExtend(cw);
+    }
+
     final to4k =
         (Const(4096, width: cw) - descAddr.getRange(0, 12).zeroExtend(cw))
             .named('dma_to_4k');
     final bytesLeft = descBytes.zeroExtend(cw);
     final wordsReady = rxCount.zeroExtend(cw);
-    final capBeats = Const(dmaBurstBeats, width: cw);
     final Logic wrBeats;
     final Logic wrBytes;
     if (dmaDataWidth == 32) {
-      wrBeats = min2(
-        min2(capBeats, wordsReady),
-        min2((bytesLeft + Const(3, width: cw)) >> 2, to4k >> 2),
-      ).named('dma_wr_beats');
+      wrBeats = minCap([
+        wordsReady,
+        (bytesLeft + Const(3, width: cw)) >> 2,
+        to4k >> 2,
+      ]).named('dma_wr_beats');
       wrBytes = (wrBeats << 2).named('dma_wr_bytes');
     } else {
-      final packBeats = min2(
-        min2(capBeats, wordsReady >> 1),
-        min2(bytesLeft >> 3, to4k >> 3),
-      ).named('dma_pack_beats');
+      final packBeats = minCap([
+        wordsReady >> 1,
+        bytesLeft >> 3,
+        to4k >> 3,
+      ]).named('dma_pack_beats');
       wrBeats = mux(
         usePack,
         packBeats,
@@ -968,17 +999,31 @@ class HarborSdioController extends BridgeModule
       ).named('dma_wr_bytes');
     }
     final wrLen = (wrBeats - Const(1, width: cw)).getRange(0, 8);
+    // The walker moves through a buffer by one word on a card write and by
+    // [wrBytes] on a card read. One adder and one subtractor serve both.
+    final stepBytes = mux(
+      cmdDataDir,
+      wrBytes,
+      Const(4, width: cw),
+    ).named('adma_step_bytes');
+    final descAddrNext = (descAddr + stepBytes.zeroExtend(32)).named(
+      'adma_addr_next',
+    );
+    // Bytes left after the step, 0 when the step takes them all. The top
+    // bit of the difference is the borrow.
+    final bytesDiff =
+        (bytesLeft.zeroExtend(cw + 1) - stepBytes.zeroExtend(cw + 1)).named(
+          'adma_bytes_diff',
+        );
     final bytesAfter = mux(
-      bytesLeft.gt(wrBytes),
-      bytesLeft - wrBytes,
-      Const(0, width: cw),
-    ).getRange(0, descBytesW).named('dma_bytes_after');
+      bytesDiff[cw],
+      Const(0, width: descBytesW),
+      bytesDiff.getRange(0, descBytesW),
+    ).named('dma_bytes_after');
 
-    // Reads go out only when no write is in flight.
-    final fetchAddr =
-        (descPtr +
-                mux<Logic>(fetchHi, Const(4, width: 32), Const(0, width: 32)))
-            .named('adma_fetch_addr');
+    // Reads go out only when no write is in flight. The descriptor pointer
+    // moves by one word after each descriptor word.
+    final fetchAddr = descPtr;
     final readReady = (~rdPending & ~reqValid & ~writesBusy).named(
       'dma_read_ready',
     );
@@ -1061,6 +1106,42 @@ class HarborSdioController extends BridgeModule
       Const(1, width: 1),
     ].concat();
 
+    // Register read data, by register index. An index past the 16
+    // registers reads 0.
+    final readValues = <Logic>[
+      ctrlEnable.zeroExtend(32) |
+          (busWidthSel.zeroExtend(32) << 4) |
+          (sampleFall.zeroExtend(32) << 8),
+      cardPresent.zeroExtend(32) |
+          ((busy | dmaInFlight).zeroExtend(32) << 8) |
+          (mux(cmdDataDir, ~rxEmpty, dataValid).zeroExtend(32) << 9) |
+          // The DAT engine state. This read also stops yosys from making
+          // the engine a new FSM, which costs about 330 LUTs more.
+          (datState.zeroExtend(32) << 12),
+      clkDiv.zeroExtend(32),
+      cmdIndex.zeroExtend(32) | (cmdRespType.zeroExtend(32) << 6),
+      cmdArg,
+      ...resp,
+      // A card read pops the RX FIFO (see `rxPopCpu`). A card write reads
+      // back the holding register.
+      mux(cmdDataDir, mux(rxEmpty, Const(0, width: 32), rxHead), dataReg),
+      blkSize.zeroExtend(32),
+      blkCount.zeroExtend(32),
+      intView.zeroExtend(32),
+      intEnable.zeroExtend(32),
+      admaBase,
+      dataTimeout.zeroExtend(32),
+    ];
+    final readWord = Logic(name: 'reg_read_word', width: 32);
+    Combinational([
+      Case(regIndex.getRange(0, 4), [
+        for (var i = 0; i < 16; i++)
+          CaseItem(Const(i, width: 4), [readWord < readValues[i]]),
+      ]),
+    ]);
+    final readHit = (~bus.we & regIndex.getRange(4).eq(Const(0, width: 5)))
+        .named('reg_read_hit');
+
     // Received response after the in-flight bit is shifted in.
     final respNext = [respShift.getRange(0, 135), cmdIn].concat();
 
@@ -1076,7 +1157,8 @@ class HarborSdioController extends BridgeModule
           cmdRespType < Const(0, width: 2),
           cmdDataPresent < Const(0),
           cmdDataDir < Const(0),
-          for (var i = 0; i < 4; i++) resp[i] < Const(0, width: 32),
+          respRaw < Const(0, width: 128),
+          respLong < Const(0),
           blkSize < Const(512, width: 12),
           blkCount < Const(1, width: 16),
           dataTimeout < Const(defaultDataTimeout, width: 24),
@@ -1216,8 +1298,9 @@ class HarborSdioController extends BridgeModule
                   If(
                     ~cmdIn,
                     then: [
+                      // The shift register is not cleared. The capture below
+                      // takes only bits this response shifts in.
                       state < Const(sRecv, width: 3),
-                      respShift < Const(0, width: 136),
                       respCnt <
                           mux<Logic>(
                             cmdRespType.eq(Const(2, width: 2)),
@@ -1290,23 +1373,9 @@ class HarborSdioController extends BridgeModule
                       // (see the CMD write handler), not here, so the engine is
                       // already parked in its memory state before the first data
                       // word and no startup words are dropped.
-                      // R2: low 128 bits of the 136-bit frame into RESP0-3.
-                      // Short: the 32-bit payload (frame bits [39:8]) into RESP0.
-                      If(
-                        cmdRespType.eq(Const(2, width: 2)),
-                        then: [
-                          resp[0] < respNext.getRange(0, 32),
-                          resp[1] < respNext.getRange(32, 64),
-                          resp[2] < respNext.getRange(64, 96),
-                          resp[3] < respNext.getRange(96, 128),
-                        ],
-                        orElse: [
-                          resp[0] < respNext.getRange(8, 40),
-                          resp[1] < Const(0, width: 32),
-                          resp[2] < Const(0, width: 32),
-                          resp[3] < Const(0, width: 32),
-                        ],
-                      ),
+                      // Keep the frame. RESP0-3 take their bits on a read.
+                      respRaw < respNext.getRange(0, 128),
+                      respLong < cmdRespType.eq(Const(2, width: 2)),
                     ],
                   ),
                 ],
@@ -1373,12 +1442,13 @@ class HarborSdioController extends BridgeModule
                     If(
                       readEdge,
                       then: [
-                        dataTimeoutCnt < (dataTimeoutCnt + Const(1, width: 24)),
+                        dataTimeoutCnt < dataTimeoutNext.getRange(0, 24),
+                        // The check is count >= timeout - 1. It is written
+                        // as count + 1 >= timeout to use the adder of the
+                        // count.
                         If(
                           dataTimeout.neq(Const(0, width: 24)) &
-                              dataTimeoutCnt.gte(
-                                dataTimeout - Const(1, width: 24),
-                              ),
+                              dataTimeoutNext.gte(dataTimeout.zeroExtend(25)),
                           then: [
                             datState < Const(dIdle, width: 4),
                             ...setInt(intDataTimeout),
@@ -1858,6 +1928,7 @@ class HarborSdioController extends BridgeModule
                     ],
                     orElse: [descAddr < rdWord, fetchHi < Const(1)],
                   ),
+                  descPtr < (descPtr + Const(4, width: 32)),
                 ],
               ),
             ]),
@@ -1880,13 +1951,8 @@ class HarborSdioController extends BridgeModule
                 then: [
                   dataReg < rdWord,
                   dataValid < Const(1),
-                  descAddr < (descAddr + Const(4, width: 32)),
-                  descBytes <
-                      mux(
-                        descBytes.gt(Const(4, width: descBytesW)),
-                        descBytes - Const(4, width: descBytesW),
-                        Const(0, width: descBytesW),
-                      ),
+                  descAddr < descAddrNext,
+                  descBytes < bytesAfter,
                   admaState < Const(aNext, width: 3),
                 ],
               ),
@@ -1919,7 +1985,7 @@ class HarborSdioController extends BridgeModule
                   wLeft < wrLen,
                   wPack < usePack,
                   wHi < descAddr[2],
-                  descAddr < (descAddr + wrBytes.zeroExtend(32)),
+                  descAddr < descAddrNext,
                   descBytes < bytesAfter,
                   If(
                     bytesAfter.eq(Const(0, width: descBytesW)),
@@ -1943,7 +2009,6 @@ class HarborSdioController extends BridgeModule
                     descEnd,
                     then: [admaState < Const(aIdle, width: 3)],
                     orElse: [
-                      descPtr < (descPtr + Const(8, width: 32)),
                       fetchHi < Const(0),
                       admaState < Const(aFetch, width: 3),
                     ],
@@ -1980,6 +2045,7 @@ class HarborSdioController extends BridgeModule
             then: [
               busServed < Const(1),
               bus.ack < Const(1),
+              If(readHit, then: [bus.dataOut < readWord.zeroExtend(dw)]),
 
               // Each register sits in its own 8-byte slot (byte offset >> 3),
               // matching every other Harbor peripheral on the byte-addressed
@@ -1987,8 +2053,8 @@ class HarborSdioController extends BridgeModule
               // indices 0,1,2. Decode every address bit of the 0x1000 window
               // and ignore the bits above it, so absolute and relative
               // addresses both work. An unused offset reads 0 and ignores
-              // writes.
-              Case(bus.windowAddr(0x1000).getRange(3), [
+              // writes. The read data comes from [readWord].
+              Case(regIndex, [
                 // 0x00: CTRL ([0] enable, [5:4] reports max bus width,
                 // [8] read-data sample edge 0:rising 1:falling).
                 CaseItem(Const(0x00, width: 9), [
@@ -2042,41 +2108,13 @@ class HarborSdioController extends BridgeModule
                         ],
                       ),
                     ],
-                    orElse: [
-                      bus.dataOut <
-                          ctrlEnable.zeroExtend(dw) |
-                              (busWidthSel.zeroExtend(dw) <<
-                                  Const(4, width: 32)) |
-                              (sampleFall.zeroExtend(dw) <<
-                                  Const(8, width: 32)),
-                    ],
                   ),
                 ]),
-                // 0x08: STATUS ([0] card detect, [8] busy, [9] data ready,
-                // [15:12] DAT engine state). Busy includes ADMA accesses in
-                // flight, which also block a CMD write. The state read also
-                // stops yosys from making the DAT engine a new FSM, which
-                // costs about 330 LUTs more.
-                CaseItem(Const(0x01, width: 9), [
-                  bus.dataOut <
-                      cardPresent.zeroExtend(dw) |
-                          ((busy | dmaInFlight).zeroExtend(dw) <<
-                              Const(8, width: 32)) |
-                          (mux(
-                                cmdDataDir,
-                                ~rxEmpty,
-                                dataValid,
-                              ).zeroExtend(dw) <<
-                              Const(9, width: 32)) |
-                          (datState.zeroExtend(dw) << Const(12, width: 32)),
-                ]),
+                // 0x08: STATUS is read only. Busy includes ADMA accesses in
+                // flight, which also block a CMD write.
                 // 0x10: CLK_DIV.
                 CaseItem(Const(0x02, width: 9), [
-                  If(
-                    bus.we,
-                    then: [clkDiv < bus.selMerge(clkDiv, 0x10)],
-                    orElse: [bus.dataOut < clkDiv.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [clkDiv < bus.selMerge(clkDiv, 0x10)]),
                 ]),
                 // 0x18: CMD. Writing triggers a command when not busy and the
                 // ADMA has nothing in flight. [5:0] index, [7:6] response
@@ -2149,27 +2187,12 @@ class HarborSdioController extends BridgeModule
                         ],
                       ),
                     ],
-                    orElse: [
-                      bus.dataOut <
-                          cmdIndex.zeroExtend(dw) |
-                              (cmdRespType.zeroExtend(dw) <<
-                                  Const(6, width: 32)),
-                    ],
                   ),
                 ]),
                 // 0x20: CMD_ARG.
                 CaseItem(Const(0x04, width: 9), [
-                  If(
-                    bus.we,
-                    then: [cmdArg < bus.selMerge(cmdArg, 0x20)],
-                    orElse: [bus.dataOut < cmdArg.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [cmdArg < bus.selMerge(cmdArg, 0x20)]),
                 ]),
-                // 0x28-0x40: RESP0-3.
-                for (var i = 0; i < 4; i++)
-                  CaseItem(Const(0x05 + i, width: 9), [
-                    bus.dataOut < resp[i].zeroExtend(dw),
-                  ]),
                 // 0x48: DATA. One-word PIO buffer. CPU writes fill it (for a
                 // write transfer), reads drain it (for a read transfer).
                 CaseItem(Const(0x09, width: 9), [
@@ -2179,33 +2202,15 @@ class HarborSdioController extends BridgeModule
                       dataReg < bus.selMerge(dataReg, 0x48),
                       dataValid < Const(1),
                     ],
-                    // A card read pops the RX FIFO (see `rxPopCpu`); a card write
-                    // reads back the holding register.
-                    orElse: [
-                      bus.dataOut <
-                          mux(
-                            cmdDataDir,
-                            mux(rxEmpty, Const(0, width: 32), rxHead),
-                            dataReg,
-                          ).zeroExtend(dw),
-                    ],
                   ),
                 ]),
                 // 0x50: BLK_SIZE.
                 CaseItem(Const(0x0A, width: 9), [
-                  If(
-                    bus.we,
-                    then: [blkSize < bus.selMerge(blkSize, 0x50)],
-                    orElse: [bus.dataOut < blkSize.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [blkSize < bus.selMerge(blkSize, 0x50)]),
                 ]),
                 // 0x58: BLK_COUNT.
                 CaseItem(Const(0x0B, width: 9), [
-                  If(
-                    bus.we,
-                    then: [blkCount < bus.selMerge(blkCount, 0x58)],
-                    orElse: [bus.dataOut < blkCount.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [blkCount < bus.selMerge(blkCount, 0x58)]),
                 ]),
                 // 0x60: INT_STATUS (write-1-to-clear).
                 CaseItem(Const(0x0C, width: 9), [
@@ -2220,16 +2225,11 @@ class HarborSdioController extends BridgeModule
                       admaErr <
                           ((admaErr | dmaFault) & ~bus.selMasked(0x60, 9)[7]),
                     ],
-                    orElse: [bus.dataOut < intView.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x68: INT_ENABLE.
                 CaseItem(Const(0x0D, width: 9), [
-                  If(
-                    bus.we,
-                    then: [intEnable < bus.selMerge(intEnable, 0x68)],
-                    orElse: [bus.dataOut < intEnable.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [intEnable < bus.selMerge(intEnable, 0x68)]),
                 ]),
                 // 0x78: DATA_TIMEOUT, SD clocks a card read waits for a block
                 // start bit. 0 turns it off.
@@ -2237,16 +2237,11 @@ class HarborSdioController extends BridgeModule
                   If(
                     bus.we,
                     then: [dataTimeout < bus.selMerge(dataTimeout, 0x78)],
-                    orElse: [bus.dataOut < dataTimeout.zeroExtend(dw)],
                   ),
                 ]),
                 // 0x70: ADMA_ADDR (descriptor table base for DMA transfers).
                 CaseItem(Const(0x0E, width: 9), [
-                  If(
-                    bus.we,
-                    then: [admaBase < bus.selMerge(admaBase, 0x70)],
-                    orElse: [bus.dataOut < admaBase.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [admaBase < bus.selMerge(admaBase, 0x70)]),
                 ]),
               ]),
             ],

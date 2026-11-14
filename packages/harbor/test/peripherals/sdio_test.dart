@@ -441,6 +441,99 @@ void main() {
       await Simulator.endSimulation();
     });
 
+    // Sends [frame] on CMD after the host releases the line, one bit per SD
+    // period, and waits for the interrupt.
+    Future<void> respond(List<int> frame) async {
+      var sawDrive = false;
+      var k = 0;
+      for (var i = 0; i < 3000; i++) {
+        await clk.nextPosedge;
+        final sending = cmdOe.value.toInt() == 1;
+        if (sending) sawDrive = true;
+        if (sawDrive &&
+            !sending &&
+            sdClk.value.toInt() == 0 &&
+            k < frame.length) {
+          cmdIn.inject(frame[k]);
+          k++;
+        }
+        if (irq.value.toInt() == 1) break;
+      }
+      expect(k, equals(frame.length));
+      await busWrite(_intStatus, 0x1FF);
+    }
+
+    test('RESP0-3 follow the type of the last response', () async {
+      await setUpDut();
+      const words = [0x11112222, 0x33334444, 0x55556666, 0x77778888];
+      // R2: start, tx, 111111, CID/CSD bits [127:0], end.
+      final r2 = [
+        0,
+        0,
+        ..._bitsMsb(0x3F, 6),
+        for (var i = 3; i >= 0; i--) ..._bitsMsb(words[i], 32),
+        1,
+      ];
+      Future<List<int>> resps() async => [
+        for (var i = 0; i < 4; i++) await busRead(_resp0 + 8 * i),
+      ];
+
+      await busWrite(_cmd, 2 | (2 << 6));
+      await respond(r2);
+      expect(await resps(), equals(words));
+      await busWrite(_cmd, 13 | (1 << 6));
+      await respond(_resp48(0x0BADCAFE));
+      expect(await resps(), equals([0x0BADCAFE, 0, 0, 0]));
+      await busWrite(_cmd, 2 | (2 << 6));
+      await respond(r2);
+      expect(await resps(), equals(words));
+      // A command with no response keeps the last one.
+      await busWrite(_cmd, 0);
+      for (var i = 0; i < 400; i++) {
+        await clk.nextPosedge;
+      }
+      expect(await resps(), equals(words));
+      await Simulator.endSimulation();
+    });
+
+    test('a card read times out after DATA_TIMEOUT SD clocks', () async {
+      // SD clocks from the response end bit to the timeout, per DATA_TIMEOUT.
+      final clocks = <int>[];
+      for (final timeout in [1, 2, 7, 20]) {
+        await setUpDut();
+        await busWrite(_intEnable, 0x100);
+        await busWrite(0x78, timeout);
+        await busWrite(_blkSize, 16);
+        datIn.inject(0xF);
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+        var sawDrive = false;
+        var k = 0;
+        var rises = -1;
+        var prev = sdClk.value.toInt();
+        final frame = _resp48(0);
+        for (var i = 0; i < 4000; i++) {
+          await clk.nextPosedge;
+          final sending = cmdOe.value.toInt() == 1;
+          if (sending) sawDrive = true;
+          final now = sdClk.value.toInt();
+          if (sawDrive && !sending && now == 0 && k < frame.length) {
+            cmdIn.inject(frame[k]);
+            k++;
+            if (k == frame.length) rises = 0;
+          }
+          if (rises >= 0 && prev == 0 && now == 1) rises++;
+          prev = now;
+          if (irq.value.toInt() == 1) break;
+        }
+        expect(await busRead(_intStatus) & 0x100, equals(0x100));
+        clocks.add(rises);
+        await Simulator.endSimulation();
+        await Simulator.reset();
+      }
+      // One SD clock more per step of DATA_TIMEOUT.
+      expect([for (final c in clocks) c - clocks[0]], equals([0, 1, 6, 19]));
+    });
+
     test('reports a timeout when the card never responds', () async {
       await setUpDut();
 
