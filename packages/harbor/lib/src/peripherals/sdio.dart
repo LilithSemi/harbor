@@ -194,7 +194,8 @@ class HarborSdioConfig with HarborPrettyString {
 ///   reset, write 1. It also stops a command in flight. Wait for STATUS[8] to
 ///   clear before the buffer is used again, since memory writes already sent
 ///   still finish.)
-/// - 0x08: STATUS    ([0] card detect, [8] busy, [9] data ready)
+/// - 0x08: STATUS    ([0] card detect, [8] busy, [9] data ready, [15:12]
+///   DAT engine state, 0 when idle, for diagnostics)
 /// - 0x10: CLK_DIV   (clock divider)
 /// - 0x18: CMD       (command index + argument trigger)
 /// - 0x20: CMD_ARG   (command argument)
@@ -2062,9 +2063,11 @@ class HarborSdioController extends BridgeModule
                     ],
                   ),
                 ]),
-                // 0x08: STATUS ([0] card detect, [8] busy, [9] data ready).
-                // Busy includes ADMA accesses in flight, which also block
-                // a CMD write.
+                // 0x08: STATUS ([0] card detect, [8] busy, [9] data ready,
+                // [15:12] DAT engine state). Busy includes ADMA accesses in
+                // flight, which also block a CMD write. The state read also
+                // stops yosys from making the DAT engine a new FSM, which
+                // costs about 330 LUTs more.
                 CaseItem(Const(0x01, width: 9), [
                   bus.dataOut <
                       cardPresent.zeroExtend(dw) |
@@ -2075,7 +2078,8 @@ class HarborSdioController extends BridgeModule
                                 ~rxEmpty,
                                 dataValid,
                               ).zeroExtend(dw) <<
-                              Const(9, width: 32)),
+                              Const(9, width: 32)) |
+                          (datState.zeroExtend(dw) << Const(12, width: 32)),
                 ]),
                 // 0x10: CLK_DIV.
                 CaseItem(Const(0x02, width: 9), [
