@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math';
 
 import 'package:rohd/rohd.dart';
@@ -14,12 +15,22 @@ Logic harborBitMux(Logic control, Logic d1, Logic d0) {
   return out;
 }
 
-/// A small register FIFO built in the current module.
+/// A small FIFO built in the current module.
 ///
 /// With [HarborRegFifo.bypassWhenEmpty] off (the default), [pushReady] and
 /// [popValid] come only from registers, so the FIFO cuts every combinational
 /// path between its two sides. Depth 2 passes one entry per cycle.
+///
+/// A FIFO of 2 or more entries and [ramBits] or more stored bits keeps its
+/// entries in a RAM with one write port and an asynchronous read port, which
+/// is distributed RAM on Xilinx and ECP5. The cycle timing does not change.
+/// Each entry in flops has its own write enable, so it costs a control set
+/// and a slice of flops for each 4 bits. A RAM32M holds 6 bits of up to 32
+/// entries in 4 LUTs and needs no flops.
 class HarborRegFifo {
+  /// Stored bits from which an entry array of 2 or more entries is a RAM.
+  static const ramBits = 8;
+
   /// Low when the FIFO is full.
   final Logic pushReady;
 
@@ -38,8 +49,7 @@ class HarborRegFifo {
   /// Entries in the FIFO, `depth.bitLength` bits wide.
   final Logic count;
 
-  /// The entry registers, for logic that reads them in place.
-  final List<Logic> entries;
+  final List<Logic>? _entries;
 
   /// Index of the entry at the head.
   final Logic readIndex;
@@ -54,25 +64,36 @@ class HarborRegFifo {
     this.pushFire,
     this.popFire,
     this.count,
-    this.entries,
+    this._entries,
     this.readIndex,
     this.writeIndex,
   );
+
+  /// The entry registers, for logic that reads them in place. Only a FIFO
+  /// built with `inPlace` has them.
+  List<Logic> get entries =>
+      _entries ??
+      (throw StateError(
+        'the entries of this FIFO are in a RAM; build it with inPlace',
+      ));
 
   /// Builds a FIFO of [depth] entries of [pushData]'s width. An entry goes
   /// in when [pushValid] and [pushReady] are high, and out when [popValid]
   /// and [popReady] are high.
   ///
-  /// [resetEntries] also resets the data registers, so [popData] is never X
-  /// before the first push. Turn it on only where that output feeds a port
-  /// an external checker samples directly, such as an AXI4 output a BFM
-  /// reads at the posedge.
+  /// [resetEntries] makes [popData] never X before the first push: flop
+  /// entries reset, and RAM entries start at zero and take no write during
+  /// reset. Turn it on only where that output feeds a port an external
+  /// checker samples directly, such as an AXI4 output a BFM reads at the
+  /// posedge.
   ///
   /// [bypassWhenEmpty] lets a push and a same-cycle pop of that same entry
   /// go through the FIFO while it is empty: [popValid] and [popData] follow
   /// [pushValid] and [pushData] for that one cycle, and the entry is not
   /// stored. Use it only where the other side can answer in the same cycle
   /// as its own request, so a push is never silently left unconsumed.
+  ///
+  /// [inPlace] keeps the entries in flops, so logic can read [entries].
   factory HarborRegFifo({
     required String name,
     required Logic clk,
@@ -83,14 +104,13 @@ class HarborRegFifo {
     required Logic popReady,
     bool resetEntries = false,
     bool bypassWhenEmpty = false,
+    bool inPlace = false,
   }) {
     if (depth < 1) throw ArgumentError.value(depth, 'depth', 'must be >= 1');
     final width = pushData.width;
     final ptrWidth = max(1, (depth - 1).bitLength);
     final countWidth = depth.bitLength;
-    final entries = [
-      for (var i = 0; i < depth; i++) Logic(name: '${name}_e$i', width: width),
-    ];
+    final ram = !inPlace && depth >= 2 && width * depth >= ramBits;
     final wr = Logic(name: '${name}_wr', width: ptrWidth);
     final rd = Logic(name: '${name}_rd', width: ptrWidth);
     final count = Logic(name: '${name}_count', width: countWidth);
@@ -106,13 +126,39 @@ class HarborRegFifo {
         .named('${name}_pop_valid');
     final popFire = (popValid & popReady).named('${name}_pop_fire');
 
-    var storedData = entries[0];
-    for (var i = 1; i < depth; i++) {
-      storedData = harborBitMux(
-        rd.eq(Const(i, width: ptrWidth)),
-        entries[i],
-        storedData,
-      );
+    List<Logic>? entries;
+    final Logic storedData;
+    if (ram) {
+      storedData = _FifoRam(
+        name: '${name}_ram',
+        clk: clk,
+        wrEn: resetEntries ? pushFire & ~reset : pushFire,
+        wrAddr: wr,
+        wrData: pushData,
+        rdAddr: rd,
+        depth: depth,
+        zeroInit: resetEntries,
+      ).rdData;
+    } else {
+      final e = [
+        for (var i = 0; i < depth; i++)
+          Logic(name: '${name}_e$i', width: width),
+      ];
+      entries = e;
+      var data = e[0];
+      for (var i = 1; i < depth; i++) {
+        data = harborBitMux(rd.eq(Const(i, width: ptrWidth)), e[i], data);
+      }
+      storedData = data;
+      // resetEntries also resets the data registers, so popData is never X
+      // before the first push. Off by default to save the reset fanout.
+      Sequential(clk, reset: resetEntries ? reset : null, [
+        for (var i = 0; i < depth; i++)
+          If(
+            pushFire & wr.eq(Const(i, width: ptrWidth)),
+            then: [e[i] < pushData],
+          ),
+      ]);
     }
     final popData = bypassWhenEmpty
         ? harborBitMux(empty, pushData, storedData)
@@ -135,16 +181,6 @@ class HarborRegFifo {
       ]),
     ]);
 
-    // resetEntries also resets the data registers, so popData is never X
-    // before the first push. Off by default to save the reset fanout.
-    Sequential(clk, reset: resetEntries ? reset : null, [
-      for (var i = 0; i < depth; i++)
-        If(
-          pushFire & wr.eq(Const(i, width: ptrWidth)),
-          then: [entries[i] < pushData],
-        ),
-    ]);
-
     return HarborRegFifo._(
       pushReady,
       popValid,
@@ -156,6 +192,90 @@ class HarborRegFifo {
       rd,
       wr,
     );
+  }
+}
+
+/// The entries of a [HarborRegFifo]: one write port and an asynchronous read
+/// port on one clock. A write takes the values from before the clock edge,
+/// as a flop does.
+class _FifoRam extends Module with SystemVerilog {
+  final int width;
+  final int depth;
+  final int addrWidth;
+  final bool zeroInit;
+
+  Logic get rdData => output('rd_data');
+
+  _FifoRam({
+    required String name,
+    required Logic clk,
+    required Logic wrEn,
+    required Logic wrAddr,
+    required Logic wrData,
+    required Logic rdAddr,
+    required this.depth,
+    required this.zeroInit,
+  }) : width = wrData.width,
+       addrWidth = wrAddr.width,
+       super(
+         name: name,
+         definitionName:
+             'HarborRegFifoRam_${wrData.width}x$depth${zeroInit ? '_z' : ''}',
+         reserveDefinitionName: true,
+       ) {
+    clk = addInput('clk', clk);
+    wrEn = addInput('wr_en', wrEn);
+    wrAddr = addInput('wr_addr', wrAddr, width: addrWidth);
+    wrData = addInput('wr_data', wrData, width: width);
+    rdAddr = addInput('rd_addr', rdAddr, width: addrWidth);
+    final out = addOutput('rd_data', width: width);
+
+    final unknown = LogicValue.filled(width, LogicValue.x);
+    final cells = List<LogicValue>.filled(
+      depth,
+      zeroInit ? LogicValue.filled(width, LogicValue.zero) : unknown,
+    );
+    void read() {
+      final a = rdAddr.value;
+      out.put(a.isValid && a.toInt() < depth ? cells[a.toInt()] : unknown);
+    }
+
+    read();
+    rdAddr.glitch.listen((_) => read());
+    clk.posedge.listen((_) {
+      final we = wrEn.previousValue ?? wrEn.value;
+      if (we == LogicValue.zero) return;
+      final wa = wrAddr.previousValue ?? wrAddr.value;
+      if (we == LogicValue.one && wa.isValid && wa.toInt() < depth) {
+        cells[wa.toInt()] = wrData.previousValue ?? wrData.value;
+      } else {
+        // An X enable or address can write any entry.
+        cells.fillRange(0, depth, unknown);
+      }
+      unawaited(Simulator.clkStable.first.then((_) => read()));
+    });
+  }
+
+  @override
+  String? definitionVerilog(String definitionType) {
+    final init = zeroInit
+        ? "  initial for (int i = 0; i < $depth; i++) mem[i] = '0;\n"
+        : '';
+    return '''
+module $definitionType (
+  input logic clk,
+  input logic wr_en,
+  input logic [${addrWidth - 1}:0] wr_addr,
+  input logic [${width - 1}:0] wr_data,
+  input logic [${addrWidth - 1}:0] rd_addr,
+  output logic [${width - 1}:0] rd_data
+);
+  logic [${width - 1}:0] mem [0:${depth - 1}];
+$init  always_ff @(posedge clk) begin
+    if (wr_en) mem[wr_addr] <= wr_data;
+  end
+  assign rd_data = mem[rd_addr];
+endmodule''';
   }
 }
 

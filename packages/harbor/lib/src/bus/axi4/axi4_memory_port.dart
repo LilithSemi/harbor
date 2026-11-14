@@ -145,6 +145,8 @@ class HarborAxi4MemorySlave extends Module {
         ],
       ]),
       popReady: reqFire & pickWrite,
+      // The exclusive monitor reads the entries in place.
+      inPlace: ex,
     );
     final arF = HarborRegFifo(
       name: 'ar',
@@ -165,6 +167,8 @@ class HarborAxi4MemorySlave extends Module {
         ],
       ]),
       popReady: reqFire & ~pickWrite,
+      // The exclusive monitor reads the entries in place.
+      inPlace: ex,
     );
     a.awReady <= awF.pushReady;
     a.arReady <= arF.pushReady;
