@@ -138,7 +138,7 @@ class HarborRegFifo {
     List<Logic>? entries;
     final Logic storedData;
     if (ram) {
-      storedData = _FifoRam(
+      storedData = HarborFifoRam(
         name: '${name}_ram',
         clk: clk,
         wrEn: resetEntries ? pushFire & ~reset : pushFire,
@@ -214,10 +214,11 @@ class HarborRegFifo {
   }
 }
 
-/// The entries of a [HarborRegFifo]: one write port and an asynchronous read
-/// port on one clock. A write takes the values from before the clock edge,
-/// as a flop does.
-class _FifoRam extends Module with SystemVerilog {
+/// A RAM with one write port and an asynchronous read port on one clock, as
+/// [HarborRegFifo] uses for its entries. A write takes the values from before
+/// the clock edge, as a flop does. On Xilinx and ECP5 it maps to distributed
+/// RAM.
+class HarborFifoRam extends Module with SystemVerilog {
   final int width;
   final int depth;
   final int addrWidth;
@@ -225,7 +226,7 @@ class _FifoRam extends Module with SystemVerilog {
 
   Logic get rdData => output('rd_data');
 
-  _FifoRam({
+  HarborFifoRam({
     required String name,
     required Logic clk,
     required Logic wrEn,
