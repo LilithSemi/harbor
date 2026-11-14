@@ -78,8 +78,14 @@ List<int> _wordBitsMsb(int word) => [
 /// The 4-bit-wide DAT line groups for one 32-bit word: a start group (0), then
 /// 8 data nibbles (byte 0 first, high nibble first, DAT3 = bit 7), then 16
 /// per-lane CRC16 groups. Each value is the 4-bit vector on DAT[3:0].
-List<int> _fourBitStream(int word) {
-  final bytes = [for (var i = 0; i < 4; i++) (word >> (i * 8)) & 0xFF];
+List<int> _fourBitStream(int word) => _fourBitWords([word]);
+
+/// One 4-bit block of [words]: start, data, per-lane CRC16, end.
+List<int> _fourBitWords(List<int> words) {
+  final bytes = [
+    for (final word in words)
+      for (var i = 0; i < 4; i++) (word >> (i * 8)) & 0xFF,
+  ];
   final data = <int>[];
   for (final b in bytes) {
     data.add((b >> 4) & 0xF);
@@ -509,6 +515,86 @@ void main() {
 
     test('cmd-done set survives a clear of another bit in its cycle', () async {
       expect(await clearAsCmdDoneSets(0x10) & 0x01, 0x01);
+      await Simulator.endSimulation();
+    });
+
+    // A PIO read of [words] through a 4-word FIFO that the CPU leaves full.
+    // With [popOnPush], the CPU reads DATA in the cycle of the next push.
+    // Returns the words the CPU reads and INT_STATUS.
+    Future<(List<int>, int)> pioFullRead(
+      List<int> words, {
+      required bool popOnPush,
+    }) async {
+      await setUpDut(fifoDepth: 4);
+      Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+      await busWrite(_blkSize, words.length * 4);
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      final stream = [..._resp48(0), ..._fourBitWords(words), 0xF];
+      var cardDone = false;
+      unawaited(() async {
+        var sawDrive = false;
+        var idx = 0;
+        while (idx < stream.length) {
+          await clk.nextPosedge;
+          final sending = cmdOe.value.toInt() == 1;
+          if (sending) sawDrive = true;
+          if (sawDrive && !sending && sdClk.value.toInt() == 0) {
+            if (idx < 48) {
+              cmdIn.inject(stream[idx]);
+            } else {
+              datIn.inject(stream[idx]);
+            }
+            idx++;
+          }
+        }
+        cardDone = true;
+      }());
+      while (sig('rx_fifo_count').value.toInt() < 4) {
+        await clk.nextPosedge;
+      }
+      final got = <int>[];
+      if (popOnPush) {
+        while (sig('rx_push').value.toInt() != 1) {
+          await clk.nextPosedge;
+        }
+        // DATA read in the push cycle.
+        adr.inject(_data);
+        we.inject(0);
+        stb.inject(1);
+        await clk.nextPosedge;
+        got.add(top.output('bus_DAT_MISO').value.toInt());
+        stb.inject(0);
+        await clk.nextPosedge;
+      } else {
+        while (sig('rx_push').value.toInt() != 1) {
+          await clk.nextPosedge;
+        }
+        await clk.nextPosedge;
+      }
+      while (!cardDone || sig('rx_fifo_count').value.toInt() > 0) {
+        if (sig('rx_fifo_count').value.toInt() > 0) {
+          got.add(await busRead(_data));
+        } else {
+          await clk.nextPosedge;
+        }
+      }
+      return (got, await busRead(_intStatus));
+    }
+
+    final pioWords = [for (var i = 0; i < 8; i++) 0x5A000000 + i * 0x10101];
+
+    test('a PIO pop in the push cycle of a full FIFO keeps the word', () async {
+      final (got, st) = await pioFullRead(pioWords, popOnPush: true);
+      expect(got, pioWords);
+      expect(st & 0x40, 0);
+      await Simulator.endSimulation();
+    });
+
+    test('a PIO push into a full FIFO with no pop flags an overrun', () async {
+      final (got, st) = await pioFullRead(pioWords, popOnPush: false);
+      expect(got, [...pioWords.take(4), ...pioWords.skip(5)]);
+      expect(st & 0x40, 0x40);
       await Simulator.endSimulation();
     });
 
@@ -1384,7 +1470,7 @@ void main() {
     // exactly the regime where an unguarded push wraps the write pointer over
     // unread entries and the transfer returns a mix of old and new words. Every
     // word must come back exactly once, in order, with no overrun reported.
-    for (final depth in [4, 8, 32]) {
+    for (final depth in [2, 4, 8, 32]) {
       test('an ADMA read is byte-stable when a $depth-word FIFO is pressed '
           'full', () async {
         // 11 distinct words through the FIFO, memory acking far slower than

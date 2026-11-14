@@ -900,13 +900,16 @@ class HarborSdioController extends BridgeModule
                 ~rxEmpty)
             .named('rx_pop_drop');
     final rxPop = (rxPopAdma | rxPopCpu | rxPopDrop).named('rx_pop');
-    // A word is only really taken when the FIFO had one to give.
-    final rxPushOk = (rxPush & ~rxFull).named('rx_push_ok');
     // How many words leave the FIFO this cycle. A packed pop is only armed when
     // two words were counted, so the count cannot underflow.
     final rxPop2Ok = (rxPopAdma2 & rxCount.gte(Const(2, width: rxPtrW + 1)))
         .named('rx_pop2_ok');
     final rxPop1Ok = (rxPop & ~rxEmpty & ~rxPop2Ok).named('rx_pop1_ok');
+    // A push goes in when the FIFO has room, or when a pop in the same cycle
+    // makes room. The pop reads its words before the push writes the RAM.
+    final rxPushOk = (rxPush & (~rxFull | rxPop1Ok | rxPop2Ok)).named(
+      'rx_push_ok',
+    );
     // Words that leave the RX FIFO this cycle.
     final rxPopCount = mux(
       rxPop2Ok,
@@ -1866,7 +1869,7 @@ class HarborSdioController extends BridgeModule
           // letting the corruption run away. Drop the word and say so instead.
           rxWr < (rxWr + rxPushOk.zeroExtend(rxPtrW)),
           rxRd < (rxRd.zeroExtend(rxPtrW + 1) + rxPopCount).getRange(0, rxPtrW),
-          If(rxPush & rxFull & ~rxPop, then: [...setInt(intRxOverrun)]),
+          If(rxPush & ~rxPushOk, then: [...setInt(intRxOverrun)]),
           // count' = count + (1 if pushed) - (words popped)
           rxCount <
               (rxCount +
