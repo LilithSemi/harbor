@@ -1067,13 +1067,13 @@ class HarborSoC extends BridgeModule {
       });
     List<String> users(int i) => [
       for (final c in order)
-        if (reach[c]!.contains(slaveName(i))) c,
+        if (reach[c]?.contains(slaveName(i)) ?? true) c,
     ];
     final legs = <int, List<(String, PairInterface)>>{};
     for (final c in order) {
       final ss = <HarborFabricSlave>[];
       for (var i = 0; i < slaves.length; i++) {
-        if (!reach[c]!.contains(slaveName(i))) continue;
+        if (!(reach[c]?.contains(slaveName(i)) ?? true)) continue;
         if (users(i).length == 1) {
           ss.add(realSlave(i));
           continue;
