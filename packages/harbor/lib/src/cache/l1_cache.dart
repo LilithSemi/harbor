@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
@@ -72,6 +74,187 @@ class _L1TagStore {
       _latency == 1 ? ram.readData(r) : flop(_clk, ram.readData(r));
 }
 
+/// Line valid bits in a RAM with one write port and asynchronous read ports.
+/// Synthesis maps it to LUT RAM, so the valid bits need no per-line enable.
+/// Cells start at X, as in SystemVerilog.
+class _L1ValidRam extends Module with SystemVerilog {
+  final int width;
+  final int depth;
+  final int addrWidth;
+  final int readPorts;
+
+  Logic rdData(int r) => output('rd${r}_data');
+
+  _L1ValidRam(
+    Logic clk, {
+    required this.width,
+    required this.depth,
+    required Logic wrEn,
+    required Logic wrAddr,
+    required Logic wrData,
+    required List<Logic> rdAddr,
+  }) : addrWidth = (depth - 1).bitLength.clamp(1, 32),
+       readPorts = rdAddr.length,
+       super(
+         name: 'valid_ram',
+         definitionName: 'HarborL1ValidRam_w${width}d${depth}r${rdAddr.length}',
+         reserveDefinitionName: true,
+       ) {
+    clk = addInput('clk', clk);
+    wrEn = addInput('wr_en', wrEn);
+    wrAddr = addInput('wr_addr', wrAddr, width: addrWidth);
+    wrData = addInput('wr_data', wrData, width: width);
+    final unknown = LogicValue.filled(width, LogicValue.x);
+    final cells = List<LogicValue>.filled(depth, unknown);
+    final reads = <void Function()>[];
+    for (var r = 0; r < readPorts; r++) {
+      final addr = addInput('rd${r}_addr', rdAddr[r], width: addrWidth);
+      final out = Logic(name: 'rd${r}_out', width: width);
+      addOutput('rd${r}_data', width: width) <= out;
+      void read() {
+        final a = addr.value;
+        out.put(a.isValid && a.toInt() < depth ? cells[a.toInt()] : unknown);
+      }
+
+      read();
+      addr.glitch.listen((_) => read());
+      reads.add(read);
+    }
+    clk.glitch.listen((event) {
+      if (event.previousValue != LogicValue.zero ||
+          event.newValue != LogicValue.one) {
+        return;
+      }
+      final we = wrEn.value;
+      if (we.isValid && we.toBool()) {
+        final wa = wrAddr.value;
+        if (!wa.isValid) throw StateError('$name: write address not valid');
+        if (wa.toInt() < depth) cells[wa.toInt()] = wrData.value;
+        unawaited(
+          Simulator.clkStable.first.then((_) {
+            for (final read in reads) {
+              read();
+            }
+          }),
+        );
+      }
+    });
+  }
+
+  @override
+  String? definitionVerilog(String definitionType) {
+    final a = addrWidth - 1;
+    final w = width - 1;
+    return '''
+module $definitionType (
+  input logic clk,
+  input logic wr_en,
+  input logic [$a:0] wr_addr,
+  input logic [$w:0] wr_data,
+${List.generate(readPorts, (r) => '  input logic [$a:0] rd${r}_addr,\n  output logic [$w:0] rd${r}_data').join(',\n')}
+);
+  logic [$w:0] mem [0:${depth - 1}];
+  always_ff @(posedge clk) begin
+    if (wr_en) mem[wr_addr] <= wr_data;
+  end
+${List.generate(readPorts, (r) => '  assign rd${r}_data = mem[rd${r}_addr];').join('\n')}
+endmodule''';
+  }
+}
+
+/// Valid bits of an L1 cache. A RAM word holds the bits of 8 lines.
+///
+/// A reset or a flush starts a sweep that writes zero to each word, one word
+/// per cycle. The sweep ends [sweepCycles] cycles after the last reset or
+/// flush cycle. While [sweeping] is high the cache must answer no lookup and
+/// must not set a valid bit. The one update port sets or clears the bit of one line with a
+/// read, modify and write of its word. A reset, a flush or a sweep drops the
+/// update.
+class _L1ValidBits {
+  /// High while the sweep runs.
+  final Logic sweeping = Logic(name: 'validSweeping');
+
+  /// Valid bit of the line at each lookup index, in the same cycle.
+  final List<Logic> valid = [];
+
+  /// Number of cycles to clear all lines.
+  final int sweepCycles;
+
+  _L1ValidBits._(this.sweepCycles);
+
+  factory _L1ValidBits({
+    required Logic clk,
+    required Logic reset,
+    required Logic flush,
+    required int lines,
+    required List<Logic> lookups,
+    required Logic updateEn,
+    required Logic updateIdx,
+    required Logic updateValue,
+  }) {
+    final idxBits = (lines - 1).bitLength;
+    final bitBits = idxBits < 3 ? idxBits : 3;
+    final width = 1 << bitBits;
+    final depth = (lines + width - 1) ~/ width;
+    final bits = _L1ValidBits._(depth);
+    final addrWidth = (depth - 1).bitLength.clamp(1, 32);
+
+    Logic wordOf(Logic idx) => idxBits == bitBits
+        ? Const(0, width: addrWidth)
+        : idx.slice(idxBits - 1, bitBits);
+    Logic bitOf(Logic idx, Logic word) =>
+        bitBits == 0 ? word[0] : word[idx.slice(bitBits - 1, 0)];
+
+    final clear = (reset | flush).named('validClear');
+    final sweepIdx = Logic(name: 'validSweepIdx', width: addrWidth);
+    final wrEn = Logic(name: 'validWrEn');
+    final wrAddr = Logic(name: 'validWrAddr', width: addrWidth);
+    final wrData = Logic(name: 'validWrData', width: width);
+    final ram = _L1ValidRam(
+      clk,
+      width: width,
+      depth: depth,
+      wrEn: wrEn,
+      wrAddr: wrAddr,
+      wrData: wrData,
+      rdAddr: [...lookups.map(wordOf), wordOf(updateIdx)],
+    );
+    for (var i = 0; i < lookups.length; i++) {
+      bits.valid.add(bitOf(lookups[i], ram.rdData(i)));
+    }
+
+    final old = ram.rdData(lookups.length);
+    final mask = bitBits == 0
+        ? Const(1)
+        : (Const(1, width: width) << updateIdx.slice(bitBits - 1, 0));
+    wrEn <= ~clear & (bits.sweeping | updateEn);
+    wrAddr <= mux(bits.sweeping, sweepIdx, wordOf(updateIdx));
+    wrData <=
+        mux(
+          bits.sweeping,
+          Const(0, width: width),
+          mux(updateValue, old | mask, old & ~mask),
+        );
+
+    Sequential(clk, [
+      If(
+        clear,
+        then: [bits.sweeping < 1, sweepIdx < 0],
+        orElse: [
+          If(
+            bits.sweeping,
+            then: [
+              sweepIdx < sweepIdx + 1,
+              If(sweepIdx.eq(depth - 1), then: [bits.sweeping < 0]),
+            ],
+          ),
+        ],
+      ),
+    ]);
+    return bits;
+  }
+}
+
 /// L1 cache request type.
 enum HarborL1RequestType {
   /// Instruction fetch.
@@ -142,6 +325,10 @@ class HarborL1ICache extends BridgeModule {
   /// The core supplies the privilege mode here (see [reqCtx]).
   final int ctxBits;
 
+  /// Cycles after a reset or flush during which the cache clears its valid
+  /// bits and answers no lookup.
+  late final int sweepCycles;
+
   /// Request port (from CPU fetch unit). The fetcher holds [reqAddr]/[reqValid]
   /// until [respValid]. A hit answers one cycle after the address is presented.
   Logic get reqAddr => input('req_addr');
@@ -173,8 +360,9 @@ class HarborL1ICache extends BridgeModule {
   Logic get respData1 => output('resp_data1');
   Logic get respValid1 => output('resp_valid1');
 
-  /// Whole-cache flush (fence.i / satp change). Clears every valid bit in one
-  /// cycle, since the cache is virtually addressed.
+  /// Whole-cache flush (fence.i / satp change), since the cache is virtually
+  /// addressed. It clears every valid bit in [sweepCycles] cycles. The cache
+  /// answers no lookup until the clear is done.
   Logic get flush => input('flush');
 
   /// Word-granular refill request to the MMU/memory. A miss fills its line one
@@ -317,9 +505,6 @@ class HarborL1ICache extends BridgeModule {
         ? Const(0, width: 1)
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits);
 
-    // Valid bits flush in one cycle. Tags and data have the same registered
-    // read timing.
-    final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
     final tagRam = _L1TagStore(
       this,
       clk: clk,
@@ -333,30 +518,6 @@ class HarborL1ICache extends BridgeModule {
     tagRam.ram.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
     if (dualPort) {
       tagRam.ram.input('rd1_addr').srcConnection! <= idxOf(reqAddr1);
-    }
-
-    // Balanced mux tree (log2(numLines) deep) when the line count is a power of
-    // two; see the matching helper in HarborL1DCache. Replaces a numLines-deep
-    // linear priority chain that was the core's FPGA timing-critical path.
-    Logic muxLine(List<Logic> arr, Logic idx) {
-      if (numLines > 1 && (numLines & (numLines - 1)) == 0) {
-        var level = List<Logic>.from(arr);
-        var bit = 0;
-        while (level.length > 1) {
-          final next = <Logic>[];
-          for (var i = 0; i < level.length; i += 2) {
-            next.add(mux(idx[bit], level[i + 1], level[i]));
-          }
-          level = next;
-          bit++;
-        }
-        return level[0];
-      }
-      var r = arr[0];
-      for (var i = 1; i < numLines; i++) {
-        r = mux(idx.eq(i), arr[i], r);
-      }
-      return r;
     }
 
     // Per-line DATA in a block RAM (one read port, one write port for fills).
@@ -416,10 +577,29 @@ class HarborL1ICache extends BridgeModule {
     final addrQ = Logic(name: 'addrQ', width: xlen);
     final addrQ1 = dualPort ? Logic(name: 'addrQ1', width: xlen) : null;
 
-    final blockHit = (filling | fillSettle).named('blockHit');
+    final validUpdateEn = Logic(name: 'validUpdateEn');
+    final validUpdateIdx = Logic(name: 'validUpdateIdx', width: fillIdx.width);
+    final validUpdateValue = Logic(name: 'validUpdateValue');
+    final lineValid = _L1ValidBits(
+      clk: clk,
+      reset: reset,
+      flush: flush,
+      lines: numLines,
+      lookups: [idxOf(addrQ), if (dualPort) idxOf(addrQ1!)],
+      updateEn: validUpdateEn,
+      updateIdx: validUpdateIdx,
+      updateValue: validUpdateValue,
+    );
+    sweepCycles = lineValid.sweepCycles;
 
+    final blockHit = (filling | fillSettle | lineValid.sweeping).named(
+      'blockHit',
+    );
+
+    // The valid bit and the tag of the line both belong to the address of the
+    // last cycle.
     Logic committedHit(Logic a, [int port = 0]) =>
-        muxLine(lineValid, idxOf(a)) & tagRam.read(port).eq(fullTagOf(a));
+        lineValid.valid[port] & tagRam.read(port).eq(fullTagOf(a));
 
     final ans = (reqValid & reqAddr.eq(addrQ)).named('ans');
     final hit = (ans & committedHit(addrQ) & ~blockHit).named('hit');
@@ -499,13 +679,21 @@ class HarborL1ICache extends BridgeModule {
     tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
     tagRam.ram.input('wr_data').srcConnection! <= fillTag;
 
+    // A fill sets its line valid when it commits. A new fill clears the
+    // victim line first.
+    final fillValidSet = (fillWrEn & fillWord.eq(lastWord)).named(
+      'fillValidSet',
+    );
+    validUpdateEn <= fillValidSet | (wantFill & ~drain);
+    validUpdateIdx <= mux(fillValidSet, fillIdx, idxOf(fillAddr));
+    validUpdateValue <= fillValidSet;
+
     Sequential(clk, [
       addrQ < reqAddr,
       if (dualPort) addrQ1! < reqAddr1,
       If(
         reset,
         then: [
-          ...List.generate(numLines, (i) => lineValid[i] < 0),
           filling < 0,
           fillSettle < 0,
           memEnR < 0,
@@ -517,7 +705,6 @@ class HarborL1ICache extends BridgeModule {
           If(
             flush,
             then: [
-              ...List.generate(numLines, (i) => lineValid[i] < 0),
               filling < 0,
               fillSettle < 0,
               memEnR < 0,
@@ -560,16 +747,7 @@ class HarborL1ICache extends BridgeModule {
                         then: [
                           If(
                             fillWord.eq(lastWord),
-                            then: [
-                              memEnR < 0,
-                              filling < 0,
-                              fillSettle < 1,
-                              ...List.generate(
-                                numLines,
-                                (l) =>
-                                    If(fillIdx.eq(l), then: [lineValid[l] < 1]),
-                              ),
-                            ],
+                            then: [memEnR < 0, filling < 0, fillSettle < 1],
                             orElse: [
                               fillWord < fillWord + 1,
                               memAddrR <
@@ -600,17 +778,11 @@ class HarborL1ICache extends BridgeModule {
                       If(
                         wantFill,
                         then: [
-                          filling < 1,
                           // Refill overwrites data before committing its tag.
-                          // Drop the victim now so a later fault cannot expose
-                          // partial replacement data under the old valid tag.
-                          ...List.generate(
-                            numLines,
-                            (l) => If(
-                              idxOf(fillAddr).eq(l),
-                              then: [lineValid[l] < 0],
-                            ),
-                          ),
+                          // The victim line is dropped now (validUpdateEn), so
+                          // a later fault cannot expose partial replacement
+                          // data under the old valid tag.
+                          filling < 1,
                           fillIdx < idxOf(fillAddr),
                           fillTag < fullTagOf(fillAddr),
                           fillBase < fillLineBase,
@@ -700,6 +872,10 @@ class HarborL1DCache extends BridgeModule {
   /// a store never leaves another context holding stale data.
   final int ctxBits;
 
+  /// Cycles after a reset or flush during which the cache clears its valid
+  /// bits and answers no lookup.
+  late final int sweepCycles;
+
   /// Request port (from the load/store unit). [reqWrite] selects store.
   ///
   /// There is no accept handshake. The cache answers with [respValid] or
@@ -749,7 +925,8 @@ class HarborL1DCache extends BridgeModule {
   Logic get perfAccess => output('perf_access');
   Logic get perfMiss => output('perf_miss');
 
-  /// Whole-cache flush.
+  /// Whole-cache flush. It clears every valid bit in [sweepCycles] cycles,
+  /// and [busy] stays high until the clear is done.
   Logic get flush => input('flush');
 
   /// Word-granular memory port (shared by load fills and write-through stores).
@@ -907,7 +1084,6 @@ class HarborL1DCache extends BridgeModule {
         ? Const(0, width: 1)
         : addr.slice(byteBits + offBits + idxBits - 1, byteBits);
 
-    final lineValid = List.generate(numLines, (i) => Logic(name: 'valid_$i'));
     final tagRam = _L1TagStore(
       this,
       clk: clk,
@@ -919,37 +1095,6 @@ class HarborL1DCache extends BridgeModule {
       name: 'l1d_tags',
     );
     tagRam.ram.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
-
-    // Select arr[idx]. A balanced mux tree (log2(numLines) deep) when the line
-    // count is a power of two, folding pairs on one index bit per level. The
-    // old linear `mux(idx.eq(i), arr[i], r)` chain was numLines muxes deep and,
-    // run twice (valid + tag) into the tag compare, was the core's FPGA timing-
-    // critical path. Falls back to the linear form for a non-power-of-two count.
-    Logic muxLine(List<Logic> arr, Logic idx) {
-      if (numLines > 1 && (numLines & (numLines - 1)) == 0) {
-        var level = List<Logic>.from(arr);
-        var bit = 0;
-        while (level.length > 1) {
-          final next = <Logic>[];
-          for (var i = 0; i < level.length; i += 2) {
-            next.add(mux(idx[bit], level[i + 1], level[i]));
-          }
-          level = next;
-          bit++;
-        }
-        return level[0];
-      }
-      var r = arr[0];
-      for (var i = 1; i < numLines; i++) {
-        r = mux(idx.eq(i), arr[i], r);
-      }
-      return r;
-    }
-
-    // Match address and permission context. Stores invalidate by index and
-    // require no asynchronous tag read.
-    Logic committedHitOf(Logic a) =>
-        muxLine(lineValid, idxOf(a)) & tagRam.read(0).eq(fullTagOf(a));
 
     final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
     final dataRam = HarborRegisterFile(
@@ -999,6 +1144,30 @@ class HarborL1DCache extends BridgeModule {
     final storeInv = Logic(name: 'storeInv');
 
     final addrQ = Logic(name: 'addrQ', width: xlen);
+    final validUpdateEn = Logic(name: 'validUpdateEn');
+    final validUpdateIdx = Logic(
+      name: 'validUpdateIdx',
+      width: idxBits == 0 ? 1 : idxBits,
+    );
+    final fillValidSet = Logic(name: 'fillValidSet');
+    // A flush clears every line, also while a store or an uncached read
+    // finishes. Those operations keep their state and give their response.
+    final lineValid = _L1ValidBits(
+      clk: clk,
+      reset: reset,
+      flush: flush,
+      lines: numLines,
+      lookups: [idxOf(addrQ)],
+      updateEn: validUpdateEn,
+      updateIdx: validUpdateIdx,
+      updateValue: fillValidSet,
+    );
+    sweepCycles = lineValid.sweepCycles;
+
+    // Match address and permission context. Stores invalidate by index and
+    // require no asynchronous tag read.
+    Logic committedHitOf(Logic a) =>
+        lineValid.valid[0] & tagRam.read(0).eq(fullTagOf(a));
     // Also block on the completion pulses (storeDone / bypassDone / fillSettle):
     // the pipeline holds its request one cycle past `done`, so without this the
     // FSM would re-issue the SAME op the cycle it finishes. A back-to-back
@@ -1014,7 +1183,8 @@ class HarborL1DCache extends BridgeModule {
                 bypassDone |
                 faultDone |
                 drain |
-                flush)
+                flush |
+                lineValid.sweeping)
             .named('blockHit');
 
     // Only DRAM (>= cacheableBase) is cacheable, everything else bypasses.
@@ -1073,7 +1243,7 @@ class HarborL1DCache extends BridgeModule {
     respFault <= faultDone;
     respFaultIsAccess <= faultDone & ~faultIsPage;
     miss <= loadMiss;
-    busy <= (filling | storing | bypassing | drain);
+    busy <= (filling | storing | bypassing | drain | lineValid.sweeping);
     // Cacheable traffic only, so perfMiss over perfAccess is the miss rate.
     // An uncacheable access bypasses the line store and never looks a tag up,
     // so bypassDone is left out.
@@ -1099,20 +1269,17 @@ class HarborL1DCache extends BridgeModule {
     // Fill completion, acknowledged stores, and miss-victim invalidation are
     // mutually exclusive FSM events. Select their index/value once so the
     // per-line valid bank needs only one equality decoder instead of three.
-    final fillValidSet = (fillWrEn & fillWord.eq(lastWord)).named(
-      'fillValidSet',
-    );
+    fillValidSet <= fillWrEn & fillWord.eq(lastWord);
     final storeValidClear = (storing & memDone & memValid & storeInv).named(
       'storeValidClear',
     );
-    final validUpdateEn = (fillValidSet | storeValidClear | loadMiss).named(
-      'validUpdateEn',
-    );
-    final validUpdateIdx = mux(
-      fillValidSet,
-      fillIdx,
-      mux(storeValidClear, storeIdx, idxOf(addrQ)),
-    ).named('validUpdateIdx');
+    validUpdateEn <= fillValidSet | storeValidClear | loadMiss;
+    validUpdateIdx <=
+        mux(
+          fillValidSet,
+          fillIdx,
+          mux(storeValidClear, storeIdx, idxOf(addrQ)),
+        );
     tagRam.ram.input('wr_en').srcConnection! <=
         fillWrEn & fillWord.eq(lastWord);
     tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
@@ -1123,7 +1290,6 @@ class HarborL1DCache extends BridgeModule {
       If(
         reset,
         then: [
-          ...List.generate(numLines, (i) => lineValid[i] < 0),
           filling < 0,
           fillSettle < 0,
           storing < 0,
@@ -1137,26 +1303,6 @@ class HarborL1DCache extends BridgeModule {
           drain < 0,
         ],
         orElse: [
-          If(
-            validUpdateEn,
-            then: [
-              ...List.generate(
-                numLines,
-                (l) => If(
-                  validUpdateIdx.eq(l),
-                  then: [lineValid[l] < fillValidSet],
-                ),
-              ),
-            ],
-          ),
-          // Invalidate every line even while an uncached read or write-through
-          // store is finishing. Those operations cannot be cancelled safely:
-          // their side effects may already have happened. Keep their state and
-          // deliver their success/fault response, including during a held flush.
-          If(
-            flush,
-            then: [...List.generate(numLines, (i) => lineValid[i] < 0)],
-          ),
           // Refills can be abandoned, but drain their outstanding beat before
           // starting another operation. blockHit prevents new requests and
           // cached hits while flush is asserted or a stale beat is draining.
