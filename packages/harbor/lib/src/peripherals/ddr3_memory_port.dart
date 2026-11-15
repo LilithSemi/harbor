@@ -18,7 +18,8 @@ import '../bus/port/reg_fifo.dart';
 /// size INCR or WRAP burst goes out as one controller command per word it
 /// touches, cut at its wrap point. A narrow or FIXED beat is one command.
 /// A WRAP burst must have 2, 4, 8 or 16 beats and an address aligned to its
-/// size. The port stops the simulation on another WRAP length.
+/// size, at most the bus size. The port stops the simulation on another
+/// WRAP length or a larger size.
 /// RDATA_ERR and WRESP_ERR are always low.
 ///
 /// A round robin arbiter picks the next command from the write path and the
@@ -320,6 +321,14 @@ class Ddr3MemoryPort extends Module {
             w.reqBurst.eq(HarborMemoryBurst.wrap.value) &
             ~[1, 3, 7, 15].map((l) => w.reqLen.eq(l)).reduce((x, y) => x | y),
         'a WRAP burst of a length other than 2, 4, 8 or 16 beats',
+      );
+      _check(
+        clk,
+        reset,
+        reqFire &
+            w.reqBurst.eq(HarborMemoryBurst.wrap.value) &
+            w.reqSize.gt(Const(busSize, width: sizeW)),
+        'a WRAP burst of a size above the bus size',
       );
       final rdataFire = (w.rdataValid & w.rdataReady).named('${p}_rd_out');
       final rLastBeat = Logic(name: '${p}_r_last');

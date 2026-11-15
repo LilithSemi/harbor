@@ -6,7 +6,7 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-Future<void> _wrap(int len) async {
+Future<void> _wrap(int len, {int size = 3}) async {
   final cfg = HarborMemoryWaistConfig(
     addressWidth: 32,
     dataWidth: 64,
@@ -57,7 +57,7 @@ Future<void> _wrap(int len) async {
   w.reqValid.put(1);
   w.reqWrite.put(0);
   w.reqLen.put(len);
-  w.reqSize.put(3);
+  w.reqSize.put(size);
   w.reqBurst.put(HarborMemoryBurst.wrap.value);
   await done;
 }
@@ -75,6 +75,16 @@ void main() {
       );
     });
   }
+
+  test(
+    'a WRAP request of a size above the bus size stops the simulation',
+    () async {
+      await expectLater(
+        _wrap(3, size: 4),
+        throwsA(predicate((e) => e.toString().contains('size above the bus'))),
+      );
+    },
+  );
 
   test('a WRAP request of len 3 runs on', () async {
     await _wrap(3);
