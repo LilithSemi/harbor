@@ -1021,10 +1021,13 @@ Future<void> _run({
   expect(commands, greaterThan(cycles ~/ 20));
 }
 
-void main() {
+void main() => runEqualTests([(64, 128), (32, 128), (64, 64), (32, 256)]);
+
+/// Runs the equality tests for each (bus width, controller word width).
+void runEqualTests(List<(int, int)> configs) {
   tearDown(Simulator.reset);
 
-  for (final (dw, cw) in [(64, 128), (32, 128), (64, 64), (32, 256)]) {
+  for (final (dw, cw) in configs) {
     for (final profile in _Profile.values) {
       for (final seed in profile == _Profile.mixed ? [1, 2] : [3]) {
         test('d$dw word $cw ${profile.name} seed $seed', () async {
