@@ -126,7 +126,7 @@ void main() {
     expect(sdram.inputs.keys, isNot(contains('mem_reset')));
   });
 
-  test('busClockSync keeps mem_reset and drops mem_clk', () async {
+  test('busClockSync drops mem_clk and mem_reset', () async {
     final sdram = HarborSdram(
       config: config,
       baseAddress: 0,
@@ -135,7 +135,7 @@ void main() {
       busClockSync: true,
     );
     await sdram.build();
-    expect(sdram.inputs.keys, contains('mem_reset'));
+    expect(sdram.inputs.keys, isNot(contains('mem_reset')));
     expect(sdram.inputs.keys, isNot(contains('mem_clk')));
     expect(sdram.busError.width, equals(1));
   });
@@ -285,6 +285,7 @@ void main() {
       await sdram.build();
       expect(sdram.cdcDepth, 0);
       expect(sdram.inputs.keys, isNot(contains('mem_clk')));
+      expect(sdram.inputs.keys, isNot(contains('mem_reset')));
       expect(
         tree(sdram).where((m) => m.definitionName.contains('Cdc')),
         isEmpty,
@@ -419,6 +420,57 @@ void main() {
         await Simulator.reset();
       }
     }
+  });
+
+  test('the capture edge follows the clock, and a missed window throws', () {
+    HarborSdram make(
+      int hz, {
+      HarborSdramCaptureEdge? edge,
+      double flight = 4.6,
+    }) => HarborSdram(
+      config: config,
+      baseAddress: 0,
+      clockHz: hz,
+      target: ecp5Target,
+      phy: HarborSdramPhyConfig(captureEdge: edge, fpgaToSdramNs: flight),
+    );
+    expect(make(125000000).phy.captureEdge, HarborSdramCaptureEdge.rising);
+    expect(make(100000000).phy.captureEdge, HarborSdramCaptureEdge.rising);
+    expect(make(25000000).phy.captureEdge, HarborSdramCaptureEdge.falling);
+    expect(
+      make(25000000, edge: HarborSdramCaptureEdge.falling).phy.captureEdge,
+      HarborSdramCaptureEdge.falling,
+    );
+    for (final call in [
+      () => make(25000000, edge: HarborSdramCaptureEdge.rising),
+      () => make(125000000, edge: HarborSdramCaptureEdge.falling),
+      () => make(100000000, flight: 30),
+    ]) {
+      expect(
+        call,
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => '$e',
+            'message',
+            allOf(contains('captureEdge'), contains('clockHz')),
+          ),
+        ),
+      );
+    }
+  });
+
+  test('a sim target with scanout needs a 32-bit bus', () {
+    expect(
+      () => HarborSdram(
+        config: config,
+        baseAddress: 0,
+        clockHz: 125000000,
+        target: const HarborSimTarget(topCell: 'top', frequency: 50000000),
+        busDataWidth: 64,
+        scanoutPorts: 1,
+      ),
+      throwsArgumentError,
+    );
   });
 
   test('sdram requests per burst', () {

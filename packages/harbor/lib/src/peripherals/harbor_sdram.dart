@@ -47,7 +47,7 @@ import 'sim_dram.dart';
 /// the memory side has taken it, so no acked write is lost on a bus
 /// reset. With it true, writes are posted (about 3x faster back to
 /// back), but a posted write still in the clock-crossing fifo is lost on
-/// a bus reset. Either reset sets the sticky `bus_error`.
+/// a bus reset. On a crossed build, either reset sets the sticky `bus_error`.
 ///
 /// An AXI4 or TileLink [protocol] has a memory slave port:
 ///
@@ -74,10 +74,10 @@ import 'sim_dram.dart';
 ///
 /// `mem_reset` re-initializes the device, so its contents are not
 /// guaranteed after one. A bus `reset` alone keeps the sdram contents. With
-/// [busClockSync] on an AXI4 or TileLink [protocol] there is no crossing to
-/// give the requests in flight an error response when `mem_reset` comes
-/// alone. They are dropped and `bus_error` is set, so a SoC resets the
-/// master with `mem_reset` or ties `mem_reset` to the bus `reset`.
+/// [busClockSync] there is one clock and one reset: no `mem_clk` and no
+/// `mem_reset` port, and every bus `reset` also re-initializes the device
+/// with the full power-up wait, so its contents are lost. `scan_reset`
+/// follows `reset` too. `bus_error` stays low.
 ///
 /// A scanout port ([scanoutPorts] is 0 or 1) is a read port for a display,
 /// such as [HarborDualClockDisplay], that joins the arbiter next to the bus
@@ -117,7 +117,10 @@ class HarborSdram extends BridgeModule
   /// Build target. Must be an ECP5 [HarborFpgaTarget] or a [HarborSimTarget].
   final HarborDeviceTarget? target;
 
-  /// Ecp5 phy knobs.
+  /// Ecp5 phy knobs, with the capture edge picked from [clockHz] when the
+  /// caller left it null. The edge must be inside the read window for the
+  /// board flight in the config, else the constructor throws an
+  /// [ArgumentError].
   final HarborSdramPhyConfig phy;
 
   /// Refreshes the scheduler may postpone before it must catch up.
@@ -127,9 +130,8 @@ class HarborSdram extends BridgeModule
   final int maxPulledInRefresh;
 
   /// When true, the bus clock is the same as `mem_clk`, so no `mem_clk`
-  /// port exists and the clock crossing is skipped. `mem_reset` stays,
-  /// because the device reset can differ from the bus reset. Works on every
-  /// [protocol].
+  /// port and no `mem_reset` port exist, the clock crossing is skipped and
+  /// the device follows the bus `reset`. Works on every [protocol].
   final bool busClockSync;
 
   /// When true, a write is acked as soon as the cdc bridge queues it,
@@ -215,7 +217,7 @@ class HarborSdram extends BridgeModule
     required this.baseAddress,
     required this.clockHz,
     this.target,
-    this.phy = const HarborSdramPhyConfig(),
+    HarborSdramPhyConfig phy = const HarborSdramPhyConfig(),
     this.maxPostponedRefresh = 8,
     this.maxPulledInRefresh = 8,
     this.busClockSync = false,
@@ -234,7 +236,15 @@ class HarborSdram extends BridgeModule
     this.simReadLatency = 1,
     this.simWriteLatency = 1,
     super.name = 'sdram',
-  }) : busAddressWidth = busAddressWidth ?? config.sizeBytes.bitLength,
+  }) : phy = _resolvePhy(
+         config,
+         clockHz,
+         target,
+         phy,
+         maxPostponedRefresh,
+         maxPulledInRefresh,
+       ),
+       busAddressWidth = busAddressWidth ?? config.sizeBytes.bitLength,
        outstanding = _outstanding(protocol, outstanding),
        cdcDepth = _cdcDepth(
          target,
@@ -256,7 +266,14 @@ class HarborSdram extends BridgeModule
            ),
            clockHz: clockHz,
            target: target,
-           phy: phy,
+           phy: _resolvePhy(
+             config,
+             clockHz,
+             target,
+             phy,
+             maxPostponedRefresh,
+             maxPulledInRefresh,
+           ),
            busClockSync: busClockSync,
            postedWrites: postedWrites,
            busAddressWidth: busAddressWidth ?? config.sizeBytes.bitLength,
@@ -286,6 +303,13 @@ class HarborSdram extends BridgeModule
         busDataWidth,
         'busDataWidth',
         'HarborSdram needs a 32-bit or 64-bit bus',
+      );
+    }
+    if (target is HarborSimTarget && scanoutPorts > 0 && busDataWidth != 32) {
+      throw ArgumentError.value(
+        busDataWidth,
+        'busDataWidth',
+        'a HarborSimTarget build with scanout ports needs a 32-bit bus',
       );
     }
     if (config.dataWidth != 16) {
@@ -389,7 +413,8 @@ class HarborSdram extends BridgeModule
       return;
     }
     final memClkPort = busClockSync ? null : addInput('mem_clk', Logic());
-    final memResetPort = addInput('mem_reset', Logic());
+    // A same-clock build has one reset: the device follows the bus reset.
+    final memResetPort = busClockSync ? reset : addInput('mem_reset', Logic());
     final fpgaTarget = target;
     if (fpgaTarget is! HarborFpgaTarget ||
         fpgaTarget.vendor != HarborFpgaVendor.ecp5) {
@@ -508,6 +533,28 @@ class HarborSdram extends BridgeModule
         : null,
   );
 
+  static HarborSdramPhyConfig _resolvePhy(
+    HarborSdramConfig config,
+    int clockHz,
+    HarborDeviceTarget? target,
+    HarborSdramPhyConfig phy,
+    int maxPostponed,
+    int maxPulledIn,
+  ) {
+    if (target is! HarborFpgaTarget) return phy;
+    return phy.resolve(
+      clockHz: clockHz,
+      config: config,
+      casLatency: _cycles(
+        config,
+        clockHz,
+        target,
+        maxPostponed,
+        maxPulledIn,
+      ).casLatency,
+    );
+  }
+
   static String _definitionName({
     required HarborSdramConfig config,
     required HarborSdramCycles cycles,
@@ -550,7 +597,7 @@ class HarborSdram extends BridgeModule
             '_${c.wr}_${c.refi}_${c.powerUp}_${c.initRefreshes}'
             '_${c.readHiz}_${c.rowAgeLimit}_${c.maxPostponed}'
             '_${c.maxPulledIn}',
-        'p${phy.captureCycles}${phy.captureEdge.index}'
+        'p${phy.captureCycles}${phy.edge.index}'
             '${phy.captureCycleOffset}_${phy.dqDelayTaps ?? 'x'}',
         if (busClockSync) 'sync',
         if (postedWrites) 'posted',
@@ -671,23 +718,6 @@ class HarborSdram extends BridgeModule
       ),
     ]);
     addOutput('bus_error') <= busErr;
-  }
-
-  /// High while the device is in reset after its first release, so a
-  /// `mem_reset` that came on its own. Set by the first release of
-  /// [deviceReset], cleared by the bus [reset].
-  Logic _memResetAlone(Logic clk, Logic reset, Logic deviceReset) {
-    final armed = Logic(name: 'mem_reset_armed');
-    Sequential(clk, [
-      If(
-        reset,
-        then: [armed < 0],
-        orElse: [
-          If(~deviceReset, then: [armed < 1]),
-        ],
-      ),
-    ]);
-    return deviceReset & armed;
   }
 
   /// Adds the scanout port pins.
@@ -850,11 +880,7 @@ class HarborSdram extends BridgeModule
     // `front_reset_0`. These copies load only the port, so the clear flop
     // stays next to the port and not the engine.
     final portAbort = copy(joined, 'port_abort');
-    _busError(
-      clk,
-      reset,
-      busClockSync ? _memResetAlone(clk, reset, frontLocalReset) : Const(0),
-    );
+    _busError(clk, reset, Const(0));
 
     final clientPort = SdramPortInterface(
       addrWidth: config.wordAddrWidth,
@@ -911,21 +937,7 @@ class HarborSdram extends BridgeModule
   ) {
     if (busClockSync) {
       final frontReset = (reset | frontLocalReset).named('front_reset');
-      // Set by a mem_reset after the first release, cleared by the bus
-      // reset.
-      final armed = Logic(name: 'mem_reset_armed');
-      final busErr = Logic(name: 'bus_error_r');
-      Sequential(clk, [
-        If(
-          reset,
-          then: [armed < Const(0), busErr < Const(0)],
-          orElse: [
-            If(~frontLocalReset, then: [armed < Const(1)]),
-            If(frontLocalReset & armed, then: [busErr < Const(1)]),
-          ],
-        ),
-      ]);
-      addOutput('bus_error') <= busErr;
+      addOutput('bus_error') <= Const(0);
       return (
         cdc: null,
         frontReset: frontReset,

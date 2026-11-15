@@ -98,7 +98,7 @@ const sdramPhyThNs = 0.98;
 /// capture (the inverted clock's own rising edge), `0` for falling, plus
 /// [HarborSdramPhyConfig.captureCycleOffset] whole cycles more.
 double sdramPhyCaptureM(HarborSdramPhyConfig phy) =>
-    (phy.captureEdge == HarborSdramCaptureEdge.rising ? 0.5 : 0.0) +
+    (phy.edge == HarborSdramCaptureEdge.rising ? 0.5 : 0.0) +
     phy.captureCycleOffset;
 
 /// Whether a beat sampled at [sdramPhyCaptureM] cycles past `E` lands

@@ -144,7 +144,7 @@ class SdramWbStack {
     if (!busClockSync) {
       sdram.input('mem_clk').srcConnection! <= memClk;
     }
-    sdram.input('mem_reset').srcConnection! <= memReset;
+    if (!busClockSync) sdram.input('mem_reset').srcConnection! <= memReset;
     sdram.input('bus_CYC').srcConnection! <= cyc;
     sdram.input('bus_STB').srcConnection! <= cyc;
     sdram.input('bus_WE').srcConnection! <= we;

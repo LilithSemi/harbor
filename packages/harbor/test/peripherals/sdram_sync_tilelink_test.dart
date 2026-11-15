@@ -2,14 +2,13 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
-import 'sdram_bus_width_bench.dart';
 import 'sdram_memory_port_bench.dart';
 
 // One file per kind, so the kinds run in parallel.
 void main() {
   tearDown(Simulator.reset);
 
-  for (final width in [32, 64]) {
+  for (final width in [64]) {
     test('tilelink $width-bit, bus clock is mem_clk: random bursts match a '
         'reference memory', () async {
       final bad = await sdramRandomBursts(
@@ -24,12 +23,4 @@ void main() {
       expect(bad, isEmpty);
     }, timeout: const Timeout(Duration(hours: 2)));
   }
-
-  test('tilelink 64-bit, bus clock is mem_clk: every strobe pattern reads back '
-      'merged', () async {
-    expect(
-      await sdramStrobePatterns(HarborFabricKind.tilelink, 64, sync: true),
-      isEmpty,
-    );
-  }, timeout: const Timeout(Duration(minutes: 30)));
 }

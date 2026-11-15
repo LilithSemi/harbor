@@ -52,15 +52,21 @@ class SdramPortTop extends BridgeModule {
     HarborAxi4Exclusive? exclusive,
     bool sync = false,
     HarborSdramAddressMap addressMap = HarborSdramAddressMap.rowBankCol,
+    HarborSdramPhyConfig phy = const HarborSdramPhyConfig(),
     void Function(BridgeModule top, HarborSdram sdram)? link,
   }) : super(
          'SdramPortBench_${kind.name}_n${config.outstanding}_m${memHz}'
          '_d${config.dataWidth}_s$scanoutPorts${link == null ? '' : '_link'}'
          '${exclusive == null ? '' : '_${exclusive.tag}'}'
-         '${sync ? '_sync' : ''}_map${addressMap.index}',
+         '${sync ? '_sync' : ''}_map${addressMap.index}'
+         '_e${phy.captureEdge?.index ?? 'x'}',
          name: 'top',
        ) {
-    final ports = ['clk', 'reset', if (!sync) 'mem_clk', 'mem_reset'];
+    final ports = [
+      'clk',
+      'reset',
+      if (!sync) ...['mem_clk', 'mem_reset'],
+    ];
     for (final p in ports) {
       createPort(p, PortDirection.input);
     }
@@ -77,6 +83,7 @@ class SdramPortTop extends BridgeModule {
         outstanding: config.outstanding,
         scanoutPorts: scanoutPorts,
         busClockSync: sync,
+        phy: phy,
         target: const HarborFpgaTarget.ecp5(
           device: 'LFE5U-85F',
           package: 'CABGA381',
@@ -132,6 +139,7 @@ class SdramPortBench {
     HarborAxi4Exclusive? exclusive,
     bool sync = false,
     HarborSdramAddressMap addressMap = HarborSdramAddressMap.rowBankCol,
+    HarborSdramPhyConfig phy = const HarborSdramPhyConfig(),
     void Function(BridgeModule top, HarborSdram sdram)? link,
     required void Function(Sim s) attach,
   }) async {
@@ -146,6 +154,7 @@ class SdramPortBench {
       exclusive: exclusive,
       sync: sync,
       addressMap: addressMap,
+      phy: phy,
       link: link,
     );
     final fabricClk = SimpleClockGenerator(
@@ -164,15 +173,17 @@ class SdramPortBench {
     await top.build();
 
     final cycles = top.sdram.cycles;
-    final phy = top.sdram.subModules.whereType<SdramPhyEcp5>().single;
-    final bbs = {for (final m in phy.subModules.whereType<Ecp5Bb>()) m.name: m};
+    final phyMod = top.sdram.subModules.whereType<SdramPhyEcp5>().single;
+    final bbs = {
+      for (final m in phyMod.subModules.whereType<Ecp5Bb>()) m.name: m,
+    };
     final dqBbs = [for (var i = 0; i < 16; i++) bbs['dq_bb_$i']!];
-    const fpgaToSdramNs = 4.6;
+    final fpgaToSdramNs = top.sdram.phy.fpgaToSdramNs;
     if (!sdramPhyCaptureOk(
       periodPs: memPeriodPs,
       tAcNs: cycles.casLatency == 3 ? 5.0 : 6.0,
       fpgaToSdramNs: fpgaToSdramNs,
-      phy: const HarborSdramPhyConfig(),
+      phy: top.sdram.phy,
     )) {
       throw ArgumentError('the capture window misses at $memPeriodPs ps');
     }
@@ -209,7 +220,7 @@ class SdramPortBench {
     for (var i = 0; i < 8; i++) {
       await memClk.nextPosedge;
     }
-    top.input('mem_reset').srcConnection!.inject(0);
+    if (!sync) top.input('mem_reset').srcConnection!.inject(0);
     await fabricClk.nextNegedge;
     top.input('reset').srcConnection!.inject(0);
     await fabricClk.nextNegedge;

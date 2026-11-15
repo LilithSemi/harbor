@@ -32,4 +32,17 @@ void main() {
       isEmpty,
     );
   }, timeout: const Timeout(Duration(minutes: 30)));
+
+  test('axi4 64-bit, bus clock is mem_clk at 25 MHz: random bursts match a '
+      'reference memory', () async {
+    final bad = await sdramRandomBursts(
+      HarborFabricKind.axi4,
+      fabricPeriodPs: 40000,
+      seed: 25,
+      outstanding: 8,
+      dataWidth: 64,
+      sync: true,
+    );
+    expect(bad, isEmpty);
+  }, timeout: const Timeout(Duration(hours: 2)));
 }
