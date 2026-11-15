@@ -170,6 +170,10 @@ void main() {
           (m) => m.definitionName.startsWith('HarborMemoryWaistCdcSlave'),
         );
         expect(cdc.definitionName, endsWith('_r'));
+        expect(
+          defs.where((d) => d.startsWith('HarborWaistCdcFifo')),
+          isNotEmpty,
+        );
         // Per channel: a device reset copy and its early flop. Per device
         // valid or ready output: one enable copy.
         final copies = [
@@ -266,13 +270,23 @@ void main() {
         target: ecp5Target,
         busClockSync: true,
       ),
+      for (final kind in [HarborFabricKind.axi4, HarborFabricKind.tilelink])
+        for (final width in [32, 64])
+          HarborSdram(
+            config: config,
+            baseAddress: 0,
+            clockHz: 125000000,
+            target: ecp5Target,
+            busClockSync: true,
+            protocol: kind,
+            busDataWidth: width,
+          ),
     ]) {
       await sdram.build();
       expect(sdram.cdcDepth, 0);
+      expect(sdram.inputs.keys, isNot(contains('mem_clk')));
       expect(
-        tree(
-          sdram,
-        ).where((m) => m.definitionName.startsWith('HarborMemoryWaistCdc')),
+        tree(sdram).where((m) => m.definitionName.contains('Cdc')),
         isEmpty,
       );
       expect(sdram.definitionName, contains('_q0'));
@@ -330,6 +344,7 @@ void main() {
       make(aw: 32),
       make(hz: 100000000),
       make(protocol: HarborFabricKind.wishbone, sync: true),
+      make(sync: true),
       make(width: 64),
       make(protocol: HarborFabricKind.wishbone, width: 64),
       make(protocol: HarborFabricKind.wishbone, width: 64, sync: true),
@@ -346,19 +361,8 @@ void main() {
     expect(names.toSet(), hasLength(names.length), reason: '$names');
   });
 
-  test('busClockSync and postedWrites need a Wishbone port', () {
+  test('postedWrites needs a Wishbone port', () {
     for (final kind in [HarborFabricKind.axi4, HarborFabricKind.tilelink]) {
-      expect(
-        () => HarborSdram(
-          config: config,
-          baseAddress: 0,
-          clockHz: 125000000,
-          target: ecp5Target,
-          busClockSync: true,
-          protocol: kind,
-        ),
-        throwsArgumentError,
-      );
       expect(
         () => HarborSdram(
           config: config,

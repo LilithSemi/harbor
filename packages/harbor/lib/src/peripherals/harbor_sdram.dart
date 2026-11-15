@@ -66,12 +66,18 @@ import 'sim_dram.dart';
 /// across the crossing. A request that a reset cuts off ends with an error
 /// response, which sets the sticky `bus_error`.
 ///
-/// Everything after the crossing runs on `mem_clk`. The target must be a
+/// Everything after the crossing runs on `mem_clk`. With [busClockSync] the
+/// bus clock is `mem_clk`, so there is no `mem_clk` port and no crossing,
+/// and everything runs on `clk`. The target must be a
 /// Lattice ecp5 or a [HarborSimTarget], which replaces the whole stack with
 /// [HarborSimDram] on the bus clock.
 ///
 /// `mem_reset` re-initializes the device, so its contents are not
-/// guaranteed after one. A bus `reset` alone keeps the sdram contents.
+/// guaranteed after one. A bus `reset` alone keeps the sdram contents. With
+/// [busClockSync] on an AXI4 or TileLink [protocol] there is no crossing to
+/// give the requests in flight an error response when `mem_reset` comes
+/// alone. They are dropped and `bus_error` is set, so a SoC resets the
+/// master with `mem_reset` or ties `mem_reset` to the bus `reset`.
 ///
 /// A scanout port ([scanoutPorts] is 0 or 1) is a read port for a display,
 /// such as [HarborDualClockDisplay], that joins the arbiter next to the bus
@@ -121,8 +127,9 @@ class HarborSdram extends BridgeModule
   final int maxPulledInRefresh;
 
   /// When true, the bus clock is the same as `mem_clk`, so no `mem_clk`
-  /// port exists and the cdc bridge is skipped. `mem_reset` stays. It needs
-  /// a Wishbone [protocol].
+  /// port exists and the clock crossing is skipped. `mem_reset` stays,
+  /// because the device reset can differ from the bus reset. Works on every
+  /// [protocol].
   final bool busClockSync;
 
   /// When true, a write is acked as soon as the cdc bridge queues it,
@@ -293,16 +300,6 @@ class HarborSdram extends BridgeModule
         this.outstanding,
         'outstanding',
         'must be >= 1',
-      );
-    }
-    // A mem_reset resets the port of a busClockSync build. Only a Wishbone
-    // master can run its cycle again. An AXI4 or TileLink master would wait
-    // for a response that never comes.
-    if (busClockSync && protocol != HarborFabricKind.wishbone) {
-      throw ArgumentError.value(
-        protocol,
-        'protocol',
-        'busClockSync needs a Wishbone port',
       );
     }
     if (exclusive != null && protocol != HarborFabricKind.axi4) {
@@ -676,6 +673,23 @@ class HarborSdram extends BridgeModule
     addOutput('bus_error') <= busErr;
   }
 
+  /// High while the device is in reset after its first release, so a
+  /// `mem_reset` that came on its own. Set by the first release of
+  /// [deviceReset], cleared by the bus [reset].
+  Logic _memResetAlone(Logic clk, Logic reset, Logic deviceReset) {
+    final armed = Logic(name: 'mem_reset_armed');
+    Sequential(clk, [
+      If(
+        reset,
+        then: [armed < 0],
+        orElse: [
+          If(~deviceReset, then: [armed < 1]),
+        ],
+      ),
+    ]);
+    return deviceReset & armed;
+  }
+
   /// Adds the scanout port pins.
   void _addScanPorts() {
     for (var i = 0; i < scanoutPorts; i++) {
@@ -806,10 +820,12 @@ class HarborSdram extends BridgeModule
       return;
     }
 
+    // Without a crossing the port reset is the bus reset joined with the
+    // device reset, as the crossing gives it.
     final port = _busPort(
       memClk,
-      cdcReset,
-      fabric: HarborFabricClock(clk: clk, reset: reset),
+      busClockSync ? (reset | cdcReset).named('bus_joined_reset') : cdcReset,
+      fabric: busClockSync ? null : HarborFabricClock(clk: clk, reset: reset),
     );
     bus = port;
     // The joined reset asserts without the clock, so it goes through two
@@ -834,7 +850,11 @@ class HarborSdram extends BridgeModule
     // `front_reset_0`. These copies load only the port, so the clear flop
     // stays next to the port and not the engine.
     final portAbort = copy(joined, 'port_abort');
-    _busError(clk, reset, Const(0));
+    _busError(
+      clk,
+      reset,
+      busClockSync ? _memResetAlone(clk, reset, frontLocalReset) : Const(0),
+    );
 
     final clientPort = SdramPortInterface(
       addrWidth: config.wordAddrWidth,
