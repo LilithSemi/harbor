@@ -1,7 +1,7 @@
-// The write path of Ddr3MemoryPort keeps its command size in flops. This
-// test runs the port next to a copy of the earlier form, which computes the
-// size from the state on each cycle, and checks that every output is the
-// same on every cycle.
+// The write and read paths of Ddr3MemoryPort keep their command size, last
+// flag and the beats that remain in flops. This test runs the port next to
+// a copy of the earlier form, which computes them from the state on each
+// cycle, and checks that every output is the same on every cycle.
 import 'dart:async';
 import 'dart:math';
 
@@ -765,6 +765,8 @@ class _Queue {
   }
 }
 
+enum _Profile { mixed, single, narrow, fixed, wrap, long }
+
 class _Wr {
   final int beats;
   _Wr(this.beats);
@@ -775,6 +777,7 @@ Future<void> _run({
   required int ctrlDataWidth,
   required int seed,
   required int cycles,
+  _Profile profile = _Profile.mixed,
 }) async {
   await Simulator.reset();
   final rnd = Random(seed);
@@ -886,11 +889,24 @@ Future<void> _run({
 
   void randomReq() {
     final write = rnd.nextInt(4) != 0;
-    final size = rnd.nextInt(busSize + 1);
-    final burst = rnd.nextInt(3);
+    var size = rnd.nextInt(busSize + 1);
+    if (profile == _Profile.narrow && busSize > 0) size = rnd.nextInt(busSize);
+    var burst = rnd.nextInt(3);
+    if (profile == _Profile.fixed) burst = HarborMemoryBurst.fixed.value;
+    if (profile == _Profile.wrap) burst = HarborMemoryBurst.wrap.value;
+    if (profile == _Profile.single) burst = HarborMemoryBurst.incr.value;
+    if (profile == _Profile.long) burst = HarborMemoryBurst.incr.value;
     int len;
     if (burst == HarborMemoryBurst.wrap.value) {
       len = [1, 3, 7, 15][rnd.nextInt(4)];
+    } else if (profile == _Profile.single) {
+      len = 0;
+    } else if (profile == _Profile.long) {
+      len = 4096 ~/ (1 << size) > 256
+          ? 128 + rnd.nextInt(128)
+          : rnd.nextInt(64);
+    } else if (burst == HarborMemoryBurst.fixed.value) {
+      len = rnd.nextInt(16);
     } else {
       len = rnd.nextInt(4) == 0 ? rnd.nextInt(64) : rnd.nextInt(9);
     }
@@ -997,7 +1013,10 @@ Future<void> _run({
   }
   await Simulator.endSimulation();
   expect(mismatches, isEmpty);
-  expect(writes, greaterThan(cycles ~/ 200));
+  expect(
+    writes,
+    greaterThan(cycles ~/ (profile == _Profile.long ? 1000 : 200)),
+  );
   expect(beats, greaterThan(cycles ~/ 20));
   expect(commands, greaterThan(cycles ~/ 20));
 }
@@ -1005,21 +1024,24 @@ Future<void> _run({
 void main() {
   tearDown(Simulator.reset);
 
-  for (final (dw, cw) in [(64, 128), (32, 128), (64, 64)]) {
-    for (final seed in [1, 2]) {
-      test('d$dw word $cw seed $seed', () async {
-        await _run(
-          cfg: HarborMemoryWaistConfig(
-            addressWidth: 64,
-            dataWidth: dw,
-            idWidth: 1,
-            outstanding: 2,
-          ),
-          ctrlDataWidth: cw,
-          seed: seed,
-          cycles: 20000,
-        );
-      });
+  for (final (dw, cw) in [(64, 128), (32, 128), (64, 64), (32, 256)]) {
+    for (final profile in _Profile.values) {
+      for (final seed in profile == _Profile.mixed ? [1, 2] : [3]) {
+        test('d$dw word $cw ${profile.name} seed $seed', () async {
+          await _run(
+            cfg: HarborMemoryWaistConfig(
+              addressWidth: 64,
+              dataWidth: dw,
+              idWidth: 1,
+              outstanding: 2,
+            ),
+            ctrlDataWidth: cw,
+            seed: seed,
+            cycles: profile == _Profile.mixed ? 10000 : 4000,
+            profile: profile,
+          );
+        });
+      }
     }
   }
 }
