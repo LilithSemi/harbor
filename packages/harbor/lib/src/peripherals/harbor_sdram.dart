@@ -11,7 +11,6 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../blackbox/ecp5/ecp5.dart';
 import '../bus/bus_exports.dart';
-import '../clock/cdc.dart';
 import '../clock/wishbone_cdc_fifo.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
@@ -92,8 +91,9 @@ import 'sim_dram.dart';
 /// a page. A port has at
 /// most [scanoutMaxInFlight] requests in flight, which bounds the wait of
 /// the bus port, see [busWaitBound]. A bus `reset` drops only the reads of
-/// the bus port. `scan_reset` follows `mem_reset` only (the bus reset on a
-/// [HarborSimTarget] build), and a scanout port client must reset on it.
+/// the bus port, except with [busClockSync]. `scan_reset` follows `mem_reset` only (the bus reset on a
+/// [HarborSimTarget] build or with [busClockSync]), and a scanout port
+/// client must reset on it.
 ///
 /// Two items of the scanout design are not done yet. A page-size CSR would
 /// let software pick a framebuffer stride that starts each line on a new
@@ -780,18 +780,6 @@ class HarborSdram extends BridgeModule
     final engineDataReset = localReset('engine_data');
     final timersReset = localReset('timers');
     final phyReset = localReset('phy');
-    // The true power-on reset, synced into mem_clk, separate from a later
-    // standalone mem_reset. The engine uses it to tell a fresh power-up
-    // from a reset that may find a bank still open.
-    // One more flop after the synchronizer, so the flops on the raw bus
-    // reset drive one load and can sit near its source.
-    final coldReset = Ecp5Fd1s3bx(
-      d: harborCdcJoinReset(memClk, Const(0), reset, name: 'sdram_cold_reset'),
-      ck: memClk,
-      pd: Const(0),
-      name: 'sdram_cold_reset_copy',
-    ).q;
-
     final Logic frontReset, engineAbort;
     Logic? abortNext;
     // The arbiter took a write of the bus port, from the slice.
@@ -846,7 +834,6 @@ class HarborSdram extends BridgeModule
         engineDataReset: engineDataReset,
         timersReset: timersReset,
         phyReset: phyReset,
-        coldReset: coldReset,
       );
       return;
     }
@@ -910,7 +897,6 @@ class HarborSdram extends BridgeModule
       engineDataReset: engineDataReset,
       timersReset: timersReset,
       phyReset: phyReset,
-      coldReset: coldReset,
     );
   }
 
@@ -1030,7 +1016,6 @@ class HarborSdram extends BridgeModule
     required Logic engineDataReset,
     required Logic timersReset,
     required Logic phyReset,
-    required Logic coldReset,
   }) {
     final scanPorts = [
       for (var i = 0; i < scanoutPorts; i++)
@@ -1073,7 +1058,6 @@ class HarborSdram extends BridgeModule
       keepReadsOnAbort: {for (var i = 1; i <= scanoutPorts; i++) i},
       abort: engineAbort,
       abortNext: abortNext,
-      coldReset: coldReset,
       warmAfterFirstInit: true,
       timersReset: timersReset,
       port: enginePort,

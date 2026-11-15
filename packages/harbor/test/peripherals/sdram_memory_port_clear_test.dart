@@ -87,7 +87,6 @@ void main() {
         syncs.map((s) => s.name).toSet(),
         containsAll([
           'mem_reset_sync',
-          'sdram_cold_reset',
           wishbone ? 'm_join_reset' : 'device_join_reset',
         ]),
       );

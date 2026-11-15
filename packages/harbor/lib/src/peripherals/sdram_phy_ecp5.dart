@@ -79,18 +79,27 @@ class HarborSdramPhyConfig {
     required HarborSdramConfig config,
     required int casLatency,
     HarborSdramCaptureEdge? edgeOverride,
+  }) => captureOkAt(
+    periodPs: (1e12 / clockHz).round(),
+    tAcNs: config.timing.tAcByCl[casLatency]!,
+    tOhNs: config.timing.tOh,
+    edgeOverride: edgeOverride,
+  );
+
+  /// [captureOk] for a clock period in ps and the chip's tAC and tOH in ns.
+  bool captureOkAt({
+    required int periodPs,
+    required double tAcNs,
+    required double tOhNs,
+    HarborSdramCaptureEdge? edgeOverride,
   }) {
-    final periodPs = (1e12 / clockHz).round();
     final m =
         ((edgeOverride ?? edge) == HarborSdramCaptureEdge.rising ? 0.5 : 0.0) +
         captureCycleOffset;
     final samplePs = (m * periodPs).round();
     final dPs = ((fpgaToSdramNs + sdramToFpgaNs) * 1000).round();
-    final tAcNs = config.timing.tAcByCl[casLatency]!;
     final dMinPs =
-        samplePs -
-        (config.timing.tOh * 1000).round() +
-        (fpgaHoldNs * 1000).round();
+        samplePs - (tOhNs * 1000).round() + (fpgaHoldNs * 1000).round();
     final dMaxPs =
         samplePs +
         periodPs -
@@ -123,11 +132,13 @@ class HarborSdramPhyConfig {
       pick = HarborSdramCaptureEdge.falling;
     }
     if (!ok(pick)) {
+      final both = captureEdge == null
+          ? 'neither the rising nor the falling edge fits'
+          : 'the ${pick.name} edge misses the window';
       throw ArgumentError.value(
-        pick,
+        pick.name,
         'captureEdge',
-        'the ${pick.name} capture edge misses the read window at clockHz '
-            '$clockHz with CL$casLatency and a board flight of '
+        '$both at clockHz $clockHz with CL$casLatency and a board flight of '
             '${fpgaToSdramNs + sdramToFpgaNs} ns',
       );
     }

@@ -165,7 +165,7 @@ Future<SdramPinModel> _bootSdram(
   const fpgaToSdramNs = 4.6;
   if (!sdramPhyCaptureOk(
     periodPs: memPeriodPs,
-    tAcNs: sdram.cycles.casLatency == 3 ? 5.0 : 6.0,
+    casLatency: sdram.cycles.casLatency,
     fpgaToSdramNs: fpgaToSdramNs,
     phy: const HarborSdramPhyConfig(),
   )) {

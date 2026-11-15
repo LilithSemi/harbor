@@ -144,7 +144,7 @@ void main() {
     expect(
       sdramPhyCaptureOk(
         periodPs: periodPs,
-        tAcNs: cycles.casLatency == 3 ? 5.0 : 6.0,
+        casLatency: cycles.casLatency,
         fpgaToSdramNs: 4.6,
         phy: const HarborSdramPhyConfig(),
       ),

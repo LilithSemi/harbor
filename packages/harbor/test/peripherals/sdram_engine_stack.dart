@@ -406,10 +406,9 @@ class SdramEngineStack {
     final phy = top.phy;
     final bbs = {for (final m in phy.subModules.whereType<Ecp5Bb>()) m.name: m};
     final dqBbs = [for (var i = 0; i < 16; i++) bbs['dq_bb_$i']!];
-    final tAcNs = cycles.casLatency == 3 ? 5.0 : 6.0;
     if (!sdramPhyCaptureOk(
       periodPs: periodPs,
-      tAcNs: tAcNs,
+      casLatency: cycles.casLatency,
       fpgaToSdramNs: fpgaToSdramNs,
       phy: const HarborSdramPhyConfig(),
     )) {

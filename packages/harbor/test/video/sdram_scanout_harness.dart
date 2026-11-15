@@ -387,10 +387,9 @@ class SdramScanoutBench {
     final bbs = {for (final m in phy.subModules.whereType<Ecp5Bb>()) m.name: m};
     final dqBbs = [for (var i = 0; i < 16; i++) bbs['dq_bb_$i']!];
     const fpgaToSdramNs = 4.6;
-    final tAcNs = cycles.casLatency == 3 ? 5.0 : 6.0;
     if (!sdramPhyCaptureOk(
       periodPs: memPeriodPs,
-      tAcNs: tAcNs,
+      casLatency: cycles.casLatency,
       fpgaToSdramNs: fpgaToSdramNs,
       phy: const HarborSdramPhyConfig(),
     )) {

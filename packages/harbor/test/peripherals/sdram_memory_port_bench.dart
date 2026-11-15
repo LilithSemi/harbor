@@ -181,7 +181,7 @@ class SdramPortBench {
     final fpgaToSdramNs = top.sdram.phy.fpgaToSdramNs;
     if (!sdramPhyCaptureOk(
       periodPs: memPeriodPs,
-      tAcNs: cycles.casLatency == 3 ? 5.0 : 6.0,
+      casLatency: cycles.casLatency,
       fpgaToSdramNs: fpgaToSdramNs,
       phy: top.sdram.phy,
     )) {

@@ -145,7 +145,7 @@ Future<WaistScanResult> runWaistScanout({
   const fpgaToSdramNs = 4.6;
   if (!sdramPhyCaptureOk(
     periodPs: memPeriodPs,
-    tAcNs: cycles.casLatency == 3 ? 5.0 : 6.0,
+    casLatency: cycles.casLatency,
     fpgaToSdramNs: fpgaToSdramNs,
     phy: const HarborSdramPhyConfig(),
   )) {

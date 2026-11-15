@@ -65,8 +65,8 @@ class _Entry {
 ///
 /// With `warmAfterFirstInit`, every reset after the first finished init
 /// runs the warm path: precharge all first, with cke high, then the full
-/// power-up wait and init. Without it, only a `reset` while `coldReset` is
-/// low takes that path.
+/// power-up wait and init, and `coldReset` is ignored. Without it, only a
+/// `reset` while `coldReset` is low takes that path.
 ///
 /// `abort` is the bus side reset: it drops queued reads and in-flight read
 /// data, but queued writes still run and init, refresh and bank state
@@ -219,8 +219,7 @@ class SdramEngine extends Module {
     abort = addInput('abort', abort ?? Const(0));
     // Only a real power-on clears [warmReset] below. With no [coldReset]
     // given, every reset counts as cold, so warmReset never latches and
-    // init always takes the cold path: unchanged from before this input
-    // existed.
+    // init always takes the cold path. [warmAfterFirstInit] ignores it.
     final coldResetSig = addInput('cold_reset', coldReset ?? externalReset);
     // A copy of [reset] for the bank timers, so neither reset net carries
     // every flop in the engine. It must assert and release with [reset].
@@ -298,20 +297,20 @@ class SdramEngine extends Module {
       // Set by the first finished init and never cleared, so every later
       // reset takes the warm path: precharge all first, then the full
       // power-up wait. The flop powers up at 0 on the fpga. A sim has no
-      // power-up state, so after 8 clock cycles a flop that is still
-      // unknown is set to 0, as the power-up state would be.
+      // power-up state, so it sets the flop to 0 just after the second
+      // clock edge. By then the engine reset is known, and the set
+      // condition no longer sets the flop to unknown.
       final seen = Logic(name: 'init_seen');
       Sequential(clk, [seen < mux(initDone & ~reset, Const(1), seen)]);
       var edges = 0;
       clk.glitch.listen((args) {
-        if (LogicValue.isNegedge(
+        if (LogicValue.isPosedge(
               args.previousValue,
               args.newValue,
               ignoreInvalid: true,
             ) &&
-            ++edges == 8 &&
-            !seen.value.isValid) {
-          seen.put(0);
+            ++edges == 2) {
+          Simulator.registerAction(Simulator.time + 1, () => seen.put(0));
         }
       });
       warmReset <= seen;
