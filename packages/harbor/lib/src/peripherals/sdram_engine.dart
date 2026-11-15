@@ -6,6 +6,7 @@ import 'package:meta/meta.dart';
 import 'package:rohd/rohd.dart';
 
 import '../blackbox/ecp5/ecp5.dart';
+import '../clock/cdc.dart';
 import 'sdram_bank_timers.dart';
 import 'sdram_command.dart';
 import 'sdram_config.dart';
@@ -296,23 +297,19 @@ class SdramEngine extends Module {
     if (warmAfterFirstInit) {
       // Set by the first finished init and never cleared, so every later
       // reset takes the warm path: precharge all first, then the full
-      // power-up wait. The flop powers up at 0 on the fpga. A sim has no
-      // power-up state, so it sets the flop to 0 just after the second
-      // clock edge. By then the engine reset is known, and the set
-      // condition no longer sets the flop to unknown.
+      // power-up wait. The flops power up at 0 on the fpga, and
+      // [harborSimPowerUp] does the same in a sim. The set condition waits
+      // 3 cycles, until the done flop and the resets hold known values, so
+      // it never loads an unknown value into the flag.
       final seen = Logic(name: 'init_seen');
-      Sequential(clk, [seen < mux(initDone & ~reset, Const(1), seen)]);
-      var edges = 0;
-      clk.glitch.listen((args) {
-        if (LogicValue.isPosedge(
-              args.previousValue,
-              args.newValue,
-              ignoreInvalid: true,
-            ) &&
-            ++edges == 2) {
-          Simulator.registerAction(Simulator.time + 1, () => seen.put(0));
-        }
-      });
+      final arm = [for (var i = 0; i < 3; i++) Logic(name: 'init_seen_arm_$i')];
+      Sequential(clk, [
+        arm[0] < 1,
+        arm[1] < arm[0],
+        arm[2] < arm[1],
+        seen < mux(arm[2] & initDone & ~reset, Const(1), seen),
+      ]);
+      harborSimPowerUp(clk, [seen, ...arm]);
       warmReset <= seen;
     } else {
       Sequential(

@@ -62,8 +62,10 @@ class SdramInitSequencer extends Module {
     const stRef = 6;
     const stWaitRfc = 7;
     const stDone = 8;
-    // Warm-reset only: close any open bank before cke drops, so the long
-    // power-up wait never leaves a row open past tRAS max.
+    // Every reset starts here, so the state never depends on warm. Only a
+    // warm reset closes any open bank before cke drops, so the long
+    // power-up wait never leaves a row open past tRAS max. A power-on
+    // idles with nop and cke low for the same cycles.
     const stWarmPre = 9;
     const stWarmWaitRp = 10;
 
@@ -96,12 +98,7 @@ class SdramInitSequencer extends Module {
       If(
         reset,
         then: [
-          st <
-              mux<Logic>(
-                warm,
-                Const(stWarmPre, width: 4),
-                Const(stPowerUp, width: 4),
-              ),
+          st < Const(stWarmPre, width: 4),
           counter < Const(0, width: counterWidth),
           refreshesLeft < Const(cycles.initRefreshes, width: refreshWidth),
           cmdReg < nopCode(),
@@ -188,10 +185,17 @@ class SdramInitSequencer extends Module {
               ]),
               CaseItem(Const(stDone, width: 4), [doneReg < Const(1)]),
               CaseItem(Const(stWarmPre, width: 4), [
-                cmdReg < Const(SdramCommand.preAll.index, width: 3),
+                cmdReg <
+                    mux<Logic>(
+                      warm,
+                      Const(SdramCommand.preAll.index, width: 3),
+                      nopCode(),
+                    ),
+                ckeReg < warm,
                 st < Const(stWarmWaitRp, width: 4),
               ]),
               CaseItem(Const(stWarmWaitRp, width: 4), [
+                ckeReg < warm,
                 If(
                   counter.lt(Const(cycles.rp - 1, width: counterWidth)),
                   then: [counter < counter + 1],

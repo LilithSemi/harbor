@@ -91,9 +91,10 @@ import 'sim_dram.dart';
 /// a page. A port has at
 /// most [scanoutMaxInFlight] requests in flight, which bounds the wait of
 /// the bus port, see [busWaitBound]. A bus `reset` drops only the reads of
-/// the bus port, except with [busClockSync]. `scan_reset` follows `mem_reset` only (the bus reset on a
-/// [HarborSimTarget] build or with [busClockSync]), and a scanout port
-/// client must reset on it.
+/// the bus port. `scan_reset` follows `mem_reset` only, and a scanout port
+/// client must reset on it. On a [HarborSimTarget] build and with
+/// [busClockSync] there is no `mem_reset`, so `scan_reset` follows the bus
+/// `reset`.
 ///
 /// Two items of the scanout design are not done yet. A page-size CSR would
 /// let software pick a framebuffer stride that starts each line on a new

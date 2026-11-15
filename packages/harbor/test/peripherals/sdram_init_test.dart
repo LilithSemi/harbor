@@ -18,6 +18,9 @@ import 'package:test/test.dart';
   HarborSdramCycles cycles,
   int k,
 ) {
+  // Every reset starts with a precharge slot of rp + 1 cycles, which a
+  // power-on fills with nop and cke low.
+  k -= cycles.rp + 1;
   final p = cycles.powerUp;
   final rp = cycles.rp;
   final mrd = cycles.mrd;
@@ -62,6 +65,8 @@ import 'package:test/test.dart';
 }
 
 int _totalEdges(HarborSdramCycles cycles) =>
+    cycles.rp +
+    1 +
     cycles.powerUp +
     3 +
     cycles.rp +
