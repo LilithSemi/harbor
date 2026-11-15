@@ -661,18 +661,87 @@ class Ecp5Dp16kd extends BridgeModule {
         }(),
     ];
   }
+
+  /// Packs the entries of one block that runs in a narrow port mode of
+  /// [dataWidth] bits (18, 9, 4, 2 or 1). The 18-bit word at physical address
+  /// w holds [dataWidth]-bit entry (w * entriesPerWord + slot) in the bits
+  /// that the sim body reads for that slot. For 18 this equals [initVals].
+  static List<BigInt> initValsForWidth(List<BigInt> entries, int dataWidth) {
+    if (dataWidth == 18) return initVals(entries);
+    final perWord = _entriesPerWord(dataWidth);
+    final mask = (BigInt.one << dataWidth) - BigInt.one;
+    final words = List<BigInt>.filled(1024, BigInt.zero);
+    for (var e = 0; e < entries.length; e++) {
+      final w = e ~/ perWord;
+      final slot = e % perWord;
+      final int base;
+      if (dataWidth == 9) {
+        base = slot * 9;
+      } else {
+        final perHalf = perWord ~/ 2;
+        base = (slot ~/ perHalf) * 9 + (slot % perHalf) * dataWidth;
+      }
+      words[w] |= (entries[e] & mask) << base;
+    }
+    return initVals(words);
+  }
+
+  static int _entriesPerWord(int dataWidth) => switch (dataWidth) {
+    9 => 2,
+    4 => 4,
+    2 => 8,
+    1 => 16,
+    _ => throw ArgumentError('DP16KD port width must be 1, 2, 4, 9 or 18'),
+  };
 }
 
 /// ECP5 EBR-backed ROM/patchable-ROM, pre-loaded from [contents] via DP16KD
-/// INITVAL (baked into the bitstream). `ceil(width/18)` DP16KD blocks in x18
-/// mode hold an 18-bit slice of each word. Port B is the registered read
+/// INITVAL (baked into the bitstream). Port B is the registered read
 /// ([rdData] is one cycle behind [rdAddr], readLatency == 1) and port A is an
 /// optional single write port (for runtime patching). It simulates through
 /// the [Ecp5Dp16kd] sim body. A read of the word that is written on the same
 /// edge gives X in [rdData] for that cycle, as on silicon.
+///
+/// [plan] picks the port mode. A block holds 1024 x18, 2048 x9, 4096 x4,
+/// 8192 x2 or 16384 x1 words. The mode with the fewest blocks wins. A tie
+/// goes to the mode with fewer depth pages (less read mux), then to the wider
+/// mode. A ROM with more than one page has one set of blocks for each page.
+/// The write enable is gated by the page of [wrAddr], and the page of
+/// [rdAddr] selects the read data one cycle later.
 class Ecp5InitRom extends Module {
   /// Registered read data, one cycle behind [rdAddr].
   Logic get rdData => output('rd_data');
+
+  /// The port mode, depth page count and block count for a ROM of [depth]
+  /// words of [width] bits.
+  static ({int dataWidth, int pages, int blocks}) plan(int depth, int width) {
+    if (depth < 1 || width < 1) {
+      throw ArgumentError('Ecp5InitRom needs depth and width above 0');
+    }
+    ({int dataWidth, int pages, int blocks})? best;
+    for (final m in const [18, 9, 4, 2, 1]) {
+      final pages = (depth + _pageWords(m) - 1) ~/ _pageWords(m);
+      final blocks = pages * ((width + m - 1) ~/ m);
+      if (best == null ||
+          blocks < best.blocks ||
+          (blocks == best.blocks && pages < best.pages)) {
+        best = (dataWidth: m, pages: pages, blocks: blocks);
+      }
+    }
+    return best!;
+  }
+
+  // The word address sits in AD[13:shift], with shift 4 for x18 down to 0
+  // for x1. Words in one block: 2^(14 - shift).
+  static int _shift(int m) => switch (m) {
+    18 => 4,
+    9 => 3,
+    4 => 2,
+    2 => 1,
+    _ => 0,
+  };
+
+  static int _pageWords(int m) => 1 << (14 - _shift(m));
 
   Ecp5InitRom(
     Logic clk, {
@@ -689,6 +758,17 @@ class Ecp5InitRom extends Module {
     super.definitionName,
     super.reserveDefinitionName = true,
   }) {
+    final (:dataWidth, :pages, :blocks) = plan(contents.length, width);
+    final shift = _shift(dataWidth);
+    final wordBits = 14 - shift;
+    final pageWords = 1 << wordBits;
+    final pageBits = pages > 1 ? (pages - 1).bitLength : 0;
+    if (pages > 1 && rdAddr.width < wordBits + pageBits) {
+      throw ArgumentError(
+        'Ecp5InitRom rdAddr has ${rdAddr.width} bits but '
+        '${contents.length} words need ${wordBits + pageBits}',
+      );
+    }
     clk = addInput('clk', clk);
     rdAddr = addInput('rd_addr', rdAddr, width: rdAddr.width);
     final hasWrite = wrEn != null;
@@ -696,58 +776,95 @@ class Ecp5InitRom extends Module {
       wrEn = addInput('wr_en', wrEn);
       wrAddr = addInput('wr_addr', wrAddr!, width: wrAddr.width);
       wrData = addInput('wr_data', wrData!, width: width);
+      if (pages > 1 && wrAddr.width < wordBits + pageBits) {
+        throw ArgumentError(
+          'Ecp5InitRom wrAddr has ${wrAddr.width} bits but '
+          '${contents.length} words need ${wordBits + pageBits}',
+        );
+      }
     }
     final rd = addOutput('rd_data', width: width);
 
-    const ebrWidth = 18;
     const ebrAddrBits = 14;
-    final blocks = (width + ebrWidth - 1) ~/ ebrWidth;
-    // x18 addressing: the word index sits in AD[13:4]. AD[1:0] are the byte
-    // enables of a write, so the write port drives them high.
-    Logic toAd(Logic a, int byteEnables) =>
-        [a.zeroExtend(ebrAddrBits - 4), Const(byteEnables, width: 4)].concat();
+    // x18: AD[1:0] are the byte enables of a write, so the write port drives
+    // them high. Narrower modes tie the low address bits to zero.
+    Logic word(Logic a) => a.width > wordBits ? a.getRange(0, wordBits) : a;
+    Logic toAd(Logic a, int byteEnables) => shift == 0
+        ? word(a).zeroExtend(wordBits)
+        : [
+            word(a).zeroExtend(wordBits),
+            Const(byteEnables, width: shift),
+          ].concat();
     final rdAd = toAd(rdAddr, 0);
-    final wrAd = hasWrite ? toAd(wrAddr!, 3) : Const(0, width: ebrAddrBits);
+    final wrAd = hasWrite
+        ? toAd(wrAddr!, dataWidth == 18 ? 3 : 0)
+        : Const(0, width: ebrAddrBits);
 
-    final slices = <Logic>[];
-    for (var b = 0; b < blocks; b++) {
-      final lo = b * ebrWidth;
-      final hi = (lo + ebrWidth) > width ? width : lo + ebrWidth;
-      final sliceWidth = hi - lo;
-      final sliceMask = (BigInt.one << sliceWidth) - BigInt.one;
-      final words = [for (final w in contents) (w >> lo) & sliceMask];
-
-      final bram = Ecp5Dp16kd(
-        name: 'rom_w$b',
-        dataWidthA: ebrWidth,
-        dataWidthB: ebrWidth,
-        initVals: Ecp5Dp16kd.initVals(words),
-        // Port A: optional single write port (posedge).
-        clkA: clk,
-        ceA: Const(1),
-        weA: hasWrite ? wrEn! : Const(0),
-        oceA: Const(0),
-        rstA: Const(0),
-        adA: wrAd,
-        diA: hasWrite
-            ? wrData!.getRange(lo, hi).zeroExtend(ebrWidth)
-            : Const(0, width: ebrWidth),
-        // Port B: registered read (posedge -> readLatency == 1).
-        clkB: clk,
-        ceB: Const(1),
-        weB: Const(0),
-        oceB: Const(0),
-        rstB: Const(0),
-        adB: rdAd,
-        diB: Const(0, width: ebrWidth),
+    final rdPage = pages > 1
+        ? flop(clk, rdAddr.getRange(wordBits, wordBits + pageBits))
+        : null;
+    final pageData = <Logic>[];
+    for (var p = 0; p < pages; p++) {
+      final pageContents = contents.sublist(
+        p * pageWords,
+        (p + 1) * pageWords > contents.length
+            ? contents.length
+            : (p + 1) * pageWords,
       );
-      slices.add(bram.doB.getRange(0, sliceWidth));
+      final pageWrEn = !hasWrite
+          ? Const(0)
+          : pages == 1
+          ? wrEn!
+          : wrEn! &
+                wrAddr!
+                    .getRange(wordBits, wordBits + pageBits)
+                    .eq(Const(p, width: pageBits));
+      final slices = <Logic>[];
+      for (var b = 0; b < blocks ~/ pages; b++) {
+        final lo = b * dataWidth;
+        final hi = (lo + dataWidth) > width ? width : lo + dataWidth;
+        final sliceWidth = hi - lo;
+        final sliceMask = (BigInt.one << sliceWidth) - BigInt.one;
+        final words = [for (final w in pageContents) (w >> lo) & sliceMask];
+
+        final bram = Ecp5Dp16kd(
+          name: pages == 1 ? 'rom_w$b' : 'rom_p${p}_w$b',
+          dataWidthA: dataWidth,
+          dataWidthB: dataWidth,
+          initVals: Ecp5Dp16kd.initValsForWidth(words, dataWidth),
+          // Port A: optional single write port (posedge).
+          clkA: clk,
+          ceA: Const(1),
+          weA: pageWrEn,
+          oceA: Const(0),
+          rstA: Const(0),
+          adA: wrAd,
+          diA: hasWrite
+              ? wrData!.getRange(lo, hi).zeroExtend(dataWidth)
+              : Const(0, width: dataWidth),
+          // Port B: registered read (posedge -> readLatency == 1).
+          clkB: clk,
+          ceB: Const(1),
+          weB: Const(0),
+          oceB: Const(0),
+          rstB: Const(0),
+          adB: rdAd,
+          diB: Const(0, width: dataWidth),
+        );
+        slices.add(bram.doB.getRange(0, sliceWidth));
+      }
+      pageData.add(
+        slices.length == 1
+            ? slices.first.zeroExtend(width)
+            : slices.rconcat().getRange(0, width),
+      );
     }
 
-    rd <=
-        (slices.length == 1
-            ? slices.first.zeroExtend(width)
-            : slices.rconcat().getRange(0, width));
+    var out = pageData.first;
+    for (var p = 1; p < pages; p++) {
+      out = mux(rdPage!.eq(Const(p, width: pageBits)), pageData[p], out);
+    }
+    rd <= out;
   }
 }
 
