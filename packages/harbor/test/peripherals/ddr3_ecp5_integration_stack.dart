@@ -6,6 +6,7 @@ import 'package:harbor/src/peripherals/ddr3_phy_ecp5.dart';
 import 'package:rohd/rohd.dart';
 
 import 'ddr3_ecp5_pad_dram_model.dart';
+import 'ddr3_scheduled_clock.dart';
 
 /// Full-stack test rig: `Ddr3Controller` + the real `Ddr3PhyEcp5`
 /// (every ECP5 DQ/DQS/command primitive built from its sim model, see
@@ -53,11 +54,7 @@ class Ddr3Ecp5IntegrationStack {
     // rising edge, which must land before the falling edge (as CLKDIVF's
     // output follows ECLK's rising edge) for the x2 gearbox models.
     ck = SimpleClockGenerator(4).clk;
-    final divInit = Logic(name: 'div_init')..inject(1);
-    Simulator.registerAction(4, () => divInit.put(0));
-    final div = Logic(name: 'div', width: 2);
-    Sequential(ck, reset: divInit, [div < div + 1]);
-    ctrlClk = div[1];
+    ctrlClk = scheduledClock(firstRise: 10, halfPeriod: 8);
 
     wbAddr = Logic(name: 'wb_addr', width: p.wbAddrBits)..inject(0);
     wbData = Logic(name: 'wb_data', width: p.wbDataBits)..inject(0);

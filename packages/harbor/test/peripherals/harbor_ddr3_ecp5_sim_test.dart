@@ -5,6 +5,7 @@ import 'package:harbor/src/peripherals/harbor_ddr3.dart';
 import 'package:harbor/src/soc/target.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
+import 'ddr3_scheduled_clock.dart';
 
 // Separate file: the 4096-cycle power-on reset makes this slow, so it runs in
 // parallel with the other ECP5 simulations.
@@ -26,14 +27,11 @@ void main() {
       ),
     );
     final ck = SimpleClockGenerator(2).clk;
-    final divInit = Logic(name: 'div_init')..inject(1);
-    Simulator.registerAction(2, () => divInit.put(0));
-    final div = Logic(name: 'div', width: 2);
-    Sequential(ck, reset: divInit, [div < div + 1]);
+    final ddrClk = scheduledClock(firstRise: 5, halfPeriod: 4);
     final ddrReset = Logic(name: 'ddr_reset')..inject(1);
     // Both clocks come from the same CK source.
     ddr.input('ddr_ck_fast').srcConnection! <= ck;
-    ddr.input('ddr_clk').srcConnection! <= div[1];
+    ddr.input('ddr_clk').srcConnection! <= ddrClk;
     ddr.input('ddr_reset').srcConnection! <= ddrReset;
     // The status outputs are on clk.
     ddr.input('clk').srcConnection! <= ck;

@@ -4,6 +4,7 @@ import 'package:harbor/harbor.dart';
 import 'package:harbor/src/peripherals/ddr3_params.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
+import 'ddr3_scheduled_clock.dart';
 
 /// Golden-model differential verification of [Ddr3ControllerGearbox].
 ///
@@ -77,11 +78,11 @@ void main() {
 
       final serdesClk = SimpleClockGenerator(4).clk;
       final rstN = Logic(name: 'rst_n')..inject(0);
-      // Divide-by-2 controller clock + a mirror of the gearbox phase flop, both
-      // reset-aligned to the DUT so the testbench knows the phase every tick.
-      final controllerClk = Logic(name: 'ctrl_clk');
+      // Divide-by-2 controller clock and a mirror of the gearbox phase flop.
+      // The controller clock runs free. It lines up with the phase flop
+      // because rst_n releases at t=4 and the first rise is at t=6.
+      final controllerClk = scheduledClock(firstRise: 6, halfPeriod: 4);
       final tbPhase = Logic(name: 'tb_phase');
-      Sequential(serdesClk, reset: ~rstN, [controllerClk < ~controllerClk]);
       Sequential(serdesClk, reset: ~rstN, [tbPhase < ~tbPhase]);
 
       // Controller-side stimulus signals.
@@ -247,9 +248,8 @@ void main() {
 
     final serdesClk = SimpleClockGenerator(4).clk;
     final rstN = Logic(name: 'rst_n')..inject(0);
-    final controllerClk = Logic(name: 'ctrl_clk');
+    final controllerClk = scheduledClock(firstRise: 6, halfPeriod: 4);
     final tbPhase = Logic(name: 'tb_phase');
-    Sequential(serdesClk, reset: ~rstN, [controllerClk < ~controllerClk]);
     Sequential(serdesClk, reset: ~rstN, [tbPhase < ~tbPhase]);
 
     Logic z(int w) => Logic(width: w)..inject(0);

@@ -5,6 +5,7 @@ import 'package:harbor/src/peripherals/ddr3_params.dart';
 import 'package:rohd/rohd.dart';
 
 import 'ddr3_ecp5_pad_dram_model.dart';
+import 'ddr3_scheduled_clock.dart';
 
 /// The status outputs of [HarborDdr3], sampled on `clk`.
 typedef Ddr3Status = ({
@@ -70,11 +71,7 @@ class Ddr3Ecp5StatusRun {
       ),
     );
     final ck = SimpleClockGenerator(4).clk;
-    final divInit = Logic(name: 'div_init')..inject(1);
-    Simulator.registerAction(4, () => divInit.put(0));
-    final div = Logic(name: 'div', width: 2);
-    Sequential(ck, reset: divInit, [div < div + 1]);
-    final ddrClk = div[1];
+    final ddrClk = scheduledClock(firstRise: 10, halfPeriod: 8);
     final clk = SimpleClockGenerator(clkPeriod + (clkPeriod & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final ddrReset = Logic(name: 'ddr_reset')..inject(1);

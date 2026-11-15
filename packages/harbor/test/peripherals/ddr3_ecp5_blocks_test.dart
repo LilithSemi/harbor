@@ -5,17 +5,14 @@ import 'package:harbor/src/peripherals/ddr3_controller.dart';
 import 'package:harbor/src/peripherals/ddr3_phy_ecp5.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
+import 'ddr3_scheduled_clock.dart';
 
 /// A CK/2 clock, a CK/4 clock divided from it (rising edges aligned, as two
 /// outputs of one PLL are), and a CK/4-domain registered reset.
 ({Logic sclk, Logic ctrlClk, Logic rstN, Logic reset}) _clocks() {
   final sclk = SimpleClockGenerator(4).clk;
   final rstN = Logic(name: 'rst_n')..inject(0);
-  // The divider only needs a defined start, so it gets its own reset.
-  final divInit = Logic(name: 'div_init')..inject(1);
-  Simulator.registerAction(3, () => divInit.put(0));
-  final ctrlClk = Logic(name: 'ctrl_clk');
-  Sequential(sclk, reset: divInit, [ctrlClk < ~ctrlClk]);
+  final ctrlClk = scheduledClock(firstRise: 6, halfPeriod: 4);
   final reset = Logic(name: 'reset');
   Sequential(ctrlClk, [reset < ~rstN]);
   return (sclk: sclk, ctrlClk: ctrlClk, rstN: rstN, reset: reset);

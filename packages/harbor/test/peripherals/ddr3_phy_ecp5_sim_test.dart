@@ -5,6 +5,7 @@ import 'package:harbor/src/peripherals/ddr3_params.dart';
 import 'package:harbor/src/peripherals/ddr3_phy_ecp5.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
+import 'ddr3_scheduled_clock.dart';
 
 /// Simulates the fabric of [Ddr3PhyEcp5] with its clock tree model. The ECP5
 /// IO cells have no model, so only the fabric around them is checked.
@@ -22,14 +23,11 @@ class _Bench {
     ck = SimpleClockGenerator(2).clk;
     final divInit = Logic(name: 'div_init')..inject(1);
     Simulator.registerAction(2, () => divInit.put(0));
-    final div = Logic(name: 'div', width: 2);
-    Sequential(
-      ck,
-      reset: divInit,
-      resetValues: {div: ctrlOffset},
-      [div < div + 1],
-    );
-    ctrlClk = div[1];
+    // The old divider counted from ctrlOffset and rose when bit 1 became set.
+    // With CK edges at 1, 3, 5 and so on, the formula gives the first rise at
+    // t=5 for offset 0 and at t=9 for offset 2, then every 8.
+    final risePulses = ((2 - ctrlOffset - 1) % 4) + 1;
+    ctrlClk = scheduledClock(firstRise: 1 + 2 * risePulses, halfPeriod: 4);
 
     // The write data changes every CK/4 tick.
     final tick = Logic(name: 'tick', width: 8);
