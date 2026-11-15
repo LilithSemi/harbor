@@ -63,6 +63,11 @@ class _Entry {
 /// requests enter the look-ahead entry, which moves into the current
 /// entry once that one is empty or finishing.
 ///
+/// With `warmAfterFirstInit`, every reset after the first finished init
+/// runs the warm path: precharge all first, with cke high, then the full
+/// power-up wait and init. Without it, only a `reset` while `coldReset` is
+/// low takes that path.
+///
 /// `abort` is the bus side reset: it drops queued reads and in-flight read
 /// data, but queued writes still run and init, refresh and bank state
 /// keep going, so the sdram keeps its contents. It keeps the reads of the
@@ -112,6 +117,7 @@ class SdramEngine extends Module {
     Logic? abort,
     Logic? abortNext,
     Logic? coldReset,
+    bool warmAfterFirstInit = false,
     Logic? timersReset,
     Logic? dataReset,
     Set<int> keepReadsOnAbort = const {},
@@ -129,6 +135,7 @@ class SdramEngine extends Module {
          abort: abort,
          abortNext: abortNext,
          coldReset: coldReset,
+         warmAfterFirstInit: warmAfterFirstInit,
          timersReset: timersReset,
          dataReset: dataReset,
          keepReadsOnAbort: keepReadsOnAbort,
@@ -149,6 +156,7 @@ class SdramEngine extends Module {
     required Logic? abort,
     required Logic? abortNext,
     required Logic? coldReset,
+    required bool warmAfterFirstInit,
     required Logic? timersReset,
     required Logic? dataReset,
     required Set<int> keepReadsOnAbort,
@@ -286,15 +294,38 @@ class SdramEngine extends Module {
     final initDoneReq = initDoneCopy('req');
     final initDonePins = initDoneCopy('pins');
     final initDonePick = initDoneCopy('pick');
-    Sequential(
-      clk,
-      [
-        If(initDone, then: [warmReset < Const(1)]),
-      ],
-      reset: coldResetSig,
-      asyncReset: true,
-      resetValues: {warmReset: Const(0)},
-    );
+    if (warmAfterFirstInit) {
+      // Set by the first finished init and never cleared, so every later
+      // reset takes the warm path: precharge all first, then the full
+      // power-up wait. The flop powers up at 0 on the fpga. A sim has no
+      // power-up state, so after 8 clock cycles a flop that is still
+      // unknown is set to 0, as the power-up state would be.
+      final seen = Logic(name: 'init_seen');
+      Sequential(clk, [seen < mux(initDone & ~reset, Const(1), seen)]);
+      var edges = 0;
+      clk.glitch.listen((args) {
+        if (LogicValue.isNegedge(
+              args.previousValue,
+              args.newValue,
+              ignoreInvalid: true,
+            ) &&
+            ++edges == 8 &&
+            !seen.value.isValid) {
+          seen.put(0);
+        }
+      });
+      warmReset <= seen;
+    } else {
+      Sequential(
+        clk,
+        [
+          If(initDone, then: [warmReset < Const(1)]),
+        ],
+        reset: coldResetSig,
+        asyncReset: true,
+        resetValues: {warmReset: Const(0)},
+      );
+    }
 
     // The last command as one registered strobe per command and bank, so
     // the timers need no decode.
@@ -1089,6 +1120,7 @@ SdramEngine debugSdramEngineWithoutRowAgeGuard(
   abort: abort,
   abortNext: null,
   coldReset: coldReset,
+  warmAfterFirstInit: false,
   timersReset: null,
   dataReset: null,
   keepReadsOnAbort: const {},

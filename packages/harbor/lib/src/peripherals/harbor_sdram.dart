@@ -75,8 +75,9 @@ import 'sim_dram.dart';
 /// `mem_reset` re-initializes the device, so its contents are not
 /// guaranteed after one. A bus `reset` alone keeps the sdram contents. With
 /// [busClockSync] there is one clock and one reset: no `mem_clk` and no
-/// `mem_reset` port, and every bus `reset` also re-initializes the device
-/// with the full power-up wait, so its contents are lost. `scan_reset`
+/// `mem_reset` port, and every bus `reset` also re-initializes the device,
+/// so its contents are lost. After the first init, a reset starts with a
+/// precharge all, then runs the full power-up wait and init. `scan_reset`
 /// follows `reset` too. `bus_error` stays low.
 ///
 /// A scanout port ([scanoutPorts] is 0 or 1) is a read port for a display,
@@ -1073,6 +1074,7 @@ class HarborSdram extends BridgeModule
       abort: engineAbort,
       abortNext: abortNext,
       coldReset: coldReset,
+      warmAfterFirstInit: true,
       timersReset: timersReset,
       port: enginePort,
       phyRdData: phyRdData,
