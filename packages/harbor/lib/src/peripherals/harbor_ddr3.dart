@@ -159,6 +159,13 @@ class HarborDdr3 extends BridgeModule
   /// ports, for a model on `ddr_clk`.
   final bool fastSim;
 
+  /// Memory clock cycles that the controller reset guard keeps rst_n low
+  /// after the domain reset releases. The guard covers the openXC7 MMCM lock.
+  /// The JEDEC 200 us and 500 us waits stay in the init ROM. The default is
+  /// 4095. A shorter hold is for simulation only. [fastSim] fixes the hold at
+  /// 15 cycles, so a value other than 4095 with [fastSim] is refused.
+  final int powerOnCycles;
+
   /// Under Verilator, present the DRAM as a host-side C++ mmap model instead of
   /// a Verilated behavioral RAM. The memory bus is routed to top-level ports and
   /// a [DramStore] drives it, so the whole address space is presented but only
@@ -216,6 +223,7 @@ class HarborDdr3 extends BridgeModule
     int? outstanding,
     int? readWords,
     this.fastSim = false,
+    this.powerOnCycles = 4095,
     this.writeCombine = false,
     int? readGap,
     super.name = 'ddr3',
@@ -243,6 +251,7 @@ class HarborDdr3 extends BridgeModule
                readWords ??
                defaultReadWords(outstanding ?? defaultOutstanding(protocol)),
            fastSim: fastSim,
+           powerOnCycles: powerOnCycles,
            writeCombine: writeCombine,
            readGap: readGap ?? defaultReadGap(protocol),
            exclusive: exclusive,
@@ -293,6 +302,20 @@ class HarborDdr3 extends BridgeModule
         this.outstanding,
         'outstanding',
         'must be >= 1',
+      );
+    }
+    if (powerOnCycles < 1 || powerOnCycles > 4095) {
+      throw ArgumentError.value(
+        powerOnCycles,
+        'powerOnCycles',
+        'must be 1 to 4095',
+      );
+    }
+    if (fastSim && powerOnCycles != 4095) {
+      throw ArgumentError.value(
+        powerOnCycles,
+        'powerOnCycles',
+        'fastSim fixes the hold at 15 cycles',
       );
     }
     final xilinx = switch (target) {
@@ -557,6 +580,7 @@ class HarborDdr3 extends BridgeModule
     required int outstanding,
     required int readWords,
     required bool fastSim,
+    required int powerOnCycles,
     required bool writeCombine,
     required int readGap,
     required HarborAxi4Exclusive? exclusive,
@@ -585,7 +609,8 @@ class HarborDdr3 extends BridgeModule
           '_d${busDataWidth}_ck${ckPeriodPs}_g$controllerGearRatio'
           '${runtimeTrainable ? '_rt' : ''}${writeCombine ? '_wc' : ''}$dm'
           '_${protocol.name}_i${idWidth}_n${outstanding}_q$cdc$burst'
-          '${fastSim ? '_fast' : ''}';
+          '${fastSim ? '_fast' : ''}'
+          '${powerOnCycles != 4095 ? '_p$powerOnCycles' : ''}';
     }
     final c = config;
     return harborStableDefinitionName(
@@ -605,6 +630,7 @@ class HarborDdr3 extends BridgeModule
         'rw$readWords',
         'rg$readGap',
         if (fastSim) 'fast',
+        if (powerOnCycles != 4095) 'p$powerOnCycles',
         ?exclusive?.tag,
       ],
     );
@@ -966,8 +992,8 @@ struct DramStore {
     int busDW,
     int busAW,
   ) {
-    // Power-on reset on the DDR clock: hold rst_n low for 4096 cycles after the
-    // domain reset releases (openXC7 MMCM LOCKED may never reach the fabric), the
+    // Power-on reset on the DDR clock: hold rst_n low for [powerOnCycles] cycles
+    // after the domain reset releases (openXC7 MMCM LOCKED may never reach the fabric), the
     // same guard the standalone harness proved.
     final porCnt = Logic(name: 'ddr_por_cnt', width: 12);
     final rstN = Logic(name: 'ddr_rst_n');
@@ -977,7 +1003,7 @@ struct DramStore {
         then: [porCnt < Const(0, width: 12), rstN < Const(0)],
         orElse: [
           If(
-            porCnt.lt(fastSim ? 15 : 4095),
+            porCnt.lt(fastSim ? 15 : powerOnCycles),
             then: [porCnt < porCnt + 1, rstN < Const(0)],
             orElse: [rstN < Const(1)],
           ),

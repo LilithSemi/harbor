@@ -7,8 +7,8 @@ import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 import 'ddr3_scheduled_clock.dart';
 
-// Separate file: the 4096-cycle power-on reset makes this slow, so it runs in
-// parallel with the other ECP5 simulations.
+// Separate file: the default powerOnCycles hold of 4095 cycles makes this
+// slow, so it runs in parallel with the other ECP5 simulations.
 void main() {
   tearDown(() async => Simulator.reset());
 

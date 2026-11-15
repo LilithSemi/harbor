@@ -14,10 +14,11 @@ void main() {
     () async {
       await ddr3RandomBursts(
         HarborFabricKind.tilelink,
-        fabricPeriod: 26,
+        fabricPeriod: 18,
         seed: 2,
-        count: 0,
+        count: 6,
         longPart: 1,
+        span: 0x800,
       );
     },
     timeout: const Timeout(Duration(hours: 6)),
