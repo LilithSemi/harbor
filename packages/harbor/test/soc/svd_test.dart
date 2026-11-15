@@ -1,4 +1,5 @@
 import 'package:harbor/harbor.dart';
+import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
 class _MockSvdPeripheral with HarborSvdPeripheralProvider {
@@ -158,6 +159,42 @@ void main() {
       expect(dev.baseAddress, equals(0x10000000));
       expect(dev.registers, isNotNull);
       expect(dev.registers!.fields, isNotEmpty);
+    });
+
+    group('HarborSoC model and manufacturer', () {
+      tearDown(() async => Simulator.reset());
+
+      test('defaults keep the name, compatible and vendor', () {
+        final soc = HarborSoC(name: 'DefSoc', compatible: 'test,def');
+        expect(soc.generateDts(), contains('model = "DefSoc";'));
+        final svd = soc.generateSvd();
+        expect(svd, contains('<vendor>Lilith Semiconductor</vendor>'));
+        expect(svd, contains('<description>test,def</description>'));
+      });
+
+      test('model and manufacturer reach the DTS and SVD', () {
+        final soc = HarborSoC(
+          name: 'ModSoc',
+          compatible: 'test,mod',
+          model: 'Delta V1',
+          manufacturer: 'Acme & Co',
+          cpus: [
+            HarborCpu(
+              hartId: 0,
+              isa: 'rv64imac',
+              model: 'River RC1.f',
+              compatible: ['lilith,river-rc1f'],
+            ),
+          ],
+        );
+        final dts = soc.generateDts();
+        expect(dts, contains('    model = "Delta V1";'));
+        expect(dts, contains('model = "River RC1.f";'));
+        expect(dts, contains('compatible = "lilith,river-rc1f", "riscv";'));
+        final svd = soc.generateSvd();
+        expect(svd, contains('<vendor>Acme &amp; Co</vendor>'));
+        expect(svd, contains('<description>Delta V1</description>'));
+      });
     });
   });
 }

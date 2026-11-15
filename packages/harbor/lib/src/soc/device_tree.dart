@@ -275,6 +275,12 @@ class HarborDeviceTreeGenerator {
     return parts.join(' ');
   }
 
+  /// Escapes [value] for use inside a DTS string literal.
+  static String _str(String value) => value
+      .replaceAll(r'\', r'\\')
+      .replaceAll('"', r'\"')
+      .replaceAll('\n', r'\n');
+
   /// Generates the DTS source as a string.
   String generate() {
     final buf = StringBuffer();
@@ -310,8 +316,8 @@ class HarborDeviceTreeGenerator {
     buf.writeln('/dts-v1/;');
     buf.writeln();
     buf.writeln('/ {');
-    buf.writeln('    model = "$model";');
-    buf.writeln('    compatible = "$compatible";');
+    buf.writeln('    model = "${_str(model)}";');
+    buf.writeln('    compatible = "${_str(compatible)}";');
     buf.writeln('    #address-cells = <$addressCells>;');
     buf.writeln('    #size-cells = <$sizeCells>;');
 
@@ -324,7 +330,13 @@ class HarborDeviceTreeGenerator {
         buf.writeln();
         buf.writeln('        cpu@${cpu.hartId} {');
         buf.writeln('            device_type = "cpu";');
-        buf.writeln('            compatible = "riscv";');
+        if (cpu.model != null) {
+          buf.writeln('            model = "${_str(cpu.model!)}";');
+        }
+        final cpuCompat = [...cpu.compatible, 'riscv'];
+        buf.writeln(
+          '            compatible = ${cpuCompat.map((c) => '"${_str(c)}"').join(', ')};',
+        );
         buf.writeln('            reg = <0x${cpu.hartId.toRadixString(16)}>;');
         // riscv,isa is deprecated and cannot name an extension past the
         // single letters in every case, so the isa-base and isa-extensions

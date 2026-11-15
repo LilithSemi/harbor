@@ -198,5 +198,55 @@ void main() {
       expect(node.toString(), contains('ns16550a'));
       expect(node.toString(), contains('0x10000000'));
     });
+
+    group('model and cpu naming', () {
+      String gen({String model = 'Test SoC', List<HarborCpu>? cpus}) =>
+          HarborDeviceTreeGenerator(
+            model: model,
+            compatible: 'test,soc-v1',
+            cpus: cpus ?? [HarborCpu(hartId: 0, isa: 'rv64imac')],
+          ).generate();
+
+      test('default cpu node is unchanged', () {
+        final dts = gen();
+        expect(dts, contains('    model = "Test SoC";\n'));
+        expect(dts, contains('            compatible = "riscv";\n'));
+        expect(
+          RegExp(r'^\s+model = ', multiLine: true).allMatches(dts).length,
+          equals(1),
+        );
+      });
+
+      test('cpu model and vendor compatible are emitted', () {
+        final dts = gen(
+          model: 'Delta V1',
+          cpus: [
+            HarborCpu(
+              hartId: 0,
+              isa: 'rv64imac',
+              model: 'River RC1.f',
+              compatible: ['lilith,river-rc1f'],
+            ),
+            HarborCpu(
+              hartId: 1,
+              isa: 'rv64imac',
+              model: 'River RC1.f',
+              compatible: ['lilith,river-rc1f'],
+            ),
+          ],
+        );
+        expect(dts, contains('    model = "Delta V1";\n'));
+        expect('model = "River RC1.f";'.allMatches(dts).length, equals(2));
+        expect(
+          'compatible = "lilith,river-rc1f", "riscv";'.allMatches(dts).length,
+          equals(2),
+        );
+      });
+
+      test('strings are escaped', () {
+        final dts = gen(model: 'A "quoted" \\ name');
+        expect(dts, contains(r'model = "A \"quoted\" \\ name";'));
+      });
+    });
   });
 }

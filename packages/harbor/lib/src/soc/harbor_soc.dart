@@ -222,6 +222,15 @@ class HarborSoC extends BridgeModule {
   final String acpiOemId;
   final String acpiOemTableId;
 
+  /// Product name for the device tree root `model` property. Defaults to
+  /// [name]. ACPI has no product name field, so it does not appear there.
+  final String model;
+  final String? _explicitModel;
+
+  /// Manufacturer name. When set, it is the vendor of the generated SVD file
+  /// and replaces [svdVendor]. Null leaves [svdVendor] in use.
+  final String? manufacturer;
+
   /// Vendor name for the generated CMSIS-SVD file.
   final String svdVendor;
 
@@ -281,6 +290,8 @@ class HarborSoC extends BridgeModule {
   HarborSoC({
     required String name,
     required this.compatible,
+    String? model,
+    this.manufacturer,
     this.fabricKind = HarborFabricKind.wishbone,
     this.fabricTopology,
     this.acpiOemId = 'LILSEM',
@@ -297,7 +308,9 @@ class HarborSoC extends BridgeModule {
     this.exclusiveGranuleBytes = HarborExclusive.defaultGranuleBytes,
     List<HarborClockConfig> clocks = const [],
     XilinxDdr3TreeSpec? xilinxDdr3Tree,
-  }) : super(name, name: name) {
+  }) : model = model ?? name,
+       _explicitModel = model,
+       super(name, name: name) {
     if (exclusiveSlotBudget < 1) {
       throw ArgumentError.value(
         exclusiveSlotBudget,
@@ -1347,7 +1360,7 @@ class HarborSoC extends BridgeModule {
         .expand((p) => p.systemMemory)
         .toList();
     return HarborDeviceTreeGenerator(
-      model: name,
+      model: model,
       compatible: compatible,
       cpus: cpus,
       peripherals: providers,
@@ -1368,10 +1381,10 @@ class HarborSoC extends BridgeModule {
         .whereType<HarborSvdPeripheralProvider>()
         .toList();
     return HarborSvdGenerator(
-      vendor: svdVendor,
+      vendor: manufacturer ?? svdVendor,
       name: name,
       version: svdVersion,
-      description: compatible,
+      description: _explicitModel ?? compatible,
       cpus: cpus,
       peripherals: providers,
       interrupts: {

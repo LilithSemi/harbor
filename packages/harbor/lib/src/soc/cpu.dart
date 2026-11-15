@@ -36,6 +36,13 @@ class HarborCpu with HarborPrettyString {
   /// working time source.
   final int? timebaseFrequency;
 
+  /// Product name for the device tree `model` property (optional).
+  final String? model;
+
+  /// Vendor compatible strings placed before `"riscv"` in the device tree
+  /// `compatible` property, e.g. `["lilith,river-rc1f"]`.
+  final List<String> compatible;
+
   const HarborCpu({
     required this.hartId,
     required this.isa,
@@ -44,6 +51,8 @@ class HarborCpu with HarborPrettyString {
     this.mmu,
     this.clockFrequency,
     this.timebaseFrequency,
+    this.model,
+    this.compatible = const [],
   });
 
   @override
@@ -66,6 +75,9 @@ class HarborCpu with HarborPrettyString {
       buf.writeln('${c}clockFrequency: $clockFrequency,');
     if (timebaseFrequency != null)
       buf.writeln('${c}timebaseFrequency: $timebaseFrequency,');
+    if (model != null) buf.writeln('${c}model: $model,');
+    if (compatible.isNotEmpty)
+      buf.writeln('${c}compatible: ${compatible.join(" ")},');
     buf.write('$p)');
     return buf.toString();
   }
