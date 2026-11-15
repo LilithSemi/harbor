@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
@@ -98,7 +99,8 @@ void _patchTest(String name, int depth, int width, int patchAt) {
     await clk.nextNegedge;
     wrEn.put(0);
     await clk.nextNegedge;
-    for (final a in [0, patchAt - 1, patchAt, patchAt + 1, depth - 1]) {
+    // Every word is read, so a write that lands in the wrong page shows.
+    for (var a = 0; a < depth; a++) {
       rdAddr.put(a);
       await clk.nextNegedge;
       expect(
@@ -193,23 +195,42 @@ void main() {
     _patchTest('2048 x 9', 2048, 9, 1500);
     _patchTest('4096 x 4', 4096, 4, 3000);
     _patchTest('8192 x 2', 8192, 2, 5000);
+    _patchTest('5000 x 9 (x9 pages)', 5000, 9, 3000);
+    _patchTest('9000 x 4 (x4 pages)', 9000, 4, 6000);
+    _patchTest('3000 x 18 low page', 3000, 18, 20);
+    _readTest('8192 x 2', 8192, 2, 2, 1);
+    _readTest('16384 x 1', 16384, 1, 1, 1);
+    _readTest('5000 x 9', 5000, 9, 9, 3);
   });
 
   group('emit', () {
-    test('1024 x 18 keeps the block name and parameters', () async {
+    test('1024 x 18 output equals the earlier output', () async {
+      // The golden file holds the output of the code before narrow modes.
+      final c = [
+        for (var a = 0; a < 5; a++)
+          (BigInt.from(a + 1) * BigInt.from(0x2D5B7A1)) &
+              ((BigInt.one << 30) - BigInt.one),
+      ];
       final rom = Ecp5InitRom(
         Logic(name: 'clk'),
-        contents: _pattern(1024, 18),
-        width: 18,
+        contents: c,
+        width: 30,
         rdAddr: Logic(name: 'a', width: 10),
-        definitionName: 'EmitRom',
+        wrEn: Logic(name: 'we'),
+        wrAddr: Logic(name: 'wa', width: 10),
+        wrData: Logic(name: 'wd', width: 30),
+        definitionName: 'GoldenRom',
       );
       await rom.build();
-      final sv = rom.dumpSystemVerilog();
-      expect(sv, contains('rom_w0'));
-      expect(sv, contains('.DATA_WIDTH_A(18)'));
-      expect(sv, contains('.DATA_WIDTH_B(18)'));
-      expect(sv, isNot(contains('rom_p')));
+      final sv = rom
+          .dumpSystemVerilog()
+          .split('\n')
+          .where((l) => !l.contains('Generation time'))
+          .join('\n');
+      final golden = File(
+        'test/blackbox/golden/ecp5_init_rom_1024.sv',
+      ).readAsStringSync();
+      expect(sv, golden);
     });
 
     test('deeper ROM names one block set for each page', () async {
@@ -227,17 +248,76 @@ void main() {
       }
     });
 
-    test('an address too narrow for the pages throws', () {
+    test('a rdAddr too narrow for the words throws', () {
+      for (final (d, w, bits) in [(3000, 18, 10), (2048, 9, 10), (64, 8, 5)]) {
+        expect(
+          () => Ecp5InitRom(
+            Logic(name: 'clk'),
+            contents: _pattern(d, w),
+            width: w,
+            rdAddr: Logic(name: 'a', width: bits),
+            definitionName: 'NarrowRom$d',
+          ),
+          throwsArgumentError,
+          reason: '$d x $w with $bits bits',
+        );
+      }
+    });
+
+    test('a wrAddr too narrow for the words throws', () {
       expect(
         () => Ecp5InitRom(
           Logic(name: 'clk'),
-          contents: _pattern(3000, 18),
-          width: 18,
-          rdAddr: Logic(name: 'a', width: 10),
-          definitionName: 'NarrowRom',
+          contents: _pattern(2048, 9),
+          width: 9,
+          rdAddr: Logic(name: 'a', width: 11),
+          wrEn: Logic(name: 'we'),
+          wrAddr: Logic(name: 'wa', width: 10),
+          wrData: Logic(name: 'wd', width: 9),
+          definitionName: 'NarrowWrRom',
         ),
         throwsArgumentError,
       );
     });
+
+    test('initValsForWidth throws for too many entries', () {
+      expect(
+        () => Ecp5Dp16kd.initValsForWidth(_pattern(2049, 9), 9),
+        throwsArgumentError,
+      );
+    });
+  });
+
+  group('write above the ROM', () {
+    for (final (d, w) in [(1000, 18), (3000, 18), (2048, 9)]) {
+      test('$d x $w ignores an address past the last word', () async {
+        final contents = _pattern(d, w);
+        final clk = SimpleClockGenerator(10).clk;
+        final rdAddr = Logic(name: 'rd_addr', width: 14);
+        final wrEn = Logic(name: 'wr_en');
+        final wrAddr = Logic(name: 'wr_addr', width: 14);
+        final wrData = Logic(name: 'wr_data', width: w);
+        final rom = await _start(
+          contents: contents,
+          width: w,
+          clk: clk,
+          rdAddr: rdAddr,
+          wrEn: wrEn,
+          wrAddr: wrAddr,
+          wrData: wrData,
+        );
+        // Addresses one and two pages up alias a real word in the low bits.
+        wrEn.put(1);
+        wrData.put((BigInt.one << w) - BigInt.one);
+        for (final hi in [1 << 13, 1 << 12 | 1 << 13]) {
+          wrAddr.put(hi + 100);
+          await clk.nextNegedge;
+        }
+        wrEn.put(0);
+        await clk.nextNegedge;
+        await _readAll(rom, clk, rdAddr, contents);
+        await Simulator.endSimulation();
+      });
+    }
   });
 }

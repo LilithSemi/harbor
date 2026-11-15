@@ -480,7 +480,9 @@ class Ecp5Dp16kd extends BridgeModule {
     // Port data width (18, 9, 4, 2, or 1). x9 yields one byte lane per BRAM,
     // which is how byte-granular write enables are built (x18 has no byte
     // masks). In sub-18 widths the word address occupies the UPPER AD bits
-    // (x9: AD[13:3], low bits zero).
+    // (x9: AD[13:3], low bits zero). The INITVAL layout of the narrow modes
+    // follows yosys brams_16kd.txt and memory_libmap.cc. Use
+    // [Ecp5Dp16kd.initValsForWidth] to pack it.
     int dataWidthA = 18,
     int dataWidthB = 18,
     // Optional ROM/RAM initial contents: exactly 64 INITVAL_xx values (each a
@@ -669,6 +671,12 @@ class Ecp5Dp16kd extends BridgeModule {
   static List<BigInt> initValsForWidth(List<BigInt> entries, int dataWidth) {
     if (dataWidth == 18) return initVals(entries);
     final perWord = _entriesPerWord(dataWidth);
+    if (entries.length > perWord * 1024) {
+      throw ArgumentError(
+        '${entries.length} entries do not fit one x$dataWidth block of '
+        '${perWord * 1024}',
+      );
+    }
     final mask = (BigInt.one << dataWidth) - BigInt.one;
     final words = List<BigInt>.filled(1024, BigInt.zero);
     for (var e = 0; e < entries.length; e++) {
@@ -762,26 +770,25 @@ class Ecp5InitRom extends Module {
     final shift = _shift(dataWidth);
     final wordBits = 14 - shift;
     final pageWords = 1 << wordBits;
-    final pageBits = pages > 1 ? (pages - 1).bitLength : 0;
-    if (pages > 1 && rdAddr.width < wordBits + pageBits) {
-      throw ArgumentError(
-        'Ecp5InitRom rdAddr has ${rdAddr.width} bits but '
-        '${contents.length} words need ${wordBits + pageBits}',
-      );
+    final addrBits = (contents.length - 1).bitLength;
+    void checkAddr(String port, int bits) {
+      if (bits < addrBits) {
+        throw ArgumentError(
+          'Ecp5InitRom $port has $bits bits but ${contents.length} words '
+          'need $addrBits',
+        );
+      }
     }
+
+    checkAddr('rdAddr', rdAddr.width);
     clk = addInput('clk', clk);
     rdAddr = addInput('rd_addr', rdAddr, width: rdAddr.width);
     final hasWrite = wrEn != null;
     if (hasWrite) {
+      checkAddr('wrAddr', wrAddr!.width);
       wrEn = addInput('wr_en', wrEn);
-      wrAddr = addInput('wr_addr', wrAddr!, width: wrAddr.width);
+      wrAddr = addInput('wr_addr', wrAddr, width: wrAddr.width);
       wrData = addInput('wr_data', wrData!, width: width);
-      if (pages > 1 && wrAddr.width < wordBits + pageBits) {
-        throw ArgumentError(
-          'Ecp5InitRom wrAddr has ${wrAddr.width} bits but '
-          '${contents.length} words need ${wordBits + pageBits}',
-        );
-      }
     }
     final rd = addOutput('rd_data', width: width);
 
@@ -800,9 +807,13 @@ class Ecp5InitRom extends Module {
         ? toAd(wrAddr!, dataWidth == 18 ? 3 : 0)
         : Const(0, width: ebrAddrBits);
 
-    final rdPage = pages > 1
-        ? flop(clk, rdAddr.getRange(wordBits, wordBits + pageBits))
+    // The page is every address bit above the word bits, so a write address
+    // above the ROM matches no page and writes nothing.
+    final rdUpper = rdAddr.width > wordBits ? rdAddr.getRange(wordBits) : null;
+    final wrUpper = hasWrite && wrAddr!.width > wordBits
+        ? wrAddr.getRange(wordBits)
         : null;
+    final rdPage = pages > 1 ? flop(clk, rdUpper!) : null;
     final pageData = <Logic>[];
     for (var p = 0; p < pages; p++) {
       final pageContents = contents.sublist(
@@ -813,12 +824,9 @@ class Ecp5InitRom extends Module {
       );
       final pageWrEn = !hasWrite
           ? Const(0)
-          : pages == 1
+          : wrUpper == null
           ? wrEn!
-          : wrEn! &
-                wrAddr!
-                    .getRange(wordBits, wordBits + pageBits)
-                    .eq(Const(p, width: pageBits));
+          : wrEn! & wrUpper.eq(Const(p, width: wrUpper.width));
       final slices = <Logic>[];
       for (var b = 0; b < blocks ~/ pages; b++) {
         final lo = b * dataWidth;
@@ -862,7 +870,7 @@ class Ecp5InitRom extends Module {
 
     var out = pageData.first;
     for (var p = 1; p < pages; p++) {
-      out = mux(rdPage!.eq(Const(p, width: pageBits)), pageData[p], out);
+      out = mux(rdPage!.eq(Const(p, width: rdPage.width)), pageData[p], out);
     }
     rd <= out;
   }
