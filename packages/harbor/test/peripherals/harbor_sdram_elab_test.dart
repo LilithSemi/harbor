@@ -291,6 +291,7 @@ void main() {
       int aw = 26,
       int hz = 125000000,
       bool sync = false,
+      int width = 32,
       int scan = 0,
       int inFlight = 3,
       int post = 8,
@@ -309,6 +310,7 @@ void main() {
       wishboneBurstBeats: beats,
       busAddressWidth: aw,
       busClockSync: sync,
+      busDataWidth: width,
       postedWrites: posted,
       scanoutPorts: scan,
       scanoutMaxInFlight: inFlight,
@@ -328,6 +330,9 @@ void main() {
       make(aw: 32),
       make(hz: 100000000),
       make(protocol: HarborFabricKind.wishbone, sync: true),
+      make(width: 64),
+      make(protocol: HarborFabricKind.wishbone, width: 64),
+      make(protocol: HarborFabricKind.wishbone, width: 64, sync: true),
       make(scan: 1),
       make(scan: 1, inFlight: 1),
       make(post: 9),
@@ -391,6 +396,27 @@ void main() {
     );
   });
 
+  test('64-bit buses build on every fabric and target', () async {
+    for (final kind in HarborFabricKind.values) {
+      for (final target in [
+        ecp5Target,
+        const HarborSimTarget(topCell: 'top', frequency: 50000000),
+      ]) {
+        final sdram = HarborSdram(
+          config: config,
+          baseAddress: 0,
+          clockHz: 125000000,
+          target: target,
+          protocol: kind,
+          busDataWidth: 64,
+        );
+        await sdram.build();
+        expect(sdram.dumpSystemVerilog(), contains('module HarborSdram'));
+        await Simulator.reset();
+      }
+    }
+  });
+
   test('sdram requests per burst', () {
     const fixed = HarborMemoryBurst.fixed;
     const wrap = HarborMemoryBurst.wrap;
@@ -399,6 +425,11 @@ void main() {
     expect(HarborSdram.busRequestsFor(16), 5);
     expect(HarborSdram.busRequestsFor(16, burst: wrap), 5);
     expect(HarborSdram.busRequestsFor(256), 65);
+    expect(HarborSdram.busRequestsFor(16, dataWidth: 64), 9);
+    expect(HarborSdram.busRequestsFor(256, dataWidth: 64), 129);
+    expect(HarborSdram.busRequestsFor(16, size: 2, dataWidth: 64), 16);
+    expect(HarborSdram.busRequestsFor(16, size: 3, dataWidth: 64), 9);
+    expect(HarborSdram.busRequestsFor(16, burst: fixed, dataWidth: 64), 16);
     expect(() => HarborSdram.busRequestsFor(257), throwsArgumentError);
     final s = HarborSdram(
       config: config,
@@ -411,14 +442,32 @@ void main() {
     expect(s.busBurstWaitBound(16), 5 * s.busWaitBound);
   });
 
-  test('a wrong bus width or depth throws', () {
+  test('a wrong bus width, device width or depth throws', () {
+    for (final width in [8, 16, 48, 128]) {
+      expect(
+        () => HarborSdram(
+          config: config,
+          baseAddress: 0,
+          clockHz: 125000000,
+          target: ecp5Target,
+          busDataWidth: width,
+        ),
+        throwsArgumentError,
+        reason: '$width',
+      );
+    }
     expect(
       () => HarborSdram(
-        config: config,
+        config: HarborSdramConfig(
+          part: 'x32',
+          timing: config.timing,
+          dataWidth: 32,
+          rowWidth: 13,
+          colWidth: 9,
+        ),
         baseAddress: 0,
         clockHz: 125000000,
         target: ecp5Target,
-        busDataWidth: 64,
       ),
       throwsArgumentError,
     );

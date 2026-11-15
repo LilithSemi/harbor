@@ -29,11 +29,16 @@ import 'sim_dram.dart';
 
 /// SoC wrapper for the sdr sdram controller.
 ///
+/// The bus is 32 or 64 bits wide ([busDataWidth]). A beat is two or four
+/// 16-bit sdram words, the low word first, and each byte strobe goes to the
+/// dqm of its word. A word with no strobe still goes out, with its dqm high.
+///
 /// A Wishbone [protocol] has a classic Wishbone port with the ERR, CTI and
 /// BTE signals of a Wishbone memory slave. It ignores CTI and BTE, so each
 /// beat is one classic access, and it never drives ERR:
 ///
-///   bus (clk, Wishbone B4 32b) -> HarborWishboneCdcFifoBridge 'sdram_cdc'
+///   bus (clk, Wishbone B4 32b or 64b) -> HarborWishboneCdcFifoBridge
+///     'sdram_cdc'
 ///     with flops on its memory side (skipped when [busClockSync])
 ///     -> SdramWishbonePort -> SdramPortSlice -> SdramArbiter -> SdramEngine
 ///     -> SdramPhyEcp5 -> sdram_* pads
@@ -53,8 +58,10 @@ import 'sim_dram.dart';
 ///
 /// That port answers in acceptance order per direction. A burst goes to the
 /// arbiter as sdram requests of up to [SdramMemoryPort.maxWords] words, one
-/// for each aligned 4-beat block, so a long burst never holds the engine
-/// for longer than a scanout request does. A write gets its response when
+/// for each aligned block of 16 bytes (4 beats of 32 bits or 2 beats of 64
+/// bits), so a long burst never holds the engine for longer than a scanout
+/// request does. Blocks in one open row follow each other with no extra row
+/// cycles. A write gets its response when
 /// the arbiter has taken its last sdram request, so writes are not posted
 /// across the crossing. A request that a reset cuts off ends with an error
 /// response, which sets the sticky `bus_error`.
@@ -127,7 +134,7 @@ class HarborSdram extends BridgeModule
   /// Bus address width.
   final int busAddressWidth;
 
-  /// Bus data width. Only 32 is supported.
+  /// Bus data width, 32 or 64.
   final int busDataWidth;
 
   /// Fabric kind of the bus port.
@@ -267,8 +274,19 @@ class HarborSdram extends BridgeModule
            exclusive: exclusive,
          ),
        ) {
-    if (busDataWidth != 32) {
-      throw ArgumentError('HarborSdram needs a 32-bit bus, got $busDataWidth');
+    if (busDataWidth != 32 && busDataWidth != 64) {
+      throw ArgumentError.value(
+        busDataWidth,
+        'busDataWidth',
+        'HarborSdram needs a 32-bit or 64-bit bus',
+      );
+    }
+    if (config.dataWidth != 16) {
+      throw ArgumentError.value(
+        config.dataWidth,
+        'config',
+        'HarborSdram needs a 16-bit sdram part',
+      );
     }
     if (this.outstanding < 1) {
       throw ArgumentError.value(
@@ -1159,19 +1177,26 @@ class HarborSdram extends BridgeModule
   int get busWaitBound => bestEffortWaitBound(cycles, scanoutMaxInFlight) + 1;
 
   /// The sdram requests [SdramMemoryPort] sends for a burst of [beats]
-  /// beats of 2^[size] bytes and type [burst]. A full size INCR or WRAP
-  /// burst takes one per 4-beat block it touches, at most beats / 4 + 1. A
-  /// FIXED or narrow burst takes one per beat.
+  /// beats of 2^[size] bytes (a full beat when null) and type [burst] on a
+  /// bus of [dataWidth] bits.
+  /// A full size INCR or WRAP burst takes one per block of 16 bytes it
+  /// touches, at most beats / 4 + 1 on 32 bits and beats / 2 + 1 on 64 bits.
+  /// A FIXED or narrow burst takes one per beat.
   static int busRequestsFor(
     int beats, {
-    int size = 2,
+    int? size,
     HarborMemoryBurst burst = HarborMemoryBurst.incr,
+    int dataWidth = 32,
   }) {
     if (beats < 1 || beats > 256) {
       throw ArgumentError.value(beats, 'beats', 'must be 1..256');
     }
-    if (size < 2 || burst == HarborMemoryBurst.fixed) return beats;
-    return (beats + 3) ~/ 4 + 1;
+    final beatLog2 = (dataWidth ~/ 8).bitLength - 1;
+    if ((size ?? beatLog2) < beatLog2 || burst == HarborMemoryBurst.fixed) {
+      return beats;
+    }
+    final blockBeats = 16 ~/ (dataWidth ~/ 8);
+    return (beats + blockBeats - 1) ~/ blockBeats + 1;
   }
 
   /// The most `mem_clk` cycles the scanout port adds to a bus burst once it
@@ -1180,9 +1205,11 @@ class HarborSdram extends BridgeModule
   /// request behind others in flight also waits for theirs.
   int busBurstWaitBound(
     int beats, {
-    int size = 2,
+    int? size,
     HarborMemoryBurst burst = HarborMemoryBurst.incr,
-  }) => busRequestsFor(beats, size: size, burst: burst) * busWaitBound;
+  }) =>
+      busRequestsFor(beats, size: size, burst: burst, dataWidth: busDataWidth) *
+      busWaitBound;
 
   /// Joins scanout port [i] to [sp], an arbiter port. Every port output
   /// comes from a register. A take is held back while

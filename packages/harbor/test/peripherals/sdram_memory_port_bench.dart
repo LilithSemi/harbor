@@ -26,16 +26,21 @@ const _pads = [
 ];
 
 /// The sdram config of the benches: the ULX3S part with a short power-up.
-HarborSdramConfig sdramBenchConfig() {
+HarborSdramConfig sdramBenchConfig({
+  HarborSdramAddressMap addressMap = HarborSdramAddressMap.rowBankCol,
+}) {
   const base = HarborSdramConfig.as4c16m16sb6();
-  return base.copyWith(timing: base.timing.copyWith(powerUpNs: 2000));
+  return base
+      .copyWith(timing: base.timing.copyWith(powerUpNs: 2000))
+      .copyWith(addressMap: addressMap);
 }
 
 /// A requester on the fabric clock `clk` linked to an ECP5 [HarborSdram]
 /// on `mem_clk`, with the sdram pads on the top.
 ///
 /// [link] replaces the requester: it gets the top and the sdram and wires
-/// the sdram port `bus` itself. [exclusive] goes to the sdram.
+/// the sdram port `bus` itself. [exclusive] goes to the sdram. With [sync]
+/// the bus clock is the memory clock, so the sdram has no `mem_clk` port.
 class SdramPortTop extends BridgeModule {
   late final HarborSdram sdram;
 
@@ -45,34 +50,40 @@ class SdramPortTop extends BridgeModule {
     required int memHz,
     int scanoutPorts = 0,
     HarborAxi4Exclusive? exclusive,
+    bool sync = false,
+    HarborSdramAddressMap addressMap = HarborSdramAddressMap.rowBankCol,
     void Function(BridgeModule top, HarborSdram sdram)? link,
   }) : super(
          'SdramPortBench_${kind.name}_n${config.outstanding}_m${memHz}'
-         '_s$scanoutPorts${link == null ? '' : '_link'}'
-         '${exclusive == null ? '' : '_${exclusive.tag}'}',
+         '_d${config.dataWidth}_s$scanoutPorts${link == null ? '' : '_link'}'
+         '${exclusive == null ? '' : '_${exclusive.tag}'}'
+         '${sync ? '_sync' : ''}_map${addressMap.index}',
          name: 'top',
        ) {
-    for (final p in ['clk', 'reset', 'mem_clk', 'mem_reset']) {
+    final ports = ['clk', 'reset', if (!sync) 'mem_clk', 'mem_reset'];
+    for (final p in ports) {
       createPort(p, PortDirection.input);
     }
     sdram = addSubModule(
       HarborSdram(
-        config: sdramBenchConfig(),
+        config: sdramBenchConfig(addressMap: addressMap),
         baseAddress: 0,
         clockHz: memHz,
         busAddressWidth: config.addressWidth,
+        busDataWidth: config.dataWidth,
         protocol: kind,
         idWidth: config.idWidth,
         exclusive: exclusive,
         outstanding: config.outstanding,
         scanoutPorts: scanoutPorts,
+        busClockSync: sync,
         target: const HarborFpgaTarget.ecp5(
           device: 'LFE5U-85F',
           package: 'CABGA381',
         ),
       ),
     );
-    for (final p in ['clk', 'reset', 'mem_clk', 'mem_reset']) {
+    for (final p in ports) {
       sdram.input(p).srcConnection! <= input(p);
     }
     for (final p in _pads) {
@@ -119,9 +130,13 @@ class SdramPortBench {
     int memPeriodPs = 8000,
     int scanoutPorts = 0,
     HarborAxi4Exclusive? exclusive,
+    bool sync = false,
+    HarborSdramAddressMap addressMap = HarborSdramAddressMap.rowBankCol,
     void Function(BridgeModule top, HarborSdram sdram)? link,
     required void Function(Sim s) attach,
   }) async {
+    // With [sync] the memory clock is the fabric clock.
+    if (sync) memPeriodPs = fabricPeriodPs;
     final memHz = 1000000000000 ~/ memPeriodPs;
     final top = SdramPortTop(
       kind,
@@ -129,19 +144,23 @@ class SdramPortBench {
       memHz: memHz,
       scanoutPorts: scanoutPorts,
       exclusive: exclusive,
+      sync: sync,
+      addressMap: addressMap,
       link: link,
     );
     final fabricClk = SimpleClockGenerator(
       fabricPeriodPs + (fabricPeriodPs & 1),
     ).clk;
-    final memClk = SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
+    final memClk = sync
+        ? fabricClk
+        : SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
     for (final input in top.inputs.values) {
       if (!{'clk', 'mem_clk'}.contains(input.name)) {
         input.srcConnection!.put(input.name.endsWith('reset') ? 1 : 0);
       }
     }
     top.input('clk').srcConnection! <= fabricClk;
-    top.input('mem_clk').srcConnection! <= memClk;
+    if (!sync) top.input('mem_clk').srcConnection! <= memClk;
     await top.build();
 
     final cycles = top.sdram.cycles;
@@ -219,10 +238,13 @@ Future<List<String>> sdramRandomBursts(
   int outstanding = 8,
   int count = 40,
   bool pastTheEnd = true,
+  int dataWidth = 32,
+  bool sync = false,
+  HarborSdramAddressMap addressMap = HarborSdramAddressMap.rowBankCol,
 }) async {
   final config = HarborMemoryWaistConfig(
     addressWidth: 26,
-    dataWidth: 32,
+    dataWidth: dataWidth,
     idWidth: 2,
     outstanding: outstanding,
   );
@@ -231,11 +253,13 @@ Future<List<String>> sdramRandomBursts(
     kind,
     config,
     fabricPeriodPs: fabricPeriodPs,
+    sync: sync,
+    addressMap: addressMap,
     attach: (s) {
       check = MemoryPortCheck(
         s,
         Random(seed),
-        busBytes: 4,
+        busBytes: dataWidth ~/ 8,
         idWidth: config.idWidth,
         span: 0x2000,
         timeout: 4000000,
@@ -244,7 +268,7 @@ Future<List<String>> sdramRandomBursts(
   );
   await check.fill();
   final bad = [
-    ...await check.run(count, extra: longBursts(Random(seed), 4)),
+    ...await check.run(count, extra: longBursts(Random(seed), dataWidth ~/ 8)),
     if (pastTheEnd) ...await _pastTheEnd(check),
     ...bench.model.errors.take(8),
   ];
@@ -258,27 +282,29 @@ Future<List<String>> _pastTheEnd(MemoryPortCheck check) async {
   const top = 1 << 25;
   final req = check.req;
   final before = req.reads.length;
+  final bytes = check.busBytes;
+  final size = bytes.bitLength - 1;
   req.send(
     Burst(
       id: 1,
       write: true,
       addr: top + 0x100,
       len: 3,
-      size: 2,
+      size: size,
       burst: 1,
       data: [0xdead0001, 0xdead0002, 0xdead0003, 0xdead0004],
-      strb: [15, 15, 15, 15],
+      strb: List.filled(4, (1 << bytes) - 1),
     ),
   );
   for (final a in [0x100, top + 0x100]) {
-    req.send(Burst(id: 1, write: false, addr: a, len: 3, size: 2, burst: 1));
+    req.send(Burst(id: 1, write: false, addr: a, len: 3, size: size, burst: 1));
   }
   await waitUntil(check.s, () => req.done, limit: 400000);
   final bad = <String>[];
   for (var k = 0; k < 2; k++) {
     final got = req.readResp[before + k];
     for (var i = 0; i < 4; i++) {
-      final want = check.want.read(0x100 + 4 * i);
+      final want = check.want.read(0x100 + bytes * i);
       if (got.length != 4 || got[i].$2 != want) {
         bad.add('past the end, read $k beat $i: $got want $want');
         break;
@@ -464,10 +490,13 @@ Future<List<String>> sdramAckedWriteSurvivesReset() async {
 
 /// Sends each burst alone and returns the sdram requests the front end
 /// sent for it, next to [HarborSdram.busRequestsFor].
-Future<List<(Burst, int, int)>> sdramRequestCounts(List<Burst> bursts) async {
-  const config = HarborMemoryWaistConfig(
+Future<List<(Burst, int, int)>> sdramRequestCounts(
+  List<Burst> bursts, {
+  int dataWidth = 32,
+}) async {
+  final config = HarborMemoryWaistConfig(
     addressWidth: 26,
-    dataWidth: 32,
+    dataWidth: dataWidth,
     idWidth: 2,
     outstanding: 8,
   );
@@ -500,6 +529,7 @@ Future<List<(Burst, int, int)>> sdramRequestCounts(List<Burst> bursts) async {
         b.beats,
         size: b.size,
         burst: HarborMemoryBurst.values.firstWhere((x) => x.value == b.burst),
+        dataWidth: dataWidth,
       ),
     ));
   }

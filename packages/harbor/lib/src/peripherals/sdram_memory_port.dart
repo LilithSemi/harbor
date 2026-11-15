@@ -7,15 +7,17 @@ import '../bus/port/memory_waist.dart';
 import '../bus/port/reg_fifo.dart';
 import 'sdram_port.dart';
 
-/// Runs the requests of a 32-bit memory slave waist on one sdram client
-/// port, with up to [HarborMemoryWaistConfig.outstanding] requests in
+/// Runs the requests of a 32-bit or 64-bit memory slave waist on one sdram
+/// client port, with up to [HarborMemoryWaistConfig.outstanding] requests in
 /// flight.
 ///
-/// Each beat is one 32-bit word, two 16-bit sdram words. A full size INCR
-/// or WRAP burst goes out as sdram requests of up to [maxWords] words, one
-/// for each aligned 4-beat block it touches. A block never crosses a page,
-/// and a WRAP burst splits at its wrap point. A narrow or FIXED beat goes
-/// out as one request of 2 words, and a read beat gives the whole word.
+/// Each beat is two (32-bit waist) or four (64-bit waist) 16-bit sdram
+/// words, the low word first. A full size INCR or WRAP burst goes out as
+/// sdram requests of up to [maxWords] words, one for each aligned block of
+/// 16 bytes it touches: 4 beats of a 32-bit waist or 2 beats of a 64-bit
+/// waist. A block never crosses a page, and a WRAP burst splits at its wrap
+/// point. A narrow or FIXED beat goes out as one request of one beat of
+/// words, and a read beat gives the whole beat.
 /// Responses come back in acceptance order per direction. RDATA_ERR and
 /// WRESP_ERR are always low.
 ///
@@ -64,15 +66,24 @@ class SdramMemoryPort extends Module {
   }) : super(
          definitionName:
              'SdramMemoryPort_a${waist.config.addressWidth}'
+             '_d${waist.config.dataWidth}'
              '_i${waist.config.idWidth}_n${waist.config.outstanding}'
              '_w${port.addrWidth}_r${readBeats}_b$writeBeats',
        ) {
     final cfg = waist.config;
     final aw = cfg.addressWidth;
     final memAW = port.addrWidth + 1;
-    if (cfg.dataWidth != 32) {
-      throw ArgumentError('the sdram memory port needs a 32-bit waist');
+    final dw = cfg.dataWidth;
+    if (dw != 32 && dw != 64) {
+      throw ArgumentError('the sdram memory port needs a 32 or 64-bit waist');
     }
+    // Words of 16 bits in a beat, and the size of a beat as a power of two.
+    final wpb = dw ~/ 16;
+    final wpbBits = wpb.bitLength - 1;
+    final beatLog2 = (dw ~/ 8).bitLength - 1;
+    final strbW = dw ~/ 8;
+    final beatW = dw + strbW;
+    final blockBeats = maxWords ~/ wpb;
     if (aw < memAW) {
       throw ArgumentError('the waist address must be at least $memAW bits');
     }
@@ -246,7 +257,8 @@ class SdramMemoryPort extends Module {
     final cPtr = Logic(name: 'wb_commit', width: wbW + 1);
     final rPtr = Logic(name: 'wb_rd', width: wbW + 1);
     final wbData = [
-      for (var i = 0; i < writeBeats; i++) Logic(name: 'wb_data_$i', width: 36),
+      for (var i = 0; i < writeBeats; i++)
+        Logic(name: 'wb_data_$i', width: beatW),
     ];
     final wbCount = (wPtr - rPtr).named('wb_count');
     // `wb_wr - wb_commit`, kept as a register.
@@ -258,10 +270,10 @@ class SdramMemoryPort extends Module {
             : wdReadyR);
     final wPush = (w.wdataValid & w.wdataReady).named('wb_push');
     oorQPop <= wPush & w.wdataLast;
-    final strb = w.wdataStrb & ~oorQ.data.replicate(4);
+    final strb = w.wdataStrb & ~oorQ.data.replicate(strbW);
 
     // --- write word feeder: one word register in front of the port ---
-    final fHalf = Logic(name: 'feed_half');
+    final fIdx = Logic(name: 'feed_word', width: wpbBits);
     final oValid = Logic(name: 'wr_valid_r');
     final oData = Logic(name: 'wr_data_r', width: 16);
     final oMask = Logic(name: 'wr_mask_r', width: 2);
@@ -271,10 +283,11 @@ class SdramMemoryPort extends Module {
     // The head register holds the next committed beat, so the word
     // register loads from it and not from the buffer read mux.
     final hValid = Logic(name: 'wr_head_valid');
-    final hBeat = Logic(name: 'wr_head', width: 36);
+    final hBeat = Logic(name: 'wr_head', width: beatW);
     final take = (oValid & p.wrReady).named('wr_take');
     final feed = ((~oValid | take) & hValid).named('feed');
-    final hLoad = ((~hValid | (feed & fHalf)) & rPtr.neq(cPtr)).named(
+    final fLast = fIdx.eq(wpb - 1).named('feed_last');
+    final hLoad = ((~hValid | (feed & fLast)) & rPtr.neq(cPtr)).named(
       'head_load',
     );
     final rIdx = rPtr.getRange(0, wbW);
@@ -391,13 +404,16 @@ class SdramMemoryPort extends Module {
       rdInData < p.rdData,
       clrLate < clr,
     ]);
-    final rHalf = Logic(name: 'rd_half');
-    final rLo = Logic(name: 'rd_lo', width: 16);
-    final tailValid = (rdIn & rHalf).named('rd_tail_valid');
-    final tailData = [rLo, rdInData].rconcat();
+    final rWord = Logic(name: 'rd_word', width: wpbBits);
+    final rdTail = rWord.eq(wpb - 1).named('rd_tail');
+    final rLo = [
+      for (var i = 0; i < wpb - 1; i++) Logic(name: 'rd_lo_$i', width: 16),
+    ];
+    final tailValid = (rdIn & rdTail).named('rd_tail_valid');
+    final tailData = [...rLo, rdInData].rconcat();
     final rbPop = Logic(name: 'rb_pop');
     final rbPush = Logic(name: 'rb_push');
-    final rbPushData = Logic(name: 'rb_push_data', width: 32);
+    final rbPushData = Logic(name: 'rb_push_data', width: dw);
     final rbBufPop = Logic(name: 'rb_buf_pop');
     final rbBuf = _Queue(
       'rb',
@@ -421,7 +437,7 @@ class SdramMemoryPort extends Module {
     // entries, and a registered copy of the RDATA fire gives entries back,
     // so no waist net gets to the read buffer in the same cycle.
     final midValid = Logic(name: 'rd_mid_valid');
-    final midData = Logic(name: 'rd_mid', width: 32);
+    final midData = Logic(name: 'rd_mid', width: dw);
     final outFire = Logic(name: 'rd_out_fire');
     if (!direct) {
       final outCredit = Logic(name: 'rd_out_credit', width: 2);
@@ -461,7 +477,7 @@ class SdramMemoryPort extends Module {
       outData = out.popData;
     } else {
       outValid = Logic(name: 'rd_out_valid');
-      outData = Logic(name: 'rd_out_data', width: 32);
+      outData = Logic(name: 'rd_out_data', width: dw);
     }
     final rBeat = Logic(name: 'rd_beat', width: lenW);
     final Logic rLast;
@@ -540,8 +556,16 @@ class SdramMemoryPort extends Module {
       If(
         feed,
         then: [
-          oData < mux(fHalf, hBeat.getRange(16, 32), hBeat.getRange(0, 16)),
-          oMask < mux(fHalf, hBeat.getRange(34, 36), hBeat.getRange(32, 34)),
+          oData <
+              _pick(fIdx, [
+                for (var i = 0; i < wpb; i++)
+                  hBeat.getRange(16 * i, 16 * i + 16),
+              ]),
+          oMask <
+              _pick(fIdx, [
+                for (var i = 0; i < wpb; i++)
+                  hBeat.getRange(dw + 2 * i, dw + 2 * i + 2),
+              ]),
         ],
       ),
       // Only reset clears the buffer pointers and the word register: their
@@ -552,7 +576,7 @@ class SdramMemoryPort extends Module {
           wPtr < 0,
           cPtr < 0,
           rPtr < 0,
-          fHalf < 0,
+          fIdx < 0,
           hValid < 0,
           oValid < 0,
           qValid < 0,
@@ -561,9 +585,9 @@ class SdramMemoryPort extends Module {
         orElse: [
           wPtr < ahead(wNext),
           If(issue & sWrite, then: [cPtr < cPtr + kWide]),
-          If(feed, then: [fHalf < ~fHalf]),
+          If(feed, then: [fIdx < fIdx + 1]),
           If(hLoad, then: [rPtr < rPtr + 1]),
-          hValid < hLoad | (hValid & ~(feed & fHalf)),
+          hValid < hLoad | (hValid & ~(feed & fLast)),
           oValid < feed | (oValid & ~take),
           If.block([
             Iff(issue, [qValid < 1, qWrite < sWrite]),
@@ -583,8 +607,12 @@ class SdramMemoryPort extends Module {
       If(
         issue,
         then: [
-          qAddr < [sAddr.getRange(2, memAW), Const(0)].concat(),
-          qWords < [kReg, Const(0)].concat().zeroExtend(port.wordsWidth),
+          qAddr <
+              [
+                sAddr.getRange(beatLog2, memAW),
+                Const(0, width: beatLog2 - 1),
+              ].concat(),
+          qWords < _words(kReg, wpbBits, port.wordsWidth),
         ],
       ),
       If(
@@ -596,7 +624,16 @@ class SdramMemoryPort extends Module {
           sSize < head[3],
           sBurst < head[4],
           sWrapLen < head[2],
-          kReg < _chunk(head[1], head[2], head[3], head[4], head[2]),
+          kReg <
+              _chunk(
+                head[1],
+                head[2],
+                head[3],
+                head[4],
+                head[2],
+                beatLog2,
+                blockBeats,
+              ),
         ],
         orElse: [
           If(
@@ -614,16 +651,28 @@ class SdramMemoryPort extends Module {
                         sSize,
                         sBurst,
                         sWrapLen,
+                        beatLog2,
                       ),
                     ].concat()
               else
-                sAddr < _next(sAddr, kReg, sSize, sBurst, sWrapLen),
+                sAddr < _next(sAddr, kReg, sSize, sBurst, sWrapLen, beatLog2),
               sLeft < sLeft - kReg.zeroExtend(lenW),
             ],
           ),
           If(
             sValid & ~kValid,
-            then: [kReg < _chunk(sAddr, sLeft, sSize, sBurst, sWrapLen)],
+            then: [
+              kReg <
+                  _chunk(
+                    sAddr,
+                    sLeft,
+                    sSize,
+                    sBurst,
+                    sWrapLen,
+                    beatLog2,
+                    blockBeats,
+                  ),
+            ],
           ),
         ],
       ),
@@ -670,34 +719,50 @@ class SdramMemoryPort extends Module {
       ),
       If(
         clrLate,
-        then: [rHalf < 0],
+        then: [rWord < 0],
         orElse: [
-          If(rdIn, then: [rHalf < ~rHalf]),
+          If(rdIn, then: [rWord < rWord + 1]),
         ],
       ),
-      If(rdIn & ~rHalf, then: [rLo < rdInData]),
+      If(
+        rdIn & ~rdTail,
+        then: [
+          for (var i = 0; i < wpb - 1; i++)
+            rLo[i] < (i == wpb - 2 ? rdInData : rLo[i + 1]),
+        ],
+      ),
     ]);
   }
 
   /// Beats in the next sdram request of a burst at [addr] with [left] beats
-  /// after this one: the rest of its aligned 4-beat block, cut at the end
-  /// of the burst and at a 2-beat wrap point. A narrow or FIXED beat is 1.
+  /// after this one: the rest of its aligned block of [blockBeats] beats, cut
+  /// at the end of the burst and at a 2-beat wrap point. A narrow or FIXED
+  /// beat is 1. A beat is 2^[beatLog2] bytes.
   static Logic _chunk(
     Logic addr,
     Logic left,
     Logic size,
     Logic burst,
     Logic wrapLen,
+    int beatLog2,
+    int blockBeats,
   ) {
-    final full = size.gte(2) & burst.neq(HarborMemoryBurst.fixed.value);
-    final idx = addr.getRange(2, 4).zeroExtend(3);
-    final toBlock = Const(4, width: 3) - idx;
-    final wrap2 = burst.eq(HarborMemoryBurst.wrap.value) & wrapLen.eq(1);
-    final cap = mux(
-      wrap2,
-      mux<Logic>(addr[2], Const(1, width: 3), Const(2, width: 3)),
-      toBlock,
-    );
+    final full = size.gte(beatLog2) & burst.neq(HarborMemoryBurst.fixed.value);
+    final idxBits = blockBeats.bitLength - 1;
+    final idx = addr.getRange(beatLog2, beatLog2 + idxBits).zeroExtend(3);
+    final toBlock = Const(blockBeats, width: 3) - idx;
+    // A 2-beat wrap is smaller than a block only for blocks of 4 beats.
+    final Logic cap;
+    if (blockBeats == 4) {
+      final wrap2 = burst.eq(HarborMemoryBurst.wrap.value) & wrapLen.eq(1);
+      cap = mux(
+        wrap2,
+        mux<Logic>(addr[beatLog2], Const(1, width: 3), Const(2, width: 3)),
+        toBlock,
+      );
+    } else {
+      cap = toBlock;
+    }
     // left < cap - 1, with cap at most 4.
     final short =
         left.getRange(2).eq(0) & left.getRange(0, 2).zeroExtend(3).lt(cap - 1);
@@ -705,28 +770,52 @@ class SdramMemoryPort extends Module {
     return mux(full, k, Const(1, width: 3));
   }
 
+  /// The words of [beats] beats of 2^[wpbBits] words each, as a number of
+  /// [width] bits.
+  static Logic _words(Logic beats, int wpbBits, int width) {
+    final n = [beats, Const(0, width: wpbBits)].concat();
+    return n.width > width ? n.getRange(0, width) : n.zeroExtend(width);
+  }
+
   /// The byte address after [k] beats of a burst at [addr], by the FIXED,
-  /// INCR and WRAP rules. [k] is 1 for a beat narrower than the bus.
+  /// INCR and WRAP rules. [k] is 1 for a beat narrower than the bus. A full
+  /// beat is 2^[beatLog2] bytes.
   static Logic _next(
     Logic addr,
     Logic k,
     Logic size,
     Logic burst,
     Logic wrapLen,
+    int beatLog2,
   ) {
     final w = addr.width;
-    final sizeMask = mux(
-      size.eq(0),
-      Const(0, width: w),
-      mux<Logic>(size.eq(1), Const(1, width: w), Const(3, width: w)),
-    );
+    Logic sizeMask = Const((1 << beatLog2) - 1, width: w);
+    Logic narrowStep = Const(1 << (beatLog2 - 1), width: w);
+    for (var s = beatLog2 - 1; s >= 0; s--) {
+      sizeMask = mux<Logic>(
+        size.eq(s),
+        Const((1 << s) - 1, width: w),
+        sizeMask,
+      );
+      if (s < beatLog2 - 1) {
+        narrowStep = mux<Logic>(
+          size.eq(s),
+          Const(1 << s, width: w),
+          narrowStep,
+        );
+      }
+    }
     final step = mux(
-      size.gte(2),
-      [k, Const(0, width: 2)].concat().zeroExtend(w),
-      mux<Logic>(size.eq(1), Const(2, width: w), Const(1, width: w)),
+      size.gte(beatLog2),
+      [k, Const(0, width: beatLog2)].concat().zeroExtend(w),
+      narrowStep,
     );
     final incr = (addr & ~sizeMask) + step;
-    final shift = mux(size.gte(2), Const(2, width: 2), size.getRange(0, 2));
+    final shift = mux(
+      size.gte(beatLog2),
+      Const(beatLog2, width: 2),
+      size.getRange(0, 2),
+    );
     final wrapMask = (wrapLen.zeroExtend(w) << shift) | sizeMask;
     final wrapNext = (addr & ~wrapMask) | (incr & wrapMask);
     return mux(
