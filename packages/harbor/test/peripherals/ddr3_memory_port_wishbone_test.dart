@@ -16,6 +16,7 @@ void main() {
         HarborFabricKind.wishbone,
         fabricPeriod: 14,
         seed: 3,
+        longPart: 2,
       );
     },
     timeout: const Timeout(Duration(hours: 6)),

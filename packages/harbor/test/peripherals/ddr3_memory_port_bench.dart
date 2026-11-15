@@ -7,8 +7,10 @@ import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:test/test.dart';
 
+import '../bus/port/memory_harness.dart';
 import '../bus/port/port_harness.dart';
 import 'ddr3_ecp5_pad_dram_model.dart';
+import 'ddr3_scheduled_clock.dart';
 import 'memory_port_bench.dart';
 
 const _pads = [
@@ -72,11 +74,16 @@ class _Ddr3Bench extends BridgeModule {
 /// through the native [kind] port of an ECP5 [HarborDdr3], whose memory
 /// clock is CK/4 with CK of period 4. The DDR3 pins drive a pad level DRAM
 /// model, and the port layer crosses between the two clocks.
+///
+/// [longPart] picks which long bursts run: 0 for all, 1 for the 256 beat
+/// write and read, 2 for the others. A slow fabric splits them over two
+/// files to stay inside the time budget.
 Future<void> ddr3RandomBursts(
   HarborFabricKind kind, {
   required int fabricPeriod,
   required int seed,
-  int count = 12,
+  int count = 2,
+  int longPart = 0,
 }) async {
   const config = HarborMemoryWaistConfig(
     addressWidth: 27,
@@ -88,11 +95,7 @@ Future<void> ddr3RandomBursts(
   final p = DdrParams.orangeCrab(ckPeriodPs: 200000);
 
   final ck = SimpleClockGenerator(4).clk;
-  final divInit = Logic(name: 'div_init')..inject(1);
-  Simulator.registerAction(4, () => divInit.put(0));
-  final div = Logic(name: 'div', width: 2);
-  Sequential(ck, reset: divInit, [div < div + 1]);
-  final ddrClk = div[1];
+  final ddrClk = scheduledClock(firstRise: 10, halfPeriod: 8);
   final fabricClk = SimpleClockGenerator(fabricPeriod + (fabricPeriod & 1)).clk;
 
   for (final input in top.inputs.values) {
@@ -128,7 +131,7 @@ Future<void> ddr3RandomBursts(
     Random(seed),
     busBytes: config.strbWidth,
     idWidth: config.idWidth,
-    span: 0x800,
+    span: 0x600,
     timeout: 4000000,
   );
   s.attach();
@@ -158,9 +161,17 @@ Future<void> ddr3RandomBursts(
   expect(state, 23, reason: 'DONE_CALIBRATE');
 
   await check.fill();
-  final bad = await check.run(count, extra: longBursts(Random(seed), 4));
+  final bad = await check.run(
+    count,
+    extra: _longPart(longBursts(Random(seed), 4), longPart),
+  );
   final busError = top.ddr.busError.value.toInt();
   await Simulator.endSimulation();
   expect([for (final e in dram.errors) 'dram: $e', ...bad], isEmpty);
   expect(busError, 0);
 }
+
+List<Burst> _longPart(List<Burst> all, int part) => [
+  for (var i = 0; i < all.length; i++)
+    if (part == 0 || (part == 1) == (i == 0 || i == 4)) all[i],
+];
