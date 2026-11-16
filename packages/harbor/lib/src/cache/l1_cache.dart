@@ -883,17 +883,11 @@ class HarborL1ICache extends BridgeModule {
 
 /// Synthesizable L1 data cache: direct-mapped, write-through, no-write-allocate.
 ///
-/// The load path is the [HarborL1ICache] path, a miss fills its line one paced
-/// word at a time so the DDR PHY only ever sees the single reads it captures
-/// correctly, then held loads hit out of the block RAM. That pacing is the whole
-/// reason the cache exists: it isolates the data-load stream from back-to-back
-/// bursts the marginal PHY mis-captures.
-///
-/// Stores are write-through with no write-allocate: the store goes straight to
-/// memory through the same verified write path, and if its line is resident the
-/// line is invalidated (a following load re-fills it, paced). This keeps the
-/// cached copy coherent without any sub-word merge or dirty-line eviction burst,
-/// stores already work on this hardware. The cache is here to pace loads.
+/// A load miss fills its line with one INCR burst from the line base, then
+/// the held load hits. Stores go to memory and are not posted: a store
+/// completes when memory acknowledges it. A store to a resident line also
+/// writes its bytes into the line, which stays valid. A store miss does not
+/// allocate a line.
 class HarborL1DCache extends BridgeModule {
   /// Cache configuration.
   final HarborCacheConfig config;
@@ -941,8 +935,8 @@ class HarborL1DCache extends BridgeModule {
   /// The core supplies the privilege mode and the SUM bit here (see [reqCtx]).
   ///
   /// Stores are unaffected: they are write-through, so every store already
-  /// reaches the MMU and is checked. Store invalidation stays context-blind, so
-  /// a store never leaves another context holding stale data.
+  /// reaches the MMU and is checked. The store hit compares the address tag
+  /// only, so a store never leaves another context holding stale data.
   final int ctxBits;
 
   /// Stops the simulation when `mem_last` does not match the burst length.
@@ -1148,8 +1142,8 @@ class HarborL1DCache extends BridgeModule {
     //
     // Two virtual addresses can name one physical word. The cache is virtually
     // tagged, so it cannot see that, and a store through one of them must still
-    // drop the line the other one holds. It does that by index (see `storeInv`
-    // in the store arm), which only reaches every alias while the index bits
+    // drop the line the other one holds. It does that by index (see
+    // `storeValidClear`), which only reaches every alias while the index bits
     // are inside the page offset: those bits are the same in every mapping of
     // one frame. Above a page per way the index moves into the translated part
     // of the address, two aliases land on DIFFERENT lines, and a store can no
@@ -1199,6 +1193,7 @@ class HarborL1DCache extends BridgeModule {
       numReadPorts: 1,
       numWritePorts: 1,
       reservedZero: false,
+      byteWrite: true,
       target: target,
       forceReadLatency: ramLatency,
       name: 'l1d_data',
@@ -1238,7 +1233,10 @@ class HarborL1DCache extends BridgeModule {
     final fillErr = Logic(name: 'fillErr');
     final fillErrPage = Logic(name: 'fillErrPage');
     final storeIdx = Logic(name: 'storeIdx', width: idxBits == 0 ? 1 : idxBits);
-    final storeInv = Logic(name: 'storeInv');
+    // High in the first cycle of a store, when the tag read and addrQ belong
+    // to the store address.
+    final storeFirst = Logic(name: 'storeFirst');
+    final storeHitQ = Logic(name: 'storeHitQ');
 
     final addrQ = Logic(name: 'addrQ', width: xlen);
     final validUpdateEn = Logic(name: 'validUpdateEn');
@@ -1261,8 +1259,7 @@ class HarborL1DCache extends BridgeModule {
     );
     sweepCycles = lineValid.sweepCycles;
 
-    // Match address and permission context. Stores invalidate by index and
-    // require no asynchronous tag read.
+    // Match address and permission context.
     Logic committedHitOf(Logic a) =>
         lineValid.valid[0] & tagRam.read(0).eq(fullTagOf(a));
     // Also block on the completion pulses (storeDone / bypassDone / fillSettle):
@@ -1360,9 +1357,51 @@ class HarborL1DCache extends BridgeModule {
     } else {
       fillEntry = [fillIdx, fillWord.slice(offBits - 1, 0)].concat();
     }
-    dataRam.input('wr_en').srcConnection! <= fillWrEn;
-    dataRam.input('wr_addr').srcConnection! <= fillEntry;
-    dataRam.input('wr_data').srcConnection! <= memRdata;
+    // A store that hits writes its bytes into the line in the storeDone cycle,
+    // after the memory acknowledged it. The write uses registers only, so the
+    // tag compare is not on the path to the RAM write enable. The address tag
+    // alone decides the hit: a line of the same address from another context
+    // holds the same bytes.
+    final storeHitNow =
+        (lineValid.valid[0] &
+                tagRam.read(0).getRange(0, tagBits).eq(tagOf(addrQ)))
+            .named('storeHitNow');
+    final storeHit = mux(storeFirst, storeHitNow, storeHitQ).named('storeHit');
+    final storeAck = (storing & memDone & memValid).named('storeAck');
+    final storeWrEn = (storeDone & storeHitQ).named('storeWrEn');
+    final lanes = wordBytes;
+    final lane = byteBits == 0
+        ? Const(0, width: 1)
+        : memAddrR.getRange(0, byteBits);
+    // Byte i of the store is written when the size covers it.
+    final strb = [
+      for (var i = 0; i < lanes; i++)
+        i == 0 ? Const(1) : memSizeR.gte(i.bitLength),
+    ].rconcat();
+    final storeStrb = (strb << lane).named('storeStrb');
+    // The core sends only stores that are aligned to their size, so the bytes
+    // stay in one word.
+    if (byteBits > 0) {
+      final sizeMask = [
+        for (var i = 0; i < byteBits; i++) memSizeR.gt(i),
+      ].rconcat();
+      _l1CheckInSim(
+        clk,
+        reset,
+        storing & (lane & sizeMask).neq(0),
+        'store is not aligned to its size',
+      );
+    }
+    final storeData = (memWdataR << [lane, Const(0, width: 3)].concat()).named(
+      'storeData',
+    );
+    dataRam.input('wr_en').srcConnection! <= fillWrEn | storeWrEn;
+    dataRam.input('wr_addr').srcConnection! <=
+        mux(storeDone, dataEntryOf(memAddrR), fillEntry);
+    dataRam.input('wr_data').srcConnection! <=
+        mux(storeDone, storeData, memRdata);
+    dataRam.input('wr_strb').srcConnection! <=
+        mux(storeDone, storeStrb, Const((1 << lanes) - 1, width: lanes));
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
     // A beat with an error, or a mem_last that does not match the burst
@@ -1389,9 +1428,13 @@ class HarborL1DCache extends BridgeModule {
     // Each one is followed by a cycle with no lookup (fillSettle, storeDone or
     // filling), which the registered update needs.
     fillValidSet <= fillCommit;
-    final storeValidClear = (storing & memDone & memValid & storeInv).named(
-      'storeValidClear',
-    );
+    // A store miss in a physical cache leaves the line alone. In a virtual
+    // cache another virtual address of the same frame can hold the line at
+    // this index (see the alias check above), so the miss drops it.
+    final storeValidClear =
+        (physicalAddresses ? Const(0) : storeAck & ~storeHit).named(
+          'storeValidClear',
+        );
     validUpdateEn <= fillValidSet | storeValidClear | loadMiss;
     validUpdateIdx <=
         mux(
@@ -1405,6 +1448,8 @@ class HarborL1DCache extends BridgeModule {
 
     Sequential(clk, [
       addrQ < reqAddr,
+      storeFirst < 0,
+      If(storeFirst, then: [storeHitQ < storeHitNow]),
       If(
         reset,
         then: [
@@ -1569,42 +1614,7 @@ class HarborL1DCache extends BridgeModule {
                                   memSizeR < reqSize,
                                   memLenR < 0,
                                   storeIdx < idxOf(reqAddr),
-                                  // ALWAYS drop the line at the stored index.
-                                  //
-                                  // This used to be
-                                  // `addrHitOf(reqAddr) & cacheableOf(reqAddr)`,
-                                  // which only dropped the line when the STORED
-                                  // virtual address matched the tag. The cache
-                                  // is virtually tagged, so a second virtual
-                                  // address for the same physical page has a
-                                  // DIFFERENT tag: the store left that line
-                                  // resident and a later load through it
-                                  // returned the value from before the store.
-                                  // RVWMO makes a hart see its own store to the
-                                  // same PHYSICAL address, so that was a memory
-                                  // model violation with no fence software is
-                                  // obliged to insert. Linux hits it through
-                                  // the linear map, vmemmap, vmalloc/vmap,
-                                  // kmap and DMA buffers, all of which name one
-                                  // frame by two virtual addresses.
-                                  //
-                                  // The index is safe to use for this because
-                                  // it is cut from bits BELOW the page offset
-                                  // (see the tagLo check in the constructor):
-                                  // every synonym of a physical word shares
-                                  // those bits, so every alias of the stored
-                                  // word is on this one line. The tag compare
-                                  // added nothing but the hole, so dropping it
-                                  // also removes a comparator from the store
-                                  // path.
-                                  //
-                                  // Uncacheable stores drop the line too. The
-                                  // cacheable test reads the VIRTUAL address,
-                                  // so one physical word can be cacheable
-                                  // through a high virtual address and
-                                  // uncacheable through a low one, and gating
-                                  // on it reopened the same hole.
-                                  storeInv < Const(1),
+                                  storeFirst < 1,
                                 ],
                                 orElse: [
                                   If(

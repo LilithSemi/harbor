@@ -567,8 +567,8 @@ void main() {
     }
   });
 
-  /// A sub-word store to a resident line must still drop that line.
-  test('sub-word store to a resident line invalidates it', () async {
+  /// A sub-word store hit merges its bytes into the resident line.
+  test('sub-word store to a resident line updates it', () async {
     final dut = await makeDut(latency: 5);
     dut.backing.mem[base] = BigInt.parse('AAAAAAAAAAAAAAAA', radix: 16);
     dut['req_addr'].inject(base);
@@ -617,12 +617,12 @@ void main() {
     expect(
       got,
       equals(BigInt.parse('AAAAAAAA5AAAAAAA', radix: 16)),
-      reason: 'the byte store left a stale line resident',
+      reason: 'the byte store did not reach the resident line',
     );
     expect(
       dut.backing.reads,
-      readsBefore + 1,
-      reason: 'the store must drop the resident line',
+      readsBefore,
+      reason: 'a store hit must keep the line valid',
     );
   });
 

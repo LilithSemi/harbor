@@ -106,160 +106,163 @@ void main() {
     await Simulator.endSimulation();
   });
 
-  test('l1d: load-fill/hit, write-through store, invalidate-on-hit', () async {
-    final clk = SimpleClockGenerator(10).clk;
-    final reset = Logic(name: 'reset');
-    final reqAddr = Logic(name: 'req_addr', width: 64);
-    final reqValid = Logic(name: 'req_valid');
-    final reqWrite = Logic(name: 'req_write');
-    final reqData = Logic(name: 'req_data', width: 64);
-    final reqSize = Logic(name: 'req_size', width: 3);
-    final flush = Logic(name: 'flush');
-    final memDone = Logic(name: 'mem_done');
-    final memValid = Logic(name: 'mem_valid');
-    final memLast = Logic(name: 'mem_last');
-    final memRdata = Logic(name: 'mem_rdata', width: 64);
-    final memFault = Logic(name: 'mem_fault');
+  test(
+    'l1d: load-fill/hit, write-through store, store hit keeps the line',
+    () async {
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset');
+      final reqAddr = Logic(name: 'req_addr', width: 64);
+      final reqValid = Logic(name: 'req_valid');
+      final reqWrite = Logic(name: 'req_write');
+      final reqData = Logic(name: 'req_data', width: 64);
+      final reqSize = Logic(name: 'req_size', width: 3);
+      final flush = Logic(name: 'flush');
+      final memDone = Logic(name: 'mem_done');
+      final memValid = Logic(name: 'mem_valid');
+      final memLast = Logic(name: 'mem_last');
+      final memRdata = Logic(name: 'mem_rdata', width: 64);
+      final memFault = Logic(name: 'mem_fault');
 
-    final cache = HarborL1DCache(
-      config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
-      xlen: 64,
-      reqAddrBits: 32,
-      memFaultIn: memFault,
-    );
-    for (final (n, l) in [
-      ('clk', clk),
-      ('reset', reset),
-      ('req_addr', reqAddr),
-      ('req_valid', reqValid),
-      ('req_write', reqWrite),
-      ('req_data', reqData),
-      ('req_size', reqSize),
-      ('flush', flush),
-      ('mem_done', memDone),
-      ('mem_valid', memValid),
-      ('mem_last', memLast),
-      ('mem_rdata', memRdata),
-    ]) {
-      cache.port(n).getsLogic(l);
-    }
-    await cache.build();
-
-    const addr = 0x80000020;
-    final v0 = BigInt.parse('1111111122222222', radix: 16);
-    final v1 = BigInt.parse('AAAABBBBCCCCDDDD', radix: 16);
-
-    // Backing memory the cache writes through to.
-    final mem = <int, BigInt>{addr: v0};
-
-    reset.inject(1);
-    reqValid.inject(0);
-    reqWrite.inject(0);
-    reqAddr.inject(0);
-    reqData.inject(0);
-    reqSize.inject(3);
-    flush.inject(0);
-    memDone.inject(0);
-    memValid.inject(0);
-    memLast.inject(0);
-    memRdata.inject(0);
-
-    unawaited(Simulator.run());
-
-    final memEn = cache.output('mem_en');
-    final memWe = cache.output('mem_we');
-    final memAddr = cache.output('mem_addr');
-    final memWdata = cache.output('mem_wdata');
-
-    var reads = 0;
-    var writes = 0;
-    var prevEn = false;
-
-    // One clock step that also services the paced memory model.
-    Future<void> step() async {
-      await clk.nextPosedge;
-      final en = memEn.value.toBool();
-      final we = memWe.value.toBool();
-      if (en && !prevEn) {
-        if (we) {
-          writes++;
-        } else {
-          reads++;
-        }
+      final cache = HarborL1DCache(
+        config: const HarborL1dCacheConfig(size: 256, ways: 1, lineSize: 8),
+        xlen: 64,
+        reqAddrBits: 32,
+        memFaultIn: memFault,
+      );
+      for (final (n, l) in [
+        ('clk', clk),
+        ('reset', reset),
+        ('req_addr', reqAddr),
+        ('req_valid', reqValid),
+        ('req_write', reqWrite),
+        ('req_data', reqData),
+        ('req_size', reqSize),
+        ('flush', flush),
+        ('mem_done', memDone),
+        ('mem_valid', memValid),
+        ('mem_last', memLast),
+        ('mem_rdata', memRdata),
+      ]) {
+        cache.port(n).getsLogic(l);
       }
-      prevEn = en;
-      if (en) {
-        final a = memAddr.value.toInt() & ~7;
-        if (we) {
-          mem[a] = memWdata.value.toBigInt();
-        } else {
-          memRdata.inject(mem[a] ?? BigInt.zero);
-        }
-        memDone.inject(1);
-        memValid.inject(1);
-        memLast.inject(1);
-      } else {
-        memDone.inject(0);
-        memValid.inject(0);
-        memLast.inject(0);
-      }
-    }
+      await cache.build();
 
-    // Drive one request until the cache responds, then return the served data.
-    Future<BigInt> op({
-      required int a,
-      required bool write,
-      BigInt? data,
-    }) async {
-      reqAddr.inject(a);
-      reqData.inject(data ?? BigInt.zero);
-      reqWrite.inject(write);
-      reqValid.inject(1);
-      BigInt? served;
-      for (var i = 0; i < 40 && served == null; i++) {
-        await step();
-        if (cache.output('resp_valid').value.toBool()) {
-          served = cache.output('resp_data').value.toBigInt();
-        }
-      }
-      // Drop the request so the next op starts from idle.
+      const addr = 0x80000020;
+      final v0 = BigInt.parse('1111111122222222', radix: 16);
+      final v1 = BigInt.parse('AAAABBBBCCCCDDDD', radix: 16);
+
+      // Backing memory the cache writes through to.
+      final mem = <int, BigInt>{addr: v0};
+
+      reset.inject(1);
       reqValid.inject(0);
+      reqWrite.inject(0);
+      reqAddr.inject(0);
+      reqData.inject(0);
+      reqSize.inject(3);
+      flush.inject(0);
+      memDone.inject(0);
+      memValid.inject(0);
+      memLast.inject(0);
+      memRdata.inject(0);
+
+      unawaited(Simulator.run());
+
+      final memEn = cache.output('mem_en');
+      final memWe = cache.output('mem_we');
+      final memAddr = cache.output('mem_addr');
+      final memWdata = cache.output('mem_wdata');
+
+      var reads = 0;
+      var writes = 0;
+      var prevEn = false;
+
+      // One clock step that also services the paced memory model.
+      Future<void> step() async {
+        await clk.nextPosedge;
+        final en = memEn.value.toBool();
+        final we = memWe.value.toBool();
+        if (en && !prevEn) {
+          if (we) {
+            writes++;
+          } else {
+            reads++;
+          }
+        }
+        prevEn = en;
+        if (en) {
+          final a = memAddr.value.toInt() & ~7;
+          if (we) {
+            mem[a] = memWdata.value.toBigInt();
+          } else {
+            memRdata.inject(mem[a] ?? BigInt.zero);
+          }
+          memDone.inject(1);
+          memValid.inject(1);
+          memLast.inject(1);
+        } else {
+          memDone.inject(0);
+          memValid.inject(0);
+          memLast.inject(0);
+        }
+      }
+
+      // Drive one request until the cache responds, then return the served data.
+      Future<BigInt> op({
+        required int a,
+        required bool write,
+        BigInt? data,
+      }) async {
+        reqAddr.inject(a);
+        reqData.inject(data ?? BigInt.zero);
+        reqWrite.inject(write);
+        reqValid.inject(1);
+        BigInt? served;
+        for (var i = 0; i < 40 && served == null; i++) {
+          await step();
+          if (cache.output('resp_valid').value.toBool()) {
+            served = cache.output('resp_data').value.toBigInt();
+          }
+        }
+        // Drop the request so the next op starts from idle.
+        reqValid.inject(0);
+        await step();
+        expect(served, isNotNull, reason: 'cache never responded');
+        return served!;
+      }
+
       await step();
-      expect(served, isNotNull, reason: 'cache never responded');
-      return served!;
-    }
+      reset.inject(0);
+      await step();
 
-    await step();
-    reset.inject(0);
-    await step();
+      // Load A: miss -> paced fill -> serve V0.
+      expect(await op(a: addr, write: false), equals(v0));
+      expect(reads, equals(1), reason: 'load miss must be one paced read');
 
-    // Load A: miss -> paced fill -> serve V0.
-    expect(await op(a: addr, write: false), equals(v0));
-    expect(reads, equals(1), reason: 'load miss must be one paced read');
+      // Load A again: resident hit, no new memory read.
+      expect(await op(a: addr, write: false), equals(v0));
+      expect(
+        reads,
+        equals(1),
+        reason: 'resident load should not re-read memory',
+      );
 
-    // Load A again: resident hit, no new memory read.
-    expect(await op(a: addr, write: false), equals(v0));
-    expect(reads, equals(1), reason: 'resident load should not re-read memory');
+      // Store A = V1: write-through to memory, the resident line stays valid.
+      await op(a: addr, write: true, data: v1);
+      expect(writes, equals(1), reason: 'store must write through to memory');
+      expect(mem[addr], equals(v1), reason: 'memory did not receive the store');
 
-    // Store A = V1: write-through to memory, invalidate the resident line.
-    await op(a: addr, write: true, data: v1);
-    expect(writes, equals(1), reason: 'store must write through to memory');
-    expect(mem[addr], equals(v1), reason: 'memory did not receive the store');
+      // Load A: a store hit writes the line, so this hits with the new bytes.
+      expect(
+        await op(a: addr, write: false),
+        equals(v1),
+        reason: 'store hit did not update the cached line',
+      );
+      expect(reads, equals(1), reason: 'store hit must keep the line valid');
 
-    // Load A: the invalidate forced a re-fill, which returns the stored V1.
-    expect(
-      await op(a: addr, write: false),
-      equals(v1),
-      reason: 'store did not invalidate the cached line',
-    );
-    expect(
-      reads,
-      equals(2),
-      reason: 'invalidated line must re-fill from memory',
-    );
-
-    await Simulator.endSimulation();
-  });
+      await Simulator.endSimulation();
+    },
+  );
 
   test(
     'l1d: uncacheable (MMIO) load bypasses, never caches a stale value',

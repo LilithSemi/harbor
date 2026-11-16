@@ -118,7 +118,8 @@ void main() {
           expect(await access(a), beats);
           await access(b, store: 0x12345678);
           expect(writes, 1);
-          expect(await access(b), beats);
+          // A store hit writes the resident line, so the next load hits.
+          expect(await access(b), 0);
           expect(await access(a), 0);
           p['flush']!.inject(1);
           await step();
