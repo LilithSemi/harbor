@@ -203,6 +203,8 @@ class BurstDut {
     int size = 1024,
     bool checkMemLast = true,
     bool physical = false,
+    bool snoop = false,
+    void Function(Module cache, Logic clk)? connect,
     int latency = 3,
     int gap = 0,
   }) async {
@@ -224,14 +226,17 @@ class BurstDut {
             ),
             xlen: xlen,
             physicalAddresses: physical,
+            snoop: snoop,
             checkMemLast: checkMemLast,
             memFaultIn: Logic(name: 'mem_fault_in'),
           );
     final clk = SimpleClockGenerator(10).clk;
-    for (final input in cache.inputs.values) {
-      if (input.name != 'clk') input.srcConnection!.put(0);
-    }
     cache.input('clk').srcConnection! <= clk;
+    connect?.call(cache, clk);
+    for (final input in cache.inputs.values) {
+      final src = input.srcConnection!;
+      if (input.name != 'clk' && src.srcConnection == null) src.put(0);
+    }
     await cache.build();
     final mem = BurstMemory(cache, xlen: xlen, latency: latency, gap: gap);
     final dut = BurstDut._(cache, mem, clk);

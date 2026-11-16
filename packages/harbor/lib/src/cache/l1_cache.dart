@@ -193,13 +193,24 @@ endmodule''';
 /// flush cycle. While [sweeping] is high the cache must answer no lookup and
 /// must not set a valid bit.
 ///
-/// The one update port sets or clears the bit of one line. The update goes
-/// into flops and writes the next cycle, with a read, modify and write of its
-/// word, so the cache must answer no lookup in the cycle after an update. A
-/// reset, a flush or a sweep drops the update.
+/// The update port sets or clears the bit of one line. The update goes into
+/// flops ([pending]) and writes the next cycle, with a read, modify and write
+/// of its word, so the cache must answer no lookup while [pending] is high.
+/// A new set replaces a pending update, so the cache sends a new update while
+/// one is pending only to set the line of the pending one. A reset, a flush
+/// or a sweep drops it.
+///
+/// The clear port clears the bit of one line in the same cycle and has
+/// priority. Its index must be the index of lookup `clearLookup` one cycle
+/// before, so the clear reuses that read port. A pending update to a different word waits for it. A pending
+/// update to the same word writes together with the clear, and the clear
+/// wins on the same bit.
 class _L1ValidBits {
   /// High while the sweep runs.
   final Logic sweeping = Logic(name: 'validSweeping');
+
+  /// High while an update waits to write.
+  final Logic pending = Logic(name: 'validPending');
 
   /// Valid bit of the line at each lookup index, in the same cycle.
   final List<Logic> valid = [];
@@ -218,6 +229,9 @@ class _L1ValidBits {
     required Logic updateEn,
     required Logic updateIdx,
     required Logic updateValue,
+    Logic? clearEn,
+    Logic? clearIdx,
+    int? clearLookup,
   }) {
     final idxBits = (lines - 1).bitLength;
     final bitBits = idxBits < 3 ? idxBits : 3;
@@ -231,15 +245,20 @@ class _L1ValidBits {
         : idx.slice(idxBits - 1, bitBits);
     Logic bitOf(Logic idx, Logic word) =>
         bitBits == 0 ? word[0] : word[idx.slice(bitBits - 1, 0)];
+    Logic maskOf(Logic idx) => bitBits == 0
+        ? Const(1)
+        : (Const(1, width: width) << idx.slice(bitBits - 1, 0));
 
     final clear = (reset | flush).named('validClear');
-    final updEnQ = Logic(name: 'validUpdEnQ');
+    final updEnQ = bits.pending;
     final updIdxQ = Logic(name: 'validUpdIdxQ', width: updateIdx.width);
     final updValueQ = Logic(name: 'validUpdValueQ');
     final sweepIdx = Logic(name: 'validSweepIdx', width: addrWidth);
     final wrEn = Logic(name: 'validWrEn');
     final wrAddr = Logic(name: 'validWrAddr', width: addrWidth);
     final wrData = Logic(name: 'validWrData', width: width);
+    final clrIdx = clearIdx ?? Const(0, width: updateIdx.width);
+    final clrEn = clearEn ?? Const(0);
     final ram = _L1ValidRam(
       clk,
       width: width,
@@ -254,26 +273,61 @@ class _L1ValidBits {
     }
 
     final old = ram.rdData(lookups.length);
-    final mask = bitBits == 0
-        ? Const(1)
-        : (Const(1, width: width) << updIdxQ.slice(bitBits - 1, 0));
-    wrEn <= ~clear & (bits.sweeping | updEnQ);
-    wrAddr <= mux(bits.sweeping, sweepIdx, wordOf(updIdxQ));
-    wrData <=
+    final updMask = maskOf(updIdxQ);
+    final updWord = mux(updValueQ, old | updMask, old & ~updMask);
+    final Logic clrWrite;
+    final Logic updDone;
+    if (clearEn == null) {
+      clrWrite = Const(0);
+      updDone = updEnQ;
+    } else {
+      final sameWord = wordOf(clrIdx).eq(wordOf(updIdxQ));
+      // The clear reads its word through lookup [clearLookup] one cycle
+      // early, with the write of that cycle forwarded.
+      final k = clearLookup!;
+      final clrOld = Logic(name: 'validClrOld', width: width);
+      Sequential(clk, [
+        clrOld <
+            mux(wrEn & wrAddr.eq(wordOf(lookups[k])), wrData, ram.rdData(k)),
+      ]);
+      final clrBase = mux(updEnQ & sameWord, updWord, clrOld);
+      clrWrite = clrEn;
+      updDone = (updEnQ & (~clrEn | sameWord)).named('validUpdDone');
+      final clrWord = clrBase & ~maskOf(clrIdx);
+      wrData <=
+          mux(
+            bits.sweeping,
+            Const(0, width: width),
+            mux(clrEn, clrWord, updWord),
+          );
+    }
+    wrEn <= ~clear & (bits.sweeping | clrWrite | updEnQ);
+    wrAddr <=
         mux(
           bits.sweeping,
-          Const(0, width: width),
-          mux(updValueQ, old | mask, old & ~mask),
+          sweepIdx,
+          clearEn == null
+              ? wordOf(updIdxQ)
+              : mux(clrEn, wordOf(clrIdx), wordOf(updIdxQ)),
         );
+    if (clearEn == null) {
+      wrData <= mux(bits.sweeping, Const(0, width: width), updWord);
+    }
 
     Sequential(clk, [
-      updIdxQ < updateIdx,
-      updValueQ < updateValue,
+      if (clearEn == null) ...[
+        updIdxQ < updateIdx,
+        updValueQ < updateValue,
+      ] else
+        If(
+          ~(updEnQ & ~updDone & ~bits.sweeping & ~updateValue),
+          then: [updIdxQ < updateIdx, updValueQ < updateValue],
+        ),
       If(
         clear,
         then: [bits.sweeping < 1, sweepIdx < 0, updEnQ < 0],
         orElse: [
-          updEnQ < updateEn,
+          updEnQ < updateEn | (updEnQ & ~updDone & ~bits.sweeping),
           If(
             bits.sweeping,
             then: [
@@ -943,6 +997,17 @@ class HarborL1DCache extends BridgeModule {
   /// The cache treats such a burst as an error in all modes.
   final bool checkMemLast;
 
+  /// Adds the snoop port: [invalValid], [invalAddr], [invalHold],
+  /// [invalBusy] and [fillLine]. It keeps the cache coherent with DMA writes
+  /// to memory. Connect it to a [HarborDmaSnoop] or a [HarborDmaSnoopMerge]
+  /// with their `connectCache`. It needs [physicalAddresses], and it costs a
+  /// second read port on the tag store.
+  ///
+  /// A refill that a snoop kills still answers the held load, with the miss
+  /// word it read, and the line stays invalid. The requester holds its
+  /// request until it gets an answer, as for every other op.
+  final bool snoop;
+
   /// Cycles after a reset or flush during which the cache clears its valid
   /// bits and answers no lookup.
   late final int sweepCycles;
@@ -996,6 +1061,25 @@ class HarborL1DCache extends BridgeModule {
   Logic get perfAccess => output('perf_access');
   Logic get perfMiss => output('perf_miss');
 
+  /// Snoop invalidate, present only when [snoop] is set. A cycle with
+  /// [invalValid] high drops the line that holds [invalAddr] if it is in the
+  /// cache. The cache takes one in each cycle and has no ready.
+  Logic get invalValid => input('inval_valid');
+  Logic get invalAddr => input('inval_addr');
+
+  /// High while [fillLine] is in a DMA write that is in flight. The cache
+  /// takes it into a flop. A refill that is in flight in a cycle after
+  /// [invalHold] was high does not make its line valid, because its read can
+  /// come before the DMA write in memory.
+  Logic get invalHold => input('inval_hold');
+
+  /// High while an invalidate is in the cache and its line can still hit.
+  /// The snoop holds a DMA completion until it is low.
+  Logic get invalBusy => output('inval_busy');
+
+  /// Line address of the refill. It is valid while a refill is in flight.
+  Logic get fillLine => output('fill_line');
+
   /// Whole-cache flush. It clears every valid bit in [sweepCycles] cycles,
   /// and [busy] stays high until the clear is done.
   Logic get flush => input('flush');
@@ -1031,6 +1115,7 @@ class HarborL1DCache extends BridgeModule {
     this.physicalAddresses = false,
     this.ctxBits = 0,
     this.checkMemLast = true,
+    this.snoop = false,
     Logic? memFaultIn,
     // Significant low bits of [reqAddr]. See the note on tag width below.
     int? reqAddrBits,
@@ -1047,6 +1132,9 @@ class HarborL1DCache extends BridgeModule {
     if (ctxBits < 0) {
       throw ArgumentError('ctxBits must not be negative (got $ctxBits).');
     }
+    if (snoop && !physicalAddresses) {
+      throw ArgumentError('A snooping cache needs physicalAddresses: true.');
+    }
     if (physicalAddresses && reqAddrBits != null && reqAddrBits != xlen) {
       throw ArgumentError(
         'Physical cache tags must retain all $xlen address bits.',
@@ -1061,6 +1149,13 @@ class HarborL1DCache extends BridgeModule {
       createPort('req_ctx', PortDirection.input, width: ctxBits);
     }
     createPort('req_write', PortDirection.input);
+    if (snoop) {
+      createPort('inval_valid', PortDirection.input);
+      createPort('inval_addr', PortDirection.input, width: xlen);
+      createPort('inval_hold', PortDirection.input);
+      addOutput('inval_busy');
+      addOutput('fill_line', width: xlen);
+    }
     createPort('req_data', PortDirection.input, width: xlen);
     createPort('req_size', PortDirection.input, width: 3);
     createPort('flush', PortDirection.input);
@@ -1179,11 +1274,14 @@ class HarborL1DCache extends BridgeModule {
       reset: reset,
       lines: numLines,
       width: lineTagBits,
-      readPorts: 1,
+      readPorts: snoop ? 2 : 1,
       target: target,
       name: 'l1d_tags',
     );
     tagRam.ram.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
+    if (snoop) {
+      tagRam.ram.input('rd1_addr').srcConnection! <= idxOf(invalAddr);
+    }
 
     final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
     final dataRam = HarborRegisterFile(
@@ -1232,6 +1330,14 @@ class HarborL1DCache extends BridgeModule {
     // An earlier beat of this refill had an error.
     final fillErr = Logic(name: 'fillErr');
     final fillErrPage = Logic(name: 'fillErrPage');
+    // Word of the line that the held load reads.
+    final fillMissWord = Logic(
+      name: 'fillMissWord',
+      width: offBits == 0 ? 1 : offBits,
+    );
+    final missBeat = offBits == 0
+        ? Const(1)
+        : fillWord.getRange(0, offBits).eq(fillMissWord);
     final storeIdx = Logic(name: 'storeIdx', width: idxBits == 0 ? 1 : idxBits);
     // High in the first cycle of a store, when the tag read and addrQ belong
     // to the store address.
@@ -1247,16 +1353,27 @@ class HarborL1DCache extends BridgeModule {
     final fillValidSet = Logic(name: 'fillValidSet');
     // A flush clears every line, also while a store or an uncached read
     // finishes. Those operations keep their state and give their response.
+    // Snoop stage: the invalidate of the last cycle, with its tag read.
+    final snpV = Logic(name: 'snoopValid');
+    final snpAddr = Logic(name: 'snoopAddr', width: xlen);
+    final snpClrEn = Logic(name: 'snoopClrEn');
+    final snpClrIdx = Logic(name: 'snoopClrIdx', width: validUpdateIdx.width);
     final lineValid = _L1ValidBits(
       clk: clk,
       reset: reset,
       flush: flush,
       lines: numLines,
-      lookups: [idxOf(addrQ)],
+      lookups: [idxOf(addrQ), if (snoop) idxOf(snpAddr)],
       updateEn: validUpdateEn,
       updateIdx: validUpdateIdx,
       updateValue: fillValidSet,
+      clearEn: snoop ? snpClrEn : null,
+      clearIdx: snoop ? snpClrIdx : null,
+      clearLookup: 1,
     );
+    final invalBusyNow = snoop
+        ? (invalValid | snpV | snpClrEn).named('invalBusyNow')
+        : Const(0);
     sweepCycles = lineValid.sweepCycles;
 
     // Match address and permission context.
@@ -1278,7 +1395,8 @@ class HarborL1DCache extends BridgeModule {
                 faultDone |
                 drain |
                 flush |
-                lineValid.sweeping)
+                lineValid.sweeping |
+                (snoop ? lineValid.pending : Const(0)))
             .named('blockHit');
 
     // Only DRAM (>= cacheableBase) is cacheable, everything else bypasses.
@@ -1404,15 +1522,27 @@ class HarborL1DCache extends BridgeModule {
         mux(storeDone, storeStrb, Const((1 << lanes) - 1, width: lanes));
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
+    // A refill commits only on a good last beat with no earlier error.
+    // A snoop drops the line of a refill that is in flight or that waits to
+    // set its valid bit. A refill of a line in a DMA write in flight also
+    // does not make its line valid. Both kill the refill. The hold goes
+    // through a flop first. A refill that commits in that cycle is cleared by
+    // the invalidate of the write.
+    final fillKill = Logic(name: 'fillKill');
+    final fillMatch = Logic(name: 'fillMatch');
+    final holdQ = snoop ? flop(clk, invalHold, reset: reset) : Const(0);
+    final killNow = snoop
+        ? (filling & (holdQ | fillMatch)).named('killNow')
+        : Const(0);
     // A beat with an error, or a mem_last that does not match the burst
     // length, early or late. Either one fails the refill.
     final fillBad = (~memValid | memLast.neq(fillWord.eq(lastWord))).named(
       'fillBad',
     );
-    // A refill commits only on a good last beat with no earlier error.
-    final fillCommit = (fillWrEn & memLast & ~fillBad & ~fillErr).named(
-      'fillCommit',
-    );
+    final fillCommit =
+        (fillWrEn & memLast & ~fillBad & ~fillErr & ~fillKill & ~killNow).named(
+          'fillCommit',
+        );
     if (checkMemLast) {
       _l1CheckInSim(
         clk,
@@ -1446,9 +1576,34 @@ class HarborL1DCache extends BridgeModule {
     tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
     tagRam.ram.input('wr_data').srcConnection! <= fillTag;
 
+    if (snoop) {
+      final snpIdx = idxOf(snpAddr);
+      final live = (filling | lineValid.pending).named('fillLive');
+      fillMatch <= snpV & live & snpIdx.eq(fillIdx);
+      final snpHit =
+          (snpV &
+                  lineValid.valid[1] &
+                  tagRam.read(1).getRange(0, tagBits).eq(tagOf(snpAddr)))
+              .named('snoopHit');
+      invalBusy <= invalBusyNow;
+      fillLine <= memAddrR;
+      Sequential(clk, [
+        snpAddr < invalAddr,
+        snpClrIdx < snpIdx,
+        If(
+          reset,
+          then: [snpV < 0, snpClrEn < 0],
+          orElse: [snpV < invalValid, snpClrEn < snpHit | fillMatch],
+        ),
+      ]);
+    } else {
+      fillMatch <= Const(0);
+    }
+
     Sequential(clk, [
       addrQ < reqAddr,
       storeFirst < 0,
+      If(killNow, then: [fillKill < 1]),
       If(storeFirst, then: [storeHitQ < storeHitNow]),
       If(
         reset,
@@ -1506,6 +1661,13 @@ class HarborL1DCache extends BridgeModule {
                         memDone,
                         then: [
                           fillWord < fillWord + 1,
+                          // Keep the miss word for a refill that a snoop
+                          // kills.
+                          if (snoop)
+                            If(
+                              memValid & missBeat,
+                              then: [bypassData < memRdata >> rdShift],
+                            ),
                           If(
                             fillBad & ~fillErr,
                             then: [
@@ -1531,7 +1693,13 @@ class HarborL1DCache extends BridgeModule {
                                         ~memValid & memFault,
                                       ),
                                 ],
-                                orElse: [fillSettle < 1],
+                                orElse: [
+                                  If(
+                                    fillKill | killNow,
+                                    then: [bypassDone < 1],
+                                    orElse: [fillSettle < 1],
+                                  ),
+                                ],
                               ),
                             ],
                           ),
@@ -1640,6 +1808,13 @@ class HarborL1DCache extends BridgeModule {
                                       fillTag < fullTagOf(addrQ),
                                       fillWord < 0,
                                       fillErr < 0,
+                                      fillKill < 0,
+                                      if (offBits > 0)
+                                        fillMissWord <
+                                            addrQ.getRange(
+                                              byteBits,
+                                              byteBits + offBits,
+                                            ),
                                       memLenR <
                                           Const(
                                             lineWords - 1,

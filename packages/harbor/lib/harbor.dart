@@ -42,6 +42,7 @@ export 'src/bus/fabric.dart';
 // Cache
 export 'src/cache/cache_config.dart';
 export 'src/cache/cache_hierarchy.dart';
+export 'src/cache/dma_snoop.dart';
 export 'src/cache/l1_cache.dart';
 export 'src/cache/l2_cache.dart';
 
