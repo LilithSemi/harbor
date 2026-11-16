@@ -214,6 +214,17 @@ class HarborSdioConfig with HarborPrettyString {
 ///   0 is off, reset 4194304). A timeout on a PIO read raises only the
 ///   timeout bit, there is no data-done. A DMA read adds data-done once the
 ///   ADMA has drained.
+/// - 0x80: ADMA_ERR (read only, ADMA Error State of the first ADMA error:
+///   1 fetching a descriptor, 3 transferring data, 0 no error). The codes
+///   are those of the ADMA Error State field of the SD Host Controller
+///   Simplified Specification. It has no Length Mismatch bit.
+/// - 0x88: ADMA_ERR_ADDR (read only, the address of the access that failed:
+///   the descriptor word for state 1 and the data address for state 3, or
+///   for a write error the start address of the burst that failed. The
+///   specification gives a descriptor address for both states.)
+///
+/// The first error stays in ADMA_ERR and ADMA_ERR_ADDR until a write of 1
+/// to INT_STATUS[7] clears them. A later error does not replace it.
 ///
 /// CMD bits: [5:0] index, [7:6] response type (0 none, 1 short, 2 long R2,
 /// 3 short+busy), [8] data present, [9] direction (0 write, 1 read), [10] use
@@ -238,12 +249,17 @@ class HarborSdioConfig with HarborPrettyString {
 /// `soc.addMaster(sdio, busInterfaceName: 'dma', memory: true,
 /// outstanding: sdio.dmaOutstanding)`.
 ///
-/// A read or write error response sets ADMA error and stops the walker. The
-/// transfer still ends: on a card read the controller drops the rest of the
-/// card data, on a card write it sends zero words to the card until the
-/// block count ends. Each card write block from the error on goes out with
-/// an inverted CRC16, so the card rejects it and does not program it. The
-/// driver must treat the transfer as failed.
+/// An error response (Wishbone ERR, AXI4 SLVERR or DECERR, TileLink denied
+/// or corrupt) on a descriptor fetch, a data read or a data write stops the
+/// walker. It sets INT_STATUS[7] ADMA error, which the SD Host Controller
+/// Simplified Specification calls ADMA Error in the Error Interrupt Status
+/// register, and it fills ADMA_ERR and ADMA_ERR_ADDR (see above).
+/// INT_ENABLE[7] raises `interrupt`. Data-done does not set for the failed
+/// transfer. The transfer still ends and BUSY clears: on a card read the
+/// controller drops the rest of the card data, on a card write it sends zero
+/// words to the card until the block count ends. Each card write block from
+/// the error on goes out with an inverted CRC16, so the card rejects it and
+/// does not program it. The driver must treat the transfer as failed.
 ///
 /// STATUS[8] busy is also set while an ADMA access is in flight, for example
 /// after a command timeout. A CMD write while busy is ignored, so the driver
@@ -543,9 +559,16 @@ class HarborSdioController extends BridgeModule
     // different bits all latch.
     final intBits = [for (var i = 0; i < 9; i++) Logic(name: 'int_status_$i')];
     final intStatus = intBits.rconcat().named('int_status');
+    // High while a DMA transfer has failed on the bus. Data-done does not
+    // latch then, so a failed transfer never reports that it finished.
+    final dmaStopped = Logic(name: 'dma_stopped');
     List<Conditional> setInt(int mask) => [
       for (var i = 0; i < 9; i++)
-        if ((mask >> i) & 1 == 1) intBits[i] < Const(1),
+        if ((mask >> i) & 1 == 1)
+          if (i == 1)
+            If(~dmaStopped, then: [intBits[i] < Const(1)])
+          else
+            intBits[i] < Const(1),
     ];
     final intEnable = Logic(name: 'int_enable', width: 9);
     final busy = Logic(name: 'busy');
@@ -701,6 +724,20 @@ class HarborSdioController extends BridgeModule
     final admaBase = Logic(name: 'adma_base', width: 32);
     final fetchHi = Logic(name: 'adma_fetch_hi');
     final admaErr = Logic(name: 'adma_err');
+    // The transfer in flight got a bus error. Clears when a command starts.
+    final dmaFailed = Logic(name: 'adma_failed');
+    // ADMA Error State of the first error, and the address of its access.
+    final admaErrState = Logic(name: 'adma_err_state', width: 2);
+    final admaErrAddr = Logic(name: 'adma_err_addr', width: 32);
+    // Start addresses of the write bursts sent and not yet answered, oldest
+    // first. A write error response names the burst at the head.
+    final qW = dmaOutstanding <= 1 ? 1 : (dmaOutstanding - 1).bitLength;
+    final wrQ = [
+      for (var i = 0; i < dmaOutstanding; i++)
+        Logic(name: 'dma_wq_$i', width: 32),
+    ];
+    final wrQTail = Logic(name: 'dma_wq_tail', width: qW);
+    final wrQHead = Logic(name: 'dma_wq_head', width: qW);
     // Set by an error in a card write. The CRC16 then goes out inverted.
     final wrAbort = Logic(name: 'dat_wr_abort');
 
@@ -733,6 +770,7 @@ class HarborSdioController extends BridgeModule
     final writesBusy = (wActive | wInflight.neq(Const(0, width: ifW))).named(
       'dma_writes_busy',
     );
+    dmaStopped <= dmaMode & (dmaFailed | dmaFault);
     final dmaInFlight = (writesBusy | reqValid | rdPending).named(
       'dma_in_flight',
     );
@@ -1117,8 +1155,8 @@ class HarborSdioController extends BridgeModule
       Const(1, width: 1),
     ].concat();
 
-    // Register read data, by register index. An index past the 16
-    // registers reads 0.
+    // Register read data, by register index. An index past the last
+    // register reads 0.
     final readValues = <Logic>[
       ctrlEnable.zeroExtend(32) |
           (busWidthSel.zeroExtend(32) << 4) |
@@ -1142,13 +1180,19 @@ class HarborSdioController extends BridgeModule
       intEnable.zeroExtend(32),
       admaBase,
       dataTimeout.zeroExtend(32),
+      admaErrState.zeroExtend(32),
+      admaErrAddr,
     ];
     final readWord = Logic(name: 'reg_read_word', width: 32);
     Combinational([
-      Case(regIndex.getRange(0, 4), [
-        for (var i = 0; i < 16; i++)
-          CaseItem(Const(i, width: 4), [readWord < readValues[i]]),
-      ]),
+      Case(
+        regIndex.getRange(0, 5),
+        [
+          for (var i = 0; i < readValues.length; i++)
+            CaseItem(Const(i, width: 5), [readWord < readValues[i]]),
+        ],
+        defaultItem: [readWord < Const(0, width: 32)],
+      ),
     ]);
     // The card did not answer the command in time.
     final cmdTimeoutNow =
@@ -1165,7 +1209,7 @@ class HarborSdioController extends BridgeModule
                 ) &
                 bus.selMasked(0x60, 9))
             .named('int_clear');
-    final readHit = (~bus.we & regIndex.getRange(4).eq(Const(0, width: 5)))
+    final readHit = (~bus.we & regIndex.getRange(5).eq(Const(0, width: 4)))
         .named('reg_read_hit');
 
     // Received response after the in-flight bit is shifted in.
@@ -1234,6 +1278,11 @@ class HarborSdioController extends BridgeModule
           admaBase < Const(0, width: 32),
           fetchHi < Const(0),
           admaErr < Const(0),
+          dmaFailed < Const(0),
+          admaErrState < Const(0, width: 2),
+          admaErrAddr < Const(0, width: 32),
+          wrQTail < Const(0, width: qW),
+          wrQHead < Const(0, width: qW),
           wrAbort < Const(0),
           reqValid < Const(0),
           reqWrite < Const(0),
@@ -1262,7 +1311,14 @@ class HarborSdioController extends BridgeModule
           // sets a bit, so a set in the same cycle wins.
           for (var i = 0; i < 9; i++)
             If(intClear[i], then: [intBits[i] < Const(0)]),
-          If(intClear[7], then: [admaErr < Const(0)]),
+          If(
+            intClear[7],
+            then: [
+              admaErr < Const(0),
+              admaErrState < Const(0, width: 2),
+              admaErrAddr < Const(0, width: 32),
+            ],
+          ),
           bus.ack < Const(0),
           bus.dataOut < Const(0, width: dw),
 
@@ -1912,7 +1968,63 @@ class HarborSdioController extends BridgeModule
           ),
           wInflight <
               (wInflight + issueWrite.zeroExtend(ifW) - bFire.zeroExtend(ifW)),
-          If(dmaFault, then: [admaErr < Const(1)]),
+          If(dmaFault, then: [admaErr < Const(1), dmaFailed < Const(1)]),
+          // The first error keeps its state and address until INT_STATUS[7]
+          // clears. A read error is on the descriptor fetch or on a data
+          // read. A write error is on the data.
+          for (var i = 0; i < dmaOutstanding; i++)
+            If(
+              issueWrite & wrQTail.eq(Const(i, width: qW)),
+              then: [wrQ[i] < descAddr],
+            ),
+          If(
+            issueWrite,
+            then: [
+              wrQTail <
+                  mux<Logic>(
+                    wrQTail.eq(Const(dmaOutstanding - 1, width: qW)),
+                    Const(0, width: qW),
+                    wrQTail + Const(1, width: qW),
+                  ),
+            ],
+          ),
+          If(
+            bFire,
+            then: [
+              wrQHead <
+                  mux<Logic>(
+                    wrQHead.eq(Const(dmaOutstanding - 1, width: qW)),
+                    Const(0, width: qW),
+                    wrQHead + Const(1, width: qW),
+                  ),
+            ],
+          ),
+          If(
+            dmaFault & (~admaErr | intClear[7]),
+            then: [
+              admaErrState <
+                  mux<Logic>(
+                    rFire & mw.rdataErr & admaState.eq(Const(aFetch, width: 3)),
+                    Const(1, width: 2),
+                    Const(3, width: 2),
+                  ),
+              admaErrAddr <
+                  mux<Logic>(
+                    rFire & mw.rdataErr,
+                    reqAddr,
+                    [
+                      for (var i = dmaOutstanding - 1; i >= 0; i--) i,
+                    ].fold<Logic>(
+                      Const(0, width: 32),
+                      (acc, i) => mux<Logic>(
+                        wrQHead.eq(Const(i, width: qW)),
+                        wrQ[i],
+                        acc,
+                      ),
+                    ),
+                  ),
+            ],
+          ),
           If(dmaFault & dmaMode & ~cmdDataDir, then: [wrAbort < Const(1)]),
 
           // A DMA read completes when the walker has parked, the RX FIFO is
@@ -2169,6 +2281,7 @@ class HarborSdioController extends BridgeModule
                           cmdDataPresent < bus.dataIn[8],
                           cmdDataDir < bus.dataIn[9],
                           wrAbort < Const(0),
+                          dmaFailed < Const(0),
                           dmaMode < bus.dataIn[10],
                           cmdShift < cmdFrame,
                           cmdCnt < Const(48, width: 7),

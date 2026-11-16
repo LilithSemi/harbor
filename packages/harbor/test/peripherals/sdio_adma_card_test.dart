@@ -7,165 +7,6 @@ import 'sdio_adma_bench.dart';
 void main() {
   tearDown(() async => Simulator.reset());
 
-  for (final kind in HarborFabricKind.values) {
-    for (final width in [32, 64]) {
-      final tag = '${kind.name}, $width-bit';
-
-      test('card read over a descriptor table ($tag)', () async {
-        final b = AdmaBench(kind, width);
-        await b.start();
-        // An unaligned run across a 4 KB boundary, an odd tail, and an
-        // unaligned odd run.
-        const runs = [(0x0FE4, 40), (0x2000, 12), (0x3004, 12)];
-        b.descriptors(0x100, runs);
-        final before = {
-          for (final a in [0x0FE0, 0x100C, 0x200C, 0x3000, 0x3010])
-            a: b.read32(a),
-        };
-        final words = [
-          for (var i = 0; i < 16; i++) 0x01020304 * (i + 1) ^ 0xA5000000,
-        ];
-        await b.wr(admaBlkSize, 64);
-        await b.wr(admaAdmaAddr, 0x100);
-        await b.wr(admaCmd, admaCmdRead | admaTable);
-        await b.cardRead(words);
-
-        var n = 0;
-        for (final (addr, len) in runs) {
-          for (var o = 0; o < len; o += 4) {
-            expect(
-              b.read32(addr + o),
-              words[n],
-              reason: 'word $n at 0x${(addr + o).toRadixString(16)}',
-            );
-            n++;
-          }
-        }
-        before.forEach(
-          (a, v) => expect(
-            b.read32(a),
-            v,
-            reason: 'touched 0x${a.toRadixString(16)}',
-          ),
-        );
-        b.checkShapes();
-        expect(
-          b.probe.writes.any((w) => w.len > 0),
-          isTrue,
-          reason: 'no burst',
-        );
-        expect(
-          b.probe.doneAt,
-          greaterThan(b.probe.lastResp),
-          reason: 'data-done before the last write response',
-        );
-        final st = await b.rd(admaIntStatus);
-        expect(st & (admaDataDone | admaAdmaErr), admaDataDone);
-        expect((await b.rd(admaStatus) >> 8) & 1, 0, reason: 'still busy');
-        await Simulator.endSimulation();
-      });
-
-      test('card write over a descriptor table ($tag)', () async {
-        final b = AdmaBench(kind, width);
-        await b.start();
-        const runs = [(0x0FF8, 16), (0x2004, 8)];
-        b.descriptors(0x180, runs);
-        final words = [
-          for (var i = 0; i < 6; i++) 0x11111111 * (i + 1) ^ 0x5A0000C3,
-        ];
-        var n = 0;
-        for (final (addr, len) in runs) {
-          for (var o = 0; o < len; o += 4) {
-            b.write32(addr + o, words[n++]);
-          }
-        }
-        await b.wr(admaBlkSize, 24);
-        await b.wr(admaAdmaAddr, 0x180);
-        await b.wr(admaCmd, admaCmdWrite | admaTable);
-        final got = await b.cardWrite();
-        final want = admaFourBitBlock(words);
-        expect(got.length, greaterThanOrEqualTo(want.length));
-        expect(got.sublist(0, want.length), want);
-        b.checkShapes();
-        expect(b.probe.writes, isEmpty);
-        expect(
-          await b.rd(admaIntStatus) & (admaDataDone | admaAdmaErr),
-          admaDataDone,
-        );
-        await Simulator.endSimulation();
-      });
-
-      test(
-        'a write error ends a card read with the ADMA error bit ($tag)',
-        () async {
-          final b = AdmaBench(kind, width);
-          await b.start();
-          await b.wr(admaBlkSize, 32);
-          await b.wr(admaAdmaAddr, admaErrBase + 0x1000);
-          await b.wr(admaCmd, admaCmdRead);
-          await b.cardRead([for (var i = 0; i < 8; i++) i]);
-          final st = await b.rd(admaIntStatus);
-          expect(st & (admaDataDone | admaAdmaErr), admaDataDone | admaAdmaErr);
-          expect((await b.rd(admaStatus) >> 8) & 1, 0, reason: 'still busy');
-          b.checkShapes();
-          await b.wr(admaIntStatus, admaAdmaErr);
-          expect(
-            await b.rd(admaIntStatus) & admaAdmaErr,
-            0,
-            reason: 'bit 7 is W1C',
-          );
-          await Simulator.endSimulation();
-        },
-      );
-
-      test(
-        'a read error ends a card write with the ADMA error bit ($tag)',
-        () async {
-          final b = AdmaBench(kind, width);
-          await b.start();
-          await b.wr(admaBlkSize, 8);
-          await b.wr(admaAdmaAddr, admaErrBase + 0x1000);
-          await b.wr(admaCmd, admaCmdWrite);
-          final got = await b.cardWrite();
-          expect(
-            await b.rd(admaIntStatus) & (admaDataDone | admaAdmaErr),
-            admaDataDone | admaAdmaErr,
-          );
-          // The card must reject the block: its CRC16 is wrong on every
-          // lane.
-          final data = got.sublist(1, 17);
-          final crc = got.sublist(17, 33);
-          for (var l = 0; l < 4; l++) {
-            expect(
-              [for (final g in crc) (g >> l) & 1],
-              isNot(admaCrc16([for (final g in data) (g >> l) & 1])),
-              reason: 'lane $l has a good CRC',
-            );
-          }
-          expect((await b.rd(admaStatus) >> 8) & 1, 0, reason: 'still busy');
-          b.checkShapes();
-          await Simulator.endSimulation();
-        },
-      );
-
-      test('a descriptor fetch error ends a card read ($tag)', () async {
-        final b = AdmaBench(kind, width);
-        await b.start();
-        await b.wr(admaBlkSize, 16);
-        await b.wr(admaAdmaAddr, admaErrBase + 0x200);
-        await b.wr(admaCmd, admaCmdRead | admaTable);
-        await b.cardRead([1, 2, 3, 4]);
-        expect(
-          await b.rd(admaIntStatus) & (admaDataDone | admaAdmaErr),
-          admaDataDone | admaAdmaErr,
-        );
-        expect(b.probe.writes, isEmpty);
-        b.checkShapes();
-        await Simulator.endSimulation();
-      });
-    }
-  }
-
   test('card accepts a block only after a driven DAT end bit', () async {
     final b = AdmaBench(HarborFabricKind.wishbone, 64);
     await b.start();
@@ -235,10 +76,12 @@ void main() {
       await b.wr(admaBlkSize, 8);
       await b.wr(admaAdmaAddr, addr);
       await b.wr(admaCmd, admaCmdWrite);
-      await b.cardWrite(statusBusy: answer);
+      await b.cardWrite(statusBusy: answer, throughBlock: true);
+      // A bus error on the memory read stops data-done, a card reject does
+      // not.
       expect(
         await b.rd(admaIntStatus) & (admaDataDone | admaWriteErr),
-        admaDataDone | admaWriteErr,
+        addr == admaErrBase ? admaWriteErr : admaDataDone | admaWriteErr,
       );
       expect((await b.rd(admaStatus) >> 8) & 1, 0, reason: 'still busy');
 

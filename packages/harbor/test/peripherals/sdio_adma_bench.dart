@@ -18,6 +18,8 @@ const admaBlkSize = 0x50;
 const admaIntStatus = 0x60;
 const admaIntEnable = 0x68;
 const admaAdmaAddr = 0x70;
+const admaAdmaErrStatus = 0x80;
+const admaAdmaErrAddr = 0x88;
 
 const admaDataDone = 0x02;
 const admaWriteErr = 0x20;
@@ -165,7 +167,7 @@ class AdmaBench {
   final bool sampleFall;
   final int errBase;
   late final HarborSdioController sdio;
-  late final AdmaSdioMemTop top;
+  late final BridgeModule top;
   late final Sim sim;
   late final RegBus bus;
   late final WaistMemory mem;
@@ -184,7 +186,16 @@ class AdmaBench {
     this.writeBatch = 4,
     this.sampleFall = false,
     this.errBase = admaErrBase,
+    this.onFabric = false,
   });
+
+  /// Runs the controller on a [HarborSoC] whose `dma` channel reaches only a
+  /// 4 KiB SRAM at [fabricSram]. Register addresses then start at
+  /// [fabricSdio], and `mem` is not used.
+  final bool onFabric;
+  static const fabricSdio = 0x60000000;
+  static const fabricSram = 0x08000000;
+  int get _regBase => onFabric ? fabricSdio : 0;
 
   int get busBytes => dataWidth ~/ 8;
   Logic get clk => sim.clk;
@@ -194,6 +205,7 @@ class AdmaBench {
     sdio = HarborSdioController(
       baseAddress: 0x60000000,
       fabricKind: kind,
+      busAddressWidth: onFabric ? 32 : 12,
       dmaDataWidth: dataWidth,
       config: HarborSdioConfig(sampleReadOnFall: sampleFall),
       dmaBurstBeats: burstBeats,
@@ -206,35 +218,110 @@ class AdmaBench {
       dataWidth: dataWidth,
       outstanding: dmaOutstanding,
     );
-    top = AdmaSdioMemTop(sdio, kind, cfg);
+    if (onFabric) {
+      final soc = HarborSoC(
+        name: 'adma_soc',
+        compatible: 'test,adma',
+        fabricKind: kind,
+        target: const HarborSimTarget(frequency: 50000000),
+      );
+      final cpu = soc.addMaster(AdmaCpu(kind));
+      soc.addPeripheral(sdio);
+      soc.addMaster(
+        sdio,
+        busInterfaceName: 'dma',
+        memory: true,
+        outstanding: dmaOutstanding,
+        channel: 'dma',
+      );
+      soc.addPeripheral(
+        HarborSram(
+          baseAddress: fabricSram,
+          size: 0x1000,
+          busAddressWidth: 32,
+          dataWidth: dataWidth,
+          protocol: kind,
+        ),
+      );
+      cpu.pullUp(soc);
+      for (final p in [
+        'sd_clk',
+        'sd_cmd_out',
+        'sd_cmd_oe',
+        'sd_cmd_in',
+        'sd_dat_out',
+        'sd_dat_oe',
+        'sd_dat_in',
+        'sd_cd',
+        'interrupt',
+      ]) {
+        soc.exposePin(sdio, p, externalName: p);
+      }
+      soc.buildFabric(
+        channelSlaves: {
+          'primary': {sdio.name, 'sram'},
+          'dma': {'sram'},
+        },
+      );
+      top = soc;
+    } else {
+      top = AdmaSdioMemTop(sdio, kind, cfg);
+    }
     sim = Sim(top);
     top.input('sd_cmd_in').srcConnection! <= cmdIn;
     top.input('sd_dat_in').srcConnection! <= datIn;
-    bus = RegBus.attach(top, sim.clk);
+    bus = onFabric
+        ? RegBus.attach(top, sim.clk, name: 'cpu', kind: kind)
+        : RegBus.attach(top, sim.clk);
     for (final e in top.inputs.entries) {
       if (e.key == 'clk' || e.value.srcConnection != null) continue;
       e.value.srcConnection! <=
           Logic(name: 'tb_${e.key}', width: e.value.width);
     }
-    mem = WaistMemory(
-      sim,
-      'mem',
-      Random(7),
-      outstanding: dmaOutstanding,
-      busBytes: busBytes,
-      errors: errors,
-      errBase: errBase,
-      stall: stall,
-    );
-    await sim.start();
-    Simulator.setMaxSimTime(4000000);
+    if (!onFabric) {
+      mem = WaistMemory(
+        sim,
+        'mem',
+        Random(7),
+        outstanding: dmaOutstanding,
+        busBytes: busBytes,
+        errors: errors,
+        errBase: errBase,
+        stall: stall,
+      );
+    }
+    if (onFabric) {
+      // The SoC needs a longer reset than [Sim.start] gives.
+      final reset = Logic(name: 'tb_reset')..inject(1);
+      top.input('clk').srcConnection! <= sim.clk;
+      top.input('reset').srcConnection! <= reset;
+      for (final n in ['sd_cd']) {
+        top.input(n).srcConnection! <= Const(0);
+      }
+      await top.build();
+      bus.idle();
+      cmdIn.inject(1);
+      datIn.inject(0xF);
+      Simulator.setMaxSimTime(4000000);
+      unawaited(Simulator.run());
+      for (var i = 0; i < 12; i++) {
+        await sim.clk.nextPosedge;
+      }
+      reset.inject(0);
+      for (var i = 0; i < 4; i++) {
+        await sim.clk.nextPosedge;
+      }
+    } else {
+      await sim.start();
+      Simulator.setMaxSimTime(4000000);
+    }
     bus.idle();
     cmdIn.inject(1);
     datIn.inject(0xF);
     probe = AdmaProbe(sdio.dmaPort.waist, sim.clk, irq);
     await wr(admaClkDiv, 0);
     await wr(admaCtrl, 0x01 | (1 << 4)); // enable, 4-bit bus
-    await wr(admaIntEnable, admaDataDone);
+    await wr(admaIntEnable, admaDataDone | admaAdmaErr);
   }
 
   Future<void> settle() async {
@@ -242,12 +329,12 @@ class AdmaBench {
   }
 
   Future<void> wr(int addr, int data) async {
-    await bus.write(addr, data);
+    await bus.write(_regBase + addr, data);
     await settle();
   }
 
   Future<int> rd(int addr) async {
-    final v = await bus.read(addr);
+    final v = await bus.read(_regBase + addr);
     await settle();
     return v;
   }
@@ -492,6 +579,7 @@ class AdmaBench {
   Future<List<int>> cardWrite({
     List<int> statusBusy = const [0, 0, 1, 0, 1, 0, 1],
     int? requiredDataGroups,
+    bool throughBlock = false,
   }) async {
     final resp = admaResp48();
     var sawCmd = false, sawDat = false, ri = 0, si = 0;
@@ -528,7 +616,11 @@ class AdmaBench {
         datIn.inject(0xE | statusBusy[si]);
         si++;
       }
-      if (irq.value.toInt() == 1) {
+      // With [throughBlock] the card finishes the block first, even after an
+      // error interrupt.
+      if (irq.value.toInt() == 1 &&
+          (!throughBlock ||
+              (sawDat && !datDriving && si >= statusBusy.length))) {
         await clk.nextNegedge;
         return captured;
       }
@@ -595,4 +687,43 @@ Future<void> checkDirectCmd18(int n, double stall) async {
   expect(bad, 0);
   expect(st & (admaDataDone | 0xF8), admaDataDone);
   await Simulator.endSimulation();
+}
+
+/// A register master whose native port pins are plain `p_<PORT>` ports.
+class AdmaCpu extends BridgeModule {
+  AdmaCpu(HarborFabricKind kind) : super('AdmaCpu_${kind.name}', name: 'cpu') {
+    createPort('clk', PortDirection.input);
+    createPort('reset', PortDirection.input);
+    final PairInterface intf = switch (kind) {
+      HarborFabricKind.wishbone => WishboneInterface(
+        const WishboneConfig(addressWidth: 32, dataWidth: 32, useErr: true),
+      ),
+      HarborFabricKind.axi4 => Axi4LiteInterface(
+        addressWidth: 32,
+        dataWidth: 32,
+      ),
+      HarborFabricKind.tilelink => TileLinkInterface(
+        const TileLinkConfig(addressWidth: 32, dataWidth: 32),
+      ),
+    };
+    final i = addInterface(
+      intf,
+      name: 'dataBus',
+      role: PairRole.provider,
+    ).internalInterface!;
+    for (final e in i.getPorts([PairDirection.fromProvider]).entries) {
+      final w = e.value.width;
+      e.value <= addInput('p_${e.key}', Logic(width: w), width: w);
+    }
+    for (final e in i.getPorts([PairDirection.fromConsumer]).entries) {
+      addOutput('p_${e.key}', width: e.value.width) <= e.value;
+    }
+  }
+
+  void pullUp(HarborSoC soc) {
+    for (final n in [...inputs.keys, ...outputs.keys]) {
+      if (!n.startsWith('p_')) continue;
+      soc.pullUpPort(port(n), newPortName: 'cpu_${n.substring(2)}');
+    }
+  }
 }
