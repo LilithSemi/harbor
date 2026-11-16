@@ -646,6 +646,10 @@ class HarborSoC extends BridgeModule {
   /// exclusive access for this master (see [HarborFabricMaster.exclusiveIds]
   /// and [memoryBusShape]).
   ///
+  /// [targetRanges] lists the address ranges this master is meant to reach.
+  /// [buildFabric] throws when a range is not fully covered by the slaves of
+  /// the master's channel. Null skips the check.
+  ///
   /// A module can be a peripheral and a master, or have more than one
   /// master port. Its master then takes the name
   /// `<module>_<busInterfaceName>` on the fabric.
@@ -661,6 +665,7 @@ class HarborSoC extends BridgeModule {
     int? outstanding,
     int? readChannel,
     int? exclusiveIds,
+    List<BusAddressRange>? targetRanges,
   }) {
     _masters.add(
       _MasterEntry(
@@ -672,6 +677,7 @@ class HarborSoC extends BridgeModule {
         outstanding: outstanding,
         readChannel: readChannel,
         exclusiveIds: exclusiveIds,
+        targetRanges: targetRanges,
       ),
     );
     _wireOnce(master, clockDomainName);
@@ -897,6 +903,17 @@ class HarborSoC extends BridgeModule {
       throw StateError('Validation errors in $name:\n${errors.join("\n")}');
     }
 
+    if (_peripherals.isEmpty) {
+      for (final m in _masters) {
+        final target = m.targetRanges?.firstOrNull;
+        if (target != null) {
+          throw StateError(
+            '${m.module.name}_${m.busInterfaceName}: target range $target '
+            'is not covered by any slave, the SoC has none',
+          );
+        }
+      }
+    }
     if (_peripherals.isEmpty || _masters.isEmpty) return;
     if (fabrics.isNotEmpty) {
       throw StateError('buildFabric was already called');
@@ -950,6 +967,25 @@ class HarborSoC extends BridgeModule {
     }
 
     final reach = {for (final c in channels) c: reachOf(c)};
+    for (final m in _masters) {
+      for (final target in m.targetRanges ?? const <BusAddressRange>[]) {
+        final covers = [
+          for (var i = 0; i < slaves.length; i++)
+            if (reach[m.channel]?.contains(slaveName(i)) ?? true)
+              slaves[i].range,
+        ]..sort((a, b) => a.start.compareTo(b.start));
+        var next = target.start;
+        for (final r in covers) {
+          if (r.start <= next && r.end > next) next = r.end;
+        }
+        if (next < target.end) {
+          throw StateError(
+            '${m.module.name}_${m.busInterfaceName}: target range $target is '
+            'not covered by the slaves of channel "${m.channel}"',
+          );
+        }
+      }
+    }
     if (channelSlaves != null) {
       final orphans = [
         for (var i = 0; i < slaves.length; i++)
@@ -2031,6 +2067,9 @@ class _MasterEntry {
   /// AXI4 exclusive slots, as in [HarborFabricMaster.exclusiveIds].
   final int? exclusiveIds;
 
+  /// Address ranges the master must reach, or null for no check.
+  final List<BusAddressRange>? targetRanges;
+
   const _MasterEntry({
     required this.module,
     required this.busInterfaceName,
@@ -2040,5 +2079,6 @@ class _MasterEntry {
     this.outstanding,
     this.readChannel,
     this.exclusiveIds,
+    this.targetRanges,
   });
 }
