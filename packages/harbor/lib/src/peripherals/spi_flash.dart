@@ -318,6 +318,64 @@ class HarborSpiFlashConfig with HarborPrettyString {
   }
 }
 
+/// Drives the quad or dual SPI pad: IO0 and IO1 follow [driveEnable], IO2
+/// and IO3 follow [holdEnable]. A bit with a low enable floats.
+///
+/// A slice of an inout pad written by a tristate in ROHD emits a parenthesised
+/// assign that yosys rejects, so the SystemVerilog is hand-written here.
+class HarborQuadPadDriver extends Module with SystemVerilog {
+  final int width;
+
+  HarborQuadPadDriver({
+    required Logic data,
+    required Logic driveEnable,
+    required Logic pad,
+    Logic? holdEnable,
+  }) : width = data.width,
+       super(
+         name: 'spi_pad_driver',
+         definitionName: 'HarborQuadPadDriver_${data.width}',
+         reserveDefinitionName: true,
+       ) {
+    if (width != 2 && width != 4) {
+      throw ArgumentError.value(width, 'data', 'must be 2 or 4 bits wide');
+    }
+    if ((width == 4) != (holdEnable != null)) {
+      throw ArgumentError.value(
+        holdEnable,
+        'holdEnable',
+        'is required for 4 bits and not allowed for 2 bits',
+      );
+    }
+    data = addInput('d', data, width: width);
+    driveEnable = addInput('oe_lo', driveEnable);
+    final hold = holdEnable == null ? null : addInput('oe_hi', holdEnable);
+    final padNet = addInOut('pad', pad, width: width);
+    padNet.getRange(0, 2) <=
+        TriStateBuffer(data.getRange(0, 2), enable: driveEnable).out;
+    if (hold != null) {
+      padNet.getRange(2, 4) <=
+          TriStateBuffer(data.getRange(2, 4), enable: hold).out;
+    }
+  }
+
+  @override
+  String? definitionVerilog(String definitionType) {
+    final hi = width == 4 ? '  input logic oe_hi,\n' : '';
+    final hiAssign = width == 4
+        ? "  assign pad[3:2] = oe_hi ? d[3:2] : 2'bzz;\n"
+        : '';
+    return '''
+module $definitionType (
+  input logic [${width - 1}:0] d,
+  input logic oe_lo,
+$hi  inout wire [${width - 1}:0] pad
+);
+  assign pad[1:0] = oe_lo ? d[1:0] : 2'bzz;
+${hiAssign}endmodule''';
+  }
+}
+
 /// SPI flash controller.
 ///
 /// Provides a Wishbone slave interface for read access to external
@@ -1426,12 +1484,12 @@ class HarborSpiFlashController extends BridgeModule
       final holdOut = (wrBusy | ~ioDir).named('spi_hold_out');
       if (ownPads) {
         final pad = inOut('spi_io');
-        pad.getRange(0, 2) <=
-            TriStateBuffer(ioOut.getRange(0, 2), enable: driveOut).out;
-        if (ioWidth == 4) {
-          pad.getRange(2, 4) <=
-              TriStateBuffer(ioOut.getRange(2, 4), enable: holdOut).out;
-        }
+        HarborQuadPadDriver(
+          data: ioOut,
+          driveEnable: driveOut,
+          holdEnable: ioWidth == 4 ? holdOut : null,
+          pad: pad,
+        );
         spiIoIn <= pad;
         statBit <= pad[1];
       } else {
