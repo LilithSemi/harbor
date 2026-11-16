@@ -28,6 +28,123 @@ enum HarborSpiFlashMode {
   quad,
 }
 
+/// How a flash part sets its quad enable (QE) bit. The bit makes IO2 and IO3
+/// work as data pins. A part with the bit clear uses them as WP# and HOLD#,
+/// and a quad read returns wrong data.
+///
+/// The controller reads the JEDEC manufacturer byte (0x9F) before it sends
+/// any vendor command, because a command such as 0x35 puts some parts in
+/// QPI mode. When the byte is not in the manufacturer list of the config
+/// ([HarborSpiFlashConfig.acceptedManufacturers]), it sends nothing else.
+enum HarborSpiFlashQuadEnable {
+  /// The part needs no QE bit. A quad output read works with the power-up
+  /// state. Micron N25Q128 data sheet, section 9.1.6 (Quad Output Fast Read)
+  /// in the extended SPI protocol, which has no QE bit.
+  none(
+    readCommand: 0,
+    writeCommand: 0,
+    bit: 0,
+    writeBytes: 0,
+    writeMaxMs: 0,
+    keepMask: 0xff,
+    defaultManufacturers: [],
+    clearsErrors: false,
+  ),
+
+  /// QE is bit 6 of status register 1. RDSR 0x05 reads it. WREN then WRSR 0x01
+  /// with one data byte writes it. ISSI IS25LP128 data sheet, section 6.1
+  /// (Table 6.2) and section 8.16. Macronix parts use the same method. The
+  /// BP and SRWD bits keep the value that the read returned. Manufacturer ID
+  /// 0x9D is ISSI (data sheet Table 8.3) and 0xC2 is Macronix (JEDEC JEP106).
+  sr1Bit6(
+    readCommand: 0x05,
+    writeCommand: 0x01,
+    bit: 6,
+    writeBytes: 1,
+    writeMaxMs: 15,
+    keepMask: 0xff,
+    defaultManufacturers: [0x9d, 0xc2],
+    clearsErrors: false,
+  ),
+
+  /// QE is bit 1 of status register 2. Command 0x35 reads it. WREN then
+  /// command 0x31 with one data byte writes it. Winbond W25Q128JV data sheet,
+  /// section 7.1.4 (QE is S9), section 8.2.4 and section 8.2.5. The write
+  /// sends 0 for the OTP lock bits LB1 to LB3 (bits 3 to 5) and for SRL
+  /// (bit 0), so it never locks them. The write time is 30 ms, the GigaDevice
+  /// GD25Q128E tW maximum. Winbond W25Q128JV is 15 ms. GigaDevice GD25Q128E
+  /// Rev 1.4 uses the same commands and bits (sections 7.3 and 7.4, Table 7).
+  sr2Bit1(
+    readCommand: 0x35,
+    writeCommand: 0x31,
+    bit: 1,
+    writeBytes: 1,
+    writeMaxMs: 30,
+    keepMask: 0xc6,
+    defaultManufacturers: [0xef],
+    clearsErrors: false,
+  ),
+
+  /// QE is the QUAD bit, bit 1 of configuration register 1. RDCR 0x35 reads
+  /// it. WREN then WRR 0x01 with two data bytes, status register 1 and then
+  /// configuration register 1, writes it. Infineon S25FL128S and S25FL256S
+  /// data sheet, section 7.5.2 (Table 24), section 9.3.3 and section 9.3.7.
+  /// The write sends 0 for the OTP bits TBPARM (bit 2), BPNV (bit 3) and
+  /// TBPROT (bit 5). A WRR that fails sets P_ERR and keeps WIP at 1 until a
+  /// CLSR (sections 7.5.1 and 9.1.3.1), so a failed sequence sends CLSR 0x30
+  /// and then WRDI 0x04. Manufacturer ID 0x01 is Spansion (section 9.2.2).
+  cr1Bit1(
+    readCommand: 0x35,
+    writeCommand: 0x01,
+    bit: 1,
+    writeBytes: 2,
+    writeMaxMs: 500,
+    keepMask: 0xd3,
+    defaultManufacturers: [0x01],
+    clearsErrors: true,
+  );
+
+  const HarborSpiFlashQuadEnable({
+    required this.readCommand,
+    required this.writeCommand,
+    required this.bit,
+    required this.writeBytes,
+    required this.writeMaxMs,
+    required this.keepMask,
+    required this.defaultManufacturers,
+    required this.clearsErrors,
+  });
+
+  /// Command that reads the register that holds QE.
+  final int readCommand;
+
+  /// Command that writes the register that holds QE.
+  final int writeCommand;
+
+  /// Bit of the register that holds QE.
+  final int bit;
+
+  /// Data bytes that follow [writeCommand]. Two means status register 1 and
+  /// then the register that holds QE.
+  final int writeBytes;
+
+  /// Data sheet maximum in ms of the register write (tW). The startup
+  /// sequence ends with an error when the part stays busy for longer than
+  /// the erase timeout, so that timeout must not be below this value.
+  final int writeMaxMs;
+
+  /// Bits of the QE register that the write keeps as read. The other bits
+  /// are OTP or lock bits, and the write sends 0 for them.
+  final int keepMask;
+
+  /// JEDEC manufacturer bytes that a config accepts when it lists none.
+  final List<int> defaultManufacturers;
+
+  /// True when a failed write of the register leaves the part busy until a
+  /// CLSR, so the controller sends CLSR and WRDI before it falls back.
+  final bool clearsErrors;
+}
+
 /// SPI flash configuration.
 /// A flash partition for the device-tree `fixed-partitions` map (also the Linux
 /// MTD binding). genip populates these per target: an FPGA target prepends an
@@ -104,7 +221,7 @@ class HarborSpiFlashConfig with HarborPrettyString {
   /// Longest time in ms that a page program may keep the part busy.
   final int programTimeoutMs;
 
-  /// Data sheet maximum in ms of a 4 KiB sector erase, or null when the preset
+  /// Data sheet maximum in ms of one sector erase, or null when the preset
   /// has none. A timeout below it is rejected at build time.
   final int? eraseMaxMs;
 
@@ -115,6 +232,31 @@ class HarborSpiFlashConfig with HarborPrettyString {
   /// Time in ns that CS# must stay high between two frames (tSHSL). The
   /// controller holds CS# high for this long, rounded up to whole clocks.
   final int tShslNs;
+
+  /// JEDEC manufacturer bytes that the startup sequence accepts. An empty
+  /// list means the default of [quadEnable]. A part with another byte gets
+  /// no vendor command.
+  final List<int> manufacturerIds;
+
+  /// The full JEDEC ID (manufacturer, type and capacity) of the part of a
+  /// preset, or null. The controller checks the manufacturer byte only.
+  final int? jedecId;
+
+  /// The manufacturer bytes that the startup sequence accepts.
+  List<int> get acceptedManufacturers => manufacturerIds.isEmpty
+      ? quadEnable.defaultManufacturers
+      : manufacturerIds;
+
+  /// How the controller sets the QE bit of the part at startup. It runs in
+  /// quad mode only. Dual reads need no QE bit.
+  final HarborSpiFlashQuadEnable quadEnable;
+
+  /// Read command that the controller uses when the QE bit cannot be set. It
+  /// is fast read, with 8 dummy cycles and the data on one line.
+  int get fallbackReadCommand => addressBytes == 4 ? 0x0c : 0x0b;
+
+  /// Dummy cycles of [fallbackReadCommand].
+  static const fallbackDummyCycles = 8;
 
   const HarborSpiFlashConfig({
     required this.size,
@@ -132,6 +274,9 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.eraseMaxMs,
     this.programMaxMs,
     this.tShslNs = 50,
+    this.quadEnable = HarborSpiFlashQuadEnable.none,
+    this.manufacturerIds = const [],
+    this.jedecId,
   });
 
   /// W25Q128: common 16MB SPI flash (e.g., on iCEBreaker, OrangeCrab).
@@ -143,7 +288,10 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.eraseTimeoutMs = 3000,
     this.programTimeoutMs = 50,
     this.tShslNs = 50,
-  }) : eraseMaxMs = 400,
+  }) : quadEnable = HarborSpiFlashQuadEnable.sr2Bit1,
+       manufacturerIds = const [0xef],
+       jedecId = 0xef4018,
+       eraseMaxMs = 400,
        programMaxMs = 3,
        size = 16 * 1024 * 1024,
        pageSize = 256,
@@ -152,7 +300,11 @@ class HarborSpiFlashConfig with HarborPrettyString {
        addressBytes = 3,
        dummyCycles = 8;
 
-  /// IS25LP128: common 16MB SPI flash (e.g., on Arty boards).
+  /// IS25LP128: common 16MB SPI flash (e.g., on Arty boards). The limits are
+  /// from the ISSI IS25LP032/064/128 data sheet Rev. D, AC characteristics:
+  /// sector erase 300 ms and page program 1 ms. Quad output read 0x6B with 8
+  /// dummy cycles is in the IS25LP128/064 data sheet Rev. K1, table of read
+  /// dummy cycles.
   const HarborSpiFlashConfig.is25lp128({
     this.spiFrequency = 50000000,
     this.mode = HarborSpiFlashMode.quad,
@@ -161,8 +313,11 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.eraseTimeoutMs = 3000,
     this.programTimeoutMs = 50,
     this.tShslNs = 50,
-  }) : eraseMaxMs = null,
-       programMaxMs = null,
+  }) : quadEnable = HarborSpiFlashQuadEnable.sr1Bit6,
+       manufacturerIds = const [0x9d],
+       jedecId = 0x9d6018,
+       eraseMaxMs = 300,
+       programMaxMs = 1,
        size = 16 * 1024 * 1024,
        pageSize = 256,
        sectorSize = 4096,
@@ -180,7 +335,10 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.eraseTimeoutMs = 3000,
     this.programTimeoutMs = 50,
     this.tShslNs = 50,
-  }) : eraseMaxMs = 800,
+  }) : quadEnable = HarborSpiFlashQuadEnable.none,
+       manufacturerIds = const [],
+       jedecId = 0x20ba18,
+       eraseMaxMs = 800,
        programMaxMs = 5,
        size = 16 * 1024 * 1024,
        pageSize = 256,
@@ -189,7 +347,8 @@ class HarborSpiFlashConfig with HarborPrettyString {
        addressBytes = 3,
        dummyCycles = 8;
 
-  /// S25FL256: 32MB SPI flash.
+  /// S25FL256: 32MB SPI flash. The 4 KiB sector erase limit of 650 ms is from
+  /// the S25FL128S/S25FL256S data sheet Rev. *Q, Table 49.
   const HarborSpiFlashConfig.s25fl256({
     this.spiFrequency = 50000000,
     this.mode = HarborSpiFlashMode.quad,
@@ -198,13 +357,70 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.eraseTimeoutMs = 3000,
     this.programTimeoutMs = 50,
     this.tShslNs = 50,
-  }) : eraseMaxMs = null,
+  }) : quadEnable = HarborSpiFlashQuadEnable.cr1Bit1,
+       manufacturerIds = const [0x01],
+       jedecId = 0x010219,
+       eraseMaxMs = 650,
        programMaxMs = null,
        size = 32 * 1024 * 1024,
        pageSize = 256,
        sectorSize = 4096,
        readCommand = 0x6C, // 4-byte addr quad read
        addressBytes = 4,
+       dummyCycles = 8;
+
+  /// S25FL128S: 16MB Spansion/Cypress SPI flash (e.g., on Arty S7-50, part
+  /// S25FL128SAGMFIR01), JEDEC ID 0x012018. The model digits 01 are uniform
+  /// 256 KiB sectors with a 512 byte page buffer, so the 4 KiB erase 0x20 is
+  /// not available and the CPU write port cannot be built. The limits are
+  /// from the S25FL128S/S25FL256S data sheet Rev. *Q: sector erase 2600 ms
+  /// and page program 750 us (Table 49). Quad output read 0x6B has 8 dummy
+  /// cycles at the default latency code up to 80 MHz (Table 27).
+  const HarborSpiFlashConfig.s25fl128s({
+    this.spiFrequency = 50000000,
+    this.mode = HarborSpiFlashMode.quad,
+    this.readAheadWords = 1,
+    this.partitions = const [],
+    this.eraseTimeoutMs = 3000,
+    this.programTimeoutMs = 50,
+    this.tShslNs = 50,
+  }) : quadEnable = HarborSpiFlashQuadEnable.cr1Bit1,
+       manufacturerIds = const [0x01],
+       jedecId = 0x012018,
+       eraseMaxMs = 2600,
+       programMaxMs = 1,
+       size = 16 * 1024 * 1024,
+       pageSize = 512,
+       sectorSize = 256 * 1024,
+       readCommand = 0x6B,
+       addressBytes = 3,
+       dummyCycles = 8;
+
+  /// GD25Q128: 16MB GigaDevice SPI flash (e.g., on OrangeCrab r0.2), JEDEC
+  /// ID 0xC84018. The commands and bits come from the GD25Q128E data sheet
+  /// Rev 1.4: QE is S9 of status register 2, read with 0x35 and written with
+  /// 0x31 (sections 7.3 and 7.4, Table 7), sector erase 300 ms, page program
+  /// 2.4 ms and register write 30 ms (AC table), quad output read 0x6B with a
+  /// dummy byte (section 7.9). The Winbond W25Q128JV uses the same commands
+  /// and bits, and some boards carry it, so manufacturer 0xEF is accepted too.
+  const HarborSpiFlashConfig.gd25q128({
+    this.spiFrequency = 50000000,
+    this.mode = HarborSpiFlashMode.quad,
+    this.readAheadWords = 1,
+    this.partitions = const [],
+    this.eraseTimeoutMs = 3000,
+    this.programTimeoutMs = 50,
+    this.tShslNs = 50,
+  }) : quadEnable = HarborSpiFlashQuadEnable.sr2Bit1,
+       manufacturerIds = const [0xc8, 0xef],
+       jedecId = 0xc84018,
+       eraseMaxMs = 300,
+       programMaxMs = 3,
+       size = 16 * 1024 * 1024,
+       pageSize = 256,
+       sectorSize = 4096,
+       readCommand = 0x6B,
+       addressBytes = 3,
        dummyCycles = 8;
 
   /// This config with another partition list.
@@ -226,6 +442,9 @@ class HarborSpiFlashConfig with HarborPrettyString {
     eraseMaxMs: eraseMaxMs,
     programMaxMs: programMaxMs,
     tShslNs: tShslNs,
+    quadEnable: quadEnable,
+    manufacturerIds: manufacturerIds,
+    jedecId: jedecId,
   );
 
   /// Most partitions a flash can have. The write port lock mask has one bit
@@ -252,6 +471,16 @@ class HarborSpiFlashConfig with HarborPrettyString {
         eraseTimeoutMs,
         'eraseTimeoutMs',
         'is below the data sheet maximum of $eraseMax ms',
+      );
+    }
+    if (mode == HarborSpiFlashMode.quad &&
+        quadEnable != HarborSpiFlashQuadEnable.none &&
+        eraseTimeoutMs < quadEnable.writeMaxMs) {
+      throw ArgumentError.value(
+        eraseTimeoutMs,
+        'eraseTimeoutMs',
+        'is below the ${quadEnable.writeMaxMs} ms register write time of '
+            '${quadEnable.name}',
       );
     }
     final programMax = programMaxMs;
@@ -313,6 +542,7 @@ class HarborSpiFlashConfig with HarborPrettyString {
     buf.writeln('${c}readCmd: 0x${readCommand.toRadixString(16)},');
     buf.writeln('${c}addrBytes: $addressBytes,');
     buf.writeln('${c}dummyCycles: $dummyCycles,');
+    buf.writeln('${c}quadEnable: ${quadEnable.name},');
     buf.write('$p)');
     return buf.toString();
   }
@@ -391,6 +621,22 @@ ${hiAssign}endmodule''';
 ///
 /// Supports XIP (Execute In Place): the CPU can fetch instructions
 /// directly from the SPI flash.
+///
+/// In quad mode with a [HarborSpiFlashConfig.quadEnable] method, the
+/// controller first reads the JEDEC manufacturer byte and checks it against
+/// the method. Then it reads the register that holds the QE bit twice. When
+/// the two reads differ, or the manufacturer does not match, it sends no
+/// write. When the bit is clear, it writes the bit and reads it back. It
+/// holds bus reads and writes until the sequence ends. When the part does not
+/// set the bit, `qe_err` and `qe_fallback` stay high and every read uses one
+/// data line with fast read (0x0B, or 0x0C with 4-byte addresses). The
+/// status ports are `qe_done`, `qe_set`, `qe_err`, `qe_fallback` and
+/// `qe_id_err`, which is high when the manufacturer did not match.
+///
+/// The controller drives IO2 and IO3 high outside the dummy and data phases of
+/// a quad read, and for the whole fallback read. In standard mode, and in
+/// dual mode, it does not drive them. The board must pull IO2 and IO3 up for
+/// those modes and for the release phase.
 ///
 /// The write command port (`wr_req`, `wr_op`, `wr_addr`, `wr_len`,
 /// `wr_data`) belongs to the DFU sink. The caller keeps `wr_req` high until
@@ -486,6 +732,10 @@ class HarborSpiFlashController extends BridgeModule
            if (useStartupe2) 'startupe2',
            if (ownPads) 'ownpads',
            'sh${config.tShslNs}',
+           if (config.mode == HarborSpiFlashMode.quad &&
+               config.quadEnable != HarborSpiFlashQuadEnable.none)
+             'qe${config.quadEnable.name}'
+                 '_${config.acceptedManufacturers.map((m) => m.toRadixString(16)).join('_')}',
            if (cpuPortBase != null) 'cpuport',
          ]),
          name: name ?? 'spi_flash',
@@ -604,6 +854,18 @@ class HarborSpiFlashController extends BridgeModule
     // ignore it see no behavioural change.
     addOutput('wr_err');
 
+    // Quad enable startup status. qe_done rises when the startup sequence
+    // ends, or at once when the part needs none. qe_set shows that the QE bit
+    // of the part was read as set. qe_err stays high after the sequence could
+    // not set the bit, and qe_fallback is the same state: reads use one data
+    // line. qe_id_err shows that the JEDEC manufacturer byte did not match
+    // the method, so the controller sent no vendor command.
+    addOutput('qe_done');
+    addOutput('qe_set');
+    addOutput('qe_err');
+    addOutput('qe_fallback');
+    addOutput('qe_id_err');
+
     final clk = input('clk');
     final reset = bus.reset;
     // A memory-class slave on the system bus must return the FULL bus word. The
@@ -627,8 +889,18 @@ class HarborSpiFlashController extends BridgeModule
     // request arriving mid-write is HELD (no ack) until wr_busy drops, so the
     // two engines never interleave on the shared SPI pins (see arbitration mux
     // at the bottom). gated stb keeps the read FSM parked in sIdle while busy.
-    final wrBusy = output('wr_busy');
-    final stb = (bus.stb & ~wrBusy).named('rd_stb_gated');
+    final wrBusy = Logic(name: 'wr_busy_int');
+    final qe = config.quadEnable;
+    final qeActive =
+        config.mode == HarborSpiFlashMode.quad &&
+        qe != HarborSpiFlashQuadEnable.none;
+    final qeDone = Logic(name: 'qe_done_reg');
+    final qeSet = Logic(name: 'qe_set_reg');
+    final qeErr = Logic(name: 'qe_err_reg');
+    final qeIdErr = Logic(name: 'qe_id_err_reg');
+    final qeRun = Logic(name: 'qe_run');
+    // A bus read waits until the startup sequence ends.
+    final stb = (bus.stb & ~wrBusy & qeDone).named('rd_stb_gated');
     // The CPU port request, driven where the port is built below. The read
     // FSM starts no flash command in the cycle the write engine starts, so
     // the engine never takes the pins in the middle of a read frame.
@@ -665,11 +937,15 @@ class HarborSpiFlashController extends BridgeModule
     final shiftReg = Logic(name: 'shift_reg', width: busWidth);
     final bitCount = Logic(name: 'bit_count', width: 8);
     final spiState = Logic(name: 'spi_state', width: 3);
-    final ioDir = Logic(name: 'io_dir'); // 0=output, 1=input
+    final ioRel = Logic(name: 'io_dir'); // 0=output, 1=input
+    // IO2 and IO3 are released only in a quad data phase. The fallback read
+    // keeps them driven high.
+    final ioDir = qeActive ? (ioRel & ~qeErr) : ioRel;
 
     final wrStart =
         (cpuReq == null ? input('wr_req') : input('wr_req') | cpuReq) &
-        spiState.eq(Const(0, width: 3));
+        spiState.eq(Const(0, width: 3)) &
+        qeDone;
 
     // CS# stays high for at least tSHSL between two frames. csCnt counts the
     // clocks the CS# pin has been high. A frame may start in a cycle where
@@ -752,10 +1028,34 @@ class HarborSpiFlashController extends BridgeModule
 
     // The shift register value AFTER this cycle's data shift, at a word boundary
     // it holds the just-completed word (MSB-first).
-    final nextShift =
+    final nextShiftWide =
         ((shiftReg << Const(bitsPerCycle, width: 32)) |
-                spiIoIn.zeroExtend(busWidth))
+        spiIoIn.zeroExtend(busWidth));
+    // The fallback read puts the data on IO1 one bit at a time.
+    final nextShift =
+        (qeActive
+                ? mux(
+                    qeErr,
+                    (shiftReg << Const(1, width: 32)) |
+                        spiIoIn.getRange(1, 2).zeroExtend(busWidth),
+                    nextShiftWide,
+                  )
+                : nextShiftWide)
             .named('next_shift');
+    final Logic dummyLast = qeActive
+        ? mux<Logic>(
+            qeErr,
+            Const(HarborSpiFlashConfig.fallbackDummyCycles - 1, width: 8),
+            Const(config.dummyCycles - 1, width: 8),
+          )
+        : Const(config.dummyCycles - 1, width: 8);
+    final Logic dataLast = qeActive
+        ? mux<Logic>(
+            qeErr,
+            Const(busWidth - 1, width: 8),
+            Const(dataClocks - 1, width: 8),
+          )
+        : Const(dataClocks - 1, width: 8);
     // Byte-reverse a busWidth word: the flash streamed bytes MSB-first (lowest
     // address in the high byte), so reverse to the little-endian bus word.
     Logic byteSwap(Logic w) => [
@@ -771,7 +1071,7 @@ class HarborSpiFlashController extends BridgeModule
           shiftReg < Const(0, width: busWidth),
           bitCount < Const(0, width: 8),
           spiState < Const(startupClocks > 0 ? sStartup : sIdle, width: 3),
-          ioDir < Const(0),
+          ioRel < Const(0),
           ack < Const(0),
           datOut < Const(0, width: busWidth),
           lineValid < Const(0),
@@ -826,15 +1126,29 @@ class HarborSpiFlashController extends BridgeModule
                               // Command left-aligned to bit busWidth-1 (shifted
                               // out MSB-first, 1-bit on DQ0).
                               shiftReg <
-                                  Const(
-                                    config.readCommand << (busWidth - 8),
-                                    width: busWidth,
-                                  ),
+                                  (qeActive
+                                      ? mux<Logic>(
+                                          qeErr,
+                                          Const(
+                                            config.fallbackReadCommand <<
+                                                (busWidth - 8),
+                                            width: busWidth,
+                                          ),
+                                          Const(
+                                            config.readCommand <<
+                                                (busWidth - 8),
+                                            width: busWidth,
+                                          ),
+                                        )
+                                      : Const(
+                                          config.readCommand << (busWidth - 8),
+                                          width: busWidth,
+                                        )),
                               bitCount < Const(0, width: 8),
                               wordIdx < Const(0, width: 8),
                               reqAddr < addr32,
                               orphan < Const(0),
-                              ioDir < Const(0), // output (drive DQ0)
+                              ioRel < Const(0), // output (drive DQ0)
                               spiState < Const(sSendCmd, width: 3),
                             ],
                           ),
@@ -896,13 +1210,26 @@ class HarborSpiFlashController extends BridgeModule
                         bitCount.eq(Const(addrClocks - 1, width: 8)),
                         then: [
                           bitCount < Const(0, width: 8),
-                          ioDir < Const(1), // release IO: the flash drives now
+                          ioRel < Const(1), // release IO: the flash drives now
                           shiftReg < Const(0, width: busWidth),
                           spiState <
-                              Const(
-                                config.dummyCycles > 0 ? sDummy : sReadData,
-                                width: 3,
-                              ),
+                              (qeActive
+                                  ? mux<Logic>(
+                                      qeErr,
+                                      Const(sDummy, width: 3),
+                                      Const(
+                                        config.dummyCycles > 0
+                                            ? sDummy
+                                            : sReadData,
+                                        width: 3,
+                                      ),
+                                    )
+                                  : Const(
+                                      config.dummyCycles > 0
+                                          ? sDummy
+                                          : sReadData,
+                                      width: 3,
+                                    )),
                         ],
                       ),
                     ],
@@ -917,7 +1244,7 @@ class HarborSpiFlashController extends BridgeModule
                     then: [
                       bitCount < (bitCount + Const(1, width: 8)),
                       If(
-                        bitCount.eq(Const(config.dummyCycles - 1, width: 8)),
+                        bitCount.eq(dummyLast),
                         then: [
                           bitCount < Const(0, width: 8),
                           shiftReg < Const(0, width: busWidth),
@@ -939,7 +1266,7 @@ class HarborSpiFlashController extends BridgeModule
                       shiftReg < nextShift,
                       bitCount < (bitCount + Const(1, width: 8)),
                       If(
-                        bitCount.eq(Const(dataClocks - 1, width: 8)),
+                        bitCount.eq(dataLast),
                         then: [
                           for (var i = 0; i < lineWords; i++)
                             If(
@@ -976,7 +1303,7 @@ class HarborSpiFlashController extends BridgeModule
                   ack < ~orphan & bus.stb,
                   spiCsN < Const(1),
                   spiClk < Const(0),
-                  ioDir < Const(0),
+                  ioRel < Const(0),
                   spiState < Const(sIdle, width: 3),
                 ]),
               ]),
@@ -1020,6 +1347,9 @@ class HarborSpiFlashController extends BridgeModule
     const wStatRead = 11;
     const wStatHigh = 12;
     const wDone = 13;
+    // Startup sequence states: a WREN frame start and the register write.
+    const wQWren = 1;
+    const wQWrite = 4;
 
     const cmdWren = 0x06;
     const cmdRdsr = 0x05;
@@ -1045,9 +1375,33 @@ class HarborSpiFlashController extends BridgeModule
     int limitOf(int ms) => max(1, ms * hz ~/ 1000);
     final eraseLimit = limitOf(config.eraseTimeoutMs);
     final programLimit = limitOf(config.programTimeoutMs);
-    // The count can pass the limit by one poll, which is 34 clocks.
-    final timerWidth = (max(eraseLimit, programLimit) + 64).bitLength;
+    // The count can pass the limit by one poll, which is 34 clocks. The startup
+    // sequence counts from its first frame, so the margin also holds the
+    // frames before the poll.
+    final timerWidth = (max(eraseLimit, programLimit) + 512).bitLength;
     final wrTimer = Logic(name: 'wr_timer', width: timerWidth);
+    // Startup quad enable sequence. Each step is one frame on the pins: read
+    // the manufacturer byte, read status register 1 twice (two byte write
+    // only), read the QE register twice, write (a WREN frame comes first),
+    // poll WIP, read back. The last two steps clear a failed write.
+    final qeSteps = !qeActive
+        ? const <String>[]
+        : [
+            'id',
+            if (qe.writeBytes == 2) ...['rdSr1', 'rdSr1b'],
+            'rdQe',
+            'rdQe2',
+            'write',
+            'poll',
+            'verify',
+            if (qe.clearsErrors) ...['clsr', 'wrdi'],
+          ];
+    final qeStep = Logic(name: 'qe_step', width: 4);
+    int qeIdx(String name) => qeSteps.indexOf(name);
+    Logic qeAt(String name) => qeStep.eq(Const(qeIdx(name), width: 4));
+    final qeSr1 = Logic(name: 'qe_sr1', width: 8);
+    final qePrev = Logic(name: 'qe_prev', width: 8);
+    final qeMask = 1 << qe.bit;
     final wrTimeLimit = mux<Logic>(
       wrOpL,
       Const(programLimit, width: timerWidth),
@@ -1058,8 +1412,23 @@ class HarborSpiFlashController extends BridgeModule
         wrState.eq(Const(st, width: 4)),
     ].reduce((a, b) => a | b);
 
-    // wr_busy is high in every state except idle.
+    // wr_busy is high in every state except idle. The sink does not see it
+    // while the startup sequence runs, so it does not take it for the end of
+    // its own request.
     wrBusy <= ~wrState.eq(Const(wIdle, width: 4));
+    output('wr_busy') <= wrBusy & ~qeRun;
+    output('qe_done') <= qeDone;
+    output('qe_set') <= qeSet;
+    output('qe_err') <= qeErr;
+    output('qe_fallback') <= qeErr;
+    output('qe_id_err') <= qeIdErr;
+    if (!qeActive) {
+      qeDone <= Const(1);
+      qeSet <= Const(0);
+      qeErr <= Const(0);
+      qeRun <= Const(0);
+      qeIdErr <= Const(0);
+    }
     output('wr_done') <= wrDoneReg;
     output('wr_err') <= wrErrReg;
     output('wr_data_index') <= wrByteIdx;
@@ -1093,6 +1462,10 @@ class HarborSpiFlashController extends BridgeModule
         engDone: wrDoneReg,
         engErr: wrErrReg,
         engIdx: wrByteIdx,
+        qeDone: qeDone,
+        qeSet: qeSet,
+        qeErr: qeErr,
+        qeIdErr: qeIdErr,
       );
       cpuReq <= port.req;
       reqOp = mux(dfuReq, reqOp, port.op);
@@ -1100,6 +1473,157 @@ class HarborSpiFlashController extends BridgeModule
       reqLen = mux(dfuReq, reqLen, port.len);
       engData = mux(port.run, port.data, engData);
     }
+    final opFrame = mux<Logic>(
+      wrOpL,
+      Const(cmdProgram << 24, width: 32),
+      Const(cmdErase << 24, width: 32),
+    );
+    // The register write frame. The bits in keepMask keep the value that the
+    // read returned, the OTP and lock bits are sent as 0, and QE is 1.
+    final qeValue =
+        ((wrStatus & Const(qe.keepMask, width: 8)) | Const(qeMask, width: 8))
+            .zeroExtend(32);
+    final Logic qeFrame = !qeActive
+        ? Const(0, width: 32)
+        : qe.writeBytes == 2
+        ? (Const(qe.writeCommand << 24, width: 32) |
+              (qeSr1.zeroExtend(32) << Const(16, width: 32)) |
+              (qeValue << Const(8, width: 32)))
+        : (Const(qe.writeCommand << 24, width: 32) |
+              (qeValue << Const(16, width: 32)));
+    // The read command of the current step: 0x9F for the manufacturer, 0x05
+    // for status register 1 and the poll, the QE register command for the
+    // others.
+    Logic qeReadCmd = Const(qe.readCommand, width: 8);
+    // The command of the one byte frame that comes before the write: WREN, or
+    // CLSR and WRDI after a failed write.
+    Logic qeCmd8 = Const(cmdWren, width: 8);
+    if (qeActive) {
+      for (final st in qeSteps) {
+        final cmd = switch (st) {
+          'id' => 0x9f,
+          'rdSr1' || 'rdSr1b' || 'poll' => cmdRdsr,
+          _ => null,
+        };
+        if (cmd != null && cmd != qe.readCommand) {
+          qeReadCmd = mux<Logic>(qeAt(st), Const(cmd, width: 8), qeReadCmd);
+        }
+      }
+      if (qe.clearsErrors) {
+        qeCmd8 = mux<Logic>(
+          qeAt('clsr'),
+          Const(0x30, width: 8),
+          mux<Logic>(qeAt('wrdi'), Const(0x04, width: 8), qeCmd8),
+        );
+      }
+    }
+    List<Conditional> qeFinish({required bool ok}) => [
+      qeDone < Const(1),
+      qeRun < Const(0),
+      if (ok) qeSet < Const(1) else qeErr < Const(1),
+      wrState < Const(wIdle, width: 4),
+    ];
+    // A failure after the write. A part that stays busy after a failed write
+    // gets CLSR and WRDI first, so that it accepts the fallback read.
+    List<Conditional> qeFailAfterWrite() => qe.clearsErrors
+        ? <Conditional>[
+            qeErr < Const(1),
+            qeStep < Const(qeIdx('clsr'), width: 4),
+            wrState < Const(wQWren, width: 4),
+          ]
+        : qeFinish(ok: false);
+    List<Conditional> qeNext(int i, int state) => [
+      qeStep < Const(i + 1, width: 4),
+      wrState < Const(state, width: 4),
+    ];
+    final qeDispatch = !qeActive
+        ? const <Conditional>[]
+        : [
+            Case(qeStep, [
+              for (final (i, st) in qeSteps.indexed)
+                CaseItem(Const(i, width: 4), [
+                  if (st == 'id')
+                    If(
+                      [
+                        for (final m in config.acceptedManufacturers)
+                          wrStatus.eq(Const(m, width: 8)),
+                      ].reduce((a, b) => a | b),
+                      then: qeNext(i, wStatLow),
+                      orElse: [qeIdErr < Const(1), ...qeFinish(ok: false)],
+                    )
+                  else if (st == 'rdSr1') ...[
+                    qeSr1 < wrStatus,
+                    ...qeNext(i, wStatLow),
+                  ] else if (st == 'rdSr1b')
+                    If(
+                      wrStatus.eq(qeSr1),
+                      then: qeNext(i, wStatLow),
+                      orElse: qeFinish(ok: false),
+                    )
+                  else if (st == 'rdQe')
+                    If(
+                      wrStatus[qe.bit],
+                      then: qeFinish(ok: true),
+                      orElse: [qePrev < wrStatus, ...qeNext(i, wStatLow)],
+                    )
+                  else if (st == 'rdQe2')
+                    If(
+                      wrStatus.eq(qePrev),
+                      then: qeNext(i, wQWren),
+                      orElse: qeFinish(ok: false),
+                    )
+                  else if (st == 'poll')
+                    If(
+                      wrStatus[0],
+                      then: [
+                        If(
+                          wrTimer.gte(wrTimeLimit),
+                          then: qeFailAfterWrite(),
+                          orElse: [wrState < Const(wStatLow, width: 4)],
+                        ),
+                      ],
+                      orElse: qeNext(i, wStatLow),
+                    )
+                  else if (st == 'verify')
+                    If(
+                      wrStatus[qe.bit],
+                      then: qeFinish(ok: true),
+                      orElse: qeFailAfterWrite(),
+                    ),
+                ]),
+            ], defaultItem: qeFinish(ok: false)),
+          ];
+    final qeFrameBits = 8 + 8 * qe.writeBytes;
+    final List<Conditional> wWrenStart = [
+      wrCsN < Const(0),
+      wrBitCount < Const(0, width: 8),
+      wrShift < (qeActive ? mux<Logic>(qeRun, qeFrame, opFrame) : opFrame),
+      wrState <
+          (qeActive
+              ? mux<Logic>(
+                  qeRun,
+                  Const(wQWrite, width: 4),
+                  Const(wCmd, width: 4),
+                )
+              : Const(wCmd, width: 4)),
+    ];
+    // STAT_HIGH for a write or erase: inspect WIP. Busy polls again, unless
+    // the timer reached the limit of the op: then the op ends with wr_err.
+    final statHighWip = If(
+      wrStatus[0],
+      then: [
+        If(
+          wrTimer.gte(wrTimeLimit),
+          then: [
+            // Watchdog timeout: give up, flag the error, finish.
+            wrErrReg < Const(1),
+            wrState < Const(wDone, width: 4),
+          ],
+          orElse: [wrState < Const(wStatLow, width: 4)],
+        ),
+      ],
+      orElse: [wrState < Const(wDone, width: 4)],
+    );
     final wrDataLoad = engData.zeroExtend(32) << Const(24, width: 32);
 
     Sequential(clk, [
@@ -1120,10 +1644,23 @@ class HarborSpiFlashController extends BridgeModule
           wrLenL < Const(0, width: 9),
           wrStatus < Const(0, width: 8),
           wrTimer < Const(0, width: timerWidth),
+          if (qeActive) ...[
+            qeDone < Const(0),
+            qeSet < Const(0),
+            qeErr < Const(0),
+            qeRun < Const(0),
+            qeStep < Const(0, width: 4),
+            qeSr1 < Const(0, width: 8),
+            qePrev < Const(0, width: 8),
+            qeIdErr < Const(0),
+          ],
         ],
         orElse: [
           wrDoneReg < Const(0),
-          If(inPoll, then: [wrTimer < (wrTimer + Const(1, width: timerWidth))]),
+          If(
+            qeActive ? (inPoll | qeRun) : inPoll,
+            then: [wrTimer < (wrTimer + Const(1, width: timerWidth))],
+          ),
           Case(wrState, [
             // IDLE: wait for a request, latch op/addr/len. Accept it only when
             // the read FSM is idle and CS# has been high long enough. While a
@@ -1141,6 +1678,17 @@ class HarborSpiFlashController extends BridgeModule
             CaseItem(Const(wIdle, width: 4), [
               wrClk < Const(0),
               wrCsN < Const(1),
+              if (qeActive)
+                If(
+                  ~qeDone & spiState.eq(Const(sIdle, width: 3)) & csOk,
+                  then: [
+                    qeRun < Const(1),
+                    qeStep < Const(0, width: 4),
+                    wrOpL < Const(0),
+                    wrTimer < Const(0, width: timerWidth),
+                    wrState < Const(wStatLow, width: 4),
+                  ],
+                ),
               If(
                 wrStart & csOk,
                 then: [
@@ -1197,19 +1745,26 @@ class HarborSpiFlashController extends BridgeModule
             ]),
 
             // WREN_HIGH: one cycle of CS high, then start the command frame.
+            // In the startup sequence it also ends the CLSR and WRDI frames.
             CaseItem(Const(wWrenHigh, width: 4), [
               If(
                 csOk,
                 then: [
-                  wrCsN < Const(0),
-                  wrBitCount < Const(0, width: 8),
-                  wrShift <
-                      mux<Logic>(
-                        wrOpL,
-                        Const(cmdProgram << 24, width: 32),
-                        Const(cmdErase << 24, width: 32),
-                      ),
-                  wrState < Const(wCmd, width: 4),
+                  if (qeActive && qe.clearsErrors)
+                    If(
+                      qeRun & ~qeAt('write'),
+                      then: [
+                        Case(qeStep, [
+                          CaseItem(Const(qeIdx('clsr'), width: 4), [
+                            qeStep < Const(qeIdx('wrdi'), width: 4),
+                            wrState < Const(wQWren, width: 4),
+                          ]),
+                        ], defaultItem: qeFinish(ok: false)),
+                      ],
+                      orElse: wWrenStart,
+                    )
+                  else
+                    ...wWrenStart,
                 ],
               ),
             ]),
@@ -1327,7 +1882,14 @@ class HarborSpiFlashController extends BridgeModule
                 then: [
                   wrCsN < Const(0),
                   wrDriveOut < Const(1),
-                  wrShift < Const(cmdRdsr << 24, width: 32),
+                  wrShift <
+                      (qeActive
+                          ? mux<Logic>(
+                              qeRun,
+                              qeReadCmd.zeroExtend(32) << Const(24, width: 32),
+                              Const(cmdRdsr << 24, width: 32),
+                            )
+                          : Const(cmdRdsr << 24, width: 32)),
                   wrBitCount < Const(0, width: 8),
                   wrStatus < Const(0, width: 8),
                   wrState < Const(wStatCmd, width: 4),
@@ -1384,22 +1946,49 @@ class HarborSpiFlashController extends BridgeModule
             // wr_err. WIP clear -> done.
             CaseItem(Const(wStatHigh, width: 4), [
               wrCsN < Const(1),
-              If(
-                wrStatus[0], // WIP still set
-                then: [
-                  If(
-                    wrTimer.gte(wrTimeLimit),
-                    then: [
-                      // Watchdog timeout: give up, flag the error, finish.
-                      wrErrReg < Const(1),
-                      wrState < Const(wDone, width: 4),
-                    ],
-                    orElse: [wrState < Const(wStatLow, width: 4)],
-                  ),
-                ],
-                orElse: [wrState < Const(wDone, width: 4)],
-              ),
+              if (qeActive)
+                If(qeRun, then: qeDispatch, orElse: [statHighWip])
+              else
+                statHighWip,
             ]),
+
+            // QE_WREN: start the WREN frame of the startup sequence.
+            if (qeActive)
+              CaseItem(Const(wQWren, width: 4), [
+                If(
+                  csOk,
+                  then: [
+                    wrCsN < Const(0),
+                    wrDriveOut < Const(1),
+                    wrShift < (qeCmd8.zeroExtend(32) << Const(24, width: 32)),
+                    wrBitCount < Const(0, width: 8),
+                    wrState < Const(wWren, width: 4),
+                  ],
+                ),
+              ]),
+
+            // QE_WRITE: shift out the register write frame.
+            if (qeActive)
+              CaseItem(Const(wQWrite, width: 4), [
+                wrClk < ~wrClk,
+                If(
+                  wrClk,
+                  then: [
+                    wrShift < (wrShift << Const(1, width: 32)),
+                    wrBitCount < (wrBitCount + Const(1, width: 8)),
+                    If(
+                      wrBitCount.eq(Const(qeFrameBits - 1, width: 8)),
+                      then: [
+                        wrBitCount < Const(0, width: 8),
+                        wrCsN < Const(1),
+                        wrClk < Const(0),
+                        qeStep < (qeStep + Const(1, width: 4)),
+                        wrState < Const(wEnd, width: 4),
+                      ],
+                    ),
+                  ],
+                ),
+              ]),
 
             // DONE: pulse wr_done for one cycle, return to idle (drops busy).
             // wr_err (if set by a watchdog timeout) is sticky and survives.
@@ -1465,7 +2054,7 @@ class HarborSpiFlashController extends BridgeModule
       wrShift[31],
       shiftReg[busWidth - 1],
     ).named('spi_mosi_bit');
-    final driveOut = mux(wrBusy, wrDriveOut, ~ioDir).named('spi_drive_out');
+    final driveOut = mux(wrBusy, wrDriveOut, ~ioRel).named('spi_drive_out');
     if (isStd) {
       output('spi_mosi') <= mosiBit;
       // Read samples MISO during read-data, write samples MISO during RDSR.
@@ -1693,6 +2282,11 @@ class HarborSpiFlashController extends BridgeModule
                   name: 'lock_mask',
                   width: 4,
                   offset: 0x10,
+                ),
+                const HarborDeviceField(
+                  name: 'qe_status',
+                  width: 4,
+                  offset: 0x14,
                 ),
                 const HarborDeviceField(name: 'claim', width: 4, offset: 0x1c),
                 for (var i = 0; i < 64; i++)

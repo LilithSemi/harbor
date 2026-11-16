@@ -465,7 +465,7 @@ void main() {
       () => _withRig((r) async {
         await r.cpu.write(0x14, 0xffffffff);
         await r.cpu.write(0x18, 0xffffffff);
-        expect(await r.cpu.read(0x14), 0);
+        expect(await r.cpu.read(0x14), 1);
         expect(await r.cpu.read(0x18), 0);
         expect(await r.run(_erase, 0x20000), _done);
       }),
@@ -626,7 +626,8 @@ void main() {
     // The lock mask is the low lane of 0x10 and the claim the high lane of 0x18.
     await cpu.write(0x10, 0x5, sel: 0x0f);
     await cpu.write(0x10, 0x2 << 32, sel: 0xf0);
-    expect(await cpu.read(0x10), 0x5);
+    // The high lane of 0x10 is qe_status, which reads 1 with no QE method.
+    expect(await cpu.read(0x10), 0x5 | (0x1 << 32));
     expect(await cpu.read(0x18), 0x1 << 32);
     expect(await cpu.read(0x18, sel: 0xf0), 0x1 << 32);
     expect(await cpu.read(0x18, sel: 0xf0), 0x0);
@@ -719,7 +720,12 @@ void main() {
       final reset = Logic(name: 'reset');
       final wrReq = Logic(name: 'wr_req');
       final flash = HarborSpiFlashController(
-        config: const HarborSpiFlashConfig.w25q128(),
+        config: const HarborSpiFlashConfig(
+          size: 16 * 1024 * 1024,
+          mode: HarborSpiFlashMode.quad,
+          readCommand: 0x6B,
+          dummyCycles: 8,
+        ),
         baseAddress: _xipBase,
         busAddressWidth: 32,
         clockHz: 100000000,

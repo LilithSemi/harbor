@@ -10,6 +10,8 @@
  *   0x08: LEN       (RW) - program byte count, 1 to 256
  *   0x0c: STATUS    (RW) - busy, done, err (write 1 to clear), locked
  *   0x10: LOCK_MASK (RW) - set by firmware, one bit for each partition
+ *   0x14: QE_STATUS (RO) - bit 0 quad enable done, bit 1 QE set, bit 2 QE
+ *                          failed and reads use one line, bit 3 JEDEC ID mismatch
  *   0x1c: CLAIM     (RW) - a read takes the claim, a write of 1 gives it back
  *   0x100 - 0x1ff : page buffer, the program data
  *

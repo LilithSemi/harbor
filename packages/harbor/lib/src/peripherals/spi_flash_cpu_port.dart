@@ -14,7 +14,12 @@ import '../bus/port/reg_fifo.dart' show HarborFifoRam;
 /// - 0x0c status: bit 0 busy, bit 1 done, bit 2 err, bit 3 locked.
 /// - 0x10 lock_mask: bit N locks partition N of the build. A write sets
 ///   bits and never clears them. Only a reset clears the mask.
-/// - 0x14 and 0x18 are reserved: they read 0 and ignore writes.
+/// - 0x14 qe_status: read only. Bit 0 the quad enable startup sequence has
+///   ended, bit 1 the QE bit of the part is set, bit 2 the sequence could not
+///   set the bit and reads use one data line, bit 3 the JEDEC manufacturer
+///   did not match the QE method, so the controller sent no vendor command.
+///   A part that needs no QE bit reads 1. Writes are ignored.
+/// - 0x18 is reserved: it reads 0 and ignores writes.
 /// - 0x1c claim: a read returns 1 and takes the claim when it is free, and
 ///   returns 0 when it is taken. A write of 1 gives the claim back.
 /// - 0x100 to 0x1ff page: the program data. Byte 0 goes to flash offset addr.
@@ -82,7 +87,8 @@ class HarborSpiFlashCpuPort {
   ///
   /// [take] is high in the cycle the engine starts the pending request.
   /// [engDone] is the engine done pulse, [engErr] its error flag and
-  /// [engIdx] the index of the program byte it asks for.
+  /// [engIdx] the index of the program byte it asks for. [qeDone], [qeSet]
+  /// [qeErr] and [qeIdErr] are the bits of the qe_status register.
   factory HarborSpiFlashCpuPort.build({
     required BusSlavePort bus,
     required Logic clk,
@@ -93,6 +99,10 @@ class HarborSpiFlashCpuPort {
     required Logic engDone,
     required Logic engErr,
     required Logic engIdx,
+    required Logic qeDone,
+    required Logic qeSet,
+    required Logic qeErr,
+    required Logic qeIdErr,
   }) {
     final busW = bus.dataIn.width;
     if (busW < 32) {
@@ -182,12 +192,20 @@ class HarborSpiFlashCpuPort {
     ].reduce((a, b) => a | b);
 
     final status = [Const(0, width: 28), locked, err, done, busy].concat();
+    final qeStatus = [
+      Const(0, width: 28),
+      qeIdErr,
+      qeErr,
+      qeSet,
+      qeDone,
+    ].concat();
     final regs = <int, Logic>{
       0x00: opR.zeroExtend(32),
       0x04: addrR,
       0x08: lenR,
       0x0c: status,
       0x10: lockMask,
+      0x14: qeStatus,
       claimOffset: (~claimed).zeroExtend(32),
     };
     final bases = {for (final o in regs.keys) o - o % bytesW};
