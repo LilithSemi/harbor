@@ -343,6 +343,22 @@ class HarborDeviceTreeGenerator {
       buf.writeln('    cpus {');
       buf.writeln('        #address-cells = <1>;');
       buf.writeln('        #size-cells = <0>;');
+      // Linux reads the timebase from /cpus only. The binding allows one
+      // value there when every hart shares it.
+      final timebases = {
+        for (final cpu in cpus)
+          if (cpu.timebaseFrequency != null) cpu.timebaseFrequency,
+      };
+      if (timebases.length > 1) {
+        throw ArgumentError.value(
+          timebases.toList(),
+          'cpus',
+          'harts have different timebase-frequency values',
+        );
+      }
+      if (timebases.isNotEmpty) {
+        buf.writeln('        timebase-frequency = <${timebases.single}>;');
+      }
       for (final cpu in cpus) {
         buf.writeln();
         buf.writeln('        cpu@${cpu.hartId} {');

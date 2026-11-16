@@ -115,6 +115,28 @@ void main() {
       ).generate();
 
       expect(dts, contains('timebase-frequency = <25000000>;'));
+      // Linux reads it from /cpus, so it must sit right under that node.
+      expect(
+        dts,
+        contains(
+          '    cpus {\n'
+          '        #address-cells = <1>;\n'
+          '        #size-cells = <0>;\n'
+          '        timebase-frequency = <25000000>;\n',
+        ),
+      );
+    });
+
+    test('rejects harts with different timebase-frequency values', () {
+      final gen = HarborDeviceTreeGenerator(
+        model: 'Mixed SoC',
+        compatible: 'test,mixed-v1',
+        cpus: [
+          HarborCpu(hartId: 0, isa: 'rv64imac', timebaseFrequency: 25000000),
+          HarborCpu(hartId: 1, isa: 'rv64imac', timebaseFrequency: 10000000),
+        ],
+      );
+      expect(gen.generate, throwsArgumentError);
     });
 
     test('generates minimal DTS without CPUs', () {
