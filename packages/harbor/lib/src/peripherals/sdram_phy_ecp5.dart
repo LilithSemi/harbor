@@ -361,11 +361,13 @@ class SdramPhyEcp5 extends SdramPhyBase {
         ).z;
       }
 
+      // All flops of one pad share the IOLOGIC LSR. The output flops have
+      // no reset, so the capture flop has none either.
       final bit = _phyConfig.edge == HarborSdramCaptureEdge.rising
           ? Ecp5Ifs1p3bx(d: padIn, sclk: clk, name: 'dq_in_ifs_$i').q
           : Ecp5Iddrx1f(
               sclk: clk,
-              rst: reset,
+              rst: Const(0),
               d: padIn,
               name: 'dq_in_iddr_$i',
             ).q1;

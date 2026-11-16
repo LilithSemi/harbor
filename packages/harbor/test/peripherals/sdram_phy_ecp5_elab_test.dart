@@ -153,6 +153,12 @@ endmodule
 
     expect(count(sv, 'IDDRX1F'), equals(16));
     expect(count(sv, 'IFS1P3BX'), equals(0));
+
+    // One IOLOGIC has one LSR, so a dq capture flop must not take the
+    // reset net.
+    for (final iddr in instances(sv, 'IDDRX1F').values) {
+      expect(iddr['RST'], equals("1'h0"));
+    }
   });
 
   test('dqDelayTaps adds a DELAYF per dq bit, chained bb.O -> delayf.A, '
