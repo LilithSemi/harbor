@@ -126,10 +126,13 @@ class RegBus {
     BigInt? data,
     int? sel,
     required bool write,
-  }) {
+  }) async {
+    // A caller that returns on a falling edge would otherwise start the next
+    // access before the rising edge, and a read or write goes out twice.
+    if (!clk.value.toBool()) await clk.nextPosedge;
     final d = data ?? BigInt.zero;
     final s = sel ?? _allSel;
-    return switch (kind) {
+    return await switch (kind) {
       HarborFabricKind.wishbone => _wishbone(addr, d, s, write),
       HarborFabricKind.axi4 => _axi4(addr, d, s, write),
       HarborFabricKind.tilelink => _tileLink(addr, d, s, write),
