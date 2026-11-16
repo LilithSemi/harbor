@@ -76,13 +76,16 @@ void main() {
           ports['mem_rdata']!.inject(lv(mem[pendA] ?? BigInt.zero));
           ports['mem_done']!.inject(1);
           ports['mem_valid']!.inject(1);
+          ports['mem_last']!.inject(1);
         } else {
           ports['mem_done']!.inject(0);
           ports['mem_valid']!.inject(0);
+          ports['mem_last']!.inject(0);
         }
       } else {
         ports['mem_done']!.inject(0);
         ports['mem_valid']!.inject(0);
+        ports['mem_last']!.inject(0);
       }
       if (cache.output('resp_valid').value.toBool()) {
         served = cache.output('resp_data').value.toBigInt();
@@ -108,6 +111,7 @@ void main() {
         'flush': Logic(name: 'flush'),
         'mem_done': Logic(name: 'mem_done'),
         'mem_valid': Logic(name: 'mem_valid'),
+        'mem_last': Logic(name: 'mem_last'),
         'mem_rdata': Logic(name: 'mem_rdata', width: 64),
         'mem_fault': Logic(name: 'mem_fault'),
         if (ctxBits > 0) 'req_ctx': Logic(name: 'req_ctx', width: ctxBits),
@@ -259,6 +263,7 @@ void main() {
         'flush': Logic(name: 'flush'),
         'mem_done': Logic(name: 'mem_done'),
         'mem_valid': Logic(name: 'mem_valid'),
+        'mem_last': Logic(name: 'mem_last'),
         'mem_fault': Logic(name: 'mem_fault'),
         'mem_rdata': Logic(name: 'mem_rdata', width: 64),
         if (ctxBits > 0) 'req_ctx': Logic(name: 'req_ctx', width: ctxBits),

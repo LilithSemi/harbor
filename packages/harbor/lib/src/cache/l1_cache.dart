@@ -12,6 +12,29 @@ import 'cache_config.dart';
 /// fanout are expensive routing resources on a dense 7-series design.
 const harborL1TagFlopBits = 4096;
 
+/// Width of the `mem_len` output of an L1 cache. It is the same as
+/// LEN width of a Harbor memory waist.
+const harborL1MemLenWidth = 8;
+
+/// Stops the simulation when [bad] is high on a rising [clk] edge out of
+/// reset. The generated RTL does not use [bad].
+void _l1CheckInSim(Logic clk, Logic reset, Logic bad, String what) {
+  clk.glitch.listen((args) {
+    if (LogicValue.isPosedge(
+          args.previousValue,
+          args.newValue,
+          ignoreInvalid: true,
+        ) &&
+        reset.value == LogicValue.zero &&
+        bad.value == LogicValue.one) {
+      Simulator.throwException(
+        Exception('L1 cache: $what'),
+        StackTrace.current,
+      );
+    }
+  });
+}
+
 /// Line tag store of an L1 cache. Its read latency is 1 on every target.
 /// Xilinx stores use block RAM. Other targets use flops up to
 /// [harborL1TagFlopBits] bits and block RAM above that limit.
@@ -335,6 +358,10 @@ class HarborL1ICache extends BridgeModule {
   /// The core supplies the privilege mode here (see [reqCtx]).
   final int ctxBits;
 
+  /// Stops the simulation when `mem_last` does not match the burst length.
+  /// The cache treats such a burst as an error in all modes.
+  final bool checkMemLast;
+
   /// Cycles after a reset or flush during which the cache clears its valid
   /// bits and answers no lookup.
   late final int sweepCycles;
@@ -375,13 +402,19 @@ class HarborL1ICache extends BridgeModule {
   /// answers no lookup until the clear is done.
   Logic get flush => input('flush');
 
-  /// Word-granular refill request to the MMU/memory. A miss fills its line one
-  /// word per response, so the DDR PHY only ever sees the single paced read it
-  /// captures correctly, never a back-to-back line burst.
+  /// Refill request. A miss sends one INCR burst from the line base:
+  /// [memLen] is the beat count minus one. [memEn] stays high from the start
+  /// of the request to the beat with [memLast].
   Logic get memEn => output('mem_en');
   Logic get memAddr => output('mem_addr');
+  Logic get memLen => output('mem_len');
+
+  /// Refill response, one [memDone] pulse per beat. [memValid] low is an
+  /// error on that beat. The memory must give exactly `mem_len + 1` beats,
+  /// also after an error, and set [memLast] on the last one.
   Logic get memDone => input('mem_done');
   Logic get memValid => input('mem_valid');
+  Logic get memLast => input('mem_last');
   Logic get memRdata => input('mem_rdata');
 
   /// Instruction page fault from the fetch translation. Asserted with the refill
@@ -404,6 +437,7 @@ class HarborL1ICache extends BridgeModule {
     this.xlen = 64,
     this.dualPort = false,
     this.ctxBits = 0,
+    this.checkMemLast = true,
     // Significant low bits of [reqAddr]: the tag store and compares are sized to
     // this instead of [xlen], so a cache over a narrow map does not pay for a
     // full 64-bit tag. Null = xlen. See the note on tag width below.
@@ -446,11 +480,12 @@ class HarborL1ICache extends BridgeModule {
       addOutput('resp_data1', width: xlen);
       addOutput('resp_valid1');
     }
-    // Word-granular refill handshake to the MMU ifetch port.
     addOutput('mem_en');
     addOutput('mem_addr', width: xlen);
+    addOutput('mem_len', width: harborL1MemLenWidth);
     createPort('mem_done', PortDirection.input);
     createPort('mem_valid', PortDirection.input);
+    createPort('mem_last', PortDirection.input);
     createPort('mem_rdata', PortDirection.input, width: xlen);
     createPort('mem_fault', PortDirection.input);
 
@@ -463,6 +498,12 @@ class HarborL1ICache extends BridgeModule {
       throw ArgumentError(
         'lineSize (${config.lineSize}B) must hold at least one $wordBytes-byte '
         'word.',
+      );
+    }
+    if (lineWords > 1 << harborL1MemLenWidth) {
+      throw ArgumentError(
+        'lineSize (${config.lineSize}B) must not be more than '
+        '${1 << harborL1MemLenWidth} words, the longest burst.',
       );
     }
     final numLines = config.lines;
@@ -567,11 +608,13 @@ class HarborL1ICache extends BridgeModule {
     final fillSettle = Logic(name: 'fillSettle');
     final fillIdx = Logic(name: 'fillIdx', width: idxBits == 0 ? 1 : idxBits);
     final fillTag = Logic(name: 'fillTag', width: lineTagBits);
-    final fillBase = Logic(name: 'fillBase', width: xlen);
     final fillWord = Logic(
       name: 'fillWord',
       width: (offBits == 0 ? 1 : offBits) + 1,
     );
+    // An earlier beat of this refill had an error.
+    final fillErr = Logic(name: 'fillErr');
+    final fillErrPage = Logic(name: 'fillErrPage');
 
     // Fetch-fault latch: set when a refill fails, with mem_fault preserving
     // whether it was a page fault or a physical access fault. Held until the
@@ -641,6 +684,7 @@ class HarborL1ICache extends BridgeModule {
     final memAddrR = Logic(name: 'memAddrR', width: xlen);
     memEn <= memEnR;
     memAddr <= memAddrR;
+    memLen <= Const(lineWords - 1, width: harborL1MemLenWidth);
 
     Logic ramRead(int r) =>
         ramLatency == 1 ? dataRam.readData(r) : flop(clk, dataRam.readData(r));
@@ -668,7 +712,7 @@ class HarborL1ICache extends BridgeModule {
       respValid1 <= hit1;
     }
 
-    // Data block-RAM write port: one fill word per MMU response.
+    // Data block-RAM write port: one fill word per beat.
     final fillWrEn = (filling & memDone & memValid & ~flush & ~reset).named(
       'fillWrEn',
     );
@@ -685,16 +729,30 @@ class HarborL1ICache extends BridgeModule {
     dataRam.input('wr_data').srcConnection! <= memRdata;
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
-    tagRam.ram.input('wr_en').srcConnection! <=
-        fillWrEn & fillWord.eq(lastWord);
+    // A beat with an error, or a mem_last that does not match the burst
+    // length, early or late. Either one fails the refill.
+    final fillBad = (~memValid | memLast.neq(fillWord.eq(lastWord))).named(
+      'fillBad',
+    );
+    // A refill commits only on a good last beat with no earlier error.
+    final fillCommit = (fillWrEn & memLast & ~fillBad & ~fillErr).named(
+      'fillCommit',
+    );
+    if (checkMemLast) {
+      _l1CheckInSim(
+        clk,
+        reset,
+        filling & memDone & memLast.neq(fillWord.eq(lastWord)),
+        'mem_last does not match the burst length',
+      );
+    }
+    tagRam.ram.input('wr_en').srcConnection! <= fillCommit;
     tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
     tagRam.ram.input('wr_data').srcConnection! <= fillTag;
 
     // A fill sets its line valid when it commits. A new fill clears the
     // victim line first.
-    final fillValidSet = (fillWrEn & fillWord.eq(lastWord)).named(
-      'fillValidSet',
-    );
+    final fillValidSet = fillCommit.named('fillValidSet');
     validUpdateEn <= fillValidSet | fillStart;
     validUpdateIdx <= mux(fillValidSet, fillIdx, idxOf(fillAddr));
     validUpdateValue <= fillValidSet;
@@ -734,7 +792,7 @@ class HarborL1ICache extends BridgeModule {
               // future fill: the core stopped fetching. Linux reaches this
               // every time a demand-paging fetch fault meets the satp write of
               // a context switch, an sfence.vma or a fence.i.
-              drain < (filling | drain) & ~memDone,
+              drain < (filling | drain) & ~(memDone & memLast),
             ],
             orElse: [
               fillSettle < 0,
@@ -747,39 +805,43 @@ class HarborL1ICache extends BridgeModule {
                   // Waiting out the abandoned read. filling is 0 so its
                   // completion is never written; just release once it lands
                   // (data or fault, so a faulting stale read cannot hang drain).
-                  If(memDone, then: [drain < 0]),
+                  If(memDone & memLast, then: [drain < 0]),
                 ],
                 orElse: [
                   If(
                     filling,
                     then: [
                       If(
-                        memDone & memValid,
+                        memDone,
                         then: [
+                          fillWord < fillWord + 1,
                           If(
-                            fillWord.eq(lastWord),
-                            then: [memEnR < 0, filling < 0, fillSettle < 1],
-                            orElse: [
-                              fillWord < fillWord + 1,
-                              memAddrR <
-                                  (fillBase +
-                                      ((fillWord + 1).zeroExtend(xlen) *
-                                          Const(wordBytes, width: xlen))),
+                            fillBad & ~fillErr,
+                            then: [
+                              fillErr < 1,
+                              fillErrPage < ~memValid & memFault,
                             ],
                           ),
-                        ],
-                        // done AND not valid: the MMU fetch walk page-faulted
-                        // (mem_fault). Stop the fill (never mark the line valid)
-                        // and latch the fault so respFault delivers it to the
-                        // pipeline. Without this the fill FSM stalls forever.
-                        orElse: [
+                          // An error on any beat drops the line and faults
+                          // the fetch after the last beat.
                           If(
-                            memDone,
+                            memLast,
                             then: [
                               memEnR < 0,
                               filling < 0,
-                              faultResp < 1,
-                              faultIsPage < memFault,
+                              If(
+                                fillErr | fillBad,
+                                then: [
+                                  faultResp < 1,
+                                  faultIsPage <
+                                      mux(
+                                        fillErr,
+                                        fillErrPage,
+                                        ~memValid & memFault,
+                                      ),
+                                ],
+                                orElse: [fillSettle < 1],
+                              ),
                             ],
                           ),
                         ],
@@ -796,8 +858,8 @@ class HarborL1ICache extends BridgeModule {
                           filling < 1,
                           fillIdx < idxOf(fillAddr),
                           fillTag < fullTagOf(fillAddr),
-                          fillBase < fillLineBase,
                           fillWord < 0,
+                          fillErr < 0,
                           memEnR < 1,
                           memAddrR < fillLineBase,
                           // Remember the exact request address this fill serves;
@@ -883,6 +945,10 @@ class HarborL1DCache extends BridgeModule {
   /// a store never leaves another context holding stale data.
   final int ctxBits;
 
+  /// Stops the simulation when `mem_last` does not match the burst length.
+  /// The cache treats such a burst as an error in all modes.
+  final bool checkMemLast;
+
   /// Cycles after a reset or flush during which the cache clears its valid
   /// bits and answers no lookup.
   late final int sweepCycles;
@@ -940,14 +1006,24 @@ class HarborL1DCache extends BridgeModule {
   /// and [busy] stays high until the clear is done.
   Logic get flush => input('flush');
 
-  /// Word-granular memory port (shared by load fills and write-through stores).
+  /// Memory request, for refills, write-through stores and uncached reads.
+  /// A refill is one INCR burst from the line base with [memLen] set to the
+  /// beat count minus one. A store or an uncached read is one beat, with
+  /// [memLen] 0. [memEn] stays high from the start of the request to the beat
+  /// with [memLast].
   Logic get memEn => output('mem_en');
   Logic get memWe => output('mem_we');
   Logic get memAddr => output('mem_addr');
+  Logic get memLen => output('mem_len');
   Logic get memWdata => output('mem_wdata');
   Logic get memSize => output('mem_size');
+
+  /// Memory response, one [memDone] pulse per beat. [memValid] low is an
+  /// error on that beat. The memory must give exactly `mem_len + 1` beats,
+  /// also after an error, and set [memLast] on the last one.
   Logic get memDone => input('mem_done');
   Logic get memValid => input('mem_valid');
+  Logic get memLast => input('mem_last');
   Logic get memRdata => input('mem_rdata');
 
   /// Distinguishes a page fault from a physical access fault when [memDone] is
@@ -960,6 +1036,7 @@ class HarborL1DCache extends BridgeModule {
     this.cacheableBase = 0x80000000,
     this.physicalAddresses = false,
     this.ctxBits = 0,
+    this.checkMemLast = true,
     Logic? memFaultIn,
     // Significant low bits of [reqAddr]. See the note on tag width below.
     int? reqAddrBits,
@@ -1001,14 +1078,15 @@ class HarborL1DCache extends BridgeModule {
     addOutput('busy');
     addOutput('perf_access');
     addOutput('perf_miss');
-    // Word-granular memory port.
     addOutput('mem_en');
     addOutput('mem_we');
     addOutput('mem_addr', width: xlen);
+    addOutput('mem_len', width: harborL1MemLenWidth);
     addOutput('mem_wdata', width: xlen);
     addOutput('mem_size', width: 3);
     createPort('mem_done', PortDirection.input);
     createPort('mem_valid', PortDirection.input);
+    createPort('mem_last', PortDirection.input);
     createPort('mem_rdata', PortDirection.input, width: xlen);
     // Default to page fault for backwards compatibility: an old consumer that
     // does not wire classification must still complete and trap, never float.
@@ -1023,6 +1101,12 @@ class HarborL1DCache extends BridgeModule {
       throw ArgumentError(
         'lineSize (${config.lineSize}B) must hold at least one $wordBytes-byte '
         'word.',
+      );
+    }
+    if (lineWords > 1 << harborL1MemLenWidth) {
+      throw ArgumentError(
+        'lineSize (${config.lineSize}B) must not be more than '
+        '${1 << harborL1MemLenWidth} words, the longest burst.',
       );
     }
     final numLines = config.lines;
@@ -1146,11 +1230,13 @@ class HarborL1DCache extends BridgeModule {
     final bypassData = Logic(name: 'bypassData', width: xlen);
     final fillIdx = Logic(name: 'fillIdx', width: idxBits == 0 ? 1 : idxBits);
     final fillTag = Logic(name: 'fillTag', width: lineTagBits);
-    final fillBase = Logic(name: 'fillBase', width: xlen);
     final fillWord = Logic(
       name: 'fillWord',
       width: (offBits == 0 ? 1 : offBits) + 1,
     );
+    // An earlier beat of this refill had an error.
+    final fillErr = Logic(name: 'fillErr');
+    final fillErrPage = Logic(name: 'fillErrPage');
     final storeIdx = Logic(name: 'storeIdx', width: idxBits == 0 ? 1 : idxBits);
     final storeInv = Logic(name: 'storeInv');
 
@@ -1231,6 +1317,8 @@ class HarborL1DCache extends BridgeModule {
     final memAddrR = Logic(name: 'memAddrR', width: xlen);
     final memWdataR = Logic(name: 'memWdataR', width: xlen);
     final memSizeR = Logic(name: 'memSizeR', width: 3);
+    final memLenR = Logic(name: 'memLenR', width: harborL1MemLenWidth);
+    memLen <= memLenR;
     memEn <= memEnR;
     memWe <= memWeR;
     memAddr <= memAddrR;
@@ -1277,11 +1365,30 @@ class HarborL1DCache extends BridgeModule {
     dataRam.input('wr_data').srcConnection! <= memRdata;
 
     final lastWord = Const(lineWords - 1, width: fillWord.width);
+    // A beat with an error, or a mem_last that does not match the burst
+    // length, early or late. Either one fails the refill.
+    final fillBad = (~memValid | memLast.neq(fillWord.eq(lastWord))).named(
+      'fillBad',
+    );
+    // A refill commits only on a good last beat with no earlier error.
+    final fillCommit = (fillWrEn & memLast & ~fillBad & ~fillErr).named(
+      'fillCommit',
+    );
+    if (checkMemLast) {
+      _l1CheckInSim(
+        clk,
+        reset,
+        memDone &
+            ((filling & memLast.neq(fillWord.eq(lastWord))) |
+                ((storing | bypassing) & ~memLast)),
+        'mem_last does not match the burst length',
+      );
+    }
     // Fill completion, acknowledged stores, and miss-victim invalidation are
     // mutually exclusive FSM events, so they share the one valid update port.
     // Each one is followed by a cycle with no lookup (fillSettle, storeDone or
     // filling), which the registered update needs.
-    fillValidSet <= fillWrEn & fillWord.eq(lastWord);
+    fillValidSet <= fillCommit;
     final storeValidClear = (storing & memDone & memValid & storeInv).named(
       'storeValidClear',
     );
@@ -1292,8 +1399,7 @@ class HarborL1DCache extends BridgeModule {
           fillIdx,
           mux(storeValidClear, storeIdx, idxOf(addrQ)),
         );
-    tagRam.ram.input('wr_en').srcConnection! <=
-        fillWrEn & fillWord.eq(lastWord);
+    tagRam.ram.input('wr_en').srcConnection! <= fillCommit;
     tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
     tagRam.ram.input('wr_data').srcConnection! <= fillTag;
 
@@ -1312,6 +1418,7 @@ class HarborL1DCache extends BridgeModule {
           faultIsPage < 0,
           memEnR < 0,
           memWeR < 0,
+          memLenR < 0,
           drain < 0,
         ],
         orElse: [
@@ -1332,7 +1439,7 @@ class HarborL1DCache extends BridgeModule {
               memWeR < 0,
               // Only an abandoned refill can enter drain; an in-flight store
               // or bypass read follows its normal completion path below.
-              drain < (filling | drain) & ~memDone,
+              drain < (filling | drain) & ~(memDone & memLast),
             ],
             orElse: [
               fillSettle < 0,
@@ -1344,40 +1451,45 @@ class HarborL1DCache extends BridgeModule {
                 then: [
                   // Waiting out the abandoned op; discard its completion
                   // (filling is 0 so nothing is written) and release.
-                  If(memDone, then: [drain < 0]),
+                  If(memDone & memLast, then: [drain < 0]),
                 ],
                 orElse: [
                   If(
                     filling,
                     then: [
                       If(
-                        memDone & memValid,
+                        memDone,
                         then: [
+                          fillWord < fillWord + 1,
                           If(
-                            fillWord.eq(lastWord),
-                            then: [memEnR < 0, filling < 0, fillSettle < 1],
-                            orElse: [
-                              fillWord < fillWord + 1,
-                              memAddrR <
-                                  (fillBase +
-                                      ((fillWord + 1).zeroExtend(xlen) *
-                                          Const(wordBytes, width: xlen))),
+                            fillBad & ~fillErr,
+                            then: [
+                              fillErr < 1,
+                              fillErrPage < ~memValid & memFault,
                             ],
                           ),
-                        ],
-                      ),
-                      // done AND not valid: the MMU faulted this refill. End the
-                      // fill (never mark the line valid, the data is garbage) and
-                      // pulse faultDone so the core takes a load page fault.
-                      // Without this arm `filling` stays asserted forever and the
-                      // core hangs on the load instead of trapping.
-                      If(
-                        memDone & ~memValid,
-                        then: [
-                          memEnR < 0,
-                          filling < 0,
-                          faultDone < 1,
-                          faultIsPage < memFault,
+                          // An error on any beat drops the line and faults
+                          // the load after the last beat.
+                          If(
+                            memLast,
+                            then: [
+                              memEnR < 0,
+                              filling < 0,
+                              If(
+                                fillErr | fillBad,
+                                then: [
+                                  faultDone < 1,
+                                  faultIsPage <
+                                      mux(
+                                        fillErr,
+                                        fillErrPage,
+                                        ~memValid & memFault,
+                                      ),
+                                ],
+                                orElse: [fillSettle < 1],
+                              ),
+                            ],
+                          ),
                         ],
                       ),
                     ],
@@ -1455,6 +1567,7 @@ class HarborL1DCache extends BridgeModule {
                                   memAddrR < reqAddr,
                                   memWdataR < reqData,
                                   memSizeR < reqSize,
+                                  memLenR < 0,
                                   storeIdx < idxOf(reqAddr),
                                   // ALWAYS drop the line at the stored index.
                                   //
@@ -1515,8 +1628,13 @@ class HarborL1DCache extends BridgeModule {
                                           ),
                                       fillIdx < idxOf(addrQ),
                                       fillTag < fullTagOf(addrQ),
-                                      fillBase < fillLineBase,
                                       fillWord < 0,
+                                      fillErr < 0,
+                                      memLenR <
+                                          Const(
+                                            lineWords - 1,
+                                            width: harborL1MemLenWidth,
+                                          ),
                                       memAddrR < fillLineBase,
                                     ],
                                     orElse: [
@@ -1535,6 +1653,7 @@ class HarborL1DCache extends BridgeModule {
                                           // the MMU makes the Wishbone SEL mask
                                           // from this size.
                                           memSizeR < reqSize,
+                                          memLenR < 0,
                                           memAddrR < addrQ,
                                         ],
                                       ),

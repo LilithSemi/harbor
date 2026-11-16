@@ -32,6 +32,7 @@ void main() {
     final flush = Logic(name: 'flush');
     final memDone = Logic(name: 'mem_done');
     final memValid = Logic(name: 'mem_valid');
+    final memLast = Logic(name: 'mem_last');
     final memRdata = Logic(name: 'mem_rdata', width: 64);
     final memFault = Logic(name: 'mem_fault');
 
@@ -52,6 +53,7 @@ void main() {
       ('flush', flush),
       ('mem_done', memDone),
       ('mem_valid', memValid),
+      ('mem_last', memLast),
       ('mem_rdata', memRdata),
     ]) {
       cache.port(n).getsLogic(l);
@@ -67,6 +69,7 @@ void main() {
     flush.inject(0);
     memDone.inject(0);
     memValid.inject(0);
+    memLast.inject(0);
     memRdata.inject(0);
 
     unawaited(Simulator.run());
@@ -114,9 +117,11 @@ void main() {
         }
         memDone.inject(1);
         memValid.inject(1);
+        memLast.inject(1);
       } else {
         memDone.inject(0);
         memValid.inject(0);
+        memLast.inject(0);
       }
     }
 

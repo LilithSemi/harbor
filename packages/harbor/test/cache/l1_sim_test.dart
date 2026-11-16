@@ -21,6 +21,7 @@ void main() {
     final flush = Logic(name: 'flush');
     final memDone = Logic(name: 'mem_done');
     final memValid = Logic(name: 'mem_valid');
+    final memLast = Logic(name: 'mem_last');
     final memRdata = Logic(name: 'mem_rdata', width: 64);
 
     final cache = HarborL1ICache(
@@ -35,6 +36,7 @@ void main() {
     cache.port('flush').getsLogic(flush);
     cache.port('mem_done').getsLogic(memDone);
     cache.port('mem_valid').getsLogic(memValid);
+    cache.port('mem_last').getsLogic(memLast);
     cache.port('mem_rdata').getsLogic(memRdata);
 
     await cache.build();
@@ -48,6 +50,7 @@ void main() {
     flush.inject(0);
     memDone.inject(0);
     memValid.inject(0);
+    memLast.inject(0);
     memRdata.inject(data);
 
     unawaited(Simulator.run());
@@ -72,6 +75,7 @@ void main() {
       if (asking) memPulses++;
       memDone.inject(asking ? 1 : 0);
       memValid.inject(asking ? 1 : 0);
+      memLast.inject(asking ? 1 : 0);
       if (cache.output('resp_valid').value.toBool()) {
         served = true;
         got = cache.output('resp_data').value.toBigInt();
@@ -113,6 +117,7 @@ void main() {
     final flush = Logic(name: 'flush');
     final memDone = Logic(name: 'mem_done');
     final memValid = Logic(name: 'mem_valid');
+    final memLast = Logic(name: 'mem_last');
     final memRdata = Logic(name: 'mem_rdata', width: 64);
     final memFault = Logic(name: 'mem_fault');
 
@@ -133,6 +138,7 @@ void main() {
       ('flush', flush),
       ('mem_done', memDone),
       ('mem_valid', memValid),
+      ('mem_last', memLast),
       ('mem_rdata', memRdata),
     ]) {
       cache.port(n).getsLogic(l);
@@ -151,10 +157,11 @@ void main() {
     reqWrite.inject(0);
     reqAddr.inject(0);
     reqData.inject(0);
-    reqSize.inject(2);
+    reqSize.inject(3);
     flush.inject(0);
     memDone.inject(0);
     memValid.inject(0);
+    memLast.inject(0);
     memRdata.inject(0);
 
     unawaited(Simulator.run());
@@ -190,9 +197,11 @@ void main() {
         }
         memDone.inject(1);
         memValid.inject(1);
+        memLast.inject(1);
       } else {
         memDone.inject(0);
         memValid.inject(0);
+        memLast.inject(0);
       }
     }
 
@@ -265,6 +274,7 @@ void main() {
       final flush = Logic(name: 'flush');
       final memDone = Logic(name: 'mem_done');
       final memValid = Logic(name: 'mem_valid');
+      final memLast = Logic(name: 'mem_last');
       final memRdata = Logic(name: 'mem_rdata', width: 64);
       final memFault = Logic(name: 'mem_fault');
 
@@ -287,6 +297,7 @@ void main() {
         ('flush', flush),
         ('mem_done', memDone),
         ('mem_valid', memValid),
+        ('mem_last', memLast),
         ('mem_rdata', memRdata),
       ]) {
         cache.port(n).getsLogic(l);
@@ -307,6 +318,7 @@ void main() {
         reqData,
         memDone,
         memValid,
+        memLast,
       ]) {
         l.inject(0);
       }
@@ -329,9 +341,11 @@ void main() {
           memRdata.inject(deviceWord);
           memDone.inject(1);
           memValid.inject(1);
+          memLast.inject(1);
         } else {
           memDone.inject(0);
           memValid.inject(0);
+          memLast.inject(0);
         }
       }
 

@@ -51,7 +51,10 @@ void main() {
 
           final reads = <int>[];
           var pending = 0;
-          var address = 0;
+          var base = 0;
+          var beat = 0;
+          var len = 0;
+          var active = false;
           var cooldown = 0;
           var injectFault = true;
           int dataAt(int a) => a < replacement
@@ -61,27 +64,39 @@ void main() {
           Future<void> step() async {
             await clk.nextPosedge;
             var done = false;
-            if (pending > 0) {
-              pending--;
-              if (pending == 0) {
+            var last = false;
+            if (active) {
+              if (--pending == 0) {
                 done = true;
-                cooldown = 1;
+                last = beat == len;
+                if (last) {
+                  active = false;
+                  cooldown = 1;
+                } else {
+                  pending = 1;
+                }
               }
             } else if (cooldown > 0) {
               cooldown--;
             } else if (out('mem_en')) {
-              address = cache.output('mem_addr').value.toInt();
-              reads.add(address);
+              base = cache.output('mem_addr').value.toInt();
+              len = cache.output('mem_len').value.toInt();
+              beat = 0;
+              reads.add(base);
+              active = true;
               pending = 3;
             }
+            final address = base + beat * wordBytes;
             final fault =
                 done &&
                 injectFault &&
                 address == replacement + faultWord * wordBytes;
             drive('mem_done', done ? 1 : 0);
             drive('mem_valid', done && !fault ? 1 : 0);
+            drive('mem_last', last ? 1 : 0);
             drive('mem_fault', fault ? 1 : 0);
             if (done && !fault) drive('mem_rdata', dataAt(address));
+            if (done) beat++;
           }
 
           Future<void> request(int a, {bool fault = false}) async {
@@ -112,23 +127,18 @@ void main() {
             drive('reset', 0);
             await step();
             await request(victim);
-            expect(reads.length, lineSize ~/ wordBytes);
+            expect(reads, [victim]);
             final beforeHit = reads.length;
             await request(victim);
             expect(reads.length, beforeHit, reason: 'victim must be resident');
 
             await request(replacement, fault: true);
-            expect(reads.sublist(beforeHit), [
-              for (var w = 0; w <= faultWord; w++) replacement + w * wordBytes,
-            ]);
+            expect(reads.sublist(beforeHit), [replacement]);
             final beforeRecovery = reads.length;
             await request(victim);
             expect(
               reads.sublist(beforeRecovery),
-              [
-                for (var w = 0; w < lineSize ~/ wordBytes; w++)
-                  victim + w * wordBytes,
-              ],
+              [victim],
               reason: 'failed replacement must force the victim to refill',
             );
             for (var w = 1; w < lineSize ~/ wordBytes; w++) {

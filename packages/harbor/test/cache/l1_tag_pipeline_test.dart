@@ -11,7 +11,10 @@ class _Bench {
   final int xlen;
   int reads = 0;
   int remaining = 0;
-  BigInt pendingData = BigInt.zero;
+  bool active = false;
+  BigInt base = BigInt.zero;
+  int beat = 0;
+  int len = 0;
 
   _Bench(this.cache, this.clk, this.p, this.xlen);
 
@@ -20,21 +23,33 @@ class _Bench {
 
   Future<void> step() async {
     await clk.nextPosedge;
-    if (remaining == 0 && cache.output('mem_en').value.toBool()) {
+    if (!active && cache.output('mem_en').value.toBool()) {
+      active = true;
       remaining = 3;
+      beat = 0;
+      base = cache.output('mem_addr').value.toBigInt();
+      len = cache.output('mem_len').value.toInt();
+    }
+    if (active && --remaining == 0) {
       reads++;
-      pendingData = value(
-        cache.output('mem_addr').value.toBigInt(),
+      final data = value(
+        base + BigInt.from(beat * (xlen ~/ 8)),
         p['req_ctx']!.value.toInt(),
       );
-    }
-    if (remaining > 0 && --remaining == 0) {
-      p['mem_rdata']!.inject(LogicValue.ofBigInt(pendingData, xlen));
+      p['mem_rdata']!.inject(LogicValue.ofBigInt(data, xlen));
       p['mem_done']!.inject(1);
       p['mem_valid']!.inject(1);
+      p['mem_last']!.inject(beat == len ? 1 : 0);
+      if (beat == len) {
+        active = false;
+      } else {
+        beat++;
+        remaining = 1;
+      }
     } else {
       p['mem_done']!.inject(0);
       p['mem_valid']!.inject(0);
+      p['mem_last']!.inject(0);
     }
   }
 

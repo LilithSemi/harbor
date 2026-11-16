@@ -19,6 +19,7 @@ class _Bench {
   final reqValid = [Logic(name: 'req_valid'), Logic(name: 'req_valid1')];
   final memDone = Logic(name: 'mem_done');
   final memValid = Logic(name: 'mem_valid');
+  final memLast = Logic(name: 'mem_last');
   final memRdata = Logic(name: 'mem_rdata', width: 64);
   final int latency;
   late final HarborL1ICache cache;
@@ -48,6 +49,7 @@ class _Bench {
     cache.port('req_valid1').getsLogic(reqValid[1]);
     cache.port('mem_done').getsLogic(memDone);
     cache.port('mem_valid').getsLogic(memValid);
+    cache.port('mem_last').getsLogic(memLast);
     cache.port('mem_rdata').getsLogic(memRdata);
     await cache.build();
     reset.inject(1);
@@ -58,6 +60,7 @@ class _Bench {
     }
     memDone.inject(0);
     memValid.inject(0);
+    memLast.inject(0);
     memRdata.inject(0);
     unawaited(Simulator.run());
     await step();
@@ -89,6 +92,7 @@ class _Bench {
     }
     memDone.inject(done ? 1 : 0);
     memValid.inject(done ? 1 : 0);
+    memLast.inject(done ? 1 : 0);
     memRdata.inject(done ? _addr : 0);
   }
 

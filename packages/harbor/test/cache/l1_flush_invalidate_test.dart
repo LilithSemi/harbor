@@ -475,6 +475,7 @@ void main() {
       final flush = Logic(name: 'flush');
       final memDone = Logic(name: 'mem_done');
       final memValid = Logic(name: 'mem_valid');
+      final memLast = Logic(name: 'mem_last');
       final memFault = Logic(name: 'mem_fault');
       final memRdata = Logic(name: 'mem_rdata', width: 64);
 
@@ -490,6 +491,7 @@ void main() {
       cache.port('flush').getsLogic(flush);
       cache.port('mem_done').getsLogic(memDone);
       cache.port('mem_valid').getsLogic(memValid);
+      cache.port('mem_last').getsLogic(memLast);
       cache.port('mem_fault').getsLogic(memFault);
       cache.port('mem_rdata').getsLogic(memRdata);
       await cache.build();
@@ -500,6 +502,7 @@ void main() {
       flush.inject(0);
       memDone.inject(0);
       memValid.inject(0);
+      memLast.inject(0);
       memFault.inject(0);
       memRdata.inject(0);
       unawaited(Simulator.run());
@@ -532,6 +535,7 @@ void main() {
           active = true;
         }
         if (doneNow) {
+          memLast.inject(1);
           if (fault) {
             memDone.inject(1);
             memValid.inject(0);
@@ -546,6 +550,7 @@ void main() {
         } else {
           memDone.inject(0);
           memValid.inject(0);
+          memLast.inject(0);
           memFault.inject(0);
         }
       }

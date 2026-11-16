@@ -20,6 +20,7 @@ class _Backing {
     required this.cache,
     required this.memDone,
     required this.memValid,
+    required this.memLast,
     required this.memRdata,
     required this.latency,
   });
@@ -27,6 +28,7 @@ class _Backing {
   final HarborL1DCache cache;
   final Logic memDone;
   final Logic memValid;
+  final Logic memLast;
   final Logic memRdata;
   final int latency;
 
@@ -35,23 +37,34 @@ class _Backing {
   var faultResponse = false;
 
   final mem = <int, BigInt>{};
+
+  /// Base address of every read request, in order.
+  final readLog = <int>[];
   final writeLog = <(int, BigInt)>[];
   var writes = 0;
+
+  /// Read requests served. A line refill is one request.
   var reads = 0;
 
   /// Memory accesses started, faulting ones included.
   var accesses = 0;
+
+  /// Beats given, faulting ones included.
+  var beats = 0;
   var _armed = false;
   var _pending = 0;
-  var _pendA = 0;
+  var _addr = 0;
+  var _len = 0;
+  var _beat = 0;
+  var _size = 3;
   var _pendWe = false;
   BigInt _pendW = BigInt.zero;
 
   /// One clock step with the multi-cycle memory model. The memory takes an
-  /// access whenever `mem_en` is high and it is idle, then answers [latency]
-  /// cycles later with a one-cycle `mem_done`/`mem_valid` pulse. `mem_en` stays
-  /// high across a multi-beat line fill, so arming must be level-based, not
-  /// edge-based.
+  /// access whenever `mem_en` is high and it is idle. It answers [latency]
+  /// cycles later with `mem_len + 1` one-cycle `mem_done` pulses, the last
+  /// with `mem_last`. `mem_en` stays high across a line refill, so arming is
+  /// level based, not edge based.
   Future<void> step() async {
     await cache.input('clk').srcConnection!.nextPosedge;
     final en = cache.output('mem_en').value.toBool();
@@ -59,38 +72,57 @@ class _Backing {
       _armed = true;
       accesses++;
       _pending = latency;
-      _pendA = cache.output('mem_addr').value.toInt() & ~7;
+      _beat = 0;
+      _addr = cache.output('mem_addr').value.toInt();
+      _len = cache.output('mem_len').value.toInt();
+      _size = cache.output('mem_size').value.toInt();
       _pendWe = cache.output('mem_we').value.toBool();
       final w = cache.output('mem_wdata').value;
       _pendW = w.isValid ? w.toBigInt() : BigInt.zero;
+      if (!_pendWe) {
+        reads++;
+        readLog.add(_addr & ~7);
+      }
     }
     var doneNow = false;
     if (_armed) {
       _pending--;
-      if (_pending <= 0) {
-        doneNow = true;
-        _armed = false;
-      }
+      if (_pending <= 0) doneNow = true;
     }
-    if (doneNow) {
-      if (faultResponse) {
-        memDone.inject(1);
-        memValid.inject(0);
-        return;
-      }
-      if (_pendWe) {
-        mem[_pendA] = _pendW;
-        writeLog.add((_pendA, _pendW));
-        writes++;
-      } else {
-        reads++;
-        memRdata.inject(mem[_pendA] ?? BigInt.zero);
-      }
-      memDone.inject(1);
-      memValid.inject(1);
-    } else {
+    if (!doneNow) {
       memDone.inject(0);
       memValid.inject(0);
+      memLast.inject(0);
+      return;
+    }
+    final last = _beat == _len;
+    beats++;
+    memLast.inject(last ? 1 : 0);
+    memDone.inject(1);
+    if (faultResponse) {
+      memValid.inject(0);
+    } else {
+      memValid.inject(1);
+      final base = _addr & ~7;
+      if (_pendWe) {
+        final bytes = 1 << _size;
+        final shift = 8 * (_addr - base);
+        final mask = ((BigInt.one << (8 * bytes)) - BigInt.one) << shift;
+        final old = mem[base] ?? BigInt.zero;
+        mem[base] = (old & ~mask) | ((_pendW << shift) & mask);
+        writeLog.add((base, mem[base]!));
+        writes++;
+      } else {
+        final word = mem[base + _beat * 8] ?? BigInt.zero;
+        final shift = _len == 0 ? 8 * (_addr - base) : 0;
+        memRdata.inject(word >> shift);
+      }
+    }
+    _beat++;
+    if (last) {
+      _armed = false;
+    } else {
+      _pending = 1;
     }
   }
 }
@@ -124,6 +156,7 @@ Future<_Dut> makeDut({
     'flush': Logic(name: 'flush'),
     'mem_done': Logic(name: 'mem_done'),
     'mem_valid': Logic(name: 'mem_valid'),
+    'mem_last': Logic(name: 'mem_last'),
     'mem_rdata': Logic(name: 'mem_rdata', width: 64),
     'mem_fault': Logic(name: 'mem_fault'),
     if (ctxBits > 0) 'req_ctx': Logic(name: 'req_ctx', width: ctxBits),
@@ -151,6 +184,7 @@ Future<_Dut> makeDut({
   ports['flush']!.inject(0);
   ports['mem_done']!.inject(0);
   ports['mem_valid']!.inject(0);
+  ports['mem_last']!.inject(0);
   ports['mem_rdata']!.inject(0);
   // This suite's denied responses model MMU page faults.
   ports['mem_fault']!.inject(1);
@@ -162,6 +196,7 @@ Future<_Dut> makeDut({
     cache: cache,
     memDone: ports['mem_done']!,
     memValid: ports['mem_valid']!,
+    memLast: ports['mem_last']!,
     memRdata: ports['mem_rdata']!,
     latency: latency,
   );
@@ -565,9 +600,7 @@ void main() {
     dut['req_valid'].inject(0);
     dut['req_write'].inject(0);
     dut['req_size'].inject(3);
-    // The backing model is word granular, so model the merge here: what matters
-    // is that the cache goes back to memory instead of answering from the line.
-    dut.backing.mem[base] = BigInt.parse('AAAAAAAAAAAA5AAA', radix: 16);
+    final readsBefore = dut.backing.reads;
     dut['req_addr'].inject(base);
     dut['req_write'].inject(0);
     dut['req_valid'].inject(1);
@@ -583,8 +616,13 @@ void main() {
     expect(acked, isTrue);
     expect(
       got,
-      equals(BigInt.parse('AAAAAAAAAAAA5AAA', radix: 16)),
+      equals(BigInt.parse('AAAAAAAA5AAAAAAA', radix: 16)),
       reason: 'the byte store left a stale line resident',
+    );
+    expect(
+      dut.backing.reads,
+      readsBefore + 1,
+      reason: 'the store must drop the resident line',
     );
   });
 

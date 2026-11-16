@@ -31,6 +31,7 @@ void main() {
       final flush = Logic(name: 'flush');
       final memDone = Logic(name: 'mem_done');
       final memValid = Logic(name: 'mem_valid');
+      final memLast = Logic(name: 'mem_last');
       final memRdata = Logic(name: 'mem_rdata', width: 64);
 
       // Two distinct single-word lines (lineSize 8 = 1 word/line).
@@ -52,6 +53,7 @@ void main() {
       cache.port('flush').getsLogic(flush);
       cache.port('mem_done').getsLogic(memDone);
       cache.port('mem_valid').getsLogic(memValid);
+      cache.port('mem_last').getsLogic(memLast);
       cache.port('mem_rdata').getsLogic(memRdata);
       await cache.build();
 
@@ -61,6 +63,7 @@ void main() {
       flush.inject(0);
       memDone.inject(0);
       memValid.inject(0);
+      memLast.inject(0);
       memRdata.inject(0);
 
       unawaited(Simulator.run());
@@ -99,9 +102,11 @@ void main() {
           memRdata.inject(backing[latchedAddr] ?? BigInt.zero);
           memDone.inject(1);
           memValid.inject(1);
+          memLast.inject(1);
         } else {
           memDone.inject(0);
           memValid.inject(0);
+          memLast.inject(0);
         }
       }
 

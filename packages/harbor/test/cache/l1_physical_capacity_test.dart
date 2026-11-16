@@ -42,16 +42,21 @@ void main() {
           await clk.nextPosedge;
           final memory = <int, int>{};
           var pending = 0, address = 0, data = 0, reads = 0, writes = 0;
-          var write = false;
+          var base = 0, beat = 0, len = 0;
+          var write = false, active = false;
           Future<void> step() async {
             await clk.nextPosedge;
-            if (pending == 0 && cache.memEn.value.toBool()) {
+            if (!active && cache.memEn.value.toBool()) {
+              active = true;
               pending = 3;
-              address = cache.memAddr.value.toInt();
+              beat = 0;
+              base = cache.memAddr.value.toInt();
+              len = cache.output('mem_len').value.toInt();
               write = cache.memWe.value.toBool();
               data = write ? cache.memWdata.value.toInt() : 0;
             }
-            if (pending > 0 && --pending == 0) {
+            if (active && --pending == 0) {
+              address = base + beat * (xlen ~/ 8);
               if (write) {
                 memory[address] = data;
                 writes++;
@@ -61,9 +66,17 @@ void main() {
               p['mem_rdata']!.inject(memory[address] ?? (address ^ 0x55aa55aa));
               p['mem_done']!.inject(1);
               p['mem_valid']!.inject(1);
+              p['mem_last']!.inject(beat == len ? 1 : 0);
+              if (beat == len) {
+                active = false;
+              } else {
+                beat++;
+                pending = 1;
+              }
             } else {
               p['mem_done']!.inject(0);
               p['mem_valid']!.inject(0);
+              p['mem_last']!.inject(0);
             }
           }
 
