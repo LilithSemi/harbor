@@ -66,7 +66,7 @@ List<List<int>> _transpose(List<List<int>> m) => [
 /// access lands in the low word on both a 32-bit and a 64-bit fabric, and the
 /// byte-address decode needs no high/low-half selection):
 /// - 0x000: ENGINE_CTRL     (enable, reset, power state)
-/// - 0x008: ENGINE_STATUS   (busy sessions, idle, error)
+/// - 0x008: ENGINE_STATUS   ([0] a DMA bus error stopped a session, W1C)
 /// - 0x010: ENGINE_CAPS     (supported codecs bitmask, read-only)
 /// - 0x018: ENGINE_VERSION  (hardware version, read-only)
 /// - 0x020: INT_STATUS      (per-session done/error bits, W1C)
@@ -74,7 +74,8 @@ List<List<int>> _transpose(List<List<int>> m) => [
 ///
 /// Per-session registers (0x100 + session * 0x100):
 /// - +0x00: SESS_CTRL       (codec select, direction, start, abort)
-/// - +0x08: SESS_STATUS     (idle/busy/done/error, progress)
+/// - +0x08: SESS_STATUS     (1 busy, 2 done, 4 DMA bus error. A DMA adapter
+///                            timeout also reads as 4.)
 /// - +0x10: SESS_SRC_ADDR   (source buffer DMA address)
 /// - +0x18: SESS_SRC_SIZE   (source buffer size in bytes)
 /// - +0x20: SESS_DST_ADDR   (destination buffer DMA address)
@@ -192,6 +193,10 @@ class HarborMediaEngine extends BridgeModule
     addOutput('dma_write_req');
     createPort('dma_write_ack', PortDirection.input);
 
+    // High with `dma_read_valid` or `dma_write_ack` when the request got a
+    // bus error. The read data is then not valid.
+    createPort('dma_err', PortDirection.input);
+
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
@@ -223,6 +228,9 @@ class HarborMediaEngine extends BridgeModule
     final engineCaps = Const(capsBits, width: 32);
 
     interrupt <= (intStatus & intEnable).or();
+    final dmaFault =
+        (input('dma_err') & (input('dma_read_valid') | input('dma_write_ack')))
+            .named('dma_fault');
 
     // Per-session state
     final sessCtrl = <Logic>[
@@ -958,9 +966,22 @@ class HarborMediaEngine extends BridgeModule
                         orElse: [bus.dataOut < engineCtrl],
                       ),
                     ]),
-                    // ENGINE_STATUS
+                    // ENGINE_STATUS ([0] a DMA bus error stopped a session,
+                    // write 1 to clear)
                     CaseItem(Const(0x08, width: 8), [
-                      bus.dataOut < engineStatus,
+                      If(
+                        bus.we,
+                        then: [
+                          If(
+                            bus.selAny(0x08, 1) & bus.dataIn[0],
+                            then: [
+                              engineStatus <
+                                  (engineStatus & ~Const(1, width: 32)),
+                            ],
+                          ),
+                        ],
+                        orElse: [bus.dataOut < engineStatus],
+                      ),
                     ]),
                     // ENGINE_CAPS
                     CaseItem(Const(0x10, width: 8), [bus.dataOut < engineCaps]),
@@ -1748,6 +1769,27 @@ class HarborMediaEngine extends BridgeModule
               ),
             ]),
           ]),
+
+          // A bus error on a DMA access stops the session. Its status reads
+          // 4, ENGINE_STATUS[0] sets and the session interrupt bit sets. The
+          // session does not count as done.
+          If(
+            dmaFault & ~engState.eq(Const(stIdle, width: 5)),
+            then: [
+              dmaReadReqReg < Const(0),
+              dmaWriteReqReg < Const(0),
+              engState < Const(stIdle, width: 5),
+              engineStatus < (engineStatus | Const(1, width: 32)),
+              for (var i = 0; i < maxSessions; i++)
+                If(
+                  activeSess.eq(Const(i, width: sessW)),
+                  then: [
+                    sessStatus[i] < Const(4, width: 32),
+                    intStatus < (intStatus | Const(1 << i, width: maxSessions)),
+                  ],
+                ),
+            ],
+          ),
         ],
       ),
     ]);

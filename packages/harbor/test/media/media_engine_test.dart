@@ -649,6 +649,7 @@ void main() {
       final widx = eng.output('dma_write_addr').getRange(4, 8);
       final wdata = eng.output('dma_write_data');
       eng.input('dma_write_ack').srcConnection! <= wreq;
+      eng.input('dma_err').srcConnection! <= Const(0);
       Sequential(clk, [
         If(
           reset,
@@ -896,6 +897,7 @@ void main() {
         final widx = eng.output('dma_write_addr').getRange(4, 8);
         final wdata = eng.output('dma_write_data');
         eng.input('dma_write_ack').srcConnection! <= wreq;
+        eng.input('dma_err').srcConnection! <= Const(0);
         Sequential(clk, [
           If(
             reset,
@@ -1030,6 +1032,7 @@ void main() {
         final widx = eng.output('dma_write_addr').getRange(4, 8);
         final wdata = eng.output('dma_write_data');
         eng.input('dma_write_ack').srcConnection! <= wreq;
+        eng.input('dma_err').srcConnection! <= Const(0);
         Sequential(clk, [
           If(
             reset,
@@ -1166,6 +1169,7 @@ void main() {
       final widx = eng.output('dma_write_addr').getRange(4, 8);
       final wdata = eng.output('dma_write_data');
       eng.input('dma_write_ack').srcConnection! <= wreq;
+      eng.input('dma_err').srcConnection! <= Const(0);
       Sequential(clk, [
         If(
           reset,
@@ -1317,6 +1321,7 @@ void main() {
       final widx = eng.output('dma_write_addr').getRange(4, 8);
       final wdata = eng.output('dma_write_data');
       eng.input('dma_write_ack').srcConnection! <= wreq;
+      eng.input('dma_err').srcConnection! <= Const(0);
       Sequential(clk, [
         If(
           reset,
@@ -1451,6 +1456,7 @@ void main() {
       final widx = eng.output('dma_write_addr').getRange(4, 8);
       final wdata = eng.output('dma_write_data');
       eng.input('dma_write_ack').srcConnection! <= wreq;
+      eng.input('dma_err').srcConnection! <= Const(0);
       Sequential(clk, [
         If(
           reset,
@@ -1611,6 +1617,7 @@ void main() {
         final widx = eng.output('dma_write_addr').getRange(4, 8);
         final wdata = eng.output('dma_write_data');
         eng.input('dma_write_ack').srcConnection! <= wreq;
+        eng.input('dma_err').srcConnection! <= Const(0);
         Sequential(clk, [
           If(
             reset,
@@ -1798,6 +1805,7 @@ void main() {
           final widx = eng.output('dma_write_addr').getRange(4, 8);
           final wdata = eng.output('dma_write_data');
           eng.input('dma_write_ack').srcConnection! <= wreq;
+          eng.input('dma_err').srcConnection! <= Const(0);
           Sequential(clk, [
             If(
               reset,
@@ -2028,6 +2036,7 @@ void main() {
         final widx = eng.output('dma_write_addr').getRange(4, 9);
         final wdata = eng.output('dma_write_data');
         eng.input('dma_write_ack').srcConnection! <= wreq;
+        eng.input('dma_err').srcConnection! <= Const(0);
         Sequential(clk, [
           If(
             reset,
@@ -2217,6 +2226,7 @@ void main() {
         final widx = eng.output('dma_write_addr').getRange(4, 8);
         final wdata = eng.output('dma_write_data');
         eng.input('dma_write_ack').srcConnection! <= wreq;
+        eng.input('dma_err').srcConnection! <= Const(0);
         Sequential(clk, [
           If(
             reset,
@@ -2384,6 +2394,7 @@ void main() {
       final widx = eng.output('dma_write_addr').getRange(4, 8);
       final wdata = eng.output('dma_write_data');
       eng.input('dma_write_ack').srcConnection! <= wreq;
+      eng.input('dma_err').srcConnection! <= Const(0);
       Sequential(clk, [
         If(
           reset,
@@ -2554,6 +2565,7 @@ void main() {
         final widx = eng.output('dma_write_addr').getRange(4, 8);
         final wdata = eng.output('dma_write_data');
         eng.input('dma_write_ack').srcConnection! <= wreq;
+        eng.input('dma_err').srcConnection! <= Const(0);
         Sequential(clk, [
           If(
             reset,
@@ -2731,6 +2743,7 @@ void main() {
         for (var byte = 15; byte >= 0; byte--) wbe[byte].replicate(8),
       ].concat();
       eng.input('dma_write_ack').srcConnection! <= wreq;
+      eng.input('dma_err').srcConnection! <= Const(0);
       Sequential(clk, [
         If(
           reset,
@@ -2930,6 +2943,7 @@ void main() {
         final widx = eng.output('dma_write_addr').getRange(4, 9);
         final wdata = eng.output('dma_write_data');
         eng.input('dma_write_ack').srcConnection! <= wreq;
+        eng.input('dma_err').srcConnection! <= Const(0);
         Sequential(clk, [
           If(
             reset,
@@ -3113,6 +3127,7 @@ void main() {
         final widx = eng.output('dma_write_addr').getRange(4, 9);
         final wdata = eng.output('dma_write_data');
         eng.input('dma_write_ack').srcConnection! <= wreq;
+        eng.input('dma_err').srcConnection! <= Const(0);
         BigInt mvBeat(int b) {
           final m = mvs[b];
           return BigInt.from(
@@ -3311,6 +3326,7 @@ void main() {
         for (var byte = 15; byte >= 0; byte--) wbe[byte].replicate(8),
       ].concat();
       eng.input('dma_write_ack').srcConnection! <= wreq;
+      eng.input('dma_err').srcConnection! <= Const(0);
       Sequential(clk, [
         If(
           reset,
@@ -3464,6 +3480,7 @@ void _registerBusTests(HarborFabricKind kind) {
       eng.input('dma_read_data').srcConnection! <= Const(0, width: 128);
       eng.input('dma_read_valid').srcConnection! <= Const(0);
       eng.input('dma_write_ack').srcConnection! <= Const(0);
+      eng.input('dma_err').srcConnection! <= Const(0);
 
       await eng.build();
       bus.idle();

@@ -27,6 +27,7 @@ void main() {
       media.port('dma_read_data').getsLogic(Const(0, width: 128));
       media.port('dma_read_valid').getsLogic(Const(0));
       media.port('dma_write_ack').getsLogic(Const(0));
+      media.port('dma_err').getsLogic(Const(0));
 
       final tb = PeripheralTestBench(media);
       await tb.init();
@@ -53,6 +54,7 @@ void main() {
       media.port('dma_read_data').getsLogic(Const(0, width: 128));
       media.port('dma_read_valid').getsLogic(Const(0));
       media.port('dma_write_ack').getsLogic(Const(0));
+      media.port('dma_err').getsLogic(Const(0));
 
       final tb = PeripheralTestBench(media);
       await tb.init();
@@ -79,6 +81,7 @@ void main() {
       media.port('dma_read_data').getsLogic(Const(0, width: 128));
       media.port('dma_read_valid').getsLogic(Const(0));
       media.port('dma_write_ack').getsLogic(Const(0));
+      media.port('dma_err').getsLogic(Const(0));
 
       final tb = PeripheralTestBench(media);
       await tb.init();
