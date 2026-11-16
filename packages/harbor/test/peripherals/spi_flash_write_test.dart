@@ -172,6 +172,7 @@ void main() {
       final miso = Logic(name: 'miso');
 
       final flash = HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig(
           size: 1024 * 1024,
           mode: HarborSpiFlashMode.standard,
@@ -289,8 +290,11 @@ void main() {
         wrAddr.inject(address);
         wrLen.inject(length);
         wrReq.inject(1);
-        // Present byte for current index continuously.
+        // Hold the request until the engine takes it, as the DFU sink does.
         await clk.nextPosedge;
+        while (!(wrBusy.value.isValid && wrBusy.value.toBool())) {
+          await clk.nextPosedge;
+        }
         wrReq.inject(0);
         // Service the data callback until done.
         var guard = 0;

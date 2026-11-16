@@ -586,14 +586,23 @@ class UsbDfuFlashSink extends BridgeModule {
     required int flashBase,
     int fifoDepth = 128,
     String? name,
-  }) => UsbDfuFlashSink(
-    flashBase: flashBase,
-    sectorSize: controller.config.sectorSize,
-    pageSize: controller.config.pageSize,
-    addrWidth: controller.config.addressBytes * 8,
-    fifoDepth: fifoDepth,
-    name: name,
-  );
+  }) {
+    if (!HarborSpiFlashController.supportsWriteEngine(controller.config)) {
+      throw ArgumentError.value(
+        controller.config,
+        'controller',
+        'the write engine needs 4 KiB sectors and 3-byte addresses',
+      );
+    }
+    return UsbDfuFlashSink(
+      flashBase: flashBase,
+      sectorSize: controller.config.sectorSize,
+      pageSize: controller.config.pageSize,
+      addrWidth: controller.config.addressBytes * 8,
+      fifoDepth: fifoDepth,
+      name: name,
+    );
+  }
 
   UsbDfuFlashSink({
     required this.flashBase,

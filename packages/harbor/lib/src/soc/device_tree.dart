@@ -91,6 +91,9 @@ class HarborDeviceTreeNode with HarborPrettyString {
   /// Address range (`reg` property): base address and size.
   final BusAddressRange reg;
 
+  /// More `reg` entries after [reg], in order.
+  final List<BusAddressRange> extraReg;
+
   /// Interrupt numbers this device sources.
   final List<int> interrupts;
 
@@ -111,6 +114,7 @@ class HarborDeviceTreeNode with HarborPrettyString {
   const HarborDeviceTreeNode({
     required this.compatible,
     required this.reg,
+    this.extraReg = const [],
     this.interrupts = const [],
     this.interruptController = false,
     this.interruptCells = 1,
@@ -185,6 +189,18 @@ class HarborDeviceTreeNode with HarborPrettyString {
 mixin HarborDeviceTreeNodeProvider {
   /// The device tree node for this device.
   HarborDeviceTreeNode get dtNode;
+
+  /// More nodes for the same device, emitted after [dtNode]. They get no
+  /// interrupts from the SoC.
+  List<HarborDeviceTreeNode> get extraDtNodes => const [];
+}
+
+/// A peripheral with more than one slave port. [HarborSoC.addPeripheral]
+/// maps each port in [secondarySlaves] into the fabric, as
+/// [HarborSoC.addPeripheralSlave] does.
+mixin HarborSecondarySlaveProvider {
+  /// The slave ports after the port named `bus`.
+  List<({String busInterfaceName, BusAddressRange range})> get secondarySlaves;
 }
 
 /// Interface for devices that back usable system RAM (DRAM, etc.).
@@ -262,8 +278,9 @@ class HarborDeviceTreeGenerator {
   });
 
   /// All device tree nodes from the peripherals.
-  List<HarborDeviceTreeNode> get nodes =>
-      peripherals.map((p) => p.dtNode).toList();
+  List<HarborDeviceTreeNode> get nodes => [
+    for (final p in peripherals) ...[p.dtNode, ...p.extraDtNodes],
+  ];
 
   /// Encodes [value] as [cells] 32-bit device-tree cells, most-significant
   /// first (big-endian cell order), e.g. cells=2 -> `0x<hi> 0x<lo>`.
@@ -412,20 +429,30 @@ class HarborDeviceTreeGenerator {
         );
       }
 
-      for (final p in peripherals) {
-        final node = p.dtNode;
-        final irqList = interrupts[p] ?? node.interrupts;
+      final entries = [
+        for (final p in peripherals) ...[
+          (p, p.dtNode, true),
+          for (final extra in p.extraDtNodes) (p, extra, false),
+        ],
+      ];
+      for (final (p, node, primary) in entries) {
+        final irqList = primary
+            ? (interrupts[p] ?? node.interrupts)
+            : node.interrupts;
         buf.writeln();
-        final label = node.interruptController ? '${controllerLabel(p)}: ' : '';
+        final label = primary && node.interruptController
+            ? '${controllerLabel(p)}: '
+            : '';
         buf.writeln('        $label${node.nodeName} {');
         final compatStr = node.compatible.map((c) => '"$c"').join(', ');
         buf.writeln('            compatible = $compatStr;');
         buf.writeln(
-          '            reg = <${_regCells(node.reg.start, addressCells)} '
-          '${_regCells(node.reg.size, sizeCells)}>;',
+          '            reg = <${[
+            for (final r in [node.reg, ...node.extraReg]) '${_regCells(r.start, addressCells)} ${_regCells(r.size, sizeCells)}',
+          ].join(' ')}>;',
         );
 
-        if (node.interruptController) {
+        if (primary && node.interruptController) {
           buf.writeln('            interrupt-controller;');
           buf.writeln(
             '            #interrupt-cells = <${node.interruptCells}>;',
@@ -508,6 +535,7 @@ class HarborDeviceTreeGenerator {
     if (value is List<int>) {
       return '<${value.map((v) => '0x${v.toRadixString(16)}').join(' ')}>';
     }
+    if (value is List<String>) return value.map((v) => '"$v"').join(', ');
     return '"$value"';
   }
 }

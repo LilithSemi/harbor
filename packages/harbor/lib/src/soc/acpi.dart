@@ -58,6 +58,9 @@ mixin HarborAcpiDeviceProvider {
   /// Returning null does not affect the device-tree output, which still
   /// describes the peripheral in full.
   HarborAcpiDevice? get acpiDevice;
+
+  /// More ACPI devices for the same peripheral, after [acpiDevice].
+  List<HarborAcpiDevice> get extraAcpiDevices => const [];
 }
 
 class HarborAcpiGenerator {
@@ -110,8 +113,12 @@ class HarborAcpiGenerator {
 
   /// ACPI device nodes from the peripherals. Peripherals with no valid ACPI
   /// representation return null and are omitted.
-  List<HarborAcpiDevice> get devices =>
-      peripherals.map((p) => p.acpiDevice).nonNulls.toList();
+  List<HarborAcpiDevice> get devices => [
+    for (final p in peripherals) ...[
+      if (p.acpiDevice != null) p.acpiDevice!,
+      ...p.extraAcpiDevices,
+    ],
+  ];
 
   /// Generates the DSDT ASL source as a string.
   ///
@@ -134,19 +141,21 @@ class HarborAcpiGenerator {
     if (cpus.isNotEmpty && peripherals.isNotEmpty) buf.writeln();
 
     // Skip peripherals with no ACPI representation (see acpiDevice above).
-    final acpiProviders = peripherals
-        .where((p) => p.acpiDevice != null)
-        .toList();
-    for (var i = 0; i < acpiProviders.length; i++) {
+    final entries = [
+      for (final p in peripherals) ...[
+        if (p.acpiDevice != null) (p, p.acpiDevice!, true),
+        for (final extra in p.extraAcpiDevices) (p, extra, false),
+      ],
+    ];
+    for (var i = 0; i < entries.length; i++) {
       if (i > 0) buf.writeln();
-      final provider = acpiProviders[i];
-      final dev = provider.acpiDevice!;
+      final (provider, dev, primary) = entries[i];
       _writeDevice(
         buf,
         dev,
         i,
-        interrupts[provider] ?? dev.interrupts,
-        _isInterruptController(provider),
+        primary ? (interrupts[provider] ?? dev.interrupts) : dev.interrupts,
+        primary && _isInterruptController(provider),
       );
     }
 

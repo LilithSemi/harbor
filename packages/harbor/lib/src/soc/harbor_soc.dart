@@ -565,6 +565,12 @@ class HarborSoC extends BridgeModule {
         busTimeoutCycles: busTimeoutCycles,
       ),
     );
+    if (peripheral is HarborSecondarySlaveProvider) {
+      for (final slave
+          in (peripheral as HarborSecondarySlaveProvider).secondarySlaves) {
+        addPeripheralSlave(peripheral, slave.busInterfaceName, slave.range);
+      }
+    }
     _wireOnce(peripheral, clockDomainName);
     if (peripheral.tryInput(BusSlavePort.fabricClkPort) != null) {
       final (clk, reset) = defaultClock;
@@ -767,26 +773,59 @@ class HarborSoC extends BridgeModule {
         .toList();
     errors.addAll(validateAddressMappings(mappings));
 
+    // A second port may sit inside its own peripheral's window, but not in
+    // the window of another peripheral or of another second port.
+    for (final (i, a) in _secondarySlaves.indexed) {
+      for (final b in _secondarySlaves.skip(i + 1)) {
+        final x = a.addressRange;
+        final y = b.addressRange;
+        if (x.start < y.end && y.start < x.end) {
+          errors.add(
+            '${a.module.name}.${a.busInterfaceName} overlaps '
+            '${b.module.name}.${b.busInterfaceName}: $x and $y',
+          );
+        }
+      }
+    }
+    for (final slave in _secondarySlaves) {
+      for (final e in _peripherals) {
+        if (identical(e.module, slave.module)) continue;
+        final a = slave.addressRange;
+        final b = e.addressRange;
+        if (a.start < b.end && b.start < a.end) {
+          errors.add(
+            '${slave.module.name}.${slave.busInterfaceName} overlaps '
+            '${e.module.name}: $a and $b',
+          );
+        }
+      }
+    }
+
     // Register maps: internal overlaps and out-of-block registers. The register
     // map and its block size both come from the SVD view, so they are checked
     // against a single source.
     for (final entry in _peripherals) {
       final m = entry.module;
       if (m is! HarborSvdPeripheralProvider) continue;
-      final sp = (m as HarborSvdPeripheralProvider).svdPeripheral;
-      final regs = sp.registers;
-      if (regs == null) continue;
+      final provider = m as HarborSvdPeripheralProvider;
+      for (final sp in [
+        provider.svdPeripheral,
+        ...provider.extraSvdPeripherals,
+      ]) {
+        final regs = sp.registers;
+        if (regs == null) continue;
 
-      for (final overlap in regs.validate()) {
-        errors.add('${sp.name}: $overlap');
-      }
-      for (final f in regs.fields) {
-        if (f.end > sp.size) {
-          errors.add(
-            "${sp.name}: register '${f.name}' @ 0x${f.offset.toRadixString(16)} "
-            '(${f.width}B) exceeds address block size '
-            '0x${sp.size.toRadixString(16)}',
-          );
+        for (final overlap in regs.validate()) {
+          errors.add('${sp.name}: $overlap');
+        }
+        for (final f in regs.fields) {
+          if (f.end > sp.size) {
+            errors.add(
+              "${sp.name}: register '${f.name}' @ 0x${f.offset.toRadixString(16)} "
+              '(${f.width}B) exceeds address block size '
+              '0x${sp.size.toRadixString(16)}',
+            );
+          }
         }
       }
     }

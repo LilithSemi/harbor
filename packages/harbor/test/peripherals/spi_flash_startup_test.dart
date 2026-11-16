@@ -20,6 +20,7 @@ void main() {
     final miso = Logic(name: 'miso');
 
     final flash = HarborSpiFlashController(
+      clockHz: 100000000,
       config: const HarborSpiFlashConfig(
         size: 1024 * 1024,
         mode: HarborSpiFlashMode.standard,

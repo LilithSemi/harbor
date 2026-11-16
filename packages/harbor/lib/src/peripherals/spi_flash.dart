@@ -1,3 +1,5 @@
+import 'dart:math' show max;
+
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
@@ -9,7 +11,10 @@ import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
+import '../memory/mmu_config.dart';
 import '../util/pretty_string.dart';
+import 'device_register.dart';
+import 'spi_flash_cpu_port.dart';
 
 /// SPI flash operating mode.
 enum HarborSpiFlashMode {
@@ -38,10 +43,15 @@ class HarborFlashPartition {
   /// Byte size of the partition.
   final int size;
 
+  /// Marks the partition `read-only` in the node an OS driver binds to, so
+  /// the OS refuses to write it. The default is false: Harbor never sets it.
+  final bool osReadOnly;
+
   const HarborFlashPartition({
     required this.label,
     required this.offset,
     required this.size,
+    this.osReadOnly = false,
   });
 
   @override
@@ -86,6 +96,26 @@ class HarborSpiFlashConfig with HarborPrettyString {
   /// genip computes this from the target (see [HarborFlashPartition]).
   final List<HarborFlashPartition> partitions;
 
+  /// Longest time in ms that a 4 KiB sector erase may keep the part busy. The
+  /// write engine ends the op with an error after this time. Set it above
+  /// the data sheet maximum of the part.
+  final int eraseTimeoutMs;
+
+  /// Longest time in ms that a page program may keep the part busy.
+  final int programTimeoutMs;
+
+  /// Data sheet maximum in ms of a 4 KiB sector erase, or null when the preset
+  /// has none. A timeout below it is rejected at build time.
+  final int? eraseMaxMs;
+
+  /// Data sheet maximum in ms of a page program, or null when the preset has
+  /// none.
+  final int? programMaxMs;
+
+  /// Time in ns that CS# must stay high between two frames (tSHSL). The
+  /// controller holds CS# high for this long, rounded up to whole clocks.
+  final int tShslNs;
+
   const HarborSpiFlashConfig({
     required this.size,
     this.spiFrequency = 25000000,
@@ -97,6 +127,11 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.dummyCycles = 0,
     this.readAheadWords = 1,
     this.partitions = const [],
+    this.eraseTimeoutMs = 3000,
+    this.programTimeoutMs = 50,
+    this.eraseMaxMs,
+    this.programMaxMs,
+    this.tShslNs = 50,
   });
 
   /// W25Q128: common 16MB SPI flash (e.g., on iCEBreaker, OrangeCrab).
@@ -105,7 +140,12 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.mode = HarborSpiFlashMode.quad,
     this.readAheadWords = 1,
     this.partitions = const [],
-  }) : size = 16 * 1024 * 1024,
+    this.eraseTimeoutMs = 3000,
+    this.programTimeoutMs = 50,
+    this.tShslNs = 50,
+  }) : eraseMaxMs = 400,
+       programMaxMs = 3,
+       size = 16 * 1024 * 1024,
        pageSize = 256,
        sectorSize = 4096,
        readCommand = 0x6B, // Quad Output Fast Read
@@ -118,7 +158,31 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.mode = HarborSpiFlashMode.quad,
     this.readAheadWords = 1,
     this.partitions = const [],
-  }) : size = 16 * 1024 * 1024,
+    this.eraseTimeoutMs = 3000,
+    this.programTimeoutMs = 50,
+    this.tShslNs = 50,
+  }) : eraseMaxMs = null,
+       programMaxMs = null,
+       size = 16 * 1024 * 1024,
+       pageSize = 256,
+       sectorSize = 4096,
+       readCommand = 0x6B,
+       addressBytes = 3,
+       dummyCycles = 8;
+
+  /// N25Q128: 16MB SPI flash (e.g., on KC705 and AX7203). The quad output
+  /// fast read takes 8 dummy cycles with the power-up configuration.
+  const HarborSpiFlashConfig.n25q128({
+    this.spiFrequency = 50000000,
+    this.mode = HarborSpiFlashMode.quad,
+    this.readAheadWords = 1,
+    this.partitions = const [],
+    this.eraseTimeoutMs = 3000,
+    this.programTimeoutMs = 50,
+    this.tShslNs = 50,
+  }) : eraseMaxMs = 800,
+       programMaxMs = 5,
+       size = 16 * 1024 * 1024,
        pageSize = 256,
        sectorSize = 4096,
        readCommand = 0x6B,
@@ -131,12 +195,105 @@ class HarborSpiFlashConfig with HarborPrettyString {
     this.mode = HarborSpiFlashMode.quad,
     this.readAheadWords = 1,
     this.partitions = const [],
-  }) : size = 32 * 1024 * 1024,
+    this.eraseTimeoutMs = 3000,
+    this.programTimeoutMs = 50,
+    this.tShslNs = 50,
+  }) : eraseMaxMs = null,
+       programMaxMs = null,
+       size = 32 * 1024 * 1024,
        pageSize = 256,
        sectorSize = 4096,
        readCommand = 0x6C, // 4-byte addr quad read
        addressBytes = 4,
        dummyCycles = 8;
+
+  /// This config with another partition list.
+  HarborSpiFlashConfig copyWith({
+    required List<HarborFlashPartition> partitions,
+  }) => HarborSpiFlashConfig(
+    size: size,
+    spiFrequency: spiFrequency,
+    mode: mode,
+    pageSize: pageSize,
+    sectorSize: sectorSize,
+    readCommand: readCommand,
+    addressBytes: addressBytes,
+    dummyCycles: dummyCycles,
+    readAheadWords: readAheadWords,
+    partitions: partitions,
+    eraseTimeoutMs: eraseTimeoutMs,
+    programTimeoutMs: programTimeoutMs,
+    eraseMaxMs: eraseMaxMs,
+    programMaxMs: programMaxMs,
+    tShslNs: tShslNs,
+  );
+
+  /// Most partitions a flash can have. The write port lock mask has one bit
+  /// for each.
+  static const maxPartitions = 32;
+
+  /// Throws an [ArgumentError] when [partitions] cannot describe this flash:
+  /// more than [maxPartitions], an empty or repeated label, a partition that
+  /// is not sector aligned, empty or outside the flash, or two that overlap.
+  void validatePartitions() {
+    if (eraseTimeoutMs < 1) {
+      throw ArgumentError.value(
+        eraseTimeoutMs,
+        'eraseTimeoutMs',
+        'must be >= 1',
+      );
+    }
+    if (tShslNs < 0) {
+      throw ArgumentError.value(tShslNs, 'tShslNs', 'must be >= 0');
+    }
+    final eraseMax = eraseMaxMs;
+    if (eraseMax != null && eraseTimeoutMs < eraseMax) {
+      throw ArgumentError.value(
+        eraseTimeoutMs,
+        'eraseTimeoutMs',
+        'is below the data sheet maximum of $eraseMax ms',
+      );
+    }
+    final programMax = programMaxMs;
+    if (programMax != null && programTimeoutMs < programMax) {
+      throw ArgumentError.value(
+        programTimeoutMs,
+        'programTimeoutMs',
+        'is below the data sheet maximum of $programMax ms',
+      );
+    }
+    if (programTimeoutMs < 1) {
+      throw ArgumentError.value(
+        programTimeoutMs,
+        'programTimeoutMs',
+        'must be >= 1',
+      );
+    }
+    if (partitions.length > maxPartitions) {
+      throw ArgumentError.value(
+        partitions.length,
+        'partitions',
+        'at most $maxPartitions partitions',
+      );
+    }
+    final labels = <String>{};
+    for (final (i, a) in partitions.indexed) {
+      void bad(String why) =>
+          throw ArgumentError.value(a, 'partitions[$i]', why);
+      if (a.label.isEmpty) bad('label is empty');
+      if (!labels.add(a.label)) bad('label is used twice');
+      if (a.size <= 0) bad('size must be above 0');
+      if (a.offset < 0 || a.offset + a.size > size) bad('outside the flash');
+      if (a.offset % sectorSize != 0 || a.size % sectorSize != 0) {
+        bad('offset and size must be multiples of $sectorSize');
+      }
+      for (final b in partitions.take(i)) {
+        if (a.offset < b.offset + b.size && b.offset < a.offset + a.size) {
+          bad('overlaps ${b.label}');
+        }
+      }
+    }
+  }
 
   @override
   String toString() =>
@@ -176,11 +333,27 @@ class HarborSpiFlashConfig with HarborPrettyString {
 ///
 /// Supports XIP (Execute In Place): the CPU can fetch instructions
 /// directly from the SPI flash.
+///
+/// The write command port (`wr_req`, `wr_op`, `wr_addr`, `wr_len`,
+/// `wr_data`) belongs to the DFU sink. The caller keeps `wr_req` high until
+/// `wr_busy` rises, because the engine takes a request only when the read
+/// FSM is idle and CS# has been high long enough.
 class HarborSpiFlashController extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborSecondarySlaveProvider {
+  /// Clocks that CS# stays high between frames: [tShslNs] rounded up to whole
+  /// clocks of [clockHz], at least 1.
+  static int csHighClocks(int tShslNs, int clockHz) =>
+      max(1, (tShslNs * clockHz + 999999999) ~/ 1000000000);
+
+  /// True when the write engine can program [config]. The engine sends the
+  /// 4 KiB erase 0x20 and the 3-byte page program 0x02 only.
+  static bool supportsWriteEngine(HarborSpiFlashConfig config) =>
+      config.sectorSize == 4096 && config.addressBytes == 3;
+
   /// Full SCK cycles sent with CS# high after reset. The first STARTUPE2
   /// USRCCLKO edges after configuration do not reach the pin (UG470).
   static const startupClocks = 8;
@@ -193,6 +366,18 @@ class HarborSpiFlashController extends BridgeModule
 
   /// Bus slave port (CPU side).
   late final BusSlavePort bus;
+
+  /// Width of the bus in bytes.
+  final int busBytes;
+
+  /// Base address of the CPU write port window, or null when the build has no
+  /// CPU write port. The port is a [HarborSpiFlashCpuPort] on the bus slave
+  /// port `cpu_bus`.
+  final int? cpuPortBase;
+
+  /// Register slave port of the CPU write port. Only built when
+  /// [cpuPortBase] is set.
+  BusSlavePort? cpuPortBus;
 
   HarborSpiFlashController({
     required this.config,
@@ -213,14 +398,16 @@ class HarborSpiFlashController extends BridgeModule
     // constraint file applies the pin + IOSTANDARD). Leave false when a
     // hand-written top or shared-bus mux owns the pads (e.g. Tiny Tapeout).
     bool ownPads = false,
-    // I4: WIP-poll watchdog bound (number of RDSR poll iterations before the
-    // write engine gives up and raises wr_err). The default (~1M) is many
-    // orders beyond any real sector-erase time, lower it for fast simulation.
-    int writePollLimit = (1 << 20) - 1,
+    // Frequency in Hz of the `clk` input. The write engine counts these
+    // clocks to time out a busy part, and holds CS# high for tSHSL. The SPI
+    // clock is this clock over 2.
+    required int clockHz,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     bool crossFabricClock = false,
+    this.cpuPortBase,
     String? name,
-  }) : super(
+  }) : busBytes = (busDataWidth ?? 32) ~/ 8,
+       super(
          harborStableDefinitionName('HarborSpiFlashController', [
            ...BusSlavePort.definitionNameParts(
              kind: fabricKind,
@@ -234,19 +421,45 @@ class HarborSpiFlashController extends BridgeModule
            'rc0x${config.readCommand.toRadixString(16)}',
            'ra${config.readAheadWords}',
            'sz${config.size}',
-           'wp$writePollLimit',
+           'hz$clockHz',
+           'te${config.eraseTimeoutMs}',
+           'tp${config.programTimeoutMs}',
            if (useUsrmclk) 'usrmclk',
            if (useStartupe2) 'startupe2',
            if (ownPads) 'ownpads',
+           'sh${config.tShslNs}',
+           if (cpuPortBase != null) 'cpuport',
          ]),
          name: name ?? 'spi_flash',
        ) {
-    if (writePollLimit < 1) {
+    final hz = clockHz;
+    if (hz < 1) throw ArgumentError.value(hz, 'clockHz', 'must be >= 1');
+    config.validatePartitions();
+    final portBase = cpuPortBase;
+    if (portBase != null && !supportsWriteEngine(config)) {
       throw ArgumentError.value(
-        writePollLimit,
-        'writePollLimit',
-        'must be >= 1',
+        config,
+        'config',
+        'the write engine needs 4 KiB sectors and 3-byte addresses',
       );
+    }
+    if (portBase != null) {
+      const window = HarborSpiFlashCpuPort.windowBytes;
+      if (portBase % window != 0) {
+        throw ArgumentError.value(
+          portBase,
+          'cpuPortBase',
+          'must be aligned to $window bytes',
+        );
+      }
+      if (portBase < baseAddress + config.size &&
+          baseAddress < portBase + window) {
+        throw ArgumentError.value(
+          portBase,
+          'cpuPortBase',
+          'must be outside the XIP window',
+        );
+      }
     }
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -277,6 +490,10 @@ class HarborSpiFlashController extends BridgeModule
     // same-width interfaces), the byte address is masked to the part's span
     // internally for the SPI read command.
     final addrWidth = busAddressWidth ?? config.size.bitLength;
+    final fabricClock = BusSlavePort.fabricClockInputs(
+      this,
+      cross: crossFabricClock,
+    );
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
@@ -285,11 +502,20 @@ class HarborSpiFlashController extends BridgeModule
       reset: input('reset'),
       addressWidth: addrWidth,
       dataWidth: busDataWidth ?? 32,
-      fabricClock: BusSlavePort.fabricClockInputs(
-        this,
-        cross: crossFabricClock,
-      ),
+      fabricClock: fabricClock,
     );
+    if (portBase != null) {
+      cpuPortBus = BusSlavePort.create(
+        module: this,
+        name: 'cpu_bus',
+        kind: fabricKind,
+        clk: input('clk'),
+        reset: input('reset'),
+        addressWidth: max(addrWidth, 12),
+        dataWidth: busDataWidth ?? 32,
+        fabricClock: fabricClock,
+      );
+    }
 
     // Write and erase command interface for the DFU flash sink, separate
     // from the CPU bus. The engine presents the next index on wr_data_index
@@ -345,6 +571,11 @@ class HarborSpiFlashController extends BridgeModule
     // at the bottom). gated stb keeps the read FSM parked in sIdle while busy.
     final wrBusy = output('wr_busy');
     final stb = (bus.stb & ~wrBusy).named('rd_stb_gated');
+    // The CPU port request, driven where the port is built below. The read
+    // FSM starts no flash command in the cycle the write engine starts, so
+    // the engine never takes the pins in the middle of a read frame.
+    final cpuBus = cpuPortBus;
+    final cpuReq = cpuBus == null ? null : Logic(name: 'cpu_port_req');
 
     // SPI state machine
     // On ECP5 the clock lives on an internal net feeding USRMCLK, otherwise it
@@ -377,6 +608,23 @@ class HarborSpiFlashController extends BridgeModule
     final bitCount = Logic(name: 'bit_count', width: 8);
     final spiState = Logic(name: 'spi_state', width: 3);
     final ioDir = Logic(name: 'io_dir'); // 0=output, 1=input
+
+    final wrStart =
+        (cpuReq == null ? input('wr_req') : input('wr_req') | cpuReq) &
+        spiState.eq(Const(0, width: 3));
+
+    // CS# stays high for at least tSHSL between two frames. csCnt counts the
+    // clocks the CS# pin has been high. A frame may start in a cycle where
+    // CS# is high and the count is csHigh - 1 or more, so CS# is high for
+    // csHigh clocks including that one.
+    final csHigh = csHighClocks(config.tShslNs, hz);
+    final csWidth = csHigh.bitLength;
+    final csCnt = csHigh > 1
+        ? Logic(name: 'cs_high_cnt', width: csWidth)
+        : null;
+    final csOk = csCnt == null
+        ? Const(1)
+        : csCnt.gte(Const(csHigh - 1, width: csWidth));
 
     // States
     const sIdle = 0;
@@ -513,20 +761,25 @@ class HarborSpiFlashController extends BridgeModule
                           ack < Const(1),
                         ],
                         orElse: [
-                          spiCsN < Const(0),
-                          // Command left-aligned to bit busWidth-1 (shifted out MSB-
-                          // first, 1-bit on DQ0).
-                          shiftReg <
-                              Const(
-                                config.readCommand << (busWidth - 8),
-                                width: busWidth,
-                              ),
-                          bitCount < Const(0, width: 8),
-                          wordIdx < Const(0, width: 8),
-                          reqAddr < addr32,
-                          orphan < Const(0),
-                          ioDir < Const(0), // output (drive DQ0)
-                          spiState < Const(sSendCmd, width: 3),
+                          If(
+                            ~wrStart & csOk,
+                            then: [
+                              spiCsN < Const(0),
+                              // Command left-aligned to bit busWidth-1 (shifted
+                              // out MSB-first, 1-bit on DQ0).
+                              shiftReg <
+                                  Const(
+                                    config.readCommand << (busWidth - 8),
+                                    width: busWidth,
+                                  ),
+                              bitCount < Const(0, width: 8),
+                              wordIdx < Const(0, width: 8),
+                              reqAddr < addr32,
+                              orphan < Const(0),
+                              ioDir < Const(0), // output (drive DQ0)
+                              spiState < Const(sSendCmd, width: 3),
+                            ],
+                          ),
                         ],
                       ),
                     ],
@@ -728,13 +981,24 @@ class HarborSpiFlashController extends BridgeModule
     final wrAddrL = Logic(name: 'wr_addr_l', width: wrAddrWidth);
     final wrLenL = Logic(name: 'wr_len_l', width: 9);
     final wrStatus = Logic(name: 'wr_status', width: 8);
-    // I4: count the number of RDSR poll iterations, abort if WIP never clears.
-    // The default bound (writePollLimit, ~1M) covers a worst-case slow sector
-    // erase (~400ms on typical parts at thousands of system clocks per RDSR)
-    // with huge margin, yet stays bounded so a dead part can't hang forever.
-    final pollCountWidth = writePollLimit.bitLength + 1;
-    final wrPollCount = Logic(name: 'wr_poll_count', width: pollCountWidth);
-    final wrPollLimit = Const(writePollLimit, width: pollCountWidth);
+    // Count clocks from the start of the RDSR poll phase. A part that is
+    // still busy when the count reaches the limit of the op ends the op with
+    // an error, so a dead part cannot hold wr_busy for ever.
+    int limitOf(int ms) => max(1, ms * hz ~/ 1000);
+    final eraseLimit = limitOf(config.eraseTimeoutMs);
+    final programLimit = limitOf(config.programTimeoutMs);
+    // The count can pass the limit by one poll, which is 34 clocks.
+    final timerWidth = (max(eraseLimit, programLimit) + 64).bitLength;
+    final wrTimer = Logic(name: 'wr_timer', width: timerWidth);
+    final wrTimeLimit = mux<Logic>(
+      wrOpL,
+      Const(programLimit, width: timerWidth),
+      Const(eraseLimit, width: timerWidth),
+    );
+    final inPoll = [
+      for (final st in [wEnd, wStatLow, wStatCmd, wStatRead, wStatHigh])
+        wrState.eq(Const(st, width: 4)),
+    ].reduce((a, b) => a | b);
 
     // wr_busy is high in every state except idle.
     wrBusy <= ~wrState.eq(Const(wIdle, width: 4));
@@ -750,7 +1014,35 @@ class HarborSpiFlashController extends BridgeModule
     // an addressBytes*8 address (3-byte -> <<8, 4-byte -> <<0).
     final wrAddrAligned =
         wrAddrL.zeroExtend(32) << Const(32 - wrAddrWidth, width: 32);
-    final wrDataLoad = input('wr_data').zeroExtend(32) << Const(24, width: 32);
+    // The CPU port shares the engine with the DFU sink. A DFU request wins
+    // when both wait, and an op that has started always finishes.
+    var reqOp = input('wr_op');
+    var reqAddr0 = input('wr_addr');
+    var reqLen = input('wr_len');
+    var engData = input('wr_data');
+    if (cpuBus != null && cpuReq != null) {
+      final dfuReq = input('wr_req');
+      final port = HarborSpiFlashCpuPort.build(
+        bus: cpuBus,
+        clk: clk,
+        flashSize: config.size,
+        partitions: [
+          for (final part in config.partitions)
+            (offset: part.offset, size: part.size),
+        ],
+        addrWidth: wrAddrWidth,
+        take: (wrStart & csOk & ~dfuReq & ~wrBusy).named('take_cpu'),
+        engDone: wrDoneReg,
+        engErr: wrErrReg,
+        engIdx: wrByteIdx,
+      );
+      cpuReq <= port.req;
+      reqOp = mux(dfuReq, reqOp, port.op);
+      reqAddr0 = mux(dfuReq, reqAddr0, port.addr);
+      reqLen = mux(dfuReq, reqLen, port.len);
+      engData = mux(port.run, port.data, engData);
+    }
+    final wrDataLoad = engData.zeroExtend(32) << Const(24, width: 32);
 
     Sequential(clk, [
       If(
@@ -769,18 +1061,19 @@ class HarborSpiFlashController extends BridgeModule
           wrAddrL < Const(0, width: wrAddrWidth),
           wrLenL < Const(0, width: 9),
           wrStatus < Const(0, width: 8),
-          wrPollCount < Const(0, width: pollCountWidth),
+          wrTimer < Const(0, width: timerWidth),
         ],
         orElse: [
           wrDoneReg < Const(0),
+          If(inPoll, then: [wrTimer < (wrTimer + Const(1, width: timerWidth))]),
           Case(wrState, [
-            // IDLE: wait for wr_req, latch op/addr/len. B1 INTERLOCK: only
-            // ACCEPT the request when the READ FSM is idle (spiState == sIdle)
-            // so the pin owner-mux never hands the SPI pins to the write engine
-            // mid-read-frame (CS low). If wr_req arrives during a read frame it
-            // is HELD pending here: the caller must keep wr_req asserted until
-            // it is accepted (wr_busy rises). The handoff therefore only ever
-            // happens at a clean CS-high boundary (read retired to sIdle).
+            // IDLE: wait for a request, latch op/addr/len. Accept it only when
+            // the read FSM is idle and CS# has been high long enough. While a
+            // request waits, the read FSM starts no new flash command (see
+            // wrStart), so a read cannot start in the accept cycle. A request
+            // that arrives during a read frame is held until the frame ends.
+            // The DFU caller keeps wr_req asserted until wr_busy rises. The
+            // hand-off therefore happens at a CS-high boundary.
             //
             // Minor validation: reject a zero-length page-program, and a
             // program that would cross the 256-byte page boundary (real flash
@@ -791,20 +1084,20 @@ class HarborSpiFlashController extends BridgeModule
               wrClk < Const(0),
               wrCsN < Const(1),
               If(
-                input('wr_req') & spiState.eq(Const(sIdle, width: 3)),
+                wrStart & csOk,
                 then: [
-                  wrOpL < input('wr_op'),
-                  wrAddrL < input('wr_addr'),
-                  wrLenL < input('wr_len'),
+                  wrOpL < reqOp,
+                  wrAddrL < reqAddr0,
+                  wrLenL < reqLen,
                   wrByteIdx < Const(0, width: 9),
                   wrErrReg < Const(0), // clear sticky err on a fresh accept
-                  wrPollCount < Const(0, width: pollCountWidth),
+                  wrTimer < Const(0, width: timerWidth),
                   If(
                     // Invalid page-program: len==0, or (addr&0xFF)+len > 256.
-                    input('wr_op') &
-                        (input('wr_len').eq(Const(0, width: 9)) |
-                            (input('wr_addr').getRange(0, 8).zeroExtend(10) +
-                                    input('wr_len').zeroExtend(10))
+                    reqOp &
+                        (reqLen.eq(Const(0, width: 9)) |
+                            (reqAddr0.getRange(0, 8).zeroExtend(10) +
+                                    reqLen.zeroExtend(10))
                                 .gt(Const(256, width: 10))),
                     then: [
                       // Reject: raise wr_err + pulse wr_done, stay idle, no pins.
@@ -847,15 +1140,20 @@ class HarborSpiFlashController extends BridgeModule
 
             // WREN_HIGH: one cycle of CS high, then start the command frame.
             CaseItem(Const(wWrenHigh, width: 4), [
-              wrCsN < Const(0),
-              wrBitCount < Const(0, width: 8),
-              wrShift <
-                  mux<Logic>(
-                    wrOpL,
-                    Const(cmdProgram << 24, width: 32),
-                    Const(cmdErase << 24, width: 32),
-                  ),
-              wrState < Const(wCmd, width: 4),
+              If(
+                csOk,
+                then: [
+                  wrCsN < Const(0),
+                  wrBitCount < Const(0, width: 8),
+                  wrShift <
+                      mux<Logic>(
+                        wrOpL,
+                        Const(cmdProgram << 24, width: 32),
+                        Const(cmdErase << 24, width: 32),
+                      ),
+                  wrState < Const(wCmd, width: 4),
+                ],
+              ),
             ]),
 
             // CMD: shift 8 bits of the opcode, then load the 24-bit address.
@@ -964,17 +1262,19 @@ class HarborSpiFlashController extends BridgeModule
               wrState < Const(wStatLow, width: 4),
             ]),
 
-            // STAT_LOW: CS low, load RDSR (0x05). I4: bump the poll watchdog on
-            // each poll iteration so a part whose WIP never clears can't pin
-            // wr_busy forever.
+            // STAT_LOW: CS low, load RDSR (0x05).
             CaseItem(Const(wStatLow, width: 4), [
-              wrCsN < Const(0),
-              wrDriveOut < Const(1),
-              wrShift < Const(cmdRdsr << 24, width: 32),
-              wrBitCount < Const(0, width: 8),
-              wrStatus < Const(0, width: 8),
-              wrPollCount < (wrPollCount + Const(1, width: pollCountWidth)),
-              wrState < Const(wStatCmd, width: 4),
+              If(
+                csOk,
+                then: [
+                  wrCsN < Const(0),
+                  wrDriveOut < Const(1),
+                  wrShift < Const(cmdRdsr << 24, width: 32),
+                  wrBitCount < Const(0, width: 8),
+                  wrStatus < Const(0, width: 8),
+                  wrState < Const(wStatCmd, width: 4),
+                ],
+              ),
             ]),
 
             // STAT_CMD: shift 8 bits of RDSR out, then release DQ0 to read.
@@ -1021,17 +1321,16 @@ class HarborSpiFlashController extends BridgeModule
               ),
             ]),
 
-            // STAT_HIGH: inspect WIP (status bit0). Busy -> poll again, UNLESS
-            // the watchdog tripped (I4): then abort, raise wr_err, and finish
-            // so the caller learns the part is stuck instead of hanging. WIP
-            // clear -> done normally.
+            // STAT_HIGH: inspect WIP (status bit0). Busy -> poll again, unless
+            // the timer reached the limit of the op: then end the op with
+            // wr_err. WIP clear -> done.
             CaseItem(Const(wStatHigh, width: 4), [
               wrCsN < Const(1),
               If(
                 wrStatus[0], // WIP still set
                 then: [
                   If(
-                    wrPollCount.gte(wrPollLimit),
+                    wrTimer.gte(wrTimeLimit),
                     then: [
                       // Watchdog timeout: give up, flag the error, finish.
                       wrErrReg < Const(1),
@@ -1062,11 +1361,31 @@ class HarborSpiFlashController extends BridgeModule
     // does. This is a hard hand-off, never an interleave: a CPU bus request
     // that arrives while wr_busy is high is HELD (stb is gated, the read FSM
     // stays in sIdle and never acks) until the write completes, then it runs
-    // normally. In the DFU flash-download use case the maskrom is in download
-    // mode so the CPU is not doing XIP, making this simple mux sufficient.
+    // normally. A waiting request also keeps the read FSM from starting a new
+    // frame, so the pins change owner only while CS# is high.
     final pinClk = mux(wrBusy, wrClk, spiClk).named('spi_clk_pin');
     final pinCsN = mux(wrBusy, wrCsN, spiCsN).named('spi_cs_n_pin');
     output('spi_cs_n') <= pinCsN;
+    if (csCnt != null) {
+      Sequential(clk, [
+        If(
+          reset,
+          then: [csCnt < Const(0, width: csWidth)],
+          orElse: [
+            If(
+              pinCsN,
+              then: [
+                If(
+                  csCnt.lt(Const(csHigh, width: csWidth)),
+                  then: [csCnt < (csCnt + Const(1, width: csWidth))],
+                ),
+              ],
+              orElse: [csCnt < Const(0, width: csWidth)],
+            ),
+          ],
+        ),
+      ]);
+    }
     // On ECP5 the clock lives on an internal net feeding USRMCLK (no pad),
     // otherwise it is the spi_clk pad.
     final clkNet = (useUsrmclk || useStartupe2)
@@ -1100,18 +1419,27 @@ class HarborSpiFlashController extends BridgeModule
           ? [Const(1), Const(1), Const(0), mosiBit]
                 .concat() // {D3,D2,D1,D0}
           : [Const(0), mosiBit].concat(); // dual {D1,D0}
-      // Drive all lines together (outputs when driveOut, inputs otherwise).
+      // IO0 and IO1 are outputs when driveOut is high and inputs otherwise.
+      // IO2 (WP#) and IO3 (HOLD#) are outputs that hold 1 whenever the engine
+      // runs and whenever the read FSM is outside its dummy and data phases,
+      // so they never float. Only the quad data phase releases them.
+      final holdOut = (wrBusy | ~ioDir).named('spi_hold_out');
       if (ownPads) {
-        // Own the pad: drive the inout `spi_io` through one bus tristate (synth
-        // infers the IOBUF) and read it back. driveOut gates the whole bus,
-        // matching the split path where oe = driveOut replicated.
         final pad = inOut('spi_io');
-        pad <= TriStateBuffer(ioOut, enable: driveOut).out;
+        pad.getRange(0, 2) <=
+            TriStateBuffer(ioOut.getRange(0, 2), enable: driveOut).out;
+        if (ioWidth == 4) {
+          pad.getRange(2, 4) <=
+              TriStateBuffer(ioOut.getRange(2, 4), enable: holdOut).out;
+        }
         spiIoIn <= pad;
         statBit <= pad[1];
       } else {
         output('spi_io_out') <= ioOut;
-        output('spi_io_oe') <= driveOut.replicate(ioWidth);
+        output('spi_io_oe') <=
+            (ioWidth == 4
+                ? [holdOut, holdOut, driveOut, driveOut].concat()
+                : driveOut.replicate(ioWidth));
         spiIoIn <= input('spi_io_in');
         // Status (RDSR) returns on DQ1 in standard-mode framing.
         statBit <= input('spi_io_in')[1];
@@ -1131,53 +1459,151 @@ class HarborSpiFlashController extends BridgeModule
     }
   }
 
+  /// Physical memory attributes of the XIP window. With a CPU write port the
+  /// flash changes under the window, so the region is IO and not cacheable,
+  /// read-only and executable. Without the port it is cacheable read-only
+  /// memory. A core takes this region in its PMA map.
+  HarborPmaRegion get xipPma {
+    final widths = [for (var w = 1; w <= busBytes; w *= 2) w];
+    return cpuPortBase == null
+        ? HarborPmaRegion(
+            start: baseAddress,
+            size: config.size,
+            memoryType: HarborPmaMemoryType.memory,
+            ordering: HarborPmaOrdering.relaxed,
+            executable: true,
+            readable: true,
+            writable: false,
+            atomicSupport: false,
+            misalignedSupport: true,
+            accessWidths: widths,
+            idempotent: true,
+          )
+        : HarborPmaRegion(
+            start: baseAddress,
+            size: config.size,
+            memoryType: HarborPmaMemoryType.io,
+            ordering: HarborPmaOrdering.channel,
+            executable: true,
+            readable: true,
+            writable: false,
+            atomicSupport: false,
+            misalignedSupport: false,
+            accessWidths: widths,
+            idempotent: true,
+          );
+  }
+
+  /// Physical memory attributes of the 4 KiB CPU port window as plain IO, or
+  /// null when the build has no port.
+  HarborPmaRegion? get ctrlPma => cpuPortBase == null
+      ? null
+      : HarborPmaRegion.io(
+          start: cpuPortBase!,
+          size: HarborSpiFlashCpuPort.windowBytes,
+        );
+
+  BusAddressRange get _xipRange => BusAddressRange(baseAddress, config.size);
+
+  BusAddressRange? get _portRange => cpuPortBase == null
+      ? null
+      : BusAddressRange(cpuPortBase!, HarborSpiFlashCpuPort.windowBytes);
+
+  Map<String, Object> get _speedProperties => {
+    'spi-max-frequency': config.spiFrequency,
+    if (config.mode == HarborSpiFlashMode.quad) 'spi-tx-bus-width': 4,
+    if (config.mode == HarborSpiFlashMode.dual) 'spi-tx-bus-width': 2,
+  };
+
+  Map<String, Object> get _geometryProperties => {
+    'harbor,flash-size': config.size,
+    'harbor,erase-size': 4096,
+    'harbor,page-size': config.pageSize,
+    'harbor,erase-timeout-ms': config.eraseTimeoutMs,
+    'harbor,program-timeout-ms': config.programTimeoutMs,
+  };
+
+  // A `fixed-partitions` map (the standard Linux MTD binding): the FSBL reads
+  // it for the firmware offset and Linux exposes each as /dev/mtdN. Only the
+  // node an OS driver binds to carries `read-only`.
+  List<HarborDeviceTreeChild> _partitionChildren({required bool osView}) =>
+      config.partitions.isEmpty
+      ? const []
+      : [
+          HarborDeviceTreeChild(
+            name: 'partitions',
+            properties: const {
+              'compatible': 'fixed-partitions',
+              '#address-cells': 1,
+              '#size-cells': 1,
+            },
+            children: [
+              for (final part in config.partitions)
+                HarborDeviceTreeChild(
+                  name: 'partition@${part.offset.toRadixString(16)}',
+                  properties: {
+                    'reg': [part.offset, part.size],
+                    'label': part.label,
+                    if (osView && part.osReadOnly) 'read-only': true,
+                  },
+                ),
+            ],
+          ),
+        ];
+
   @override
   HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(
     compatible: ['jedec,spi-nor'],
-    reg: BusAddressRange(baseAddress, config.size),
+    reg: _xipRange,
+    extraReg: [if (_portRange != null) _portRange!],
     properties: {
-      'spi-max-frequency': config.spiFrequency,
-      if (config.mode == HarborSpiFlashMode.quad) 'spi-tx-bus-width': 4,
-      if (config.mode == HarborSpiFlashMode.dual) 'spi-tx-bus-width': 2,
+      ..._speedProperties,
+      if (_portRange != null) 'reg-names': ['xip', 'ctrl'],
     },
-    // A `fixed-partitions` map (the standard Linux MTD binding): the FSBL reads
-    // it for the firmware offset and Linux exposes each as /dev/mtdN.
-    children: config.partitions.isEmpty
-        ? const []
-        : [
-            HarborDeviceTreeChild(
-              name: 'partitions',
-              properties: const {
-                'compatible': 'fixed-partitions',
-                '#address-cells': 1,
-                '#size-cells': 1,
-              },
-              children: [
-                for (final part in config.partitions)
-                  HarborDeviceTreeChild(
-                    name: 'partition@${part.offset.toRadixString(16)}',
-                    properties: {
-                      'reg': [part.offset, part.size],
-                      'label': part.label,
-                    },
-                  ),
-              ],
-            ),
-          ],
+    children: _partitionChildren(osView: false),
   );
+
+  @override
+  List<HarborDeviceTreeNode> get extraDtNodes => _portRange == null
+      ? const []
+      : [
+          HarborDeviceTreeNode(
+            compatible: ['harbor,spi-flash-port'],
+            reg: _portRange!,
+            extraReg: [_xipRange],
+            properties: {
+              'reg-names': ['ctrl', 'xip'],
+              ..._geometryProperties,
+            },
+            children: _partitionChildren(osView: true),
+          ),
+        ];
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(
     hid: 'PRP0001',
     uid: 0,
-    memory: [BusAddressRange(baseAddress, config.size)],
+    memory: [_xipRange],
     properties: {
       'compatible': ['jedec,spi-nor'],
-      'spi-max-frequency': config.spiFrequency,
-      if (config.mode == HarborSpiFlashMode.quad) 'spi-tx-bus-width': 4,
-      if (config.mode == HarborSpiFlashMode.dual) 'spi-tx-bus-width': 2,
+      ..._speedProperties,
     },
   );
+
+  @override
+  List<HarborAcpiDevice> get extraAcpiDevices => _portRange == null
+      ? const []
+      : [
+          HarborAcpiDevice(
+            hid: 'PRP0001',
+            uid: 1,
+            memory: [_portRange!, _xipRange],
+            properties: {
+              'compatible': ['harbor,spi-flash-port'],
+              ..._geometryProperties,
+            },
+          ),
+        ];
 
   @override
   HarborSvdPeripheral get svdPeripheral => HarborSvdPeripheral(
@@ -1187,4 +1613,44 @@ class HarborSpiFlashController extends BridgeModule
     baseAddress: baseAddress,
     size: config.size,
   );
+
+  @override
+  List<HarborSvdPeripheral> get extraSvdPeripherals => _portRange == null
+      ? const []
+      : [
+          HarborSvdPeripheral(
+            name: 'SPIFLASH_PORT',
+            groupName: 'SPIFLASH_PORT',
+            description: 'SPI NOR flash write port with lock range',
+            baseAddress: cpuPortBase!,
+            size: HarborSpiFlashCpuPort.windowBytes,
+            registers: HarborDeviceRegisterMap(
+              name: 'spi_flash_port',
+              fields: [
+                const HarborDeviceField(name: 'ctrl', width: 4, offset: 0x00),
+                const HarborDeviceField(name: 'addr', width: 4, offset: 0x04),
+                const HarborDeviceField(name: 'len', width: 4, offset: 0x08),
+                const HarborDeviceField(name: 'status', width: 4, offset: 0x0c),
+                const HarborDeviceField(
+                  name: 'lock_mask',
+                  width: 4,
+                  offset: 0x10,
+                ),
+                const HarborDeviceField(name: 'claim', width: 4, offset: 0x1c),
+                for (var i = 0; i < 64; i++)
+                  HarborDeviceField(
+                    name: 'page$i',
+                    width: 4,
+                    offset: 0x100 + 4 * i,
+                  ),
+              ],
+            ),
+          ),
+        ];
+
+  @override
+  List<({String busInterfaceName, BusAddressRange range})>
+  get secondarySlaves => _portRange == null
+      ? const []
+      : [(busInterfaceName: 'cpu_bus', range: _portRange!)];
 }
