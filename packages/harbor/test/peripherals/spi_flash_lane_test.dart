@@ -119,13 +119,13 @@ void _laneTest(HarborFabricKind kind) {
       }
     }());
 
-    final data = await bus.read(0);
+    final wide = await bus.accessWide(0, write: false);
     done = true;
 
     final mask32 = (BigInt.one << 32) - BigInt.one;
-    // RegBus.read gives back a signed 64-bit int (the high bit is set for
-    // this word), so recover the unsigned bit pattern before comparing.
-    final bigData = BigInt.from(data).toUnsigned(64);
+    // accessWide returns the data as a BigInt, so the high bit of the word
+    // is not clamped. Read it as unsigned.
+    final bigData = wide.data.toUnsigned(64);
     // Full 64-bit little-endian word.
     expect(
       bigData,
