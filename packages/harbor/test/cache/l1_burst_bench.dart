@@ -204,6 +204,7 @@ class BurstDut {
     bool checkMemLast = true,
     bool physical = false,
     bool snoop = false,
+    HarborDeviceTarget? target,
     void Function(Module cache, Logic clk)? connect,
     int latency = 3,
     int gap = 0,
@@ -217,6 +218,7 @@ class BurstDut {
             ),
             xlen: xlen,
             checkMemLast: checkMemLast,
+            target: target,
           )
         : HarborL1DCache(
             config: HarborL1dCacheConfig(
@@ -228,6 +230,7 @@ class BurstDut {
             physicalAddresses: physical,
             snoop: snoop,
             checkMemLast: checkMemLast,
+            target: target,
             memFaultIn: Logic(name: 'mem_fault_in'),
           );
     final clk = SimpleClockGenerator(10).clk;

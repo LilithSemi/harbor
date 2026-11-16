@@ -7,10 +7,15 @@ import '../peripherals/register_file.dart';
 import '../soc/target.dart';
 import 'cache_config.dart';
 
-/// Largest L1 tag store, in bits, that stays in flops on small Lattice FPGAs.
-/// Xilinx uses block RAM even below this limit: wide tag read muxes and reset
-/// fanout are expensive routing resources on a dense 7-series design.
+/// Largest L1 tag store, in bits, that stays in flops on an iCE40. One iCE40
+/// block RAM holds 4096 bits. The iCE40 has no LUT RAM.
 const harborL1TagFlopBits = 4096;
+
+/// Most lines of an L1 tag store in LUT RAM on ECP5 and Xilinx targets. Up to
+/// this depth the LUT RAM read is one level of RAM and a small mux, and it
+/// costs fewer resources than a column of block RAMs. A deeper store uses
+/// block RAM.
+const harborL1TagLutRamLines = 64;
 
 /// Width of the `mem_len` output of an L1 cache. It is the same as
 /// LEN width of a Harbor memory waist.
@@ -36,12 +41,23 @@ void _l1CheckInSim(Logic clk, Logic reset, Logic bad, String what) {
 }
 
 /// Line tag store of an L1 cache. Its read latency is 1 on every target.
-/// Xilinx stores use block RAM. Other targets use flops up to
-/// [harborL1TagFlopBits] bits and block RAM above that limit.
+///
+/// - ECP5 and Xilinx: LUT RAM up to [harborL1TagLutRamLines] lines, block RAM
+///   above. The RAM has a `ram_style` attribute, so synthesis keeps it in LUT
+///   RAM. In a 4 KiB, 64-byte-line D-cache bench on an ECP5 85F this uses
+///   about 500 LUT4 more than two EBRs and is about 8 MHz faster. On an
+///   xc7s50 it frees one RAMB36 and costs about 6 to 21 MHz, the most with
+///   snoop at 4 KiB and 64-byte lines.
+/// - iCE40: flops up to [harborL1TagFlopBits] bits, block RAM above.
+/// - No target: flops.
+///
+/// A read of the line that is written in the same cycle gives the new tag.
 class _L1TagStore {
-  final HarborRegisterFile ram;
-  final Logic _clk;
-  final int _latency;
+  final List<Logic> rdAddr;
+  final Logic wrEn;
+  final Logic wrAddr;
+  final Logic wrData;
+  final List<Logic> _data = [];
 
   _L1TagStore(
     BridgeModule parent, {
@@ -52,53 +68,79 @@ class _L1TagStore {
     required int readPorts,
     required HarborDeviceTarget? target,
     required String name,
-  }) : this._(
-         parent,
-         clk,
-         reset,
-         target?.blockRam == HarborBlockRam.ramb ||
-                 lines * width > harborL1TagFlopBits
-             ? target
-             : null,
-         lines: lines,
-         width: width,
-         readPorts: readPorts,
-         name: name,
-       );
-
-  _L1TagStore._(
-    BridgeModule parent,
-    this._clk,
-    Logic reset,
-    HarborDeviceTarget? target, {
-    required int lines,
-    required int width,
-    required int readPorts,
-    required String name,
-  }) : _latency = HarborRegisterFile.blockRamReadLatency(target) ?? 1,
-       ram = HarborRegisterFile(
-         useXilinxSdp72: true,
-         numEntries: lines,
-         dataWidth: width,
-         numReadPorts: readPorts,
-         reservedZero: false,
-         target: target,
-         forceReadLatency: HarborRegisterFile.blockRamReadLatency(target) ?? 1,
-         name: name,
-       ) {
+  }) : rdAddr = [
+         for (var r = 0; r < readPorts; r++)
+           Logic(
+             name: '${name}_rd${r}_addr',
+             width: (lines - 1).bitLength.clamp(1, 32),
+           ),
+       ],
+       wrEn = Logic(name: '${name}_wr_en'),
+       wrAddr = Logic(
+         name: '${name}_wr_addr',
+         width: (lines - 1).bitLength.clamp(1, 32),
+       ),
+       wrData = Logic(name: '${name}_wr_data', width: width) {
+    final fpga = target is HarborFpgaTarget ? target : null;
+    final lutRam =
+        fpga != null &&
+        fpga.vendor != HarborFpgaVendor.ice40 &&
+        lines <= harborL1TagLutRamLines;
+    if (lutRam) {
+      final ram = _L1ValidRam(
+        clk,
+        width: width,
+        depth: lines,
+        wrEn: wrEn & ~reset,
+        wrAddr: wrAddr,
+        wrData: wrData,
+        rdAddr: rdAddr,
+        definitionPrefix: 'HarborL1TagRam',
+        name: '${name}_lutram',
+      );
+      for (var r = 0; r < readPorts; r++) {
+        final collide = wrEn & ~reset & wrAddr.eq(rdAddr[r]);
+        _data.add(flop(clk, mux(collide, wrData, ram.rdData(r))));
+      }
+      return;
+    }
+    final ramTarget =
+        fpga != null &&
+            (fpga.vendor != HarborFpgaVendor.ice40 ||
+                lines * width > harborL1TagFlopBits)
+        ? target
+        : null;
+    final latency = HarborRegisterFile.blockRamReadLatency(ramTarget) ?? 1;
+    final ram = HarborRegisterFile(
+      useXilinxSdp72: true,
+      numEntries: lines,
+      dataWidth: width,
+      numReadPorts: readPorts,
+      reservedZero: false,
+      target: ramTarget,
+      forceReadLatency: latency,
+      name: name,
+    );
     parent.addSubModule(ram);
-    ram.input('clk').srcConnection! <= _clk;
+    ram.input('clk').srcConnection! <= clk;
     ram.input('reset').srcConnection! <= reset;
+    for (var r = 0; r < readPorts; r++) {
+      ram.input('rd${r}_addr').srcConnection! <= rdAddr[r];
+      // The iCE40 block RAM reads in 0 cycles, so one flop follows it.
+      _data.add(latency == 1 ? ram.readData(r) : flop(clk, ram.readData(r)));
+    }
+    ram.input('wr_en').srcConnection! <= wrEn;
+    ram.input('wr_addr').srcConnection! <= wrAddr;
+    ram.input('wr_data').srcConnection! <= wrData;
   }
 
-  /// Tag of read port [r], one cycle after its address. The iCE40 block RAM
-  /// reads in 0 cycles, so one flop follows it.
-  Logic read(int r) =>
-      _latency == 1 ? ram.readData(r) : flop(_clk, ram.readData(r));
+  /// Tag of read port [r], one cycle after its address.
+  Logic read(int r) => _data[r];
 }
 
-/// Line valid bits in a RAM with one write port and asynchronous read ports.
-/// Synthesis maps it to LUT RAM, so the valid bits need no per-line enable.
+/// RAM with one write port and asynchronous read ports, for valid bits and
+/// small tag stores. Synthesis maps it to LUT RAM, so it needs no per-line
+/// enable.
 /// Cells start at X, as in SystemVerilog. The simulation model samples the
 /// write port on the rising clock edge, before the flops change.
 class _L1ValidRam extends Module with SystemVerilog {
@@ -117,11 +159,13 @@ class _L1ValidRam extends Module with SystemVerilog {
     required Logic wrAddr,
     required Logic wrData,
     required List<Logic> rdAddr,
+    String definitionPrefix = 'HarborL1ValidRam',
+    super.name = 'valid_ram',
   }) : addrWidth = (depth - 1).bitLength.clamp(1, 32),
        readPorts = rdAddr.length,
        super(
-         name: 'valid_ram',
-         definitionName: 'HarborL1ValidRam_w${width}d${depth}r${rdAddr.length}',
+         definitionName:
+             '${definitionPrefix}_w${width}d${depth}r${rdAddr.length}',
          reserveDefinitionName: true,
        ) {
     clk = addInput('clk', clk);
@@ -177,6 +221,7 @@ module $definitionType (
   input logic [$w:0] wr_data,
 ${List.generate(readPorts, (r) => '  input logic [$a:0] rd${r}_addr,\n  output logic [$w:0] rd${r}_data').join(',\n')}
 );
+  (* ram_style = "distributed", syn_ramstyle = "distributed" *)
   logic [$w:0] mem [0:${depth - 1}];
   always_ff @(posedge clk) begin
     if (wr_en) mem[wr_addr] <= wr_data;
@@ -496,9 +541,9 @@ class HarborL1ICache extends BridgeModule {
     // this instead of [xlen], so a cache over a narrow map does not pay for a
     // full 64-bit tag. Null = xlen. See the note on tag width below.
     int? reqAddrBits,
-    // FPGA/ASIC target for the data block RAM, and for the tag store when it
-    // is larger than [harborL1TagFlopBits]. Null (simulation / std-cell) uses
-    // the flop backend at the same read latency.
+    // FPGA/ASIC target for the data block RAM and the tag store (see
+    // [_L1TagStore]). Null (simulation / std-cell) uses flops at the same read
+    // latency.
     HarborDeviceTarget? target,
     super.name = 'l1i',
   }) : super('HarborL1ICache') {
@@ -620,9 +665,9 @@ class HarborL1ICache extends BridgeModule {
       target: target,
       name: 'l1i_tags',
     );
-    tagRam.ram.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
+    tagRam.rdAddr[0] <= idxOf(reqAddr);
     if (dualPort) {
-      tagRam.ram.input('rd1_addr').srcConnection! <= idxOf(reqAddr1);
+      tagRam.rdAddr[1] <= idxOf(reqAddr1);
     }
 
     // Per-line DATA in a block RAM (one read port, one write port for fills).
@@ -800,9 +845,9 @@ class HarborL1ICache extends BridgeModule {
         'mem_last does not match the burst length',
       );
     }
-    tagRam.ram.input('wr_en').srcConnection! <= fillCommit;
-    tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
-    tagRam.ram.input('wr_data').srcConnection! <= fillTag;
+    tagRam.wrEn <= fillCommit;
+    tagRam.wrAddr <= fillIdx;
+    tagRam.wrData <= fillTag;
 
     // A fill sets its line valid when it commits. A new fill clears the
     // victim line first.
@@ -1119,8 +1164,8 @@ class HarborL1DCache extends BridgeModule {
     Logic? memFaultIn,
     // Significant low bits of [reqAddr]. See the note on tag width below.
     int? reqAddrBits,
-    // FPGA/ASIC target for the data block RAM, and for the tag store when it
-    // is larger than [harborL1TagFlopBits]. Null uses the flop backend.
+    // FPGA/ASIC target for the data block RAM and the tag store (see
+    // [_L1TagStore]). Null uses flops.
     HarborDeviceTarget? target,
     super.name = 'l1d',
   }) : super('HarborL1DCache') {
@@ -1278,9 +1323,9 @@ class HarborL1DCache extends BridgeModule {
       target: target,
       name: 'l1d_tags',
     );
-    tagRam.ram.input('rd0_addr').srcConnection! <= idxOf(reqAddr);
+    tagRam.rdAddr[0] <= idxOf(reqAddr);
     if (snoop) {
-      tagRam.ram.input('rd1_addr').srcConnection! <= idxOf(invalAddr);
+      tagRam.rdAddr[1] <= idxOf(invalAddr);
     }
 
     final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
@@ -1572,9 +1617,9 @@ class HarborL1DCache extends BridgeModule {
           fillIdx,
           mux(storeValidClear, storeIdx, idxOf(addrQ)),
         );
-    tagRam.ram.input('wr_en').srcConnection! <= fillCommit;
-    tagRam.ram.input('wr_addr').srcConnection! <= fillIdx;
-    tagRam.ram.input('wr_data').srcConnection! <= fillTag;
+    tagRam.wrEn <= fillCommit;
+    tagRam.wrAddr <= fillIdx;
+    tagRam.wrData <= fillTag;
 
     if (snoop) {
       final snpIdx = idxOf(snpAddr);
