@@ -73,7 +73,7 @@ void main() {
     expect(
       () => HarborSdioController(
         baseAddress: 0x60000000,
-        writeBusyTimeout: HarborSdioController.writeNoBusyClocks,
+        writeBusyTimeout: HarborSdioController.writeBusyStartClocks,
       ),
       throwsArgumentError,
     );

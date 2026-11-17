@@ -14,6 +14,7 @@ const _clkDiv = 0x10;
 const _cmd = 0x18;
 const _cmdArg = 0x20;
 const _blkSize = 0x50;
+const _blkCount = 0x58;
 const _intStatus = 0x60;
 const _intEnable = 0x68;
 
@@ -60,10 +61,14 @@ List<int> _bitsMsb(int value, int width) => [
 /// rising SD clock and changes its outputs after that edge. A released host lane
 /// reads high, as the pull-ups make it.
 class _SdCard {
-  _SdCard({this.busyClocks = 60, this.busyDelay = 0});
+  _SdCard({this.busyClocks = 60, this.busyDelay = 0, this.multiBlocks = 1});
 
   final int busyClocks;
   final int busyDelay;
+
+  /// Blocks a CMD25 write takes. The card waits for the next block when the
+  /// busy of the last one ends.
+  final int multiBlocks;
 
   int cmdLine = 1;
   int datLine = 0xF;
@@ -90,6 +95,17 @@ class _SdCard {
   var crcOk = false;
   var blocks = 0;
   var cmdErrors = 0;
+  var _rises = 0;
+  var _respEndRise = -1;
+  var _busyEndRise = -1;
+
+  /// SD clocks from the card driving the last response bit to the host
+  /// start bit of the first block.
+  int respToStart = -1;
+
+  /// SD clocks from the card releasing busy to the start bit of each next
+  /// block.
+  final busyToStart = <int>[];
   final commands = <int>[];
   bool get programming => _programming;
   int get stateCode => _programming ? 7 : 4;
@@ -111,6 +127,7 @@ class _SdCard {
     final rising = _prevClk == 0 && sdClk == 1;
     _prevClk = sdClk;
     if (!rising) return;
+    _rises++;
 
     // Command receiver.
     final cmdBit = cmdOe == 1 ? cmdOut : 1;
@@ -128,10 +145,10 @@ class _SdCard {
             for (var i = 2; i < 8; i++) _cmdBits[i],
           ].fold<int>(0, (a, b) => (a << 1) | b);
           commands.add(index);
-          if (index == 13 || index == 24) {
+          if (index == 13 || index == 24 || index == 25) {
             _resp = _r1(index);
             _cmdGap = 5;
-            if (index == 24) {
+            if (index == 24 || index == 25) {
               _wrWait = true;
               _groups.clear();
             }
@@ -158,6 +175,7 @@ class _SdCard {
         if (_respPos == resp.length) {
           _resp = null;
           _respPos = 0;
+          _respEndRise = _rises;
         }
       }
     }
@@ -169,6 +187,11 @@ class _SdCard {
     ].reversed.fold<int>(0, (a, b) => (a << 1) | b);
     if (_wrWait && _resp == null) {
       if (lanes == 0 && _cmdGap == 0) {
+        if (blocks == 0 && respToStart < 0 && _respEndRise >= 0) {
+          respToStart = _rises - _respEndRise;
+        } else if (_busyEndRise >= 0) {
+          busyToStart.add(_rises - _busyEndRise);
+        }
         _wrWait = false;
         _recv = true;
         _groups.clear();
@@ -218,6 +241,11 @@ class _SdCard {
         if (_busyLeft == 0) {
           _programming = false;
           blocks++;
+          _busyEndRise = _rises;
+          if (blocks < multiBlocks) {
+            _wrWait = true;
+            _groups.clear();
+          }
         }
       }
     }
@@ -363,15 +391,27 @@ void main() {
       int busyDelay = 0,
       int clkDivider = 0,
       bool fall = false,
+      int blocks = 1,
     }) async {
-      final words = [for (var i = 0; i < 128; i++) 0x01020304 * (i + 1)];
+      final words = [
+        for (var i = 0; i < 128 * blocks; i++) 0x01020304 * (i + 1),
+      ];
       await setUpDut(
-        dmaMem: [0x40, 0x80000200, ...List.filled(14, 0), ...words],
+        dmaMem: [
+          0x40,
+          0x80000000 | (512 * blocks),
+          ...List.filled(14, 0),
+          ...words,
+        ],
       );
       await busWrite(_clkDiv, clkDivider);
       await busWrite(_ctrl, 0x11 | (fall ? 0x100 : 0));
       strictResponse = true;
-      final card = _SdCard(busyClocks: busyClocks, busyDelay: busyDelay);
+      final card = _SdCard(
+        busyClocks: busyClocks,
+        busyDelay: busyDelay,
+        multiBlocks: blocks,
+      );
       var running = true;
       unawaited(() async {
         while (running) {
@@ -400,7 +440,10 @@ void main() {
       }
 
       await busWrite(_blkSize, 512);
-      final wr = await run(24 | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11));
+      await busWrite(_blkCount, blocks);
+      final wr = await run(
+        (blocks > 1 ? 25 : 24) | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11),
+      );
       expect(wr & 0x22, equals(0x02), reason: 'write done without error');
       expect(
         card.programming,
@@ -410,12 +453,35 @@ void main() {
       final st = await run(13 | (1 << 6));
       expect(st & 0x10, equals(0), reason: 'CMD13 after the write answers');
       expect(st & 0x01, equals(0x01));
-      expect(card.commands, equals([24, 13]));
+      expect(card.commands, equals([blocks > 1 ? 25 : 24, 13]));
       expect(card.cmdErrors, equals(0));
       expect(card.blockOk, isTrue);
       running = false;
       return card;
     }
+
+    // The physical layer wants at least two clocks with no driver between the
+    // response end bit and the first block (Nwr). The count here is
+    // `S - R - 2`: R is the clock the card drives its last bit and S the clock
+    // the card samples the start bit. The host keeps three, one more than the
+    // specification, for its own output delay. After busy it needs one more,
+    // because it samples DAT0 a clock late.
+    const nwrClocks = 3;
+    const nwrBusyClocks = 4;
+
+    test('the first block starts after enough released clocks', () async {
+      final card = await writeThenStatus(busyClocks: 60);
+      expect(card.respToStart - 2, greaterThanOrEqualTo(nwrClocks));
+      await Simulator.endSimulation();
+    });
+
+    test('the next block starts after enough clocks past busy', () async {
+      final card = await writeThenStatus(busyClocks: 60, blocks: 2);
+      expect(card.blocks, equals(2));
+      expect(card.busyToStart, hasLength(1));
+      expect(card.busyToStart.single - 2, greaterThanOrEqualTo(nwrBusyClocks));
+      await Simulator.endSimulation();
+    });
 
     test('a 4-bit write is accepted and CMD13 answers after it', () async {
       final card = await writeThenStatus(busyClocks: 60);
@@ -548,6 +614,11 @@ void main() {
       );
       expect(st & 0x202, equals(0x200));
       expect((await busRead(_status)) & 0x100, equals(0));
+      await Simulator.endSimulation();
+    });
+
+    test('a card that turns busy 12 clocks late is waited for', () async {
+      await writeThenStatus(busyClocks: 60, busyDelay: 12);
       await Simulator.endSimulation();
     });
   });

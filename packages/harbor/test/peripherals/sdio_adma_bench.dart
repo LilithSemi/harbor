@@ -161,7 +161,7 @@ class AdmaBench {
   final double stall;
 
   /// SD clocks the controller waits for the end of a card's busy.
-  final int writeBusyTimeout;
+  final int? writeBusyTimeout;
   final int burstBeats;
   final int writeBatch;
   final bool sampleFall;
@@ -181,7 +181,7 @@ class AdmaBench {
     this.dataWidth, {
     this.dmaOutstanding = 4,
     this.stall = 0.3,
-    this.writeBusyTimeout = HarborSdioController.defaultWriteBusyTimeout,
+    this.writeBusyTimeout,
     this.burstBeats = 8,
     this.writeBatch = 4,
     this.sampleFall = false,

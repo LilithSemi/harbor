@@ -346,15 +346,14 @@ class HarborSdioController extends BridgeModule
   final int dmaWriteBatch;
 
   /// SD clocks a card write waits for the end of the card's busy after the
-  /// CRC status. Then the transfer ends with write error and data-done.
+  /// CRC status. Then the transfer ends with write error and data-done. The
+  /// default is one second at the configured maximum SD clock.
   final int writeBusyTimeout;
 
-  /// The default [writeBusyTimeout]: 0.67 s at 25 MHz.
-  static const defaultWriteBusyTimeout = 1 << 24;
-
   /// SD clocks after a write status token in which the card must pull DAT0
-  /// low. A card that does not has no busy phase.
-  static const writeNoBusyClocks = 4;
+  /// low. A card that does not has no busy phase. This is a chosen margin, not
+  /// a limit taken from the physical layer specification.
+  static const writeBusyStartClocks = 16;
 
   /// The reset value of DATA_TIMEOUT: 4194304 SD clocks. A 25 MHz system clock
   /// gives at most a 12.5 MHz SD clock, so this is at least 335 ms.
@@ -381,7 +380,7 @@ class HarborSdioController extends BridgeModule
     this.rxFifoDepth = 16,
     this.dmaBurstBeats = 16,
     this.dmaWriteBatch = 4,
-    this.writeBusyTimeout = defaultWriteBusyTimeout,
+    int? writeBusyTimeout,
     String? name,
   }) : assert(
          dmaDataWidth == 32 || dmaDataWidth == 64,
@@ -393,6 +392,7 @@ class HarborSdioController extends BridgeModule
        ),
        assert(dmaWriteBatch >= 1, 'dmaWriteBatch must be at least 1'),
        assert(dmaOutstanding >= 1, 'dmaOutstanding must be at least 1'),
+       writeBusyTimeout = writeBusyTimeout ?? config.maxFrequency,
        super(
          harborStableDefinitionName('HarborSdioController', [
            ...BusSlavePort.definitionNameParts(
@@ -414,8 +414,7 @@ class HarborSdioController extends BridgeModule
            'rx$rxFifoDepth',
            'db$dmaBurstBeats',
            'wb$dmaWriteBatch',
-           if (writeBusyTimeout != defaultWriteBusyTimeout)
-             'bt$writeBusyTimeout',
+           if (writeBusyTimeout != null) 'bt$writeBusyTimeout',
          ]),
          name: name ?? 'sdio',
        ) {
@@ -426,11 +425,11 @@ class HarborSdioController extends BridgeModule
         'must be a power of two, at least 2',
       );
     }
-    if (writeBusyTimeout <= writeNoBusyClocks) {
+    if (this.writeBusyTimeout <= writeBusyStartClocks) {
       throw ArgumentError.value(
-        writeBusyTimeout,
+        this.writeBusyTimeout,
         'writeBusyTimeout',
-        'must be larger than $writeNoBusyClocks SD clocks',
+        'must be larger than $writeBusyStartClocks SD clocks',
       );
     }
     createPort('clk', PortDirection.input);
@@ -708,10 +707,11 @@ class HarborSdioController extends BridgeModule
     final busWidthSel = Logic(name: 'bus_width_sel', width: 2);
     // Write CRC-status token + busy tracking.
     final statShift = Logic(name: 'dat_stat_shift', width: 3);
-    final statCnt = Logic(name: 'dat_stat_cnt', width: 2);
+    final statCntW = writeBusyStartClocks.bitLength;
+    final statCnt = Logic(name: 'dat_stat_cnt', width: statCntW);
     final busySeen = Logic(name: 'dat_busy_seen');
     final statWaitCnt = Logic(name: 'dat_stat_wait', width: 16);
-    final busyW = writeBusyTimeout.bitLength;
+    final busyW = this.writeBusyTimeout.bitLength;
     final busyCnt = Logic(name: 'dat_busy_wait', width: busyW);
     // Keep the write-data start at least two SD clock cycles after the
     // command response end, even when the first DMA/PIO word is already ready.
@@ -1328,7 +1328,7 @@ class HarborSdioController extends BridgeModule
           wrNeedFill < Const(0),
           busWidthSel < Const(0, width: 2),
           statShift < Const(0, width: 3),
-          statCnt < Const(0, width: 2),
+          statCnt < Const(0, width: statCntW),
           busySeen < Const(0),
           statWaitCnt < Const(0, width: 16),
           busyCnt < Const(0, width: busyW),
@@ -1559,7 +1559,7 @@ class HarborSdioController extends BridgeModule
                             then: [datState < Const(dRWait, width: 4)],
                             orElse: [
                               datState < Const(dWStart, width: 4),
-                              wrNwrCnt < Const(2, width: 2),
+                              wrNwrCnt < Const(3, width: 2),
                               wrLineFree < Const(1),
                             ],
                           ),
@@ -1884,7 +1884,7 @@ class HarborSdioController extends BridgeModule
                       then: [
                         datState < Const(dWStat, width: 4),
                         statShift < Const(0, width: 3),
-                        statCnt < Const(3, width: 2),
+                        statCnt < Const(3, width: statCntW),
                       ],
                       orElse: [
                         statWaitCnt < (statWaitCnt + Const(1, width: 16)),
@@ -1908,9 +1908,9 @@ class HarborSdioController extends BridgeModule
                   readEdge,
                   then: [
                     statShift < [statShift.getRange(0, 2), datIn[0]].concat(),
-                    statCnt < (statCnt - Const(1, width: 2)),
+                    statCnt < (statCnt - Const(1, width: statCntW)),
                     If(
-                      statCnt.eq(Const(1, width: 2)),
+                      statCnt.eq(Const(1, width: statCntW)),
                       then: [
                         // A rejected block has no busy, so the transfer
                         // ends here.
@@ -1942,7 +1942,7 @@ class HarborSdioController extends BridgeModule
                       datIn[0],
                       then: [
                         datState < Const(dWBusy, width: 4),
-                        statCnt < Const(3, width: 2),
+                        statCnt < Const(writeBusyStartClocks, width: statCntW),
                       ],
                       orElse: [
                         datState < Const(dIdle, width: 4),
@@ -1964,12 +1964,14 @@ class HarborSdioController extends BridgeModule
                       datIn[0],
                       then: [
                         datState < Const(dWStart, width: 4),
-                        wrNwrCnt < Const(2, width: 2),
+                        wrNwrCnt < Const(3, width: 2),
                         wrLineFree < Const(1),
                       ],
                       orElse: [
                         If(
-                          busyCnt.eq(Const(writeBusyTimeout, width: busyW)),
+                          busyCnt.eq(
+                            Const(this.writeBusyTimeout, width: busyW),
+                          ),
                           then: [
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
@@ -1982,7 +1984,7 @@ class HarborSdioController extends BridgeModule
                 ),
               ]),
               // WRITE: wait out programming. The card pulls DAT0 low (busy)
-              // within four SD clocks of the token, then releases it high when
+              // within [writeBusyStartClocks] SD clocks of the token, then releases it high when
               // done. A card that never pulls it low has no busy phase.
               CaseItem(Const(dWBusy, width: 4), [
                 If(
@@ -1990,12 +1992,12 @@ class HarborSdioController extends BridgeModule
                   then: [
                     If(~datIn[0], then: [busySeen < Const(1)]),
                     If(
-                      statCnt.neq(Const(0, width: 2)),
-                      then: [statCnt < (statCnt - Const(1, width: 2))],
+                      statCnt.neq(Const(0, width: statCntW)),
+                      then: [statCnt < (statCnt - Const(1, width: statCntW))],
                     ),
                     busyCnt < (busyCnt + Const(1, width: busyW)),
                     If(
-                      busyCnt.eq(Const(writeBusyTimeout, width: busyW)),
+                      busyCnt.eq(Const(this.writeBusyTimeout, width: busyW)),
                       then: [
                         datState < Const(dIdle, width: 4),
                         busy < Const(0),
@@ -2003,7 +2005,8 @@ class HarborSdioController extends BridgeModule
                       ],
                     ),
                     If(
-                      (busySeen | statCnt.eq(Const(0, width: 2))) & datIn[0],
+                      (busySeen | statCnt.eq(Const(0, width: statCntW))) &
+                          datIn[0],
                       then: [
                         If(
                           blockLeft.eq(Const(1, width: 16)),
@@ -2018,7 +2021,7 @@ class HarborSdioController extends BridgeModule
                             for (final c in crc16) c < Const(0, width: 16),
                             byteInWord < Const(0, width: 2),
                             datState < Const(dWStart, width: 4),
-                            wrNwrCnt < Const(2, width: 2),
+                            wrNwrCnt < Const(3, width: 2),
                             wrLineFree < Const(1),
                           ],
                         ),
@@ -2622,6 +2625,7 @@ class HarborSdioController extends BridgeModule
       if (config.maxSpeed.index >= HarborSdioSpeed.sdr104.index)
         'sd-uhs-sdr104': true,
       if (config.supportsEmmc) 'non-removable': true,
+      'harbor,busy-timeout-clocks': writeBusyTimeout,
     },
   );
 
@@ -2644,6 +2648,7 @@ class HarborSdioController extends BridgeModule
       if (config.maxSpeed.index >= HarborSdioSpeed.sdr104.index)
         'sd-uhs-sdr104': true,
       if (config.supportsEmmc) 'non-removable': true,
+      'harbor,busy-timeout-clocks': writeBusyTimeout,
     },
   );
 

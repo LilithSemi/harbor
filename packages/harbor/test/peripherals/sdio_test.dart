@@ -179,6 +179,26 @@ void main() {
       expect(emmc.dtNode.compatible.first, equals('harbor,sdhci-emmc'));
     });
 
+    test('the busy timeout is one second at the maximum SD clock', () {
+      final sd = HarborSdioController(
+        baseAddress: 0x60000000,
+        config: const HarborSdioConfig.sd(),
+      );
+      expect(sd.writeBusyTimeout, equals(50000000));
+      expect(
+        sd.dtNode.properties['harbor,busy-timeout-clocks'],
+        equals(50000000),
+      );
+      final custom = HarborSdioController(
+        baseAddress: 0x60000000,
+        writeBusyTimeout: 1000,
+      );
+      expect(
+        custom.dtNode.properties['harbor,busy-timeout-clocks'],
+        equals(1000),
+      );
+    });
+
     test('bus width in DT', () {
       final sd = HarborSdioController(
         baseAddress: 0x60000000,
