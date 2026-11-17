@@ -67,6 +67,35 @@ void main() {
       );
     });
 
+    test('rejects packed registers on a wide AXI4 bus', () {
+      for (final width in [16, 32, 64, 128]) {
+        expect(
+          () => HarborUart(
+            baseAddress: 0x10000000,
+            busDataWidth: width,
+            fabricKind: HarborFabricKind.axi4,
+          ),
+          throwsArgumentError,
+          reason: '$width bits',
+        );
+      }
+      // One byte per register, or one word per register, is fine.
+      HarborUart(baseAddress: 0x10000000, fabricKind: HarborFabricKind.axi4);
+      HarborUart(
+        baseAddress: 0x10000000,
+        busDataWidth: 32,
+        regShift: 2,
+        fabricKind: HarborFabricKind.axi4,
+      );
+      // Wishbone and TileLink carry the byte lanes of a read.
+      for (final kind in [
+        HarborFabricKind.wishbone,
+        HarborFabricKind.tilelink,
+      ]) {
+        HarborUart(baseAddress: 0x10000000, busDataWidth: 32, fabricKind: kind);
+      }
+    });
+
     test('rejects regShift 2 on a bus narrower than 32 bits', () {
       expect(
         () => HarborUart(baseAddress: 0, busDataWidth: 8, regShift: 2),
@@ -94,7 +123,9 @@ void main() {
   for (final kind in HarborFabricKind.values) {
     registerTests(kind);
     wordRegisterTests(kind);
-    packedLaneTests(kind);
+    // An AXI4-Lite read selects whole words, so it cannot address one
+    // packed register. The constructor rejects that layout.
+    if (kind != HarborFabricKind.axi4) packedLaneTests(kind);
     for (final width in [64, 128]) {
       // Wishbone has no 128-bit data width.
       if (kind == HarborFabricKind.wishbone && width > 64) continue;
@@ -200,7 +231,7 @@ void wordRegisterTests(HarborFabricKind kind) {
       await bus.write(0x1c, 0xffffffff, sel: 0xe);
       expect(await bus.read(0x1c), equals(0x5a));
 
-      final rx = _receiveByte(d.uart.tx, d.clk, 4);
+      final rx = _receiveByte(d.uart.tx, d.clk, 64);
       await bus.write(0x00, 0xa5);
       expect(await rx, equals(0xa5));
 
@@ -311,72 +342,77 @@ void registerTests(HarborFabricKind kind) {
     // On a wide bus every UART register lands in one access and the RBR
     // pop is gated by SEL bit 0 (see HarborUart), so a read of any other
     // register in that word must leave a pending byte untouched.
-    test('RBR pop is gated by its own lane on a 64-bit bus', () async {
-      uart = HarborUart(
-        baseAddress: 0x10000000,
-        fabricKind: kind,
-        busDataWidth: 64,
-      );
-      clk = SimpleClockGenerator(10).clk;
-      reset = Logic(name: 'reset');
-      rx = Logic(name: 'rx');
+    // An AXI4-Lite read cannot select one packed register, so the
+    // constructor rejects this layout.
+    if (kind != HarborFabricKind.axi4)
+      test('RBR pop is gated by its own lane on a 64-bit bus', () async {
+        uart = HarborUart(
+          baseAddress: 0x10000000,
+          fabricKind: kind,
+          busDataWidth: 64,
+        );
+        clk = SimpleClockGenerator(10).clk;
+        reset = Logic(name: 'reset');
+        rx = Logic(name: 'rx');
 
-      uart.input('clk').srcConnection! <= clk;
-      uart.input('reset').srcConnection! <= reset;
-      uart.input('rx').srcConnection! <= rx;
-      bus = RegBus.attach(uart, clk);
+        uart.input('clk').srcConnection! <= clk;
+        uart.input('reset').srcConnection! <= reset;
+        uart.input('rx').srcConnection! <= rx;
+        bus = RegBus.attach(uart, clk);
 
-      await uart.build();
+        await uart.build();
 
-      reset.inject(1);
-      bus.idle();
-      rx.inject(1);
-      Simulator.setMaxSimTime(200000);
-      unawaited(Simulator.run());
-      await clk.nextPosedge;
-      await clk.nextPosedge;
-      reset.inject(0);
-      await clk.nextPosedge;
-
-      // Send one byte on RX at the default (divisor = 1) bit rate: two
-      // cycles low for the start bit, then each data bit for one cycle,
-      // LSB first, then the stop bit.
-      const sent = 0xA5;
-      rx.inject(0);
-      await clk.nextPosedge;
-      await clk.nextPosedge;
-      for (var i = 0; i < 8; i++) {
-        rx.inject((sent >> i) & 1);
+        reset.inject(1);
+        bus.idle();
+        rx.inject(1);
+        Simulator.setMaxSimTime(200000);
+        unawaited(Simulator.run());
         await clk.nextPosedge;
-      }
-      rx.inject(1);
-      await clk.nextPosedge;
-      await clk.nextPosedge;
+        await clk.nextPosedge;
+        reset.inject(0);
+        await clk.nextPosedge;
 
-      // Poll LSR (byte 5, bit 40 of the word) until data-ready, reading
-      // only its own lane so this does not touch RBR.
-      var ready = false;
-      for (var i = 0; i < 50 && !ready; i++) {
-        final word = await bus.read(0, sel: 0x20);
-        ready = (word >> 40) & 1 == 1;
-        if (!ready) await clk.nextPosedge;
-      }
-      expect(ready, isTrue, reason: 'LSR data-ready should assert');
+        // Send one byte on RX at the default (divisor = 1) bit rate: a bit
+        // lasts 16 cycles. The start bit is low, then the data bits go out
+        // LSB first, then the stop bit.
+        const sent = 0xA5;
+        Future<void> bit(int v) async {
+          rx.inject(v);
+          for (var i = 0; i < 16; i++) {
+            await clk.nextPosedge;
+          }
+        }
 
-      // Reading LSR again must not have popped RBR.
-      final still = await bus.read(0, sel: 0x20);
-      expect((still >> 40) & 1, equals(1));
+        await bit(0);
+        for (var i = 0; i < 8; i++) {
+          await bit((sent >> i) & 1);
+        }
+        await bit(1);
 
-      // Reading RBR (lane 0) pops it and returns the byte.
-      final rbr = await bus.read(0, sel: 0x01);
-      expect(rbr & 0xff, equals(sent));
+        // Poll LSR (byte 5, bit 40 of the word) until data-ready, reading
+        // only its own lane so this does not touch RBR.
+        var ready = false;
+        for (var i = 0; i < 100 && !ready; i++) {
+          final word = await bus.read(0, sel: 0x20);
+          ready = (word >> 40) & 1 == 1;
+          if (!ready) await clk.nextPosedge;
+        }
+        expect(ready, isTrue, reason: 'LSR data-ready should assert');
 
-      // LSR now shows no data ready.
-      final after = await bus.read(0, sel: 0x20);
-      expect((after >> 40) & 1, equals(0));
+        // Reading LSR again must not have popped RBR.
+        final still = await bus.read(0, sel: 0x20);
+        expect((still >> 40) & 1, equals(1));
 
-      await Simulator.endSimulation();
-    });
+        // Reading RBR (lane 0) pops it and returns the byte.
+        final rbr = await bus.read(0, sel: 0x01);
+        expect(rbr & 0xff, equals(sent));
+
+        // LSR now shows no data ready.
+        final after = await bus.read(0, sel: 0x20);
+        expect((after >> 40) & 1, equals(0));
+
+        await Simulator.endSimulation();
+      });
   });
 }
 
@@ -430,17 +466,20 @@ Future<void> _writeReg(RegBus bus, int width, int n, int v) {
   return _writeSlots(bus, width, n ~/ slots, {n % slots: v});
 }
 
+// Sends one frame at the reset divisor of 1, which is 16 cycles a bit.
 Future<void> _sendRx(Logic rx, Logic clk, int byte) async {
-  rx.inject(0);
-  await clk.nextPosedge;
-  await clk.nextPosedge;
-  for (var i = 0; i < 8; i++) {
-    rx.inject((byte >> i) & 1);
-    await clk.nextPosedge;
+  Future<void> bit(int v) async {
+    rx.inject(v);
+    for (var i = 0; i < 16; i++) {
+      await clk.nextPosedge;
+    }
   }
-  rx.inject(1);
-  await clk.nextPosedge;
-  await clk.nextPosedge;
+
+  await bit(0);
+  for (var i = 0; i < 8; i++) {
+    await bit((byte >> i) & 1);
+  }
+  await bit(1);
 }
 
 void wideWordRegisterTests(HarborFabricKind kind, int width) {
@@ -482,8 +521,10 @@ void wideWordRegisterTests(HarborFabricKind kind, int width) {
       model[1] = 0x02;
       model[2] = 0x02;
       await check('ier');
+      // The IIR read in the check cleared the THRE interrupt.
+      model[2] = 0x01;
       await _writeReg(bus, width, 2, 0xffffffc1);
-      model[2] = 0xc2;
+      model[2] = 0xc1;
       await check('fcr');
       await _writeReg(bus, width, 3, 0xffffff83);
       model[3] = 0x83;
@@ -511,7 +552,7 @@ void wideWordRegisterTests(HarborFabricKind kind, int width) {
       await _writeReg(bus, width, 3, 0x83);
       await _writeReg(bus, width, 0, 0x04);
       await _writeReg(bus, width, 3, 0x03);
-      final rx = _receiveByte(d.uart.tx, d.clk, 4);
+      final rx = _receiveByte(d.uart.tx, d.clk, 64);
       await _writeReg(bus, width, 0, 0xa5);
       expect(await rx, equals(0xa5));
       await Simulator.endSimulation();
@@ -555,7 +596,7 @@ void wideWordRegisterTests(HarborFabricKind kind, int width) {
       await _writeReg(bus, width, 3, 0x83);
       await _writeReg(bus, width, 0, 0x04);
       await _writeReg(bus, width, 3, 0x03);
-      final rx = _receiveByte(d.uart.tx, d.clk, 4);
+      final rx = _receiveByte(d.uart.tx, d.clk, 64);
       await _writeSlots(bus, width, 0, {0: 0x5c});
       expect(await rx, equals(0x5c));
       await Simulator.endSimulation();
@@ -567,7 +608,7 @@ void wideWordRegisterTests(HarborFabricKind kind, int width) {
       Future<bool> dataReady() async =>
           (await _readSlot(bus, width, 5)) & 1 == 1;
       Future<void> waitReady() async {
-        for (var i = 0; i < 50 && !await dataReady(); i++) {
+        for (var i = 0; i < 100 && !await dataReady(); i++) {
           await d.clk.nextPosedge;
         }
       }

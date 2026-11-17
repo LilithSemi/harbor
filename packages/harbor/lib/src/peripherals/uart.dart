@@ -77,6 +77,17 @@ class HarborUart extends BridgeModule
         'must be 0 (byte registers) or 2 (32-bit word registers)',
       );
     }
+    // An AXI4-Lite read has no byte strobes, so it selects whole 32-bit
+    // words. A read of one packed register would also read its neighbours,
+    // and a read of IIR, LSR or RBR changes state.
+    if (kind == HarborFabricKind.axi4 && regShift == 0 && dataWidth > 8) {
+      throw ArgumentError.value(
+        dataWidth,
+        'busDataWidth',
+        'must be 8 when regShift is 0 on AXI4, because an AXI4-Lite read '
+            'selects every register in the word',
+      );
+    }
     if (regShift == 2 && dataWidth < 32) {
       throw ArgumentError.value(
         dataWidth,
@@ -202,6 +213,10 @@ class HarborUart extends BridgeModule
     final txCount = Logic(name: 'tx_count', width: 4);
     final txHolding = Logic(name: 'tx_holding', width: 8);
     final txHoldingFull = Logic(name: 'tx_holding_full');
+    // The THRE interrupt is a latch: it sets when the holding register
+    // empties and clears on a THR write or on an IIR read that reports it.
+    final threPend = Logic(name: 'thre_pend');
+    final txEmptyQ = Logic(name: 'tx_empty_q');
 
     // RX state (single-byte holding register). The pin is asynchronous, so it
     // passes through a two-flop synchronizer before the sampler looks at it.
@@ -210,17 +225,29 @@ class HarborUart extends BridgeModule
     final rxSyncB = Logic(name: 'rx_sync_b');
     final rxBusy = Logic(name: 'rx_busy');
     final rxBits = Logic(name: 'rx_bits', width: 4);
-    final rxBaud = Logic(name: 'rx_baud', width: 16);
+    final rxPhase = Logic(name: 'rx_phase', width: 4);
     final rxShift = Logic(name: 'rx_shift', width: 8);
     final rxData = Logic(name: 'rx_data', width: 8);
     final rxReady = Logic(name: 'rx_ready');
 
-    // Baud rate
+    // Baud rate. As in a 16550, one bit lasts 16 divisor periods. The
+    // baud tick runs at 16 times the bit rate, and txPhase counts it up to
+    // the bit tick.
     final baudCount = Logic(name: 'baud_count', width: 16);
     final baudTick = Logic(name: 'baud_tick');
+    final txPhase = Logic(name: 'tx_phase', width: 4);
     final divisor = [dlm, dll].concat();
+    // A write of a divisor latch loads the counter, as in a PC16550D.
+    Logic divisorLoad(Logic next) => mux<Logic>(
+      next.eq(Const(0, width: 16)),
+      Const(0, width: 16),
+      next - Const(1, width: 16),
+    );
     baudTick <=
         baudCount.eq(Const(0, width: 16)) & divisor.neq(Const(0, width: 16));
+    final bitTick = (baudTick & txPhase.eq(Const(15, width: 4))).named(
+      'bit_tick',
+    );
 
     // LSR
     final lsr = Logic(name: 'lsr', width: 8);
@@ -233,7 +260,7 @@ class HarborUart extends BridgeModule
 
     // IIR
     final irqRx = rxReady & ier[0];
-    final irqTx = (~txHoldingFull) & ier[1];
+    final irqTx = threPend & ier[1];
     final computedIir = Logic(name: 'computed_iir', width: 8);
     Combinational([
       computedIir < (fcr.getRange(6, 8).zeroExtend(8) << Const(6, width: 8)),
@@ -250,7 +277,10 @@ class HarborUart extends BridgeModule
       ),
     ]);
 
-    interrupt <= irqRx | irqTx;
+    // The output comes from one flop, so it carries no glitch from the
+    // interrupt logic.
+    final irqQ = Logic(name: 'irq_q');
+    interrupt <= irqQ;
 
     final dlab = lcr[7];
 
@@ -271,12 +301,31 @@ class HarborUart extends BridgeModule
       CaseItem(Const(0, width: 3), [
         If(
           dlab,
-          then: [dll < d],
-          orElse: [txHolding < d, txHoldingFull < Const(1)],
+          then: [
+            dll < d,
+            baudCount < divisorLoad([dlm, d].concat()),
+          ],
+          orElse: [
+            txHolding < d,
+            txHoldingFull < Const(1),
+            threPend < Const(0),
+          ],
         ),
       ]),
       CaseItem(Const(1, width: 3), [
-        If(dlab, then: [dlm < d], orElse: [ier < d]),
+        If(
+          dlab,
+          then: [
+            dlm < d,
+            baudCount < divisorLoad([d, dll].concat()),
+          ],
+          orElse: [
+            // Only bits 3:0 exist. Enabling THRE while the holding register
+            // is empty raises the interrupt.
+            ier < (d & Const(0x0f, width: 8)),
+            If(d[1] & ~ier[1] & ~txHoldingFull, then: [threPend < Const(1)]),
+          ],
+        ),
       ]),
       CaseItem(Const(2, width: 3), [fcr < d]),
       CaseItem(Const(3, width: 3), [lcr < d]),
@@ -285,10 +334,13 @@ class HarborUart extends BridgeModule
       CaseItem(Const(7, width: 3), [scr < d]),
     ]);
 
-    // Only a read that selects the RBR byte pops the receive buffer, so a
-    // read of another register in the same word does not.
+    // A read changes state only when it selects the byte lane of the
+    // register: RBR pops the receive buffer and IIR clears THRE. A read of
+    // another register in the same word does neither.
     final List<Conditional> readItems;
     final List<Conditional> writeItems;
+    // High when the bus word of a read holds register [r] in a selected lane.
+    final Logic Function(int r) regSel;
     if (wide) {
       // Each bus word holds `slots` registers, one per 32-bit slot. Slot s
       // of word w is register w * slots + s.
@@ -317,6 +369,10 @@ class HarborUart extends BridgeModule
                 ])
                 .zeroExtend(32),
       ];
+      regSel = (r) => [
+        for (var s = 0; s < used; s++)
+          regIndex(s).eq(Const(r, width: 3)) & bus.sel[4 * s],
+      ].reduce((a, b) => a | b);
       final rbrWord = word == null ? Const(1) : word.eq(0);
       readItems = [
         datOutW <
@@ -333,6 +389,7 @@ class HarborUart extends BridgeModule
           ),
       ];
     } else if (lanes == 1) {
+      regSel = (r) => addr!.eq(Const(r, width: 3));
       readItems = [
         Case(addr!, [
           for (var i = 0; i < 8; i++)
@@ -347,6 +404,11 @@ class HarborUart extends BridgeModule
       ];
     } else {
       // Every register of the addressed word is returned in its lane.
+      regSel = (r) {
+        final lane = r & 3 < lanes ? bus.sel[r & 3] : Const(0);
+        if (lanes >= 8) return lane;
+        return (r < 4 ? ~bus.addr[2] : bus.addr[2]) & lane;
+      };
       final word0 = regValue.sublist(0, 4).reversed.toList().concat();
       final word1 = regValue.sublist(4).reversed.toList().concat();
       if (lanes >= 8) {
@@ -379,6 +441,20 @@ class HarborUart extends BridgeModule
       ];
     }
 
+    // The middle of the start bit is 8 ticks after the edge, the middle of
+    // every other bit 16 ticks after the one before.
+    final rxSample =
+        (rxBusy &
+                baudTick &
+                rxPhase.eq(
+                  mux<Logic>(
+                    rxBits.eq(Const(0, width: 4)),
+                    Const(7, width: 4),
+                    Const(15, width: 4),
+                  ),
+                ))
+            .named('rx_sample');
+
     Sequential(clk, [
       If(
         reset,
@@ -395,13 +471,17 @@ class HarborUart extends BridgeModule
           txCount < Const(0, width: 4),
           txHolding < Const(0, width: 8),
           txHoldingFull < Const(0),
+          threPend < Const(0),
+          txEmptyQ < Const(1),
+          irqQ < Const(0),
           rxData < Const(0, width: 8),
           rxReady < Const(0),
           rxSyncA < Const(1), // idle-high line
           rxSyncB < Const(1),
           rxBusy < Const(0),
           rxBits < Const(0, width: 4),
-          rxBaud < Const(0, width: 16),
+          rxPhase < Const(0, width: 4),
+          txPhase < Const(0, width: 4),
           rxShift < Const(0, width: 8),
           baudCount < Const(0, width: 16),
           ack < Const(0),
@@ -409,16 +489,26 @@ class HarborUart extends BridgeModule
           datOutW < Const(0, width: bus.dataOut.width),
         ],
         orElse: [
+          irqQ < (irqRx | irqTx),
+
           // Baud counter
+          // The counter holds at 0 while the divisor is 0.
           If(
             baudCount.eq(Const(0, width: 16)),
-            then: [baudCount < (divisor - Const(1, width: 16))],
+            then: [
+              If(
+                divisor.neq(Const(0, width: 16)),
+                then: [baudCount < (divisor - Const(1, width: 16))],
+              ),
+            ],
             orElse: [baudCount < (baudCount - Const(1, width: 16))],
           ),
 
+          If(baudTick, then: [txPhase < (txPhase + Const(1, width: 4))]),
+
           // TX engine
           If(
-            txBusy & baudTick,
+            txBusy & bitTick,
             then: [
               txShift < (txShift >> Const(1, width: 10)),
               txCount < (txCount + Const(1, width: 4)),
@@ -429,25 +519,29 @@ class HarborUart extends BridgeModule
             ],
           ),
 
-          // Load from holding register when TX idle. Reloading the baud
-          // counter here phase-aligns the generator to the new frame:
-          // without it the free-running counter truncates the start bit to
-          // whatever remained of the current period, and receivers misframe
-          // the first byte after an idle gap.
+          // THRE interrupt when the holding register becomes empty.
+          txEmptyQ < ~txHoldingFull,
+          If(~txHoldingFull & ~txEmptyQ, then: [threPend < Const(1)]),
+
+          // Load from the holding register when TX idle, on a baud tick. The
+          // baud counter runs free, as in a 16550, so the start bit lasts
+          // exactly 16 divisor periods and the receiver keeps its sample
+          // points. Nothing loads while the divisor is 0.
           If(
-            ~txBusy & txHoldingFull,
+            ~txBusy & txHoldingFull & baudTick,
             then: [
               txShift <
                   [Const(1, width: 1), txHolding, Const(0, width: 1)].concat(),
               txBusy < Const(1),
               txCount < Const(0, width: 4),
               txHoldingFull < Const(0),
-              baudCount < (divisor - Const(1, width: 16)),
+              txPhase < Const(0, width: 4),
             ],
           ),
 
           // RX engine: hunt for a start bit on the synchronized line, then
-          // sample mid-bit at the divisor rate (8N1, LSB first). The divisor
+          // sample at the middle of each bit, 8 baud ticks after the start
+          // edge and every 16 ticks after that (8N1, LSB first). The divisor
           // gate keeps the receiver idle until the UART is configured, the
           // same rule the transmitter follows.
           rxSyncA < rxIn,
@@ -460,17 +554,15 @@ class HarborUart extends BridgeModule
                 then: [
                   rxBusy < Const(1),
                   rxBits < Const(0, width: 4),
-                  // Half a bit period, to land mid-start for validation.
-                  rxBaud <
-                      [Const(0, width: 1), divisor.getRange(1, 16)].concat(),
+                  rxPhase < Const(0, width: 4),
                 ],
               ),
             ],
             orElse: [
               If(
-                rxBaud.eq(Const(0, width: 16)),
+                rxSample,
                 then: [
-                  rxBaud < (divisor - Const(1, width: 16)),
+                  rxPhase < Const(0, width: 4),
                   If(
                     rxBits.eq(Const(0, width: 4)),
                     then: [
@@ -503,7 +595,12 @@ class HarborUart extends BridgeModule
                     ],
                   ),
                 ],
-                orElse: [rxBaud < (rxBaud - Const(1, width: 16))],
+                orElse: [
+                  If(
+                    baudTick,
+                    then: [rxPhase < (rxPhase + Const(1, width: 4))],
+                  ),
+                ],
               ),
             ],
           ),
@@ -523,6 +620,14 @@ class HarborUart extends BridgeModule
                 then: writeItems,
                 orElse: [If(inWindow & ~we, then: readItems)],
               ),
+              // An IIR read that reports THRE clears it.
+              If(
+                inWindow &
+                    ~we &
+                    regSel(2) &
+                    computedIir.getRange(0, 4).eq(Const(2, width: 4)),
+                then: [threPend < Const(0)],
+              ),
             ],
           ),
         ],
@@ -538,8 +643,8 @@ class HarborUart extends BridgeModule
   /// A terminal on the TX line: decodes 8N1 serial and writes bytes to stdout.
   ///
   /// The divisor is a runtime register, so the bit period cannot be known when
-  /// this is generated. The default assumes the firmware programs
-  /// `<this peripheral's clock>` / 115200; override with
+  /// this is generated. The default assumes the firmware programs a divisor of
+  /// `<this peripheral's clock>` / (16 * 115200) for 115200 baud; override with
   /// `--uart-cycles-per-bit=N`. A wrong value is reported as a framing error
   /// rather than printed as mojibake, so the failure names its own cause.
   ///
@@ -653,8 +758,7 @@ struct UartSink {
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(
-    hid: 'PNP0501',
-    cid: ['PNP0501'],
+    hid: 'RSCV0003',
     uid: 0,
     memory: [BusAddressRange(baseAddress, 0x1000)],
     properties: {
