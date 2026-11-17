@@ -389,6 +389,7 @@ export 'src/peripherals/hpm.dart';
 export 'src/peripherals/i2c.dart';
 export 'src/peripherals/imsic.dart';
 export 'src/peripherals/iommu.dart';
+export 'src/peripherals/led_engine.dart';
 export 'src/peripherals/maskrom.dart';
 export 'src/peripherals/pcie.dart';
 export 'src/peripherals/pcie/gtp_pcie_params.dart';
