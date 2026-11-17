@@ -173,6 +173,11 @@ class HarborLedEngine extends BridgeModule
   final int maxPixels;
   final HarborLedRamKind ramKind;
 
+  /// Width of the register bus, 32 or 64. Registers sit in 8-byte slots and
+  /// read in the low 32 bits. The item and pixel windows keep 4-byte strides,
+  /// and the byte lanes pick the half of a 64-bit beat.
+  final int busDataWidth;
+
   /// Clocks after which a dma frame that has taken no item sets STALL.
   final int stallClocks;
 
@@ -266,6 +271,7 @@ class HarborLedEngine extends BridgeModule
     this.dmaAddressWidth = 32,
     int dmaDataWidth = 32,
     int busAddressWidth = 12,
+    this.busDataWidth = 32,
     this.stallClocks = 65536,
     String? name,
   }) : super(
@@ -273,7 +279,7 @@ class HarborLedEngine extends BridgeModule
            ...BusSlavePort.definitionNameParts(
              kind: fabricKind,
              addressWidth: busAddressWidth,
-             dataWidth: 32,
+             dataWidth: busDataWidth,
              cross: crossFabricClock,
            ),
            'ch${channels.length}',
@@ -306,6 +312,11 @@ class HarborLedEngine extends BridgeModule
       throw ArgumentError(
         'HarborLedEngine: busAddressWidth must be from 12 to 64 '
         '(got $busAddressWidth).',
+      );
+    }
+    if (busDataWidth != 32 && busDataWidth != 64) {
+      throw ArgumentError(
+        'HarborLedEngine: busDataWidth must be 32 or 64 (got $busDataWidth).',
       );
     }
     if (channels.isEmpty || channels.length > maxChannels) {
@@ -381,7 +392,7 @@ class HarborLedEngine extends BridgeModule
       clk: input('clk'),
       reset: input('reset'),
       addressWidth: busAddressWidth,
-      dataWidth: 32,
+      dataWidth: busDataWidth,
       fabricClock: fabricClock,
     );
     final hasDma = pixelSource == HarborLedPixelSource.dma;
@@ -412,7 +423,32 @@ class HarborLedEngine extends BridgeModule
     final hasSerial = channels.any((c) => c.kind == HarborLedKind.serial);
     final isBram = hasPixels && ramKind == HarborLedRamKind.bram;
     final pixelAw = maxPixels > 1 ? (maxPixels - 1).bitLength : 1;
-    final a = bus.addr;
+    // On a 64-bit bus the slave port clears address bit 2, so the byte lanes
+    // say which 32-bit half a window access means. The register slots decode
+    // the half as address bit 2, which a register never uses.
+    final wide = busDataWidth == 64;
+    final upper = wide
+        ? (bus.sel.getRange(4, 8).or() & ~bus.sel.getRange(0, 4).or()).named(
+            'upper_half',
+          )
+        : Const(0);
+    final a = wide
+        ? [bus.addr.getRange(3), upper, bus.addr.getRange(0, 2)].concat()
+        : bus.addr;
+    final sel32 = wide
+        ? mux(upper, bus.sel.getRange(4, 8), bus.sel.getRange(0, 4))
+        : bus.sel;
+    final din32 = wide
+        ? mux(upper, bus.dataIn.getRange(32, 64), bus.dataIn.getRange(0, 32))
+        : bus.dataIn;
+    Logic laneSel(int lane) => wide ? sel32[lane] : bus.selAny(lane, 1);
+    Logic busWord(Logic v) => wide
+        ? mux(
+            upper,
+            [v, Const(0, width: 32)].concat(),
+            [Const(0, width: 32), v].concat(),
+          )
+        : v;
     final isPwm = [for (final c in channels) c.kind == HarborLedKind.pwm];
 
     // A block RAM pixel read gives its data one clock after the address.
@@ -636,14 +672,9 @@ class HarborLedEngine extends BridgeModule
       final itemRam = HarborFifoRam(
         name: 'item_ram',
         clk: clk,
-        wrEn:
-            busWr &
-            inItems &
-            itemWindowOk &
-            bus.selAny(0, 1) &
-            bus.selAny(1, 1),
+        wrEn: busWr & inItems & itemWindowOk & laneSel(0) & laneSel(1),
         wrAddr: a.getRange(2, 2 + aw),
-        wrData: bus.dataIn.getRange(0, 16),
+        wrData: din32.getRange(0, 16),
         rdAddr: mux(
           anyReq & ~busWin,
           arbAddr,
@@ -926,12 +957,12 @@ class HarborLedEngine extends BridgeModule
                 ~reset &
                 pixelWrEn &
                 pixelWindowOk &
-                bus.selAny(0, 1) &
-                bus.selAny(1, 1) &
-                bus.selAny(2, 1) &
-                bus.selAny(3, 1),
+                laneSel(0) &
+                laneSel(1) &
+                laneSel(2) &
+                laneSel(3),
             wrAddr: pixelIdx,
-            wrData: bus.dataIn,
+            wrData: din32,
             rdAddr: pixelRdAddr,
             zeroInit: true,
           );
@@ -941,9 +972,18 @@ class HarborLedEngine extends BridgeModule
           final pixelRam = HarborFifoRam(
             name: 'pixel_ram',
             clk: clk,
-            wrEn: pixelWrEn & pixelWindowOk & bus.selAny(0, 4),
+            wrEn: pixelWrEn & pixelWindowOk & sel32.getRange(0, 4).or(),
             wrAddr: pixelIdx,
-            wrData: bus.selMerge(pixelOld, 0),
+            wrData: wide
+                ? [
+                    for (var b = 3; b >= 0; b--)
+                      mux(
+                        sel32[b],
+                        din32.getRange(8 * b, 8 * b + 8),
+                        pixelOld.getRange(8 * b, 8 * b + 8),
+                      ),
+                  ].concat()
+                : bus.selMerge(pixelOld, 0),
             rdAddr: pixelRdAddr,
             depth: maxPixels,
             zeroInit: true,
@@ -1140,7 +1180,7 @@ class HarborLedEngine extends BridgeModule
             ],
           ],
           bus.ack < Const(0),
-          bus.dataOut < Const(0, width: 32),
+          bus.dataOut < Const(0, width: busDataWidth),
           pxPend < 0,
           if (hasSerial) ...[busAged < 0, busCool < Const(0, width: 3)],
           for (var c = 0; c < n; c++) ...[
@@ -1155,7 +1195,7 @@ class HarborLedEngine extends BridgeModule
           irqStatus < ((irqStatus & ~irqClear) | doneBits),
           ...writes,
           bus.ack < Const(0),
-          bus.dataOut < Const(0, width: 32),
+          bus.dataOut < Const(0, width: busDataWidth),
           if (hasSerial) ...[
             busAged < itemLose,
             If(
@@ -1202,12 +1242,15 @@ class HarborLedEngine extends BridgeModule
                 then: [pxPend < 1],
                 orElse: [
                   bus.ack < Const(1),
-                  If(~bus.we, then: [bus.dataOut < readValue]),
+                  If(~bus.we, then: [bus.dataOut < busWord(readValue)]),
                 ],
               ),
             ],
           ),
-          If(pxPend, then: [bus.ack < Const(1), bus.dataOut < readValue]),
+          If(
+            pxPend,
+            then: [bus.ack < Const(1), bus.dataOut < busWord(readValue)],
+          ),
         ],
       ),
     ]);

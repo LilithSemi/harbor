@@ -3,11 +3,43 @@
 // the engine reads pixels as a master.
 
 import 'package:harbor/harbor.dart';
+import 'package:rohd/rohd.dart';
+import 'package:rohd_bridge/rohd_bridge.dart';
 import 'package:test/test.dart';
 
+import '../bus/port/memory_harness.dart' show exposeWaist;
 import '../peripherals/sdio_adma_bench.dart';
 
 const _base = 0x10005000;
+
+/// A memory master of 64 data bits, a stand-in for a 64-bit core.
+class _Master64 extends BridgeModule {
+  _Master64(HarborFabricKind kind)
+    : super('LedMaster64_${kind.name}', name: 'cpu') {
+    createPort('clk', PortDirection.input);
+    createPort('reset', PortDirection.input);
+    final mem = HarborMemoryMasterPort.create(
+      module: this,
+      name: 'dataBus',
+      kind: kind,
+      config: const HarborMemoryWaistConfig(
+        addressWidth: 32,
+        dataWidth: 64,
+        idWidth: 2,
+        outstanding: 1,
+      ),
+      clk: input('clk'),
+      reset: input('reset'),
+    );
+    exposeWaist(this, mem.waist, 'mem', PairRole.consumer);
+  }
+
+  void pullUp(HarborSoC soc) {
+    for (final n in [...inputs.keys, ...outputs.keys]) {
+      if (n.startsWith('mem_')) soc.pullUpPort(port(n), newPortName: 'cpu_$n');
+    }
+  }
+}
 
 /// The top-level port name of a catalog pin such as `led[3]`.
 String _port(String pin) =>
@@ -187,5 +219,45 @@ void main() {
       _checkOutputs(soc, led, const ['led_out']);
       expect(soc.dumpSystemVerilog(), contains('led_dma'));
     });
+  }
+
+  for (final kind in [HarborFabricKind.wishbone, HarborFabricKind.axi4]) {
+    test(
+      '${kind.name}: a 64-bit fabric takes the engine and its board LEDs',
+      () async {
+        final board = HarborBoard.get('kc705');
+        final ch = board.ledChannels.single;
+        final target = board.fpgaTarget();
+        final led = HarborLedEngine(
+          baseAddress: _base,
+          busAddressWidth: 32,
+          busDataWidth: 64,
+          fabricKind: kind,
+          channels: [ch.config],
+          maxPixels: ch.pixels,
+          clockHz: board.oscillatorHz,
+        );
+        final soc = HarborSoC(
+          name: 'led64_${kind.name}',
+          compatible: 'test,led',
+          fabricKind: kind,
+          board: board,
+          target: target,
+        );
+        final cpu = soc.addMaster(_Master64(kind), memory: true);
+        soc.addPeripheral(led);
+        cpu.pullUp(soc);
+        soc.bindBoardLeds(led, board);
+        soc.buildFabric();
+        await soc.build();
+        final ports = {
+          for (final e in soc.outputs.entries)
+            if (e.key.startsWith('led')) e.key: e.value.width,
+        };
+        expect(ports, isNotEmpty);
+        expect(target.missingPins(ports), isEmpty);
+        expect(soc.dumpSystemVerilog(), contains(led.definitionName));
+      },
+    );
   }
 }
