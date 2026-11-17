@@ -342,14 +342,11 @@ class SdramMemoryPort extends Module {
       // After a clear the count is the commit pointer minus a read pointer
       // value. With a power of two buffer it is full when the commit pointer
       // is that read pointer with its top bit flipped, so no subtraction.
-      Logic Function(Logic)? notFullOnCut;
-      if (writeBeats == 1 << wbW) {
-        notFullOnCut = (r) => mux(
-          reset,
-          Const(1),
-          cPtr.neq([~r[wbW], r.getRange(0, wbW)].concat()),
-        );
-      }
+      Logic notFullOnCut(Logic r) => mux(
+        reset,
+        Const(1),
+        cPtr.neq([~r[wbW], r.getRange(0, wbW)].concat()),
+      );
       Sequential(clk, [
         cnt < ahead((b) => step(b, (c) => c)),
         wdReadyR <
@@ -776,7 +773,8 @@ class SdramMemoryPort extends Module {
   /// Beats in the next sdram request of a burst at [addr] with [left] beats
   /// after this one: the rest of its aligned block of [blockBeats] beats, cut
   /// at the end of the burst and at a 2-beat wrap point. A narrow or FIXED
-  /// beat is 1. A beat is 2^[beatLog2] bytes.
+  /// beat is 1. A beat is 2^[beatLog2] bytes. The result is never 0, and
+  /// `wb_cmt_any` relies on it.
   static Logic _chunk(
     Logic addr,
     Logic left,

@@ -237,6 +237,32 @@ class SdramPortBench {
   }
 }
 
+/// Records an error in [errors] on each rising edge of [s] where the
+/// `wb_cmt_any` register of the memory port in [sdram] differs from
+/// `wb_rd != wb_commit`. Returns a counter of the edges it checked.
+List<int> watchCommitFlag(Sim s, Module sdram, List<String> errors) {
+  final port = sdram.subModules.whereType<SdramMemoryPort>().single;
+  Logic sig(String n) => port.signals.firstWhere((l) => l.name == n);
+  final any = sig('wb_cmt_any');
+  final rd = sig('wb_rd');
+  final commit = sig('wb_commit');
+  final checked = [0];
+  s.onRise(() {
+    final a = any.previousValue!;
+    final r = rd.previousValue!;
+    final c = commit.previousValue!;
+    if (!a.isValid || !r.isValid || !c.isValid) return;
+    checked[0]++;
+    if (a.toInt() != (r.toInt() != c.toInt() ? 1 : 0) && errors.length < 8) {
+      errors.add(
+        'wb_cmt_any ${a.toInt()} with rd ${r.toInt()}, commit '
+        '${c.toInt()}',
+      );
+    }
+  });
+  return checked;
+}
+
 /// Random bursts and IDs from a requester on a fabric clock of
 /// [fabricPeriodPs] through the native [kind] port of an ECP5 [HarborSdram]
 /// on a 125 MHz memory clock, against a reference memory. Returns the
@@ -260,6 +286,8 @@ Future<List<String>> sdramRandomBursts(
     outstanding: outstanding,
   );
   late MemoryPortCheck check;
+  final flagErrors = <String>[];
+  late List<int> flagChecked;
   final bench = await SdramPortBench.start(
     kind,
     config,
@@ -267,6 +295,11 @@ Future<List<String>> sdramRandomBursts(
     sync: sync,
     addressMap: addressMap,
     attach: (s) {
+      flagChecked = watchCommitFlag(
+        s,
+        (s.dut as SdramPortTop).sdram,
+        flagErrors,
+      );
       check = MemoryPortCheck(
         s,
         Random(seed),
@@ -282,6 +315,8 @@ Future<List<String>> sdramRandomBursts(
     ...await check.run(count, extra: longBursts(Random(seed), dataWidth ~/ 8)),
     if (pastTheEnd) ...await _pastTheEnd(check),
     ...bench.model.errors.take(8),
+    ...flagErrors,
+    if (flagChecked[0] == 0) 'wb_cmt_any was never checked',
   ];
   if (bench.sdram.busError.value.toInt() != 0) bad.add('bus_error is set');
   await bench.stop();
