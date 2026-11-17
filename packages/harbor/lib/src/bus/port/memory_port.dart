@@ -284,8 +284,9 @@ class HarborMemoryMasterPort {
   ///
   /// With [readOnly], the device sends reads only. The write request, write
   /// data and write response paths are not built. The write side of the
-  /// native port stays idle, WDATA_READY and WRESP_VALID stay 0, and the
-  /// device must not send a write request.
+  /// native port stays idle and the device must not send a write request.
+  /// A simulation stops when it does. Without a clock crossing, WDATA_READY
+  /// and WRESP_VALID also stay 0.
   static HarborMemoryMasterPort create({
     required BridgeModule module,
     required String name,
@@ -309,6 +310,23 @@ class HarborMemoryMasterPort {
       );
     }
     final waist = HarborMemoryWaist(config);
+    if (readOnly) {
+      clk.glitch.listen((args) {
+        if (LogicValue.isPosedge(
+              args.previousValue,
+              args.newValue,
+              ignoreInvalid: true,
+            ) &&
+            reset.value == LogicValue.zero &&
+            waist.reqValid.value == LogicValue.one &&
+            waist.reqWrite.value == LogicValue.one) {
+          Simulator.throwException(
+            Exception('memory master port: write request on a read only port'),
+            StackTrace.current,
+          );
+        }
+      });
+    }
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
       final inner = create(
         module: module,
