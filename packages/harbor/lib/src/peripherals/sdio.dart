@@ -527,6 +527,7 @@ class HarborSdioController extends BridgeModule
     const sWait = 2;
     const sRecv = 3;
     const sEnd = 4; // hold the end bit for one SD clock
+    const sBusy = 5; // wait for the card to release DAT0 after an R1b
 
     // INT_STATUS bits.
     const intCmdDone = 0x01;
@@ -1158,7 +1159,8 @@ class HarborSdioController extends BridgeModule
     // for [cmdQuietClocks] after a failed or stopped response.
     final cmdIdleHigh =
         (ctrlEnable &
-                state.eq(Const(sIdle, width: 3)) &
+                (state.eq(Const(sIdle, width: 3)) |
+                    state.eq(Const(sBusy, width: 3))) &
                 cmdHold.eq(Const(0, width: 8)))
             .named('cmd_idle_high');
     final cmdPadOe = (cmdOe | cmdIdleHigh).named('cmd_pad_oe');
@@ -1593,7 +1595,21 @@ class HarborSdioController extends BridgeModule
                             ],
                           ),
                         ],
-                        orElse: [busy < Const(0)],
+                        orElse: [
+                          // A response with busy holds the command until the
+                          // card releases DAT0.
+                          If(
+                            cmdRespType.eq(Const(3, width: 2)),
+                            then: [
+                              state < Const(sBusy, width: 3),
+                              busySeen < Const(0),
+                              busyCnt < Const(0, width: busyW),
+                              statCnt <
+                                  Const(writeBusyStartClocks, width: statCntW),
+                            ],
+                            orElse: [busy < Const(0)],
+                          ),
+                        ],
                       ),
                       // The ADMA descriptor fetch is kicked off at command issue
                       // (see the CMD write handler), not here, so the engine is
@@ -1603,6 +1619,35 @@ class HarborSdioController extends BridgeModule
                       respRaw < respNext.getRange(0, 128),
                       respLong < cmdRespType.eq(Const(2, width: 2)),
                     ],
+                  ),
+                ],
+              ),
+            ]),
+            // Wait for DAT0 to rise after an R1b. The card pulls it low
+            // within [writeBusyStartClocks] clocks of the response, so a
+            // line that stays high has no busy phase.
+            CaseItem(Const(sBusy, width: 3), [
+              If(
+                readEdge,
+                then: [
+                  If(~datIn[0], then: [busySeen < Const(1)]),
+                  If(
+                    statCnt.neq(Const(0, width: statCntW)),
+                    then: [statCnt < (statCnt - Const(1, width: statCntW))],
+                  ),
+                  busyCnt < (busyCnt + Const(1, width: busyW)),
+                  If(
+                    busyCnt.eq(Const(this.writeBusyTimeout, width: busyW)),
+                    then: [
+                      state < Const(sIdle, width: 3),
+                      busy < Const(0),
+                      ...setInt(intCmdTimeout),
+                    ],
+                  ),
+                  If(
+                    (busySeen | statCnt.eq(Const(0, width: statCntW))) &
+                        datIn[0],
+                    then: [state < Const(sIdle, width: 3), busy < Const(0)],
                   ),
                 ],
               ),
@@ -2399,6 +2444,15 @@ class HarborSdioController extends BridgeModule
                               state < Const(sIdle, width: 3),
                               busy < Const(0),
                               cmdHold < Const(cmdQuietClocks, width: 8),
+                              ...setInt(intCmdTimeout),
+                            ],
+                          ),
+                          // A command that waits for busy end needs the clock too.
+                          If(
+                            ~bus.dataIn[0] & state.eq(Const(sBusy, width: 3)),
+                            then: [
+                              state < Const(sIdle, width: 3),
+                              busy < Const(0),
                               ...setInt(intCmdTimeout),
                             ],
                           ),

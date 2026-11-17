@@ -304,6 +304,7 @@ void main() {
       int dmaDataWidth = 32,
       HarborSdioConfig? config,
       int cardDetectLevel = 0,
+      int? writeBusyTimeout,
     }) async {
       strictResponse = false;
       cmdProbe = SdCmdProbe();
@@ -311,6 +312,7 @@ void main() {
         baseAddress: 0x60000000,
         config: config ?? const HarborSdioConfig.sd(),
         rxFifoDepth: fifoDepth,
+        writeBusyTimeout: writeBusyTimeout,
         dmaDataWidth: dmaDataWidth,
       );
       top = MasterTop(
@@ -819,6 +821,134 @@ void main() {
 
     test('a card that turns busy 12 clocks late is waited for', () async {
       await writeThenStatus(busyClocks: 60, busyDelay: 12);
+      await Simulator.endSimulation();
+    });
+
+    // An R1b command with the card holding DAT0 low for [busyCycles] system
+    // clocks after its response. Returns the STATUS busy flag one hundred
+    // clocks into the busy window and again after DAT0 is released.
+    Future<(int, int, int)> r1bCommand({required bool holdLow}) async {
+      await setUpDut();
+      strictResponse = true;
+      await busWrite(_intEnable, 0xE11);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 12 | (3 << 6));
+      datIn.inject(holdLow ? 0 : 0xF);
+      final frame = r1Frame(12);
+      var sawDrive = false;
+      var k = 0;
+      for (var i = 0; i < 6000 && k < frame.length + 8; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        if (sawDrive &&
+            !sending &&
+            sdClk.value.toInt() == 0 &&
+            k < frame.length) {
+          cmdIn.inject(frame[k++]);
+        } else if (k == frame.length) {
+          k++;
+        }
+      }
+      cmdIn.inject(1);
+      for (var i = 0; i < 100; i++) {
+        await clk.nextPosedge;
+      }
+      final during = (await busRead(_status) >> 8) & 1;
+      final ist = await busRead(_intStatus);
+      datIn.inject(0xF);
+      for (var i = 0; i < 100; i++) {
+        await clk.nextPosedge;
+      }
+      final after = (await busRead(_status) >> 8) & 1;
+      return (during, after, ist);
+    }
+
+    // An R1b command whose card holds DAT0 low for ever. [during] runs once the
+    // response is in and the host waits for busy end.
+    Future<int> r1bStuck({
+      int? writeBusyTimeout,
+      required Future<void> Function() during,
+    }) async {
+      await setUpDut(writeBusyTimeout: writeBusyTimeout);
+      strictResponse = true;
+      await busWrite(_intEnable, 0xE11);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 12 | (3 << 6));
+      datIn.inject(0);
+      final frame = r1Frame(12);
+      var sawDrive = false;
+      var k = 0;
+      for (var i = 0; i < 2000 && k < frame.length; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        if (sawDrive &&
+            !sending &&
+            sdClk.value.toInt() == 0 &&
+            k < frame.length) {
+          cmdIn.inject(frame[k++]);
+        }
+      }
+      cmdIn.inject(1);
+      for (var i = 0; i < 40; i++) {
+        await clk.nextPosedge;
+      }
+      await during();
+      return busRead(_intStatus);
+    }
+
+    test('CMD is driven high while an R1b waits for busy end', () async {
+      await r1bStuck(
+        during: () async {
+          expect(sig('cmd_state').value.toInt(), equals(5));
+          expect(cmdOe.value.toInt(), equals(1));
+          expect(cmdOut.value.toInt(), equals(1));
+        },
+      );
+      await Simulator.endSimulation();
+    });
+
+    test('a busy that never ends sets the command timeout', () async {
+      final ist = await r1bStuck(
+        writeBusyTimeout: 200,
+        during: () async {
+          for (var i = 0; i < 1500; i++) {
+            await clk.nextPosedge;
+          }
+        },
+      );
+      expect(ist & 0xE11, equals(0x11));
+      expect((await busRead(_status) >> 8) & 1, equals(0));
+      await Simulator.endSimulation();
+    });
+
+    test('clearing enable during the busy wait ends the command', () async {
+      final ist = await r1bStuck(
+        during: () async {
+          expect((await busRead(_status) >> 8) & 1, equals(1));
+          await busWrite(_ctrl, 0x0);
+          await clk.nextPosedge;
+        },
+      );
+      expect(ist & 0xE11, equals(0x11));
+      expect((await busRead(_status) >> 8) & 1, equals(0));
+      await Simulator.endSimulation();
+    });
+
+    test('an R1b command stays busy until the card releases DAT0', () async {
+      final (during, after, ist) = await r1bCommand(holdLow: true);
+      expect(during, equals(1));
+      expect(after, equals(0));
+      expect(ist & 0xE11, equals(0x01));
+      await Simulator.endSimulation();
+    });
+
+    test('an R1b command ends at once when DAT0 never goes low', () async {
+      final (during, after, ist) = await r1bCommand(holdLow: false);
+      expect(during, equals(0));
+      expect(after, equals(0));
+      expect(ist & 0xE11, equals(0x01));
       await Simulator.endSimulation();
     });
   });
