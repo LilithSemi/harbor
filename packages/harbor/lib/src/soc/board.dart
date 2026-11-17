@@ -54,8 +54,8 @@ class HarborBoard {
   /// single-ended clock.
   final String? clockNPortName;
 
-  /// Xilinx speed grade of the fitted part (`'1'`, `'2'`, ...). See
-  /// [HarborFpgaTarget.speedGrade].
+  /// Speed grade of the fitted part. The default is `'6'` for ECP5 and `'1'`
+  /// for the other vendors. See [HarborFpgaTarget.speedGrade].
   final String speedGrade;
 
   /// Package balls that reach a global clock net with no clock buffer.
@@ -91,9 +91,10 @@ class HarborBoard {
     this.progCommand,
     this.clockPortName = 'clk',
     this.clockNPortName,
-    this.speedGrade = '1',
+    String? speedGrade,
     this.clockCapableSites = const {},
-  });
+  }) : speedGrade =
+           speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1');
 
   /// Whether [pin] is on a ball that reaches a global clock net with no clock
   /// buffer, per [clockCapableSites].
@@ -140,15 +141,43 @@ class HarborBoard {
   };
 
   /// Resolves a board preset by name, throwing if it is unknown.
+  ///
+  /// The name is `<preset>` or `<preset>:<grade>`. A suffix returns the preset
+  /// with [speedGrade] set to the grade and [name] set to the full string. The
+  /// grade must be valid for the vendor of the preset.
   static HarborBoard get(String name) {
-    final board = byName[name];
+    final colon = name.indexOf(':');
+    final preset = colon < 0 ? name : name.substring(0, colon);
+    final board = byName[preset];
     if (board == null) {
       throw ArgumentError(
         'Unknown board "$name". Known: ${byName.keys.join(', ')}.',
       );
     }
-    return board;
+    if (colon < 0) return board;
+    final grade = name.substring(colon + 1);
+    HarborFpgaTarget.checkSpeedGrade(board.vendor, grade);
+    return board._withSpeedGrade(name, grade);
   }
+
+  /// The preset name without a speed grade suffix.
+  String get preset => name.split(':').first;
+
+  HarborBoard _withSpeedGrade(String newName, String grade) => HarborBoard(
+    name: newName,
+    vendor: vendor,
+    device: device,
+    package: package,
+    oscillatorHz: oscillatorHz,
+    pins: pins,
+    interfaces: interfaces,
+    ddrDqsComplementPins: ddrDqsComplementPins,
+    progCommand: progCommand,
+    clockPortName: clockPortName,
+    clockNPortName: clockNPortName,
+    speedGrade: grade,
+    clockCapableSites: clockCapableSites,
+  );
 
   String get _vendorPrefix => switch (vendor) {
     HarborFpgaVendor.ice40 => 'ice40',
@@ -245,6 +274,7 @@ class HarborBoard {
       _checkPerstPull(e.key, e.value);
     }
 
+    HarborFpgaTarget.checkSpeedGrade(vendor, speedGrade);
     return HarborFpgaTarget(
       name: '$_vendorPrefix-$device',
       vendor: vendor,

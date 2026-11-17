@@ -82,6 +82,8 @@ Future<void> _placeAndRoute({
         '--85k',
         '--package',
         'CABGA381',
+        '--speed',
+        board.speedGrade,
         '--seed',
         '$seed',
         '--json',

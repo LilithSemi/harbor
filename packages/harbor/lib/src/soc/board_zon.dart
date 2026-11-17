@@ -128,6 +128,7 @@ class HarborBoardZonGenerator {
   static String fpgaPart(HarborBoard b) => switch (b.vendor) {
     HarborFpgaVendor.vivado ||
     HarborFpgaVendor.openXc7 => '${b.device}${b.package}-${b.speedGrade}',
+    HarborFpgaVendor.ecp5 => '${b.device}-${b.package}-${b.speedGrade}',
     _ => '${b.device}-${b.package}',
   };
 
@@ -159,7 +160,7 @@ class HarborBoardZonGenerator {
     final b = board;
     if (b != null) {
       out.writeln(
-        '    .board = .{ .preset = ${quote(b.name)}, '
+        '    .board = .{ .preset = ${quote(b.preset)}, '
         '.fpga_part = ${quote(fpgaPart(b))} },',
       );
     }

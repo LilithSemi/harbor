@@ -145,10 +145,34 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// IBUFDS, so the XDC also constrains this net.
   static const differentialClockNet = 'sysclk_diff';
 
-  /// Xilinx speed grade (`'1'`, `'2'`, `'2L'`, `'3'`). It completes the part
-  /// name that the openXC7 flow gives to prjxray, for example
-  /// `xc7a200tfbg484-2`. Other vendors ignore it.
+  /// Speed grade of the part.
+  ///
+  /// Xilinx: `'1'`, `'2'`, `'2L'`, `'3'`. It completes the part name that the
+  /// openXC7 flow gives to prjxray, for example `xc7a200tfbg484-2`.
+  /// ECP5: `'6'`, `'7'` or `'8'`, passed to nextpnr-ecp5 as `--speed`.
+  /// iCE40 has no grade. See [checkSpeedGrade].
   final String speedGrade;
+
+  /// The speed grade that a vendor uses when a target gives none.
+  static String defaultSpeedGrade(HarborFpgaVendor vendor) =>
+      vendor == HarborFpgaVendor.ecp5 ? '6' : '1';
+
+  /// Throws an [ArgumentError] if [grade] is not valid for [vendor].
+  static void checkSpeedGrade(HarborFpgaVendor vendor, String grade) {
+    final ok = switch (vendor) {
+      HarborFpgaVendor.ecp5 => const {'6', '7', '8'}.contains(grade),
+      HarborFpgaVendor.ice40 => grade == '1',
+      HarborFpgaVendor.vivado ||
+      HarborFpgaVendor.openXc7 => RegExp(r'^[1-3][A-Z]*$').hasMatch(grade),
+    };
+    if (!ok) {
+      throw ArgumentError.value(
+        grade,
+        'speedGrade',
+        'is not a valid speed grade for ${vendor.name}',
+      );
+    }
+  }
 
   /// Optional bitstream programming command for a `prog` Makefile target
   /// (e.g. `'openFPGALoader -b ulx3s \$(TOP).bit'`). When null, no `prog`
@@ -222,12 +246,14 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
     this.clockNPortName,
-    this.speedGrade = '1',
+    String? speedGrade,
     this.progCommand,
     this.ecp5Autoname = false,
     this.xilinxLut6Cost,
     this.useHimbaechel = false,
-  }) : assert(xilinxLut6Cost == null || xilinxLut6Cost > 0),
+  }) : speedGrade =
+           speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1'),
+       assert(xilinxLut6Cost == null || xilinxLut6Cost > 0),
        assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
        _xilinxFamily = null;
 
@@ -257,12 +283,12 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.pinMap = const {},
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
+    this.speedGrade = '6',
     this.progCommand,
     this.ecp5Autoname = false,
   }) : name = 'ecp5-$device',
        vendor = HarborFpgaVendor.ecp5,
        clockNPortName = null,
-       speedGrade = '1',
        useHimbaechel = false,
        _xilinxFamily = null,
        xilinxLut6Cost = null;
@@ -498,8 +524,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
             '--asc $topCell.asc'
             '${frequency > 0 ? " --freq ${(frequency / 1e6).toStringAsFixed(0)}" : ""}';
       case HarborFpgaVendor.ecp5:
+        checkSpeedGrade(vendor, speedGrade);
         final ecp5Size = _ecp5DeviceSize(device);
         return 'nextpnr-ecp5 --$ecp5Size --package $package '
+            '--speed $speedGrade '
             '--json $topCell.json '
             '--lpf $topCell.lpf '
             '--textcfg $topCell.config'

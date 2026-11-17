@@ -178,6 +178,8 @@ Future<void> _pnr(int sysHz, {int? memHz}) async {
             '--85k',
             '--package',
             'CABGA381',
+            '--speed',
+            board.speedGrade,
             '--seed',
             '$seed',
             '--json',
