@@ -55,6 +55,7 @@
 #define HARBOR_SD_CTRL_WIDTH_1	   0
 #define HARBOR_SD_CTRL_WIDTH_4	   1
 #define HARBOR_SD_CTRL_WIDTH_8	   2
+#define HARBOR_SD_CTRL_SAMPLE_FALL BIT(8)
 #define HARBOR_SD_CTRL_DAT_RESET   BIT(9)
 
 #define HARBOR_SD_ST_CARD_DETECT BIT(0)
@@ -130,14 +131,15 @@ struct harbor_sd {
 	struct device *dev;
 	unsigned int clk_freq;
 	u32 ctrl;		     /* the CTRL value in force */
+	u32 ctrl_fixed;		     /* CTRL bits the driver leaves as found */
 	struct harbor_sd_desc *desc; /* descriptor table (coherent) */
 	dma_addr_t desc_dma;
 };
 
 static void harbor_sd_write_ctrl(struct harbor_sd *hs, u32 ctrl)
 {
-	hs->ctrl = ctrl;
-	writel(ctrl, hs->base + HARBOR_SD_CTRL);
+	hs->ctrl = ctrl | hs->ctrl_fixed;
+	writel(hs->ctrl, hs->base + HARBOR_SD_CTRL);
 }
 
 static void harbor_sd_set_clock(struct harbor_sd *hs, unsigned int hz)
@@ -446,6 +448,13 @@ static int harbor_sd_probe(struct platform_device *pdev)
 		ret = PTR_ERR(hs->base);
 		goto err_free_host;
 	}
+
+	/*
+	 * The sample edge is a build choice that CTRL keeps at its reset
+	 * value, so every later CTRL write carries it along.
+	 */
+	hs->ctrl_fixed = readl(hs->base + HARBOR_SD_CTRL) &
+			 HARBOR_SD_CTRL_SAMPLE_FALL;
 
 	/*
 	 * The controller input clock. Harbor's device tree states the rate
