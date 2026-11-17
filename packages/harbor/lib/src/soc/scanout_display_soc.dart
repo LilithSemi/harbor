@@ -2,6 +2,7 @@ import 'dart:math';
 
 import 'package:rohd/rohd.dart';
 
+import '../bus/bus.dart';
 import '../peripherals/display.dart';
 import '../peripherals/harbor_sdram.dart';
 import '../peripherals/scanout_display.dart';
@@ -353,6 +354,10 @@ extension HarborSocScanoutDisplay on HarborSoC {
         strides: strides,
         framebufferBase: fbBase ?? 0,
         placement: framebuffer,
+        scanoutMemory: BusAddressRange(
+          sdram.baseAddress,
+          sdram.config.sizeBytes,
+        ),
         framebufferSize: size,
         target: target,
         simpleFramebuffer:

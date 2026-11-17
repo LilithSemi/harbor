@@ -58,6 +58,15 @@ class HarborDeviceTreeCells {
   const HarborDeviceTreeCells(this.cells);
 }
 
+/// An address and size pair, written in the address and size cells of the
+/// root node, like the `reg` of a `memory` node.
+class HarborDeviceTreeRegion {
+  /// The span.
+  final BusAddressRange range;
+
+  const HarborDeviceTreeRegion(this.range);
+}
+
 /// One context (hart-facing register block) of an interrupt controller.
 ///
 /// A RISC-V PLIC gives each privilege level that claims interrupts its own
@@ -752,6 +761,10 @@ class HarborDeviceTreeGenerator {
     if (value is String) return '"$value"';
     if (value is int) return '<$value>';
     if (value is HarborDeviceTreeRef) return '<&${value.label}>';
+    if (value is HarborDeviceTreeRegion) {
+      return '<${_regCells(value.range.start, addressCells)} '
+          '${_regCells(value.range.size, sizeCells)}>';
+    }
     if (value is HarborDeviceTreeCells) {
       final cells = [
         for (final c in value.cells)

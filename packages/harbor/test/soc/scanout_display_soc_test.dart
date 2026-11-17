@@ -165,6 +165,7 @@ const _dts = r'''
             harbor,pixel-clock-hz = <25000000>;
             harbor,formats = "r5g6b5";
             harbor,strides = <0x800>;
+            harbor,scanout-memory = <0x80000000 0x2000000>;
             memory-region = <&display_fb>;
         };
     };
@@ -225,6 +226,7 @@ void main() {
       expect(dts, isNot(contains('simple-framebuffer')));
       expect(dts, isNot(contains('memory-region')));
       expect(dts, contains('display@10008000'));
+      expect(dts, contains('harbor,scanout-memory = <0x80000000 0x2000000>;'));
     });
 
     test('FB_BASE resets to 0 and the display is off', () {
@@ -297,6 +299,7 @@ void main() {
       '"harbor,pixel-clock-hz", 0x17D7840',
       '"harbor,formats", Package () { "r5g6b5" }',
       '"harbor,strides", Package () { 0x800 }',
+      '"harbor,scanout-memory", Package () { 0x80000000, 0x2000000 }',
     ]) {
       expect(block, contains(p));
     }

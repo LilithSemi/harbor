@@ -181,6 +181,11 @@ class HarborScanoutDisplay extends BridgeModule
   /// Size of the framebuffer region in bytes.
   final int framebufferSize;
 
+  /// The sdram span that the scanout port reads, or null when unknown. It is
+  /// the `harbor,scanout-memory` property of the node, so the firmware can
+  /// place the framebuffer where the display can read it.
+  final BusAddressRange? scanoutMemory;
+
   /// Who places the framebuffer, see [HarborFramebufferPlacement].
   final HarborFramebufferPlacement placement;
 
@@ -240,6 +245,7 @@ class HarborScanoutDisplay extends BridgeModule
     required this.framebufferBase,
     required this.framebufferSize,
     required HarborDeviceTarget target,
+    this.scanoutMemory,
     this.placement = HarborFramebufferPlacement.fixed,
     this.simpleFramebuffer = true,
     this.enableOnReset = false,
@@ -677,6 +683,8 @@ class HarborScanoutDisplay extends BridgeModule
     reg: BusAddressRange(baseAddress, windowBytes),
     properties: {
       ..._modeProperties,
+      if (scanoutMemory != null)
+        'harbor,scanout-memory': HarborDeviceTreeRegion(scanoutMemory!),
       if (placement == HarborFramebufferPlacement.fixed)
         'memory-region': HarborDeviceTreeRef(reservedLabel),
     },
@@ -721,6 +729,8 @@ class HarborScanoutDisplay extends BridgeModule
     properties: {
       'compatible': const ['harbor,display'],
       ..._modeProperties,
+      if (scanoutMemory != null)
+        'harbor,scanout-memory': [scanoutMemory!.start, scanoutMemory!.size],
     },
   );
 
