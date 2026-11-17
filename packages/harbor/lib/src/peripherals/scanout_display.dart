@@ -15,6 +15,20 @@ import '../video/dual_clock_display.dart';
 import 'device_register.dart';
 import 'display.dart';
 
+/// Who places the framebuffer of a [HarborScanoutDisplay].
+enum HarborFramebufferPlacement {
+  /// The build fixes the framebuffer pool. The device tree has a
+  /// `reserved-memory` node for it and a `simple-framebuffer` node in
+  /// `/chosen`, and FB_BASE resets to the pool base.
+  fixed,
+
+  /// The firmware places the framebuffer. The device tree has no
+  /// `reserved-memory` node, no `simple-framebuffer` node and no
+  /// `memory-region` on the display node. FB_BASE resets to 0 and the display
+  /// is off after a reset.
+  firmware,
+}
+
 /// A display with a register block, scanning an sdram through its scanout
 /// port.
 ///
@@ -167,6 +181,9 @@ class HarborScanoutDisplay extends BridgeModule
   /// Size of the framebuffer region in bytes.
   final int framebufferSize;
 
+  /// Who places the framebuffer, see [HarborFramebufferPlacement].
+  final HarborFramebufferPlacement placement;
+
   /// True when the node tree has a `simple-framebuffer` node for the
   /// region, for the firmware and early boot.
   final bool simpleFramebuffer;
@@ -223,6 +240,7 @@ class HarborScanoutDisplay extends BridgeModule
     required this.framebufferBase,
     required this.framebufferSize,
     required HarborDeviceTarget target,
+    this.placement = HarborFramebufferPlacement.fixed,
     this.simpleFramebuffer = true,
     this.enableOnReset = false,
     this.gateOnInitDone = true,
@@ -247,6 +265,7 @@ class HarborScanoutDisplay extends BridgeModule
                '${timing.vBackPorch}${timing.vSyncPositive ? 'p' : 'n'}',
            'c${timing.pixelClock}',
            'b${framebufferBase.toRadixString(16)}',
+           if (placement == HarborFramebufferPlacement.firmware) 'fw',
            if (enableOnReset) 'on',
            if (gateOnInitDone) 'g',
            target is HarborFpgaTarget ? target.vendor.name : 'generic',
@@ -591,6 +610,13 @@ class HarborScanoutDisplay extends BridgeModule
         );
       }
     }
+    if (placement == HarborFramebufferPlacement.firmware &&
+        (framebufferBase != 0 || enableOnReset || simpleFramebuffer)) {
+      throw ArgumentError(
+        'a framebuffer that the firmware places has a framebufferBase of 0, '
+        'no simple-framebuffer node, and a display that is off after a reset',
+      );
+    }
     if (framebufferBase % 4 != 0 || framebufferBase < 0) {
       throw ArgumentError.value(
         framebufferBase,
@@ -651,16 +677,19 @@ class HarborScanoutDisplay extends BridgeModule
     reg: BusAddressRange(baseAddress, windowBytes),
     properties: {
       ..._modeProperties,
-      'memory-region': HarborDeviceTreeRef(reservedLabel),
+      if (placement == HarborFramebufferPlacement.fixed)
+        'memory-region': HarborDeviceTreeRef(reservedLabel),
     },
   );
 
   @override
-  List<HarborDeviceTreeNode> get extraDtNodes => !simpleFramebuffer
+  List<HarborDeviceTreeNode> get chosenDtNodes =>
+      !simpleFramebuffer || placement == HarborFramebufferPlacement.firmware
       ? const []
       : [
           HarborDeviceTreeNode(
             compatible: const ['simple-framebuffer'],
+            name: 'framebuffer',
             reg: _framebufferRange,
             properties: {
               'width': timing.hActive,
@@ -672,14 +701,17 @@ class HarborScanoutDisplay extends BridgeModule
         ];
 
   @override
-  List<HarborReservedMemory> get reservedMemory => [
-    HarborReservedMemory(
-      label: reservedLabel,
-      name: 'framebuffer',
-      range: _framebufferRange,
-      compatible: 'shared-dma-pool',
-    ),
-  ];
+  List<HarborReservedMemory> get reservedMemory =>
+      placement == HarborFramebufferPlacement.firmware
+      ? const []
+      : [
+          HarborReservedMemory(
+            label: reservedLabel,
+            name: 'framebuffer',
+            range: _framebufferRange,
+            compatible: 'shared-dma-pool',
+          ),
+        ];
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(

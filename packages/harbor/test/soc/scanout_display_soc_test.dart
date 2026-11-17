@@ -114,6 +114,20 @@ const _dts = r'''
         };
     };
 
+    chosen {
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        framebuffer@81e00000 {
+            compatible = "simple-framebuffer";
+            reg = <0x81e00000 0x200000>;
+            width = <640>;
+            height = <480>;
+            stride = <2048>;
+            format = "r5g6b5";
+        };
+    };
+
     soc {
         compatible = "simple-bus";
         #address-cells = <1>;
@@ -153,15 +167,6 @@ const _dts = r'''
             harbor,strides = <0x800>;
             memory-region = <&display_fb>;
         };
-
-        simple-framebuffer@81e00000 {
-            compatible = "simple-framebuffer";
-            reg = <0x81e00000 0x200000>;
-            width = <640>;
-            height = <480>;
-            stride = <2048>;
-            format = "r5g6b5";
-        };
     };
 };
 ''';
@@ -192,6 +197,77 @@ void main() {
           contains('firmware reads /memory only'),
         ),
       ),
+    );
+  });
+
+  group('firmware placement', () {
+    HarborSoC build() {
+      final target = _target();
+      final soc = _soc(target);
+      final sdram = soc.addPeripheral(_sdram(target));
+      soc.addScanoutDisplay(
+        sdram: sdram,
+        timing: const HarborDisplayTiming.vga640x480(),
+        pixelClockHz: 25000000,
+        framebuffer: HarborFramebufferPlacement.firmware,
+        baseAddress: 0x10008000,
+        busDataWidth: 64,
+      );
+      soc.buildFabric();
+      return soc;
+    }
+
+    test('the tree has the whole sdram and no framebuffer nodes', () {
+      final dts = build().generateDts();
+      expect(dts, contains('reg = <0x80000000 0x2000000>;\n    };'));
+      expect(dts, isNot(contains('reserved-memory')));
+      expect(dts, isNot(contains('chosen')));
+      expect(dts, isNot(contains('simple-framebuffer')));
+      expect(dts, isNot(contains('memory-region')));
+      expect(dts, contains('display@10008000'));
+    });
+
+    test('FB_BASE resets to 0 and the display is off', () {
+      final svd = build().generateSvd();
+      final start = svd.indexOf('<name>DISPLAY</name>');
+      final block = svd.substring(start, svd.indexOf('</peripheral>', start));
+      expect(block, contains('<resetValue>0x0</resetValue>'));
+      expect(block, isNot(contains('0x81E00000')));
+    });
+
+    test('a fixed base or enable on reset is rejected', () {
+      final target = _target();
+      final soc = _soc(target);
+      final sdram = soc.addPeripheral(_sdram(target));
+      for (final (base, on) in [(0x81e00000, false), (null, true)]) {
+        expect(
+          () => soc.addScanoutDisplay(
+            sdram: sdram,
+            timing: const HarborDisplayTiming.vga640x480(),
+            pixelClockHz: 25000000,
+            framebuffer: HarborFramebufferPlacement.firmware,
+            framebufferBase: base,
+            enableOnReset: on,
+            baseAddress: 0x10008000,
+          ),
+          throwsArgumentError,
+        );
+      }
+    });
+  });
+
+  test('a fixed framebuffer needs a base', () {
+    final target = _target();
+    final soc = _soc(target);
+    final sdram = soc.addPeripheral(_sdram(target));
+    expect(
+      () => soc.addScanoutDisplay(
+        sdram: sdram,
+        timing: const HarborDisplayTiming.vga640x480(),
+        pixelClockHz: 25000000,
+        baseAddress: 0x10008000,
+      ),
+      throwsArgumentError,
     );
   });
 

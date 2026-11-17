@@ -83,7 +83,15 @@ extension HarborSocScanoutDisplay on HarborSoC {
   /// `sys` domain. The pixel clock of the display is the real rate of
   /// [pixelDomain], not the one in [timing].
   ///
-  /// [framebufferBase] is the start of the framebuffer region. It must be
+  /// [framebuffer] says who places the framebuffer. With
+  /// [HarborFramebufferPlacement.firmware] the helper takes no
+  /// [framebufferBase]: the sdram `memory` node covers all of the sdram, the
+  /// tree has no `reserved-memory` node and no `simple-framebuffer` node, the
+  /// display node has no `memory-region`, FB_BASE resets to 0 and the display
+  /// is off after a reset. The firmware makes the framebuffer, reserves it,
+  /// and adds the nodes for the OS.
+  ///
+  /// With [HarborFramebufferPlacement.fixed], [framebufferBase] is the start of the framebuffer region. It must be
   /// aligned to a page of the sdram, and so must [framebufferSize]. The
   /// region is a `reserved-memory` node with `no-map`, a `shared-dma-pool`
   /// that the display driver takes its buffers from, so no other part of the
@@ -149,7 +157,8 @@ extension HarborSocScanoutDisplay on HarborSoC {
     required HarborSdram sdram,
     required HarborDisplayTiming timing,
     List<HarborPixelFormat> formats = const [HarborPixelFormat.rgb565],
-    required int framebufferBase,
+    HarborFramebufferPlacement framebuffer = HarborFramebufferPlacement.fixed,
+    int? framebufferBase,
     int? framebufferSize,
     required int baseAddress,
     int? pixelClockHz,
@@ -180,6 +189,16 @@ extension HarborSocScanoutDisplay on HarborSoC {
         'needs scanoutPorts of 1',
       );
     }
+    final firmwarePlaces = framebuffer == HarborFramebufferPlacement.firmware;
+    if (firmwarePlaces && (framebufferBase != null || enableOnReset)) {
+      throw ArgumentError(
+        'a framebuffer that the firmware places has no framebufferBase, and '
+        'the display is off after a reset',
+      );
+    }
+    if (!firmwarePlaces && framebufferBase == null) {
+      throw ArgumentError.notNull('framebufferBase');
+    }
     final page = sdram.config.pageBytes;
     final sdramEnd = sdram.baseAddress + sdram.config.sizeBytes;
     final strides = [
@@ -201,30 +220,32 @@ extension HarborSocScanoutDisplay on HarborSoC {
         'the dma pool needs $block bytes for one buffer of $frame bytes',
       );
     }
-    if (framebufferBase % page != 0 ||
-        size % page != 0 ||
-        framebufferBase % 4096 != 0 ||
-        size % 4096 != 0) {
-      throw ArgumentError(
-        'the framebuffer base and size must be multiples of the sdram page '
-        'size $page and of 4096',
-      );
-    }
-    if (framebufferBase < sdram.baseAddress ||
-        framebufferBase + size > sdramEnd) {
-      throw ArgumentError(
-        'the framebuffer must lie inside the sdram, from '
-        '0x${sdram.baseAddress.toRadixString(16)} to '
-        '0x${sdramEnd.toRadixString(16)}',
-      );
-    }
-    if (framebufferBase + size != sdramEnd) {
-      throw ArgumentError(
-        'the framebuffer must end at the top of the sdram, 0x'
-        '${sdramEnd.toRadixString(16)}: the firmware reads /memory only, so '
-        'the memory node ends at the framebuffer base and nothing may lie '
-        'above it',
-      );
+    final fbBase = framebufferBase;
+    if (fbBase != null) {
+      if (fbBase % page != 0 ||
+          size % page != 0 ||
+          fbBase % 4096 != 0 ||
+          size % 4096 != 0) {
+        throw ArgumentError(
+          'the framebuffer base and size must be multiples of the sdram page '
+          'size $page and of 4096',
+        );
+      }
+      if (fbBase < sdram.baseAddress || fbBase + size > sdramEnd) {
+        throw ArgumentError(
+          'the framebuffer must lie inside the sdram, from '
+          '0x${sdram.baseAddress.toRadixString(16)} to '
+          '0x${sdramEnd.toRadixString(16)}',
+        );
+      }
+      if (fbBase + size != sdramEnd) {
+        throw ArgumentError(
+          'the framebuffer must end at the top of the sdram, 0x'
+          '${sdramEnd.toRadixString(16)}: the firmware reads /memory only, so '
+          'the memory node ends at the framebuffer base and nothing may lie '
+          'above it',
+        );
+      }
     }
 
     var shift = clockDomain(shiftDomain);
@@ -321,7 +342,7 @@ extension HarborSocScanoutDisplay on HarborSoC {
       );
     }
 
-    sdram.firmwareReservedBytes = sdramEnd - framebufferBase;
+    if (fbBase != null) sdram.firmwareReservedBytes = sdramEnd - fbBase;
 
     final gate = sdram.tryOutput('init_done') != null;
     final display = addPeripheral(
@@ -330,10 +351,12 @@ extension HarborSocScanoutDisplay on HarborSoC {
         timing: mode,
         formats: formats,
         strides: strides,
-        framebufferBase: framebufferBase,
+        framebufferBase: fbBase ?? 0,
+        placement: framebuffer,
         framebufferSize: size,
         target: target,
-        simpleFramebuffer: simpleFramebuffer ?? enableOnReset,
+        simpleFramebuffer:
+            !firmwarePlaces && (simpleFramebuffer ?? enableOnReset),
         enableOnReset: enableOnReset,
         gateOnInitDone: gate,
         fabricKind: fabricKind,

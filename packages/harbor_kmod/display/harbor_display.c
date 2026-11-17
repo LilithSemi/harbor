@@ -28,8 +28,11 @@
  * "harbor,*" properties. A node without them is read from the registers.
  *
  * The scanout port reaches only the sdram, so the framebuffers come from
- * the memory-region of the node, a shared-dma-pool inside the sdram. The
- * driver takes over from a simple-framebuffer node that uses the same region.
+ * the memory-region of the node, a shared-dma-pool inside the sdram. A node
+ * without a memory-region uses the default DMA pool or the CMA area, which
+ * must lie in the sdram. The driver takes over from a simple-framebuffer
+ * node that uses the same region, or from any firmware framebuffer when the
+ * node has no memory-region.
  */
 
 #include <linux/aperture.h>
@@ -58,6 +61,7 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_mode_config.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
@@ -561,7 +565,7 @@ static int harbor_display_remove_firmware_fb(struct device *dev)
 
 	np = of_parse_phandle(dev->of_node, "memory-region", 0);
 	if (!np)
-		return 0;
+		return aperture_remove_all_conflicting_devices("harbor-display");
 	ret = of_address_to_resource(np, 0, &res);
 	of_node_put(np);
 	if (ret)
@@ -615,14 +619,17 @@ static int harbor_display_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
-	ret = of_reserved_mem_device_init(dev);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "no memory-region, the display needs a device "
-				     "tree with a shared-dma-pool\n");
-	ret = devm_add_action_or_reset(dev, harbor_display_release_pool, dev);
-	if (ret)
-		return ret;
+	if (of_property_present(dev->of_node, "memory-region")) {
+		ret = of_reserved_mem_device_init(dev);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "the memory-region is not a "
+					     "shared-dma-pool\n");
+		ret = devm_add_action_or_reset(dev, harbor_display_release_pool,
+					       dev);
+		if (ret)
+			return ret;
+	}
 
 	ret = drmm_mode_config_init(drm);
 	if (ret)

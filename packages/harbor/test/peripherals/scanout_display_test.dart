@@ -504,7 +504,7 @@ void main() {
       expect(dt.properties['harbor,hactive'], 16);
       expect(dt.properties['harbor,formats'], ['r5g6b5', 'x8r8g8b8']);
       expect(dt.properties['harbor,strides'], [64, 128]);
-      expect(d.extraDtNodes.single.properties['format'], 'r5g6b5');
+      expect(d.chosenDtNodes.single.properties['format'], 'r5g6b5');
       expect(d.reservedMemory.single.range.start, _fbBase);
       final acpi = d.acpiDevice;
       expect(acpi.hid, 'PRP0001');
@@ -525,7 +525,7 @@ void main() {
         target: const HarborSimTarget(),
         simpleFramebuffer: false,
       );
-      expect(d.extraDtNodes, isEmpty);
+      expect(d.chosenDtNodes, isEmpty);
     });
   });
 }

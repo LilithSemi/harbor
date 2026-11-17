@@ -11,7 +11,7 @@ Out-of-tree Linux kernel drivers for Harbor SoC peripherals.
 | `harbor_i2c` | `harbor,i2c` | I2C master controller |
 | `harbor_sdio` | `harbor,sdio`, `harbor,sdhci` | SD/SDIO/eMMC host controller (ADMA) |
 | `harbor_spi_flash` | `harbor,spi-flash-port` | MTD driver for the SPI flash write port |
-| `harbor_display` | `harbor,display` | DRM driver for the sdram scanout display, one fixed mode, vblank interrupt. It takes buffers of the full screen size only: a dumb buffer of another size is refused. It needs a device tree `memory-region`. |
+| `harbor_display` | `harbor,display` | DRM driver for the sdram scanout display, one fixed mode, vblank interrupt. It takes buffers of the full screen size only: a dumb buffer of another size is refused. It takes its buffers from the `memory-region` of the node, or from the default DMA pool or CMA area when the node has none. |
 
 ## Peripherals with upstream Linux support
 

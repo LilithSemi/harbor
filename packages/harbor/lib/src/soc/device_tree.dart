@@ -133,6 +133,10 @@ class HarborDeviceTreeNode with HarborPrettyString {
   /// node has an interrupt, because the driver builds the domain only then.
   final int? interruptDomainCells;
 
+  /// Node name without the unit address, or null to derive it from the first
+  /// compatible string.
+  final String? name;
+
   const HarborDeviceTreeNode({
     required this.compatible,
     required this.reg,
@@ -144,6 +148,7 @@ class HarborDeviceTreeNode with HarborPrettyString {
     this.children = const [],
     this.label,
     this.interruptDomainCells,
+    this.name,
   });
 
   /// The primary compatible string (first in the list).
@@ -153,10 +158,9 @@ class HarborDeviceTreeNode with HarborPrettyString {
   ///
   /// Generated from the first compatible string + hex base address.
   String get nodeName {
-    final base = primaryCompatible
-        .split(',')
-        .last
-        .replaceAll(RegExp(r'[^a-z0-9]'), '-');
+    final base =
+        name ??
+        primaryCompatible.split(',').last.replaceAll(RegExp(r'[^a-z0-9]'), '-');
     return '$base@${reg.start.toRadixString(16)}';
   }
 
@@ -217,6 +221,10 @@ mixin HarborDeviceTreeNodeProvider {
   /// More nodes for the same device, emitted after [dtNode]. They get no
   /// interrupts from the SoC.
   List<HarborDeviceTreeNode> get extraDtNodes => const [];
+
+  /// Nodes for the `/chosen` node, such as a `simple-framebuffer` that the
+  /// firmware sets up. They get no interrupts from the SoC.
+  List<HarborDeviceTreeNode> get chosenDtNodes => const [];
 }
 
 /// A peripheral with more than one slave port. [HarborSoC.addPeripheral]
@@ -521,6 +529,30 @@ class HarborDeviceTreeGenerator {
       buf.writeln('    };');
     }
 
+    final chosenNodes = [for (final p in peripherals) ...p.chosenDtNodes];
+    if (chosenNodes.isNotEmpty) {
+      buf.writeln();
+      buf.writeln('    chosen {');
+      buf.writeln('        #address-cells = <$addressCells>;');
+      buf.writeln('        #size-cells = <$sizeCells>;');
+      for (final node in chosenNodes) {
+        buf.writeln();
+        final label = node.label == null ? '' : '${node.label}: ';
+        buf.writeln('        $label${node.nodeName} {');
+        final compatStr = node.compatible.map((c) => '"$c"').join(', ');
+        buf.writeln('            compatible = $compatStr;');
+        buf.writeln(
+          '            reg = <${_regCells(node.reg.start, addressCells)} '
+          '${_regCells(node.reg.size, sizeCells)}>;',
+        );
+        for (final entry in node.properties.entries) {
+          _emitProperty(buf, '            ', entry.key, entry.value);
+        }
+        buf.writeln('        };');
+      }
+      buf.writeln('    };');
+    }
+
     if (peripherals.isNotEmpty) {
       buf.writeln();
       buf.writeln('    soc {');
@@ -635,7 +667,11 @@ class HarborDeviceTreeGenerator {
     }
 
     final nodes = [
-      for (final p in peripherals) ...[p.dtNode, ...p.extraDtNodes],
+      for (final p in peripherals) ...[
+        p.dtNode,
+        ...p.extraDtNodes,
+        ...p.chosenDtNodes,
+      ],
     ];
     for (final n in nodes) {
       add(n.label);
