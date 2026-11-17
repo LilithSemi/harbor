@@ -194,13 +194,25 @@ class SdramMemoryPort extends Module {
       popOf: (b) => on(b[fWv] && b[fWl], w.wdataReady),
     );
     final reqWidths = [1, memAW, lenW, sizeW, burstW];
-    final reqPacked = harborPack([
+    final reqFields = [
       w.reqWrite,
       w.reqAddr.getRange(0, memAW),
       w.reqLen,
       w.reqSize,
       w.reqBurst,
-    ]);
+    ];
+    final reqPacked = harborPack(reqFields);
+    // The first chunk of a request, worked out as it enters the 2 entry
+    // FIFO so the splitter loads it ready.
+    final reqChunk = _chunk(
+      reqFields[1],
+      reqFields[2],
+      reqFields[3],
+      reqFields[4],
+      reqFields[2],
+      beatLog2,
+      blockBeats,
+    );
     // With one request in flight the splitter loads straight from the
     // waist, one cycle sooner. Else a 2 entry FIFO cuts the path.
     final direct = n == 1;
@@ -217,7 +229,7 @@ class SdramMemoryPort extends Module {
         reset: clr,
         depth: 2,
         pushValid: w.reqValid & ~clr,
-        pushData: reqPacked,
+        pushData: harborPack([...reqFields, reqChunk]),
         popReady: load,
       );
       final ready = reqIn.pushReady & ~clr & rdQ.ready & widQ.ready;
@@ -248,7 +260,9 @@ class SdramMemoryPort extends Module {
       headData = reqIn.popData;
     }
     reqFire <= w.reqValid & w.reqReady;
-    final head = harborUnpack(headData, reqWidths);
+    final headFields = harborUnpack(headData, [...reqWidths, if (!direct) 3]);
+    final head = headFields.sublist(0, 5);
+    final headChunk = direct ? reqChunk : headFields[5];
 
     // --- write buffer: beats in order, with a commit pointer that marks
     // the beats of requests already sent to the port ---
@@ -287,9 +301,10 @@ class SdramMemoryPort extends Module {
     final take = (oValid & p.wrReady).named('wr_take');
     final feed = ((~oValid | take) & hValid).named('feed');
     final fLast = fIdx.eq(wpb - 1).named('feed_last');
-    final hLoad = ((~hValid | (feed & fLast)) & rPtr.neq(cPtr)).named(
-      'head_load',
-    );
+    // High while committed beats are left to read, `wb_rd != wb_commit`,
+    // kept as a register.
+    final cmtAny = Logic(name: 'wb_cmt_any');
+    final hLoad = ((~hValid | (feed & fLast)) & cmtAny).named('head_load');
     final rIdx = rPtr.getRange(0, wbW);
     final beat = _pick(rIdx, wbData);
     final zero = Const(0, width: wbW + 1);
@@ -302,23 +317,48 @@ class SdramMemoryPort extends Module {
       // A register with the value of the WDATA ready in each cycle, from a
       // register copy of `wb_count`.
       final cnt = Logic(name: 'wb_count_r', width: wbW + 1);
-      final rNext = mux(reset, zero, mux(hLoad, rPtr + 1, rPtr));
-      final clrCnt = mux(reset, zero, cPtr - rNext);
+      // The count after a clear is the commit pointer minus the read
+      // pointer after this edge. Both values are made from registers, and
+      // the late [hLoad] only selects one.
+      final clrKeep = mux(reset, zero, cPtr - rPtr);
+      final clrLoad = mux(reset, zero, cPtr - rPtr - 1);
       final cut = reset | clr;
-      Logic step(_Far b, Logic Function(Logic c) f) {
+      Logic step(
+        _Far b,
+        Logic Function(Logic c) f, {
+        Logic Function(Logic readPtr)? onCut,
+      }) {
         final wp = on(b[fWv], w.wdataReady);
+        final cutKeep = onCut == null ? f(clrKeep) : onCut(rPtr);
+        final cutLoad = onCut == null ? f(clrLoad) : onCut(rPtr + 1);
         return mux(
-          cut,
-          f(clrCnt),
-          mux(hLoad, mux(wp, f(cnt), f(cnt - 1)), mux(wp, f(cnt + 1), f(cnt))),
+          hLoad,
+          mux(cut, cutLoad, mux(wp, f(cnt), f(cnt - 1))),
+          mux(cut, cutKeep, mux(wp, f(cnt + 1), f(cnt))),
         );
       }
 
       Logic notFull(Logic c) => c.neq(Const(writeBeats, width: wbW + 1));
+      // After a clear the count is the commit pointer minus a read pointer
+      // value. With a power of two buffer it is full when the commit pointer
+      // is that read pointer with its top bit flipped, so no subtraction.
+      Logic Function(Logic)? notFullOnCut;
+      if (writeBeats == 1 << wbW) {
+        notFullOnCut = (r) => mux(
+          reset,
+          Const(1),
+          cPtr.neq([~r[wbW], r.getRange(0, wbW)].concat()),
+        );
+      }
       Sequential(clk, [
         cnt < ahead((b) => step(b, (c) => c)),
         wdReadyR <
-            ahead((b) => ~clrNext! & step(b, notFull) & oorQ.validNextOf(b)),
+            ahead(
+              (b) =>
+                  ~clrNext! &
+                  step(b, notFull, onCut: notFullOnCut) &
+                  oorQ.validNextOf(b),
+            ),
       ]);
     }
 
@@ -358,14 +398,15 @@ class SdramMemoryPort extends Module {
     final kWide = kReg.zeroExtend(wbW + 1);
     final enough = mux(
       sWrite,
-      wbFree.gte(kWide),
-      credit.gte(kReg.zeroExtend(rbW)),
+      _atLeastK(wbFree, kReg),
+      _atLeastK(credit, kReg),
     );
     // A request goes out only into an empty request register, so no port
     // ready reaches the splitter.
     final issue = (sValid & kValid & ~qValid & enough & ~clr).named('issue');
     load <= ~sValid & headValid & ~clr;
-    final lastChunk = sLeft.getRange(3).eq(0) & sLeft.getRange(0, 3).lt(kReg);
+    final lastChunk =
+        sLeft.getRange(3).eq(0) & ~_atLeastK(sLeft.getRange(0, 3), kReg);
     // The arbiter takes the last request of a write.
     final wEvent =
         (writeTaken == null
@@ -576,6 +617,7 @@ class SdramMemoryPort extends Module {
           wPtr < 0,
           cPtr < 0,
           rPtr < 0,
+          cmtAny < 0,
           fIdx < 0,
           hValid < 0,
           oValid < 0,
@@ -585,6 +627,12 @@ class SdramMemoryPort extends Module {
         orElse: [
           wPtr < ahead(wNext),
           If(issue & sWrite, then: [cPtr < cPtr + kWide]),
+          cmtAny <
+              mux(
+                issue & sWrite,
+                Const(1),
+                mux(hLoad, cPtr.neq(rPtr + 1), cmtAny),
+              ),
           If(feed, then: [fIdx < fIdx + 1]),
           If(hLoad, then: [rPtr < rPtr + 1]),
           hValid < hLoad | (hValid & ~(feed & fLast)),
@@ -624,16 +672,7 @@ class SdramMemoryPort extends Module {
           sSize < head[3],
           sBurst < head[4],
           sWrapLen < head[2],
-          kReg <
-              _chunk(
-                head[1],
-                head[2],
-                head[3],
-                head[4],
-                head[2],
-                beatLog2,
-                blockBeats,
-              ),
+          kReg < headChunk,
         ],
         orElse: [
           If(
@@ -987,6 +1026,19 @@ class SdramMemoryPort extends Module {
       }
     });
   }
+}
+
+/// [a] >= [k] for a 3 bit [k], from the high bits of [a] and a compare of
+/// its low 3 bits written as gates, so it does not use a carry chain.
+Logic _atLeastK(Logic a, Logic k) {
+  final a3 = a.width < 3 ? a.zeroExtend(3) : a;
+  final high = a3.width > 3 ? a3.getRange(3).or() : Const(0);
+  final gt2 = a3[2] & ~k[2];
+  final eq2 = ~(a3[2] ^ k[2]);
+  final gt1 = a3[1] & ~k[1];
+  final eq1 = ~(a3[1] ^ k[1]);
+  final ge0 = a3[0] | ~k[0];
+  return high | gt2 | (eq2 & (gt1 | (eq1 & ge0)));
 }
 
 /// A FIFO of [depth] entries rounded up to a power of two. [ready] is low
