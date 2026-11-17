@@ -63,7 +63,8 @@
 
 /*
  * CMD: [5:0] index, [7:6] response type, [8] data, [9] read, [10] ADMA,
- * [11] ADMA_ADDR is a descriptor table.
+ * [11] ADMA_ADDR is a descriptor table, [12] the response has no CRC7,
+ * [13] the response does not echo the index.
  */
 #define HARBOR_SD_CMD_INDEX	 GENMASK(5, 0)
 #define HARBOR_SD_CMD_RESP_SHIFT 6
@@ -75,6 +76,8 @@
 #define HARBOR_SD_CMD_READ	 BIT(9)
 #define HARBOR_SD_CMD_DMA	 BIT(10)
 #define HARBOR_SD_CMD_TABLE	 BIT(11)
+#define HARBOR_SD_CMD_NO_CRC	 BIT(12)
+#define HARBOR_SD_CMD_NO_INDEX	 BIT(13)
 
 /* INT_STATUS, write-1-to-clear. */
 #define HARBOR_SD_INT_CMD_DONE	  BIT(0)
@@ -85,7 +88,14 @@
 #define HARBOR_SD_INT_WRITE_ERR	  BIT(5)
 #define HARBOR_SD_INT_RX_OVERRUN  BIT(6)
 #define HARBOR_SD_INT_ADMA_ERR	  BIT(7)
-#define HARBOR_SD_INT_ALL	  GENMASK(7, 0)
+#define HARBOR_SD_INT_DATA_TMO	  BIT(8)
+#define HARBOR_SD_INT_RESP_CRC	  BIT(9)
+#define HARBOR_SD_INT_RESP_END	  BIT(10)
+#define HARBOR_SD_INT_RESP_INDEX  BIT(11)
+#define HARBOR_SD_INT_RESP_ERR                                                 \
+	(HARBOR_SD_INT_RESP_CRC | HARBOR_SD_INT_RESP_END |                     \
+	 HARBOR_SD_INT_RESP_INDEX)
+#define HARBOR_SD_INT_ALL	  GENMASK(11, 0)
 
 /*
  * ADMA descriptor: two 32-bit words, [buffer address], [byte length in [15:0],
@@ -286,6 +296,10 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 
 	val = (cmd->opcode & HARBOR_SD_CMD_INDEX) |
 	      (harbor_sd_resp_type(cmd) << HARBOR_SD_CMD_RESP_SHIFT);
+	if (!(cmd->flags & MMC_RSP_CRC))
+		val |= HARBOR_SD_CMD_NO_CRC;
+	if (!(cmd->flags & MMC_RSP_OPCODE))
+		val |= HARBOR_SD_CMD_NO_INDEX;
 
 	if (data) {
 		val |= HARBOR_SD_CMD_DATA | HARBOR_SD_CMD_DMA |
@@ -332,12 +346,20 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		return;
 	}
 
+	if (ist & HARBOR_SD_INT_RESP_ERR) {
+		cmd->error = -EILSEQ;
+		if (data)
+			data->error = -EILSEQ;
+		harbor_sd_dat_reset(hs);
+		return;
+	}
+
 	harbor_sd_read_response(hs, cmd);
 
 	if (!data)
 		return;
 
-	if (!(ist & HARBOR_SD_INT_DATA_DONE))
+	if ((ist & HARBOR_SD_INT_DATA_TMO) || !(ist & HARBOR_SD_INT_DATA_DONE))
 		data->error = -ETIMEDOUT;
 	else if (ist & HARBOR_SD_INT_ADMA_ERR)
 		data->error = -EIO;
