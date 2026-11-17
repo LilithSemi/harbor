@@ -32,6 +32,7 @@
 #include <linux/mmc/mmc.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/math64.h>
 #include <linux/of.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
@@ -121,6 +122,8 @@ struct harbor_sd_desc {
 #define HARBOR_SD_CMD_TIMEOUT_US 100000
 /* A data phase includes the card's programming time on a write. */
 #define HARBOR_SD_DATA_TIMEOUT_US 5000000
+/* No data transfer or busy wait is allowed to hold the host for longer. */
+#define HARBOR_SD_MAX_WAIT_US	  60000000
 
 /* CLK_DIV counts full SD periods, so the divider is freq/(2*rate) - 1. */
 #define HARBOR_SD_CLK_DIV_MAX 65535
@@ -292,7 +295,7 @@ static int harbor_sd_dat_reset(struct harbor_sd *hs)
 static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 			      struct mmc_data *data)
 {
-	unsigned int timeout_us;
+	u64 timeout_us;
 	u32 val, ist, sts;
 	int ret;
 
@@ -313,10 +316,25 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		writel(data->blocks, hs->base + HARBOR_SD_BLK_COUNT);
 		writel(lower_32_bits(hs->desc_dma),
 		       hs->base + HARBOR_SD_ADMA_ADDR);
+		/*
+		 * The card timeout is for one block, and the engine ends a block
+		 * with its own busy limit. Allow each block its full time.
+		 */
 		timeout_us = HARBOR_SD_DATA_TIMEOUT_US;
+		if (data->timeout_ns) {
+			u64 per_block = div_u64(data->timeout_ns, 1000);
+
+			timeout_us = max_t(u64, timeout_us,
+					   per_block * data->blocks);
+		}
 	} else {
 		timeout_us = HARBOR_SD_CMD_TIMEOUT_US;
+		if (cmd->flags & MMC_RSP_BUSY)
+			timeout_us += (cmd->busy_timeout ? cmd->busy_timeout :
+							   10000) *
+				      1000ull;
 	}
+	timeout_us = min_t(u64, timeout_us, HARBOR_SD_MAX_WAIT_US);
 
 	/*
 	 * Clear the latched status first. Without this the timeout and error
@@ -433,6 +451,7 @@ static int harbor_sd_probe(struct platform_device *pdev)
 	struct harbor_sd *hs;
 	struct mmc_host *mmc;
 	struct clk *clk;
+	u32 busy_clocks;
 	int ret;
 
 	mmc = mmc_alloc_host(sizeof(*hs), dev);
@@ -539,6 +558,19 @@ static int harbor_sd_probe(struct platform_device *pdev)
 	 * clock the card actually gets.
 	 */
 	mmc->f_max = min(mmc->f_max, hs->clk_freq / 2);
+
+	/*
+	 * The engine holds a command with busy until DAT0 is high again, and
+	 * gives up after the number of SD clocks that the firmware node states.
+	 * At the fastest clock that is the shortest time it waits.
+	 */
+	if (!device_property_read_u32(dev, "harbor,busy-timeout-clocks",
+				      &busy_clocks) &&
+	    busy_clocks) {
+		mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY;
+		mmc->max_busy_timeout = div64_u64((u64)busy_clocks * 1000,
+						  max(mmc->f_max, 1u));
+	}
 
 	mmc->max_blk_size = HARBOR_SD_MAX_BLK_SIZE;
 	mmc->max_blk_count = HARBOR_SD_MAX_BLK_COUNT;
