@@ -1,5 +1,5 @@
 // buildFabric checks the target ranges of a master against the slaves of its
-// channel.
+// channel, and a burst master against slaves that cannot take bursts.
 
 import 'package:harbor/harbor.dart';
 import 'package:test/test.dart';
@@ -157,5 +157,104 @@ void main() {
       ),
       throwsStateError,
     );
+  });
+
+  group('burst masters', () {
+    // A DMA master with SRAM and a register slave, the register slave being
+    // the only one that may lack burst support.
+    HarborSoC burstSoc(
+      HarborFabricKind kind, {
+      List<BusAddressRange>? targets,
+      List<BusAddressRange>? bursts,
+    }) {
+      final soc = HarborSoC(
+        name: 'burst_${kind.name}',
+        compatible: 'test,burst',
+        fabricKind: kind,
+        target: const HarborSimTarget(frequency: 50000000),
+      );
+      final cpu = soc.addMaster(AdmaCpu(kind));
+      final dma = HarborDmaController(
+        baseAddress: 0x30000000,
+        channels: 1,
+        busAddressWidth: 32,
+        fabricKind: kind,
+      );
+      soc.addPeripheral(dma);
+      soc.addMaster(
+        dma,
+        busInterfaceName: 'dma',
+        memory: true,
+        outstanding: 1,
+        targetRanges: targets,
+        burstRanges: bursts,
+      );
+      soc.addPeripheral(
+        HarborSram(
+          name: 'sram',
+          baseAddress: 0x08000000,
+          size: 0x1000,
+          busAddressWidth: 32,
+          protocol: kind,
+        ),
+      );
+      soc.addPeripheral(
+        HarborGpio(
+          baseAddress: 0x40000000,
+          pinCount: 8,
+          busAddressWidth: 32,
+          fabricKind: kind,
+          name: 'gpio0',
+        ),
+      );
+      cpu.pullUp(soc);
+      soc.buildFabric();
+      return soc;
+    }
+
+    const sram = BusAddressRange(0x08000000, 0x1000);
+    const regs = BusAddressRange(0x40000000, 0x1000);
+
+    test('a burst master onto a TL-UL slave throws and names all three', () {
+      expect(
+        () => burstSoc(HarborFabricKind.tilelink, bursts: [sram, regs]),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('dma_dma'),
+              contains('gpio0'),
+              contains('0x40000000'),
+              contains('burst range'),
+              contains('cannot take bursts'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('a range that holds only burst slaves passes', () {
+      expect(
+        () => burstSoc(HarborFabricKind.tilelink, bursts: [sram]),
+        returnsNormally,
+      );
+    });
+
+    test('target ranges alone are not a burst check', () {
+      expect(
+        () => burstSoc(HarborFabricKind.tilelink, targets: [sram, regs]),
+        returnsNormally,
+      );
+    });
+
+    for (final kind in [HarborFabricKind.axi4, HarborFabricKind.wishbone]) {
+      test('${kind.name} takes bursts on every slave', () {
+        expect(
+          () => burstSoc(kind, targets: [sram, regs], bursts: [sram, regs]),
+          returnsNormally,
+        );
+      });
+    }
   });
 }

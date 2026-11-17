@@ -294,6 +294,21 @@ abstract final class HarborFabric {
     return errors;
   }
 
+  /// True when a fabric of [kind] can deliver a multi-beat burst to a slave
+  /// port with the [HarborFabricSlave.memory] flag [memory].
+  ///
+  /// - AXI4: every slave. An AXI4-Lite slave gets the burst as single beat
+  ///   requests from the fabric.
+  /// - Wishbone: every slave. A classic slave sees the beats of a burst as
+  ///   classic cycles.
+  /// - TileLink: memory slaves only. A TL-UL slave takes one beat or less,
+  ///   and a larger message to it ends denied.
+  static bool slaveTakesBursts(HarborFabricKind kind, {required bool memory}) =>
+      switch (kind) {
+        HarborFabricKind.axi4 || HarborFabricKind.wishbone => true,
+        HarborFabricKind.tilelink => memory,
+      };
+
   /// Throws [ArgumentError] when the master and slave lists cannot form a
   /// fabric of [kind]. Each builder calls it first.
   static void checkPorts({

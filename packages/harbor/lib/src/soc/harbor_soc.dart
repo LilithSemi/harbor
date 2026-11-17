@@ -657,6 +657,13 @@ class HarborSoC extends BridgeModule {
   /// [buildFabric] throws when a range is not fully covered by the slaves of
   /// the master's channel. Null skips the check.
   ///
+  /// [burstRanges] lists the address ranges where this master issues
+  /// multi-beat bursts, for example the ranges a cache with a line over one
+  /// bus word refills from, or a DMA engine moves data to. A master with no
+  /// [burstRanges] issues single beats only. [buildFabric] throws when a
+  /// burst range holds a slave that cannot take bursts (see
+  /// [HarborFabric.slaveTakesBursts]).
+  ///
   /// A module can be a peripheral and a master, or have more than one
   /// master port. Its master then takes the name
   /// `<module>_<busInterfaceName>` on the fabric.
@@ -673,6 +680,7 @@ class HarborSoC extends BridgeModule {
     int? readChannel,
     int? exclusiveIds,
     List<BusAddressRange>? targetRanges,
+    List<BusAddressRange>? burstRanges,
   }) {
     _masters.add(
       _MasterEntry(
@@ -685,6 +693,7 @@ class HarborSoC extends BridgeModule {
         readChannel: readChannel,
         exclusiveIds: exclusiveIds,
         targetRanges: targetRanges,
+        burstRanges: burstRanges,
       ),
     );
     _wireOnce(master, clockDomainName);
@@ -1030,6 +1039,26 @@ class HarborSoC extends BridgeModule {
 
     ({bool memory, int outstanding}) shapeOf(int i) =>
         _slaveShape(slaves[i].module, slaves[i].iface, slaveIntf(i));
+
+    for (final m in _masters) {
+      for (final target in m.burstRanges ?? const <BusAddressRange>[]) {
+        for (var i = 0; i < slaves.length; i++) {
+          final r = slaves[i].range;
+          if (!(reach[m.channel]?.contains(slaveName(i)) ?? true)) continue;
+          if (r.start >= target.end || r.end <= target.start) continue;
+          if (HarborFabric.slaveTakesBursts(
+            fabricKind,
+            memory: shapeOf(i).memory,
+          )) {
+            continue;
+          }
+          throw StateError(
+            '${m.module.name}_${m.busInterfaceName}: burst range $target '
+            'holds ${slaveName(i)} at $r, which cannot take bursts',
+          );
+        }
+      }
+    }
     // The map check takes the largest Wishbone burst block of any slave.
     final burstBeats = slaves
         .map(
@@ -1111,7 +1140,7 @@ class HarborSoC extends BridgeModule {
           name: masterName(m),
           interface: intf,
           outstanding: m.outstanding,
-          memory: m.memory ?? intf is Axi4Interface,
+          memory: m.isMemoryPort,
           reach: reach[m.channel],
           readChannel: m.readChannel,
           exclusiveIds: slotsOf[m],
@@ -2097,6 +2126,13 @@ class _MasterEntry {
   /// Address ranges the master must reach, or null for no check.
   final List<BusAddressRange>? targetRanges;
 
+  /// Address ranges where the master issues bursts, or null for none.
+  final List<BusAddressRange>? burstRanges;
+
+  /// The memory port flag: [memory], else true for a full AXI4 port.
+  bool get isMemoryPort =>
+      memory ?? module.interface(busInterfaceName).interface is Axi4Interface;
+
   const _MasterEntry({
     required this.module,
     required this.busInterfaceName,
@@ -2107,5 +2143,6 @@ class _MasterEntry {
     this.readChannel,
     this.exclusiveIds,
     this.targetRanges,
+    this.burstRanges,
   });
 }
