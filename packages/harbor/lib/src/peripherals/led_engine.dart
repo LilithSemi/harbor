@@ -799,12 +799,9 @@ class HarborLedEngine extends BridgeModule
                 If(hit, then: [dmaStall[c] < 1]),
                 If(
                   startNow[c] & modeNow[c],
-                  then: [
-                    stallArmed[c] < 1,
-                    stallCnt[c] < Const(0, width: sw),
-                    dmaStall[c] < 0,
-                  ],
+                  then: [stallArmed[c] < 1, stallCnt[c] < Const(0, width: sw)],
                 ),
+                If(startNow[c] | sendBusy[c], then: [dmaStall[c] < 0]),
               ],
             ),
           ]);

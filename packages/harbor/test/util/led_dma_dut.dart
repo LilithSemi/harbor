@@ -443,60 +443,69 @@ void registerLedDmaTests(HarborFabricKind kind) {
       expect(await d.rd(_reg(0, _status)) & 0x1E, equals(0));
       await Simulator.endSimulation();
     });
+  });
+}
 
-    if (kind == HarborFabricKind.wishbone) {
-      test('a fetch kept off the bus sets STALL and not UNDERRUN', () async {
-        await d.setUp(kind, cap: null, stallClocks: 256);
-        await d.putWords(_mem + 0x100, [0x00112233, 0x00445566, 0x00778899]);
+/// The starvation tests, which need the Wishbone fabric and take minutes.
+void registerLedDmaStarveTests() {
+  const kind = HarborFabricKind.wishbone;
+  group('HarborLedEngine dma starvation (wishbone)', () {
+    final d = _Dut();
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test('a fetch kept off the bus sets STALL and not UNDERRUN', () async {
+      await d.setUp(kind, cap: null, stallClocks: 256);
+      await d.putWords(_mem + 0x100, [0x00112233, 0x00445566, 0x00778899]);
+      await d.timing();
+      await d.wr(_reg(0, _baseLo), _mem + 0x100);
+      await d.wr(_reg(0, _pixelCount), 3);
+      await d.wr(_reg(0, _ctrl), _send);
+      var st = 0;
+      for (var i = 0; i < 150; i++) {
+        st = await d.rd(_reg(0, _status));
+      }
+      expect(st & 1, equals(1), reason: 'BUSY, the fetch has no bus');
+      expect(st & 0x10, equals(0x10), reason: 'STALL');
+      expect(st & 2, equals(0), reason: 'no UNDERRUN');
+      expect(d.status >> 32 & 1, equals(1));
+      expect(d.status >> 16 & 1, equals(0));
+      await d.wr(_reg(0, _ctrl), _send);
+      expect(await d.rd(_reg(0, _status)) & 0x10, equals(0), reason: 'SEND');
+      await Simulator.endSimulation();
+    });
+
+    test(
+      'a fetch starved in the middle stretches a low and UNDERRUNs',
+      () async {
+        await d.setUp(kind, cap: null);
+        final pixels = [for (var i = 0; i < 8; i++) 0x00102030 + 0x030507 * i];
+        await d.putWords(_mem + 0x100, pixels);
         await d.timing();
         await d.wr(_reg(0, _baseLo), _mem + 0x100);
-        await d.wr(_reg(0, _pixelCount), 3);
+        await d.wr(_reg(0, _pixelCount), 8);
         await d.wr(_reg(0, _ctrl), _send);
-        var st = 0;
-        for (var i = 0; i < 150; i++) {
-          st = await d.rd(_reg(0, _status));
-        }
-        expect(st & 1, equals(1), reason: 'BUSY, the fetch has no bus');
-        expect(st & 0x10, equals(0x10), reason: 'STALL');
-        expect(st & 2, equals(0), reason: 'no UNDERRUN');
-        expect(d.status >> 32 & 1, equals(1));
-        expect(d.status >> 16 & 1, equals(0));
-        await Simulator.endSimulation();
-      });
-
-      test(
-        'a fetch starved in the middle stretches a low and UNDERRUNs',
-        () async {
-          await d.setUp(kind, cap: null);
-          final pixels = [
-            for (var i = 0; i < 8; i++) 0x00102030 + 0x030507 * i,
-          ];
-          await d.putWords(_mem + 0x100, pixels);
-          await d.timing();
-          await d.wr(_reg(0, _baseLo), _mem + 0x100);
-          await d.wr(_reg(0, _pixelCount), 8);
-          await d.wr(_reg(0, _ctrl), _send);
-          while (d.soc.output('led_pin').value.toInt() == 0) {
-            await d.clk.nextPosedge;
-          }
-          for (var i = 0; i < 40; i++) {
-            await d.clk.nextPosedge;
-          }
-          for (var i = 0; i < 300; i++) {
-            await d.rd(_reg(0, _status));
-          }
-          for (var i = 0; i < 600; i++) {
-            await d.clk.nextPosedge;
-          }
-          await d.waitIdle();
+        while (d.soc.output('led_pin').value.toInt() == 0) {
           await d.clk.nextPosedge;
-          final st = await d.rd(_reg(0, _status));
-          expect(st & 2, equals(2), reason: 'UNDERRUN');
-          expect(st & 0x10, equals(0), reason: 'the first item was taken');
-          expect(_lowsExact(d.wave.samples), isFalse);
-          await Simulator.endSimulation();
-        },
-      );
-    }
+        }
+        for (var i = 0; i < 40; i++) {
+          await d.clk.nextPosedge;
+        }
+        for (var i = 0; i < 300; i++) {
+          await d.rd(_reg(0, _status));
+        }
+        for (var i = 0; i < 600; i++) {
+          await d.clk.nextPosedge;
+        }
+        await d.waitIdle();
+        await d.clk.nextPosedge;
+        final st = await d.rd(_reg(0, _status));
+        expect(st & 2, equals(2), reason: 'UNDERRUN');
+        expect(st & 0x10, equals(0), reason: 'the first item was taken');
+        expect(_lowsExact(d.wave.samples), isFalse);
+        await Simulator.endSimulation();
+      },
+    );
   });
 }
