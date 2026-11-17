@@ -308,12 +308,12 @@ class Bench {
   }
 
   /// The response code [x] must get: DECERR when unmapped, SLVERR for a
-  /// burst or a narrow access to an AXI4-Lite slave.
+  /// narrow access to an AXI4-Lite slave.
   int respOf(Burst x) {
     final s = slaveOf(x.addr);
     if (s == null) return 3;
     final full = busBytes.bitLength - 1;
-    if (slaveCfgs[s].lite && (x.len != 0 || x.size != full)) return 2;
+    if (slaveCfgs[s].lite && x.size != full) return 2;
     return 0;
   }
 

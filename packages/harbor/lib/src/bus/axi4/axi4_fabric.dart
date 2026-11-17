@@ -191,7 +191,11 @@ class _Tracker {
 /// Ports can be [Axi4Interface] or [Axi4LiteInterface]:
 /// - An AXI4-Lite master sends ID 0, LEN 0, full width SIZE and INCR.
 /// - An AXI4-Lite slave has 1 request in flight, and the fabric keeps the
-///   ID. Its `outstanding` must be 1. A burst or a narrow access to it gets
+///   ID. Its `outstanding` must be 1. An INCR, WRAP or FIXED burst to it
+///   runs as one single beat request per beat, in order, and a write burst
+///   gets one B after the last beat, with the worst response of its beats.
+///   An error response goes back on its own beat. A narrow access, a WRAP
+///   burst that is not 2, 4, 8 or 16 beats, or the reserved burst type gets
 ///   SLVERR on every beat.
 ///
 /// Decode uses the start address of a burst only. A full AXI4 slave must
@@ -853,8 +857,8 @@ class HarborAxi4Fabric extends HarborFabricModule {
   // An AXI4-Lite slave [lite] has 1 request in flight. Its AW and AR share
   // one entry, which stays until the response ends, and its W has one
   // entry. [s] then only carries the handshakes and responses for the
-  // guard. A burst or a narrow access gets SLVERR on every beat without the
-  // slave.
+  // guard. A burst runs as single beats, and a narrow access gets SLVERR on
+  // every beat without the slave.
   //
   // The guard keeps a record of each request in flight. When the slave owes
   // something and shows no progress for `timeout` cycles, the guard cuts it
@@ -1449,15 +1453,39 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final size = _fullSize(s.dataWidth);
     final slvErr = _resp(Axi4RespField.slvErr);
     Logic entry(_Req x, Logic sid) {
-      final [addr, len, sz, _, _, _, prot, _] = harborUnpack(
+      final [addr, len, sz, burst, _, _, prot, _] = harborUnpack(
         x.rest,
         restWidths,
       );
+      // A burst reaches the slave as single beats. WRAP takes 2, 4, 8 or
+      // 16 beats, and the reserved burst type is an error.
+      final isWrap = burst.eq(Const(2, width: 2));
+      final wrapOk =
+          len[0] & (len & (len + 1)).eq(0) & len.getRange(4, lenW).eq(0);
+      var badBurst = burst.eq(Const(3, width: 2)) | (isWrap & ~wrapOk);
+      if (k < 12) {
+        // A region under 4 KB has no bits above it to carry into, so a
+        // burst that leaves it is an error.
+        final nbLog = (s.dataWidth ~/ 8).bitLength - 1;
+        final w = max(k + 1, lenW + nbLog) + 2;
+        final low = addr.getRange(0, k);
+        final aligned = k > nbLog
+            ? [low.getRange(nbLog, k), Const(0, width: nbLog)].concat()
+            : Const(0, width: k);
+        final span = [len, Const(0, width: nbLog)].concat();
+        final end = aligned.zeroExtend(w) + span.zeroExtend(w);
+        final window = (len.zeroExtend(w) + 1) << nbLog;
+        final leaves =
+            (burst.eq(Const(1, width: 2)) & end.getRange(k, w).neq(0)) |
+            (isWrap & window.getRange(k + 1, w).neq(0));
+        badBurst = badBurst | (len.neq(0) & leaves);
+      }
       return harborPack([
         sid,
         addr.getRange(0, k),
         len,
-        len.neq(0) | sz.neq(size),
+        burst,
+        sz.neq(size) | badBurst,
         prot,
       ]);
     }
@@ -1482,10 +1510,11 @@ class HarborAxi4Fabric extends HarborFabricModule {
     );
     awReady <= req.pushReady | dead;
     arReady <= req.pushReady | dead;
-    final [id, low, len, bad, prot, isW] = harborUnpack(req.popData, [
+    final [id, low, len, burst, bad, prot, isW] = harborUnpack(req.popData, [
       s.idWidth,
       k,
       lenW,
+      Axi4Interface.burstWidth,
       1,
       protW,
       1,
@@ -1515,8 +1544,15 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final aSent = Logic(name: '${p}_lite_a_sent');
     final wSent = Logic(name: '${p}_lite_w_sent');
     final beat = Logic(name: '${p}_lite_beat', width: lenW);
+    // A burst never crosses 4 KB, so only the low 12 address bits change.
+    final kk = min(k, 12);
+    final cur = Logic(name: '${p}_lite_cur', width: kk);
+    final worst = Logic(name: '${p}_lite_worst', width: 2);
+    final lastBeat = beat.eq(len);
+    final hereLow = mux(beat.eq(0), low.getRange(0, kk), cur);
+    final here = k > kk ? [low.getRange(kk, k), hereLow].concat() : hereLow;
     final good = held & ~bad;
-    final addr = slaveAddr(low);
+    final addr = slaveAddr(here);
     l.awValid <= good & isW & ~aSent;
     l.awAddr <= addr;
     l.awProt <= prot;
@@ -1532,15 +1568,15 @@ class HarborAxi4Fabric extends HarborFabricModule {
     s.wValid <= wValid;
     s.wLast <= wLast;
     s.wReady <= held & isW & ~wSent & (bad | l.wReady);
-    s.bValid <= held & isW & mux(bad, wSent, l.bValid);
+    s.bValid <= held & isW & mux(bad, wSent, l.bValid & lastBeat);
     s.bId <= id;
-    s.bResp <= mux(bad, slvErr, l.bResp);
-    l.bReady <= good & isW & s.bReady;
+    s.bResp <= mux(bad, slvErr, mux(worst.gt(l.bResp), worst, l.bResp));
+    l.bReady <= good & isW & (s.bReady | ~lastBeat);
     s.rValid <= held & ~isW & (bad | l.rValid);
     s.rId <= id;
     s.rData <= mux(bad, Const(0, width: s.dataWidth), l.rData);
     s.rResp <= mux(bad, slvErr, l.rResp);
-    s.rLast <= ~bad | beat.eq(len);
+    s.rLast <= lastBeat;
     l.rReady <= good & ~isW & s.rReady;
     final bFire = s.bValid & s.bReady;
     final rFire = s.rValid & s.rReady;
@@ -1550,13 +1586,44 @@ class HarborAxi4Fabric extends HarborFabricModule {
     s.awReady <= bFire;
     s.arReady <= rFire & s.rLast;
 
-    // These flags take no flop enable, so they share the common control
-    // set.
+    // A good request moves on when the slave answers one beat. A bad
+    // request has no slave beats and only counts the R beats it returns.
+    final lBeat = good & isW & l.bValid & l.bReady;
+    final step = rFire | lBeat;
+    final clear = done | step;
+    final wFire = s.wValid & s.wReady;
+
+    // Next address: FIXED keeps it, INCR adds one word to the aligned
+    // address, and WRAP wraps inside the window of len + 1 words.
+    final nb = s.dataWidth ~/ 8;
+    final nbLog = nb.bitLength - 1;
+    Logic next = hereLow;
+    if (kk > nbLog) {
+      final aligned = [
+        hereLow.getRange(nbLog, kk),
+        Const(0, width: nbLog),
+      ].concat();
+      final inc = aligned + Const(nb, width: kk);
+      final win = [len, Const(nb - 1, width: nbLog)].concat();
+      final mask = kk >= win.width ? win.zeroExtend(kk) : win.getRange(0, kk);
+      final wrap = (aligned & ~mask) | (inc & mask);
+      next = mux(
+        burst.eq(Const(2, width: 2)),
+        wrap,
+        mux(burst.eq(Const(1, width: 2)), inc, hereLow),
+      );
+    }
+
+    // The flags and counters have no flop enable, so they share the common
+    // control set. cur loads only when a beat ends.
     Sequential(c, reset: r, [
       aSent <
-          ~done & (aSent | (l.awValid & l.awReady) | (l.arValid & l.arReady)),
-      wSent < ~done & (wSent | (s.wValid & s.wReady & s.wLast)),
-      beat < (beat + rFire.zeroExtend(lenW)) & ~done.replicate(lenW),
+          ~clear & (aSent | (l.awValid & l.awReady) | (l.arValid & l.arReady)),
+      wSent < ~clear & (wSent | mux(bad, wFire & s.wLast, l.wValid & l.wReady)),
+      beat < (beat + step.zeroExtend(lenW)) & ~done.replicate(lenW),
+      cur < mux(step, next, cur),
+      worst <
+          ~done.replicate(2) & mux(lBeat & l.bResp.gt(worst), l.bResp, worst),
     ]);
     return (req.popValid & ~isW, wF.popValid);
   }
