@@ -18,8 +18,10 @@ import 'wishbone_interface.dart';
 ///
 /// When [maxGrantCycles] is set, a master that has held the grant for that
 /// many cycles loses it at the end of its next transfer if another master is
-/// waiting. This can split a read-modify-write that a
-/// master holds under one CYC, so it is off by default.
+/// waiting. This can split a read-modify-write that a master holds under one
+/// CYC. The arbiter has no cap by default. `HarborSoC.buildFabric` sets one
+/// of 16 cycles on a fabric with two or more
+/// masters, so a master that polls back to back cannot starve the others.
 class WishboneArbiter extends BridgeModule {
   final int numMasters;
 

@@ -926,13 +926,16 @@ class HarborSoC extends BridgeModule {
   /// off until reset. Memory (system RAM, SRAM, flash, mask ROM) gets none,
   /// and [addPeripheral] can set the timeout of one peripheral.
   /// [maxGrantCycles] sets the Wishbone grant hold cap (see
-  /// [WishboneArbiter.maxGrantCycles]). Both are off by default.
+  /// [WishboneArbiter.maxGrantCycles]). It is [harborDefaultWishboneGrantCap]
+  /// on a Wishbone fabric with two or more masters, so a master that polls
+  /// back to back cannot starve the others. Pass null or 0 to turn it off.
+  /// [busTimeoutCycles] is off by default.
   void buildFabric({
     bool pipeline = false,
     Map<String, Set<String>>? channelSlaves,
     HarborMemConverge converge = HarborMemConverge.arbiter,
     int? busTimeoutCycles,
-    int? maxGrantCycles,
+    int? maxGrantCycles = harborDefaultWishboneGrantCap,
   }) {
     final errors = validate();
     if (errors.isNotEmpty) {

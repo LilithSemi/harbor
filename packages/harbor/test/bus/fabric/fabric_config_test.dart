@@ -71,6 +71,7 @@ HarborFabricModule _native(
   List<PortCfg> slaves = const [PortCfg('s0', size: 0x1000)],
   Map<String, PairInterface> intf = const {},
   int? maxGrantCycles,
+  bool defaultCap = false,
   int burstBeats = 8,
 }) => HarborFabric.build(
   kind: kind,
@@ -98,7 +99,7 @@ HarborFabricModule _native(
         memory: s.memory,
       ),
   ],
-  maxGrantCycles: maxGrantCycles,
+  maxGrantCycles: defaultCap ? harborDefaultWishboneGrantCap : maxGrantCycles,
   wishboneBurstBeats: burstBeats,
 );
 
@@ -608,7 +609,8 @@ void main() {
         () => _native(wb, masters: const [PortCfg('m0', outstanding: 2)]),
         throwsArgumentError,
       );
-      expect(() => _native(wb, maxGrantCycles: 0), throwsArgumentError);
+      expect(() => _native(wb, maxGrantCycles: -1), throwsArgumentError);
+      expect(() => _native(wb, maxGrantCycles: 0), returnsNormally);
       expect(() => _native(wb), returnsNormally);
     });
 
@@ -659,10 +661,29 @@ void main() {
         name(s: const PortCfg('s0', size: 0x1000, timeout: 5)),
         name(s: const PortCfg('s0', base: 0x1000, size: 0x1000)),
         name(s: const PortCfg('s0', size: 0x2000)),
-        name(cap: 4),
         name(beats: 4),
       ];
       expect({base, ...others}, hasLength(others.length + 1));
+    });
+
+    test('the grant cap is on by default for two or more masters', () {
+      String name({
+        int masters = 2,
+        int? cap,
+        bool defaultCap = false,
+      }) => _native(
+        wb,
+        masters: [for (var i = 0; i < masters; i++) PortCfg('m$i')],
+        maxGrantCycles: cap,
+        defaultCap: defaultCap,
+      ).definitionName;
+      // The default value is the cap of 16, an opt-out of null or 0 is none.
+      expect(name(defaultCap: true), name(cap: 16));
+      expect(name(defaultCap: true), isNot(name(cap: null)));
+      expect(name(cap: 0), name(cap: null));
+      expect(name(cap: 4), isNot(name(cap: 16)));
+      // A fabric with one master has no cap.
+      expect(name(masters: 1, defaultCap: true), name(masters: 1, cap: null));
     });
   });
 
