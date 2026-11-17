@@ -29,6 +29,15 @@ class HarborPlic extends BridgeModule
   final int priorityBits;
   final int baseAddress;
 
+  /// When true, `ext_irq_*` comes from a flop. Every change of the output
+  /// is then one cycle later. The interrupt rises one cycle later. It also
+  /// stays high one cycle longer after a claim read, after a write that
+  /// clears an enable bit, after a write that raises a threshold, and after
+  /// a write that lowers a priority to the threshold. A hart can read a
+  /// claim of 0 in that cycle. A claim of 0 is legal and means no source is
+  /// pending.
+  final bool registeredOutput;
+
   late final List<Logic> externalInterrupt;
   late final List<Logic> sourceInterrupt;
 
@@ -40,6 +49,7 @@ class HarborPlic extends BridgeModule
     this.sources = 32,
     this.contexts = 1,
     this.priorityBits = 3,
+    this.registeredOutput = false,
     int? busAddressWidth,
     this.busDataWidth,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
@@ -56,6 +66,7 @@ class HarborPlic extends BridgeModule
            's$sources',
            'c$contexts',
            'p$priorityBits',
+           if (registeredOutput) 'rq',
          ]),
          name: name ?? 'plic',
        ) {
@@ -141,7 +152,13 @@ class HarborPlic extends BridgeModule
             priority[src].gt(threshold[ctx]);
         anyPending = anyPending | active;
       }
-      externalInterrupt[ctx] <= anyPending;
+      if (registeredOutput) {
+        final irq = Logic(name: 'ext_irq_q_$ctx');
+        Sequential(clk, [irq < mux(reset, Const(0), anyPending)]);
+        externalInterrupt[ctx] <= irq;
+      } else {
+        externalInterrupt[ctx] <= anyPending;
+      }
     }
 
     Sequential(clk, [
