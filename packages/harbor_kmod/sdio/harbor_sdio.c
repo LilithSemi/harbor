@@ -55,6 +55,7 @@
 #define HARBOR_SD_CTRL_WIDTH_1	   0
 #define HARBOR_SD_CTRL_WIDTH_4	   1
 #define HARBOR_SD_CTRL_WIDTH_8	   2
+#define HARBOR_SD_CTRL_DAT_RESET   BIT(9)
 
 #define HARBOR_SD_ST_CARD_DETECT BIT(0)
 #define HARBOR_SD_ST_BUSY	 BIT(8)
@@ -255,6 +256,26 @@ static int harbor_sd_build_desc(struct harbor_sd *hs, struct mmc_data *data)
 	return 0;
 }
 
+/*
+ * Stop the data engine and wait for the memory accesses already sent. A
+ * failed transfer leaves the engine and the DAT pads in whatever state the
+ * error found them.
+ */
+static int harbor_sd_dat_reset(struct harbor_sd *hs)
+{
+	u32 sts;
+	int ret;
+
+	writel(hs->ctrl | HARBOR_SD_CTRL_DAT_RESET, hs->base + HARBOR_SD_CTRL);
+	ret = readl_poll_timeout(hs->base + HARBOR_SD_STATUS, sts,
+				 !(sts & HARBOR_SD_ST_BUSY), 10,
+				 HARBOR_SD_CMD_TIMEOUT_US);
+	if (ret)
+		dev_warn(hs->dev, "the data engine did not stop after a reset\n");
+
+	return ret;
+}
+
 /* Issue one command, and its data phase when it has one. */
 static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 			      struct mmc_data *data)
@@ -296,6 +317,7 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		cmd->error = -ETIMEDOUT;
 		if (data)
 			data->error = -ETIMEDOUT;
+		harbor_sd_dat_reset(hs);
 		return;
 	}
 
@@ -306,6 +328,7 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		cmd->error = -ETIMEDOUT;
 		if (data)
 			data->error = -ETIMEDOUT;
+		harbor_sd_dat_reset(hs);
 		return;
 	}
 
@@ -324,6 +347,9 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		data->error = -EIO;
 	else
 		data->bytes_xfered = data->blocks * data->blksz;
+
+	if (data->error)
+		harbor_sd_dat_reset(hs);
 }
 
 static void harbor_sd_request(struct mmc_host *mmc, struct mmc_request *mrq)
