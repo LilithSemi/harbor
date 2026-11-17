@@ -417,6 +417,7 @@ export 'src/peripherals/spi.dart';
 export 'src/peripherals/spi_flash.dart';
 export 'src/peripherals/sram.dart';
 export 'src/peripherals/temperature_sensor.dart';
+export 'src/peripherals/unit_id.dart';
 export 'src/peripherals/uart.dart';
 export 'src/peripherals/usb.dart';
 export 'src/peripherals/usb_core.dart';
