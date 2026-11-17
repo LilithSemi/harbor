@@ -407,6 +407,23 @@ void main() {
       },
     );
 
+    test('a build with a fixed sample edge ignores CTRL[8] writes', () async {
+      await setUpDut(config: const HarborSdioConfig(sampleReadOnFall: true));
+      expect((await busRead(_ctrl)) & 0x100, equals(0x100));
+      await busWrite(_ctrl, 0x1);
+      expect((await busRead(_ctrl)) & 0x100, equals(0x100));
+      await Simulator.endSimulation();
+    });
+
+    test('a default build lets CTRL[8] be written', () async {
+      await setUpDut();
+      await busWrite(_ctrl, 0x101);
+      expect((await busRead(_ctrl)) & 0x100, equals(0x100));
+      await busWrite(_ctrl, 0x1);
+      expect((await busRead(_ctrl)) & 0x100, equals(0));
+      await Simulator.endSimulation();
+    });
+
     test('serializes a command frame with a correct CRC7', () async {
       await setUpDut();
 

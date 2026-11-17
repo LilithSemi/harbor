@@ -191,7 +191,8 @@ class HarborSdioConfig with HarborPrettyString {
 ///
 /// Register map (each register in its own 8-byte slot; the byte-addressed fabric
 /// decodes byte-offset >> 3, so these byte offsets map to indices 0,1,2,...):
-/// - 0x00: CTRL      ([0] enable, [5:4] bus width, [8] sample edge, [9] DAT
+/// - 0x00: CTRL      ([0] enable, [5:4] bus width, [8] sample edge (a build with
+///   sampleReadOnFall holds it at 1), [9] DAT
 ///   reset, write 1. It also stops a command in flight. Wait for STATUS[8] to
 ///   clear before the buffer is used again, since memory writes already sent
 ///   still finish.)
@@ -2413,7 +2414,11 @@ class HarborSdioController extends BridgeModule
                       If(
                         bus.selAny(0x01, 1),
                         then: [
-                          sampleFall < bus.dataIn[8],
+                          // A build that fixes the sample edge keeps it.
+                          sampleFall <
+                              (config.sampleReadOnFall
+                                  ? Const(1)
+                                  : bus.dataIn[8]),
                           // [9] DAT reset: a write of 1 stops the data engine,
                           // empties the RX FIFO and parks the ADMA walker.
                           // Memory accesses already sent still finish.
