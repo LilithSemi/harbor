@@ -120,6 +120,65 @@ void main() {
     });
   });
 
+  group('HarborUart debug output', () {
+    tearDown(() async {
+      await Simulator.reset();
+    });
+
+    test('status bits rise at their events and reset clears them', () async {
+      final uart = HarborUart(baseAddress: 0x10000000);
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset');
+      uart.input('clk').srcConnection! <= clk;
+      uart.input('reset').srcConnection! <= reset;
+      uart.input('rx').srcConnection! <= Const(1);
+      final bus = RegBus.attach(uart, clk);
+      await uart.build();
+      reset.inject(1);
+      bus.idle();
+      Simulator.setMaxSimTime(400000);
+      unawaited(Simulator.run());
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+
+      Future<int> dbg() async {
+        await clk.nextPosedge;
+        await clk.nextPosedge;
+        return uart.output('debug').value.toInt();
+      }
+
+      // Reset divisor is 1, tx idles high.
+      expect(await dbg(), equals(0x81));
+      reset.inject(0);
+      await clk.nextPosedge;
+      expect(await dbg(), equals(0x81));
+
+      await bus.write(0x3, 0x83);
+      expect(await dbg(), equals(0x80 | 0x04 | 0x02 | 0x01));
+      await bus.write(0x0, 0x00);
+      expect(await dbg(), equals(0x80 | 0x08 | 0x04 | 0x02));
+      await bus.write(0x1, 0x01);
+      expect(await dbg(), equals(0x80 | 0x08 | 0x04 | 0x02 | 0x01));
+      await bus.write(0x3, 0x03);
+      expect(await dbg(), equals(0x80 | 0x08 | 0x04 | 0x01));
+      await bus.write(0x0, 0x55);
+      expect(await dbg() & 0x7f, equals(0x08 | 0x10 | 0x04 | 0x01));
+      for (var i = 0; i < 1200; i++) {
+        await clk.nextPosedge;
+      }
+      expect(await dbg() & 0x20, equals(0x20));
+      await bus.read(0x5);
+      final all = await dbg();
+      expect(all & 0x7f, equals(0x7d));
+
+      reset.inject(1);
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      expect(await dbg(), equals(0x81));
+      await Simulator.endSimulation();
+    });
+  });
+
   for (final kind in HarborFabricKind.values) {
     registerTests(kind);
     wordRegisterTests(kind);

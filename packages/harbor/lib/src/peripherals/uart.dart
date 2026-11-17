@@ -28,6 +28,17 @@ import 'device_register.dart';
 /// MSR follows MCR, the `tx` pin stays high and the transmitter output feeds
 /// the receiver. The `rx` pin is ignored.
 ///
+/// The 8-bit `debug` output comes from flops in the UART clock domain. The
+/// sticky bits clear only on reset. The bits are:
+/// - 0: the divisor is not zero
+/// - 1: LCR bit 7 (DLAB)
+/// - 2: sticky, a bus write in the window was accepted
+/// - 3: sticky, a DLL or DLM write with DLAB set
+/// - 4: sticky, a THR write
+/// - 5: sticky, the transmitter started a frame
+/// - 6: sticky, a bus read in the window was accepted
+/// - 7: the `tx` pin
+///
 /// Register map (standard 16550), register index n:
 /// - 0: RBR (read) / THR (write) / DLL (DLAB=1)
 /// - 1: IER (DLAB=0) / DLM (DLAB=1)
@@ -145,6 +156,7 @@ class HarborUart extends BridgeModule
     createPort('rx', PortDirection.input);
     addOutput('tx');
     addOutput('interrupt');
+    addOutput('debug', width: 8);
 
     bus = BusSlavePort.create(
       module: this,
@@ -222,6 +234,13 @@ class HarborUart extends BridgeModule
     final scr = Logic(name: 'scr', width: 8);
 
     final dlab = lcr[7];
+
+    // Status flops for the `debug` output.
+    final dbgWrite = Logic(name: 'dbg_write');
+    final dbgDivWrite = Logic(name: 'dbg_div_write');
+    final dbgThrWrite = Logic(name: 'dbg_thr_write');
+    final dbgTxStart = Logic(name: 'dbg_tx_start');
+    final dbgRead = Logic(name: 'dbg_read');
     final fifoOn = fcr[0];
 
     // TX state. The TX FIFO holds 16 bytes in distributed RAM. A THR write
@@ -392,16 +411,23 @@ class HarborUart extends BridgeModule
         If(
           dlab,
           then: [
+            dbgDivWrite < Const(1),
             dll < d,
             baudCount < divisorLoad([dlm, d].concat()),
           ],
-          orElse: [thrData < d, thrValid < Const(1), threPend < Const(0)],
+          orElse: [
+            dbgThrWrite < Const(1),
+            thrData < d,
+            thrValid < Const(1),
+            threPend < Const(0),
+          ],
         ),
       ]),
       CaseItem(Const(1, width: 3), [
         If(
           dlab,
           then: [
+            dbgDivWrite < Const(1),
             dlm < d,
             baudCount < divisorLoad([d, dll].concat()),
           ],
@@ -578,6 +604,11 @@ class HarborUart extends BridgeModule
           lcr < Const(0x03, width: 8), // 8N1
           mcr < Const(0, width: 8),
           scr < Const(0, width: 8),
+          dbgWrite < Const(0),
+          dbgDivWrite < Const(0),
+          dbgThrWrite < Const(0),
+          dbgTxStart < Const(0),
+          dbgRead < Const(0),
           txBusy < Const(0),
           txShift < Const(0x3FF, width: 10),
           txCount < Const(0, width: 4),
@@ -758,6 +789,8 @@ class HarborUart extends BridgeModule
             then: [
               ack < Const(1),
 
+              If(inWindow & we, then: [dbgWrite < Const(1)]),
+              If(inWindow & ~we, then: [dbgRead < Const(1)]),
               If(
                 inWindow & we,
                 then: writeItems,
@@ -776,6 +809,7 @@ class HarborUart extends BridgeModule
             ],
           ),
           If(rxFrame & ~rxPush, then: [overrun < Const(1)]),
+          If(txBusy, then: [dbgTxStart < Const(1)]),
         ],
       ),
     ]);
@@ -786,6 +820,17 @@ class HarborUart extends BridgeModule
       If(txBusy, then: [txLine < txShift[0]], orElse: [txLine < Const(1)]),
     ]);
     tx <= txLine | mcr[4];
+    output('debug') <=
+        [
+          tx,
+          dbgRead,
+          dbgTxStart,
+          dbgThrWrite,
+          dbgDivWrite,
+          dbgWrite,
+          dlab,
+          [dlm, dll].concat().or(),
+        ].concat().named('debug_value');
   }
 
   /// A terminal on the TX line: decodes 8N1 serial and writes bytes to stdout.
