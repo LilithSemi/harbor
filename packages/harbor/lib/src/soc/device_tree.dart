@@ -244,6 +244,40 @@ mixin HarborSystemMemoryProvider {
   HarborMemoryInfo get memoryInfo;
 }
 
+/// A span of memory that the OS must not use as normal RAM, emitted as a
+/// child of the root `reserved-memory` node.
+class HarborReservedMemory {
+  /// Label of the node, for a [HarborDeviceTreeRef] from a device node.
+  final String label;
+
+  /// Node name without the unit address, for example `framebuffer`.
+  final String name;
+
+  /// The reserved span.
+  final BusAddressRange range;
+
+  /// Value of the `compatible` property, or null for none. A
+  /// `shared-dma-pool` gives a device a private DMA pool.
+  final String? compatible;
+
+  /// True for the `no-map` property: the OS does not map the span.
+  final bool noMap;
+
+  const HarborReservedMemory({
+    required this.label,
+    required this.name,
+    required this.range,
+    this.compatible,
+    this.noMap = true,
+  });
+}
+
+/// Interface for devices that reserve a span of system memory.
+mixin HarborReservedMemoryProvider {
+  /// The spans this device reserves.
+  List<HarborReservedMemory> get reservedMemory;
+}
+
 /// Generates a Linux/U-Boot compatible `.dts` file from a list of
 /// [HarborDeviceTreeNodeProvider] peripherals and [HarborCpu] entries.
 ///
@@ -278,6 +312,10 @@ class HarborDeviceTreeGenerator {
   /// `device_type = "memory"`. Without these an OS/SBI payload finds no RAM.
   final List<BusAddressRange> memories;
 
+  /// Spans of memory that the OS must not use as RAM, emitted under a root
+  /// `reserved-memory` node.
+  final List<HarborReservedMemory> reservedMemories;
+
   /// Interrupt numbers assigned to peripherals by the SoC's allocator, keyed
   /// by provider.
   ///
@@ -301,6 +339,7 @@ class HarborDeviceTreeGenerator {
     this.cpus = const [],
     this.peripherals = const [],
     this.memories = const [],
+    this.reservedMemories = const [],
     this.interrupts = const {},
     this.interruptContexts = const [],
   });
@@ -458,6 +497,30 @@ class HarborDeviceTreeGenerator {
       buf.writeln('    };');
     }
 
+    if (reservedMemories.isNotEmpty) {
+      buf.writeln();
+      buf.writeln('    reserved-memory {');
+      buf.writeln('        #address-cells = <$addressCells>;');
+      buf.writeln('        #size-cells = <$sizeCells>;');
+      buf.writeln('        ranges;');
+      for (final r in reservedMemories) {
+        buf.writeln();
+        buf.writeln(
+          '        ${r.label}: ${r.name}@${r.range.start.toRadixString(16)} {',
+        );
+        if (r.compatible != null) {
+          buf.writeln('            compatible = "${_str(r.compatible!)}";');
+        }
+        buf.writeln(
+          '            reg = <${_regCells(r.range.start, addressCells)} '
+          '${_regCells(r.range.size, sizeCells)}>;',
+        );
+        if (r.noMap) buf.writeln('            no-map;');
+        buf.writeln('        };');
+      }
+      buf.writeln('    };');
+    }
+
     if (peripherals.isNotEmpty) {
       buf.writeln();
       buf.writeln('    soc {');
@@ -577,6 +640,9 @@ class HarborDeviceTreeGenerator {
     for (final n in nodes) {
       add(n.label);
       n.children.forEach(addChild);
+    }
+    for (final r in reservedMemories) {
+      add(r.label);
     }
     for (final cpu in cpus) {
       if (peripherals.any((p) => p.dtNode.interruptController)) {

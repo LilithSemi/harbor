@@ -452,35 +452,55 @@ class HarborSoC extends BridgeModule {
         );
         continue;
       }
-      final sec = clkConfig.coClkosSecondary;
-      if (sec != null) {
-        // One EHXPLLL drives both: CLKOP = this domain, CLKOS = the secondary.
-        // Avoids a 2nd PLL block that may not lock on silicon.
-        final shared = _clockGen.createDomainWithSecondary(
-          clkConfig,
-          secondaryFrequency: sec.frequency,
-          secondaryName: sec.name,
-          secondaryTolerancePpm: sec.tolerancePpm,
-        );
-        // Register the secondary FIRST so a 'sys'-named secondary stays the
-        // default clock (values.first), then the CLKOP primary.
-        _clockDomains[sec.name] = shared.secondary;
-        _clockDomains[clkConfig.name] = shared.primary;
-      } else {
-        final t = target;
-        // A design with the DDR3 clock tree has its own clock script, so its
-        // generated RTL stays as it was.
-        final domain = _clockGen.createDomain(
-          clkConfig,
-          namePllClock:
-              !_hasDdr3ClockTree &&
-              t is HarborFpgaTarget &&
-              t.vendor == HarborFpgaVendor.openXc7,
-        );
-        _clockDomains[clkConfig.name] = domain;
-        final pll = domain.pllClock;
-        if (pll != null) _xilinxPllClockMhz[pll.net] = pll.hz / 1e6;
-      }
+      _addPllClock(clkConfig);
+    }
+  }
+
+  /// Adds a clock domain from [config] after the constructor, for a helper
+  /// that needs its own domains. A [HarborClockConfig.coClkosSecondary]
+  /// adds the secondary domain too. Returns the domain of [config]. Call it
+  /// before [build], and not for a name that already has a domain.
+  HarborClockDomain addClockDomain(HarborClockConfig config) {
+    if (_clockDomains.containsKey(config.name)) {
+      throw ArgumentError.value(
+        config.name,
+        'config',
+        'a clock domain with this name exists',
+      );
+    }
+    _addPllClock(config);
+    return _clockDomains[config.name]!;
+  }
+
+  void _addPllClock(HarborClockConfig clkConfig) {
+    final sec = clkConfig.coClkosSecondary;
+    if (sec != null) {
+      // One EHXPLLL drives both: CLKOP = this domain, CLKOS = the secondary.
+      // Avoids a 2nd PLL block that may not lock on silicon.
+      final shared = _clockGen.createDomainWithSecondary(
+        clkConfig,
+        secondaryFrequency: sec.frequency,
+        secondaryName: sec.name,
+        secondaryTolerancePpm: sec.tolerancePpm,
+      );
+      // Register the secondary FIRST so a 'sys'-named secondary stays the
+      // default clock (values.first), then the CLKOP primary.
+      _clockDomains[sec.name] = shared.secondary;
+      _clockDomains[clkConfig.name] = shared.primary;
+    } else {
+      final t = target;
+      // A design with the DDR3 clock tree has its own clock script, so its
+      // generated RTL stays as it was.
+      final domain = _clockGen.createDomain(
+        clkConfig,
+        namePllClock:
+            !_hasDdr3ClockTree &&
+            t is HarborFpgaTarget &&
+            t.vendor == HarborFpgaVendor.openXc7,
+      );
+      _clockDomains[clkConfig.name] = domain;
+      final pll = domain.pllClock;
+      if (pll != null) _xilinxPllClockMhz[pll.net] = pll.hz / 1e6;
     }
   }
 
@@ -1476,6 +1496,11 @@ class HarborSoC extends BridgeModule {
       cpus: cpus,
       peripherals: providers,
       memories: memories,
+      reservedMemories: _peripherals
+          .map((e) => e.module)
+          .whereType<HarborReservedMemoryProvider>()
+          .expand((p) => p.reservedMemory)
+          .toList(),
       interrupts: {
         for (final p in providers)
           if (assign[p] != null) p: [assign[p]!],

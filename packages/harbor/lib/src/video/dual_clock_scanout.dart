@@ -173,6 +173,10 @@ class HarborDualClockScanout extends Module {
   /// Pixel word for the previous cycle's [col] in the active buffer.
   Logic get pixel => output('pixel');
 
+  /// One system clock pulse for each errored read beat of a memory waist.
+  /// Always 0 on a scanout port, which has no error response.
+  Logic get fetchError => output('fetch_error');
+
   /// Latches if a line was not ready at a swap.
   Logic get underrun => output('underrun');
 
@@ -496,6 +500,7 @@ class HarborDualClockScanout extends Module {
     final Logic wrSel;
     final Logic wrIdx;
     final Logic wrData;
+    final fetchErr = Logic(name: 'fetch_err');
     if (port) {
       final f = HarborScanoutFetcher(
         clk: sysClk,
@@ -519,6 +524,7 @@ class HarborDualClockScanout extends Module {
         f.wrIdx,
         f.wrData,
       );
+      fetchErr <= Const(0);
     } else {
       final mWaist = memory!.clone()
         ..pairConnectIO(
@@ -545,7 +551,9 @@ class HarborDualClockScanout extends Module {
         f.wrIdx,
         f.wrData,
       );
+      fetchErr <= f.err;
     }
+    addOutput('fetch_error') <= fetchErr;
     final buffer = HarborDoubleLineBuffer(
       wrClk: sysClk,
       wrEn: wrEn,
@@ -1423,6 +1431,7 @@ class HarborDualClockScanout extends Module {
     final Logic wrSel;
     final Logic wrIdx;
     final Logic wrData;
+    final fetchErr = Logic(name: 'fetch_err');
     if (port) {
       final f = HarborScanoutFetcher(
         clk: sysClk,
@@ -1446,6 +1455,7 @@ class HarborDualClockScanout extends Module {
         f.wrIdx,
         f.wrData,
       );
+      fetchErr <= Const(0);
     } else {
       final mWaist = memory!.clone()
         ..pairConnectIO(
@@ -1472,8 +1482,10 @@ class HarborDualClockScanout extends Module {
         f.wrIdx,
         f.wrData,
       );
+      fetchErr <= f.err;
     }
 
+    addOutput('fetch_error') <= fetchErr;
     final rd = <Logic>[];
     for (var k = 0; k < all; k++) {
       final o = k >= planes;
