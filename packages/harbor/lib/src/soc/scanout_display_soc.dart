@@ -3,10 +3,12 @@ import 'dart:math';
 import 'package:rohd/rohd.dart';
 
 import '../bus/bus.dart';
+import '../clock/clock_domain.dart';
 import '../peripherals/display.dart';
 import '../peripherals/harbor_sdram.dart';
 import '../peripherals/scanout_display.dart';
 import 'harbor_soc.dart';
+import 'target.dart';
 
 /// The memory bandwidth of a scanout, against the peak of an sdram.
 ///
@@ -81,8 +83,14 @@ extension HarborSocScanoutDisplay on HarborSoC {
   /// [pixelDomain]. When the SoC has no such domain, the helper adds them
   /// from one PLL with [HarborScanoutDisplay.clockConfig], at [pixelClockHz]
   /// (the pixel clock of [timing] by default) from the source clock of the
-  /// `sys` domain. The pixel clock of the display is the real rate of
-  /// [pixelDomain], not the one in [timing].
+  /// `sys` domain. On an ECP5 the PLL must give the shift clock of 5 times the
+  /// pixel clock exactly, so the helper takes the nearest pixel clock that the
+  /// PLL reaches, 25.0 MHz for 25.175 MHz from a 25 MHz source. The build
+  /// throws an [ArgumentError] with the nearest clock when that clock is more
+  /// than [pixelClockTolerancePpm] away from the wanted one. The default of
+  /// 10000 ppm takes 25.0 MHz for 25.175 MHz, an error of 0.7%. The pixel clock
+  /// of the display is the real rate of [pixelDomain], not the one in
+  /// [timing].
   ///
   /// [framebuffer] says who places the framebuffer. With
   /// [HarborFramebufferPlacement.firmware] the helper takes no
@@ -163,6 +171,7 @@ extension HarborSocScanoutDisplay on HarborSoC {
     int? framebufferSize,
     required int baseAddress,
     int? pixelClockHz,
+    int pixelClockTolerancePpm = 10000,
     String shiftDomain = 'shift',
     String pixelDomain = 'pixel',
     String? busDomain,
@@ -267,7 +276,12 @@ extension HarborSocScanoutDisplay on HarborSoC {
       }
       shift = addClockDomain(
         HarborScanoutDisplay.clockConfig(
-          pixelClockHz: pixelClockHz ?? timing.pixelClock,
+          pixelClockHz: _reachablePixelClock(
+            target,
+            source,
+            pixelClockHz ?? timing.pixelClock,
+            pixelClockTolerancePpm,
+          ),
           sourceClockHz: source,
           shiftName: shiftDomain,
           pixelName: pixelDomain,
@@ -406,4 +420,46 @@ extension HarborSocScanoutDisplay on HarborSoC {
     }
     return display;
   }
+}
+
+/// The pixel clock of an ECP5 PLL that is nearest to [wantHz] and that has a
+/// shift clock of exactly 5 times its rate from [sourceHz]. Other targets keep
+/// [wantHz]. Throws when the nearest clock is more than [tolerancePpm] away.
+int _reachablePixelClock(
+  HarborDeviceTarget target,
+  int sourceHz,
+  int wantHz,
+  int tolerancePpm,
+) {
+  if (target is! HarborFpgaTarget || target.vendor != HarborFpgaVendor.ecp5) {
+    return wantHz;
+  }
+  final candidates = <int>{};
+  for (var div = 1; div <= 128; div++) {
+    for (var mult = 1; mult <= 80; mult++) {
+      final shift = sourceHz * mult;
+      if (shift % (div * 5) == 0) candidates.add(shift ~/ (div * 5));
+    }
+  }
+  final ordered = candidates.toList()
+    ..sort((a, b) => (a - wantHz).abs().compareTo((b - wantHz).abs()));
+  for (final pixel in ordered) {
+    try {
+      HarborClockGenerator.ecp5CoSecondaryDividers(sourceHz, 5 * pixel, pixel);
+    } on ArgumentError {
+      continue;
+    }
+    final ppm = (pixel - wantHz).abs() * 1000000 / wantHz;
+    if (ppm > tolerancePpm) {
+      throw ArgumentError(
+        'no ECP5 PLL setting makes a pixel clock of $wantHz Hz from '
+        '$sourceHz Hz within $tolerancePpm ppm, the nearest is $pixel Hz '
+        '(${ppm.toStringAsFixed(0)} ppm)',
+      );
+    }
+    return pixel;
+  }
+  throw ArgumentError(
+    'no ECP5 PLL setting makes a pixel clock of $wantHz Hz from $sourceHz Hz',
+  );
 }

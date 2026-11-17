@@ -406,6 +406,44 @@ void main() {
     soc.buildFabric();
   });
 
+  group('pixel clock', () {
+    HarborScanoutDisplay add(HarborSoC soc, HarborSdram sdram, {int? hz}) =>
+        soc.addScanoutDisplay(
+          sdram: sdram,
+          timing: const HarborDisplayTiming.vga640x480(),
+          pixelClockHz: hz,
+          framebufferBase: 0x81e00000,
+          baseAddress: 0x10008000,
+          busDataWidth: 64,
+        );
+
+    test('the timing clock of 25.175 MHz builds as 25.0 MHz on ECP5', () {
+      final target = _target();
+      final soc = _soc(target);
+      final display = add(soc, soc.addPeripheral(_sdram(target)));
+      expect(display.timing.pixelClock, 25000000);
+      expect(soc.clockDomain('pixel')!.config.frequency, 25000000);
+      expect(soc.clockDomain('shift')!.config.frequency, 125000000);
+      soc.buildFabric();
+    });
+
+    test('a clock that no PLL setting reaches within tolerance throws', () {
+      final target = _target();
+      final soc = _soc(target);
+      final sdram = soc.addPeripheral(_sdram(target));
+      expect(
+        () => add(soc, sdram, hz: 100000000),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.message,
+            'message',
+            allOf(contains('100000000'), contains('nearest')),
+          ),
+        ),
+      );
+    });
+  });
+
   group('bandwidth', () {
     test('rgb565 640x480 at 25 MHz on a 16-bit sdram uses 73%', () {
       final bw = HarborScanoutBandwidth(
