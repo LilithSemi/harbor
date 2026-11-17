@@ -166,6 +166,56 @@ void main() {
     });
   });
 
+  group('HarborDeviceTreeGenerator labels and interrupt domains', () {
+    String gen(
+      List<HarborDeviceTreeNodeProvider> p, {
+      Map<HarborDeviceTreeNodeProvider, List<int>> irqs = const {},
+    }) => HarborDeviceTreeGenerator(
+      model: 'm',
+      compatible: 'c',
+      peripherals: p,
+      interrupts: irqs,
+    ).generate();
+
+    test('a GPIO without an interrupt is not an interrupt controller', () {
+      final gpio = HarborGpio(baseAddress: 0x10001000);
+      final dts = gen([gpio]);
+      expect(dts, isNot(contains('interrupt-controller')));
+      expect(dts, isNot(contains('#interrupt-cells')));
+    });
+
+    test('a GPIO with an interrupt writes its interrupt domain', () {
+      final gpio = HarborGpio(baseAddress: 0x10001000);
+      final dts = gen(
+        [gpio],
+        irqs: {
+          gpio: [5],
+        },
+      );
+      expect(dts, contains('interrupts = <0x5>;'));
+      expect(dts, contains('interrupt-controller;'));
+      expect(dts, contains('#interrupt-cells = <2>;'));
+    });
+
+    test('two nodes with the same label are refused', () {
+      final a = HarborGpio(baseAddress: 0x10001000);
+      final b = HarborGpio(baseAddress: 0x10002000);
+      expect(
+        () => gen([a, b]),
+        throwsA(isA<ArgumentError>().having((e) => e.name, 'name', 'label')),
+      );
+      final named = HarborGpio(baseAddress: 0x10002000, dtLabel: 'gpio1');
+      expect(gen([a, named]), contains('gpio1: gpio@10002000'));
+    });
+
+    test('a label on an interrupt controller is used', () {
+      final plic = _LabelledController();
+      final dts = gen([plic]);
+      expect(dts, contains('myintc: labelled@c000000'));
+      expect(dts, contains('interrupt-parent = <&myintc>;'));
+    });
+  });
+
   group('HarborDeviceTreeNodeProvider', () {
     test('CLINT has correct DT properties', () {
       final clint = HarborClint(baseAddress: 0x02000000);
@@ -271,4 +321,14 @@ void main() {
       });
     });
   });
+}
+
+class _LabelledController with HarborDeviceTreeNodeProvider {
+  @override
+  HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(
+    compatible: ['test,labelled'],
+    reg: BusAddressRange(0x0C000000, 0x1000),
+    interruptController: true,
+    label: 'myintc',
+  );
 }

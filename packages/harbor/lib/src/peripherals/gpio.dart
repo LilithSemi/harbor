@@ -22,6 +22,11 @@ import '../soc/svd.dart';
 /// - 0x18: IRQ_EN  (read/write, interrupt enable per pin)
 /// - 0x20: IRQ_STATUS (read/write-1-to-clear, interrupt status)
 /// - 0x28: IRQ_EDGE (read/write, 0=level, 1=edge triggered)
+/// - 0x30: IRQ_FALL (read/write, 1=falling edge triggered)
+///
+/// A pin takes its trigger from the IRQ_EDGE and IRQ_FALL bits together:
+/// both 0 is high level, IRQ_EDGE only is rising edge, IRQ_FALL only is
+/// falling edge, and both 1 is both edges. There is no low level trigger.
 class HarborGpio extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -40,6 +45,10 @@ class HarborGpio extends BridgeModule
   /// SoC). The register file itself is 32-bit; wider buses zero-extend reads.
   final int busDataWidth;
 
+  /// Device tree label of the node, which a child node uses to name this
+  /// controller in a `<&label pin flags>` property.
+  final String dtLabel;
+
   /// Bus slave port.
   late final BusSlavePort bus;
 
@@ -56,6 +65,7 @@ class HarborGpio extends BridgeModule
     this.pinCount = 32,
     this.busAddressWidth = 12,
     this.busDataWidth = 32,
+    this.dtLabel = 'gpio',
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     bool crossFabricClock = false,
     String? name,
@@ -105,6 +115,7 @@ class HarborGpio extends BridgeModule
     final irqEn = Logic(name: 'irq_en', width: pinCount);
     final irqStatus = Logic(name: 'irq_status', width: pinCount);
     final irqEdge = Logic(name: 'irq_edge', width: pinCount);
+    final irqFall = Logic(name: 'irq_fall', width: pinCount);
     final prevInput = Logic(name: 'prev_input', width: pinCount);
 
     gpioOut <= outputReg;
@@ -118,8 +129,11 @@ class HarborGpio extends BridgeModule
     // per-pin conditional: `pinCount` separate `If`s all assigning irqStatus
     // race under last-write-wins, so only the highest-numbered firing pin was
     // ever recorded and every lower pin's interrupt was lost.
-    final irqSet = ((irqEdge & gpioIn & ~prevInput) | (~irqEdge & gpioIn))
-        .named('irq_set');
+    final irqSet =
+        ((irqEdge & gpioIn & ~prevInput) |
+                (irqFall & ~gpioIn & prevInput) |
+                (~irqEdge & ~irqFall & gpioIn))
+            .named('irq_set');
 
     Sequential(clk, [
       If(
@@ -130,6 +144,7 @@ class HarborGpio extends BridgeModule
           irqEn < Const(0, width: pinCount),
           irqStatus < Const(0, width: pinCount),
           irqEdge < Const(0, width: pinCount),
+          irqFall < Const(0, width: pinCount),
           prevInput < Const(0, width: pinCount),
           bus.ack < Const(0),
           bus.dataOut < Const(0, width: dw),
@@ -203,6 +218,14 @@ class HarborGpio extends BridgeModule
                     orElse: [bus.dataOut < irqEdge.zeroExtend(dw)],
                   ),
                 ]),
+                // 0x30: IRQ_FALL
+                CaseItem(Const(0x30, width: 12), [
+                  If(
+                    bus.we,
+                    then: [irqFall < bus.selMerge(irqFall, 0x30)],
+                    orElse: [bus.dataOut < irqFall.zeroExtend(dw)],
+                  ),
+                ]),
               ]),
             ],
           ),
@@ -213,8 +236,12 @@ class HarborGpio extends BridgeModule
 
   @override
   HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(
-    compatible: ['harbor,gpio', 'sifive,gpio0'],
+    compatible: ['harbor,gpio'],
+    label: dtLabel,
     reg: BusAddressRange(baseAddress, 0x1000),
+    // The driver builds an interrupt domain with two cells, the pin and the
+    // trigger type, when the node has an interrupt.
+    interruptDomainCells: 2,
     properties: {'ngpios': pinCount, '#gpio-cells': 2, 'gpio-controller': true},
   );
 
@@ -224,7 +251,7 @@ class HarborGpio extends BridgeModule
     uid: 0,
     memory: [BusAddressRange(baseAddress, 0x1000)],
     properties: {
-      'compatible': ['harbor,gpio', 'sifive,gpio0'],
+      'compatible': ['harbor,gpio'],
       'ngpios': pinCount,
       '#gpio-cells': 2,
       'gpio-controller': true,

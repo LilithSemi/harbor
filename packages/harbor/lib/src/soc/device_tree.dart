@@ -112,6 +112,17 @@ class HarborDeviceTreeNode with HarborPrettyString {
   /// Nested child nodes (e.g. a `partitions` container under a flash node).
   final List<HarborDeviceTreeChild> children;
 
+  /// Label of the node, for a [HarborDeviceTreeRef] to it. It must be unique
+  /// in the device tree. An interrupt controller without a label gets a
+  /// generated one.
+  final String? label;
+
+  /// The number of cells of an interrupt specifier when the node maps its own
+  /// interrupts, such as the pin and type of a GPIO controller. The generator
+  /// writes `interrupt-controller` and `#interrupt-cells` for it only when the
+  /// node has an interrupt, because the driver builds the domain only then.
+  final int? interruptDomainCells;
+
   const HarborDeviceTreeNode({
     required this.compatible,
     required this.reg,
@@ -121,6 +132,8 @@ class HarborDeviceTreeNode with HarborPrettyString {
     this.interruptCells = 1,
     this.properties = const {},
     this.children = const [],
+    this.label,
+    this.interruptDomainCells,
   });
 
   /// The primary compatible string (first in the list).
@@ -305,6 +318,7 @@ class HarborDeviceTreeGenerator {
 
   /// Generates the DTS source as a string.
   String generate() {
+    _checkLabels();
     final buf = StringBuffer();
 
     // Phandle plan. An `interrupts` number means nothing to an OS until the
@@ -333,7 +347,7 @@ class HarborDeviceTreeGenerator {
     // below are the conventional source form that dtc can check.
     String cpuIntcLabel(int hartId) => 'cpu${hartId}_intc';
     String controllerLabel(HarborDeviceTreeNodeProvider c) =>
-        'intc${controllers.indexOf(c)}';
+        c.dtNode.label ?? 'intc${controllers.indexOf(c)}';
 
     buf.writeln('/dts-v1/;');
     buf.writeln();
@@ -463,7 +477,9 @@ class HarborDeviceTreeGenerator {
         buf.writeln();
         final label = primary && node.interruptController
             ? '${controllerLabel(p)}: '
-            : '';
+            : node.label == null
+            ? ''
+            : '${node.label}: ';
         buf.writeln('        $label${node.nodeName} {');
         final compatStr = node.compatible.map((c) => '"$c"').join(', ');
         buf.writeln('            compatible = $compatStr;');
@@ -500,6 +516,12 @@ class HarborDeviceTreeGenerator {
         if (irqList.isNotEmpty) {
           final irqs = irqList.map((i) => '0x${i.toRadixString(16)}').join(' ');
           buf.writeln('            interrupts = <$irqs>;');
+          if (!node.interruptController && node.interruptDomainCells != null) {
+            buf.writeln('            interrupt-controller;');
+            buf.writeln(
+              '            #interrupt-cells = <${node.interruptDomainCells}>;',
+            );
+          }
         }
 
         for (final entry in node.properties.entries) {
@@ -518,6 +540,43 @@ class HarborDeviceTreeGenerator {
 
     buf.writeln('};');
     return buf.toString();
+  }
+
+  /// Throws when two nodes share a label or a reference names no label.
+  void _checkLabels() {
+    final seen = <String>{};
+    void add(String? label) {
+      if (label == null) return;
+      if (!seen.add(label)) {
+        throw ArgumentError.value(
+          label,
+          'label',
+          'more than one device tree node has this label',
+        );
+      }
+    }
+
+    void addChild(HarborDeviceTreeChild c) {
+      add(c.label);
+      c.children.forEach(addChild);
+    }
+
+    final nodes = [
+      for (final p in peripherals) ...[p.dtNode, ...p.extraDtNodes],
+    ];
+    for (final n in nodes) {
+      add(n.label);
+      n.children.forEach(addChild);
+    }
+    for (final cpu in cpus) {
+      if (peripherals.any((p) => p.dtNode.interruptController)) {
+        add('cpu${cpu.hartId}_intc');
+      }
+    }
+    for (final (i, p)
+        in peripherals.where((p) => p.dtNode.interruptController).indexed) {
+      if (p.dtNode.label == null) add('intc$i');
+    }
   }
 
   /// Recursively emits a nested [HarborDeviceTreeChild] at [indent].
