@@ -489,12 +489,14 @@ class HarborTileLinkMemoryMaster extends Module {
     required Logic reset,
     required HarborMemoryWaist waist,
     required TileLinkInterface tl,
+    bool readOnly = false,
     super.name = 'tilelink_memory_master',
   }) : super(
          definitionName:
              'HarborTileLinkMemoryMaster_a${waist.config.addressWidth}'
              '_d${waist.config.dataWidth}_i${waist.config.idWidth}'
-             '_n${waist.config.outstanding}_s${tl.config.sizeWidth}',
+             '_n${waist.config.outstanding}_s${tl.config.sizeWidth}'
+             '${readOnly ? '_ro' : ''}',
        ) {
     final config = waist.config;
     _checkMatch(tl, config);
@@ -545,17 +547,22 @@ class HarborTileLinkMemoryMaster extends Module {
     );
 
     final wPop = Logic(name: 'w_pop');
-    final wF = HarborRegFifo(
-      name: 'w',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: m.wdataValid,
-      pushData: harborPack([m.wdataData, m.wdataStrb]),
-      popReady: wPop,
-    );
-    m.wdataReady <= wF.pushReady;
-    final [wData, wStrb] = harborUnpack(wF.popData, [dataW, strbW]);
+    final wF = readOnly
+        ? null
+        : HarborRegFifo(
+            name: 'w',
+            clk: c,
+            reset: r,
+            depth: 2,
+            pushValid: m.wdataValid,
+            pushData: harborPack([m.wdataData, m.wdataStrb]),
+            popReady: wPop,
+          );
+    m.wdataReady <= (wF?.pushReady ?? Const(0));
+    final wPopValid = wF?.popValid ?? Const(0);
+    final [wData, wStrb] = wF == null
+        ? [Const(0, width: dataW), Const(0, width: strbW)]
+        : harborUnpack(wF.popData, [dataW, strbW]);
 
     // One busy bit per source.
     final busy = Logic(name: 'busy', width: 1 << idW);
@@ -566,6 +573,7 @@ class HarborTileLinkMemoryMaster extends Module {
     start <= reqF.popValid & ~headBusy & ~act;
     final cId = Logic(name: 'c_id', width: idW);
     final cWrite = Logic(name: 'c_write');
+    if (readOnly) cWrite <= Const(0);
     final cAddr = Logic(name: 'c_addr', width: addrW);
     final cLen = Logic(name: 'c_len', width: lenW);
     final cSize = Logic(name: 'c_size', width: wSizeW);
@@ -668,7 +676,7 @@ class HarborTileLinkMemoryMaster extends Module {
     a.aCorrupt <= Const(0);
 
     final canSend = act & (~cSplit | ~cWait) & aPushReady;
-    aPush <= canSend & (~cWrite | wF.popValid);
+    aPush <= canSend & (~cWrite | wPopValid);
     wPop <= aPush & cWrite;
     final wholeDone =
         aPush & ~cSplit & (~cWrite | cBeat.eq(cLen.zeroExtend(beatW)));
@@ -727,9 +735,15 @@ class HarborTileLinkMemoryMaster extends Module {
     m.rdataData <= dData;
     m.rdataErr <= dErr;
     m.rdataLast <= mux(piece, pieceLast, dLast);
-    m.wrespValid <= dIn.popValid & isAck & (~piece | pieceLast);
-    m.wrespId <= dSrc;
-    m.wrespErr <= dErr | (piece & cErr);
+    if (readOnly) {
+      m.wrespValid <= Const(0);
+      m.wrespId <= Const(0, width: idW);
+      m.wrespErr <= Const(0);
+    } else {
+      m.wrespValid <= dIn.popValid & isAck & (~piece | pieceLast);
+      m.wrespId <= dSrc;
+      m.wrespErr <= dErr | (piece & cErr);
+    }
     m.rdataExOkay <= Const(0);
     m.wrespExOkay <= Const(0);
     dPop <=
@@ -737,7 +751,9 @@ class HarborTileLinkMemoryMaster extends Module {
             mux(
               isData,
               m.rdataReady,
-              mux(isAck & (~piece | pieceLast), m.wrespReady, Const(1)),
+              readOnly
+                  ? Const(1)
+                  : mux(isAck & (~piece | pieceLast), m.wrespReady, Const(1)),
             );
     final dFire = dIn.popValid & dPop;
     final rdDone = m.rdataValid & m.rdataReady & m.rdataLast;
@@ -751,7 +767,7 @@ class HarborTileLinkMemoryMaster extends Module {
         Iff(start, [
           act < Const(1),
           cId < hId,
-          cWrite < hWrite,
+          if (!readOnly) cWrite < hWrite,
           cAddr < hAddr,
           cLen < hLen,
           cSize < hSize,

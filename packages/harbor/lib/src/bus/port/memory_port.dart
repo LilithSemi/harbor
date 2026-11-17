@@ -281,6 +281,11 @@ class HarborMemoryMasterPort {
   /// [busAddressWidth] makes the AXI4 address wider than the waist address
   /// in [config]. The bus address is the waist address with zeros above it.
   /// Only AXI4 takes a [busAddressWidth] other than the waist width.
+  ///
+  /// With [readOnly], the device sends reads only. The write request, write
+  /// data and write response paths are not built. The write side of the
+  /// native port stays idle, WDATA_READY and WRESP_VALID stay 0, and the
+  /// device must not send a write request.
   static HarborMemoryMasterPort create({
     required BridgeModule module,
     required String name,
@@ -291,6 +296,7 @@ class HarborMemoryMasterPort {
     HarborFabricClock? fabricClock,
     int? cdcDepth,
     int? busAddressWidth,
+    bool readOnly = false,
   }) {
     if (busAddressWidth != null &&
         busAddressWidth != config.addressWidth &&
@@ -312,6 +318,7 @@ class HarborMemoryMasterPort {
         clk: fabricClock.clk,
         reset: fabricClock.reset,
         busAddressWidth: busAddressWidth,
+        readOnly: readOnly,
       );
       final cdc = HarborMemoryWaistCdc(
         fabricClk: fabricClock.clk,
@@ -346,6 +353,7 @@ class HarborMemoryMasterPort {
           waist: waist,
           axi: ref.internalInterface!,
           name: '${name}_axi4',
+          readOnly: readOnly,
         );
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);
       case HarborFabricKind.wishbone:
@@ -360,6 +368,7 @@ class HarborMemoryMasterPort {
           waist: waist,
           wb: ref.internalInterface!,
           name: '${name}_wishbone',
+          readOnly: readOnly,
         );
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);
       case HarborFabricKind.tilelink:
@@ -374,6 +383,7 @@ class HarborMemoryMasterPort {
           waist: waist,
           tl: ref.internalInterface!,
           name: '${name}_tilelink',
+          readOnly: readOnly,
         );
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);
     }

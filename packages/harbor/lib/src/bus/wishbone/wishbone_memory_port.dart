@@ -327,12 +327,14 @@ class HarborWishboneMemoryMaster extends Module {
     required Logic reset,
     required HarborMemoryWaist waist,
     required WishboneInterface wb,
+    bool readOnly = false,
     super.name = 'wishbone_memory_master',
   }) : super(
          definitionName:
              'HarborWishboneMemoryMaster_a${waist.config.addressWidth}'
              '_d${waist.config.dataWidth}_i${waist.config.idWidth}'
-             '_n${waist.config.outstanding}',
+             '_n${waist.config.outstanding}'
+             '${readOnly ? '_ro' : ''}',
        ) {
     final config = waist.config;
     _checkMatch(wb, config);
@@ -344,9 +346,9 @@ class HarborWishboneMemoryMaster extends Module {
       ..pairConnectIO(this, wb, PairRole.provider, uniquify: (n) => 'wb_$n');
 
     if (config.outstanding == 1) {
-      _buildWishboneMemoryMasterFast(c, r, m, b, config);
+      _buildWishboneMemoryMasterFast(c, r, m, b, config, readOnly);
     } else {
-      _buildWishboneMemoryMasterQueued(c, r, m, b, config);
+      _buildWishboneMemoryMasterQueued(c, r, m, b, config, readOnly);
     }
   }
 }
@@ -383,6 +385,7 @@ void _buildWishboneMemoryMasterFast(
   HarborMemoryWaist m,
   WishboneInterface b,
   HarborMemoryWaistConfig config,
+  bool readOnly,
 ) {
   final idW = config.idWidth;
   final addrW = config.addressWidth;
@@ -403,6 +406,7 @@ void _buildWishboneMemoryMasterFast(
   final abort = Logic(name: 'abort');
   final cId = Logic(name: 'c_id', width: idW);
   final cWrite = Logic(name: 'c_write');
+  if (readOnly) cWrite <= Const(0);
   final cAddr = Logic(name: 'c_addr', width: addrW);
   final cLen = Logic(name: 'c_len', width: lenW);
   final cSize = Logic(name: 'c_size', width: sizeW);
@@ -501,10 +505,11 @@ void _buildWishboneMemoryMasterFast(
     ),
   ).getRange(0, addrW);
 
-  final readyBad =
-      ((m.wrespReady & ~((busy & cWrite) | (reqFire & m.reqWrite))) |
-              (m.rdataReady & ~((busy & ~cWrite) | (reqFire & ~m.reqWrite))))
-          .named('ready_bad');
+  final rdBad = m.rdataReady & ~((busy & ~cWrite) | (reqFire & ~m.reqWrite));
+  final readyBad = readOnly
+      ? rdBad.named('ready_bad')
+      : ((m.wrespReady & ~((busy & cWrite) | (reqFire & m.reqWrite))) | rdBad)
+            .named('ready_bad');
   _checkInSim(
     c,
     r,
@@ -524,7 +529,7 @@ void _buildWishboneMemoryMasterFast(
             pendValid < Const(0),
             abort < Const(0),
             cId < m.reqId,
-            cWrite < m.reqWrite,
+            if (!readOnly) cWrite < m.reqWrite,
             cAddr < m.reqAddr,
             cLen < m.reqLen,
             cSize < m.reqSize,
@@ -576,6 +581,7 @@ void _buildWishboneMemoryMasterQueued(
   HarborMemoryWaist m,
   WishboneInterface b,
   HarborMemoryWaistConfig config,
+  bool readOnly,
 ) {
   final n = config.outstanding;
   final idW = config.idWidth;
@@ -622,24 +628,30 @@ void _buildWishboneMemoryMasterQueued(
   // The entries reset, since DAT_MOSI comes straight from them and shows
   // on every beat.
   final wPop = Logic(name: 'w_pop');
-  final wF = HarborRegFifo(
-    name: 'w',
-    clk: c,
-    reset: r,
-    depth: 2,
-    pushValid: m.wdataValid,
-    pushData: harborPack([m.wdataData, m.wdataStrb]),
-    popReady: wPop,
-    resetEntries: true,
-  );
-  m.wdataReady <= wF.pushReady;
-  final [wData, wStrb] = harborUnpack(wF.popData, [dataW, strbW]);
+  final wF = readOnly
+      ? null
+      : HarborRegFifo(
+          name: 'w',
+          clk: c,
+          reset: r,
+          depth: 2,
+          pushValid: m.wdataValid,
+          pushData: harborPack([m.wdataData, m.wdataStrb]),
+          popReady: wPop,
+          resetEntries: true,
+        );
+  m.wdataReady <= (wF?.pushReady ?? Const(0));
+  final wPopValid = wF?.popValid ?? Const(0);
+  final [wData, wStrb] = wF == null
+      ? [Const(0, width: dataW), Const(0, width: strbW)]
+      : harborUnpack(wF.popData, [dataW, strbW]);
 
   final act = Logic(name: 'act');
   final gap = Logic(name: 'gap');
   final abort = Logic(name: 'abort');
   final cId = Logic(name: 'c_id', width: idW);
   final cWrite = Logic(name: 'c_write');
+  if (readOnly) cWrite <= Const(0);
   final cAddr = Logic(name: 'c_addr', width: addrW);
   final cLen = Logic(name: 'c_len', width: lenW);
   final cSize = Logic(name: 'c_size', width: sizeW);
@@ -649,7 +661,7 @@ void _buildWishboneMemoryMasterQueued(
   final cErr = Logic(name: 'c_err');
   // A write does not raise CYC until its first data beat is in the
   // FIFO, so the bus is not held while this master waits for data.
-  start <= ~act & ~gap & reqF.popValid & (~hWrite | wF.popValid);
+  start <= ~act & ~gap & reqF.popValid & (~hWrite | wPopValid);
 
   final last = cBeat.eq(cLen.zeroExtend(beatW)).named('last');
   final rStore = Logic(name: 'r_store');
@@ -668,20 +680,22 @@ void _buildWishboneMemoryMasterQueued(
     ]),
     popReady: m.rdataReady,
   );
-  final bF = HarborRegFifo(
-    name: 'b',
-    clk: c,
-    reset: r,
-    depth: 2,
-    pushValid: bStore,
-    pushData: harborPack([cId, cErr | abort | b.err!]),
-    popReady: m.wrespReady,
-  );
+  final bF = readOnly
+      ? null
+      : HarborRegFifo(
+          name: 'b',
+          clk: c,
+          reset: r,
+          depth: 2,
+          pushValid: bStore,
+          pushData: harborPack([cId, cErr | abort | b.err!]),
+          popReady: m.wrespReady,
+        );
 
   // A beat can run once its data is here and its response has room.
   final beatReady = mux(
     cWrite,
-    wF.popValid & (~last | bF.pushReady),
+    wPopValid & (~last | (bF?.pushReady ?? Const(1))),
     rF.pushReady,
   );
   final pieceSize = mux(
@@ -737,10 +751,16 @@ void _buildWishboneMemoryMasterQueued(
   m.rdataData <= rDat;
   m.rdataErr <= rErr;
   m.rdataLast <= rLast;
-  final [bId, bErr] = harborUnpack(bF.popData, [idW, 1]);
-  m.wrespValid <= bF.popValid;
-  m.wrespId <= bId;
-  m.wrespErr <= bErr;
+  if (bF != null) {
+    final [bId, bErr] = harborUnpack(bF.popData, [idW, 1]);
+    m.wrespValid <= bF.popValid;
+    m.wrespId <= bId;
+    m.wrespErr <= bErr;
+  } else {
+    m.wrespValid <= Const(0);
+    m.wrespId <= Const(0, width: idW);
+    m.wrespErr <= Const(0);
+  }
   m.rdataExOkay <= Const(0);
   m.wrespExOkay <= Const(0);
 
@@ -751,7 +771,7 @@ void _buildWishboneMemoryMasterQueued(
         act < Const(1),
         abort < Const(0),
         cId < hId,
-        cWrite < hWrite,
+        if (!readOnly) cWrite < hWrite,
         cAddr < hAddr,
         cLen < hLen,
         cSize < hSize,

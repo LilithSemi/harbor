@@ -168,8 +168,10 @@ class MemLoopShell extends BridgeModule {
     HarborMemoryWaistConfig config, {
     HarborFabricKind kind = HarborFabricKind.axi4,
     int burstBeats = 8,
+    bool readOnly = false,
   }) : super(
-         'MemTestLoopShell_${kind.name}_${_cfgName(config)}_b$burstBeats',
+         'MemTestLoopShell_${kind.name}_${_cfgName(config)}_b$burstBeats'
+         '${readOnly ? '_ro' : ''}',
          name: 'shell',
        ) {
     createPort('clk', PortDirection.input);
@@ -185,11 +187,23 @@ class MemLoopShell extends BridgeModule {
           dataWidth: config.dataWidth,
           idWidth: config.idWidth,
         );
-        HarborAxi4MemoryMaster(clk: clk, reset: reset, waist: up, axi: link);
+        HarborAxi4MemoryMaster(
+          clk: clk,
+          reset: reset,
+          waist: up,
+          axi: link,
+          readOnly: readOnly,
+        );
         HarborAxi4MemorySlave(clk: clk, reset: reset, axi: link, waist: down);
       case HarborFabricKind.tilelink:
         final link = TileLinkInterface(harborTileLinkMemoryConfig(config));
-        HarborTileLinkMemoryMaster(clk: clk, reset: reset, waist: up, tl: link);
+        HarborTileLinkMemoryMaster(
+          clk: clk,
+          reset: reset,
+          waist: up,
+          tl: link,
+          readOnly: readOnly,
+        );
         HarborTileLinkMemorySlave(
           clk: clk,
           reset: reset,
@@ -198,7 +212,13 @@ class MemLoopShell extends BridgeModule {
         );
       case HarborFabricKind.wishbone:
         final link = WishboneInterface(harborWishboneMemoryConfig(config));
-        HarborWishboneMemoryMaster(clk: clk, reset: reset, waist: up, wb: link);
+        HarborWishboneMemoryMaster(
+          clk: clk,
+          reset: reset,
+          waist: up,
+          wb: link,
+          readOnly: readOnly,
+        );
         HarborWishboneMemorySlave(
           clk: clk,
           reset: reset,
