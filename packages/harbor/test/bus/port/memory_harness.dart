@@ -440,6 +440,10 @@ class WaistMemory {
   /// request's start address, so a request can carry both good and bad
   /// beats.
   final bool perBeatErr;
+
+  /// With [perBeatErr], only a beat at the start of a line of this many
+  /// bytes fails, so an error comes early in a burst.
+  final int? errLine;
   final List<String> errors;
   final WordMemory mem;
   final List<Burst> reads = [];
@@ -463,6 +467,7 @@ class WaistMemory {
     required this.errors,
     this.errBase = 0xf000,
     this.perBeatErr = false,
+    this.errLine,
     double stall = 0.3,
   }) : mem = WordMemory(busBytes) {
     rdata = Source(s, '${p}_RDATA_VALID', '${p}_RDATA_READY', rng, idle: stall)
@@ -547,7 +552,10 @@ class WaistMemory {
       errors.add('WDATA_LAST wrong on beat $_beat of $b');
     }
     final strb = f['${p}_WDATA_STRB']!;
-    final addrErr = perBeatErr ? addrs[_beat] >= errBase : b.addr >= errBase;
+    final addrErr = perBeatErr
+        ? addrs[_beat] >= errBase &&
+              (errLine == null || addrs[_beat] % errLine! == 0)
+        : b.addr >= errBase;
     if (perBeatErr) {
       // A beat with every strobe low has no effect, so it must not be
       // able to fault the device.

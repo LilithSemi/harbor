@@ -142,7 +142,10 @@ class WishboneArbiter extends BridgeModule {
 /// shows one cycle after the request. With no request the grant stays on
 /// the last owner. [terminate] is high when the owner's transfer ends. With
 /// [maxGrantCycles], an owner that held the grant that long loses it at the
-/// end of a transfer when another master waits (see [WishboneArbiter]).
+/// end of a transfer when another master waits (see [WishboneArbiter]). The
+/// cap takes the grant only at a transfer end where [safeEnd] is high, so
+/// the fabric can cut after a read or after a write that waited for its
+/// response. A null [safeEnd] counts as high.
 /// [prefix] goes in front of every signal name.
 Logic harborWishboneGrant({
   required Logic clk,
@@ -151,6 +154,7 @@ Logic harborWishboneGrant({
   required Logic terminate,
   BusArbitration arbitration = BusArbitration.roundRobin,
   int? maxGrantCycles,
+  Logic? safeEnd,
   String prefix = '',
 }) {
   final numMasters = requests.length;
@@ -203,9 +207,13 @@ Logic harborWishboneGrant({
     final othersWait = (requestsVec & ~heldReg).or().named(
       '${prefix}others_wait',
     );
-    final preempt = (heldValid & count.eq(cap) & terminate & othersWait).named(
-      '${prefix}preempt',
-    );
+    final preempt =
+        (heldValid &
+                count.eq(cap) &
+                terminate &
+                (safeEnd ?? Const(1)) &
+                othersWait)
+            .named('${prefix}preempt');
     final freeVec = (requestsVec & ~blocked!).named('${prefix}free_requests');
     Sequential(clk, [
       If(
