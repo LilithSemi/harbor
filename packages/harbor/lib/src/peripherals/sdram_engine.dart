@@ -403,6 +403,10 @@ class SdramEngine extends Module {
     final forceRef = Logic(name: 'force_ref');
     final idleRefWant = Logic(name: 'idle_ref_want');
     final refCommit = Logic(name: 'ref_commit');
+    // High from a refresh pick until the refresh credit counted it. A new
+    // idle refresh waits, because a refresh at a low clock rate is shorter
+    // than that feedback and would be issued again from a stale credit.
+    final refGuard = Logic(name: 'ref_guard');
     final idleWidth = pullInIdleCycles.bitLength;
     final idleCnt = Logic(name: 'idle_cnt', width: idleWidth);
     final idleLong = Logic(name: 'idle_long');
@@ -448,12 +452,10 @@ class SdramEngine extends Module {
     // cycle.
     final wantPreAll = Logic(name: 'want_pre_all');
     final wantRef = Logic(name: 'want_ref');
-    final idleNow = ~cur.valid & ~la.valid & idleRefWant;
+    final idleNow = ~cur.valid & ~la.valid & idleRefWant & ~refGuard;
     // A force does not wait for the current request to end. Its precharge
     // all can cut that request, which opens its row again afterwards.
     final wantPreAllNext = initDonePick & (forceAny | idleNow);
-    final wantRefNext = initDonePick & (forceRef | idleNow | refCommit);
-    final holdNext = ~initDonePick | wantPreAllNext | wantRefNext;
 
     // The sel_* registers and free flags cover the cycle the timers miss.
     // This needs want_* to hold curGo and laBase low in that cycle, and no
@@ -466,6 +468,12 @@ class SdramEngine extends Module {
     final pickRef = (selIdle & wantRef & ~timers.anyOpen & timers.canRef).named(
       'pick_ref',
     );
+
+    // A commit ends at the pick, so the want does not stay for a second
+    // refresh when the refresh time is 2 cycles or less.
+    final wantRefNext =
+        initDonePick & (forceRef | idleNow | (refCommit & ~pickRef));
+    final holdNext = ~initDonePick | wantPreAllNext | wantRefNext;
 
     final readIssue = (selCurCol & ~cur.write).named('read_issue');
     final writeIssue = (selCurCol & cur.write).named('write_issue');
@@ -793,6 +801,7 @@ class SdramEngine extends Module {
       initIs(SdramCommand.preAll),
     );
     final refNext = mux(initDonePick, pickRef, initIs(SdramCommand.ref));
+    refGuard <= (refNext | selRef | lastRef).named('ref_guard_any');
     final mrsNext = ~initDonePick & initIs(SdramCommand.mrs);
 
     // A flag for the entry that is current after this edge. Both picks run
@@ -817,7 +826,8 @@ class SdramEngine extends Module {
     // --- refresh policy ---
     // A precharge all for a refresh commits to that refresh, so rows are
     // never closed for nothing.
-    final refCommitNext = (refCommit | (pickPreAll & wantRef)) & ~selRef;
+    final refCommitNext =
+        (refCommit | (pickPreAll & wantRef)) & ~selRef & ~pickRef;
     final busy = cur.valid | la.valid;
     final idleCntNext = mux(
       busy,
@@ -828,10 +838,12 @@ class SdramEngine extends Module {
     // Pull a refresh in only after a long idle time or with every bank
     // closed. An owed refresh does not wait.
     final idleRefWantNext =
-        credit.need | (credit.mayPullIn & (idleLong | ~timers.anyOpen));
-    final forceRefNext = initDonePick & credit.force;
+        ~refGuard &
+        (credit.need | (credit.mayPullIn & (idleLong | ~timers.anyOpen)));
+    final forceRefNext = initDonePick & credit.force & ~refGuard;
     final rowAgeForce = rowAgeGuard ? timers.rowAgeForce : Const(0);
-    final forceAnyNext = initDonePick & (credit.force | rowAgeForce);
+    final forceAnyNext =
+        initDonePick & ((credit.force & ~refGuard) | rowAgeForce);
 
     // --- read return ---
     final pipeDepth = phyReadLatency + 1;

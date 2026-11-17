@@ -33,6 +33,7 @@ class SdramEngineStackTop extends Module {
     required List<SdramPortInterface> ports,
     required LogicNet dqPad,
     required int maxGrantWords,
+    HarborSdramPhyConfig phyConfig = const HarborSdramPhyConfig(),
     List<int>? portMaxGrantWords,
     List<bool>? portRealtime,
     List<bool>? portSlice,
@@ -79,6 +80,7 @@ class SdramEngineStackTop extends Module {
       dqOut: dqOut,
       dqOe: dqOe,
       dqPad: dq,
+      phy: phyConfig,
     );
 
     // A bare port sitting only between the arbiter and the engine, the
@@ -207,6 +209,7 @@ class SdramEngineStack {
   final HarborSdramConfig config;
   final HarborSdramCycles cycles;
   final double fpgaToSdramNs;
+  late final HarborSdramPhyConfig phyConfig;
   final int maxGrantWords;
   final bool fastInit;
 
@@ -388,9 +391,15 @@ class SdramEngineStack {
         s.inject(0);
       }
     }
+    phyConfig = const HarborSdramPhyConfig().resolve(
+      clockHz: clockHz,
+      config: config,
+      casLatency: cycles.casLatency,
+    );
     top = SdramEngineStackTop(
       config,
       cycles,
+      phyConfig: phyConfig,
       clk: clk,
       reset: reset,
       ports: portIfaces,
@@ -410,7 +419,7 @@ class SdramEngineStack {
       periodPs: periodPs,
       casLatency: cycles.casLatency,
       fpgaToSdramNs: fpgaToSdramNs,
-      phy: const HarborSdramPhyConfig(),
+      phy: phyConfig,
     )) {
       throw ArgumentError('fpgaToSdramNs $fpgaToSdramNs misses the window');
     }
