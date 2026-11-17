@@ -29,7 +29,12 @@ enum HarborLedByte { r, g, b, w }
 class HarborLedPin {
   final int pixel;
   final HarborLedByte byte;
-  const HarborLedPin(this.pixel, this.byte);
+
+  /// The highest duty that software may set on this pixel. The driver
+  /// reports it as the brightness ceiling. A pixel with several pins uses
+  /// the lowest value of its pins.
+  final int maxDuty;
+  const HarborLedPin(this.pixel, this.byte, {this.maxDuty = 255});
 }
 
 /// The configuration of one channel.
@@ -198,6 +203,39 @@ class HarborLedEngine extends BridgeModule
 
   int get _pixelCountInfo =>
       pixelSource == HarborLedPixelSource.none ? 0 : maxPixels;
+
+  Iterable<HarborLedPin> get _pwmPins => [
+    for (final c in channels) ...c.pwmPins,
+  ];
+
+  /// The pixels that the property lists cover. A build with a serial channel
+  /// covers every pixel of the window.
+  int get _listedPixels {
+    if (channels.any((c) => c.kind == HarborLedKind.serial)) {
+      return _pixelCountInfo;
+    }
+    return channels.fold(0, (n, c) => c.pixelsUsed > n ? c.pixelsUsed : n);
+  }
+
+  // Per pixel, 0 for RGB and 1 for a mono LED. A pwm pixel that reads only
+  // the B byte is mono. Every other pixel is RGB.
+  List<int> get _pixelColors => [
+    for (var p = 0; p < _listedPixels; p++)
+      if (_pwmPins.any((x) => x.pixel == p) &&
+          _pwmPins
+              .where((x) => x.pixel == p)
+              .every((x) => x.byte == HarborLedByte.b))
+        1
+      else
+        0,
+  ];
+
+  List<int> get _pixelMaxBrightness => [
+    for (var p = 0; p < _listedPixels; p++)
+      _pwmPins
+          .where((x) => x.pixel == p)
+          .fold(255, (m, x) => x.maxDuty < m ? x.maxDuty : m),
+  ];
 
   HarborLedEngine({
     required this.baseAddress,
@@ -799,7 +837,10 @@ class HarborLedEngine extends BridgeModule
                 If(hit, then: [dmaStall[c] < 1]),
                 If(
                   startNow[c] & modeNow[c],
-                  then: [stallArmed[c] < 1, stallCnt[c] < Const(0, width: sw)],
+                  then: [
+                    stallArmed[c] < 1,
+                    stallCnt[c] < Const(0, width: sw),
+                  ],
                 ),
                 If(startNow[c] | sendBusy[c], then: [dmaStall[c] < 0]),
               ],
@@ -1191,6 +1232,10 @@ class HarborLedEngine extends BridgeModule
     'harbor,kinds': [for (final c in channels) c.kind.name],
     'harbor,pixel-count': _pixelCountInfo,
     'harbor,pixel-source': pixelSource.name,
+    if (_pixelCountInfo > 0) ...{
+      'harbor,pixel-colors': _pixelColors,
+      'harbor,pixel-max-brightness': _pixelMaxBrightness,
+    },
     if (clockHz != null) 'clock-frequency': clockHz!,
   };
 

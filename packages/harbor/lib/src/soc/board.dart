@@ -796,7 +796,8 @@ const _artyS7_50 = HarborBoard(
     },
   },
   // Four plain LEDs on pixels 0 to 3 and two RGB LEDs on pixels 4 and 5, all
-  // active high.
+  // active high. The Digilent Arty S7 Reference Manual advises at most 50%
+  // duty on the RGB LEDs, so their ceiling is 128 of 255.
   ledChannels: [
     HarborBoardLedChannel(
       HarborLedChannelConfig.pwm([
@@ -804,12 +805,12 @@ const _artyS7_50 = HarborBoard(
         HarborLedPin(1, HarborLedByte.b),
         HarborLedPin(2, HarborLedByte.b),
         HarborLedPin(3, HarborLedByte.b),
-        HarborLedPin(4, HarborLedByte.r),
-        HarborLedPin(4, HarborLedByte.g),
-        HarborLedPin(4, HarborLedByte.b),
-        HarborLedPin(5, HarborLedByte.r),
-        HarborLedPin(5, HarborLedByte.g),
-        HarborLedPin(5, HarborLedByte.b),
+        HarborLedPin(4, HarborLedByte.r, maxDuty: 128),
+        HarborLedPin(4, HarborLedByte.g, maxDuty: 128),
+        HarborLedPin(4, HarborLedByte.b, maxDuty: 128),
+        HarborLedPin(5, HarborLedByte.r, maxDuty: 128),
+        HarborLedPin(5, HarborLedByte.g, maxDuty: 128),
+        HarborLedPin(5, HarborLedByte.b, maxDuty: 128),
       ]),
       [
         'led[0]',

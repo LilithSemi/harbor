@@ -30,6 +30,7 @@ stdenv.mkDerivation {
       ../../packages/harbor_kmod/media
       ../../packages/harbor_kmod/audio
       ../../packages/harbor_kmod/efuse
+      ../../packages/harbor_kmod/led
     ];
   };
 
