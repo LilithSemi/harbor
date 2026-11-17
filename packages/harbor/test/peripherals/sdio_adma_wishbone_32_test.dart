@@ -6,5 +6,5 @@ import 'sdio_adma_kind_cases.dart';
 
 void main() {
   tearDown(() async => Simulator.reset());
-  admaKindCases(HarborFabricKind.tilelink);
+  admaKindCases(HarborFabricKind.wishbone, widths: [32]);
 }
