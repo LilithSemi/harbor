@@ -104,7 +104,7 @@ void main() {
   });
 
   // The transmitter stays gated while the divisor is 0. The byte waits in
-  // the holding register with the line idle, and goes out once a divisor is set.
+  // the FIFO with the line idle, and goes out once a divisor is set.
   test(
     'a THR write with divisor 0 sends nothing until a divisor is set',
     () async {
@@ -161,6 +161,12 @@ void main() {
   test('serial8250 startup and THRE-driven transmit in 16450 mode', () async {
     final d = await UartDut.start();
     await _linuxSequence(d, fifo: false);
+    await Simulator.endSimulation();
+  });
+
+  test('serial8250 startup and THRE-driven transmit in FIFO mode', () async {
+    final d = await UartDut.start();
+    await _linuxSequence(d, fifo: true);
     await Simulator.endSimulation();
   });
 }

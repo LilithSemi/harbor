@@ -88,7 +88,9 @@ class UartDut {
       await wait(cyclesPerBit);
     }
     rx.inject(1);
-    await wait(cyclesPerBit);
+    // The receiver samples the stop bit a few cycles after the frame ends,
+    // because of the input synchronizer.
+    await wait(cyclesPerBit + 4);
   }
 
   /// Collects [count] 8N1 frames from TX. The result holds fewer bytes when
