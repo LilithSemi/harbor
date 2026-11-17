@@ -1304,10 +1304,6 @@ struct DramStore {
       dqPad: dqPad,
       dqsPad: dqsPad,
       dqsNPad: dqsNPad,
-      himbaechel: switch (target) {
-        HarborFpgaTarget(useHimbaechel: true) => true,
-        _ => false,
-      },
     );
 
     // Lattice ECP5 PHY (gearRatio 1 only, so straight from the controller).

@@ -409,11 +409,9 @@ void main() {
       File('${dir.path}/support/nextpnr/show_bels.py').existsSync(),
       isFalse,
     );
-    final ckOddr = File(
-      '${dir.path}/rtl/Ddr3Phy.sv',
-    ).readAsLinesSync().singleWhere((line) => line.contains(' ck_oddr('));
-    expect(ckOddr, contains('.R(sync_rst)'));
-    expect(ckOddr, isNot(contains('.S(')));
+    final phySv = File('${dir.path}/rtl/Ddr3Phy.sv').readAsStringSync();
+    expect(phySv, contains(' ck_oserdes('));
+    expect(phySv, isNot(contains('ck_oddr')));
   });
 
   test('geared DDR constraints name the CK/8 controller BUFG output', () async {

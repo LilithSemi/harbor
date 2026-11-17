@@ -44,7 +44,8 @@ void main() {
 
       expect(sv, contains('IDELAYCTRL'));
       expect(sv, contains('OBUFDS'));
-      expect(sv, contains('ODDR'));
+      expect(sv, contains('ck_oserdes'));
+      expect(sv, isNot(contains('ck_oddr')));
       // Read-return port widths track the x16 geometry.
       expect(phy.iserdesData.width, p.dqBits * p.lanes * 8); // 128
       expect(phy.iserdesDqs.width, p.lanes * 8); // 16
