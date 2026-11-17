@@ -465,15 +465,18 @@ class SdramEngine extends Module {
         (selIdle & wantPreAll & timers.anyOpen & timers.canPreAll).named(
           'pick_pre_all',
         );
-    final pickRef = (selIdle & wantRef & ~timers.anyOpen & timers.canRef).named(
-      'pick_ref',
-    );
+    // can_ref is only high with every bank closed, so it covers any_open.
+    final pickRef = (selIdle & wantRef & timers.canRef).named('pick_ref');
 
     // A commit ends at the pick, so the want does not stay for a second
     // refresh when the refresh time is 2 cycles or less.
     final wantRefNext =
         initDonePick & (forceRef | idleNow | (refCommit & ~pickRef));
-    final holdNext = ~initDonePick | wantPreAllNext | wantRefNext;
+    // The hold is split so the refresh pick joins it after the entry logic,
+    // not in front of it.
+    final refDropHold = initDonePick & refCommit & ~pickRef;
+    final holdNext =
+        ~initDonePick | wantPreAllNext | (initDonePick & (forceRef | idleNow));
 
     final readIssue = (selCurCol & ~cur.write).named('read_issue');
     final writeIssue = (selCurCol & cur.write).named('write_issue');
@@ -964,8 +967,8 @@ class SdramEngine extends Module {
       (curCanAct, forNextCur((_, b) => canActFor(b)), 0),
       (curCanPre, forNextCur((_, b) => canPreFor(b)), 0),
       (curCanColR, forNextCur(canColFor), 0),
-      (curGo, byFinish(goFor), 0),
-      (laBase, byFinish(laBaseFor), 0),
+      (curGo, byFinish(goFor) & ~refDropHold, 0),
+      (laBase, byFinish(laBaseFor) & ~refDropHold, 0),
       (laCanAct, mux(accept, canActFor(inBank), canActFor(la.bank)), 0),
       (laCanPre, mux(accept, canPreFor(inBank), canPreFor(la.bank)), 0),
       (forceAny, forceAnyNext, 0),
