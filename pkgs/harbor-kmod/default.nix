@@ -15,6 +15,7 @@ stdenv.mkDerivation {
       ../../packages/harbor_kmod/Makefile
       ../../packages/harbor_kmod/gpio
       ../../packages/harbor_kmod/spi
+      ../../packages/harbor_kmod/spi_flash
       ../../packages/harbor_kmod/i2c
       ../../packages/harbor_kmod/sdio
       ../../packages/harbor_kmod/dma
