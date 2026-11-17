@@ -14,6 +14,9 @@ import 'package:rohd/rohd.dart';
 /// a LOOP count starts again from that register, so a repeat has no gap.
 /// When the next item is not ready at a tick, the pin keeps its level and
 /// `underrun` goes high until the next SEND.
+///
+/// With `pixel` high, the items come from a pixel expander and the item
+/// address is not used.
 class HarborLedSerialChannel extends Module {
   final int addrWidth;
 
@@ -26,6 +29,13 @@ class HarborLedSerialChannel extends Module {
   /// High from a missed item until the next SEND.
   Logic get underrun => output('underrun');
   Logic get ramReq => output('ram_req');
+
+  /// High with `ram_req` when the item is needed to keep the train exact.
+  /// It is low for the read of the first item, which has no deadline.
+  Logic get ramCritical => output('ram_crit');
+
+  /// High in a clock in which the reader takes an item.
+  Logic get fetched => output('fetched');
   Logic get ramAddr => output('ram_addr');
 
   /// Completed trains, 8 bits.
@@ -45,6 +55,7 @@ class HarborLedSerialChannel extends Module {
     required Logic loop,
     required Logic ramData,
     required Logic ramGrant,
+    required Logic pixel,
     required this.addrWidth,
     required bool activeLow,
     super.name = 'led_serial_channel',
@@ -64,11 +75,14 @@ class HarborLedSerialChannel extends Module {
     loop = addInput('loop', loop, width: 8);
     ramData = addInput('ram_data', ramData, width: 16);
     ramGrant = addInput('ram_grant', ramGrant);
+    pixel = addInput('pixel', pixel);
     addOutput('pin');
     addOutput('busy');
     addOutput('done');
     addOutput('underrun');
     addOutput('ram_req');
+    addOutput('ram_crit');
+    addOutput('fetched');
     addOutput('ram_addr', width: aw);
     addOutput('frame_count', width: 8);
     addOutput('state', width: aw);
@@ -111,7 +125,7 @@ class HarborLedSerialChannel extends Module {
     final fetchReq =
         busy & ((wrapping & consume) | (~pfEnd & (~pfValid | consume)));
     final fetching = fetchReq & ramGrant;
-    final overrun = fetchAddrEff[aw];
+    final overrun = fetchAddrEff[aw] & ~pixel;
     final ramLevel = mux(overrun, Const(0), ramData[15]);
     final ramDur = mux(overrun, Const(0, width: 15), ramData.getRange(0, 15));
 
@@ -120,6 +134,8 @@ class HarborLedSerialChannel extends Module {
     output('done') <= doneQ;
     output('underrun') <= underrunQ;
     output('ram_req') <= fetchReq;
+    output('ram_crit') <= fetchReq & (started | pfValid);
+    output('fetched') <= fetching;
     output('ram_addr') <= fetchAddrEff.getRange(0, aw);
     output('frame_count') <= frames;
     output('state') <= curIdx;
@@ -250,6 +266,267 @@ class HarborLedSerialChannel extends Module {
               startQ < itemStart,
               fetchAddr < itemStart.zeroExtend(aw + 1),
               loopLeft < loop,
+            ],
+          ),
+        ],
+      ),
+    ]);
+  }
+}
+
+// Balanced mux tree: entries[index].
+Logic _pick(Logic index, List<Logic> entries) {
+  if (entries.length == 1) return entries[0];
+  final next = <Logic>[];
+  for (var i = 0; i < entries.length; i += 2) {
+    next.add(
+      i + 1 < entries.length
+          ? mux(index[0], entries[i + 1], entries[i])
+          : entries[i],
+    );
+  }
+  return _pick(index.getRange(1, index.width), next);
+}
+
+/// The pixel expander of one serial channel.
+///
+/// It turns pixel words into the items of a WS2812 frame. Each bit is a high
+/// item and a low item, and the frame ends with the reset gap and an end
+/// item. A reset gap longer than 15 bits is sent as more than one item. The
+/// expander gives the next item in `level` and `dur` while `ready` is high,
+/// and moves on when `advance` is high.
+///
+/// The expander asks for a pixel word with `px_req` and `px_addr`. The word
+/// is taken in the clock in which `px_valid` is high. `px_grant` ends the
+/// request. The next word is read while the low item of the last bit of the
+/// pixel is sent.
+class HarborLedPixelExpander extends Module {
+  final int pixelAddrWidth;
+  final int countWidth;
+
+  Logic get level => output('level');
+  Logic get dur => output('dur');
+  Logic get ready => output('ready');
+  Logic get pxReq => output('px_req');
+  Logic get pxAddr => output('px_addr');
+
+  /// The index of the pixel that is sent.
+  Logic get index => output('index');
+
+  HarborLedPixelExpander({
+    required Logic clk,
+    required Logic reset,
+    required Logic start,
+    required Logic busy,
+    required Logic advance,
+    required Logic bpp,
+    required Logic order,
+    required List<Logic> timing,
+    required Logic resetGap,
+    required Logic count,
+    required Logic pxData,
+    required Logic pxGrant,
+    required Logic pxValid,
+    required int maxPixels,
+    required this.pixelAddrWidth,
+    super.name = 'led_pixel_expander',
+  }) : countWidth = count.width,
+       super(
+         definitionName:
+             'HarborLedPixelExpander_p${maxPixels}_a$pixelAddrWidth',
+         reserveDefinitionName: true,
+       ) {
+    final cw = countWidth;
+    clk = addInput('clk', clk);
+    reset = addInput('reset', reset);
+    start = addInput('start', start);
+    busy = addInput('busy', busy);
+    advance = addInput('advance', advance);
+    bpp = addInput('bpp', bpp);
+    order = addInput('order', order, width: 3);
+    timing = [
+      for (var k = 0; k < 4; k++) addInput('t$k', timing[k], width: 15),
+    ];
+    resetGap = addInput('reset_gap', resetGap, width: 20);
+    count = addInput('count', count, width: cw);
+    pxData = addInput('px_data', pxData, width: 32);
+    pxGrant = addInput('px_grant', pxGrant);
+    pxValid = addInput('px_valid', pxValid);
+    addOutput('level');
+    addOutput('dur', width: 15);
+    addOutput('ready');
+    addOutput('px_req');
+    addOutput('px_addr', width: pixelAddrWidth);
+    addOutput('index', width: cw);
+
+    const phH = 0, phL = 1, phReset = 2, phEnd = 3;
+    final active = Logic(name: 'active');
+    final wordValid = Logic(name: 'word_valid');
+    final reqQ = Logic(name: 'req_q');
+    final tail = Logic(name: 'tail');
+    final curBit = Logic(name: 'cur_bit');
+    final pidx = Logic(name: 'pidx', width: cw);
+    final cntQ = Logic(name: 'cnt_q', width: cw);
+    final kbyte = Logic(name: 'kbyte', width: 2);
+    final bidx = Logic(name: 'bidx', width: 3);
+    final phase = Logic(name: 'phase', width: 2);
+    final word = Logic(name: 'word', width: 32);
+    final rstLeft = Logic(name: 'rst_left', width: 20);
+
+    // Byte of the pixel word that goes out as byte number kbyte. The word
+    // is 0xWWRRGGBB, so B is byte 0, G is 1, R is 2 and W is 3.
+    const table = [
+      [1, 2, 0],
+      [2, 1, 0],
+      [0, 2, 1],
+      [2, 0, 1],
+      [1, 0, 2],
+      [0, 1, 2],
+    ];
+    final srcByte = Logic(name: 'src_byte', width: 2);
+    Combinational([
+      Case(
+        [order, kbyte].concat(),
+        [
+          for (var o = 0; o < 6; o++)
+            for (var k = 0; k < 3; k++)
+              CaseItem(Const(o * 4 + k, width: 5), [
+                srcByte < Const(table[o][k], width: 2),
+              ]),
+        ],
+        defaultItem: [srcByte < Const(3, width: 2)],
+      ),
+    ]);
+
+    final selBit = _pick([srcByte, bidx].concat(), [
+      for (var i = 0; i < 32; i++) word[i],
+    ]);
+
+    final lastByte = [Const(1), bpp].concat();
+    final nextPidx = pidx + 1;
+    final inH = phase.eq(phH);
+    final inL = phase.eq(phL);
+    final inReset = phase.eq(phReset);
+    final bigReset = rstLeft.getRange(15, 20).neq(0);
+    final chunk = mux(
+      bigReset,
+      Const(0x7FFF, width: 15),
+      rstLeft.getRange(0, 15),
+    );
+    final restAfter = mux(
+      bigReset,
+      rstLeft - Const(0x7FFF, width: 20),
+      Const(0, width: 20),
+    );
+
+    output('ready') <= active & (~inH | wordValid);
+    output('level') <= inH;
+    output('px_req') <= reqQ;
+    output('px_addr') <= pidx.getRange(0, pixelAddrWidth);
+    output('index') <= pidx;
+    output('dur') <=
+        mux(
+          inH,
+          mux(selBit, timing[2], timing[0]),
+          mux(
+            inL,
+            mux(curBit, timing[3], timing[1]),
+            mux(inReset, chunk, Const(0, width: 15)),
+          ),
+        );
+
+    final step = advance & active & (~inH | wordValid);
+    final lastBit = kbyte.eq(lastByte) & bidx.eq(0);
+    final clamped = mux(
+      count.gt(Const(maxPixels, width: cw)),
+      Const(maxPixels, width: cw),
+      count,
+    );
+
+    Sequential(clk, [
+      If(
+        reset,
+        then: [
+          active < 0,
+          wordValid < 0,
+          reqQ < 0,
+          tail < 0,
+          curBit < 0,
+          pidx < Const(0, width: cw),
+          cntQ < Const(0, width: cw),
+          kbyte < Const(0, width: 2),
+          bidx < Const(7, width: 3),
+          phase < Const(phEnd, width: 2),
+          word < Const(0, width: 32),
+          rstLeft < Const(0, width: 20),
+        ],
+        orElse: [
+          If(pxGrant, then: [reqQ < 0]),
+          If(pxValid, then: [word < pxData, wordValid < 1]),
+          If(
+            step,
+            then: [
+              Case(phase, [
+                CaseItem(Const(phH, width: 2), [
+                  curBit < selBit,
+                  phase < Const(phL, width: 2),
+                  If(
+                    lastBit,
+                    then: [
+                      If(
+                        nextPidx.neq(cntQ),
+                        then: [
+                          pidx < nextPidx,
+                          reqQ < 1,
+                          wordValid < 0,
+                          tail < 0,
+                        ],
+                        orElse: [tail < 1],
+                      ),
+                    ],
+                  ),
+                ]),
+                CaseItem(Const(phL, width: 2), [
+                  If(
+                    bidx.eq(0),
+                    then: [
+                      bidx < Const(7, width: 3),
+                      If(
+                        kbyte.eq(lastByte),
+                        then: [
+                          kbyte < Const(0, width: 2),
+                          phase < [tail, Const(0)].concat(),
+                        ],
+                        orElse: [
+                          kbyte < (kbyte + 1),
+                          phase < Const(phH, width: 2),
+                        ],
+                      ),
+                    ],
+                    orElse: [bidx < (bidx - 1), phase < Const(phH, width: 2)],
+                  ),
+                ]),
+                CaseItem(Const(phReset, width: 2), [
+                  rstLeft < restAfter,
+                  If(restAfter.eq(0), then: [phase < Const(phEnd, width: 2)]),
+                ]),
+              ]),
+            ],
+          ),
+          If(~busy, then: [active < 0, reqQ < 0]),
+          If(
+            start,
+            then: [
+              active < 1,
+              cntQ < clamped,
+              rstLeft < resetGap,
+              kbyte < Const(0, width: 2),
+              bidx < Const(7, width: 3),
+              pidx < Const(0, width: cw),
+              tail < 0,
+              wordValid < 0,
+              reqQ < clamped.neq(0),
+              phase < [clamped.eq(0), Const(0)].concat(),
             ],
           ),
         ],

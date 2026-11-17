@@ -89,13 +89,6 @@ void main() {
         ),
         throwsUnsupportedError,
       );
-      expect(
-        () => HarborLedEngine(
-          baseAddress: 0x1000,
-          ramKind: HarborLedRamKind.bram,
-        ),
-        throwsUnsupportedError,
-      );
     });
 
     test('maxPixels above 512 is rejected', () {
@@ -149,7 +142,7 @@ void main() {
       );
       expect(led.interrupt.width, equals(1));
       expect(led.frameTick.width, equals(2));
-      expect(led.status.width, equals(24));
+      expect(led.status.width, equals(32));
       expect(led.channelOut(1), hasLength(1));
       expect(led.dma, isNull);
     });
@@ -371,14 +364,14 @@ void registerTests(HarborFabricKind kind) {
       await writeItems([_it(1, 2), 0]);
       await bus.write(_reg(0, _ctrl), 1);
       await waitIdle();
-      expect(await bus.read(_irqStatus), equals(1));
+      expect(await bus.read(_irqStatus), equals(0x101));
       await clk.nextNegedge;
       expect(led.interrupt.value.toInt(), equals(0));
       await bus.write(_irqEnable, 1);
       await waitClk(2);
       await clk.nextNegedge;
       expect(led.interrupt.value.toInt(), equals(1));
-      await bus.write(_irqStatus, 1);
+      await bus.write(_irqStatus, 0x101);
       expect(await bus.read(_irqStatus), equals(0));
       await clk.nextNegedge;
       expect(led.interrupt.value.toInt(), equals(0));
@@ -415,19 +408,81 @@ void registerTests(HarborFabricKind kind) {
       await Simulator.endSimulation();
     });
 
-    test('a SEND while BUSY is ignored', () async {
+    test('a SEND while BUSY starts one more train when BUSY drops', () async {
       await setUpDut();
       await bus.write(_div, 1);
       await writeItems([_it(1, 20), _it(0, 5), 0]);
       await bus.write(_reg(0, _ctrl), 1);
       await waitClk(10);
       await bus.write(_reg(0, _ctrl), 1);
+      await waitClk(10);
+      await bus.write(_reg(0, _ctrl), 1);
       await waitIdle();
-      await waitClk(100);
-      expect(wave.pulses(1), hasLength(1));
-      expect(await bus.read(_reg(0, _status)) >> 16, equals(1));
+      await waitClk(200);
+      final high = wave.pulses(1);
+      expect(high.map((r) => r.length), equals([40, 40]));
+      expect(await bus.read(_reg(0, _status)) >> 16, equals(2));
       await Simulator.endSimulation();
     });
+
+    if (kind == HarborFabricKind.wishbone) {
+      for (final n in [2, 3, 6]) {
+        test('$n channels at the minimum: staggered starts keep the lowest '
+            'priority channel exact', () async {
+          await setUpDut(
+            channels: List.filled(n, const HarborLedChannelConfig.serial()),
+          );
+          final last = LedWave(clk, led.channelOut(n - 1).first);
+          final d = n + 1;
+          await writeItems([
+            for (var i = 0; i < 12; i++) _it((i + 1) & 1, d),
+            0,
+          ]);
+          Future<void> idleAll() async {
+            while (led.status.value.toInt() & ((1 << n) - 1) != 0) {
+              await clk.nextPosedge;
+            }
+          }
+
+          var runs = 0;
+          for (final order in [0, 1]) {
+            for (var delay = 0; delay < 2 * d + 2; delay++) {
+              await idleAll();
+              last.samples.clear();
+              await bus.write(_reg(n - 1, _loop), 1);
+              await bus.write(_reg(n - 1, _ctrl), 1);
+              await waitClk(delay);
+              if (order == 0) {
+                for (var c = 0; c < n - 1; c++) {
+                  await bus.write(_reg(c, _ctrl), 1);
+                }
+                await bus.read(_item(1));
+                await bus.read(_item(2));
+              } else {
+                await bus.read(_item(1));
+                for (var c = 0; c < n - 1; c++) {
+                  await bus.write(_reg(c, _ctrl), 1);
+                  await bus.read(_item(2));
+                }
+              }
+              await idleAll();
+              await waitClk(4);
+              final msg = 'order $order delay $delay';
+              expect(led.status.value.toInt() >> 16, equals(0), reason: msg);
+              expect(
+                last.pulses(1).map((r) => r.length),
+                everyElement(d),
+                reason: msg,
+              );
+              expect(last.pulses(1), hasLength(12), reason: msg);
+              runs++;
+            }
+          }
+          expect(runs, equals(2 * (2 * d + 2)));
+          await Simulator.endSimulation();
+        });
+      }
+    }
 
     test('the reserved RX space reads 0 and ignores writes', () async {
       await setUpDut();
@@ -493,7 +548,7 @@ void registerTests(HarborFabricKind kind) {
       await waitClk(120);
       expect(wave.pulses(1).map((r) => r.length), equals([8]));
       expect(wave1.pulses(1).map((r) => r.length), equals([12]));
-      expect(await bus.read(_irqStatus), equals(3));
+      expect(await bus.read(_irqStatus), equals(0x303));
       await Simulator.endSimulation();
     });
 
@@ -560,7 +615,7 @@ void registerTests(HarborFabricKind kind) {
     });
 
     test(
-      'a bus item read waits for a channel that reads every clock',
+      'a bus item read gets through a channel that reads every clock',
       () async {
         await setUpDut();
         final items = [_it(1, 1), _it(0, 1), _it(1, 1), _it(0, 1), 0];
@@ -568,12 +623,77 @@ void registerTests(HarborFabricKind kind) {
         await bus.write(_reg(0, _ctrl), 1);
         expect(await bus.read(_item(2)), equals(items[2]));
         await waitIdle();
-        await waitClk(10);
-        expect(wave.pulses(1).map((r) => r.length), equals([1, 1]));
-        expect(await bus.read(_reg(0, _status)) & 2, equals(0));
         await Simulator.endSimulation();
       },
     );
+
+    test(
+      'many bus item reads in a long duration 2 train keep it exact',
+      () async {
+        await setUpDut();
+        final items = [
+          for (var i = 0; i < 30; i++) ...[_it(1, 2), _it(0, 2)],
+          0,
+        ];
+        await writeItems(items);
+        await bus.write(_reg(0, _ctrl), 1);
+        var reads = 0;
+        while (led.status.value.toInt() & 1 == 1 || reads == 0) {
+          final i = (reads * 7) % items.length;
+          expect(await bus.read(_item(i)), equals(items[i]));
+          reads++;
+        }
+        await waitClk(10);
+        expect(reads, greaterThan(20));
+        final high = wave.pulses(1);
+        expect(high.map((r) => r.length), everyElement(2));
+        expect(high, hasLength(30));
+        for (var i = 1; i < high.length; i++) {
+          expect(high[i].start - high[i - 1].start, equals(4));
+        }
+        expect(await bus.read(_reg(0, _status)) & 2, equals(0));
+        expect(led.status.value.toInt() >> 16, equals(0));
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('6 channels at the minimum with bus item reads stay exact', () async {
+      await setUpDut(
+        channels: List.filled(6, const HarborLedChannelConfig.serial()),
+      );
+      final waves = [
+        wave,
+        for (var c = 1; c < 6; c++) LedWave(clk, led.channelOut(c).first),
+      ];
+      // 7 clocks per item is the minimum for 6 channels.
+      final items = [
+        for (var i = 0; i < 4; i++) ...[_it(1, 7), _it(0, 7)],
+        0,
+      ];
+      await writeItems(items);
+      for (var c = 0; c < 6; c++) {
+        await bus.write(_reg(c, _loop), 1);
+      }
+      for (var c = 0; c < 6; c++) {
+        await bus.write(_reg(c, _ctrl), 1);
+      }
+      var reads = 0;
+      while (led.status.value.toInt() & 0x3F != 0 || reads == 0) {
+        final i = reads % items.length;
+        expect(await bus.read(_item(i)), equals(items[i]));
+        reads++;
+      }
+      await waitClk(20);
+      expect(reads, greaterThan(10));
+      for (final w in waves) {
+        final high = w.pulses(1);
+        expect(high.map((r) => r.length), everyElement(7));
+        expect(high, hasLength(8));
+        expect(high[4].start - high[3].start, equals(14));
+      }
+      expect(led.status.value.toInt() >> 16, equals(0));
+      await Simulator.endSimulation();
+    });
 
     test('two channels with the same train give exact pulses', () async {
       await setUpDut(
@@ -600,7 +720,7 @@ void registerTests(HarborFabricKind kind) {
       await Simulator.endSimulation();
     });
 
-    test('UNDERRUN shows when two channels read every clock', () async {
+    test('UNDERRUN shows when a running channel loses its reads', () async {
       await setUpDut(
         channels: const [
           HarborLedChannelConfig.serial(),
@@ -608,13 +728,16 @@ void registerTests(HarborFabricKind kind) {
         ],
       );
       final wave1 = LedWave(clk, led.channelOut(1).first);
-      await writeItems([_it(1, 1), _it(0, 1), 0]);
-      await bus.write(_reg(0, _loop), 4);
-      await bus.write(_reg(1, _loop), 4);
-      await bus.write(_reg(1, _ctrl), 1);
+      await writeItems([_it(1, 2), _it(0, 2), 0]);
+      await writeItems([_it(1, 1), _it(0, 1), 0], at: 16);
+      await bus.write(_reg(0, _loop), 8);
+      await bus.write(_reg(1, _loop), 8);
+      await bus.write(_reg(1, _itemStart), 16);
       await bus.write(_reg(0, _ctrl), 1);
+      await bus.write(_reg(1, _ctrl), 1);
       await waitClk(100);
-      expect(wave.pulses(1).map((r) => r.length), equals([1, 1, 1, 1, 1]));
+      expect(wave.pulses(1).map((r) => r.length), everyElement(2));
+      expect(wave.pulses(1), hasLength(9));
       expect(wave1.pulses(1), isNotEmpty);
       expect(await bus.read(_reg(0, _status)) & 2, equals(0));
       expect(await bus.read(_reg(1, _status)) & 2, equals(2));
@@ -639,13 +762,24 @@ void registerTests(HarborFabricKind kind) {
       await Simulator.endSimulation();
     });
 
-    test('SEND with MODE=1 in the same write starts nothing', () async {
+    test('SEND with MODE=1 in the same write starts a pixel frame', () async {
       await setUpDut();
+      await writeItems([_it(1, 2), 0]);
+      await bus.write(_reg(0, 0x30), 5);
+      await bus.write(_reg(0, _ctrl), 3);
+      await waitIdle();
+      expect(await bus.read(_reg(0, _status)) >> 16, equals(1));
+      expect(await bus.read(_reg(0, _ctrl)), equals(2));
+      expect(wave.samples.every((v) => v == 0), isTrue);
+      await Simulator.endSimulation();
+    });
+
+    test('SEND with MODE=1 and no pixel source starts nothing', () async {
+      await setUpDut(pixelSource: HarborLedPixelSource.none);
       await writeItems([_it(1, 2), 0]);
       await bus.write(_reg(0, _ctrl), 3);
       await waitClk(20);
       expect(await bus.read(_reg(0, _status)), equals(0));
-      expect(await bus.read(_reg(0, _ctrl)), equals(2));
       expect(wave.samples.every((v) => v == 0), isTrue);
       await Simulator.endSimulation();
     });
@@ -704,9 +838,9 @@ void registerTests(HarborFabricKind kind) {
       await bus.write(_reg(0, _ctrl), 1);
       await waitIdle();
       await bus.write(_irqStatus, 0);
-      expect(await bus.read(_irqStatus), equals(1));
+      expect(await bus.read(_irqStatus), equals(0x101));
       await bus.write(_irqStatus, 0x2);
-      expect(await bus.read(_irqStatus), equals(1));
+      expect(await bus.read(_irqStatus), equals(0x101));
       await bus.write(_irqStatus, 0x100, sel: 0x2);
       expect(await bus.read(_irqStatus), equals(1));
       await bus.write(_irqStatus, 0x1, sel: 0x2);
@@ -725,7 +859,11 @@ void registerTests(HarborFabricKind kind) {
           await bus.write(_irqStatus, 1);
         }
         await waitClk(8);
-        expect(await bus.read(_irqStatus), equals(1), reason: 'delay $delay');
+        expect(
+          await bus.read(_irqStatus) & 1,
+          equals(1),
+          reason: 'delay $delay',
+        );
       }
       await Simulator.endSimulation();
     });
@@ -738,7 +876,7 @@ void registerTests(HarborFabricKind kind) {
       await waitIdle();
       await waitClk(10);
       expect(wave.samples.every((v) => v == 0), isTrue);
-      expect(await bus.read(_irqStatus), equals(1));
+      expect(await bus.read(_irqStatus) & 1, equals(1));
       expect(await bus.read(_reg(0, _status)) >> 16, equals(1));
       await Simulator.endSimulation();
     });

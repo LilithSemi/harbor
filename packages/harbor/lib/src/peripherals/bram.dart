@@ -1,5 +1,7 @@
 library;
 
+import 'dart:async';
+
 import 'package:rohd/rohd.dart';
 
 import '../soc/target.dart';
@@ -54,6 +56,11 @@ class HarborBram extends Module with SystemVerilog {
   /// model (and the required silicon behavior) is deterministic.
   final bool useFlops;
 
+  /// When true, every entry reads 0 until it is written, in simulation and
+  /// through an `initial` block in the emitted SystemVerilog. A flow that has
+  /// no memory initial value needs the entries written before they are read.
+  final bool zeroInit;
+
   /// Registered read data, one cycle behind [rd_addr] (readLatency == 1).
   Logic get rdData => output('rd_data');
 
@@ -67,13 +74,14 @@ class HarborBram extends Module with SystemVerilog {
     required Logic rdAddr,
     String? name,
     this.useFlops = false,
+    this.zeroInit = false,
   }) : addrWidth = (depth - 1).bitLength.clamp(1, 32),
        super(
          name: name ?? 'harbor_bram',
          // Distinct stable definition name per shape so the emitted SV file name
          // and the instantiation agree (two different-shaped RAMs are different
          // modules, same-shape RAMs dedupe to one).
-         definitionName: 'HarborBram_${width}x$depth',
+         definitionName: 'HarborBram_${width}x$depth${zeroInit ? '_z' : ''}',
          reserveDefinitionName: true,
        ) {
     final aw = addrWidth;
@@ -83,6 +91,32 @@ class HarborBram extends Module with SystemVerilog {
     wrData = addInput('wr_data', wrData, width: width);
     rdAddr = addInput('rd_addr', rdAddr, width: aw);
     final rd = addOutput('rd_data', width: width);
+
+    if (zeroInit) {
+      // A behavioral memory that starts at 0, with a registered read that
+      // gives the value from before the edge on a same-address write.
+      final zero = LogicValue.filled(width, LogicValue.zero);
+      final unknown = LogicValue.filled(width, LogicValue.x);
+      final mem = List<LogicValue>.filled(depth, zero);
+      rd.put(zero);
+      clk.posedge.listen((_) {
+        final ra = rdAddr.previousValue ?? rdAddr.value;
+        final next = ra.isValid && ra.toInt() < depth
+            ? mem[ra.toInt()]
+            : unknown;
+        final we = wrEn.previousValue ?? wrEn.value;
+        final wa = wrAddr.previousValue ?? wrAddr.value;
+        if (we == LogicValue.one && wa.isValid && wa.toInt() < depth) {
+          mem[wa.toInt()] = wrData.previousValue ?? wrData.value;
+        }
+        unawaited(
+          Simulator.clkStable.first
+              .then((_) => rd.put(next))
+              .catchError((_) {}, test: (e) => e is StateError),
+        );
+      });
+      return;
+    }
 
     // Replaced wholesale by [definitionVerilog] in synth, so these flops never
     // reach the netlist. They only give the Simulator a correct 1-cycle-latency
@@ -116,7 +150,7 @@ module $definitionType (
   // (readLatency == 1). yosys infers this as a block RAM (DP16KD on ECP5,
   // RAMB on Xilinx).
   logic [${width - 1}:0] mem [0:${depth - 1}];
-  always_ff @(posedge clk) begin
+${zeroInit ? "  initial for (int i = 0; i < $depth; i++) mem[i] = '0;\n" : ''}  always_ff @(posedge clk) begin
     if (wr_en) mem[wr_addr] <= wr_data;
     rd_data <= mem[rd_addr];
   end
