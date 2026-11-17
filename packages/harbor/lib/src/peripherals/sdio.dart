@@ -238,7 +238,8 @@ class HarborSdioConfig with HarborPrettyString {
 /// [3] data-CRC-error, [4] cmd-timeout, [5] write-error, [6] RX overrun,
 /// [7] ADMA error, [8] data timeout, [9] response CRC7 error, [10] response
 /// end bit or transmission bit error, [11] response index error. A response
-/// with one of these errors never sets cmd-done.
+/// with one of these errors never sets cmd-done. A driver must set CMD[12]
+/// and CMD[13] for an R3 command such as ACMD41, or bits 9 and 11 set.
 ///
 /// DMA: with CMD[10] set and CMD[11] clear, ADMA_ADDR is the buffer address
 /// and BLK_COUNT * BLK_SIZE is its length. With CMD[11] set, ADMA_ADDR points
