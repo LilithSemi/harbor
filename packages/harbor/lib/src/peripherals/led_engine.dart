@@ -5,6 +5,7 @@ import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
 import '../bus/port/reg_fifo.dart' show HarborFifoRam;
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
@@ -76,13 +77,20 @@ class HarborLedChannelConfig {
 ///   in the same write as MODE uses the new MODE. Without a pixel source,
 ///   SEND with MODE 1 does nothing.
 /// - 0x08 STATUS (RO): [0] BUSY, [1] UNDERRUN (set when the next item is not
-///   ready at a tick, cleared by SEND), [23:16] completed trains
+///   ready at a tick, cleared by SEND), [2] DMA_ERR (a pixel fetch got a bus
+///   error, cleared by SEND), [3] KIND (1 for pwm, 0 for serial), [4] STALL
+///   (a dma frame took no first item for stallClocks clocks, cleared by
+///   SEND, the frame goes on), [23:16]
+///   completed trains
 /// - 0x10 T0H, 0x18 T0L, 0x20 T1H, 0x28 T1L: 15 bits each
 /// - 0x30 RESET: 20 bits, the gap after the last pixel in ticks
 /// - 0x38 PIXEL_COUNT: bit width is the bit length of maxPixels. A value
 ///   above maxPixels sends maxPixels pixels. It is copied at SEND.
-/// - 0x40 BASE_LO and 0x48 BASE_HI: only the dma source has them, others
-///   read 0
+/// - 0x40 BASE_LO and 0x48 BASE_HI: the byte address of the first pixel word
+///   of the dma source. Only the dma source has them, others read 0 and
+///   ignore writes. BASE_LO bits 1:0 read 0. BASE_HI has the bits above 32
+///   and exists only when dmaAddressWidth is more than 32. Do not write them
+///   while BUSY.
 /// - 0x50 REFRESH: 32 bits, the period of an automatic SEND in clocks, 0 is
 ///   off. A write restarts the count, so the first frame starts one period
 ///   after the write. A frame that is due while BUSY starts when BUSY drops.
@@ -113,7 +121,28 @@ class HarborLedChannelConfig {
 /// pixels written before the first pixel SEND. A block RAM pays off only for
 /// a large pixel count: 512 pixels of 32 bits fill one block.
 ///
-/// All channels share one read port of the item RAM. A channel reads an item
+/// The dma source reads PIXEL_COUNT words from BASE in each pixel frame,
+/// through the master port `dma`. A read is a burst of up to 4 words inside
+/// an aligned block of 4 words, and it starts only when the 4 word FIFO of
+/// the channel has room for all its beats. The frame starts when the first
+/// word arrives. STALL is set when no first item was taken stallClocks clocks
+/// after the start. A later word that is not there in time gives UNDERRUN.
+/// On a shared Wishbone bus the fetch needs a grant hold cap
+/// (`maxGrantCycles` of buildFabric), or a master that keeps CYC high can
+/// keep the fetch off the bus. A bus
+/// error on a read sets DMA_ERR and the IRQ done bit, ends the frame, and the
+/// pin goes to its idle level. The engine only reads, and a pwm channel needs
+/// the ram source. A pixel RAM word is a pixel, so with the dma source the
+/// pixel window reads 0 and ignores writes. With a data width of more than 32
+/// bits, each beat is a 4 byte transfer.
+///
+/// A duty that changes during a PWM period gives one period with the wrong
+/// high time.
+///
+/// All channels share one read port of the item RAM, which exists only when
+/// a channel is serial. Without one the item window reads 0, ignores writes
+/// and INFO gives an item depth of 0. A serial pixel reader goes before a pwm
+/// load in the pixel RAM, because a pixel read has a deadline. A channel reads an item
 /// at most once per tick and the channels read in index order. A bus read of
 /// the item window waits one clock, then it goes before the channels. It
 /// takes a clock from the channels at most once in every channel count plus
@@ -139,6 +168,9 @@ class HarborLedEngine extends BridgeModule
   final int maxPixels;
   final HarborLedRamKind ramKind;
 
+  /// Clocks after which a dma frame that has taken no item sets STALL.
+  final int stallClocks;
+
   /// The clock in Hz, written to the DT and ACPI `clock-frequency` property.
   final int? clockHz;
 
@@ -153,12 +185,14 @@ class HarborLedEngine extends BridgeModule
   /// One clock high at each frame start, one bit per channel.
   Logic get frameTick => output('frame_tick');
 
-  /// Diagnostics, 32 bits: bit ch is BUSY, bit 8+ch is the frame tick and
-  /// bit 16+ch is UNDERRUN of channel ch. Bits 31 to 24 are 0.
+  /// Diagnostics, 40 bits: bit ch is BUSY, bit 8+ch is the frame tick, bit
+  /// 16+ch is UNDERRUN, bit 24+ch is DMA_ERR and bit 32+ch is STALL of
+  /// channel ch.
   Logic get status => output('led_status');
 
   /// The pixel read master, present only for the dma pixel source.
-  HarborMemoryMasterPort? get dma => null;
+  HarborMemoryMasterPort? get dma => _dma;
+  HarborMemoryMasterPort? _dma;
 
   late final List<List<Logic>> _channelOut;
 
@@ -177,12 +211,14 @@ class HarborLedEngine extends BridgeModule
     bool crossFabricClock = false,
     int dmaAddressWidth = 32,
     int dmaDataWidth = 32,
+    int busAddressWidth = 12,
+    this.stallClocks = 65536,
     String? name,
   }) : super(
          harborStableDefinitionName('HarborLedEngine', [
            ...BusSlavePort.definitionNameParts(
              kind: fabricKind,
-             addressWidth: 12,
+             addressWidth: busAddressWidth,
              dataWidth: 32,
              cross: crossFabricClock,
            ),
@@ -198,10 +234,26 @@ class HarborLedEngine extends BridgeModule
            'i$itemDepth',
            'p$maxPixels',
            pixelSource.name,
+           if (pixelSource == HarborLedPixelSource.dma) ...[
+             'a$dmaAddressWidth',
+             'd$dmaDataWidth',
+             's$stallClocks',
+           ],
            ramKind.name,
          ]),
          name: name ?? 'led_engine',
        ) {
+    if (stallClocks < 1 || stallClocks > 0xFFFFFF) {
+      throw ArgumentError(
+        'HarborLedEngine: stallClocks is from 1 to 16777215 (got $stallClocks).',
+      );
+    }
+    if (busAddressWidth < 12 || busAddressWidth > 64) {
+      throw ArgumentError(
+        'HarborLedEngine: busAddressWidth must be from 12 to 64 '
+        '(got $busAddressWidth).',
+      );
+    }
     if (channels.isEmpty || channels.length > maxChannels) {
       throw ArgumentError(
         'HarborLedEngine: 1 to $maxChannels channels are supported '
@@ -238,9 +290,13 @@ class HarborLedEngine extends BridgeModule
         );
       }
     }
-    if (pixelSource == HarborLedPixelSource.dma) {
-      throw UnsupportedError(
-        'HarborLedEngine: the dma source is not built yet.',
+    if (pixelSource == HarborLedPixelSource.dma &&
+        (dmaAddressWidth < 16 ||
+            dmaAddressWidth > 64 ||
+            ![32, 64, 128].contains(dmaDataWidth))) {
+      throw ArgumentError(
+        'HarborLedEngine: dmaAddressWidth is 16 to 64 and dmaDataWidth is 32, '
+        '64 or 128 (got $dmaAddressWidth and $dmaDataWidth).',
       );
     }
 
@@ -249,7 +305,7 @@ class HarborLedEngine extends BridgeModule
     createPort('reset', PortDirection.input);
     addOutput('interrupt');
     addOutput('frame_tick', width: n);
-    addOutput('led_status', width: 32);
+    addOutput('led_status', width: 40);
     _channelOut = [
       for (var ch = 0; ch < n; ch++)
         channels[ch].kind == HarborLedKind.pwm
@@ -260,24 +316,45 @@ class HarborLedEngine extends BridgeModule
             : [addOutput('led_ch$ch')],
     ];
 
+    final fabricClock = BusSlavePort.fabricClockInputs(
+      this,
+      cross: crossFabricClock,
+    );
     bus = BusSlavePort.create(
       module: this,
       name: 'bus',
       kind: fabricKind,
       clk: input('clk'),
       reset: input('reset'),
-      addressWidth: 12,
+      addressWidth: busAddressWidth,
       dataWidth: 32,
-      fabricClock: BusSlavePort.fabricClockInputs(
-        this,
-        cross: crossFabricClock,
-      ),
+      fabricClock: fabricClock,
     );
+    final hasDma = pixelSource == HarborLedPixelSource.dma;
+    final dmaPort = hasDma
+        ? HarborMemoryMasterPort.create(
+            module: this,
+            name: 'dma',
+            kind: fabricKind,
+            config: HarborMemoryWaistConfig(
+              addressWidth: dmaAddressWidth,
+              dataWidth: dmaDataWidth,
+              idWidth: 1,
+              outstanding: 1,
+            ),
+            clk: input('clk'),
+            reset: input('reset'),
+            fabricClock: fabricClock,
+          )
+        : null;
+    _dma = dmaPort;
 
     final clk = input('clk');
     final reset = bus.reset;
     final aw = itemDepth.bitLength - 1;
     final hasPixels = pixelSource == HarborLedPixelSource.ram;
+    final hasPixelSrc = hasPixels || hasDma;
+    final hasSerial = channels.any((c) => c.kind == HarborLedKind.serial);
     final isBram = hasPixels && ramKind == HarborLedRamKind.bram;
     final pixelAw = maxPixels > 1 ? (maxPixels - 1).bitLength : 1;
     final a = bus.addr;
@@ -368,6 +445,24 @@ class HarborLedEngine extends BridgeModule
     final pixelCount = [
       for (var c = 0; c < n; c++) serialReg(c, 'pxn', maxPixels.bitLength),
     ];
+    final dmaAw = hasDma ? dmaAddressWidth : 32;
+    final baseLoW = (dmaAw > 32 ? 32 : dmaAw) - 2;
+    final baseHiW = dmaAw - 32;
+    final baseLo = [
+      for (var c = 0; c < n; c++)
+        hasDma ? reg('ch${c}_base_lo', baseLoW) : Const(0, width: 30),
+    ];
+    final baseHi = [
+      for (var c = 0; c < n; c++)
+        hasDma && baseHiW > 0 ? reg('ch${c}_base_hi', baseHiW) : null,
+    ];
+    final dmaStall = [
+      for (var c = 0; c < n; c++)
+        hasDma ? reg('ch${c}_dma_stall', 1) : Const(0),
+    ];
+    final dmaErr = [
+      for (var c = 0; c < n; c++) hasDma ? reg('ch${c}_dma_err', 1) : Const(0),
+    ];
     final refresh = [for (var c = 0; c < n; c++) reg('ch${c}_refresh', 32)];
     final loop = [for (var c = 0; c < n; c++) serialReg(c, 'loop', 8)];
     final itemStart = [for (var c = 0; c < n; c++) serialReg(c, 'istart', aw)];
@@ -412,10 +507,11 @@ class HarborLedEngine extends BridgeModule
     final pxGrantQ = [for (var c = 0; c < n; c++) Logic(name: 'px_grant_q$c')];
     final pixelIndex = [
       for (var c = 0; c < n; c++)
-        hasPixels && !isPwm[c]
+        hasPixelSrc && !isPwm[c]
             ? Logic(name: 'pixel_index$c', width: maxPixels.bitLength)
             : Const(0, width: maxPixels.bitLength),
     ];
+    final abortW = [for (var c = 0; c < n; c++) Logic(name: 'dma_abort$c')];
     final chs = [
       for (var c = 0; c < n; c++)
         if (isPwm[c])
@@ -431,13 +527,14 @@ class HarborLedEngine extends BridgeModule
               idle: idle[c],
               itemStart: itemStart[c],
               loop: mux(modeNow[c], Const(0, width: 8), loop[c]),
-              ramData: hasPixels
+              ramData: hasPixelSrc
                   ? mux(runPixel[c], [expLevel[c], expDur[c]].concat(), ramData)
                   : ramData,
-              ramGrant: hasPixels
+              ramGrant: hasPixelSrc
                   ? mux(runPixel[c], expReady[c], itemGrant[c])
                   : itemGrant[c],
               pixel: runPixel[c],
+              abort: hasDma ? abortW[c] : Const(0),
               addrWidth: aw,
               activeLow: channels[c].activeLow,
               name: 'led_ch${c}_serial',
@@ -446,64 +543,85 @@ class HarborLedEngine extends BridgeModule
     ];
 
     final itemWindowOk = aw == 8 ? Const(1) : a.getRange(2 + aw, 10).eq(0);
-    final reqs = [
-      for (var c = 0; c < n; c++) chs[c].ramCritical & ~runPixel[c],
-    ];
-    final lowReqs = [
-      for (var c = 0; c < n; c++)
-        chs[c].ramReq & ~chs[c].ramCritical & ~runPixel[c],
-    ];
-    final anyReq = reqs.reduce((x, y) => x | y);
-    // A bus item read that waited one clock goes before the channels. After
-    // it took a clock from a channel, the channels go first for n clocks.
-    // The read of the first item of a train has no deadline and goes last.
     final busAged = Logic(name: 'bus_aged');
     final busCool = Logic(name: 'bus_cool', width: 3);
     final busItemRd = busRd & inItems;
-    final busWin = busItemRd & busAged & busCool.eq(0);
-    final itemLose = busItemRd & anyReq & ~busWin;
-    var arbAddr = chs[0].ramAddr;
-    for (var c = n - 1; c >= 0; c--) {
-      arbAddr = mux(reqs[c], chs[c].ramAddr, arbAddr);
+    Logic anyReq = Const(0);
+    Logic busWin = Const(0);
+    Logic itemLose = Const(0);
+    if (hasSerial) {
+      final reqs = [
+        for (var c = 0; c < n; c++) chs[c].ramCritical & ~runPixel[c],
+      ];
+      final lowReqs = [
+        for (var c = 0; c < n; c++)
+          chs[c].ramReq & ~chs[c].ramCritical & ~runPixel[c],
+      ];
+      anyReq = reqs.reduce((x, y) => x | y);
+      // A bus item read that waited one clock goes before the channels. After
+      // it took a clock from a channel, the channels go first for n clocks.
+      // The read of the first item of a train has no deadline and goes last.
+      busWin = busItemRd & busAged & busCool.eq(0);
+      itemLose = busItemRd & anyReq & ~busWin;
+      var arbAddr = chs[0].ramAddr;
+      for (var c = n - 1; c >= 0; c--) {
+        arbAddr = mux(reqs[c], chs[c].ramAddr, arbAddr);
+      }
+      var lowAddr = chs[0].ramAddr;
+      for (var c = n - 1; c >= 0; c--) {
+        lowAddr = mux(lowReqs[c], chs[c].ramAddr, lowAddr);
+      }
+      Logic noLower = ~busWin;
+      Logic noLowerLow = ~anyReq & ~busItemRd;
+      for (var c = 0; c < n; c++) {
+        itemGrant[c] <= (reqs[c] & noLower) | (lowReqs[c] & noLowerLow);
+        noLower = noLower & ~reqs[c];
+        noLowerLow = noLowerLow & ~lowReqs[c];
+      }
+      final itemRam = HarborFifoRam(
+        name: 'item_ram',
+        clk: clk,
+        wrEn:
+            busWr &
+            inItems &
+            itemWindowOk &
+            bus.selAny(0, 1) &
+            bus.selAny(1, 1),
+        wrAddr: a.getRange(2, 2 + aw),
+        wrData: bus.dataIn.getRange(0, 16),
+        rdAddr: mux(
+          anyReq & ~busWin,
+          arbAddr,
+          mux(busItemRd, a.getRange(2, 2 + aw), lowAddr),
+        ),
+        depth: itemDepth,
+        zeroInit: true,
+      );
+      ramData <= itemRam.rdData;
+    } else {
+      ramData <= Const(0, width: 16);
     }
-    var lowAddr = chs[0].ramAddr;
-    for (var c = n - 1; c >= 0; c--) {
-      lowAddr = mux(lowReqs[c], chs[c].ramAddr, lowAddr);
-    }
-    Logic noLower = ~busWin;
-    Logic noLowerLow = ~anyReq & ~busItemRd;
-    for (var c = 0; c < n; c++) {
-      itemGrant[c] <= (reqs[c] & noLower) | (lowReqs[c] & noLowerLow);
-      noLower = noLower & ~reqs[c];
-      noLowerLow = noLowerLow & ~lowReqs[c];
-    }
-    final itemRam = HarborFifoRam(
-      name: 'item_ram',
-      clk: clk,
-      wrEn:
-          busWr & inItems & itemWindowOk & bus.selAny(0, 1) & bus.selAny(1, 1),
-      wrAddr: a.getRange(2, 2 + aw),
-      wrData: bus.dataIn.getRange(0, 16),
-      rdAddr: mux(
-        anyReq & ~busWin,
-        arbAddr,
-        mux(busItemRd, a.getRange(2, 2 + aw), lowAddr),
-      ),
-      depth: itemDepth,
-      zeroInit: true,
-    );
-    ramData <= itemRam.rdData;
 
-    // Pixel RAM. The expanders, the pwm banks and the bus share its read
-    // port.
+    // The pixel source: the pixel RAM, or the fetch of the dma source. The
+    // expanders, the pwm banks and the bus share the read port of the RAM. A
+    // serial expander goes before a pwm load, because a pixel read of an
+    // expander has a deadline and a pwm load has none.
     final banks = List<HarborLedPwmBank?>.filled(n, null);
+    final dmaWord = [
+      for (var c = 0; c < n; c++) Logic(name: 'dma_word$c', width: 32),
+    ];
+    final dmaGrant = [for (var c = 0; c < n; c++) Logic(name: 'dma_grant$c')];
+    final dmaPop = [for (var c = 0; c < n; c++) Logic(name: 'dma_pop$c')];
+    final dmaTotal = [
+      for (var c = 0; c < n; c++)
+        Logic(name: 'dma_total$c', width: maxPixels.bitLength),
+    ];
+    final dmaBeat = Logic(name: 'dma_beat');
+    final dmaAccept = [for (var c = 0; c < n; c++) Logic(name: 'dma_acc$c')];
+    final dmaRvalid = [for (var c = 0; c < n; c++) Logic(name: 'dma_rv$c')];
     Logic pixelRead = Const(0, width: 32);
     Logic pixelLose = Const(0);
-    if (hasPixels) {
-      final pixelWindowOk = maxPixels >= 512
-          ? Const(1)
-          : a.getRange(2, 11).lt(Const(maxPixels, width: 9));
-      final pixelIdx = a.getRange(2, 2 + pixelAw);
+    if (hasPixelSrc) {
       final expanders = <HarborLedPixelExpander?>[
         for (var c = 0; c < n; c++)
           isPwm[c]
@@ -519,9 +637,11 @@ class HarborLedEngine extends BridgeModule
                   timing: timing[c],
                   resetGap: resetGap[c],
                   count: pixelCount[c],
-                  pxData: pixelRdData,
-                  pxGrant: pxGrant[c],
-                  pxValid: isBram ? pxGrantQ[c] : pxGrant[c],
+                  pxData: hasDma ? dmaWord[c] : pixelRdData,
+                  pxGrant: hasDma ? dmaGrant[c] : pxGrant[c],
+                  pxValid: hasDma
+                      ? dmaGrant[c]
+                      : (isBram ? pxGrantQ[c] : pxGrant[c]),
                   maxPixels: maxPixels,
                   pixelAddrWidth: pixelAw,
                   name: 'led_ch${c}_pixels',
@@ -554,69 +674,234 @@ class HarborLedEngine extends BridgeModule
           expDur[c] <= e.dur;
           expReady[c] <= e.ready;
           pixelIndex[c] <= e.index;
+          dmaPop[c] <= e.pxReq;
+          dmaTotal[c] <= e.total;
         }
       }
-      final pxReqs = [
-        for (var c = 0; c < n; c++)
-          isPwm[c] ? banks[c]!.pxReq : expanders[c]!.pxReq,
-      ];
-      final pxAddrs = [
-        for (var c = 0; c < n; c++)
-          isPwm[c] ? banks[c]!.pxAddr : expanders[c]!.pxAddr,
-      ];
-      final anyPxReq = pxReqs.reduce((x, y) => x | y);
-      var pxAddr = pxAddrs[0];
-      for (var c = n - 1; c >= 0; c--) {
-        pxAddr = mux(pxReqs[c], pxAddrs[c], pxAddr);
+      if (hasDma) {
+        final mem = dmaPort!.waist;
+        final chBits = n > 1 ? (n - 1).bitLength : 1;
+        final ownValid = Logic(name: 'dma_own_valid');
+        final sent = Logic(name: 'dma_sent');
+        final own = Logic(name: 'dma_own', width: chBits);
+        final ownIs = [
+          for (var c = 0; c < n; c++)
+            ownValid & own.eq(Const(c, width: chBits)),
+        ];
+        final fetches = [
+          for (var c = 0; c < n; c++)
+            HarborLedDmaFetch(
+              clk: clk,
+              reset: reset,
+              start: startNow[c] & modeNow[c],
+              total: dmaTotal[c],
+              base: baseHi[c] == null
+                  ? baseLo[c]
+                  : [baseHi[c]!, baseLo[c]].concat(),
+              accepted: dmaAccept[c],
+              rvalid: dmaRvalid[c],
+              rdata: mem.rdataData,
+              rerr: mem.rdataErr,
+              rlast: mem.rdataLast,
+              popReq: dmaPop[c],
+              addressWidth: dmaAddressWidth,
+              dataWidth: dmaDataWidth,
+              maxPixels: maxPixels,
+              name: 'led_ch${c}_fetch',
+            ),
+        ];
+        Logic pickOwn(List<Logic> v) {
+          var r = v[0];
+          for (var c = 1; c < n; c++) {
+            r = mux(own.eq(Const(c, width: chBits)), v[c], r);
+          }
+          return r;
+        }
+
+        final reqs = [for (final f in fetches) f.req];
+        final reqAny = reqs.reduce((x, y) => x | y);
+        // The next owner is the first requester after the last owner.
+        Logic pickFrom(int o) {
+          Logic r = Const(o, width: chBits);
+          for (var k = n; k >= 1; k--) {
+            final c = (o + k) % n;
+            r = mux(reqs[c], Const(c, width: chBits), r);
+          }
+          return r;
+        }
+
+        Logic pickNext = pickFrom(0);
+        for (var o = 1; o < n; o++) {
+          pickNext = mux(
+            own.eq(Const(o, width: chBits)),
+            pickFrom(o),
+            pickNext,
+          );
+        }
+        final ownReq = pickOwn(reqs);
+        final handshake = mem.reqValid & mem.reqReady;
+        mem.reqValid <= ownValid & ~sent & ownReq;
+        mem.reqId <= Const(0, width: mem.config.idWidth);
+        mem.reqWrite <= Const(0);
+        mem.reqAddr <= pickOwn([for (final f in fetches) f.reqAddr]);
+        mem.reqLen <=
+            [
+              Const(0, width: HarborMemoryWaistConfig.lenWidth - 2),
+              pickOwn([for (final f in fetches) f.reqLen]),
+            ].concat();
+        mem.reqSize <= Const(2, width: HarborMemoryWaistConfig.sizeWidth);
+        mem.reqBurst <=
+            Const(
+              HarborMemoryBurst.incr.value,
+              width: HarborMemoryWaistConfig.burstWidth,
+            );
+        mem.reqExclusive <= Const(0);
+        mem.wdataValid <= Const(0);
+        mem.wdataData <= Const(0, width: mem.config.dataWidth);
+        mem.wdataStrb <= Const(0, width: mem.config.strbWidth);
+        mem.wdataLast <= Const(0);
+        mem.rdataReady <= ownValid & sent;
+        mem.wrespReady <= Const(0);
+        dmaBeat <= mem.rdataValid & mem.rdataReady;
+        for (var c = 0; c < n; c++) {
+          dmaAccept[c] <= handshake & ownIs[c];
+          dmaRvalid[c] <= dmaBeat & ownIs[c];
+          dmaWord[c] <= fetches[c].word;
+          dmaGrant[c] <= fetches[c].grant;
+          abortW[c] <= fetches[c].abort;
+        }
+        // A frame whose first item is not taken after stallClocks clocks sets
+        // STALL. The frame goes on.
+        final sw = stallClocks.bitLength;
+        final stallCnt = [
+          for (var c = 0; c < n; c++) Logic(name: 'dma_stall_cnt$c', width: sw),
+        ];
+        final stallArmed = [
+          for (var c = 0; c < n; c++) Logic(name: 'dma_stall_armed$c'),
+        ];
+        for (var c = 0; c < n; c++) {
+          final hit =
+              stallArmed[c] & stallCnt[c].eq(Const(stallClocks, width: sw));
+          Sequential(clk, [
+            If(
+              reset,
+              then: [
+                stallCnt[c] < Const(0, width: sw),
+                stallArmed[c] < 0,
+                dmaStall[c] < 0,
+              ],
+              orElse: [
+                If(
+                  ~chs[c].busy | chs[c].started | hit,
+                  then: [stallArmed[c] < 0],
+                  orElse: [stallCnt[c] < (stallCnt[c] + 1)],
+                ),
+                If(hit, then: [dmaStall[c] < 1]),
+                If(
+                  startNow[c] & modeNow[c],
+                  then: [
+                    stallArmed[c] < 1,
+                    stallCnt[c] < Const(0, width: sw),
+                    dmaStall[c] < 0,
+                  ],
+                ),
+              ],
+            ),
+          ]);
+        }
+        Sequential(clk, [
+          If(
+            reset,
+            then: [
+              ownValid < 0,
+              sent < 0,
+              own < Const(0, width: chBits),
+            ],
+            orElse: [
+              If(
+                ~ownValid & reqAny,
+                then: [ownValid < 1, own < pickNext, sent < 0],
+              ),
+              If(ownValid & ~sent & ~ownReq, then: [ownValid < 0]),
+              If(handshake, then: [sent < 1]),
+              If(dmaBeat & mem.rdataLast, then: [ownValid < 0, sent < 0]),
+            ],
+          ),
+        ]);
       }
-      Logic pxNoLower = Const(1);
-      for (var c = 0; c < n; c++) {
-        pxGrant[c] <= pxReqs[c] & pxNoLower;
-        pxNoLower = pxNoLower & ~pxReqs[c];
-      }
-      pixelLose = (busRd | busWr) & inPixels & anyPxReq;
-      final pixelRdAddr = mux(anyPxReq, pxAddr, pixelIdx);
-      final pixelWrEn = accessStart & ~pixelLose & bus.we & inPixels;
-      if (isBram) {
-        final pixelRam = HarborBram(
-          clk,
-          name: 'pixel_ram',
-          width: 32,
-          depth: maxPixels,
-          wrEn:
-              ~reset &
-              pixelWrEn &
-              pixelWindowOk &
-              bus.selAny(0, 1) &
-              bus.selAny(1, 1) &
-              bus.selAny(2, 1) &
-              bus.selAny(3, 1),
-          wrAddr: pixelIdx,
-          wrData: bus.dataIn,
-          rdAddr: pixelRdAddr,
-          zeroInit: true,
+      if (hasPixels) {
+        final pixelWindowOk = maxPixels >= 512
+            ? Const(1)
+            : a.getRange(2, 11).lt(Const(maxPixels, width: 9));
+        final pixelIdx = a.getRange(2, 2 + pixelAw);
+        final prio = [
+          for (var c = 0; c < n; c++)
+            if (!isPwm[c]) c,
+          for (var c = 0; c < n; c++)
+            if (isPwm[c]) c,
+        ];
+        final pxReqs = [
+          for (var c = 0; c < n; c++)
+            isPwm[c] ? banks[c]!.pxReq : expanders[c]!.pxReq,
+        ];
+        final pxAddrs = [
+          for (var c = 0; c < n; c++)
+            isPwm[c] ? banks[c]!.pxAddr : expanders[c]!.pxAddr,
+        ];
+        final anyPxReq = pxReqs.reduce((x, y) => x | y);
+        var pxAddr = pxAddrs[prio.first];
+        for (var i = n - 1; i >= 0; i--) {
+          pxAddr = mux(pxReqs[prio[i]], pxAddrs[prio[i]], pxAddr);
+        }
+        Logic pxNoLower = Const(1);
+        for (final c in prio) {
+          pxGrant[c] <= pxReqs[c] & pxNoLower;
+          pxNoLower = pxNoLower & ~pxReqs[c];
+        }
+        pixelLose = (busRd | busWr) & inPixels & anyPxReq;
+        final pixelRdAddr = mux(anyPxReq, pxAddr, pixelIdx);
+        final pixelWrEn = accessStart & ~pixelLose & bus.we & inPixels;
+        if (isBram) {
+          final pixelRam = HarborBram(
+            clk,
+            name: 'pixel_ram',
+            width: 32,
+            depth: maxPixels,
+            wrEn:
+                ~reset &
+                pixelWrEn &
+                pixelWindowOk &
+                bus.selAny(0, 1) &
+                bus.selAny(1, 1) &
+                bus.selAny(2, 1) &
+                bus.selAny(3, 1),
+            wrAddr: pixelIdx,
+            wrData: bus.dataIn,
+            rdAddr: pixelRdAddr,
+            zeroInit: true,
+          );
+          pixelRdData <= pixelRam.rdData;
+        } else {
+          final pixelOld = Logic(name: 'pixel_old', width: 32);
+          final pixelRam = HarborFifoRam(
+            name: 'pixel_ram',
+            clk: clk,
+            wrEn: pixelWrEn & pixelWindowOk & bus.selAny(0, 4),
+            wrAddr: pixelIdx,
+            wrData: bus.selMerge(pixelOld, 0),
+            rdAddr: pixelRdAddr,
+            depth: maxPixels,
+            zeroInit: true,
+          );
+          pixelOld <= pixelRam.rdData;
+          pixelRdData <= pixelRam.rdData;
+        }
+        pixelRead = mux(
+          inPixels & pixelWindowOk,
+          pixelRdData,
+          Const(0, width: 32),
         );
-        pixelRdData <= pixelRam.rdData;
-      } else {
-        final pixelOld = Logic(name: 'pixel_old', width: 32);
-        final pixelRam = HarborFifoRam(
-          name: 'pixel_ram',
-          clk: clk,
-          wrEn: pixelWrEn & pixelWindowOk & bus.selAny(0, 4),
-          wrAddr: pixelIdx,
-          wrData: bus.selMerge(pixelOld, 0),
-          rdAddr: pixelRdAddr,
-          depth: maxPixels,
-          zeroInit: true,
-        );
-        pixelOld <= pixelRam.rdData;
-        pixelRdData <= pixelRam.rdData;
       }
-      pixelRead = mux(
-        inPixels & pixelWindowOk,
-        pixelRdData,
-        Const(0, width: 32),
-      );
     }
     final busStall = itemLose | pixelLose;
 
@@ -681,13 +966,27 @@ class HarborLedEngine extends BridgeModule
       // MODE and SEND are taken from the same write.
       final ctrlWr = busWr & ctrlHit & bus.selAny(0x00, 1);
       modeNow[c] <= (isPwm[c] ? Const(1) : mux(ctrlWr, bus.dataIn[1], mode[c]));
-      final startOk = hasPixels ? Const(1) : ~modeNow[c];
+      final startOk = hasPixelSrc ? Const(1) : ~modeNow[c];
       startNow[c] <=
           ((ctrlWr & bus.dataIn[0]) | refreshDue[c]) & ~chs[c].busy & startOk;
       sendBusy[c] <= ctrlWr & bus.dataIn[0] & chs[c].busy & startOk;
       refreshRestart[c] <= busWr & chanHit(c, 10) & bus.selAny(0x50, 4);
       wr(chanHit(c, 10), refresh[c], 0x50);
       if (isPwm[c]) continue;
+      if (hasDma) {
+        writes.add(
+          If(
+            busWr & chanHit(c, 8) & bus.selAny(0x40, 4),
+            then: [
+              baseLo[c] <
+                  bus
+                      .selMerge([baseLo[c], Const(0, width: 2)].concat(), 0x40)
+                      .getRange(2, baseLoW + 2),
+            ],
+          ),
+        );
+        if (baseHi[c] != null) wr(chanHit(c, 9), baseHi[c]!, 0x48);
+      }
       for (var k = 0; k < 4; k++) {
         wr(chanHit(c, 2 + k), timing[c][k], 0x10 + 8 * k);
       }
@@ -702,7 +1001,7 @@ class HarborLedEngine extends BridgeModule
       0: [
         Const(n, width: 4),
         Const(pixelSource.index, width: 4),
-        Const(aw, width: 8),
+        Const(hasSerial ? aw : 0, width: 8),
         Const(_pixelCountInfo, width: 12),
         Const(0, width: 4),
       ].rconcat(),
@@ -713,7 +1012,9 @@ class HarborLedEngine extends BridgeModule
     Logic gate(Logic hit, Logic v) => mux(hit, v, Const(0, width: 32));
     final reads = <Logic>[
       gate(globalSel, globalRead),
-      gate(inItems & itemWindowOk, ramData.zeroExtend(32)),
+      hasSerial
+          ? gate(inItems & itemWindowOk, ramData.zeroExtend(32))
+          : Const(0, width: 32),
       pixelRead,
     ];
     for (var c = 0; c < n; c++) {
@@ -731,13 +1032,18 @@ class HarborLedEngine extends BridgeModule
         1: [
           chs[c].busy,
           chs[c].underrun,
-          Const(0, width: 14),
+          dmaErr[c],
+          Const(isPwm[c] ? 1 : 0),
+          dmaStall[c],
+          Const(0, width: 11),
           chs[c].frameCount,
           Const(0, width: 8),
         ].rconcat(),
         for (var k = 0; k < 4; k++) 2 + k: timing[c][k],
         6: resetGap[c],
         7: pixelCount[c],
+        if (hasDma) 8: [baseLo[c], Const(0, width: 2)].concat(),
+        if (baseHi[c] != null) 9: baseHi[c]!,
         10: refresh[c],
         11: loop[c],
         12: itemStart[c],
@@ -772,16 +1078,20 @@ class HarborLedEngine extends BridgeModule
               loop[c] < Const(0, width: 8),
               itemStart[c] < Const(0, width: aw),
             ],
+            if (hasDma) ...[
+              baseLo[c] < Const(0, width: baseLoW),
+              if (baseHi[c] != null) baseHi[c]! < Const(0, width: baseHiW),
+              dmaErr[c] < 0,
+            ],
           ],
           bus.ack < Const(0),
           bus.dataOut < Const(0, width: 32),
           pxPend < 0,
-          busAged < 0,
-          busCool < Const(0, width: 3),
+          if (hasSerial) ...[busAged < 0, busCool < Const(0, width: 3)],
           for (var c = 0; c < n; c++) ...[
             if (!isPwm[c]) runPixel[c] < 0,
             ftQ[c] < 0,
-            pxGrantQ[c] < 0,
+            if (hasPixels) pxGrantQ[c] < 0,
             refreshCnt[c] < Const(0, width: 32),
             refreshDue[c] < 0,
           ],
@@ -791,18 +1101,24 @@ class HarborLedEngine extends BridgeModule
           ...writes,
           bus.ack < Const(0),
           bus.dataOut < Const(0, width: 32),
-          busAged < itemLose,
-          If(
-            busWin & anyReq,
-            then: [busCool < Const(n, width: 3)],
-            orElse: [
-              If(busCool.neq(0), then: [busCool < (busCool - 1)]),
-            ],
-          ),
+          if (hasSerial) ...[
+            busAged < itemLose,
+            If(
+              busWin & anyReq,
+              then: [busCool < Const(n, width: 3)],
+              orElse: [
+                If(busCool.neq(0), then: [busCool < (busCool - 1)]),
+              ],
+            ),
+          ],
           pxPend < 0,
           for (var c = 0; c < n; c++) ...[
             ftQ[c] < startNow[c],
-            pxGrantQ[c] < pxGrant[c],
+            if (hasPixels) pxGrantQ[c] < pxGrant[c],
+            if (hasDma && !isPwm[c]) ...[
+              If(startNow[c], then: [dmaErr[c] < 0]),
+              If(abortW[c], then: [dmaErr[c] < 1]),
+            ],
             if (!isPwm[c]) If(startNow[c], then: [runPixel[c] < modeNow[c]]),
             If(startNow[c], then: [refreshDue[c] < 0]),
             If(sendBusy[c], then: [refreshDue[c] < 1]),
@@ -844,13 +1160,14 @@ class HarborLedEngine extends BridgeModule
     output('frame_tick') <= bitsOf(ftQ);
     output('led_status') <=
         [
-          for (var b = 0; b < 32; b++)
+          for (var b = 0; b < 40; b++)
             b % 8 < n
                 ? switch (b ~/ 8) {
                     0 => chs[b % 8].busy,
                     1 => ftQ[b % 8],
                     2 => chs[b % 8].underrun,
-                    _ => Const(0),
+                    3 => dmaErr[b % 8],
+                    _ => dmaStall[b % 8],
                   }
                 : Const(0),
         ].rconcat();
@@ -907,6 +1224,7 @@ class _ChSignals {
   final Logic done;
   final Logic underrun;
   final Logic ramReq;
+  final Logic started;
   final Logic ramCritical;
   final Logic fetched;
   final Logic ramAddr;
@@ -919,6 +1237,7 @@ class _ChSignals {
       done = ch.done,
       underrun = ch.underrun,
       ramReq = ch.ramReq,
+      started = ch.started,
       ramCritical = ch.ramCritical,
       fetched = ch.fetched,
       ramAddr = ch.ramAddr,
@@ -932,6 +1251,7 @@ class _ChSignals {
       done = Logic(name: 'ch${c}_pwm_done'),
       underrun = Const(0),
       ramReq = Const(0),
+      started = Const(0),
       ramCritical = Const(0),
       fetched = Const(0),
       ramAddr = Const(0, width: addrWidth),

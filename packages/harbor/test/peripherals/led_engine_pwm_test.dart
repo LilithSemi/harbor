@@ -79,8 +79,8 @@ class _Dut {
     }
   }
 
-  Future<void> waitIdle({int ch = 0}) async {
-    for (var i = 0; i < 400; i++) {
+  Future<void> waitIdle({int ch = 0, int polls = 400}) async {
+    for (var i = 0; i < polls; i++) {
       if ((await bus.read(_reg(ch, _status)) & 1) == 0) return;
     }
     fail('the frame did not end');
@@ -239,7 +239,7 @@ void registerOther() {
       expect(ticks, equals(1));
       expect(d.led.interrupt.value.toInt(), equals(1));
       expect(await d.bus.read(_irqStatus) & 1, equals(1));
-      expect(await d.bus.read(_reg(0, _status)), equals(1 << 16));
+      expect(await d.bus.read(_reg(0, _status)), equals((1 << 16) | 8));
       await Simulator.endSimulation();
     });
 
@@ -299,6 +299,97 @@ void registerOther() {
           bits.sublist(i, i + 8).fold(0, (v, b) => v << 1 | b),
       ], equals([0, 0, 0x80, 0, 0, 0xFF, 0, 0x20, 1]));
       expect((await d.highs()).sublist(1), equals(_duties));
+      await Simulator.endSimulation();
+    });
+
+    test('STATUS KIND is 1 for a pwm channel and 0 for a serial one', () async {
+      await d.setUp(
+        channels: [
+          const HarborLedChannelConfig.serial(),
+          const HarborLedChannelConfig.pwm(_pins),
+        ],
+      );
+      expect(await d.bus.read(_reg(0, _status)) & 8, equals(0));
+      expect(await d.bus.read(_reg(1, _status)) & 8, equals(8));
+      await Simulator.endSimulation();
+    });
+
+    test('without a serial channel the item window is empty', () async {
+      await d.setUp(channels: [const HarborLedChannelConfig.pwm(_pins)]);
+      expect((await d.bus.read(0x000) >> 8) & 0xFF, equals(0));
+      await d.bus.write(0x400, 0x8005);
+      expect(await d.bus.read(0x400), equals(0));
+      await d.writePixels();
+      await d.bus.write(_reg(0, _ctrl), 1);
+      await d.waitIdle();
+      expect(await d.highs(), equals(_duties));
+      await Simulator.endSimulation();
+      await Simulator.reset();
+      await d.setUp(
+        channels: [
+          const HarborLedChannelConfig.serial(),
+          const HarborLedChannelConfig.pwm(_pins),
+        ],
+      );
+      expect((await d.bus.read(0x000) >> 8) & 0xFF, equals(6));
+      await d.bus.write(0x400, 0x8005);
+      expect(await d.bus.read(0x400), equals(0x8005));
+      await Simulator.endSimulation();
+    });
+
+    test('pwm loads do not make a serial channel underrun', () async {
+      final wide = [
+        for (var i = 0; i < 16; i++) HarborLedPin(i, HarborLedByte.b),
+      ];
+      await d.setUp(
+        channels: [
+          HarborLedChannelConfig.pwm(wide),
+          HarborLedChannelConfig.pwm(wide),
+          const HarborLedChannelConfig.serial(),
+        ],
+        maxPixels: 16,
+      );
+      final pixels = [for (var i = 0; i < 16; i++) 0x00010203 * (i + 1)];
+      for (var i = 0; i < 16; i++) {
+        await d.bus.write(_pixel(i), pixels[i]);
+      }
+      await d.bus.write(_reg(0, _refresh), 40);
+      await d.bus.write(_reg(1, _refresh), 41);
+      await d.bus.write(_reg(2, 0x10), 1);
+      await d.bus.write(_reg(2, 0x18), 2);
+      await d.bus.write(_reg(2, 0x20), 2);
+      await d.bus.write(_reg(2, 0x28), 1);
+      await d.bus.write(_reg(2, 0x30), 4);
+      await d.bus.write(_reg(2, 0x38), 16);
+      final serial = d.waves.last;
+      serial.samples.clear();
+      await d.bus.write(_reg(2, _ctrl), 3);
+      await d.waitIdle(ch: 2, polls: 3000);
+      await d.waitClk(4);
+      expect(
+        await d.bus.read(_reg(2, _status)) & 2,
+        equals(0),
+        reason: 'UNDERRUN',
+      );
+      expect(d.led.status.value.toInt() >> 16, equals(0));
+      final bits = [
+        for (final r in ledPulses(serial.samples, 1)) r.length >= 2 ? 1 : 0,
+      ];
+      expect(bits, hasLength(16 * 24));
+      expect(
+        [
+          for (var i = 0; i < bits.length; i += 8)
+            bits.sublist(i, i + 8).fold(0, (v, b) => v << 1 | b),
+        ],
+        equals([
+          for (final p in pixels) ...[
+            (p >> 8) & 0xFF,
+            (p >> 16) & 0xFF,
+            p & 0xFF,
+          ],
+        ]),
+      );
+      expect(await d.bus.read(_reg(0, _status)) >> 16, greaterThan(8));
       await Simulator.endSimulation();
     });
 

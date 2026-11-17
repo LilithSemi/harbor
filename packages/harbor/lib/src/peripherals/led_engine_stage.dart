@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
+import '../bus/port/reg_fifo.dart' show HarborFifoRam;
 import 'led_engine.dart' show HarborLedByte, HarborLedPin;
 
 /// One serial channel of the LED engine: the item reader, the output stage
@@ -19,7 +20,8 @@ import 'led_engine.dart' show HarborLedByte, HarborLedPin;
 /// `underrun` goes high until the next SEND.
 ///
 /// With `pixel` high, the items come from a pixel expander and the item
-/// address is not used.
+/// address is not used. A pulse on `abort` ends the train at once, and the
+/// pin goes to its idle level. It sets `done` and does not count a train.
 class HarborLedSerialChannel extends Module {
   final int addrWidth;
 
@@ -32,6 +34,9 @@ class HarborLedSerialChannel extends Module {
   /// High from a missed item until the next SEND.
   Logic get underrun => output('underrun');
   Logic get ramReq => output('ram_req');
+
+  /// High from the first item of a train until the train ends.
+  Logic get started => output('started');
 
   /// High with `ram_req` when the item is needed to keep the train exact.
   /// It is low for the read of the first item, which has no deadline.
@@ -59,6 +64,7 @@ class HarborLedSerialChannel extends Module {
     required Logic ramData,
     required Logic ramGrant,
     required Logic pixel,
+    required Logic abort,
     required this.addrWidth,
     required bool activeLow,
     super.name = 'led_serial_channel',
@@ -79,7 +85,9 @@ class HarborLedSerialChannel extends Module {
     ramData = addInput('ram_data', ramData, width: 16);
     ramGrant = addInput('ram_grant', ramGrant);
     pixel = addInput('pixel', pixel);
+    abort = addInput('abort', abort);
     addOutput('pin');
+    addOutput('started');
     addOutput('busy');
     addOutput('done');
     addOutput('underrun');
@@ -134,6 +142,7 @@ class HarborLedSerialChannel extends Module {
 
     output('pin') <= pinQ;
     output('busy') <= busy;
+    output('started') <= started;
     output('done') <= doneQ;
     output('underrun') <= underrunQ;
     output('ram_req') <= fetchReq;
@@ -257,6 +266,16 @@ class HarborLedSerialChannel extends Module {
             ],
           ),
           If(
+            abort & busy,
+            then: [
+              busy < 0,
+              started < 0,
+              curActive < 0,
+              pfValid < 0,
+              doneQ < 1,
+            ],
+          ),
+          If(
             send & ~busy,
             then: [
               busy < 1,
@@ -316,6 +335,9 @@ class HarborLedPixelExpander extends Module {
   /// The index of the pixel that is sent.
   Logic get index => output('index');
 
+  /// The pixel count of the frame, after the clamp to the pixel RAM size.
+  Logic get total => output('total');
+
   HarborLedPixelExpander({
     required Logic clk,
     required Logic reset,
@@ -361,6 +383,7 @@ class HarborLedPixelExpander extends Module {
     addOutput('px_req');
     addOutput('px_addr', width: pixelAddrWidth);
     addOutput('index', width: cw);
+    addOutput('total', width: cw);
 
     const phH = 0, phL = 1, phReset = 2, phEnd = 3;
     final active = Logic(name: 'active');
@@ -427,6 +450,7 @@ class HarborLedPixelExpander extends Module {
     output('px_req') <= reqQ;
     output('px_addr') <= pidx.getRange(0, pixelAddrWidth);
     output('index') <= pidx;
+    output('total') <= cntQ;
     output('dur') <=
         mux(
           inH,
@@ -682,6 +706,209 @@ class HarborLedPwmBank extends Module {
               busyQ < 1,
               reqActive < 1,
               reqIdx < Const(0, width: iw),
+            ],
+          ),
+        ],
+      ),
+    ]);
+  }
+}
+
+/// The pixel fetch of one serial channel with a DMA source.
+///
+/// A frame reads `total` words from `base`, one per pixel, in bursts of at
+/// most 4 beats. A burst stays inside an aligned block of 4 words, so it
+/// never crosses a 4 KiB boundary. A burst is asked for only when the FIFO of
+/// 4 words has room for all its beats. The engine joins the requests of its
+/// channels to one master port. It pulses `accepted` when the port takes the
+/// request, and gives the beats of the burst with `rvalid`, `rdata`, `rerr`
+/// and `rlast`.
+///
+/// A beat with `rerr` ends the frame: `abort` goes high for one clock and
+/// the fetch stops. The rest of that burst is dropped. A new frame waits for
+/// it to end.
+///
+/// The expander takes the oldest word with `pop_req` and `grant`. `word` is
+/// valid in the clock of `grant`. The beats are 4 byte transfers, so on a
+/// wider bus the word is the lane that the address selects.
+class HarborLedDmaFetch extends Module {
+  static const int depth = 4;
+
+  final int addressWidth;
+  final int dataWidth;
+
+  /// High while a request waits for the master port.
+  Logic get req => output('req');
+
+  /// Beats of the request minus one.
+  Logic get reqLen => output('req_len');
+
+  /// The byte address of the request.
+  Logic get reqAddr => output('req_addr');
+  Logic get grant => output('grant');
+  Logic get word => output('word');
+
+  /// One clock high at the first beat with an error.
+  Logic get abort => output('abort');
+
+  HarborLedDmaFetch({
+    required Logic clk,
+    required Logic reset,
+    required Logic start,
+    required Logic total,
+    required Logic base,
+    required Logic accepted,
+    required Logic rvalid,
+    required Logic rdata,
+    required Logic rerr,
+    required Logic rlast,
+    required Logic popReq,
+    required this.addressWidth,
+    required this.dataWidth,
+    required int maxPixels,
+    super.name = 'led_dma_fetch',
+  }) : super(
+         definitionName:
+             'HarborLedDmaFetch_a${addressWidth}_d${dataWidth}_p$maxPixels',
+         reserveDefinitionName: true,
+       ) {
+    final wordAw = addressWidth - 2;
+    final cw = total.width;
+    final lw = (dataWidth ~/ 32).bitLength - 1;
+    clk = addInput('clk', clk);
+    reset = addInput('reset', reset);
+    start = addInput('start', start);
+    total = addInput('total', total, width: cw);
+    base = addInput('base', base, width: wordAw);
+    accepted = addInput('accepted', accepted);
+    rvalid = addInput('rvalid', rvalid);
+    rdata = addInput('rdata', rdata, width: dataWidth);
+    rerr = addInput('rerr', rerr);
+    rlast = addInput('rlast', rlast);
+    popReq = addInput('pop_req', popReq);
+    addOutput('req');
+    addOutput('req_len', width: 2);
+    addOutput('req_addr', width: addressWidth);
+    addOutput('grant');
+    addOutput('word', width: 32);
+    addOutput('abort');
+
+    final active = Logic(name: 'active');
+    final reqPend = Logic(name: 'req_pend');
+    final inflight = Logic(name: 'inflight');
+    final stale = Logic(name: 'stale');
+    final lenQ = Logic(name: 'len_q', width: 2);
+    final pending = Logic(name: 'pending', width: 3);
+    final cnt = Logic(name: 'cnt', width: 3);
+    final wr = Logic(name: 'wr', width: 2);
+    final rd = Logic(name: 'rd', width: 2);
+    final off = Logic(name: 'off', width: cw);
+    final rptr = lw > 0 ? Logic(name: 'rptr', width: lw) : Const(0);
+
+    final wa = base + off.zeroExtend(wordAw);
+    final remaining = total - off;
+    final free = Const(depth, width: 3) - cnt - pending;
+    final align = Const(4, width: 3) - wa.getRange(0, 2).zeroExtend(3);
+    final remWide = cw >= 3 ? remaining : remaining.zeroExtend(3);
+    final remClamp = mux(
+      remWide.gte(Const(4, width: remWide.width)),
+      Const(4, width: 3),
+      remWide.getRange(0, 3),
+    );
+    Logic least(Logic a, Logic b) => mux(a.lt(b), a, b);
+    final len = least(least(align, free), remClamp);
+    final issue =
+        active & ~start & ~reqPend & ~inflight & remaining.neq(0) & free.neq(0);
+
+    final live = rvalid & active & ~stale;
+    final push = live & ~rerr;
+    final errNow = live & rerr;
+    final grantW = popReq & active & cnt.neq(0);
+
+    final ram = HarborFifoRam(
+      name: 'fetch_ram',
+      clk: clk,
+      wrEn: push,
+      wrAddr: wr,
+      wrData: lw > 0
+          ? _pick(rptr, [
+              for (var i = 0; i < dataWidth ~/ 32; i++)
+                rdata.getRange(32 * i, 32 * i + 32),
+            ])
+          : rdata,
+      rdAddr: rd,
+      depth: depth,
+      zeroInit: true,
+    );
+
+    output('req') <= reqPend;
+    output('req_len') <= lenQ;
+    output('req_addr') <= [wa, Const(0, width: 2)].concat();
+    output('grant') <= grantW;
+    output('word') <= ram.rdData;
+    output('abort') <= errNow;
+
+    Sequential(clk, [
+      If(
+        reset,
+        then: [
+          active < 0,
+          reqPend < 0,
+          inflight < 0,
+          stale < 0,
+          lenQ < Const(0, width: 2),
+          pending < Const(0, width: 3),
+          cnt < Const(0, width: 3),
+          wr < Const(0, width: 2),
+          rd < Const(0, width: 2),
+          off < Const(0, width: cw),
+          if (lw > 0) rptr < Const(0, width: lw),
+        ],
+        orElse: [
+          If(
+            issue,
+            then: [
+              reqPend < 1,
+              lenQ < (len - 1).getRange(0, 2),
+              pending < (pending + len),
+            ],
+            orElse: [
+              If(live, then: [pending < (pending - 1)]),
+            ],
+          ),
+          If(
+            accepted,
+            then: [
+              reqPend < 0,
+              inflight < 1,
+              off < (off + lenQ.zeroExtend(cw) + 1),
+            ],
+          ),
+          If(rvalid & rlast, then: [inflight < 0, stale < 0]),
+          if (lw > 0) If(live, then: [rptr < (rptr + 1)]),
+          If(push, then: [wr < (wr + 1)]),
+          If(grantW, then: [rd < (rd + 1)]),
+          cnt < (cnt + push.zeroExtend(3) - grantW.zeroExtend(3)),
+          If(
+            errNow,
+            then: [
+              active < 0,
+              reqPend < 0,
+              pending < Const(0, width: 3),
+              If(~rlast, then: [stale < 1]),
+            ],
+          ),
+          If(
+            start,
+            then: [
+              active < 1,
+              reqPend < 0,
+              pending < Const(0, width: 3),
+              cnt < Const(0, width: 3),
+              wr < Const(0, width: 2),
+              rd < Const(0, width: 2),
+              off < Const(0, width: cw),
+              if (lw > 0) rptr < base.getRange(0, lw),
             ],
           ),
         ],

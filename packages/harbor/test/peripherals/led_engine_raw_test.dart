@@ -72,16 +72,6 @@ void main() {
       );
     });
 
-    test('the dma source throws UnsupportedError', () {
-      expect(
-        () => HarborLedEngine(
-          baseAddress: 0x1000,
-          pixelSource: HarborLedPixelSource.dma,
-        ),
-        throwsUnsupportedError,
-      );
-    });
-
     test('maxPixels above 512 is rejected', () {
       expect(
         () => HarborLedEngine(baseAddress: 0x1000, maxPixels: 513),
@@ -133,7 +123,7 @@ void main() {
       );
       expect(led.interrupt.width, equals(1));
       expect(led.frameTick.width, equals(2));
-      expect(led.status.width, equals(32));
+      expect(led.status.width, equals(40));
       expect(led.channelOut(1), hasLength(1));
       expect(led.dma, isNull);
     });
