@@ -37,6 +37,8 @@
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 
 #define HARBOR_SD_CTRL	     0x00
 #define HARBOR_SD_STATUS     0x08
@@ -50,6 +52,10 @@
 #define HARBOR_SD_INT_STATUS 0x60
 #define HARBOR_SD_INT_ENABLE 0x68
 #define HARBOR_SD_ADMA_ADDR  0x70
+#define HARBOR_SD_DATA_TMO_REG 0x78
+#define HARBOR_SD_ADMA_ERR   0x80
+#define HARBOR_SD_ADMA_ERR_ADDR 0x88
+#define HARBOR_SD_DIAG	     0x90
 
 #define HARBOR_SD_CTRL_ENABLE	   BIT(0)
 #define HARBOR_SD_CTRL_WIDTH_SHIFT 4
@@ -137,6 +143,7 @@ struct harbor_sd {
 	u32 ctrl_fixed;		     /* CTRL bits the driver leaves as found */
 	struct harbor_sd_desc *desc; /* descriptor table (coherent) */
 	dma_addr_t desc_dma;
+	struct dentry *dbg;
 };
 
 static void harbor_sd_write_ctrl(struct harbor_sd *hs, u32 ctrl)
@@ -445,6 +452,58 @@ static const struct mmc_host_ops harbor_sd_ops = {
     .get_cd = harbor_sd_get_cd,
 };
 
+/*
+ * Reading DATA pops the PIO holding register, so the dump skips it. The slots
+ * sit 8 bytes apart.
+ */
+static const struct {
+	unsigned int off;
+	const char *name;
+} harbor_sd_regs[] = {
+    {HARBOR_SD_CTRL, "CTRL"},
+    {HARBOR_SD_STATUS, "STATUS"},
+    {HARBOR_SD_CLK_DIV, "CLK_DIV"},
+    {HARBOR_SD_CMD, "CMD"},
+    {HARBOR_SD_CMD_ARG, "CMD_ARG"},
+    {HARBOR_SD_RESP(0), "RESP0"},
+    {HARBOR_SD_RESP(1), "RESP1"},
+    {HARBOR_SD_RESP(2), "RESP2"},
+    {HARBOR_SD_RESP(3), "RESP3"},
+    {HARBOR_SD_DATA, "DATA"},
+    {HARBOR_SD_BLK_SIZE, "BLK_SIZE"},
+    {HARBOR_SD_BLK_COUNT, "BLK_COUNT"},
+    {HARBOR_SD_INT_STATUS, "INT_STATUS"},
+    {HARBOR_SD_INT_ENABLE, "INT_ENABLE"},
+    {HARBOR_SD_ADMA_ADDR, "ADMA_ADDR"},
+    {HARBOR_SD_DATA_TMO_REG, "DATA_TIMEOUT"},
+    {HARBOR_SD_ADMA_ERR, "ADMA_ERR"},
+    {HARBOR_SD_ADMA_ERR_ADDR, "ADMA_ERR_ADDR"},
+    {HARBOR_SD_DIAG, "DIAG"},
+};
+
+static struct dentry *harbor_sd_debugfs;
+
+static int harbor_sd_regs_show(struct seq_file *s, void *unused)
+{
+	struct harbor_sd *hs = s->private;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(harbor_sd_regs); i++) {
+		unsigned int off = harbor_sd_regs[i].off;
+
+		if (off == HARBOR_SD_DATA)
+			seq_printf(s, "0x%02x %-13s (not read)\n", off,
+				   harbor_sd_regs[i].name);
+		else
+			seq_printf(s, "0x%02x %-13s 0x%08x\n", off,
+				   harbor_sd_regs[i].name,
+				   readl(hs->base + off));
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(harbor_sd_regs);
+
 static int harbor_sd_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -592,6 +651,9 @@ static int harbor_sd_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_free_dma;
 
+	hs->dbg = debugfs_create_dir(dev_name(dev), harbor_sd_debugfs);
+	debugfs_create_file("regs", 0444, hs->dbg, hs, &harbor_sd_regs_fops);
+
 	return 0;
 
 err_free_dma:
@@ -606,6 +668,7 @@ static void harbor_sd_remove(struct platform_device *pdev)
 {
 	struct harbor_sd *hs = platform_get_drvdata(pdev);
 
+	debugfs_remove_recursive(hs->dbg);
 	mmc_remove_host(hs->mmc);
 	harbor_sd_write_ctrl(hs, 0);
 	dma_free_coherent(hs->dev, HARBOR_SD_MAX_SEGS * sizeof(*hs->desc),
@@ -630,7 +693,26 @@ static struct platform_driver harbor_sd_driver = {
 	    .of_match_table = harbor_sd_of_match,
 	},
 };
-module_platform_driver(harbor_sd_driver);
+
+static int __init harbor_sd_init(void)
+{
+	int ret;
+
+	harbor_sd_debugfs = debugfs_create_dir("harbor_sdio", NULL);
+	ret = platform_driver_register(&harbor_sd_driver);
+	if (ret)
+		debugfs_remove(harbor_sd_debugfs);
+
+	return ret;
+}
+module_init(harbor_sd_init);
+
+static void __exit harbor_sd_exit(void)
+{
+	platform_driver_unregister(&harbor_sd_driver);
+	debugfs_remove(harbor_sd_debugfs);
+}
+module_exit(harbor_sd_exit);
 
 MODULE_AUTHOR("Lilith Semiconductor");
 MODULE_DESCRIPTION("Harbor SD/SDIO/eMMC host controller driver");
