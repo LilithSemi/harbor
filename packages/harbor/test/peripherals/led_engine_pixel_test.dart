@@ -309,6 +309,19 @@ void registerTests(HarborFabricKind kind) {
       }
     }
 
+    test('STATE follows the mode of the frame and not the MODE bit', () async {
+      await setUpDut();
+      for (final (i, item) in [0x8003, 0x0002, 0x8001, 0x0000].indexed) {
+        await bus.write(0x400 + 4 * i, item);
+      }
+      await bus.write(_reg(0, _ctrl), 1);
+      await waitIdle();
+      expect(await bus.read(_reg(0, 0x68)), equals(2));
+      await bus.write(_reg(0, _ctrl), 2);
+      expect(await bus.read(_reg(0, 0x68)), equals(2));
+      await Simulator.endSimulation();
+    });
+
     test('REFRESH starts frames at the period and ticks the frame', () async {
       await setUpDut();
       await fastTimings();

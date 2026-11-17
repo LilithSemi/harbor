@@ -84,6 +84,9 @@ class HarborBram extends Module with SystemVerilog {
          definitionName: 'HarborBram_${width}x$depth${zeroInit ? '_z' : ''}',
          reserveDefinitionName: true,
        ) {
+    if (zeroInit && useFlops) {
+      throw ArgumentError('HarborBram: zeroInit and useFlops are exclusive.');
+    }
     final aw = addrWidth;
     clk = addInput('clk', clk);
     wrEn = addInput('wr_en', wrEn);

@@ -1,4 +1,20 @@
+import '../peripherals/led_engine.dart';
 import 'target.dart';
+
+/// The LEDs that one channel of a `HarborLedEngine` drives on a board.
+class HarborBoardLedChannel {
+  /// The channel kind and pin map.
+  final HarborLedChannelConfig config;
+
+  /// The pin catalog name of each pin of [config], in the order of its pin
+  /// map.
+  final List<String> pins;
+
+  const HarborBoardLedChannel(this.config, this.pins);
+
+  /// The pixel count that the channel needs.
+  int get pixels => config.pixelsUsed;
+}
 
 /// A physical FPGA board: a named bundle of the vendor part, the on-board
 /// oscillator, a catalog of usable pins, and how to program it.
@@ -79,6 +95,10 @@ class HarborBoard {
   /// gives a buffer that was not necessary.
   final Set<String> clockCapableSites;
 
+  /// The user LEDs as channels of a `HarborLedEngine`, with the pin catalog
+  /// name of each pin. Empty for a board that has no preset.
+  final List<HarborBoardLedChannel> ledChannels;
+
   const HarborBoard({
     required this.name,
     required this.vendor,
@@ -93,6 +113,7 @@ class HarborBoard {
     this.clockNPortName,
     String? speedGrade,
     this.clockCapableSites = const {},
+    this.ledChannels = const [],
   }) : speedGrade =
            speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1');
 
@@ -177,6 +198,7 @@ class HarborBoard {
     clockNPortName: clockNPortName,
     speedGrade: grade,
     clockCapableSites: clockCapableSites,
+    ledChannels: ledChannels,
   );
 
   String get _vendorPrefix => switch (vendor) {
@@ -395,6 +417,31 @@ const _ulx3s85f = HarborBoard(
   },
   // openFPGALoader knows the ULX3S. Loads the bitstream over USB.
   progCommand: 'openFPGALoader -b ulx3s \$(TOP).bit',
+  // Eight active high LEDs, each one a plain LED on its own pixel.
+  ledChannels: [
+    HarborBoardLedChannel(
+      HarborLedChannelConfig.pwm([
+        HarborLedPin(0, HarborLedByte.b),
+        HarborLedPin(1, HarborLedByte.b),
+        HarborLedPin(2, HarborLedByte.b),
+        HarborLedPin(3, HarborLedByte.b),
+        HarborLedPin(4, HarborLedByte.b),
+        HarborLedPin(5, HarborLedByte.b),
+        HarborLedPin(6, HarborLedByte.b),
+        HarborLedPin(7, HarborLedByte.b),
+      ]),
+      [
+        'led[0]',
+        'led[1]',
+        'led[2]',
+        'led[3]',
+        'led[4]',
+        'led[5]',
+        'led[6]',
+        'led[7]',
+      ],
+    ),
+  ],
 );
 
 /// OrangeCrab r0.2 with the Lattice ECP5 LFE5U-25F (CSFBGA285), 48 MHz oscillator.
@@ -656,6 +703,22 @@ const _artyS7_50 = HarborBoard(
     'gpdi_dn[1]': 'P18 LVCMOS33', // green -, header pin 2
     'gpdi_dn[2]': 'P17 LVCMOS33', // red -, header pin 1
     'gpdi_dn[3]': 'T18 LVCMOS33', // clock -, header pin 4
+    // User LEDs. Sites from the Digilent Arty-S7-50 master XDC. The LiteX
+    // digilent_arty_s7 platform gives the same sites. Both are bank 15,
+    // LVCMOS33. The reference manual says the four plain LEDs are anode
+    // connected and light on a logic high, and that the RGB LED inputs drive
+    // a transistor that inverts, so a logic high lights the RGB LED too. All
+    // ten pins are active high. The XDC names led[0] to led[3] LD2 to LD5.
+    'led[0]': 'E18 LVCMOS33',
+    'led[1]': 'F13 LVCMOS33',
+    'led[2]': 'E13 LVCMOS33',
+    'led[3]': 'H15 LVCMOS33',
+    'led0_r': 'J15 LVCMOS33',
+    'led0_g': 'G17 LVCMOS33',
+    'led0_b': 'F15 LVCMOS33',
+    'led1_r': 'E15 LVCMOS33',
+    'led1_g': 'F18 LVCMOS33',
+    'led1_b': 'E14 LVCMOS33',
     // DDR3L (Micron MT41K128M16, 256 MB, x16). Address a[13:0] gives 14 row
     // lines. Lane 0 is DM0/DQS0 with DQ[7:0], lane 1 is DM1/DQS1 with
     // DQ[15:8], in litex site order.
@@ -732,6 +795,36 @@ const _artyS7_50 = HarborBoard(
       'sck': 'T18 LVCMOS33',
     },
   },
+  // Four plain LEDs on pixels 0 to 3 and two RGB LEDs on pixels 4 and 5, all
+  // active high.
+  ledChannels: [
+    HarborBoardLedChannel(
+      HarborLedChannelConfig.pwm([
+        HarborLedPin(0, HarborLedByte.b),
+        HarborLedPin(1, HarborLedByte.b),
+        HarborLedPin(2, HarborLedByte.b),
+        HarborLedPin(3, HarborLedByte.b),
+        HarborLedPin(4, HarborLedByte.r),
+        HarborLedPin(4, HarborLedByte.g),
+        HarborLedPin(4, HarborLedByte.b),
+        HarborLedPin(5, HarborLedByte.r),
+        HarborLedPin(5, HarborLedByte.g),
+        HarborLedPin(5, HarborLedByte.b),
+      ]),
+      [
+        'led[0]',
+        'led[1]',
+        'led[2]',
+        'led[3]',
+        'led0_r',
+        'led0_g',
+        'led0_b',
+        'led1_r',
+        'led1_g',
+        'led1_b',
+      ],
+    ),
+  ],
 );
 
 /// Alinx AX7203 with the Xilinx Artix-7 XC7A200T-2FBG484I, 200 MHz
@@ -1296,4 +1389,29 @@ const _kc705 = HarborBoard(
   // SYSCLK_P (AD12), PHY_RXCLK (U27) and PHY_TXCLK (M28) are MRCC or SRCC
   // balls in the package pin file.
   clockCapableSites: {'AD12', 'U27', 'M28'},
+  // Eight active high LEDs, each one a plain LED on its own pixel.
+  ledChannels: [
+    HarborBoardLedChannel(
+      HarborLedChannelConfig.pwm([
+        HarborLedPin(0, HarborLedByte.b),
+        HarborLedPin(1, HarborLedByte.b),
+        HarborLedPin(2, HarborLedByte.b),
+        HarborLedPin(3, HarborLedByte.b),
+        HarborLedPin(4, HarborLedByte.b),
+        HarborLedPin(5, HarborLedByte.b),
+        HarborLedPin(6, HarborLedByte.b),
+        HarborLedPin(7, HarborLedByte.b),
+      ]),
+      [
+        'led[0]',
+        'led[1]',
+        'led[2]',
+        'led[3]',
+        'led[4]',
+        'led[5]',
+        'led[6]',
+        'led[7]',
+      ],
+    ),
+  ],
 );

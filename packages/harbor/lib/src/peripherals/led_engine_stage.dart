@@ -1,5 +1,8 @@
 import 'package:rohd/rohd.dart';
 
+import '../arith/fpu_config.dart' show harborStableDefinitionName;
+import 'led_engine.dart' show HarborLedByte, HarborLedPin;
+
 /// One serial channel of the LED engine: the item reader, the output stage
 /// and the frame control for a raw pulse train.
 ///
@@ -527,6 +530,158 @@ class HarborLedPixelExpander extends Module {
               wordValid < 0,
               reqQ < clamped.neq(0),
               phase < [clamped.eq(0), Const(0)].concat(),
+            ],
+          ),
+        ],
+      ),
+    ]);
+  }
+}
+
+/// The PWM bank of one channel.
+///
+/// Each pin has an 8-bit duty register and a compare against the shared
+/// `counter`. A pin is high while the counter is below its duty, so a duty
+/// of d gives d ticks high in the 256 ticks of the counter.
+///
+/// `start` loads the duties. The bank asks for the pixel of one pin in each
+/// clock with `px_req` and `px_addr`. The word is taken in the clock in which
+/// `px_valid` is high, which is the clock of `px_grant` for a RAM with an
+/// asynchronous read and the next one when `registeredRead` is set.
+/// `done` is high for one clock when the last duty is loaded.
+class HarborLedPwmBank extends Module {
+  final List<HarborLedPin> pwmPins;
+  final int pixelAddrWidth;
+
+  /// One bit per pin, in the order of the pin map.
+  Logic get pins => output('pins');
+  Logic get busy => output('busy');
+  Logic get done => output('done');
+
+  /// Completed frames, 8 bits.
+  Logic get frameCount => output('frame_count');
+  Logic get pxReq => output('px_req');
+  Logic get pxAddr => output('px_addr');
+
+  HarborLedPwmBank({
+    required Logic clk,
+    required Logic reset,
+    required Logic start,
+    required Logic polarity,
+    required Logic counter,
+    required Logic pxData,
+    required Logic pxGrant,
+    required Logic pxValid,
+    required this.pwmPins,
+    required this.pixelAddrWidth,
+    required bool registeredRead,
+    required bool activeLow,
+    super.name = 'led_pwm_bank',
+  }) : super(
+         definitionName: harborStableDefinitionName('HarborLedPwmBank', [
+           for (final p in pwmPins) '${p.pixel}${p.byte.name}',
+           'a$pixelAddrWidth',
+           registeredRead ? 'q' : 'c',
+           activeLow ? 'l' : 'h',
+         ]),
+         reserveDefinitionName: true,
+       ) {
+    final p = pwmPins.length;
+    final iw = p > 1 ? (p - 1).bitLength : 1;
+    clk = addInput('clk', clk);
+    reset = addInput('reset', reset);
+    start = addInput('start', start);
+    polarity = addInput('polarity', polarity);
+    counter = addInput('counter', counter, width: 8);
+    pxData = addInput('px_data', pxData, width: 32);
+    pxGrant = addInput('px_grant', pxGrant);
+    pxValid = addInput('px_valid', pxValid);
+    addOutput('pins', width: p);
+    addOutput('busy');
+    addOutput('done');
+    addOutput('frame_count', width: 8);
+    addOutput('px_req');
+    addOutput('px_addr', width: pixelAddrWidth);
+
+    final busyQ = Logic(name: 'busy_q');
+    final reqActive = Logic(name: 'req_active');
+    final reqIdx = Logic(name: 'req_idx', width: iw);
+    final grantIdx = Logic(name: 'grant_idx', width: iw);
+    final doneQ = Logic(name: 'done_q');
+    final frames = Logic(name: 'frames', width: 8);
+    final duty = [for (var i = 0; i < p; i++) Logic(name: 'duty$i', width: 8)];
+    final pinQ = [for (var i = 0; i < p; i++) Logic(name: 'pin_q$i')];
+
+    // The byte lanes of the pixel word 0xWWRRGGBB.
+    int lane(HarborLedByte b) => switch (b) {
+      HarborLedByte.b => 0,
+      HarborLedByte.g => 1,
+      HarborLedByte.r => 2,
+      HarborLedByte.w => 3,
+    };
+
+    final target = registeredRead ? grantIdx : reqIdx;
+    output('pins') <= (p == 1 ? pinQ[0] : pinQ.rconcat());
+    output('busy') <= busyQ;
+    output('done') <= doneQ;
+    output('frame_count') <= frames;
+    output('px_req') <= reqActive;
+    output('px_addr') <=
+        _pick(reqIdx, [
+          for (final pin in pwmPins) Const(pin.pixel, width: pixelAddrWidth),
+        ]);
+
+    Sequential(clk, [
+      If(
+        reset,
+        then: [
+          busyQ < 0,
+          reqActive < 0,
+          reqIdx < Const(0, width: iw),
+          grantIdx < Const(0, width: iw),
+          doneQ < 0,
+          frames < Const(0, width: 8),
+          for (var i = 0; i < p; i++) ...[
+            duty[i] < Const(0, width: 8),
+            pinQ[i] < Const(activeLow ? 1 : 0),
+          ],
+        ],
+        orElse: [
+          doneQ < 0,
+          for (var i = 0; i < p; i++) ...[
+            pinQ[i] < (counter.lt(duty[i]) ^ polarity),
+            If(
+              pxValid & target.eq(Const(i, width: iw)),
+              then: [
+                duty[i] <
+                    pxData.getRange(
+                      8 * lane(pwmPins[i].byte),
+                      8 * lane(pwmPins[i].byte) + 8,
+                    ),
+              ],
+            ),
+          ],
+          If(
+            pxGrant,
+            then: [
+              grantIdx < reqIdx,
+              If(
+                reqIdx.eq(Const(p - 1, width: iw)),
+                then: [reqActive < 0],
+                orElse: [reqIdx < (reqIdx + 1)],
+              ),
+            ],
+          ),
+          If(
+            pxValid & target.eq(Const(p - 1, width: iw)),
+            then: [busyQ < 0, doneQ < 1, frames < (frames + 1)],
+          ),
+          If(
+            start,
+            then: [
+              busyQ < 1,
+              reqActive < 1,
+              reqIdx < Const(0, width: iw),
             ],
           ),
         ],

@@ -72,16 +72,7 @@ void main() {
       );
     });
 
-    test('options that are not built throw UnsupportedError', () {
-      expect(
-        () => HarborLedEngine(
-          baseAddress: 0x1000,
-          channels: const [
-            HarborLedChannelConfig.pwm([HarborLedPin(0, HarborLedByte.b)]),
-          ],
-        ),
-        throwsUnsupportedError,
-      );
+    test('the dma source throws UnsupportedError', () {
       expect(
         () => HarborLedEngine(
           baseAddress: 0x1000,
