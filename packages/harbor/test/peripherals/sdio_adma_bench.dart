@@ -9,6 +9,7 @@ import 'package:test/test.dart';
 import '../bus/port/memory_harness.dart';
 import '../bus/port/port_harness.dart';
 import '../util/reg_bus.dart';
+import '../util/sd_cmd_probe.dart';
 
 const admaCtrl = 0x00;
 const admaStatus = 0x08;
@@ -150,6 +151,7 @@ class AdmaProbe {
 }
 
 class AdmaBench {
+  final cmdProbe = SdCmdProbe();
   final HarborFabricKind kind;
   final int dataWidth;
 
@@ -392,7 +394,10 @@ class AdmaBench {
     var prevHigh = top.output('sd_clk').value.toInt() == 1;
     for (var i = 0; i < 4000000; i++) {
       await clk.nextPosedge;
-      final sending = top.output('sd_cmd_oe').value.toInt() == 1;
+      final sending = cmdProbe.sending(
+        top.output('sd_cmd_oe'),
+        top.output('sd_cmd_out'),
+      );
       if (sending) sawDrive = true;
       final high = top.output('sd_clk').value.toInt() == 1;
       final edge = launchOnRise ? (high && !prevHigh) : (!high && prevHigh);
@@ -435,7 +440,10 @@ class AdmaBench {
     var prevHigh = top.output('sd_clk').value.toInt() == 1;
     for (var i = 0; i < cycles; i++) {
       await clk.nextPosedge;
-      final sending = top.output('sd_cmd_oe').value.toInt() == 1;
+      final sending = cmdProbe.sending(
+        top.output('sd_cmd_oe'),
+        top.output('sd_cmd_out'),
+      );
       final high = top.output('sd_clk').value.toInt() == 1;
       final rise = high && !prevHigh;
       prevHigh = high;
@@ -494,7 +502,10 @@ class AdmaBench {
     var cardBusy = false;
     for (var i = 0; i < 30000; i++) {
       await clk.nextPosedge;
-      final sending = top.output('sd_cmd_oe').value.toInt() == 1;
+      final sending = cmdProbe.sending(
+        top.output('sd_cmd_oe'),
+        top.output('sd_cmd_out'),
+      );
       if (sending) sawDrive = true;
       final datDriving = (top.output('sd_dat_oe').value.toInt() & 1) == 1;
       final high = top.output('sd_clk').value.toInt() == 1;
@@ -591,7 +602,10 @@ class AdmaBench {
     final maxCycles = requiredDataGroups == null ? 40000 : 200000;
     for (var i = 0; i < maxCycles; i++) {
       await clk.nextPosedge;
-      final cmdSending = top.output('sd_cmd_oe').value.toInt() == 1;
+      final cmdSending = cmdProbe.sending(
+        top.output('sd_cmd_oe'),
+        top.output('sd_cmd_out'),
+      );
       if (cmdSending) sawCmd = true;
       final datDriving = (top.output('sd_dat_oe').value.toInt() & 1) == 1;
       if (datDriving) sawDat = true;

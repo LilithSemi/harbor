@@ -6,6 +6,7 @@ import 'package:test/test.dart';
 
 import '../util/mem_target.dart';
 import '../util/reg_bus.dart';
+import '../util/sd_cmd_probe.dart';
 
 // Register byte offsets: each register in its own 8-byte slot (the byte-addressed
 // fabric decodes byte-offset >> 3).
@@ -236,6 +237,7 @@ void main() {
     late Logic datIn, datOut, datOe;
     late Logic cardDetectLine;
     late MasterTop top;
+    var cmdProbe = SdCmdProbe();
     late BeatMemory memory;
 
     // 32-bit word [i] of the ADMA memory.
@@ -463,7 +465,7 @@ void main() {
       var k = 0;
       for (var i = 0; i < 1200; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive &&
             !sending &&
@@ -488,7 +490,7 @@ void main() {
       var k = 0;
       for (var i = 0; i < 3000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive &&
             !sending &&
@@ -560,7 +562,7 @@ void main() {
         var idx = 0;
         while (idx < stream.length) {
           await clk.nextPosedge;
-          final sending = cmdOe.value.toInt() == 1;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
           if (sending) sawDrive = true;
           if (sawDrive && !sending && sdClk.value.toInt() == 0) {
             if (idx < 48) {
@@ -650,7 +652,7 @@ void main() {
       var idx = 0;
       for (var i = 0; i < 6000 && idx < stream.length; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive && !sending && sdClk.value.toInt() == 0) {
           if (idx < 48) {
@@ -678,7 +680,7 @@ void main() {
       var idx = 0;
       while (idx < all.length) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive && !sending && sdClk.value.toInt() == 0) {
           if (idx < 48) {
@@ -813,7 +815,7 @@ void main() {
         final frame = _resp48(0);
         for (var i = 0; i < 4000; i++) {
           await clk.nextPosedge;
-          final sending = cmdOe.value.toInt() == 1;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
           if (sending) sawDrive = true;
           final now = sdClk.value.toInt();
           if (sawDrive && !sending && now == 0 && k < frame.length) {
@@ -896,7 +898,7 @@ void main() {
       var previousLow = sdClk.value.toInt() == 0;
       for (var cycle = 0; cycle < 6000; cycle++) {
         await clk.nextPosedge;
-        final commandDriving = cmdOe.value.toInt() == 1;
+        final commandDriving = cmdProbe.sending(cmdOe, cmdOut);
         if (commandDriving) sawReadCommand = true;
         final low = sdClk.value.toInt() == 0;
         if (sawReadCommand &&
@@ -933,7 +935,7 @@ void main() {
       previousLow = sdClk.value.toInt() == 0;
       for (var cycle = 0; cycle < 1000 && waitAfterResponse < 8; cycle++) {
         await clk.nextPosedge;
-        final commandDriving = cmdOe.value.toInt() == 1;
+        final commandDriving = cmdProbe.sending(cmdOe, cmdOut);
         if (commandDriving) sawWriteCommand = true;
         final low = sdClk.value.toInt() == 0;
         final fall = previousLow == false && low;
@@ -1015,7 +1017,7 @@ void main() {
       var idx = 0;
       for (var i = 0; i < 6000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1053,7 +1055,7 @@ void main() {
       var idx = 0;
       for (var i = 0; i < 6000 && idx < total; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1110,7 +1112,7 @@ void main() {
         var idx = 0;
         for (var i = 0; i < 6000; i++) {
           await clk.nextPosedge;
-          final sending = cmdOe.value.toInt() == 1;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
           if (sending) sawDrive = true;
           final sdLow = sdClk.value.toInt() == 0;
           if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1163,7 +1165,7 @@ void main() {
       var prevClk = sdClk.value.toInt();
       for (var i = 0; i < 8000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
         final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
@@ -1221,7 +1223,7 @@ void main() {
         }
         final diag = await busRead(_diag);
         expect((diag >> 16) & 0xF, equals(0x8));
-        expect(diag & 0x2, equals(0));
+        expect(diag & 0x2, equals(0x2));
         expect(top.output('sd_diag').value.toInt() & 0xF0000, equals(0x80000));
         // CMD0 keeps the same drive through the whole command.
         await busWrite(_cmdArg, 0);
@@ -1263,7 +1265,7 @@ void main() {
       var sawCmd = false, ri = 0;
       for (var i = 0; i < 4000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
         if (sawCmd &&
             !cmdSending &&
@@ -1341,7 +1343,7 @@ void main() {
         var sawCmd = false, sawDat = false, ri = 0, si = 0;
         for (var i = 0; i < 8000; i++) {
           await clk.nextPosedge;
-          final cmdSending = cmdOe.value.toInt() == 1;
+          final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
           if (cmdSending) sawCmd = true;
           final datDriving = (datOe.value.toInt() & 1) == 1;
           if (datDriving) sawDat = true;
@@ -1388,7 +1390,7 @@ void main() {
       var idx = 0;
       for (var i = 0; i < 6000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive && !sending && sdClk.value.toInt() == 0 && idx < total) {
           if (idx < resp.length) {
@@ -1437,7 +1439,7 @@ void main() {
       var prevClk = sdClk.value.toInt();
       for (var i = 0; i < 8000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
         final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
@@ -1493,7 +1495,7 @@ void main() {
       var prevSdLow = sdClk.value.toInt() == 0;
       for (var i = 0; i < 6000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1538,7 +1540,7 @@ void main() {
       var prevClk = sdClk.value.toInt();
       for (var i = 0; i < 8000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
         final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
@@ -1587,7 +1589,7 @@ void main() {
       for (var i = 0; i < 40000; i++) {
         await clk.nextPosedge;
         cycles++;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive && !sending && sdClk.value.toInt() == 0 && idx < total) {
           if (idx < resp.length) {
@@ -1697,7 +1699,7 @@ void main() {
         var prevSdLow = sdClk.value.toInt() == 0;
         for (var i = 0; i < 200000; i++) {
           await clk.nextPosedge;
-          final sending = cmdOe.value.toInt() == 1;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
           if (sending) sawDrive = true;
           final sdLow = sdClk.value.toInt() == 0;
           if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1775,7 +1777,7 @@ void main() {
         var prevSdLow = sdClk.value.toInt() == 0;
         for (var i = 0; i < 200000; i++) {
           await clk.nextPosedge;
-          final sending = cmdOe.value.toInt() == 1;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
           if (sending) sawDrive = true;
           final sdLow = sdClk.value.toInt() == 0;
           if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1821,7 +1823,7 @@ void main() {
       var prevSdLow = sdClk.value.toInt() == 0;
       for (var i = 0; i < 200000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -2001,7 +2003,7 @@ void main() {
       var prevSdLow = sdClk.value.toInt() == 0;
       for (var i = 0; i < 40000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -2091,7 +2093,7 @@ void main() {
       var prevClk = sdClk.value.toInt();
       for (var i = 0; i < 12000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
         final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
@@ -2288,6 +2290,8 @@ void main() {
       await sdio.build();
 
       final cmdOe = sdio.output('sd_cmd_oe');
+      final cmdOut = sdio.output('sd_cmd_out');
+      final cmdProbe = SdCmdProbe();
       final sdClk = sdio.output('sd_clk');
       final irq = sdio.output('interrupt');
 
@@ -2360,7 +2364,7 @@ void main() {
       var idx = 0;
       for (var i = 0; i < 10000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {

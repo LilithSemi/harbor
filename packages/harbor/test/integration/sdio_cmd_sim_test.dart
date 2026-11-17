@@ -126,7 +126,9 @@ class _FakeSdCard {
       }
 
       // Host released CMD: decode the 47 collected bits and arm the response.
-      if (released && collecting && !responding) {
+      // With no response the host keeps CMD driven high, so a bit past the
+      // end bit also ends the frame.
+      if ((released || cmdBits.length >= 49) && collecting && !responding) {
         if (cmdBits.length >= 47) {
           final f = cmdBits.sublist(0, 47);
           gotIndex = _fromBits(f.sublist(2, 8));

@@ -5,6 +5,7 @@ import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
 import '../util/mem_target.dart';
+import '../util/sd_cmd_probe.dart';
 
 // Register byte offsets: each register in its own 8-byte slot (the byte-addressed
 // fabric decodes byte-offset >> 3).
@@ -261,6 +262,7 @@ void main() {
     late Logic datIn, datOut, datOe;
     late Logic cardDetectLine;
     late MasterTop top;
+    var cmdProbe = SdCmdProbe();
     late BeatMemory memory;
 
     // The frames most tests send carry no valid CRC7 or index, so the
@@ -304,6 +306,7 @@ void main() {
       int cardDetectLevel = 0,
     }) async {
       strictResponse = false;
+      cmdProbe = SdCmdProbe();
       sdio = HarborSdioController(
         baseAddress: 0x60000000,
         config: config ?? const HarborSdioConfig.sd(),
@@ -507,7 +510,7 @@ void main() {
       var k = 0;
       for (var i = 0; i < 4000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (frame != null &&
             sawDrive &&
@@ -572,6 +575,203 @@ void main() {
     test('a bad end bit sets the end bit error', () async {
       final st = await strictCommand(13 | (1 << 6), r1Frame(13, end: 0));
       expect(st & 0xE01, equals(0x400));
+      await Simulator.endSimulation();
+    });
+
+    Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+
+    // Sends [cmd] and answers it with [frame]. After the last response bit it
+    // waits [lateAfter] SD clocks and then pulls CMD low for [lateLow] clocks,
+    // as a card does that answers late. It checks every clock that the host pad
+    // enable is low while the card drives. With [rewrite] software writes a new
+    // command as soon as the error shows. The result is the host pad enable
+    // and value [settle] SD clocks after the card lets go, and the SD clocks
+    // from the end of the frame to the first low bit the host sends.
+    Future<(int, int, int)> lateCard(
+      List<int> frame, {
+      int cmd = 13 | (1 << 6),
+      required int lateAfter,
+      required int lateLow,
+      int settle = 0,
+      bool rewrite = false,
+    }) async {
+      await setUpDut();
+      strictResponse = true;
+      await busWrite(_intEnable, 0xE11);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, cmd);
+      var sawDrive = false;
+      var k = 0;
+      var prev = sdClk.value.toInt();
+      var clocks = 0;
+      var cardLow = false;
+      var rewritten = false;
+      var hostStart = -1;
+      for (var i = 0; i < 60000 && clocks < lateAfter + lateLow + settle; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        if (rewritten && sending && hostStart < 0) hostStart = clocks;
+        final c = sdClk.value.toInt();
+        if (sawDrive && !sending && c == 0 && k < frame.length) {
+          cmdIn.inject(frame[k++]);
+        }
+        if (rewrite && !rewritten && irq.value.toInt() == 1) {
+          rewritten = true;
+          unawaited(() async {
+            await busWrite(_intStatus, 0x1FF);
+            await busWrite(_cmd, 13 | (1 << 6));
+          }());
+        }
+        if (prev == 0 && c == 1 && k == frame.length) {
+          clocks++;
+          if (clocks == lateAfter) {
+            cardLow = true;
+            cmdIn.inject(0);
+          }
+          if (clocks == lateAfter + lateLow) {
+            cardLow = false;
+            cmdIn.inject(1);
+          }
+        }
+        prev = c;
+        if (cardLow) {
+          expect(cmdOe.value.toInt(), equals(0), reason: 'host drives CMD');
+        }
+      }
+      return (cmdOe.value.toInt(), cmdOut.value.toInt(), hostStart);
+    }
+
+    for (final after in [2, 40, 100, 150]) {
+      test(
+        'CMD stays released while a card answers $after clocks late',
+        () async {
+          await lateCard(
+            r1Frame(13, crcXor: 1),
+            lateAfter: after,
+            lateLow: 48,
+            settle: 2,
+          );
+          await Simulator.endSimulation();
+        },
+      );
+    }
+
+    test('CMD stays released through a long late answer', () async {
+      await lateCard(
+        r2Frame(crcXor: 4),
+        cmd: 2 | (2 << 6),
+        lateAfter: 2,
+        lateLow: 136,
+        settle: 2,
+      );
+      await Simulator.endSimulation();
+    });
+
+    test(
+      'a command written after the error waits for the quiet time',
+      () async {
+        final (_, _, hostStart) = await lateCard(
+          r1Frame(13, crcXor: 1),
+          lateAfter: 20,
+          lateLow: 100,
+          settle: 300,
+          rewrite: true,
+        );
+        expect(hostStart, greaterThanOrEqualTo(195));
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('CMD is driven high again after the quiet time', () async {
+      final (oe, out, _) = await lateCard(
+        r1Frame(13, crcXor: 1),
+        lateAfter: 20,
+        lateLow: 16,
+        settle: 240,
+      );
+      expect(oe, equals(1));
+      expect(out, equals(1));
+      await Simulator.endSimulation();
+    });
+
+    // Clears enable while a command is on the wire. The state stops, CMD is
+    // released and stays so for the quiet time after enable returns.
+    for (final state in [1, 4]) {
+      test(
+        'clearing enable in state $state releases CMD for the quiet time',
+        () async {
+          await setUpDut();
+          strictResponse = true;
+          await busWrite(_intEnable, 0xE11);
+          final cmdState = sig('cmd_state');
+          await busWrite(_clkDiv, 6);
+          await busWrite(_cmdArg, 0);
+          await busWrite(_cmd, 13 | (1 << 6));
+          for (var i = 0; i < 4000; i++) {
+            await clk.nextPosedge;
+            if (cmdState.value.toInt() == state) break;
+          }
+          expect(cmdState.value.toInt(), equals(state));
+          await busWrite(_ctrl, 0x10);
+          for (var i = 0; i < 10; i++) {
+            await clk.nextPosedge;
+          }
+          expect(cmdState.value.toInt(), equals(0));
+          expect(cmdOe.value.toInt(), equals(0));
+          expect((await busRead(_status) >> 8) & 1, equals(0));
+          expect((await busRead(_intStatus)) & 0x10, equals(0x10));
+          await busWrite(_ctrl, 0x11);
+          var rises = 0;
+          var prev = sdClk.value.toInt();
+          var firstOe = -1;
+          for (var i = 0; i < 20000 && firstOe < 0; i++) {
+            await clk.nextPosedge;
+            final c = sdClk.value.toInt();
+            if (prev == 0 && c == 1) rises++;
+            prev = c;
+            if (cmdOe.value.toInt() == 1) firstOe = rises;
+          }
+          expect(firstOe, inInclusiveRange(190, 210));
+          await Simulator.endSimulation();
+        },
+      );
+    }
+
+    test('CMD is driven high when idle and released while waiting', () async {
+      await setUpDut();
+      strictResponse = true;
+      await busWrite(_intEnable, 0xE11);
+      final frame = r1Frame(13);
+      expect(cmdOe.value.toInt(), equals(1));
+      expect(cmdOut.value.toInt(), equals(1));
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 13 | (1 << 6));
+      var sawDrive = false;
+      var k = 0;
+      final states = <int>{};
+      for (var i = 0; i < 3000; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        if (sawDrive &&
+            !sending &&
+            sdClk.value.toInt() == 0 &&
+            k < frame.length) {
+          cmdIn.inject(frame[k++]);
+        }
+        final st = sig('cmd_state').value.toInt();
+        states.add(st);
+        if (st == 2 || st == 3) {
+          expect(cmdOe.value.toInt(), equals(0), reason: 'state $st');
+        }
+        if (st == 0) {
+          expect(cmdOe.value.toInt(), equals(1));
+          expect(cmdOut.value.toInt(), equals(1));
+        }
+        if (irq.value.toInt() == 1) break;
+      }
+      expect(states, containsAll([0, 1, 2, 3]));
       await Simulator.endSimulation();
     });
 

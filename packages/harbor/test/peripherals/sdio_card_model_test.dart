@@ -7,7 +7,8 @@ import 'package:test/test.dart';
 /// the Verilator harness and checks each response the way the controller does:
 /// transmission bit, end bit and CRC7 remainder. R2 is checked over bits 127:8.
 const _host = r'''
-// Host emulation: drive on falls and release after the end bit plus one clock.
+// Host emulation: drive on falls, release after the end bit plus one clock
+// for a command with a response, keep CMD driven high for one without.
 static int crc7rem(const int* b, int n) { int c = 0; for (int i = 0; i < n; i++) { int fb = ((c >> 6) & 1) ^ b[i]; c = (c << 1) & 0x7f; if (fb) c ^= 0x09; } return c; }
 static SdCard card("t");
 static int sclk = 0;
@@ -22,7 +23,7 @@ static int run(int idx, unsigned arg, int resp) { // 0 none, 1 short, 2 long
   for (int i = 0; i < 32; i++) f[8+i] = (arg >> (31-i)) & 1;
   int c = crc7rem(f, 40); for (int i = 0; i < 7; i++) f[40+i] = (c >> (6-i)) & 1; f[47] = 1;
   for (int i = 0; i < 48; i++) clk(1, f[i], nullptr);
-  if (!resp) { for (int i = 0; i < 20; i++) clk(0, 1, nullptr); return 0; }
+  if (!resp) { for (int i = 0; i < 20; i++) clk(1, 1, nullptr); return 0; }
   clk(1, 1, nullptr); // sEnd keeps the end bit one clock
   int s = 1, n = 0; for (n = 0; n < 128; n++) { clk(0, 1, &s); if (!s) break; }
   if (s) { printf("cmd%d: no response\n", idx); return 1; }

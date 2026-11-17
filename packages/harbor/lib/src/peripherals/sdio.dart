@@ -355,6 +355,11 @@ class HarborSdioController extends BridgeModule
   /// a limit taken from the physical layer specification.
   static const writeBusyStartClocks = 16;
 
+  /// SD clocks the host keeps CMD released after a response that ended with an
+  /// error or a reset: a long response frame (136) plus the longest response
+  /// delay (64). A card that is still answering finds the line free.
+  static const cmdQuietClocks = 200;
+
   /// The reset value of DATA_TIMEOUT: 4194304 SD clocks. A 25 MHz system clock
   /// gives at most a 12.5 MHz SD clock, so this is at least 335 ms.
   static const defaultDataTimeout = 1 << 22;
@@ -552,6 +557,7 @@ class HarborSdioController extends BridgeModule
     final cmdNoIdx = Logic(name: 'cmd_no_idx');
     final respCrc = Logic(name: 'resp_crc', width: 7);
     final respTxBad = Logic(name: 'resp_tx_bad');
+    final cmdHold = Logic(name: 'cmd_hold', width: 8);
     final resp = [
       mux(respLong, respRaw.getRange(0, 32), respRaw.getRange(8, 40)),
       for (var i = 1; i < 4; i++)
@@ -1146,11 +1152,20 @@ class HarborSdioController extends BridgeModule
     }
     final datOePins = datOeLane.rconcat().named('dat_oe_pins');
     final datOutPins = datOutLane.rconcat().named('dat_out_pins');
+    // An enabled host holds CMD high when no command is on the bus, so the
+    // line cannot float low on a board without a pull-up. It stays released
+    // for [cmdQuietClocks] after a failed or stopped response.
+    final cmdIdleHigh =
+        (ctrlEnable &
+                state.eq(Const(sIdle, width: 3)) &
+                cmdHold.eq(Const(0, width: 8)))
+            .named('cmd_idle_high');
+    final cmdPadOe = (cmdOe | cmdIdleHigh).named('cmd_pad_oe');
     if (ownPads) {
       // One IOBUF per bidirectional line: drive when the FSM asserts its output
       // enable, otherwise release and read the pad back in.
       final cmdPad = inOut('sd_cmd');
-      cmdPad <= TriStateBuffer(cmdOut, enable: cmdOe).out;
+      cmdPad <= TriStateBuffer(cmdOut, enable: cmdPadOe).out;
       _sdCmdInInt! <= cmdPad;
       // Per-lane IOBUF: lane l drives its pad when its enable is set, else reads.
       final datInBits = <Logic>[];
@@ -1162,7 +1177,7 @@ class HarborSdioController extends BridgeModule
       _sdDatInInt! <= datInBits.rconcat(); // lane 0 = LSB
     } else {
       output('sd_cmd_out') <= cmdOut;
-      output('sd_cmd_oe') <= cmdOe;
+      output('sd_cmd_oe') <= cmdPadOe;
       output('sd_dat_out') <= datOutPins;
       output('sd_dat_oe') <= datOePins;
     }
@@ -1191,7 +1206,7 @@ class HarborSdioController extends BridgeModule
     // [23:16] DAT pad enables. The levels are the sampled pad values.
     final diag =
         (cmdIn.zeroExtend(32) |
-                (cmdOe.zeroExtend(32) << 1) |
+                (cmdPadOe.zeroExtend(32) << 1) |
                 (datIn.zeroExtend(32) << 4) |
                 (datOePins.zeroExtend(32) << 16))
             .named('sd_diag_value');
@@ -1294,6 +1309,7 @@ class HarborSdioController extends BridgeModule
           cmdNoIdx < Const(0),
           respCrc < Const(0, width: 7),
           respTxBad < Const(0),
+          cmdHold < Const(0, width: 8),
           blkSize < Const(512, width: 12),
           blkCount < Const(1, width: 16),
           dataTimeout < Const(defaultDataTimeout, width: 24),
@@ -1401,12 +1417,24 @@ class HarborSdioController extends BridgeModule
             ],
           ),
 
+          // Counts the quiet time after a failed response.
+          If(
+            sdRise & cmdHold.neq(Const(0, width: 8)),
+            then: [cmdHold < (cmdHold - Const(1, width: 8))],
+          ),
+
           // CMD engine.
           Case(state, [
             // Serialize the command, MSB-first, one bit per SD falling edge.
             CaseItem(Const(sSend, width: 3), [
+              // A command written while the quiet time runs waits for it. CMD
+              // stays released until then, and STATUS shows busy meanwhile.
               If(
-                sdFall,
+                ~cmdOe & cmdHold.eq(Const(0, width: 8)),
+                then: [cmdOe < Const(1)],
+              ),
+              If(
+                sdFall & cmdOe,
                 then: [
                   cmdOut < cmdShift[47],
                   cmdShift < [cmdShift.getRange(0, 47), Const(0)].concat(),
@@ -1579,6 +1607,11 @@ class HarborSdioController extends BridgeModule
               ),
             ]),
           ]),
+
+          If(
+            respErrNow | cmdTimeoutNow,
+            then: [cmdHold < Const(cmdQuietClocks, width: 8)],
+          ),
 
           // DAT engine (1/4/8-bit PIO). Each SD clock moves [laneCount] bits,
           // one per active lane, MSB group first, each lane has its own CRC16.
@@ -2346,6 +2379,28 @@ class HarborSdioController extends BridgeModule
                               ...setInt(intWriteErr | intDataDone),
                             ],
                           ),
+                          If(
+                            ~bus.dataIn[0] &
+                                (state.eq(Const(sWait, width: 3)) |
+                                    state.eq(Const(sRecv, width: 3))),
+                            then: [cmdHold < Const(cmdQuietClocks, width: 8)],
+                          ),
+                          // A command that is on the wire stops with the
+                          // clock. The card sees a short frame and may answer
+                          // it, so CMD stays released for the quiet time.
+                          If(
+                            ~bus.dataIn[0] &
+                                (state.eq(Const(sSend, width: 3)) |
+                                    state.eq(Const(sEnd, width: 3))),
+                            then: [
+                              cmdOe < Const(0),
+                              cmdOut < Const(1),
+                              state < Const(sIdle, width: 3),
+                              busy < Const(0),
+                              cmdHold < Const(cmdQuietClocks, width: 8),
+                              ...setInt(intCmdTimeout),
+                            ],
+                          ),
                           // [5:4] selects the active bus width (0:1-bit,
                           // 1:4-bit, 2:8-bit), clamped to the configured
                           // maximum.
@@ -2380,6 +2435,13 @@ class HarborSdioController extends BridgeModule
                               busy < Const(0),
                               // A command that waits for its answer stops
                               // too, so a late card answer starts nothing.
+                              If(
+                                state.eq(Const(sWait, width: 3)) |
+                                    state.eq(Const(sRecv, width: 3)),
+                                then: [
+                                  cmdHold < Const(cmdQuietClocks, width: 8),
+                                ],
+                              ),
                               state < Const(sIdle, width: 3),
                               cmdOe < Const(0),
                               cmdOut < Const(1),
@@ -2420,7 +2482,7 @@ class HarborSdioController extends BridgeModule
                           cmdShift < cmdFrame,
                           cmdCnt < Const(48, width: 7),
                           cmdOut < Const(1),
-                          cmdOe < Const(1),
+                          cmdOe < cmdHold.eq(Const(0, width: 8)),
                           busy < Const(1),
                           state < Const(sSend, width: 3),
                           // Start every data phase with an empty RX FIFO, so
@@ -2732,6 +2794,7 @@ struct SdCard {
 
   int   rx_active = 0;
   int   rx_n = 0;
+  int   rx_extra = 0;
   uint8_t rx[48];
 
   int   resp_active = 0;
@@ -2896,8 +2959,11 @@ struct SdCard {
     int fall = prev_clk && !sclk;
     prev_clk = sclk;
 
-    if (prev_oe && !cmd_oe && rx_active && rx_n >= 40) {
+    // The host releases CMD after a frame that expects a response. With no
+    // response CMD stays driven high, so a clock past the end bit ends it.
+    if (((prev_oe && !cmd_oe) || rx_extra) && rx_active && rx_n >= 40) {
       rx_active = 0;
+      rx_extra = 0;
       decode_and_respond();
     }
     prev_oe = cmd_oe;
@@ -2905,9 +2971,11 @@ struct SdCard {
     if (rise) {
       if (cmd_oe) {
         if (!rx_active) {
-          if (cmd_out == 0) { rx_active = 1; rx_n = 0; rx[rx_n++] = 0; }
+          if (cmd_out == 0) { rx_active = 1; rx_n = 0; rx_extra = 0; rx[rx_n++] = 0; }
         } else if (rx_n < 48) {
           rx[rx_n++] = cmd_out & 1;
+        } else {
+          rx_extra = 1;
         }
       }
     }
