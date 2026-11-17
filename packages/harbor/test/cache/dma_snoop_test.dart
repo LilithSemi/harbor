@@ -78,7 +78,10 @@ void main() {
     late Axi4Interface m;
     late Axi4Interface s;
 
-    Future<(_Probe, HarborDmaSnoop)> start({int awDepth = 4}) {
+    Future<(_Probe, HarborDmaSnoop)> start({
+      int awDepth = 4,
+      List<BusAddressRange>? writeWindow,
+    }) {
       m = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
       s = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
       _zero(m, s);
@@ -90,6 +93,7 @@ void main() {
           slave: s,
           lineSize: 32,
           awDepth: awDepth,
+          writeWindow: writeWindow,
         ),
       );
     }
@@ -160,6 +164,73 @@ void main() {
         m.bReady.inject(0);
       },
     );
+
+    test('B right after AW and W still waits for every line', () async {
+      final (p, _) = await start();
+      m.bReady.inject(1);
+      m.wValid.inject(1);
+      m.wLast.inject(1);
+      s.wReady.inject(1);
+      await aw(p, 0x3000, 31, 3, 1);
+      // The slave answers in the first cycle after the AW.
+      s.bValid.inject(1);
+      var shownAt = -1;
+      for (var c = 0; c < 40 && shownAt < 0; c++) {
+        await p.settle();
+        if (m.bValid.value.toBool()) {
+          shownAt = c;
+          // Eight lines of 32 bytes are all out before B reaches the master.
+          expect(p.lines, [for (var l = 0; l < 8; l++) 0x3000 + l * 32]);
+        }
+        await p.step();
+      }
+      expect(shownAt, greaterThanOrEqualTo(8));
+    });
+
+    test('a burst at the top of the target range', () async {
+      const top = BusAddressRange(0x80000000, 1 << 20);
+      final (p, tap) = await start(writeWindow: [top]);
+      expect(tap.invalAddr.width, 32);
+      m.bReady.inject(1);
+      await aw(p, 0x800fffc0, 7, 3, 1);
+      s.bValid.inject(1);
+      tap.fillLineIn.inject(0x800fffe0);
+      await p.settle();
+      expect(tap.invalHold.value.toBool(), isFalse, reason: 'range not yet in');
+      var seen = false;
+      for (var c = 0; c < 20 && !seen; c++) {
+        await p.step();
+        await p.settle();
+        seen = m.bValid.value.toBool();
+        // The hold is high from the cycle of the first line.
+        if (!seen && p.lines.isNotEmpty) {
+          expect(tap.invalHold.value.toBool(), isTrue, reason: 'hold');
+        }
+      }
+      expect(seen, isTrue);
+      expect(p.lines, [0x800fffc0, 0x800fffe0]);
+    });
+
+    test('target ranges that need more bits than the address throw', () {
+      m = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
+      s = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
+      for (final bad in [
+        <BusAddressRange>[],
+        [const BusAddressRange(0xfffff000, 0x2000)],
+      ]) {
+        expect(
+          () => HarborDmaSnoop.axi4(
+            SimpleClockGenerator(10).clk,
+            Logic(),
+            master: m,
+            slave: s,
+            lineSize: 32,
+            writeWindow: bad,
+          ),
+          throwsArgumentError,
+        );
+      }
+    });
 
     test('a WRAP burst covers its wrap block', () async {
       final (p, _) = await start();

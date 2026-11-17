@@ -420,4 +420,243 @@ void main() {
       }
     });
   });
+
+  group('AXI4 tap into the cache', () {
+    for (final (latency, land, window) in [
+      (3, 1, null),
+      (8, 1, null),
+      (8, 6, null),
+      (3, 1, 'in'),
+      (3, 1, 'out'),
+      // The data lands late, so a refill can start after the last invalidate.
+      (3, 12, null),
+      (3, 12, 'out'),
+    ]) {
+      for (final kind in ['single', 'incr4', 'wrap', 'b2b']) {
+        test(
+          'a refill started around the AW sees the write: lat $latency '
+          'land +$land $kind${window == null ? '' : ' window $window'}',
+          () async {
+            await _raceSweep(latency, land, kind, window);
+          },
+        );
+      }
+    }
+
+    test('B the cycle after AW does not pass the invalidate', () async {
+      late Axi4Interface m;
+      late Axi4Interface s;
+      final dut = await _dut(
+        connect: (cache, clk) {
+          m = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
+          s = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
+          _zeroPorts(m, s);
+          HarborDmaSnoop.axi4(
+            clk,
+            cache.input('reset').srcConnection!,
+            master: m,
+            slave: s,
+            lineSize: _line,
+          )..connectCache(cache as HarborL1DCache);
+        },
+      );
+      const a = _base + 0x100;
+      await dut.read(a + 8);
+      _dmaWrite(dut, a + 8, 0x4321);
+      s.awReady.inject(1);
+      m.bReady.inject(1);
+      m.awValid.inject(1);
+      m.awAddr.inject(a + 8);
+      m.awLen.inject(0);
+      m.awSize.inject(3);
+      m.awBurst.inject(1);
+      await dut.step();
+      m.awValid.inject(0);
+      s.bValid.inject(1);
+      // The master loads in the cycle after it sees B.
+      for (var i = 0; i < 20; i++) {
+        await dut.clk.nextNegedge;
+        final seen = m.bValid.value.toBool();
+        await dut.step();
+        if (seen) {
+          s.bValid.inject(0);
+          break;
+        }
+      }
+      expect(await dut.read(a + 8), BigInt.from(0x4321));
+    });
+
+    test('a write outside the window does not leave a stale line', () async {
+      late Axi4Interface m;
+      late Axi4Interface s;
+      late HarborDmaSnoop tap;
+      final dut = await _dut(
+        connect: (cache, clk) {
+          m = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
+          s = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
+          _zeroPorts(m, s);
+          tap = HarborDmaSnoop.axi4(
+            clk,
+            cache.input('reset').srcConnection!,
+            master: m,
+            slave: s,
+            lineSize: _line,
+            writeWindow: const [BusAddressRange(0x80100000, 0x10000)],
+          )..connectCache(cache as HarborL1DCache);
+        },
+      );
+      const a = 0x80000100;
+      await dut.read(a + 8);
+      s.awReady.inject(1);
+      m.bReady.inject(1);
+      m.awValid.inject(1);
+      m.awAddr.inject(a + 8);
+      m.awLen.inject(0);
+      m.awSize.inject(3);
+      m.awBurst.inject(1);
+      await dut.step();
+      m.awValid.inject(0);
+      dut.mem.writeValue(a + 8, 3, BigInt.from(0x1234));
+      s.bValid.inject(1);
+      for (var i = 0; i < 20; i++) {
+        await dut.clk.nextNegedge;
+        final take = m.bValid.value.toBool();
+        await dut.step();
+        if (take) {
+          s.bValid.inject(0);
+          break;
+        }
+      }
+      expect(tap.output('window_miss').value.toBool(), isTrue);
+      await dut.steps(4);
+      expect(await dut.read(a + 8), BigInt.from(0x1234));
+    });
+  });
+}
+
+void _zeroPorts(PairInterface m, PairInterface s) {
+  for (final p in m.getPorts([PairDirection.fromProvider]).values) {
+    p.put(0);
+  }
+  for (final p in s.getPorts([PairDirection.fromConsumer]).values) {
+    p.put(0);
+  }
+}
+
+typedef _Aw = ({int addr, int len, int size, int burst});
+
+/// Bursts that cover the word [a] + 8 of line [a].
+Map<String, List<_Aw>> _kinds(int a) => {
+  'single': [(addr: a + 8, len: 0, size: 3, burst: 1)],
+  // Four lines, the last one is the target.
+  'incr4': [(addr: a - 3 * _line, len: 15, size: 3, burst: 1)],
+  // A 64 byte wrap block that starts in its upper half, so the target wraps.
+  'wrap': [(addr: (a & ~63) + ((a & 32) ^ 32) + 8, len: 7, size: 3, burst: 2)],
+  // Another line first, then the target in the next cycle.
+  'b2b': [
+    (addr: a + 16 * _line, len: 0, size: 3, burst: 1),
+    (addr: a + 8, len: 0, size: 3, burst: 1),
+  ],
+};
+
+/// Starts a refill of the target line at each cycle around the AW, and lets
+/// the DMA write land [land] cycles after the last AW. The load after the B
+/// must read the new value.
+Future<void> _raceSweep(
+  int latency,
+  int land,
+  String kind,
+  String? window,
+) async {
+  late Axi4Interface m;
+  late Axi4Interface s;
+  final dut = await _dut(
+    latency: latency,
+    connect: (cache, clk) {
+      m = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
+      s = Axi4Interface(addressWidth: 32, dataWidth: 64, idWidth: 2);
+      _zeroPorts(m, s);
+      HarborDmaSnoop.axi4(
+        clk,
+        cache.input('reset').srcConnection!,
+        master: m,
+        slave: s,
+        lineSize: _line,
+        writeWindow: switch (window) {
+          'in' => const [BusAddressRange(_base, 1 << 20)],
+          'out' => const [BusAddressRange(0x90000000, 1 << 20)],
+          _ => null,
+        },
+      )..connectCache(cache as HarborL1DCache);
+    },
+  );
+  s.awReady.inject(1);
+  m.bReady.inject(1);
+  var idx = 0;
+  for (var d = -8; d <= 14; d++) {
+    final a = _base + (8 + 4 * idx++) * _line;
+    final newV = 0xd0000 + idx;
+    final aws = _kinds(a)[kind]!;
+    // Cycle numbers are the rising edges from here.
+    const start = 12;
+    final target = start + aws.length - 1;
+    final readAt = target + d;
+    final landAt = target + land;
+    var c = 0;
+    var awI = 0;
+    var readOn = false;
+    var readDone = false;
+    var bDone = false;
+    void showAw() {
+      if (awI < aws.length && c >= start + awI - 1) {
+        final w = aws[awI];
+        m.awValid.inject(1);
+        m.awAddr.inject(w.addr);
+        m.awLen.inject(w.len);
+        m.awSize.inject(w.size);
+        m.awBurst.inject(w.burst);
+      }
+    }
+
+    showAw();
+    while (!(readDone && bDone) || c < target + 2) {
+      await dut.clk.nextNegedge;
+      final next = c + 1;
+      if (readOn && dut.out('resp_valid')) {
+        dut.drive('req_valid', 0);
+        readOn = false;
+        readDone = true;
+      }
+      if (next == readAt) {
+        dut.drive('req_addr', a + 8);
+        dut.drive('req_write', 0);
+        dut.drive('req_size', 3);
+        dut.drive('req_valid', 1);
+        readOn = true;
+      }
+      if (next == landAt) _dmaWrite(dut, a + 8, newV);
+      final awTake = m.awValid.value.toBool() && m.awReady.value.toBool();
+      final bTake = s.bValid.value.toBool() && m.bValid.value.toBool();
+      await dut.step();
+      c++;
+      if (awTake) {
+        awI++;
+        m.awValid.inject(0);
+        showAw();
+      } else if (!m.awValid.value.toBool()) {
+        showAw();
+      }
+      if (bTake) {
+        s.bValid.inject(0);
+        bDone = true;
+      } else if (!bDone && awI == aws.length && c >= landAt) {
+        s.bValid.inject(1);
+      }
+      if (c > 400) throw StateError('stuck');
+    }
+    final got = await dut.read(a + 8);
+    await dut.steps(4);
+    expect(got, BigInt.from(newV), reason: 'stale at d=$d');
+    await dut.steps(4);
+  }
 }

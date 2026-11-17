@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 
 import '../bus/axi4/axi4_interface.dart';
+import '../bus/bus.dart';
 import '../bus/tilelink/tilelink_interface.dart';
 import '../bus/wishbone/wishbone_interface.dart';
 import 'l1_cache.dart';
@@ -12,8 +13,9 @@ class _FlopFifo {
   final Logic empty;
   final Logic full;
   final Logic head;
+  final Logic count;
 
-  _FlopFifo._(this.empty, this.full, this.head);
+  _FlopFifo._(this.empty, this.full, this.head, this.count);
 
   factory _FlopFifo(
     Logic clk,
@@ -62,7 +64,7 @@ class _FlopFifo {
         ],
       ),
     ]);
-    return _FlopFifo._(empty, full, head.named('${name}_head'));
+    return _FlopFifo._(empty, full, head.named('${name}_head'), count);
   }
 }
 
@@ -179,15 +181,21 @@ class HarborDmaSnoop extends Module {
     required Logic lo,
     required Logic hi,
     required Logic busy,
+    Logic? outside,
+    BigInt? upper,
+    int lineShift = 0,
   }) {
     final w = lo.width;
     final valid = Logic(name: 'rangeValid');
     final rLo = Logic(name: 'rangeLo', width: w);
     final rHi = Logic(name: 'rangeHi', width: w);
+    // A write outside the window holds every refill until the tap is idle.
+    final holdAll = Logic(name: 'holdAll');
+    final miss = Logic(name: 'windowMiss');
     Sequential(clk, [
       If(
         reset,
-        then: [valid < 0],
+        then: [valid < 0, holdAll < 0, miss < 0],
         orElse: [
           If(
             add,
@@ -195,16 +203,32 @@ class HarborDmaSnoop extends Module {
               valid < 1,
               rLo < mux(valid & rLo.lt(lo), rLo, lo),
               rHi < mux(valid & rHi.gt(hi), rHi, hi),
+              if (outside != null) ...[
+                holdAll < ((holdAll & valid) | outside),
+                miss < (miss | outside),
+              ],
             ],
             orElse: [
-              If(~busy, then: [valid < 0]),
+              If(~busy, then: [valid < 0, holdAll < 0]),
             ],
           ),
         ],
       ),
     ]);
-    final line = _lineOf(_fillLine);
-    addOutput('inval_hold') <= valid & line.gte(rLo) & line.lte(rHi);
+    final top = w + lineShift;
+    final line = lineShift > 0
+        ? _fillLine.getRange(lineShift, top)
+        : _lineOf(w == _fillLine.width ? _fillLine : _fillLine.getRange(0, w));
+    var inRange = line.gte(rLo) & line.lte(rHi);
+    if (upper != null) {
+      final aw = _fillLine.width;
+      inRange =
+          inRange &
+          _fillLine.getRange(top).eq(Const(upper >> top, width: aw - top));
+    }
+    addOutput('inval_hold') <=
+        valid & (outside == null ? inRange : (holdAll | inRange));
+    if (outside != null) addOutput('window_miss') <= miss;
   }
 
   /// Connects this tap straight to [cache], with no merge.
@@ -230,6 +254,24 @@ class HarborDmaSnoop extends Module {
   /// Inline stage on an AXI4 manager. Each accepted AW gives one invalidate
   /// for each line it covers, one line per cycle. [awDepth] accepted AWs can
   /// wait for their invalidates. When they are all waiting, AWREADY is low.
+  ///
+  /// The stage registers each accepted AW, and computes its lines in the next
+  /// cycle. The completion stays held while that register is full, so the B
+  /// of a write cannot pass before its lines are queued.
+  ///
+  /// [writeWindow] lists the address ranges the master normally writes. The
+  /// range math then uses only the low bits in which the ranges differ, and
+  /// the bits above are the common value of the ranges. Null keeps the full
+  /// address width. The invalidate queue and `inval_addr` stay full width, so
+  /// every line of every write is still invalidated. A write that is not
+  /// inside the window (its upper bits differ, or its burst leaves the
+  /// window) holds every refill until the tap is idle. That costs speed
+  /// only, and it sets the sticky `window_miss` output for diagnostics. A
+  /// refill is held only when its line is in the line range of the writes
+  /// in flight, or when such a write is outside the window.
+  ///
+  /// The constructor throws when [writeWindow] is empty or has a range with
+  /// bit 63 set, a size of 0 or a range past the address width.
   HarborDmaSnoop.axi4(
     Logic clk,
     Logic reset, {
@@ -237,13 +279,15 @@ class HarborDmaSnoop extends Module {
     required Axi4Interface slave,
     required this.lineSize,
     int awDepth = 4,
+    List<BusAddressRange>? writeWindow,
     super.name = 'dma_snoop',
   }) : beatBytes = master.dataWidth ~/ 8,
        _clk = clk,
        super(
          definitionName:
              'HarborDmaSnoopAxi4_a${master.addressWidth}_d${master.dataWidth}'
-             '_i${master.idWidth}_l${lineSize}_q$awDepth',
+             '_i${master.idWidth}_l${lineSize}_q$awDepth'
+             '${writeWindow == null ? '' : _windowName(writeWindow, master.addressWidth)}',
        ) {
     _checkLine();
     clk = addInput('clk', clk);
@@ -261,6 +305,9 @@ class HarborDmaSnoop extends Module {
       if (!gated.contains(n)) m.port(n) <= p;
     });
     final aW = master.addressWidth;
+    final (nW, upper) = writeWindow == null
+        ? (aW, BigInt.zero)
+        : _windowBits(writeWindow, aW);
 
     final busy = Logic(name: 'busy');
     final cur = Logic(name: 'curLine', width: aW);
@@ -284,25 +331,42 @@ class HarborDmaSnoop extends Module {
       bShown < ~reset & s.port('BVALID') & bOpen & ~m.port('BREADY'),
     ]);
 
-    final addr = m.port('AWADDR');
-    final len = m.port('AWLEN');
-    final size = m.port('AWSIZE');
-    final burst = m.port('AWBURST');
+    // The accepted AW waits one cycle in these flops. Only awQ gates their
+    // use, so they load on every cycle.
+    final awQ = Logic(name: 'awQ');
+    final addr = Logic(name: 'awAddrQ', width: aW);
+    final len = Logic(name: 'awLenQ', width: m.port('AWLEN').width);
+    final size = Logic(name: 'awSizeQ', width: m.port('AWSIZE').width);
+    final burst = Logic(name: 'awBurstQ', width: m.port('AWBURST').width);
+    Sequential(clk, [
+      awQ < ~reset & aw,
+      addr < m.port('AWADDR'),
+      len < m.port('AWLEN'),
+      size < m.port('AWSIZE'),
+      burst < m.port('AWBURST'),
+    ]);
     // Bytes of the burst: (len + 1) << size, at most 256 * 128.
     const bytesW = 16;
     final bytes = ((len.zeroExtend(bytesW) + 1) << size.zeroExtend(bytesW))
         .named('burstBytes');
-    final bytesA = bytes.width >= aW
-        ? bytes.getRange(0, aW)
-        : bytes.zeroExtend(aW);
     final wrapBlock = burst.eq(2) & bytes.gte(lineSize);
+    // The bytes after the first in the burst, bytes - 1.
+    final span = (bytes - 1).named('burstSpan');
     final first = mux(
       wrapBlock,
-      addr & ~(bytesA - 1),
+      addr & ~span.zeroExtend(aW),
       _lineOf(addr),
     ).named('firstLine');
+    // The line math below runs on the low nW bits. A burst stays in one 4 KB
+    // page, so these bits give the line count of a legal burst.
+    final firstN = first.getRange(0, nW);
+    final sum =
+        (addr.getRange(0, nW).zeroExtend(nW + 1) + span.zeroExtend(nW + 1))
+            .named('burstEnd');
+    final endN = _lineOf(sum.getRange(0, nW)).named('endLine');
+    final cW = nW < 18 ? nW : 18;
     final incrCount =
-        ((_lineOf(addr + bytesA - 1) - _lineOf(addr)) >> _lineBits).getRange(
+        ((endN.getRange(0, cW) - firstN.getRange(0, cW)) >> _lineBits).getRange(
           0,
           countW,
         ) +
@@ -316,31 +380,71 @@ class HarborDmaSnoop extends Module {
         Const(1, width: countW),
       ),
     ).named('lineCount');
-    final lastLine = (first + (count.zeroExtend(aW) - 1 << _lineBits)).named(
-      'lastLine',
-    );
+    // The last line. A wrap block starts at a multiple of its size, so the
+    // sum of its start and span has no carry.
+    final lastLine = mux(
+      burst.eq(1),
+      endN,
+      mux(wrapBlock, firstN | _lineOf(span.zeroExtend(nW)), firstN),
+    ).named('lastLine');
+    Logic? outsideNow;
+    if (nW < aW) {
+      outsideNow =
+          (addr.getRange(nW).neq(Const(upper >> nW, width: aW - nW)) |
+                  (burst.eq(1) & sum[nW]))
+              .named('outsideWindow');
+    }
+
+    // Simulation only: AXI4 allows a wrap burst of 2, 4, 8 or 16 beats.
+    clk.negedge.listen((_) {
+      final v = m.port('AWVALID').value;
+      final l = m.port('AWLEN').value;
+      if (v.isValid &&
+          v.toBool() &&
+          m.port('AWBURST').value == LogicValue.ofInt(2, 2)) {
+        if (l.isValid && ![1, 3, 7, 15].contains(l.toInt())) {
+          throw StateError('WRAP burst with AWLEN ${l.toInt()}');
+        }
+      }
+    });
+
+    final rangeQ = Logic(name: 'rangeQ');
+    // The low line-offset bits of both are zero, so the flops hold the rest.
+    final firstQ = Logic(name: 'firstQ', width: nW - _lineBits);
+    final lastQ = Logic(name: 'lastQ', width: nW - _lineBits);
+    final outsideQ = Logic(name: 'outsideQ');
+    Sequential(clk, [
+      rangeQ < ~reset & awQ,
+      firstQ < firstN.getRange(_lineBits),
+      lastQ < lastLine.getRange(_lineBits),
+      if (outsideNow != null) outsideQ < outsideNow else outsideQ < 0,
+    ]);
 
     final fifo = _FlopFifo(
       clk,
       reset,
-      push: aw,
+      push: awQ,
       data: [count, first].concat(),
       pop: pop,
       depth: awDepth,
       name: 'aw',
     );
-    full <= fifo.full;
+    // The register and the queue together hold at most awDepth AWs, so the
+    // push from the register always finds room.
+    full <=
+        fifo.full |
+            (awQ & (awDepth == 1 ? Const(1) : fifo.count.eq(awDepth - 1)));
     final advance = (busy & _ready).named('advance');
     pop <= ~fifo.empty & (~busy | (advance & left.eq(1)));
     final outstanding = Logic(name: 'outstanding', width: 16);
-    final idle = (fifo.empty & ~busy).named('idle');
+    final idle = (fifo.empty & ~busy & ~awQ & ~rangeQ).named('idle');
     release <= idle & _quiet;
     Sequential(clk, [
       If(
         reset,
         then: [busy < 0, outstanding < 0],
         orElse: [
-          outstanding < outstanding + aw.zeroExtend(16) - b.zeroExtend(16),
+          outstanding < outstanding + awQ.zeroExtend(16) - b.zeroExtend(16),
           If(
             pop,
             then: [
@@ -369,11 +473,53 @@ class HarborDmaSnoop extends Module {
     _range(
       clk,
       reset,
-      add: aw,
-      lo: first,
-      hi: lastLine,
+      add: rangeQ,
+      lo: firstQ,
+      hi: lastQ,
       busy: outstanding.neq(0) | ~idle,
+      lineShift: _lineBits,
+      outside: nW < aW ? outsideQ : null,
+      upper: nW < aW ? upper : null,
     );
+    if (nW == aW) addOutput('window_miss') <= Const(0);
+  }
+
+  /// The number of low address bits in which [ranges] differ, and the value
+  /// of the bits above them. The width is at least 17 bits so a legal burst
+  /// stays inside it. Throws when [ranges] is empty or a range has bit 63
+  /// set, a size of 0 or an end past [addressWidth] bits.
+  static (int, BigInt) _windowBits(
+    List<BusAddressRange> ranges,
+    int addressWidth,
+  ) {
+    if (ranges.isEmpty) throw ArgumentError('writeWindow is empty.');
+    var differ = BigInt.zero;
+    final base = BigInt.from(ranges.first.start);
+    for (final r in ranges) {
+      if (r.start < 0 || r.size <= 0 || r.end <= 0) {
+        throw ArgumentError(
+          'write window range ${r.start.toRadixString(16)}+${r.size} has '
+          'bit 63 set or no size.',
+        );
+      }
+      final start = BigInt.from(r.start);
+      final last = BigInt.from(r.end - 1);
+      if (last.bitLength > addressWidth) {
+        throw ArgumentError(
+          'write window range ${r.start.toRadixString(16)}+${r.size} does '
+          'not fit in $addressWidth address bits.',
+        );
+      }
+      differ |= (start ^ base) | (last ^ base);
+    }
+    final bits = differ.bitLength < 17 ? 17 : differ.bitLength;
+    final w = bits > addressWidth ? addressWidth : bits;
+    return (w, (base >> w) << w);
+  }
+
+  static String _windowName(List<BusAddressRange> ranges, int addressWidth) {
+    final (w, base) = _windowBits(ranges, addressWidth);
+    return '_w${w}_b${base.toRadixString(16)}';
   }
 
   /// Inline stage on a Wishbone master. Each acknowledged write beat gives
