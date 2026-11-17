@@ -20,6 +20,7 @@ const _blkSize = 0x50;
 const _intStatus = 0x60;
 const _intEnable = 0x68;
 const _admaAddr = 0x70;
+const _diag = 0x90;
 
 /// Reference SD CRC7 (x^7 + x^3 + 1) over an MSB-first bit list, mirroring the
 /// hardware. Returns 7 bits, MSB-first.
@@ -925,7 +926,8 @@ void main() {
           responseEndSeen = true;
           waitAfterResponse++;
         }
-        if (responseEndSeen && datOe.value.toInt() == 1) staleStarted = true;
+        if (responseEndSeen && (datOe.value.toInt() & 1) == 1)
+          staleStarted = true;
         previousLow = low;
       }
       expect(responseIndex, equals(response.length));
@@ -949,7 +951,7 @@ void main() {
       var previousClk = sdClk.value.toInt();
       for (var cycle = 0; cycle < 4000; cycle++) {
         await clk.nextPosedge;
-        final dataDriving = datOe.value.toInt() == 1;
+        final dataDriving = (datOe.value.toInt() & 1) == 1;
         if (dataDriving) sawData = true;
         final currentClk = sdClk.value.toInt();
         if (previousClk == 0 && currentClk == 1 && dataDriving) {
@@ -1141,7 +1143,7 @@ void main() {
         await clk.nextPosedge;
         final cmdSending = cmdOe.value.toInt() == 1;
         if (cmdSending) sawCmd = true;
-        final datDriving = datOe.value.toInt() == 1;
+        final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
         if (sawCmd &&
             !cmdSending &&
@@ -1186,6 +1188,116 @@ void main() {
     });
 
     test(
+      'DAT3 is held high and DAT0..2 are released outside a write',
+      () async {
+        await setUpDut();
+        await busWrite(_intEnable, 0x11);
+        for (var i = 0; i < 20; i++) {
+          await clk.nextPosedge;
+          expect(datOe.value.toInt(), equals(0x8));
+          expect(datOut.value.toInt() & 0x8, equals(0x8));
+        }
+        final diag = await busRead(_diag);
+        expect((diag >> 16) & 0xF, equals(0x8));
+        expect(diag & 0x2, equals(0));
+        expect(top.output('sd_diag').value.toInt() & 0xF0000, equals(0x80000));
+        // CMD0 keeps the same drive through the whole command.
+        await busWrite(_cmdArg, 0);
+        await busWrite(_cmd, 0);
+        for (var i = 0; i < 600; i++) {
+          await clk.nextPosedge;
+          expect(datOe.value.toInt(), equals(0x8));
+          expect(datOut.value.toInt() & 0x8, equals(0x8));
+        }
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('DAT3 is released in reset and held high once enabled', () async {
+      await setUpDut();
+      reset.inject(1);
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      expect(datOe.value.toInt(), equals(0));
+      reset.inject(0);
+      await clk.nextPosedge;
+      expect(datOe.value.toInt(), equals(0));
+      await busWrite(_ctrl, 0x1);
+      expect(datOe.value.toInt(), equals(0x8));
+      expect(datOut.value.toInt() & 0x8, equals(0x8));
+      await busWrite(_ctrl, 0x0);
+      expect(datOe.value.toInt(), equals(0));
+      await Simulator.endSimulation();
+    });
+
+    Future<void> startWrite1Bit() async {
+      await busWrite(_blkSize, 4);
+      await busWrite(_intEnable, 0x32);
+      await busWrite(_data, 0x11223344);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 24 | (1 << 6) | (1 << 8));
+      datIn.inject(1);
+      final resp = _resp48(0);
+      var sawCmd = false, ri = 0;
+      for (var i = 0; i < 4000; i++) {
+        await clk.nextPosedge;
+        final cmdSending = cmdOe.value.toInt() == 1;
+        if (cmdSending) sawCmd = true;
+        if (sawCmd &&
+            !cmdSending &&
+            sdClk.value.toInt() == 0 &&
+            ri < resp.length) {
+          cmdIn.inject(resp[ri]);
+          ri++;
+        }
+        if ((datOe.value.toInt() & 1) == 1) return;
+      }
+      fail('the write never drove DAT0');
+    }
+
+    test('a 1-bit write keeps DAT3 high and DAT1, DAT2 released', () async {
+      await setUpDut();
+      await startWrite1Bit();
+      var driven = 0;
+      for (var i = 0; i < 400; i++) {
+        await clk.nextPosedge;
+        final oe = datOe.value.toInt();
+        expect(oe & 0x6, equals(0), reason: 'DAT1 and DAT2 stay released');
+        expect(oe & 0x8, equals(0x8), reason: 'DAT3 stays driven');
+        expect(datOut.value.toInt() & 0x8, equals(0x8));
+        if (oe & 1 == 1) driven++;
+      }
+      expect(driven, greaterThan(40));
+      await Simulator.endSimulation();
+    });
+
+    test('clearing enable in a write releases the DAT pads', () async {
+      await setUpDut();
+      await startWrite1Bit();
+      await busWrite(_ctrl, 0x0);
+      for (var i = 0; i < 20; i++) {
+        await clk.nextPosedge;
+        expect(datOe.value.toInt() & 0x7, equals(0));
+      }
+      final status = await busRead(_intStatus);
+      expect(status & 0x22, equals(0x22)); // write error and data-done
+      expect((await busRead(_status)) & 0x100, equals(0)); // not busy
+      await Simulator.endSimulation();
+    });
+
+    test('a DAT reset in a write releases the DAT pads', () async {
+      await setUpDut();
+      await startWrite1Bit();
+      await busWrite(_ctrl, 0x201);
+      for (var i = 0; i < 20; i++) {
+        await clk.nextPosedge;
+        expect(datOe.value.toInt(), equals(0x8));
+        expect(datOut.value.toInt() & 0x7, equals(0));
+      }
+      await Simulator.endSimulation();
+    });
+
+    test(
       'a rejected CRC-status token raises the write-error interrupt',
       () async {
         await setUpDut();
@@ -1209,7 +1321,7 @@ void main() {
           await clk.nextPosedge;
           final cmdSending = cmdOe.value.toInt() == 1;
           if (cmdSending) sawCmd = true;
-          final datDriving = datOe.value.toInt() == 1;
+          final datDriving = (datOe.value.toInt() & 1) == 1;
           if (datDriving) sawDat = true;
           if (sawCmd &&
               !cmdSending &&
@@ -1305,7 +1417,7 @@ void main() {
         await clk.nextPosedge;
         final cmdSending = cmdOe.value.toInt() == 1;
         if (cmdSending) sawCmd = true;
-        final datDriving = datOe.value.toInt() == 1;
+        final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
         if (sawCmd &&
             !cmdSending &&
@@ -1406,7 +1518,7 @@ void main() {
         await clk.nextPosedge;
         final cmdSending = cmdOe.value.toInt() == 1;
         if (cmdSending) sawCmd = true;
-        final datDriving = datOe.value.toInt() == 1;
+        final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
         if (sawCmd &&
             !cmdSending &&
@@ -1959,7 +2071,7 @@ void main() {
         await clk.nextPosedge;
         final cmdSending = cmdOe.value.toInt() == 1;
         if (cmdSending) sawCmd = true;
-        final datDriving = datOe.value.toInt() == 1;
+        final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
         if (sawCmd &&
             !cmdSending &&

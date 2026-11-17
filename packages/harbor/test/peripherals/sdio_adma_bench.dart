@@ -494,7 +494,7 @@ class AdmaBench {
       await clk.nextPosedge;
       final sending = top.output('sd_cmd_oe').value.toInt() == 1;
       if (sending) sawDrive = true;
-      final datDriving = top.output('sd_dat_oe').value.toInt() == 1;
+      final datDriving = (top.output('sd_dat_oe').value.toInt() & 1) == 1;
       final high = top.output('sd_clk').value.toInt() == 1;
       final rise = high && !prevHigh;
       final launch = launchOnRise ? rise : (!high && prevHigh);
@@ -591,7 +591,7 @@ class AdmaBench {
       await clk.nextPosedge;
       final cmdSending = top.output('sd_cmd_oe').value.toInt() == 1;
       if (cmdSending) sawCmd = true;
-      final datDriving = top.output('sd_dat_oe').value.toInt() == 1;
+      final datDriving = (top.output('sd_dat_oe').value.toInt() & 1) == 1;
       if (datDriving) sawDat = true;
       final sdClk = top.output('sd_clk').value.toInt();
       if (sawCmd && !cmdSending && !sawDat && sdClk == 0 && ri < resp.length) {

@@ -222,6 +222,9 @@ class HarborSdioConfig with HarborPrettyString {
 ///   the descriptor word for state 1 and the data address for state 3, or
 ///   for a write error the start address of the burst that failed. The
 ///   specification gives a descriptor address for both states.)
+/// - 0x90: DIAG     (read only, the raw bus: [0] sampled CMD level, [1] CMD
+///   pad enable, [11:4] sampled DAT levels, [23:16] DAT pad enables. The
+///   same value leaves the `sd_diag` port.)
 ///
 /// The first error stays in ADMA_ERR and ADMA_ERR_ADDR until a write of 1
 /// to INT_STATUS[7] clears them. A later error does not replace it.
@@ -453,10 +456,11 @@ class HarborSdioController extends BridgeModule
       addOutput('sd_cmd_oe');
       createPort('sd_cmd_in', PortDirection.input);
       addOutput('sd_dat_out', width: maxBusW);
-      addOutput('sd_dat_oe');
+      addOutput('sd_dat_oe', width: maxBusW);
       createPort('sd_dat_in', PortDirection.input, width: maxBusW);
     }
     createPort('sd_cd', PortDirection.input); // card detect
+    addOutput('sd_diag', width: 32);
     addOutput('interrupt');
 
     final fabricClock = BusSlavePort.fabricClockInputs(
@@ -1114,25 +1118,42 @@ class HarborSdioController extends BridgeModule
     mw.wrespReady <= writesBusy | (reqValid & reqWrite);
 
     output('sd_clk') <= sdClkReg & ctrlEnable;
+    // Per-lane drive. The host drives the active lanes while it writes. In
+    // 1-bit mode an enabled host also holds DAT3 high, so a card does not read
+    // the line as an SPI mode select, and it releases DAT1 and DAT2. A disabled
+    // host drives nothing, so a card with switched power can be cycled.
+    final datOeLane = <Logic>[];
+    final datOutLane = <Logic>[];
+    for (var l = 0; l < maxW; l++) {
+      if (l == 3) {
+        datOeLane.add((datOeReg & laneMask[l]) | (wSel1 & ctrlEnable));
+        datOutLane.add(mux(wSel1, Const(1), datOutReg[l]));
+      } else {
+        datOeLane.add(datOeReg & laneMask[l]);
+        datOutLane.add(datOutReg[l]);
+      }
+    }
+    final datOePins = datOeLane.rconcat().named('dat_oe_pins');
+    final datOutPins = datOutLane.rconcat().named('dat_out_pins');
     if (ownPads) {
       // One IOBUF per bidirectional line: drive when the FSM asserts its output
       // enable, otherwise release and read the pad back in.
       final cmdPad = inOut('sd_cmd');
       cmdPad <= TriStateBuffer(cmdOut, enable: cmdOe).out;
       _sdCmdInInt! <= cmdPad;
-      // Per-lane IOBUF: lane l drives its pad when datOeReg is set, else reads.
+      // Per-lane IOBUF: lane l drives its pad when its enable is set, else reads.
       final datInBits = <Logic>[];
       for (var l = 0; l < maxBusW; l++) {
         final datPad = inOut('sd_dat$l');
-        datPad <= TriStateBuffer(datOutReg[l], enable: datOeReg).out;
+        datPad <= TriStateBuffer(datOutPins[l], enable: datOePins[l]).out;
         datInBits.add(datPad);
       }
       _sdDatInInt! <= datInBits.rconcat(); // lane 0 = LSB
     } else {
       output('sd_cmd_out') <= cmdOut;
       output('sd_cmd_oe') <= cmdOe;
-      output('sd_dat_out') <= datOutReg;
-      output('sd_dat_oe') <= datOeReg;
+      output('sd_dat_out') <= datOutPins;
+      output('sd_dat_oe') <= datOePins;
     }
     final intView = (intStatus | (admaErr.zeroExtend(9) << 7)).named(
       'int_view',
@@ -1154,6 +1175,16 @@ class HarborSdioController extends BridgeModule
       _crc7(cmdContent),
       Const(1, width: 1),
     ].concat();
+
+    // Raw bus view: [0] CMD level, [1] CMD pad enable, [11:4] DAT levels,
+    // [23:16] DAT pad enables. The levels are the sampled pad values.
+    final diag =
+        (cmdIn.zeroExtend(32) |
+                (cmdOe.zeroExtend(32) << 1) |
+                (datIn.zeroExtend(32) << 4) |
+                (datOePins.zeroExtend(32) << 16))
+            .named('sd_diag_value');
+    output('sd_diag') <= diag;
 
     // Register read data, by register index. An index past the last
     // register reads 0.
@@ -1182,6 +1213,7 @@ class HarborSdioController extends BridgeModule
       dataTimeout.zeroExtend(32),
       admaErrState.zeroExtend(32),
       admaErrAddr,
+      diag,
     ];
     final readWord = Logic(name: 'reg_read_word', width: 32);
     Combinational([
@@ -2216,6 +2248,23 @@ class HarborSdioController extends BridgeModule
                         bus.selAny(0x00, 1),
                         then: [
                           ctrlEnable < bus.dataIn[0],
+                          // Without the clock a write cannot finish, so a
+                          // disable stops it and releases the pads.
+                          If(
+                            ~bus.dataIn[0] &
+                                datState.gte(Const(dWStart, width: 4)),
+                            then: [
+                              datState < Const(dIdle, width: 4),
+                              datOeReg < Const(0),
+                              datOutReg < Const(0, width: maxW),
+                              wrAbort < Const(0),
+                              wrNeedFill < Const(0),
+                              dmaTailWait < Const(0),
+                              admaState < Const(aIdle, width: 3),
+                              busy < Const(0),
+                              ...setInt(intWriteErr | intDataDone),
+                            ],
+                          ),
                           // [5:4] selects the active bus width (0:1-bit,
                           // 1:4-bit, 2:8-bit), clamped to the configured
                           // maximum.
@@ -2237,6 +2286,8 @@ class HarborSdioController extends BridgeModule
                             then: [
                               datState < Const(dIdle, width: 4),
                               datOeReg < Const(0),
+                              datOutReg < Const(0, width: maxW),
+                              wrAbort < Const(0),
                               rxCount < Const(0, width: rxPtrW + 1),
                               rxRd < Const(0, width: rxPtrW),
                               rxWr < Const(0, width: rxPtrW),
