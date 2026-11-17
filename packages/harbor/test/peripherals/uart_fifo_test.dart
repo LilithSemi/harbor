@@ -336,14 +336,70 @@ void main() {
   test('MSR has no modem interrupt and follows MCR in loopback', () async {
     final d = await UartDut.start();
     await d.write(_ier, 0x08);
-    expect(await d.read(_msr), equals(0));
+    expect(await d.read(_msr), equals(0xb0));
     expect(await d.irq(), isFalse);
     // The loopback test of the Linux autoconfig.
     await d.write(_mcr, 0x1a);
     expect(await d.read(_msr) & 0xf0, equals(0x90));
     await d.write(_mcr, 0x00);
-    expect(await d.read(_msr), equals(0));
+    expect(await d.read(_msr), equals(0xb0));
     expect(await d.irq(), isFalse);
+    await Simulator.endSimulation();
+  });
+
+  for (final fifo in [false, true]) {
+    test('loopback returns THR bytes in RBR with FIFOs ${fifo ? 'on' : 'off'},'
+        ' holds tx high and ignores rx', () async {
+      final d = await UartDut.start(maxSimTime: 8000000);
+      await d.setDivisor(2);
+      await d.write(_fcr, fifo ? 0x01 : 0x00);
+      await d.write(_mcr, 0x10);
+      var txLow = 0;
+      var watch = true;
+      unawaited(() async {
+        while (watch) {
+          await d.clk.nextNegedge;
+          if (d.uart.tx.value.toInt() != 1) txLow++;
+        }
+      }());
+      final data = fifo ? [0xa5, 0x3c, 0x00, 0xff, 0x81] : [0xa5];
+      for (final b in data) {
+        await d.write(_thr, b);
+        if (!fifo) await d.wait(d.cyclesPerBit * 12);
+      }
+      await d.wait(d.cyclesPerBit * 12 * data.length);
+      final got = <int>[];
+      for (var i = 0; i < data.length; i++) {
+        expect(await d.read(_lsr) & 0x01, equals(1));
+        got.add(await d.read(_rbr));
+      }
+      expect(got, equals(data));
+      expect(await d.read(_lsr) & 0x01, equals(0));
+      await d.sendByte(0x5a);
+      expect(await d.read(_lsr) & 0x01, equals(0));
+      watch = false;
+      expect(txLow, equals(0));
+      await Simulator.endSimulation();
+    });
+  }
+
+  test('normal TX and RX work again after loopback is cleared', () async {
+    final d = await UartDut.start();
+    await d.setDivisor(2);
+    await d.write(_fcr, 0x01);
+    await d.write(_mcr, 0x10);
+    await d.write(_thr, 0x42);
+    await d.wait(d.cyclesPerBit * 14);
+    expect(await d.read(_rbr), equals(0x42));
+    await d.write(_mcr, 0x00);
+    await d.wait(d.cyclesPerBit * 4);
+    expect(await d.read(_lsr) & 0x01, equals(0));
+    final out = d.collectTx(1);
+    await d.write(_thr, 0x99);
+    expect(await out, equals([0x99]));
+    await d.sendByte(0x2d);
+    expect(await d.read(_lsr) & 0x01, equals(1));
+    expect(await d.read(_rbr), equals(0x2d));
     await Simulator.endSimulation();
   });
 }

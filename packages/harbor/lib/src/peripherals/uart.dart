@@ -23,8 +23,10 @@ import 'device_register.dart';
 /// the FIFOs off, each direction holds one byte, as in a 16450. A byte that
 /// arrives when the RX FIFO is full is dropped and sets LSR OE. A THR write
 /// when the TX FIFO is full is dropped. A frame with a low stop bit is
-/// dropped, so LSR bits 7 and 4:2 always read 0. The UART has no modem pins:
-/// MSR reads 0, and MSR follows MCR only in loopback.
+/// dropped, so LSR bits 7 and 4:2 always read 0. The UART has no modem pins.
+/// Outside loopback, MSR reads CTS, DSR and DCD high. In loopback (MCR bit 4),
+/// MSR follows MCR, the `tx` pin stays high and the transmitter output feeds
+/// the receiver. The `rx` pin is ignored.
 ///
 /// Register map (standard 16550), register index n:
 /// - 0: RBR (read) / THR (write) / DLL (DLAB=1)
@@ -242,6 +244,7 @@ class HarborUart extends BridgeModule
     final rxIn = input('rx');
     final rxSyncA = Logic(name: 'rx_sync_a');
     final rxSyncB = Logic(name: 'rx_sync_b');
+    final txLine = Logic(name: 'tx_line');
     final rxBusy = Logic(name: 'rx_busy');
     final rxBits = Logic(name: 'rx_bits', width: 4);
     final rxPhase = Logic(name: 'rx_phase', width: 4);
@@ -328,12 +331,12 @@ class HarborUart extends BridgeModule
           rxHasData, // DR
         ].concat();
 
-    // MSR. The UART has no modem pins. In loopback the upper nibble follows
-    // MCR and the delta bits stay 0.
+    // MSR. The UART has no modem pins, so CTS, DSR and DCD read high. In
+    // loopback the upper nibble follows MCR. The delta bits stay 0.
     final msr = mux(
       mcr[4],
       [mcr[3], mcr[2], mcr[0], mcr[1], Const(0, width: 4)].concat(),
-      Const(0, width: 8),
+      Const(0xB0, width: 8),
     );
 
     // Interrupt sources, highest priority first.
@@ -665,7 +668,7 @@ class HarborUart extends BridgeModule
           // edge and every 16 ticks after that (8N1, LSB first). The divisor
           // gate keeps the receiver idle until the UART is configured, the
           // same rule the transmitter follows.
-          rxSyncA < rxIn,
+          rxSyncA < mux(mcr[4], txLine, rxIn),
           rxSyncB < rxSyncA,
           If(
             ~rxBusy,
@@ -777,10 +780,12 @@ class HarborUart extends BridgeModule
       ),
     ]);
 
-    // TX output: LSB of shift register when busy, else idle high
+    // TX line: LSB of shift register when busy, else idle high. Loopback
+    // holds the pin high and feeds the line to the receiver synchronizer.
     Combinational([
-      If(txBusy, then: [tx < txShift[0]], orElse: [tx < Const(1)]),
+      If(txBusy, then: [txLine < txShift[0]], orElse: [txLine < Const(1)]),
     ]);
+    tx <= txLine | mcr[4];
   }
 
   /// A terminal on the TX line: decodes 8N1 serial and writes bytes to stdout.

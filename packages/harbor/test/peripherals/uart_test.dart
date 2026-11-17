@@ -223,7 +223,7 @@ void wordRegisterTests(HarborFabricKind kind) {
       await bus.write(0x10, 0x0b);
       expect(await bus.read(0x10), equals(0x0b));
       expect(await bus.read(0x14), equals(0x60));
-      expect(await bus.read(0x18), equals(0x00));
+      expect(await bus.read(0x18), equals(0xb0));
       await bus.write(0x1c, 0x5a);
       expect(await bus.read(0x1c), equals(0x5a));
 
@@ -502,7 +502,7 @@ void wideWordRegisterTests(HarborFabricKind kind, int width) {
       final d = await start();
       final bus = d.bus;
       // Reset values of registers 0 to 7 as read back.
-      final model = [0, 0, 0x01, 0x03, 0, 0x60, 0, 0];
+      final model = [0, 0, 0x01, 0x03, 0, 0x60, 0xb0, 0];
       Future<void> check(String why) async {
         for (var n = 0; n < 8; n++) {
           expect(await _readSlot(bus, width, n), model[n], reason: '$why r$n');
@@ -568,13 +568,14 @@ void wideWordRegisterTests(HarborFabricKind kind, int width) {
         for (var s = 0; s < slots; s++) s: 0xffffff00 | (0x10 + s),
       };
       await _writeSlots(bus, width, last, writes);
-      // Registers 5 and 6 are read only, so they keep their values.
+      // Registers 5 and 6 are read only, so they keep their values. The write
+      // of 0x10 to MCR starts loopback, where MSR follows the other MCR bits.
       final read = await _readWord(bus, width, last);
       for (var s = 0; s < slots; s++) {
         final n = first + s;
         final want = switch (n) {
           5 => 0x60,
-          6 => 0x00,
+          6 => first <= 4 ? 0x00 : 0xb0,
           _ => 0x10 + s,
         };
         expect(read[s], want, reason: 'register $n');
@@ -592,7 +593,9 @@ void wideWordRegisterTests(HarborFabricKind kind, int width) {
       expect(await _readSlot(bus, width, skipped), before, reason: 'skipped');
       expect(await _readSlot(bus, width, strobed), 0x07, reason: 'strobed');
 
-      // Word 0 has THR, so the same write sends a character.
+      // Word 0 has THR, so the same write sends a character. Loopback from
+      // the MCR write above would hold the TX pin high.
+      await _writeReg(bus, width, 4, 0x00);
       await _writeReg(bus, width, 3, 0x83);
       await _writeReg(bus, width, 0, 0x04);
       await _writeReg(bus, width, 3, 0x03);
