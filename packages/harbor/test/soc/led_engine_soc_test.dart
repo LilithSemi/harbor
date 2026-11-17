@@ -61,10 +61,27 @@ void _checkOutputs(HarborSoC soc, HarborLedEngine led, List<String> pins) {
 }
 
 void main() {
+  const sites = {
+    'kc705': ['AB8'],
+    'ulx3s-85f': ['B2'],
+    'arty-s7-50': [
+      'E18',
+      'F13',
+      'E13',
+      'H15',
+      'J15',
+      'G17',
+      'F15',
+      'E15',
+      'F18',
+      'E14',
+    ],
+  };
   for (final name in ['kc705', 'ulx3s-85f', 'arty-s7-50']) {
     test('$name: the board LED channel binds its pins', () async {
       final board = HarborBoard.get(name);
       final ch = board.ledChannels.single;
+      final target = board.fpgaTarget();
       final led = HarborLedEngine(
         baseAddress: _base,
         busAddressWidth: 32,
@@ -76,17 +93,30 @@ void main() {
         'led_$name'.replaceAll('-', '_'),
         HarborFabricKind.wishbone,
         led,
-        target: board.fpgaTarget(),
+        target: target,
         board: board,
-        pins: ch.pins,
       );
+      soc.bindBoardLeds(led, board);
       soc.buildFabric();
       await soc.build();
-      expect(ch.pins, hasLength(led.channelOut(0).length));
+      final ports = {
+        for (final e in soc.outputs.entries)
+          if (e.key.startsWith('led')) e.key: e.value.width,
+      };
+      expect(ports, isNotEmpty);
+      expect(target.missingPins(ports), isEmpty);
+      final constraints = target.generateConstraints(
+        knownPorts: ports.keys.toSet(),
+      );
       for (final pin in ch.pins) {
-        expect(board.pins.containsKey(pin), isTrue, reason: pin);
+        final site = board.pins[pin]!.split(' ').first;
+        expect(constraints, contains(site), reason: pin);
       }
-      _checkOutputs(soc, led, ch.pins);
+      for (final site in sites[name]!) {
+        expect(constraints, contains(site));
+      }
+      expect(soc.dumpSystemVerilog(), contains(led.definitionName));
+      expect(soc.generateDts(), contains('harbor,led'));
     });
   }
 
@@ -94,6 +124,9 @@ void main() {
     'a badge-like ECP5 SoC drives one serial channel on a free pin',
     () async {
       final board = HarborBoard.get('ulx3s-85f');
+      final target = board.fpgaTarget(
+        extraPins: {'led_ws': 'B2 LVCMOS33 DRIVE=4'},
+      );
       final led = HarborLedEngine(
         baseAddress: _base,
         busAddressWidth: 32,
@@ -103,15 +136,19 @@ void main() {
         'led_badge',
         HarborFabricKind.wishbone,
         led,
-        target: board.fpgaTarget(),
+        target: target,
         board: board,
-        pins: const ['led[7]'],
+        pins: const ['led_ws'],
       );
       soc.buildFabric();
       await soc.build();
-      expect(board.pins.containsKey('led[7]'), isTrue);
       expect(led.channels.single.kind, HarborLedKind.serial);
-      _checkOutputs(soc, led, const ['led[7]']);
+      expect(target.missingPins({'led_ws': 1}), isEmpty);
+      expect(
+        target.generateConstraints(knownPorts: {'led_ws'}),
+        contains('B2'),
+      );
+      _checkOutputs(soc, led, const ['led_ws']);
     },
   );
 

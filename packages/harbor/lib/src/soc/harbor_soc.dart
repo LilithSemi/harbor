@@ -23,6 +23,7 @@ import '../pdk/klayout.dart';
 import '../peripherals/flash.dart';
 import '../peripherals/harbor_ddr3.dart';
 import '../peripherals/harbor_sdram.dart';
+import '../peripherals/led_engine.dart';
 import '../peripherals/maskrom.dart';
 import '../peripherals/spi_flash.dart';
 import '../peripherals/sram.dart';
@@ -733,6 +734,49 @@ class HarborSoC extends BridgeModule {
     // has to read; the peripheral itself only knows its own port names.
     (_exposedPins[peripheral] ??= {})[portName] = topName;
     return pullUpPort(peripheral.port(portName), newPortName: topName);
+  }
+
+  /// Binds the pins of [engine] to the LED pins of [board].
+  ///
+  /// Channel `k` of [engine] drives `board.ledChannels[k]`. A catalog pin
+  /// such as `led[3]` joins one top-level vector port `led`, bit 3, so that
+  /// the pin constraints match. A pin without an index, such as `led0_r`,
+  /// is a 1-bit port of the same name. The pin indices of one vector must be
+  /// 0 to N-1 with no gap.
+  void bindBoardLeds(HarborLedEngine engine, HarborBoard board) {
+    if (board.ledChannels.length > engine.channels.length) {
+      throw ArgumentError(
+        '${board.name} has ${board.ledChannels.length} LED channels but the '
+        'engine has ${engine.channels.length}',
+      );
+    }
+    final vectors = <String, Map<int, Logic>>{};
+    for (var k = 0; k < board.ledChannels.length; k++) {
+      final pins = board.ledChannels[k].pins;
+      final outs = engine.channelOut(k);
+      if (pins.length != outs.length) {
+        throw ArgumentError(
+          'LED channel $k has ${outs.length} outputs for ${pins.length} pins',
+        );
+      }
+      for (var i = 0; i < pins.length; i++) {
+        final m = RegExp(r'^(\w+)\[(\d+)\]$').firstMatch(pins[i]);
+        if (m == null) {
+          addOutput(pins[i]) <= outs[i];
+        } else {
+          (vectors[m.group(1)!] ??= {})[int.parse(m.group(2)!)] = outs[i];
+        }
+      }
+    }
+    for (final MapEntry(key: name, value: bits) in vectors.entries) {
+      for (var i = 0; i < bits.length; i++) {
+        if (!bits.containsKey(i)) {
+          throw ArgumentError('LED pin $name[$i] is missing');
+        }
+      }
+      addOutput(name, width: bits.length) <=
+          [for (var i = 0; i < bits.length; i++) bits[i]!].rconcat();
+    }
   }
 
   /// Peripheral -> (its port name -> top-level port name), for every pin

@@ -125,7 +125,7 @@ void main() {
         pixelSource: HarborLedPixelSource.dma,
         fabricKind: HarborFabricKind.wishbone,
       ),
-      1650,
+      1570,
     ),
     'dma on AXI4': (
       () => HarborLedEngine(
