@@ -64,6 +64,7 @@ export 'src/clock/wishbone_cdc.dart';
 // SoC
 export 'src/soc/acpi.dart';
 export 'src/soc/board.dart';
+export 'src/soc/board_zon.dart';
 export 'src/soc/boot_sequencer.dart';
 export 'src/soc/cpu.dart';
 export 'src/soc/device_tree.dart';

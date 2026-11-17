@@ -5,6 +5,7 @@ import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
+import '../soc/board_zon.dart' show HarborMemoryInfo, HarborMemoryKind;
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../util/pretty_string.dart';
@@ -456,6 +457,13 @@ class HarborPsramController extends BridgeModule
   List<BusAddressRange> get systemMemory => [
     BusAddressRange(baseAddress, config.size),
   ];
+
+  @override
+  HarborMemoryInfo get memoryInfo => HarborMemoryInfo(
+    kind: HarborMemoryKind.psram,
+    sizeBytes: config.size,
+    widthBits: config.mode == HarborPsramMode.quad ? 4 : 1,
+  );
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(

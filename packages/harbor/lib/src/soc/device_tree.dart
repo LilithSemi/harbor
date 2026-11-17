@@ -1,5 +1,6 @@
 import '../bus/bus.dart';
 import '../util/pretty_string.dart';
+import 'board_zon.dart' show HarborMemoryInfo;
 import 'cpu.dart';
 
 /// A device tree node: an immutable value object describing a device's
@@ -214,6 +215,10 @@ mixin HarborSystemMemoryProvider {
   /// The usable RAM span(s) this device backs. Excludes any control-register
   /// window, matching the ACPI memory view.
   List<BusAddressRange> get systemMemory;
+
+  /// The kind, size and data width of this memory, for the firmware board
+  /// file.
+  HarborMemoryInfo get memoryInfo;
 }
 
 /// Generates a Linux/U-Boot compatible `.dts` file from a list of

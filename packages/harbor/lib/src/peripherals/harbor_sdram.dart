@@ -13,6 +13,7 @@ import '../blackbox/ecp5/ecp5.dart';
 import '../bus/bus_exports.dart';
 import '../clock/wishbone_cdc_fifo.dart';
 import '../soc/acpi.dart';
+import '../soc/board_zon.dart' show HarborMemoryInfo, HarborMemoryKind;
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../soc/target.dart';
@@ -1447,6 +1448,13 @@ class HarborSdram extends BridgeModule
   List<BusAddressRange> get systemMemory => [
     BusAddressRange(baseAddress, config.sizeBytes),
   ];
+
+  @override
+  HarborMemoryInfo get memoryInfo => HarborMemoryInfo(
+    kind: HarborMemoryKind.sdram,
+    sizeBytes: config.sizeBytes,
+    widthBits: config.dataWidth,
+  );
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(

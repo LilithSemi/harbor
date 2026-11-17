@@ -12,6 +12,8 @@ import '../bus/port/memory_waist.dart';
 import '../bus/port/port_cdc.dart';
 import '../clock/cdc.dart';
 import '../soc/acpi.dart';
+import '../soc/board_zon.dart'
+    show HarborMemoryFormFactor, HarborMemoryInfo, HarborMemoryKind;
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../soc/target.dart';
@@ -118,6 +120,10 @@ class HarborDdr3 extends BridgeModule
   /// false (default), wb2 stays tied off and dtNode is unchanged from train=hw.
   final bool runtimeTrainable;
 
+  /// How the DRAM is fitted to the board. A socketed DRAM has a fitted size
+  /// that the build cannot know.
+  final HarborMemoryFormFactor memoryFormFactor;
+
   /// The fabric kind of [bus] and [trainBus].
   final HarborFabricKind protocol;
 
@@ -214,6 +220,7 @@ class HarborDdr3 extends BridgeModule
     this.ckPeriodPs = 3333,
     this.controllerGearRatio = 1,
     this.runtimeTrainable = false,
+    this.memoryFormFactor = HarborMemoryFormFactor.chip,
     this.simExternalMem = false,
     this.protocol = HarborFabricKind.wishbone,
     this.idWidth = 1,
@@ -1524,6 +1531,23 @@ struct DramStore {
   List<BusAddressRange> get systemMemory => [
     BusAddressRange(baseAddress, usableSize),
   ];
+
+  @override
+  HarborMemoryInfo get memoryInfo => HarborMemoryInfo(
+    kind: switch (config.type) {
+      HarborDdrType.ddr => HarborMemoryKind.ddr,
+      HarborDdrType.ddr2 => HarborMemoryKind.ddr2,
+      HarborDdrType.ddr3 || HarborDdrType.ddr3l => HarborMemoryKind.ddr3,
+      HarborDdrType.ddr4 => HarborMemoryKind.ddr4,
+      HarborDdrType.ddr5 => HarborMemoryKind.ddr5,
+      HarborDdrType.lpddr4 => HarborMemoryKind.lpddr4,
+      HarborDdrType.lpddr5 => HarborMemoryKind.lpddr5,
+    },
+    sizeBytes: usableSize,
+    maxSizeBytes: config.size,
+    widthBits: config.dataWidth,
+    formFactor: memoryFormFactor,
+  );
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(

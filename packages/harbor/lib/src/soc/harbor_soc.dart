@@ -27,6 +27,8 @@ import '../peripherals/maskrom.dart';
 import '../peripherals/spi_flash.dart';
 import '../peripherals/sram.dart';
 import 'acpi.dart';
+import 'board.dart';
+import 'board_zon.dart';
 import 'cpu.dart';
 import 'device_tree.dart';
 import 'graph.dart';
@@ -231,6 +233,10 @@ class HarborSoC extends BridgeModule {
   /// and replaces [svdVendor]. Null leaves [svdVendor] in use.
   final String? manufacturer;
 
+  /// The board preset this SoC builds for, or null. It fills the board fields
+  /// of [generateBoardZon].
+  final HarborBoard? board;
+
   /// Vendor name for the generated CMSIS-SVD file.
   final String svdVendor;
 
@@ -292,6 +298,7 @@ class HarborSoC extends BridgeModule {
     required this.compatible,
     String? model,
     this.manufacturer,
+    this.board,
     this.fabricKind = HarborFabricKind.wishbone,
     this.fabricTopology,
     this.acpiOemId = 'LILSEM',
@@ -1448,6 +1455,24 @@ class HarborSoC extends BridgeModule {
     ).generate();
   }
 
+  /// Generates the Zig object notation file that the firmware reads to make
+  /// its SMBIOS tables.
+  ///
+  /// Each field is present only when this SoC knows it. The memory fields
+  /// come from the peripherals that back system memory.
+  String generateBoardZon() => HarborBoardZonGenerator(
+    vendor: manufacturer,
+    product: _explicitModel,
+    family: name,
+    cpus: cpus,
+    memories: _peripherals
+        .map((e) => e.module)
+        .whereType<HarborSystemMemoryProvider>()
+        .map((p) => p.memoryInfo)
+        .toList(),
+    board: board,
+  ).generate();
+
   /// Generates a CMSIS-SVD (System View Description) file.
   String generateSvd() {
     final assign = interruptAssignments();
@@ -1498,6 +1523,7 @@ class HarborSoC extends BridgeModule {
   /// Generates:
   /// - `rtl/`: SystemVerilog files + filelist.f (via rohd_bridge)
   /// - `<name>.dts`: device tree source
+  /// - `<name>.board.zon`: firmware SMBIOS board data
   /// - `<name>.dot`: Graphviz topology graph
   /// - `<name>.mermaid.md`: Mermaid topology graph
   /// - Target-specific files:
@@ -1598,6 +1624,7 @@ class HarborSoC extends BridgeModule {
 
     // Device tree
     File('$path/$name.dts').writeAsStringSync(generateDts());
+    File('$path/$name.board.zon').writeAsStringSync(generateBoardZon());
 
     // CMSIS-SVD
     File('$path/$name.svd').writeAsStringSync(generateSvd());
