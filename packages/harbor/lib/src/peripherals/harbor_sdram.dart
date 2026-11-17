@@ -1629,9 +1629,15 @@ class HarborSdram extends BridgeModule
     },
   );
 
+  /// Bytes at the top of the sdram that the firmware must not use as RAM.
+  /// A device that keeps a buffer there sets it, and [systemMemory] ends
+  /// below it. The firmware reads `/memory` only, so a `reserved-memory` node
+  /// does not keep it away.
+  int firmwareReservedBytes = 0;
+
   @override
   List<BusAddressRange> get systemMemory => [
-    BusAddressRange(baseAddress, config.sizeBytes),
+    BusAddressRange(baseAddress, config.sizeBytes - firmwareReservedBytes),
   ];
 
   @override

@@ -87,7 +87,9 @@ extension HarborSocScanoutDisplay on HarborSoC {
   /// aligned to a page of the sdram, and so must [framebufferSize]. The
   /// region is a `reserved-memory` node with `no-map`, a `shared-dma-pool`
   /// that the display driver takes its buffers from, so no other part of the
-  /// system uses it. [simpleFramebuffer] adds a `simple-framebuffer` node for
+  /// system uses it. The region must end at the top of the sdram, and the
+  /// `memory` node of the sdram ends at [framebufferBase], because the firmware
+  /// reads `/memory` only and does not read `reserved-memory`. [simpleFramebuffer] adds a `simple-framebuffer` node for
   /// the same region, for the firmware and early boot, and it is on by default
   /// only with [enableOnReset], because a display that is off shows nothing
   /// for the firmware to hand over. The driver takes over from it.
@@ -216,6 +218,14 @@ extension HarborSocScanoutDisplay on HarborSoC {
         '0x${sdramEnd.toRadixString(16)}',
       );
     }
+    if (framebufferBase + size != sdramEnd) {
+      throw ArgumentError(
+        'the framebuffer must end at the top of the sdram, 0x'
+        '${sdramEnd.toRadixString(16)}: the firmware reads /memory only, so '
+        'the memory node ends at the framebuffer base and nothing may lie '
+        'above it',
+      );
+    }
 
     var shift = clockDomain(shiftDomain);
     var pixel = clockDomain(pixelDomain);
@@ -310,6 +320,8 @@ extension HarborSocScanoutDisplay on HarborSoC {
         '${need.periodCycles} cycles at ${sdram.clockHz} Hz',
       );
     }
+
+    sdram.firmwareReservedBytes = sdramEnd - framebufferBase;
 
     final gate = sdram.tryOutput('init_done') != null;
     final display = addPeripheral(

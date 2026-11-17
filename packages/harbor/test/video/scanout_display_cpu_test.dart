@@ -82,7 +82,7 @@ const _timing = HarborDisplayTiming(
 
 const _sdramBase = 0x80000000;
 const _displayBase = 0x10008000;
-const _fbBase = 0x80100000;
+const _fbBase = 0x81e00000;
 
 /// A ULX3S shaped SoC: AXI4, the sdram on the 25 MHz bus clock with the real
 /// controller, phy and pin model, and the display from the one-call helper.

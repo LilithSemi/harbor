@@ -137,7 +137,7 @@ Future<void> _pnr(int sysHz, {int? memHz}) async {
         sdram: sdram,
         timing: const HarborDisplayTiming.vga640x480(),
         pixelClockHz: 25000000,
-        framebufferBase: 0x80100000,
+        framebufferBase: 0x81e00000,
         baseAddress: _displayBase,
       );
       soc.buildFabric();

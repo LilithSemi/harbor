@@ -79,7 +79,7 @@ HarborSdram _sdram(
     timing: const HarborDisplayTiming.vga640x480(),
     formats: formats,
     pixelClockHz: 25000000,
-    framebufferBase: 0x80100000,
+    framebufferBase: 0x81e00000,
     baseAddress: 0x10008000,
     busDataWidth: 64,
     enableOnReset: true,
@@ -99,7 +99,7 @@ const _dts = r'''
 
     memory@80000000 {
         device_type = "memory";
-        reg = <0x80000000 0x2000000>;
+        reg = <0x80000000 0x1e00000>;
     };
 
     reserved-memory {
@@ -107,9 +107,9 @@ const _dts = r'''
         #size-cells = <1>;
         ranges;
 
-        display_fb: framebuffer@80100000 {
+        display_fb: framebuffer@81e00000 {
             compatible = "shared-dma-pool";
-            reg = <0x80100000 0x200000>;
+            reg = <0x81e00000 0x200000>;
             no-map;
         };
     };
@@ -154,9 +154,9 @@ const _dts = r'''
             memory-region = <&display_fb>;
         };
 
-        simple-framebuffer@80100000 {
+        simple-framebuffer@81e00000 {
             compatible = "simple-framebuffer";
-            reg = <0x80100000 0x200000>;
+            reg = <0x81e00000 0x200000>;
             width = <640>;
             height = <480>;
             stride = <2048>;
@@ -173,6 +173,28 @@ void main() {
     expect(b.soc.generateDts(), _dts);
   });
 
+  test('a framebuffer pool below the top of the sdram is rejected', () {
+    final target = _target();
+    final soc = _soc(target);
+    final sdram = soc.addPeripheral(_sdram(target));
+    expect(
+      () => soc.addScanoutDisplay(
+        sdram: sdram,
+        timing: const HarborDisplayTiming.vga640x480(),
+        pixelClockHz: 25000000,
+        framebufferBase: 0x81c00000,
+        baseAddress: 0x10008000,
+      ),
+      throwsA(
+        isA<ArgumentError>().having(
+          (e) => e.message,
+          'message',
+          contains('firmware reads /memory only'),
+        ),
+      ),
+    );
+  });
+
   test('ACPI has a PRP0001 display with the same properties', () {
     final asl = _build().soc.generateAcpi();
     final start = asl.indexOf('Device (D001)');
@@ -182,7 +204,7 @@ void main() {
       block,
       contains('Memory32Fixed (ReadWrite, 0x10008000, 0x00001000)'),
     );
-    expect(block, isNot(contains('0x80100000')));
+    expect(block, isNot(contains('0x81e00000')));
     expect(block, contains('0x1\n'), reason: 'interrupt source 1');
     for (final p in [
       '"compatible", Package () { "harbor,display" }',
@@ -236,7 +258,7 @@ void main() {
         reason: e.key,
       );
     }
-    expect(block, contains('<resetValue>0x80100000</resetValue>'));
+    expect(block, contains('<resetValue>0x81E00000</resetValue>'));
   });
 
   test(
@@ -298,7 +320,7 @@ void main() {
     final display = soc.addScanoutDisplay(
       sdram: sdram,
       timing: const HarborDisplayTiming.vga640x480(),
-      framebufferBase: 0x80100000,
+      framebufferBase: 0x81e00000,
       baseAddress: 0x10008000,
     );
     expect(display.timing.pixelClock, 25000000);
@@ -338,7 +360,7 @@ void main() {
           timing: const HarborDisplayTiming.vga640x480(),
           formats: const [HarborPixelFormat.xrgb8888],
           pixelClockHz: 25000000,
-          framebufferBase: 0x80100000,
+          framebufferBase: 0x81c00000,
           baseAddress: 0x10008000,
         ),
         throwsA(
@@ -361,7 +383,7 @@ void main() {
           timing: const HarborDisplayTiming.vga640x480(),
           formats: const [HarborPixelFormat.rgb565, HarborPixelFormat.xrgb8888],
           pixelClockHz: 25000000,
-          framebufferBase: 0x80100000,
+          framebufferBase: 0x81c00000,
           baseAddress: 0x10008000,
         ),
         throwsArgumentError,
@@ -440,7 +462,7 @@ void main() {
           sdram: sdram,
           timing: const HarborDisplayTiming.vga640x480(),
           pixelClockHz: 25000000,
-          framebufferBase: 0x80100000,
+          framebufferBase: 0x81e00000,
           baseAddress: 0x10008000,
         ),
         throwsArgumentError,
@@ -467,7 +489,7 @@ void main() {
           sdram: sdram,
           timing: tight,
           pixelClockHz: 25000000,
-          framebufferBase: 0x80100000,
+          framebufferBase: 0x81e00000,
           baseAddress: 0x10008000,
         ),
         throwsArgumentError,
@@ -485,7 +507,7 @@ void main() {
           sdram: sdram,
           timing: const HarborDisplayTiming.vga640x480(),
           pixelClockHz: 25000000,
-          framebufferBase: 0x80100000,
+          framebufferBase: 0x81e00000,
           baseAddress: 0x10008000,
         ),
         throwsArgumentError,
@@ -533,7 +555,7 @@ void main() {
           sdram: sdram,
           timing: const HarborDisplayTiming.vga640x480(),
           pixelClockHz: 25000000,
-          framebufferBase: 0x80100000,
+          framebufferBase: 0x81e00000,
           baseAddress: 0x10008000,
         ),
         throwsStateError,
