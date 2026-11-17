@@ -58,4 +58,43 @@ void main() {
     expect(dt.properties['harbor,pixel-colors'], equals([0]));
     expect(dt.properties['harbor,pixel-max-brightness'], equals([100]));
   });
+
+  test('a pixel with one pin is mono and names its byte', () {
+    final dt = _engine(const [
+      HarborLedChannelConfig.pwm([
+        HarborLedPin(0, HarborLedByte.r),
+        HarborLedPin(1, HarborLedByte.b),
+        HarborLedPin(2, HarborLedByte.r),
+        HarborLedPin(2, HarborLedByte.g),
+      ]),
+    ]).dtNode;
+    expect(dt.properties['harbor,pixel-colors'], equals([1, 1, 0]));
+    expect(dt.properties['harbor,pixel-mono-byte'], equals([0, 2, 2]));
+  });
+
+  test(
+    'the owner property appears only when a coprocessor owns the engine',
+    () {
+      final kernel = _engine(const [HarborLedChannelConfig.serial()]);
+      expect(kernel.dtNode.properties.containsKey('harbor,owner'), isFalse);
+      final cp = HarborLedEngine(baseAddress: 0x10005000, kernelOwned: false);
+      expect(cp.dtNode.properties['harbor,owner'], equals('coprocessor'));
+      expect(cp.acpiDevice.properties['harbor,owner'], equals('coprocessor'));
+    },
+  );
+
+  test('a dma build gives the dma address width', () {
+    final led = HarborLedEngine(
+      baseAddress: 0x10005000,
+      pixelSource: HarborLedPixelSource.dma,
+      dmaAddressWidth: 40,
+    );
+    expect(led.dtNode.properties['harbor,dma-address-width'], equals(40));
+    expect(
+      _engine(const [
+        HarborLedChannelConfig.serial(),
+      ]).dtNode.properties.containsKey('harbor,dma-address-width'),
+      isFalse,
+    );
+  });
 }

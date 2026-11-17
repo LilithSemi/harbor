@@ -21,6 +21,8 @@
 
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
+#include <linux/debugfs.h>
+#include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -31,6 +33,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/seq_file.h>
 #include <linux/property.h>
 #include <linux/sysfs.h>
 #include <linux/unaligned.h>
@@ -49,7 +52,9 @@
 #define HLED_INFO_ITEM_LOG2	GENMASK(15, 8)
 #define HLED_INFO_PIXELS	GENMASK(27, 16)
 
+#define HLED_SRC_NONE		0
 #define HLED_SRC_RAM		1
+#define HLED_SRC_DMA		2
 
 #define HLED_CTRL		0x00
 #define HLED_STATUS		0x08
@@ -59,6 +64,8 @@
 #define HLED_T1L		0x28
 #define HLED_RESET		0x30
 #define HLED_PIXEL_COUNT	0x38
+#define HLED_BASE_LO		0x40
+#define HLED_BASE_HI		0x48
 #define HLED_REFRESH		0x50
 
 #define HLED_CTRL_SEND		BIT(0)
@@ -79,7 +86,7 @@
 #define HLED_T0L_NS		850
 #define HLED_T1H_NS		800
 #define HLED_T1L_NS		450
-#define HLED_RESET_NS		80000
+#define HLED_RESET_NS		300000
 #define HLED_SERIAL_TICK_HZ	20000000
 /* One pwm period is 256 ticks. 1 kHz needs a 256 kHz tick. */
 #define HLED_PWM_TICK_HZ	256000
@@ -91,6 +98,7 @@ struct harbor_led_pixel {
 	unsigned int index;
 	u32 max;
 	bool mono;
+	unsigned int shift;
 	struct led_classdev mono_cdev;
 	struct led_classdev_mc mc_cdev;
 	struct mc_subled subled[3];
@@ -110,6 +118,10 @@ struct harbor_led {
 	bool serial[HLED_MAX_CHANNELS];
 	bool has_serial;
 	bool raw;
+	bool owned;
+	void *buf;
+	dma_addr_t buf_dma;
+	struct dentry *dbg;
 	atomic_t frames[HLED_MAX_CHANNELS];
 	struct mutex lock;
 	struct harbor_led_pixel *pixels;
@@ -121,13 +133,19 @@ static void __iomem *hled_ch(struct harbor_led *hl, unsigned int ch,
 	return hl->base + HLED_CH_BASE + ch * HLED_CH_STRIDE + off;
 }
 
-/* Called with hl->lock held. */
-static void hled_send_all(struct harbor_led *hl)
+/*
+ * Called with hl->lock held. A serial channel in raw mode runs the item
+ * window, so only an explicit send starts it.
+ */
+static void hled_send(struct harbor_led *hl, bool force)
 {
 	unsigned int ch;
 
-	for (ch = 0; ch < hl->channels; ch++)
+	for (ch = 0; ch < hl->channels; ch++) {
+		if (!force && hl->serial[ch] && hl->raw)
+			continue;
 		writel(hl->ctrl[ch] | HLED_CTRL_SEND, hled_ch(hl, ch, HLED_CTRL));
+	}
 }
 
 static int hled_write_pixel(struct harbor_led_pixel *p, u32 word)
@@ -135,8 +153,13 @@ static int hled_write_pixel(struct harbor_led_pixel *p, u32 word)
 	struct harbor_led *hl = p->hl;
 
 	mutex_lock(&hl->lock);
-	writel(word, hl->base + HLED_PIXELS + 4 * p->index);
-	hled_send_all(hl);
+	if (hl->buf) {
+		((__le32 *)hl->buf)[p->index] = cpu_to_le32(word);
+		wmb();
+	} else {
+		writel(word, hl->base + HLED_PIXELS + 4 * p->index);
+	}
+	hled_send(hl, false);
 	mutex_unlock(&hl->lock);
 
 	return 0;
@@ -147,7 +170,7 @@ static int hled_mono_set(struct led_classdev *cdev, enum led_brightness b)
 	struct harbor_led_pixel *p =
 		container_of(cdev, struct harbor_led_pixel, mono_cdev);
 
-	return hled_write_pixel(p, min_t(u32, b, p->max));
+	return hled_write_pixel(p, min_t(u32, b, p->max) << p->shift);
 }
 
 static int hled_mc_set(struct led_classdev *cdev, enum led_brightness b)
@@ -166,7 +189,7 @@ static int hled_mc_set(struct led_classdev *cdev, enum led_brightness b)
 }
 
 static int hled_register_pixel(struct harbor_led *hl, unsigned int index,
-			       bool mono, u32 max)
+			       bool mono, u32 mono_byte, u32 max)
 {
 	struct harbor_led_pixel *p = &hl->pixels[index];
 	struct led_classdev *cdev;
@@ -175,12 +198,13 @@ static int hled_register_pixel(struct harbor_led *hl, unsigned int index,
 	p->hl = hl;
 	p->index = index;
 	p->mono = mono;
+	p->shift = mono_byte == 0 ? 16 : mono_byte == 1 ? 8 : mono_byte == 3 ? 24 : 0;
 	p->max = min_t(u32, max, 255);
 	if (!p->max)
 		p->max = 255;
 
 	if (mono) {
-		name = devm_kasprintf(hl->dev, GFP_KERNEL, "%s:mono:pixel%u",
+		name = devm_kasprintf(hl->dev, GFP_KERNEL, "%s::pixel%u",
 				      dev_name(hl->dev), index);
 		if (!name)
 			return -ENOMEM;
@@ -214,6 +238,18 @@ static int hled_register_pixel(struct harbor_led *hl, unsigned int index,
 	return devm_led_classdev_multicolor_register(hl->dev, &p->mc_cdev);
 }
 
+/* The WS2812 datasheet allows 150 ns of error on each high and low time. */
+static void hled_check_ticks(struct harbor_led *hl, u64 ticks, u32 ns,
+			     unsigned long tick_hz)
+{
+	u64 actual = div64_u64(ticks * NSEC_PER_SEC, tick_hz);
+
+	if (abs((s64)actual - (s64)ns) > 150)
+		dev_warn_once(hl->dev,
+			      "the clock is too slow for the WS2812 timing, a pulse is %llu ns and should be %u ns\n",
+			      actual, ns);
+}
+
 /* DIV and the pulse timing, from the clock. */
 static void hled_setup_timing(struct harbor_led *hl)
 {
@@ -236,6 +272,11 @@ static void hled_setup_timing(struct harbor_led *hl)
 
 #define HLED_TICKS(ns) \
 	min_t(u64, DIV_ROUND_CLOSEST_ULL((u64)(ns) * tick_hz, NSEC_PER_SEC), 0x7fff)
+
+	hled_check_ticks(hl, HLED_TICKS(HLED_T0H_NS), HLED_T0H_NS, tick_hz);
+	hled_check_ticks(hl, HLED_TICKS(HLED_T0L_NS), HLED_T0L_NS, tick_hz);
+	hled_check_ticks(hl, HLED_TICKS(HLED_T1H_NS), HLED_T1H_NS, tick_hz);
+	hled_check_ticks(hl, HLED_TICKS(HLED_T1L_NS), HLED_T1L_NS, tick_hz);
 
 	for (ch = 0; ch < hl->channels; ch++) {
 		if (!hl->serial[ch])
@@ -323,7 +364,7 @@ static ssize_t send_store(struct device *dev, struct device_attribute *attr,
 
 	if (v) {
 		mutex_lock(&hl->lock);
-		hled_send_all(hl);
+		hled_send(hl, true);
 		mutex_unlock(&hl->lock);
 	}
 
@@ -371,30 +412,33 @@ static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(mode);
 
-static ssize_t status_show(struct device *dev, struct device_attribute *attr,
-			   char *buf)
+static int hled_status_show(struct seq_file *m, void *unused)
 {
-	struct harbor_led *hl = dev_get_drvdata(dev);
-	ssize_t n = 0;
+	struct harbor_led *hl = m->private;
 	unsigned int ch;
 
 	for (ch = 0; ch < hl->channels; ch++) {
 		u32 st = readl(hled_ch(hl, ch, HLED_STATUS));
 
-		n += sysfs_emit_at(buf, n,
-				   "ch%u kind=%s status=0x%08x busy=%u underrun=%u dma_err=%u stall=%u hw_frames=%lu irq_frames=%d\n",
-				   ch, (st & HLED_ST_KIND_PWM) ? "pwm" : "serial",
-				   st, !!(st & HLED_ST_BUSY),
-				   !!(st & HLED_ST_UNDERRUN),
-				   !!(st & HLED_ST_DMA_ERR),
-				   !!(st & HLED_ST_STALL),
-				   FIELD_GET(HLED_ST_FRAMES, st),
-				   atomic_read(&hl->frames[ch]));
+		seq_printf(m,
+			   "ch%u kind=%s status=0x%08x busy=%u underrun=%u dma_err=%u stall=%u hw_frames=%lu irq_frames=%d\n",
+			   ch, (st & HLED_ST_KIND_PWM) ? "pwm" : "serial", st,
+			   !!(st & HLED_ST_BUSY), !!(st & HLED_ST_UNDERRUN),
+			   !!(st & HLED_ST_DMA_ERR), !!(st & HLED_ST_STALL),
+			   FIELD_GET(HLED_ST_FRAMES, st),
+			   atomic_read(&hl->frames[ch]));
 	}
 
-	return n;
+	return 0;
 }
-static DEVICE_ATTR_RO(status);
+DEFINE_SHOW_ATTRIBUTE(hled_status);
+
+static struct dentry *hled_debugfs_root;
+
+static void hled_debugfs_remove(void *dir)
+{
+	debugfs_remove_recursive(dir);
+}
 
 /* The items are packed 16 bit little endian values. */
 static ssize_t items_write(struct file *file, struct kobject *kobj,
@@ -428,7 +472,6 @@ static struct attribute *hled_attrs[] = {
 	&dev_attr_refresh_hz.attr,
 	&dev_attr_send.attr,
 	&dev_attr_mode.attr,
-	&dev_attr_status.attr,
 	NULL,
 };
 
@@ -437,16 +480,25 @@ static const struct bin_attribute *const hled_bin_attrs[] = {
 	NULL,
 };
 
+static umode_t hled_visible(struct kobject *kobj, struct attribute *attr,
+			    int n)
+{
+	struct harbor_led *hl = dev_get_drvdata(kobj_to_dev(kobj));
+
+	return hl->owned ? attr->mode : 0;
+}
+
 static umode_t hled_bin_visible(struct kobject *kobj,
 				const struct bin_attribute *attr, int n)
 {
 	struct harbor_led *hl = dev_get_drvdata(kobj_to_dev(kobj));
 
-	return hl->has_serial ? attr->attr.mode : 0;
+	return hl->owned && hl->has_serial ? attr->attr.mode : 0;
 }
 
 static const struct attribute_group hled_group = {
 	.attrs = hled_attrs,
+	.is_visible = hled_visible,
 	.bin_attrs = hled_bin_attrs,
 	.is_bin_visible = hled_bin_visible,
 };
@@ -460,17 +512,20 @@ static int harbor_led_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct harbor_led *hl;
-	u32 info, clk = 0;
-	u32 *colors = NULL, *maxb = NULL;
-	unsigned int ch, i, n_colors;
+	u32 info, clk = 0, dma_width = 32;
+	u32 *colors = NULL, *maxb = NULL, *monob = NULL;
 	const char *kinds[HLED_MAX_CHANNELS];
+	const char *owner;
+	unsigned int ch, i, n_colors;
 	int irq, ret, count, nkinds;
 
 	hl = devm_kzalloc(dev, sizeof(*hl), GFP_KERNEL);
 	if (!hl)
 		return -ENOMEM;
 	hl->dev = dev;
-	mutex_init(&hl->lock);
+	ret = devm_mutex_init(dev, &hl->lock);
+	if (ret)
+		return ret;
 	platform_set_drvdata(pdev, hl);
 
 	hl->base = devm_platform_ioremap_resource(pdev, 0);
@@ -487,6 +542,8 @@ static int harbor_led_probe(struct platform_device *pdev)
 				     hl->channels);
 	hl->item_depth = min_t(unsigned int, hl->item_depth, HLED_ITEM_MAX);
 
+	hl->owned = !(!device_property_read_string(dev, "harbor,owner", &owner) &&
+		      !strcmp(owner, "coprocessor"));
 	device_property_read_u32(dev, "clock-frequency", &clk);
 	hl->clk_rate = clk;
 	nkinds = device_property_read_string_array(dev, "harbor,kinds", kinds,
@@ -500,14 +557,26 @@ static int harbor_led_probe(struct platform_device *pdev)
 		hl->serial[ch] = !(st & HLED_ST_KIND_PWM);
 		hl->has_serial |= hl->serial[ch];
 		/* Keep the reset value of POLARITY and IDLE. */
-		hl->ctrl[ch] = (readl(hled_ch(hl, ch, HLED_CTRL)) &
-				~HLED_CTRL_SEND) | HLED_CTRL_MODE_PIXEL;
-		if (ch < nkinds && !strcmp(kinds[ch], "serial") != !hl->serial[ch])
+		hl->ctrl[ch] = readl(hled_ch(hl, ch, HLED_CTRL)) & ~HLED_CTRL_SEND;
+		if (hl->pixel_source != HLED_SRC_NONE)
+			hl->ctrl[ch] |= HLED_CTRL_MODE_PIXEL;
+		if (ch < nkinds && !strcmp(kinds[ch], "serial") != !!hl->serial[ch])
 			dev_warn(dev, "harbor,kinds of channel %u disagrees with STATUS\n",
 				 ch);
 	}
+	hl->raw = hl->pixel_source == HLED_SRC_NONE;
 
-	if (hl->pixel_source == HLED_SRC_RAM) {
+	hl->dbg = debugfs_create_dir(dev_name(dev), hled_debugfs_root);
+	debugfs_create_file("status", 0444, hl->dbg, hl, &hled_status_fops);
+	ret = devm_add_action_or_reset(dev, hled_debugfs_remove, hl->dbg);
+	if (ret)
+		return ret;
+
+	/* A coprocessor owns the engine. Only the status is visible. */
+	if (!hl->owned)
+		return 0;
+
+	if (hl->pixel_source != HLED_SRC_NONE) {
 		count = device_property_count_u32(dev, "harbor,pixel-colors");
 		n_colors = count > 0 ? count : hl->max_pixels;
 		n_colors = min(n_colors, hl->max_pixels);
@@ -515,9 +584,10 @@ static int harbor_led_probe(struct platform_device *pdev)
 
 		colors = devm_kcalloc(dev, n_colors, sizeof(*colors), GFP_KERNEL);
 		maxb = devm_kcalloc(dev, n_colors, sizeof(*maxb), GFP_KERNEL);
+		monob = devm_kcalloc(dev, n_colors, sizeof(*monob), GFP_KERNEL);
 		hl->pixels = devm_kcalloc(dev, n_colors, sizeof(*hl->pixels),
 					  GFP_KERNEL);
-		if (!colors || !maxb || !hl->pixels)
+		if (!colors || !maxb || !monob || !hl->pixels)
 			return -ENOMEM;
 		if (count > 0)
 			device_property_read_u32_array(dev, "harbor,pixel-colors",
@@ -527,12 +597,37 @@ static int harbor_led_probe(struct platform_device *pdev)
 			device_property_read_u32_array(dev,
 						       "harbor,pixel-max-brightness",
 						       maxb, min_t(unsigned int, count, n_colors));
+		count = device_property_count_u32(dev, "harbor,pixel-mono-byte");
+		if (count > 0)
+			device_property_read_u32_array(dev,
+						       "harbor,pixel-mono-byte",
+						       monob, min_t(unsigned int, count, n_colors));
+	}
+
+	if (hl->pixel_source == HLED_SRC_DMA) {
+		device_property_read_u32(dev, "harbor,dma-address-width",
+					 &dma_width);
+		ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(dma_width));
+		if (ret)
+			return dev_err_probe(dev, ret, "dma mask\n");
+		hl->buf = dmam_alloc_coherent(dev, hl->max_pixels * 4,
+					      &hl->buf_dma, GFP_KERNEL);
+		if (!hl->buf)
+			return -ENOMEM;
 	}
 
 	hled_setup_timing(hl);
 	for (ch = 0; ch < hl->channels; ch++) {
-		if (hl->serial[ch])
+		if (hl->serial[ch]) {
 			writel(hl->npixels, hled_ch(hl, ch, HLED_PIXEL_COUNT));
+			if (hl->buf) {
+				writel(lower_32_bits(hl->buf_dma),
+				       hled_ch(hl, ch, HLED_BASE_LO));
+				if (dma_width > 32)
+					writel(upper_32_bits(hl->buf_dma),
+					       hled_ch(hl, ch, HLED_BASE_HI));
+			}
+		}
 		writel(hl->ctrl[ch], hled_ch(hl, ch, HLED_CTRL));
 	}
 
@@ -548,7 +643,7 @@ static int harbor_led_probe(struct platform_device *pdev)
 	}
 
 	for (i = 0; i < hl->npixels; i++) {
-		ret = hled_register_pixel(hl, i, colors[i] == 1,
+		ret = hled_register_pixel(hl, i, colors[i] == 1, monob[i],
 					  maxb[i] ? maxb[i] : 255);
 		if (ret)
 			return dev_err_probe(dev, ret, "pixel %u\n", i);
@@ -561,6 +656,10 @@ static void harbor_led_remove(struct platform_device *pdev)
 {
 	struct harbor_led *hl = platform_get_drvdata(pdev);
 	unsigned int ch;
+
+	/* A coprocessor owns the engine, so leave it as it is. */
+	if (!hl->owned)
+		return;
 
 	/* The class devices and sysfs files are removed by the device core. */
 	writel(0, hl->base + HLED_IRQ_ENABLE);
@@ -583,7 +682,26 @@ static struct platform_driver harbor_led_driver = {
 		.dev_groups = hled_groups,
 	},
 };
-module_platform_driver(harbor_led_driver);
+
+static int __init harbor_led_init(void)
+{
+	int ret;
+
+	hled_debugfs_root = debugfs_create_dir("harbor_led", NULL);
+	ret = platform_driver_register(&harbor_led_driver);
+	if (ret)
+		debugfs_remove(hled_debugfs_root);
+
+	return ret;
+}
+module_init(harbor_led_init);
+
+static void __exit harbor_led_exit(void)
+{
+	platform_driver_unregister(&harbor_led_driver);
+	debugfs_remove(hled_debugfs_root);
+}
+module_exit(harbor_led_exit);
 
 MODULE_AUTHOR("Lilith Semiconductor");
 MODULE_DESCRIPTION("Harbor LED engine driver");

@@ -179,6 +179,13 @@ class HarborLedEngine extends BridgeModule
   /// The clock in Hz, written to the DT and ACPI `clock-frequency` property.
   final int? clockHz;
 
+  /// The address width of the dma read master.
+  final int dmaAddressWidth;
+
+  /// False when a coprocessor owns the engine. The DT then has
+  /// `harbor,owner = "coprocessor"` and the kernel driver configures nothing.
+  final bool kernelOwned;
+
   late final BusSlavePort bus;
 
   Logic get interrupt => output('interrupt');
@@ -217,17 +224,25 @@ class HarborLedEngine extends BridgeModule
     return channels.fold(0, (n, c) => c.pixelsUsed > n ? c.pixelsUsed : n);
   }
 
-  // Per pixel, 0 for RGB and 1 for a mono LED. A pwm pixel that reads only
-  // the B byte is mono. Every other pixel is RGB.
+  Iterable<HarborLedPin> _pinsOf(int p) => _pwmPins.where((x) => x.pixel == p);
+
+  // Per pixel, 0 for RGB and 1 for a mono LED. A pwm pixel with one pin is
+  // mono. Every other pixel is RGB.
   List<int> get _pixelColors => [
+    for (var p = 0; p < _listedPixels; p++) _pinsOf(p).length == 1 ? 1 : 0,
+  ];
+
+  // Per pixel, the byte that a mono LED reads: 0 R, 1 G, 2 B, 3 W.
+  List<int> get _pixelMonoByte => [
     for (var p = 0; p < _listedPixels; p++)
-      if (_pwmPins.any((x) => x.pixel == p) &&
-          _pwmPins
-              .where((x) => x.pixel == p)
-              .every((x) => x.byte == HarborLedByte.b))
-        1
-      else
-        0,
+      _pinsOf(p).length == 1
+          ? const {
+              HarborLedByte.r: 0,
+              HarborLedByte.g: 1,
+              HarborLedByte.b: 2,
+              HarborLedByte.w: 3,
+            }[_pinsOf(p).single.byte]!
+          : 2,
   ];
 
   List<int> get _pixelMaxBrightness => [
@@ -245,9 +260,10 @@ class HarborLedEngine extends BridgeModule
     this.maxPixels = 16,
     this.ramKind = HarborLedRamKind.lut,
     this.clockHz,
+    this.kernelOwned = true,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     bool crossFabricClock = false,
-    int dmaAddressWidth = 32,
+    this.dmaAddressWidth = 32,
     int dmaDataWidth = 32,
     int busAddressWidth = 12,
     this.stallClocks = 65536,
@@ -1234,9 +1250,13 @@ class HarborLedEngine extends BridgeModule
     'harbor,pixel-source': pixelSource.name,
     if (_pixelCountInfo > 0) ...{
       'harbor,pixel-colors': _pixelColors,
+      'harbor,pixel-mono-byte': _pixelMonoByte,
       'harbor,pixel-max-brightness': _pixelMaxBrightness,
     },
     if (clockHz != null) 'clock-frequency': clockHz!,
+    if (pixelSource == HarborLedPixelSource.dma)
+      'harbor,dma-address-width': dmaAddressWidth,
+    if (!kernelOwned) 'harbor,owner': 'coprocessor',
   };
 
   @override
