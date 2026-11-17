@@ -399,6 +399,7 @@ class HarborLedEngine extends BridgeModule
             clk: input('clk'),
             reset: input('reset'),
             fabricClock: fabricClock,
+            readOnly: true,
           )
         : null;
     _dma = dmaPort;

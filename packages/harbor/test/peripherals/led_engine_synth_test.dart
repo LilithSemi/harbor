@@ -133,7 +133,7 @@ void main() {
         pixelSource: HarborLedPixelSource.dma,
         fabricKind: HarborFabricKind.axi4,
       ),
-      1700,
+      1640,
     ),
   };
 
