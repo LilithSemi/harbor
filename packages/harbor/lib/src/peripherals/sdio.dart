@@ -231,10 +231,13 @@ class HarborSdioConfig with HarborPrettyString {
 ///
 /// CMD bits: [5:0] index, [7:6] response type (0 none, 1 short, 2 long R2,
 /// 3 short+busy), [8] data present, [9] direction (0 write, 1 read), [10] use
-/// ADMA DMA, [11] ADMA_ADDR is a descriptor table. INT_STATUS bits (each
+/// ADMA DMA, [11] ADMA_ADDR is a descriptor table, [12] the response has no
+/// CRC7 (R3), [13] the response does not echo the index (R3). INT_STATUS bits (each
 /// write-1-to-clear): [0] cmd-done, [1] data-done, [2] data-request,
 /// [3] data-CRC-error, [4] cmd-timeout, [5] write-error, [6] RX overrun,
-/// [7] ADMA error, [8] data timeout.
+/// [7] ADMA error, [8] data timeout, [9] response CRC7 error, [10] response
+/// end bit or transmission bit error, [11] response index error. A response
+/// with one of these errors never sets cmd-done.
 ///
 /// DMA: with CMD[10] set and CMD[11] clear, ADMA_ADDR is the buffer address
 /// and BLK_COUNT * BLK_SIZE is its length. With CMD[11] set, ADMA_ADDR points
@@ -545,6 +548,11 @@ class HarborSdioController extends BridgeModule
     // bits [39:8], in RESP0 and reads 0 in RESP1-3.
     final respRaw = Logic(name: 'resp_raw', width: 128);
     final respLong = Logic(name: 'resp_long');
+    // CMD[12] no CRC7 in the response, CMD[13] no echoed index (R3).
+    final cmdNoCrc = Logic(name: 'cmd_no_crc');
+    final cmdNoIdx = Logic(name: 'cmd_no_idx');
+    final respCrc = Logic(name: 'resp_crc', width: 7);
+    final respTxBad = Logic(name: 'resp_tx_bad');
     final resp = [
       mux(respLong, respRaw.getRange(0, 32), respRaw.getRange(8, 40)),
       for (var i = 1; i < 4; i++)
@@ -561,20 +569,20 @@ class HarborSdioController extends BridgeModule
         );
     // INT_STATUS, one register per bit. Events in the same cycle that set
     // different bits all latch.
-    final intBits = [for (var i = 0; i < 9; i++) Logic(name: 'int_status_$i')];
+    final intBits = [for (var i = 0; i < 12; i++) Logic(name: 'int_status_$i')];
     final intStatus = intBits.rconcat().named('int_status');
     // High while a DMA transfer has failed on the bus. Data-done does not
     // latch then, so a failed transfer never reports that it finished.
     final dmaStopped = Logic(name: 'dma_stopped');
     List<Conditional> setInt(int mask) => [
-      for (var i = 0; i < 9; i++)
+      for (var i = 0; i < 12; i++)
         if ((mask >> i) & 1 == 1)
           if (i == 1)
             If(~dmaStopped, then: [intBits[i] < Const(1)])
           else
             intBits[i] < Const(1),
     ];
-    final intEnable = Logic(name: 'int_enable', width: 9);
+    final intEnable = Logic(name: 'int_enable', width: 12);
     final busy = Logic(name: 'busy');
     final divCount = Logic(name: 'div_count', width: 16);
     final sdClkReg = Logic(name: 'sd_clk_reg');
@@ -613,6 +621,9 @@ class HarborSdioController extends BridgeModule
     const intDataCrcErr = 0x08;
     const intWriteErr = 0x20; // card reported a write/CRC-status error
     const intRxOverrun = 0x40; // a received word was dropped (RX FIFO full)
+    const intCmdCrcErr = 0x200; // response CRC7 mismatch
+    const intCmdEndErr = 0x400; // response end bit or transmission bit wrong
+    const intCmdIdxErr = 0x800; // response index differs from the command
     const intDataTimeout = 0x100; // no block start bit within DATA_TIMEOUT
 
     final maxW = config.maxBusWidth.width;
@@ -1155,7 +1166,7 @@ class HarborSdioController extends BridgeModule
       output('sd_dat_out') <= datOutPins;
       output('sd_dat_oe') <= datOePins;
     }
-    final intView = (intStatus | (admaErr.zeroExtend(9) << 7)).named(
+    final intView = (intStatus | (admaErr.zeroExtend(12) << 7)).named(
       'int_view',
     );
     interrupt <= (intView & intEnable).or();
@@ -1237,15 +1248,33 @@ class HarborSdioController extends BridgeModule
     // INT_STATUS bits a write clears in this cycle.
     final intClear =
         ((busAccess & bus.we & regIndex.eq(Const(0x0C, width: 9))).replicate(
-                  9,
+                  12,
                 ) &
-                bus.selMasked(0x60, 9))
+                bus.selMasked(0x60, 12))
             .named('int_clear');
     final readHit = (~bus.we & regIndex.getRange(5).eq(Const(0, width: 4)))
         .named('reg_read_hit');
 
     // Received response after the in-flight bit is shifted in.
     final respNext = [respShift.getRange(0, 135), cmdIn].concat();
+
+    // Checks on the last response bit: end bit, CRC7 remainder and echoed
+    // index. A card sends the transmission bit as 0.
+    final respIsLong = cmdRespType.eq(Const(2, width: 2));
+    final respLast =
+        (state.eq(Const(sRecv, width: 3)) &
+                respEdge &
+                respCnt.eq(Const(1, width: 8)))
+            .named('resp_last');
+    final respEndBad = (~cmdIn | respTxBad).named('resp_end_bad');
+    final respCrcBad = (respCrc.neq(Const(0, width: 7)) & ~cmdNoCrc).named(
+      'resp_crc_bad',
+    );
+    final respIdxBad =
+        (~respIsLong & ~cmdNoIdx & respNext.getRange(40, 46).neq(cmdIndex))
+            .named('resp_idx_bad');
+    final respErrNow = (respLast & (respEndBad | respCrcBad | respIdxBad))
+        .named('resp_err_now');
 
     Sequential(clk, [
       If(
@@ -1261,12 +1290,16 @@ class HarborSdioController extends BridgeModule
           cmdDataDir < Const(0),
           respRaw < Const(0, width: 128),
           respLong < Const(0),
+          cmdNoCrc < Const(0),
+          cmdNoIdx < Const(0),
+          respCrc < Const(0, width: 7),
+          respTxBad < Const(0),
           blkSize < Const(512, width: 12),
           blkCount < Const(1, width: 16),
           dataTimeout < Const(defaultDataTimeout, width: 24),
           dataTimeoutCnt < Const(0, width: 24),
           for (final b in intBits) b < Const(0),
-          intEnable < Const(0, width: 9),
+          intEnable < Const(0, width: 12),
           busy < Const(0),
           divCount < Const(0, width: 16),
           sdClkReg < Const(0),
@@ -1341,7 +1374,7 @@ class HarborSdioController extends BridgeModule
         orElse: [
           // INT_STATUS write-1-to-clear. It comes before every event that
           // sets a bit, so a set in the same cycle wins.
-          for (var i = 0; i < 9; i++)
+          for (var i = 0; i < 12; i++)
             If(intClear[i], then: [intBits[i] < Const(0)]),
           If(
             intClear[7],
@@ -1420,6 +1453,8 @@ class HarborSdioController extends BridgeModule
                       // The shift register is not cleared. The capture below
                       // takes only bits this response shifts in.
                       state < Const(sRecv, width: 3),
+                      respCrc < Const(0, width: 7),
+                      respTxBad < Const(0),
                       respCnt <
                           mux<Logic>(
                             cmdRespType.eq(Const(2, width: 2)),
@@ -1460,8 +1495,51 @@ class HarborSdioController extends BridgeModule
                 then: [
                   respShift < respNext,
                   respCnt < (respCnt - Const(1, width: 8)),
+                  // The CRC7 runs over the header and payload and then over
+                  // the card CRC itself, so a good frame leaves zero. A long
+                  // response covers only the register field.
                   If(
-                    respCnt.eq(Const(1, width: 8)),
+                    respCnt.gte(Const(2, width: 8)) &
+                        (~respIsLong | respCnt.lte(Const(128, width: 8))),
+                    then: [
+                      respCrc <
+                          [
+                            respCrc[5],
+                            respCrc[4],
+                            respCrc[3],
+                            respCrc[2] ^ (cmdIn ^ respCrc[6]),
+                            respCrc[1],
+                            respCrc[0],
+                            cmdIn ^ respCrc[6],
+                          ].concat(),
+                    ],
+                  ),
+                  If(
+                    respCnt.eq(
+                      mux<Logic>(
+                        respIsLong,
+                        Const(135, width: 8),
+                        Const(47, width: 8),
+                      ),
+                    ),
+                    then: [respTxBad < cmdIn],
+                  ),
+                  If(
+                    respCnt.eq(Const(1, width: 8)) & respErrNow,
+                    then: [
+                      state < Const(sIdle, width: 3),
+                      busy < Const(0),
+                      If(
+                        cmdDataPresent & ~cmdDataDir & ~dmaMode,
+                        then: [dataValid < Const(0)],
+                      ),
+                      If(respEndBad, then: [...setInt(intCmdEndErr)]),
+                      If(respCrcBad, then: [...setInt(intCmdCrcErr)]),
+                      If(respIdxBad, then: [...setInt(intCmdIdxErr)]),
+                    ],
+                  ),
+                  If(
+                    respCnt.eq(Const(1, width: 8)) & ~respErrNow,
                     then: [
                       state < Const(sIdle, width: 3),
                       ...setInt(intCmdDone),
@@ -2203,7 +2281,7 @@ class HarborSdioController extends BridgeModule
           // A command with no response stops it too, so a later PIO
           // transfer finds no DMA work left.
           If(
-            dmaFault | cmdTimeoutNow,
+            dmaFault | cmdTimeoutNow | respErrNow,
             then: [admaState < Const(aIdle, width: 3)],
           ),
           // A parked walker in a DMA card write feeds zero words, so the
@@ -2331,6 +2409,8 @@ class HarborSdioController extends BridgeModule
                           cmdRespType < bus.dataIn.getRange(6, 8),
                           cmdDataPresent < bus.dataIn[8],
                           cmdDataDir < bus.dataIn[9],
+                          cmdNoCrc < bus.dataIn[12],
+                          cmdNoIdx < bus.dataIn[13],
                           wrAbort < Const(0),
                           dmaFailed < Const(0),
                           dmaMode < bus.dataIn[10],
@@ -2617,6 +2697,9 @@ class HarborSdioController extends BridgeModule
     ];
   }
 
+  /// The C++ source of the simulated SD card, for a host test that compiles it.
+  static const simCardHeader = _sdCardHeader;
+
   static const _sdCardHeader = r'''
 #pragma once
 // Simulated SD card for the Verilator harness. Speaks enough of the SD protocol
@@ -2719,6 +2802,11 @@ struct SdCard {
     resp[1] = 0;
     for (int i = 0; i < 6; i++) resp[2 + i] = 1;
     for (int i = 0; i < 128; i++) resp[8 + i] = reg[127 - i];
+    // The CRC7 covers register bits 127:8 and replaces bits 7:1. Bit 0 is the
+    // end bit.
+    uint8_t c = crc7(resp + 8, 120);
+    for (int i = 0; i < 7; i++) resp[128 + i] = (c >> (6 - i)) & 1;
+    resp[135] = 1;
     resp_len = 136;
   }
 

@@ -329,7 +329,9 @@ class AdmaBench {
   }
 
   Future<void> wr(int addr, int data) async {
-    await bus.write(_regBase + addr, data);
+    // These frames carry no valid CRC7 or index, so skip those checks.
+    final value = addr == admaCmd ? data | 0x3000 : data;
+    await bus.write(_regBase + addr, value);
     await settle();
   }
 

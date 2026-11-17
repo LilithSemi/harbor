@@ -221,9 +221,11 @@ void main() {
     // 32-bit word [i] of the ADMA memory.
     int mem(int i) => memory.readBytes(4 * i, 4);
 
+    // The frames these tests send carry no valid CRC7 or index, so the
+    // command skips those checks.
     Future<void> busWrite(int addr, int data) async {
       adr.inject(addr);
-      mosi.inject(data);
+      mosi.inject(addr == _cmd ? data | 0x3000 : data);
       we.inject(1);
       stb.inject(1);
       await clk.nextPosedge;
@@ -743,7 +745,7 @@ void main() {
 
     test('RESP0-3 follow the type of the last response', () async {
       await setUpDut();
-      const words = [0x11112222, 0x33334444, 0x55556666, 0x77778888];
+      const words = [0x11112223, 0x33334444, 0x55556666, 0x77778888];
       // R2: start, tx, 111111, CID/CSD bits [127:0], end.
       final r2 = [
         0,
@@ -2325,7 +2327,8 @@ void main() {
       await busWrite(_intEnable, 0x12);
       await busWrite(_cmdArg, 0);
       // index 17, short response, data present, read direction.
-      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      // The canned response has no valid CRC7 or index, so skip both checks.
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (3 << 12));
 
       final resp = _resp48(0);
       final dataBits = [..._wordBitsMsb(wordA), ..._wordBitsMsb(wordB)];
