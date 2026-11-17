@@ -269,7 +269,9 @@ class HarborUart extends BridgeModule
         (rxBusy & rxSample & rxBits.gt(Const(8, width: 4)) & rxSyncB).named(
           'rx_frame',
         );
-    final rxPush = (rxFrame & ~rxFull).named('rx_push');
+    // An RBR read in the same cycle frees the slot the frame needs.
+    final rbrPop = Logic(name: 'rbr_pop');
+    final rxPush = (rxFrame & (~rxFull | rbrPop)).named('rx_push');
     final txPush = (thrValid & ~txFull).named('tx_push');
 
     final txRam = HarborFifoRam(
@@ -551,6 +553,7 @@ class HarborUart extends BridgeModule
     // own lane is selected.
     final readEvt = stb & ~ack & inWindow & ~we;
     final rbrRead = (readEvt & ~dlab & regSel(0)).named('rbr_read');
+    rbrPop <= rbrRead & rxHasData;
 
     // Four character times in bit times: start, data, parity, stop.
     final timeoutLimit =
@@ -769,7 +772,7 @@ class HarborUart extends BridgeModule
               If(readEvt & regSel(5), then: [overrun < Const(0)]),
             ],
           ),
-          If(rxFrame & rxFull, then: [overrun < Const(1)]),
+          If(rxFrame & ~rxPush, then: [overrun < Const(1)]),
         ],
       ),
     ]);

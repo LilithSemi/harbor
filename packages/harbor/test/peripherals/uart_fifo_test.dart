@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
@@ -277,6 +279,59 @@ void main() {
     }
     await Simulator.endSimulation();
   });
+
+  // A frame that ends in the same cycle as an RBR read that makes room must
+  // land in the buffer, with no overrun.
+  for (final preload in [(fifo: false, count: 1), (fifo: true, count: 16)]) {
+    test('RX push in the cycle of an RBR pop keeps the byte, '
+        '${preload.fifo ? 'FIFO full' : '16450'}', () async {
+      final d = await UartDut.start();
+      await d.setDivisor(1);
+      if (preload.fifo) await d.write(_fcr, 0x01);
+      final sigs = {for (final s in d.uart.signals) s.name: s};
+      var hit = false;
+      d.clk.negedge.listen((_) {
+        final v = [
+          for (final n in ['rx_frame', 'rbr_read', 'rx_has_data'])
+            sigs[n]!.value,
+        ];
+        if (v.every((x) => x.isValid && x.toInt() == 1)) hit = true;
+      });
+      var coincided = 0;
+      for (var delay = 146; delay < 162; delay++) {
+        while (await d.read(_lsr) & 1 == 1) {
+          await d.read(_rbr);
+        }
+        for (var i = 0; i < preload.count; i++) {
+          await d.sendByte(0xa0 + i);
+        }
+        hit = false;
+        unawaited(() async {
+          d.rx.inject(0);
+          await d.wait(16);
+          for (var i = 0; i < 8; i++) {
+            d.rx.inject((0x5b >> i) & 1);
+            await d.wait(16);
+          }
+          d.rx.inject(1);
+        }());
+        await d.wait(delay);
+        final seen = <int>[];
+        for (var i = 0; i < preload.count + 3; i++) {
+          seen.add(await d.read(_rbr));
+        }
+        await d.wait(40);
+        final lsr = await d.read(_lsr);
+        if (hit) {
+          coincided++;
+          expect(seen, contains(0x5b), reason: 'delay $delay lost the byte');
+          expect(lsr & 0x02, equals(0), reason: 'delay $delay set OE');
+        }
+      }
+      expect(coincided, greaterThan(0), reason: 'the sweep never collided');
+      await Simulator.endSimulation();
+    });
+  }
 
   test('MSR has no modem interrupt and follows MCR in loopback', () async {
     final d = await UartDut.start();
