@@ -48,6 +48,16 @@ class HarborDeviceTreeRef {
   const HarborDeviceTreeRef(this.label);
 }
 
+/// A property value made of cells that mix numbers and references, such as the
+/// `<&gpio 5 1>` of a `reset-gpios` property. A [HarborDeviceTreeRef] writes as
+/// `&label` and an [int] writes as a decimal cell.
+class HarborDeviceTreeCells {
+  /// The cells, in order.
+  final List<Object> cells;
+
+  const HarborDeviceTreeCells(this.cells);
+}
+
 /// One context (hart-facing register block) of an interrupt controller.
 ///
 /// A RISC-V PLIC gives each privilege level that claims interrupts its own
@@ -577,6 +587,34 @@ class HarborDeviceTreeGenerator {
         in peripherals.where((p) => p.dtNode.interruptController).indexed) {
       if (p.dtNode.label == null) add('intc$i');
     }
+
+    // A reference must name a node that exists.
+    void check(Object value) {
+      final refs = value is HarborDeviceTreeRef
+          ? [value]
+          : value is HarborDeviceTreeCells
+          ? value.cells.whereType<HarborDeviceTreeRef>()
+          : const <HarborDeviceTreeRef>[];
+      for (final r in refs) {
+        if (!seen.contains(r.label)) {
+          throw ArgumentError.value(
+            r.label,
+            'HarborDeviceTreeRef',
+            'no device tree node has this label',
+          );
+        }
+      }
+    }
+
+    void checkChild(HarborDeviceTreeChild c) {
+      c.properties.values.forEach(check);
+      c.children.forEach(checkChild);
+    }
+
+    for (final n in nodes) {
+      n.properties.values.forEach(check);
+      n.children.forEach(checkChild);
+    }
   }
 
   /// Recursively emits a nested [HarborDeviceTreeChild] at [indent].
@@ -612,6 +650,13 @@ class HarborDeviceTreeGenerator {
     if (value is String) return '"$value"';
     if (value is int) return '<$value>';
     if (value is HarborDeviceTreeRef) return '<&${value.label}>';
+    if (value is HarborDeviceTreeCells) {
+      final cells = [
+        for (final c in value.cells)
+          if (c is HarborDeviceTreeRef) '&${c.label}' else '$c',
+      ];
+      return '<${cells.join(' ')}>';
+    }
     if (value is List<int>) {
       return '<${value.map((v) => '0x${v.toRadixString(16)}').join(' ')}>';
     }

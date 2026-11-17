@@ -3,6 +3,68 @@ import 'package:test/test.dart';
 
 void main() {
   group('HarborDeviceTreeGenerator', () {
+    test('an ESP32 child on the SPI node refers to the GPIO node', () {
+      final gpio = HarborGpio(baseAddress: 0x10001000, pinCount: 16);
+      final spi = HarborSpiController(
+        baseAddress: 0x10002000,
+        children: [
+          HarborDeviceTreeChild(
+            name: 'wifi@0',
+            properties: {
+              'compatible': 'espressif,esp32-spi',
+              'reg': 0,
+              'spi-max-frequency': 10000000,
+              'spi-cpol': true,
+              'reset-gpios': HarborDeviceTreeCells([
+                HarborDeviceTreeRef(gpio.dtLabel),
+                0,
+                1,
+              ]),
+              'handshake-gpios': HarborDeviceTreeCells([
+                HarborDeviceTreeRef(gpio.dtLabel),
+                1,
+                0,
+              ]),
+              'data-ready-gpios': HarborDeviceTreeCells([
+                HarborDeviceTreeRef(gpio.dtLabel),
+                2,
+                0,
+              ]),
+            },
+          ),
+        ],
+      );
+      final dts = HarborDeviceTreeGenerator(
+        model: 'Test SoC',
+        compatible: 'test,soc-v1',
+        peripherals: [gpio, spi],
+      ).generate();
+
+      expect(dts, contains('gpio: gpio@10001000 {'));
+      expect(dts, isNot(contains('sifive,gpio0')));
+      expect(
+        dts,
+        contains('''
+        spi@10002000 {
+            compatible = "harbor,spi", "opencores,spi-oc";
+            reg = <0x10002000 0x1000>;
+            num-cs = <1>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            wifi@0 {
+                compatible = "espressif,esp32-spi";
+                reg = <0>;
+                spi-max-frequency = <10000000>;
+                spi-cpol;
+                reset-gpios = <&gpio 0 1>;
+                handshake-gpios = <&gpio 1 0>;
+                data-ready-gpios = <&gpio 2 0>;
+            };
+        };
+'''),
+      );
+    });
+
     test('generates valid DTS with CPUs and peripherals', () {
       final clint = HarborClint(baseAddress: 0x02000000);
       final plic = HarborPlic(baseAddress: 0x0C000000, sources: 32);
@@ -206,6 +268,35 @@ void main() {
       );
       final named = HarborGpio(baseAddress: 0x10002000, dtLabel: 'gpio1');
       expect(gen([a, named]), contains('gpio1: gpio@10002000'));
+    });
+
+    test('a reference to a missing label is refused', () {
+      final spi = HarborSpiController(
+        baseAddress: 0x10002000,
+        children: [
+          HarborDeviceTreeChild(
+            name: 'dev@0',
+            properties: {
+              'reg': 0,
+              'reset-gpios': HarborDeviceTreeCells([
+                HarborDeviceTreeRef('nogpio'),
+                0,
+                0,
+              ]),
+            },
+          ),
+        ],
+      );
+      expect(
+        () => gen([spi]),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.name,
+            'name',
+            'HarborDeviceTreeRef',
+          ),
+        ),
+      );
     });
 
     test('a label on an interrupt controller is used', () {
