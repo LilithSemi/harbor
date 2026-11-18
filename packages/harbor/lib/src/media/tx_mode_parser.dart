@@ -33,10 +33,10 @@ class HarborTxModeParser extends BridgeModule {
     output('tx_mode') <=
         mux(
           notLossless,
-          mux(sel, Const(2, width: 2), Const(1, width: 2)),
+          mux<Logic>(sel, Const(2, width: 2), Const(1, width: 2)),
           Const(0, width: 2),
         );
     output('bits_consumed') <=
-        mux(notLossless, Const(1, width: 8), Const(0, width: 8));
+        mux<Logic>(notLossless, Const(1, width: 8), Const(0, width: 8));
   }
 }

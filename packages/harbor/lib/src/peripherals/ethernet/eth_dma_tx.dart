@@ -230,7 +230,7 @@ class HarborEthDmaTx extends Module {
 
     final mask = [
       for (var i = iw - 1; i >= 0; i--) ringSize.gt(Const(i, width: 4)),
-    ].swizzle().named('ring_mask');
+    ].concat().named('ring_mask');
     final nextIdx = ((idx + 1) & mask).named('next_idx');
     final base = (ringBase & ~Const(descBytes - 1, width: aw)).named(
       'ring_base_aligned',
@@ -244,7 +244,7 @@ class HarborEthDmaTx extends Module {
     final dLen = dw2.getRange(0, 16);
     final eop = dw2[17];
     final irq = dw2[18];
-    final dAddr = [dw1, dw0].swizzle().getRange(0, aw).named('d_addr');
+    final dAddr = [dw1, dw0].concat().getRange(0, aw).named('d_addr');
     final dBad = Logic(name: 'd_addr_bad');
 
     // Buffer setup from a start address and a length: the request address,
@@ -273,8 +273,8 @@ class HarborEthDmaTx extends Module {
         endLo,
         words,
         Const(1024, width: ww) - a.getRange(2, 12).zeroExtend(ww),
-        [a.getRange(2), Const(0, width: 2)].swizzle(),
-      ].swizzle();
+        [a.getRange(2), Const(0, width: 2)].concat(),
+      ].concat();
     }
 
     final curSetup = Logic(name: 'cur_setup', width: setupW);
@@ -350,7 +350,8 @@ class HarborEthDmaTx extends Module {
           reqAddr,
           mux(
             inState(_writeBack),
-            descAddr + mux(wbBeat, Const(8, width: aw), Const(12, width: aw)),
+            descAddr +
+                mux<Logic>(wbBeat, Const(8, width: aw), Const(12, width: aw)),
             descAddr,
           ),
         );
@@ -358,7 +359,7 @@ class HarborEthDmaTx extends Module {
         mux(
           inState(_buf),
           (beats - 1).getRange(0, lenW),
-          mux(
+          mux<Logic>(
             inState(_writeBack),
             Const(0, width: lenW),
             Const(descBeats - 1, width: lenW),
@@ -387,14 +388,11 @@ class HarborEthDmaTx extends Module {
     final rdLastFire = (rdFire & m.rdataLast).named('rd_last_fire');
 
     // Write back: word 3 first (wb_beat low), then byte 3 of word 2 (OWN).
-    final word3 = [
-      Const(0, width: 28),
-      code,
-      Const(1),
-    ].swizzle().named('word3');
+    final word3 = [Const(0, width: 28), code, Const(1)].concat().named('word3');
     m.wdataValid <= inState(_writeBack) & wbData;
     m.wdataData <= mux(wbBeat, Const(0, width: 32), word3);
-    m.wdataStrb <= mux(wbBeat, Const(0x8, width: 4), Const(0xf, width: 4));
+    m.wdataStrb <=
+        mux<Logic>(wbBeat, Const(0x8, width: 4), Const(0xf, width: 4));
     m.wdataLast <= Const(1);
     final wFire = (m.wdataValid & m.wdataReady).named('w_fire');
     m.wrespReady <= inState(_writeBack) & busyIn;
@@ -413,16 +411,13 @@ class HarborEthDmaTx extends Module {
     final n = beatN;
     final keep = [
       for (var i = 3; i >= 0; i--) n.gt(Const(i, width: 3)).replicate(8),
-    ].swizzle().named('beat_keep');
-    final shifted =
-        ((m.rdataData >>> [lo, Const(0, width: 3)].swizzle()) & keep).named(
-          'beat_shifted',
-        );
+    ].concat().named('beat_keep');
+    final shifted = ((m.rdataData >>> [lo, Const(0, width: 3)].concat()) & keep)
+        .named('beat_shifted');
     final total = (accN.zeroExtend(4) + n.zeroExtend(4)).named('pack_total');
     final combined =
         (acc.zeroExtend(64) |
-                (shifted.zeroExtend(64) <<
-                    [accN, Const(0, width: 3)].swizzle()))
+                (shifted.zeroExtend(64) << [accN, Const(0, width: 3)].concat()))
             .named('pack_combined');
     final over = total.gt(Const(4, width: 4)).named('pack_over');
     final packFire = (rdFire & inState(_buf) & ~abort & ~m.rdataErr).named(
@@ -568,7 +563,7 @@ class HarborEthDmaTx extends Module {
                   curSetup < setupOf(dAddr, rdLen.getRange(0, 16)),
                   dBad <
                       (aw < 64
-                              ? [dw1, dw0].swizzle().getRange(aw).or()
+                              ? [dw1, dw0].concat().getRange(aw).or()
                               : Const(0)) &
                           rdLen.getRange(0, 16).neq(0),
                   sumNext < sumIn,
@@ -721,7 +716,7 @@ class HarborEthDmaTx extends Module {
                 then: [fail < Const(1), ...toWriteBack(headReg)],
                 orElse: [
                   code <
-                      mux(
+                      mux<Logic>(
                         txClkLost,
                         Const(errClkLost, width: 3),
                         Const(errOk, width: 3),

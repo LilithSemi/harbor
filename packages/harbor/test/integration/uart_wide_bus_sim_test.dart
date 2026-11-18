@@ -91,7 +91,7 @@ void main() {
         expect(await _loadByte(tb, b, lanes, 5) & 0x60, equals(0x60));
 
         await _storeByte(tb, b, lanes, 0, 0xA5);
-        expect(await _receiveByte(tb, uart.tx, 4), equals(0xA5));
+        expect(await _receiveByte(tb, uart.tx, 64), equals(0xA5));
 
         await Simulator.endSimulation();
       });

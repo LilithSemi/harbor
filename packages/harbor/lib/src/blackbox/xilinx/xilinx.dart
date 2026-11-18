@@ -462,9 +462,14 @@ XilinxDdr3Clocks buildXilinxDdr3ClockTree(
   // fails to route on nextpnr-xilinx ("Failed to route arc of net CLKOUTx").
   // Every PLL output therefore stays on its own global BUFG.
   // CK/4 SERDES/CLKDIV clock (also the sequencer clock at gearRatio 1).
-  final ctrlNet = bufOut('CLKOUT1', 'ctrl');
+  final ctrlNet = bufOut(
+    'CLKOUT1',
+    'ctrl',
+  ).named(geared ? 'ddr_ck4_clk' : 'ddr_clk');
   // CK/8 controller-logic clock on the spare CLKOUT5, only when geared.
-  final ctrlGearNet = geared ? bufOut('CLKOUT5', 'ctrlgear') : null;
+  final ctrlGearNet = geared
+      ? bufOut('CLKOUT5', 'ctrlgear').named('ddr_clk')
+      : null;
   return XilinxDdr3Clocks(
     ddrCk: bufOut('CLKOUT0', 'ck'),
     controller: ctrlNet,
@@ -793,6 +798,7 @@ class XilinxIobufds extends BridgeModule {
 /// Xilinx 7-series RAMB36E1: 36Kbit block RAM.
 class XilinxRamb36e1 extends BridgeModule {
   XilinxRamb36e1({
+    String ramMode = 'TDP',
     int readWidthA = 36,
     int writeWidthA = 36,
     int readWidthB = 36,
@@ -822,6 +828,7 @@ class XilinxRamb36e1 extends BridgeModule {
     createPort('DOBDO', PortDirection.output, width: 32);
     createPort('DOPBDOP', PortDirection.output, width: 4);
 
+    createParameter('RAM_MODE', '"$ramMode"');
     createParameter('READ_WIDTH_A', '$readWidthA');
     createParameter('WRITE_WIDTH_A', '$writeWidthA');
     createParameter('READ_WIDTH_B', '$readWidthB');
@@ -905,6 +912,65 @@ class XilinxXadc extends BridgeModule {
     addOutput('EOC');
     addOutput('EOS');
     addOutput('BUSY');
+  }
+}
+
+/// Xilinx 7-series DNA_PORT: access to the 57-bit device DNA (UG470, Device
+/// Identifier and Device DNA).
+///
+/// A rising [clk] edge with [read] high loads the shift register with the DNA
+/// and [dout] shows bit 56. [read] overrides [shift]. A rising [clk] edge with
+/// [shift] high moves the register toward [dout] and shifts [din] into bit 0.
+/// The clock limit is 100 MHz (DS181, FDNACK, 70 MHz for the -2LE grade).
+///
+/// [simDnaValue] sets the DNA of the simulation model and the SIM_DNA_VALUE
+/// parameter of the primitive.
+class XilinxDnaPort extends BridgeModule {
+  /// Width of the device DNA in bits.
+  static const int dnaWidth = 57;
+
+  Logic get dout => output('DOUT');
+
+  XilinxDnaPort({
+    required Logic clk,
+    required Logic din,
+    required Logic read,
+    required Logic shift,
+    BigInt? simDnaValue,
+    super.name = 'dna_port',
+  }) : super('DNA_PORT', isSystemVerilogLeaf: true) {
+    final value = simDnaValue ?? BigInt.zero;
+    if (value.isNegative || value.bitLength > dnaWidth) {
+      throw ArgumentError.value(
+        simDnaValue,
+        'simDnaValue',
+        'must fit in $dnaWidth bits',
+      );
+    }
+    createParameter('SIM_DNA_VALUE', "$dnaWidth'h${value.toRadixString(16)}");
+    addInput('CLK', clk);
+    addInput('DIN', din);
+    addInput('READ', read);
+    addInput('SHIFT', shift);
+    final dout = addOutput('DOUT');
+    // Sim only. The register has no reset, so it is unknown until the first
+    // READ.
+    final sreg = Logic(name: '${name}_sim_sreg', width: dnaWidth);
+    Sequential(input('CLK'), [
+      If(
+        input('READ'),
+        then: [sreg < Const(value, width: dnaWidth)],
+        orElse: [
+          If(
+            input('SHIFT'),
+            then: [
+              sreg < [sreg.getRange(0, dnaWidth - 1), input('DIN')].concat(),
+            ],
+          ),
+        ],
+      ),
+    ]);
+    dout <= sreg[dnaWidth - 1];
   }
 }
 

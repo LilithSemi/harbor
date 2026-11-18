@@ -144,7 +144,7 @@ class HarborPcieOptionRom extends BridgeModule {
       mux(
         be[2],
         Const(2, width: 3),
-        mux(be[1], Const(1, width: 3), Const(0, width: 3)),
+        mux<Logic>(be[1], Const(1, width: 3), Const(0, width: 3)),
       ),
     );
 
@@ -160,7 +160,7 @@ class HarborPcieOptionRom extends BridgeModule {
           mux(
             firstBe[1],
             Const(1, width: 2),
-            mux(firstBe[2], Const(2, width: 2), Const(3, width: 2)),
+            mux<Logic>(firstBe[2], Const(2, width: 2), Const(3, width: 2)),
           ),
         );
     final requestWords = Logic(name: 'request_words', width: 11);
@@ -248,10 +248,10 @@ class HarborPcieOptionRom extends BridgeModule {
     ];
     final dataBeat = [
       for (var i = n - 1; i >= 0; i--) wireWords[i] & laneLive[i].replicate(32),
-    ].swizzle();
+    ].concat();
     final dataKeep = [
       for (var i = n - 1; i >= 0; i--) laneLive[i].replicate(4),
-    ].swizzle();
+    ].concat();
     final dataEnds = ~Const(n, width: 11).lt(remaining);
 
     // A 3DW read request at width 128 is one beat with DW2 in it.
@@ -296,7 +296,7 @@ class HarborPcieOptionRom extends BridgeModule {
     Logic beat(List<Logic> dws) => [
       for (var i = n - 1; i >= 0; i--)
         i < dws.length ? dws[i] : Const(0, width: 32),
-    ].swizzle();
+    ].concat();
     final fullKeep = Const((1 << (w ~/ 8)) - 1, width: w ~/ 8);
 
     Combinational([
@@ -381,7 +381,7 @@ class HarborPcieOptionRom extends BridgeModule {
                   requestOk < headerOk,
                   if (w == 64)
                     state <
-                        mux(
+                        mux<Logic>(
                           rxLast,
                           Const(waitHeader, width: 4),
                           Const(waitAddress, width: 4),
@@ -408,7 +408,7 @@ class HarborPcieOptionRom extends BridgeModule {
                     then: [wordAddress < headerAddress, ...startRequest()],
                     orElse: [
                       state <
-                          mux(
+                          mux<Logic>(
                             rxLast,
                             Const(waitHeader, width: 4),
                             Const(drain, width: 4),

@@ -52,7 +52,7 @@ void main() {
         bitslip: Logic(name: 'bitslip'),
       );
       await wrap.build();
-      final sv = wrap.generateSynth();
+      final sv = wrap.dumpSystemVerilog();
 
       expect(sv, contains('ISERDESE2'));
       expect(sv, contains('.DATA_WIDTH(2)'));

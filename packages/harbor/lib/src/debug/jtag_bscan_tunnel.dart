@@ -124,11 +124,11 @@ class JtagBscanTunnel extends Module {
 
     Sequential(clk, reset: reset, [
       // Advance the input synchronizers every system clock.
-      jtckSync < [jtckSync[0], jtck].swizzle(),
-      jtdiSync < [jtdiSync[0], jtdi].swizzle(),
-      jshiftSync < [jshiftSync[0], jshift].swizzle(),
-      jce1Sync < [jce1Sync[0], jce1].swizzle(),
-      jrstnSync < [jrstnSync[0], jrstn].swizzle(),
+      jtckSync < [jtckSync[0], jtck].concat(),
+      jtdiSync < [jtdiSync[0], jtdi].concat(),
+      jshiftSync < [jshiftSync[0], jshift].concat(),
+      jce1Sync < [jce1Sync[0], jce1].concat(),
+      jrstnSync < [jrstnSync[0], jrstn].concat(),
 
       jtckPrev < jtckS,
       If(
@@ -148,7 +148,7 @@ class JtagBscanTunnel extends Module {
                     cnt.gte(Const(1, width: cntW)) &
                         cnt.lte(Const(7, width: cntW)),
                     then: [
-                      width < [jtdiS, width.getRange(1, 7)].swizzle(),
+                      width < [jtdiS, width.getRange(1, 7)].concat(),
                     ],
                   ),
                   // Capture inner tdo while shifting (registered -> the +1 skew).

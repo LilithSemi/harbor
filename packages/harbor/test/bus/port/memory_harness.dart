@@ -95,8 +95,10 @@ class MemMasterShell extends BridgeModule {
   MemMasterShell(
     HarborMemoryWaistConfig config, {
     HarborFabricKind kind = HarborFabricKind.axi4,
+    int? busAddressWidth,
   }) : super(
-         'MemTestMasterShell_${kind.name}_${_cfgName(config)}',
+         'MemTestMasterShell_${kind.name}_${_cfgName(config)}'
+         '${busAddressWidth == null ? '' : '_b$busAddressWidth'}',
          name: 'shell',
        ) {
     createPort('clk', PortDirection.input);
@@ -108,6 +110,7 @@ class MemMasterShell extends BridgeModule {
       config: config,
       clk: input('clk'),
       reset: input('reset'),
+      busAddressWidth: busAddressWidth,
     );
     exposeWaist(this, mem.waist, 'mem', PairRole.consumer);
   }
@@ -165,8 +168,10 @@ class MemLoopShell extends BridgeModule {
     HarborMemoryWaistConfig config, {
     HarborFabricKind kind = HarborFabricKind.axi4,
     int burstBeats = 8,
+    bool readOnly = false,
   }) : super(
-         'MemTestLoopShell_${kind.name}_${_cfgName(config)}_b$burstBeats',
+         'MemTestLoopShell_${kind.name}_${_cfgName(config)}_b$burstBeats'
+         '${readOnly ? '_ro' : ''}',
          name: 'shell',
        ) {
     createPort('clk', PortDirection.input);
@@ -182,11 +187,23 @@ class MemLoopShell extends BridgeModule {
           dataWidth: config.dataWidth,
           idWidth: config.idWidth,
         );
-        HarborAxi4MemoryMaster(clk: clk, reset: reset, waist: up, axi: link);
+        HarborAxi4MemoryMaster(
+          clk: clk,
+          reset: reset,
+          waist: up,
+          axi: link,
+          readOnly: readOnly,
+        );
         HarborAxi4MemorySlave(clk: clk, reset: reset, axi: link, waist: down);
       case HarborFabricKind.tilelink:
         final link = TileLinkInterface(harborTileLinkMemoryConfig(config));
-        HarborTileLinkMemoryMaster(clk: clk, reset: reset, waist: up, tl: link);
+        HarborTileLinkMemoryMaster(
+          clk: clk,
+          reset: reset,
+          waist: up,
+          tl: link,
+          readOnly: readOnly,
+        );
         HarborTileLinkMemorySlave(
           clk: clk,
           reset: reset,
@@ -195,7 +212,13 @@ class MemLoopShell extends BridgeModule {
         );
       case HarborFabricKind.wishbone:
         final link = WishboneInterface(harborWishboneMemoryConfig(config));
-        HarborWishboneMemoryMaster(clk: clk, reset: reset, waist: up, wb: link);
+        HarborWishboneMemoryMaster(
+          clk: clk,
+          reset: reset,
+          waist: up,
+          wb: link,
+          readOnly: readOnly,
+        );
         HarborWishboneMemorySlave(
           clk: clk,
           reset: reset,
@@ -437,6 +460,10 @@ class WaistMemory {
   /// request's start address, so a request can carry both good and bad
   /// beats.
   final bool perBeatErr;
+
+  /// With [perBeatErr], only a beat at the start of a line of this many
+  /// bytes fails, so an error comes early in a burst.
+  final int? errLine;
   final List<String> errors;
   final WordMemory mem;
   final List<Burst> reads = [];
@@ -460,6 +487,7 @@ class WaistMemory {
     required this.errors,
     this.errBase = 0xf000,
     this.perBeatErr = false,
+    this.errLine,
     double stall = 0.3,
   }) : mem = WordMemory(busBytes) {
     rdata = Source(s, '${p}_RDATA_VALID', '${p}_RDATA_READY', rng, idle: stall)
@@ -544,7 +572,10 @@ class WaistMemory {
       errors.add('WDATA_LAST wrong on beat $_beat of $b');
     }
     final strb = f['${p}_WDATA_STRB']!;
-    final addrErr = perBeatErr ? addrs[_beat] >= errBase : b.addr >= errBase;
+    final addrErr = perBeatErr
+        ? addrs[_beat] >= errBase &&
+              (errLine == null || addrs[_beat] % errLine! == 0)
+        : b.addr >= errBase;
     if (perBeatErr) {
       // A beat with every strobe low has no effect, so it must not be
       // able to fault the device.

@@ -53,7 +53,7 @@ class HarborUvModeDecode extends BridgeModule {
     Logic packCdf(List<int> icdf) => [
       for (var s = _maxSyms - 1; s >= 0; s--)
         Const(s < icdf.length ? icdf[s] : 0, width: 16),
-    ].swizzle();
+    ].concat();
     Logic selCdf() {
       Logic v = packCdf(table[12]);
       for (var i = 11; i >= 0; i--) {
@@ -98,7 +98,7 @@ class HarborUvModeDecode extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 

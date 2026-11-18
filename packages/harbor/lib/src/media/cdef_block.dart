@@ -68,7 +68,7 @@ class HarborCdefBlock extends BridgeModule {
         [
           for (var r = 7; r >= 0; r--)
             for (var c = 7; c >= 0; c--) pad(r + 2, c + 2).getRange(0, bd),
-        ].swizzle();
+        ].concat();
     final rawDir = dirUnit.output('dir');
     final variance = dirUnit.output('variance');
 
@@ -110,7 +110,7 @@ class HarborCdefBlock extends BridgeModule {
         final nb = [
           for (var dr = 4; dr >= 0; dr--)
             for (var dc = 4; dc >= 0; dc--) pad(r + dr, c + dc),
-        ].swizzle();
+        ].concat();
         final Logic fout;
         if (sentinel) {
           final f = HarborCdefFilterSentinel(name: 'flt_${r}_$c', bd: bd);
@@ -137,6 +137,6 @@ class HarborCdefBlock extends BridgeModule {
       }
     }
     // outPx is row-major (r*8+c). Pack LSB-first.
-    output('out') <= outPx.reversed.toList().swizzle();
+    output('out') <= outPx.reversed.toList().concat();
   }
 }

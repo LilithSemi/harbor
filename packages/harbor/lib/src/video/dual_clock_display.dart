@@ -89,6 +89,14 @@ import 'video_timing.dart';
 /// port, start each plane at an sdram row and use a pitch from
 /// [HarborSdram.scanoutStride], so each line starts on a new row.
 ///
+/// `vblank` (control domain) is high while the timing generator is in the
+/// vertical blank, at least one control clock after the last active line.
+/// `bus_error` (control domain) pulses for each errored read beat of a memory
+/// waist. The fetcher writes zero for that beat. A scanout port has no error
+/// response, so the output is 0 there.
+/// `active` (control domain) is the `enable` value that the pixel side took
+/// at the last frame start.
+///
 /// The constant outputs tell the build: `plane_count` (4 bits) is
 /// [planeCount], `plane_formats_0` and, with an overlay, `plane_formats_1`
 /// are [planeFormats], and `overlay_present` is [overlayPresent].
@@ -245,6 +253,17 @@ class HarborDualClockDisplay extends Module {
   /// pixel shows the word of the next pixel.
   Logic get pixelWord => output('pixel_word');
   Logic get underrun => output('underrun');
+
+  /// High while the timing generator is in the vertical blank (control
+  /// domain).
+  Logic get vblank => output('vblank');
+
+  /// One control clock pulse after an errored read beat of the memory
+  /// waist. Always 0 with a scanout port, which has no error response.
+  Logic get busError => output('bus_error');
+
+  /// The `enable` value of the last frame start take (control domain).
+  Logic get active => output('active');
 
   /// One underrun bit for each plane, present only on a planar build.
   Logic get planeUnderrun => output('plane_underrun');
@@ -649,6 +668,9 @@ class HarborDualClockDisplay extends Module {
     addOutput('y', width: vbits);
     addOutput('pixel_word', width: 32);
     addOutput('underrun');
+    addOutput('vblank');
+    addOutput('active');
+    addOutput('bus_error');
 
     final timingGen = VideoTimingGenerator(
       timing: timing,
@@ -930,6 +952,34 @@ class HarborDualClockDisplay extends Module {
       addOutput('rq_words', width: scanout.rqWords.width) <= scanout.rqWords;
     }
     underrun <= status(scanout.underrun, 'all');
+    // The vertical blank level, registered in the pixel domain before it
+    // goes to the control domain.
+    output('vblank') <=
+        status(
+          flop(
+            pixelClk,
+            ty.gte(timing.vActive),
+            reset: pixelReset,
+          ).named('vblank_pixel'),
+          'vblank',
+        );
+    output('active') <= status(enable, 'active');
+    if (localMemory == null) {
+      output('bus_error') <= Const(0);
+    } else {
+      // A toggle in the system domain, one pulse in the control domain for
+      // each change of it.
+      final errToggle = Logic(name: 'bus_error_toggle');
+      Sequential(sysClk, reset: sysReset, [
+        If(scanout.fetchError, then: [errToggle < ~errToggle]),
+      ]);
+      var t = errToggle;
+      for (var i = 0; i < 2; i++) {
+        t = flop(ctrlClk, t, reset: ctrlReset).named('bus_error_sync$i');
+      }
+      final prev = flop(ctrlClk, t, reset: ctrlReset).named('bus_error_prev');
+      output('bus_error') <= (t ^ prev).named('bus_error_pulse');
+    }
     if (unpack != null) {
       for (var k = 0; k < planes; k++) {
         planeWord[k] <= scanout.planeData(k);
@@ -991,9 +1041,9 @@ class HarborDualClockDisplay extends Module {
       final is565 = frameFormat == null
           ? Const(1)
           : frameFormat.eq(i565).named('is_rgb565');
-      r = mux(is565, [r5, r5.getRange(2, 5)].swizzle(), word.getRange(16, 24));
-      g = mux(is565, [g6, g6.getRange(4, 6)].swizzle(), word.getRange(8, 16));
-      b = mux(is565, [b5, b5.getRange(2, 5)].swizzle(), word.getRange(0, 8));
+      r = mux(is565, [r5, r5.getRange(2, 5)].concat(), word.getRange(16, 24));
+      g = mux(is565, [g6, g6.getRange(4, 6)].concat(), word.getRange(8, 16));
+      b = mux(is565, [b5, b5.getRange(2, 5)].concat(), word.getRange(0, 8));
     } else if (rgb565) {
       // Column 0 is the low half (bits 15..0), column 1 the high half
       // (bits 31..16): little-endian memory order.
@@ -1002,9 +1052,9 @@ class HarborDualClockDisplay extends Module {
       final r5 = half.getRange(11, 16);
       final g6 = half.getRange(5, 11);
       final b5 = half.getRange(0, 5);
-      r = [r5, r5.getRange(2, 5)].swizzle();
-      g = [g6, g6.getRange(4, 6)].swizzle();
-      b = [b5, b5.getRange(2, 5)].swizzle();
+      r = [r5, r5.getRange(2, 5)].concat();
+      g = [g6, g6.getRange(4, 6)].concat();
+      b = [b5, b5.getRange(2, 5)].concat();
     } else {
       // argb8888 behaves like xrgb8888: alpha is ignored.
       r = word.getRange(16, 24);
@@ -1120,7 +1170,7 @@ class HarborDualClockDisplay extends Module {
       // No TMDS encoder or serializer, and no shift clock: rgb/hsync/vsync/de
       // are already the registered, pixel-aligned values of the last stage
       // above, and pclk is the pixel clock forwarded through the same edge.
-      rgb <= [r2, g2, b2].swizzle();
+      rgb <= [r2, g2, b2].concat();
       pclk <=
           HarborPixelClockForward(
             clk: pixelClk,
@@ -1296,7 +1346,7 @@ class HarborDualClockDisplay extends Module {
         [
           addInput('audio_right', right, width: 24),
           addInput('audio_left', left, width: 24),
-        ].swizzle();
+        ].concat();
     fifo.input('rd_clk').srcConnection! <= pixelClk;
     fifo.input('rd_reset').srcConnection! <=
         harborCdcJoinReset(pixelClk, pixelReset, ctrlReset, name: 'audio_rd');
@@ -1591,7 +1641,7 @@ class HarborDualClockDisplay extends Module {
     for (var i = g.width - 2; i >= 0; i--) {
       bits.add(bits.last ^ g[i]);
     }
-    return bits.swizzle().named('${name}_sync');
+    return bits.concat().named('${name}_sync');
   }
 
   /// Pixel cycles from the timing generator to the outputs.
@@ -1723,7 +1773,7 @@ class _ShadowSet {
     final applied = early ? Logic(name: '${name}_applied', width: w) : null;
     _fields.add((input, shadow, applied, resetValue >> low, low));
     final v = applied ?? shadow;
-    return low == 0 ? v : [v, Const(0, width: low)].swizzle();
+    return low == 0 ? v : [v, Const(0, width: low)].concat();
   }
 
   void build({

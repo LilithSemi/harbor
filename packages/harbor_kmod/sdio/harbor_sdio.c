@@ -32,10 +32,13 @@
 #include <linux/mmc/mmc.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/math64.h>
 #include <linux/of.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 
 #define HARBOR_SD_CTRL	     0x00
 #define HARBOR_SD_STATUS     0x08
@@ -49,12 +52,18 @@
 #define HARBOR_SD_INT_STATUS 0x60
 #define HARBOR_SD_INT_ENABLE 0x68
 #define HARBOR_SD_ADMA_ADDR  0x70
+#define HARBOR_SD_DATA_TMO_REG 0x78
+#define HARBOR_SD_ADMA_ERR   0x80
+#define HARBOR_SD_ADMA_ERR_ADDR 0x88
+#define HARBOR_SD_DIAG	     0x90
 
 #define HARBOR_SD_CTRL_ENABLE	   BIT(0)
 #define HARBOR_SD_CTRL_WIDTH_SHIFT 4
 #define HARBOR_SD_CTRL_WIDTH_1	   0
 #define HARBOR_SD_CTRL_WIDTH_4	   1
 #define HARBOR_SD_CTRL_WIDTH_8	   2
+#define HARBOR_SD_CTRL_SAMPLE_FALL BIT(8)
+#define HARBOR_SD_CTRL_DAT_RESET   BIT(9)
 
 #define HARBOR_SD_ST_CARD_DETECT BIT(0)
 #define HARBOR_SD_ST_BUSY	 BIT(8)
@@ -62,7 +71,8 @@
 
 /*
  * CMD: [5:0] index, [7:6] response type, [8] data, [9] read, [10] ADMA,
- * [11] ADMA_ADDR is a descriptor table.
+ * [11] ADMA_ADDR is a descriptor table, [12] the response has no CRC7,
+ * [13] the response does not echo the index.
  */
 #define HARBOR_SD_CMD_INDEX	 GENMASK(5, 0)
 #define HARBOR_SD_CMD_RESP_SHIFT 6
@@ -74,6 +84,8 @@
 #define HARBOR_SD_CMD_READ	 BIT(9)
 #define HARBOR_SD_CMD_DMA	 BIT(10)
 #define HARBOR_SD_CMD_TABLE	 BIT(11)
+#define HARBOR_SD_CMD_NO_CRC	 BIT(12)
+#define HARBOR_SD_CMD_NO_INDEX	 BIT(13)
 
 /* INT_STATUS, write-1-to-clear. */
 #define HARBOR_SD_INT_CMD_DONE	  BIT(0)
@@ -84,7 +96,14 @@
 #define HARBOR_SD_INT_WRITE_ERR	  BIT(5)
 #define HARBOR_SD_INT_RX_OVERRUN  BIT(6)
 #define HARBOR_SD_INT_ADMA_ERR	  BIT(7)
-#define HARBOR_SD_INT_ALL	  GENMASK(7, 0)
+#define HARBOR_SD_INT_DATA_TMO	  BIT(8)
+#define HARBOR_SD_INT_RESP_CRC	  BIT(9)
+#define HARBOR_SD_INT_RESP_END	  BIT(10)
+#define HARBOR_SD_INT_RESP_INDEX  BIT(11)
+#define HARBOR_SD_INT_RESP_ERR                                                 \
+	(HARBOR_SD_INT_RESP_CRC | HARBOR_SD_INT_RESP_END |                     \
+	 HARBOR_SD_INT_RESP_INDEX)
+#define HARBOR_SD_INT_ALL	  GENMASK(11, 0)
 
 /*
  * ADMA descriptor: two 32-bit words, [buffer address], [byte length in [15:0],
@@ -109,6 +128,8 @@ struct harbor_sd_desc {
 #define HARBOR_SD_CMD_TIMEOUT_US 100000
 /* A data phase includes the card's programming time on a write. */
 #define HARBOR_SD_DATA_TIMEOUT_US 5000000
+/* No data transfer or busy wait is allowed to hold the host for longer. */
+#define HARBOR_SD_MAX_WAIT_US	  60000000
 
 /* CLK_DIV counts full SD periods, so the divider is freq/(2*rate) - 1. */
 #define HARBOR_SD_CLK_DIV_MAX 65535
@@ -119,14 +140,16 @@ struct harbor_sd {
 	struct device *dev;
 	unsigned int clk_freq;
 	u32 ctrl;		     /* the CTRL value in force */
+	u32 ctrl_fixed;		     /* CTRL bits the driver leaves as found */
 	struct harbor_sd_desc *desc; /* descriptor table (coherent) */
 	dma_addr_t desc_dma;
+	struct dentry *dbg;
 };
 
 static void harbor_sd_write_ctrl(struct harbor_sd *hs, u32 ctrl)
 {
-	hs->ctrl = ctrl;
-	writel(ctrl, hs->base + HARBOR_SD_CTRL);
+	hs->ctrl = ctrl | hs->ctrl_fixed;
+	writel(hs->ctrl, hs->base + HARBOR_SD_CTRL);
 }
 
 static void harbor_sd_set_clock(struct harbor_sd *hs, unsigned int hz)
@@ -255,16 +278,40 @@ static int harbor_sd_build_desc(struct harbor_sd *hs, struct mmc_data *data)
 	return 0;
 }
 
+/*
+ * Stop the data engine and wait for the memory accesses already sent. A
+ * failed transfer leaves the engine and the DAT pads in whatever state the
+ * error found them.
+ */
+static int harbor_sd_dat_reset(struct harbor_sd *hs)
+{
+	u32 sts;
+	int ret;
+
+	writel(hs->ctrl | HARBOR_SD_CTRL_DAT_RESET, hs->base + HARBOR_SD_CTRL);
+	ret = readl_poll_timeout(hs->base + HARBOR_SD_STATUS, sts,
+				 !(sts & HARBOR_SD_ST_BUSY), 10,
+				 HARBOR_SD_CMD_TIMEOUT_US);
+	if (ret)
+		dev_warn(hs->dev, "the data engine did not stop after a reset\n");
+
+	return ret;
+}
+
 /* Issue one command, and its data phase when it has one. */
 static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 			      struct mmc_data *data)
 {
-	unsigned int timeout_us;
+	u64 timeout_us;
 	u32 val, ist, sts;
 	int ret;
 
 	val = (cmd->opcode & HARBOR_SD_CMD_INDEX) |
 	      (harbor_sd_resp_type(cmd) << HARBOR_SD_CMD_RESP_SHIFT);
+	if (!(cmd->flags & MMC_RSP_CRC))
+		val |= HARBOR_SD_CMD_NO_CRC;
+	if (!(cmd->flags & MMC_RSP_OPCODE))
+		val |= HARBOR_SD_CMD_NO_INDEX;
 
 	if (data) {
 		val |= HARBOR_SD_CMD_DATA | HARBOR_SD_CMD_DMA |
@@ -276,10 +323,25 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		writel(data->blocks, hs->base + HARBOR_SD_BLK_COUNT);
 		writel(lower_32_bits(hs->desc_dma),
 		       hs->base + HARBOR_SD_ADMA_ADDR);
+		/*
+		 * The card timeout is for one block, and the engine ends a block
+		 * with its own busy limit. Allow each block its full time.
+		 */
 		timeout_us = HARBOR_SD_DATA_TIMEOUT_US;
+		if (data->timeout_ns) {
+			u64 per_block = div_u64(data->timeout_ns, 1000);
+
+			timeout_us = max_t(u64, timeout_us,
+					   per_block * data->blocks);
+		}
 	} else {
 		timeout_us = HARBOR_SD_CMD_TIMEOUT_US;
+		if (cmd->flags & MMC_RSP_BUSY)
+			timeout_us += (cmd->busy_timeout ? cmd->busy_timeout :
+							   10000) *
+				      1000ull;
 	}
+	timeout_us = min_t(u64, timeout_us, HARBOR_SD_MAX_WAIT_US);
 
 	/*
 	 * Clear the latched status first. Without this the timeout and error
@@ -296,6 +358,7 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		cmd->error = -ETIMEDOUT;
 		if (data)
 			data->error = -ETIMEDOUT;
+		harbor_sd_dat_reset(hs);
 		return;
 	}
 
@@ -306,6 +369,15 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		cmd->error = -ETIMEDOUT;
 		if (data)
 			data->error = -ETIMEDOUT;
+		harbor_sd_dat_reset(hs);
+		return;
+	}
+
+	if (ist & HARBOR_SD_INT_RESP_ERR) {
+		cmd->error = -EILSEQ;
+		if (data)
+			data->error = -EILSEQ;
+		harbor_sd_dat_reset(hs);
 		return;
 	}
 
@@ -314,7 +386,7 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 	if (!data)
 		return;
 
-	if (!(ist & HARBOR_SD_INT_DATA_DONE))
+	if ((ist & HARBOR_SD_INT_DATA_TMO) || !(ist & HARBOR_SD_INT_DATA_DONE))
 		data->error = -ETIMEDOUT;
 	else if (ist & HARBOR_SD_INT_ADMA_ERR)
 		data->error = -EIO;
@@ -324,6 +396,9 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		data->error = -EIO;
 	else
 		data->bytes_xfered = data->blocks * data->blksz;
+
+	if (data->error)
+		harbor_sd_dat_reset(hs);
 }
 
 static void harbor_sd_request(struct mmc_host *mmc, struct mmc_request *mrq)
@@ -377,12 +452,65 @@ static const struct mmc_host_ops harbor_sd_ops = {
     .get_cd = harbor_sd_get_cd,
 };
 
+/*
+ * Reading DATA pops the PIO holding register, so the dump skips it. The slots
+ * sit 8 bytes apart.
+ */
+static const struct {
+	unsigned int off;
+	const char *name;
+} harbor_sd_regs[] = {
+    {HARBOR_SD_CTRL, "CTRL"},
+    {HARBOR_SD_STATUS, "STATUS"},
+    {HARBOR_SD_CLK_DIV, "CLK_DIV"},
+    {HARBOR_SD_CMD, "CMD"},
+    {HARBOR_SD_CMD_ARG, "CMD_ARG"},
+    {HARBOR_SD_RESP(0), "RESP0"},
+    {HARBOR_SD_RESP(1), "RESP1"},
+    {HARBOR_SD_RESP(2), "RESP2"},
+    {HARBOR_SD_RESP(3), "RESP3"},
+    {HARBOR_SD_DATA, "DATA"},
+    {HARBOR_SD_BLK_SIZE, "BLK_SIZE"},
+    {HARBOR_SD_BLK_COUNT, "BLK_COUNT"},
+    {HARBOR_SD_INT_STATUS, "INT_STATUS"},
+    {HARBOR_SD_INT_ENABLE, "INT_ENABLE"},
+    {HARBOR_SD_ADMA_ADDR, "ADMA_ADDR"},
+    {HARBOR_SD_DATA_TMO_REG, "DATA_TIMEOUT"},
+    {HARBOR_SD_ADMA_ERR, "ADMA_ERR"},
+    {HARBOR_SD_ADMA_ERR_ADDR, "ADMA_ERR_ADDR"},
+    {HARBOR_SD_DIAG, "DIAG"},
+};
+
+static struct dentry *harbor_sd_debugfs;
+
+static int harbor_sd_regs_show(struct seq_file *s, void *unused)
+{
+	struct harbor_sd *hs = s->private;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(harbor_sd_regs); i++) {
+		unsigned int off = harbor_sd_regs[i].off;
+
+		if (off == HARBOR_SD_DATA)
+			seq_printf(s, "0x%02x %-13s (not read)\n", off,
+				   harbor_sd_regs[i].name);
+		else
+			seq_printf(s, "0x%02x %-13s 0x%08x\n", off,
+				   harbor_sd_regs[i].name,
+				   readl(hs->base + off));
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(harbor_sd_regs);
+
 static int harbor_sd_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct harbor_sd *hs;
 	struct mmc_host *mmc;
 	struct clk *clk;
+	u32 busy_clocks;
 	int ret;
 
 	mmc = mmc_alloc_host(sizeof(*hs), dev);
@@ -398,6 +526,13 @@ static int harbor_sd_probe(struct platform_device *pdev)
 		ret = PTR_ERR(hs->base);
 		goto err_free_host;
 	}
+
+	/*
+	 * The sample edge is a build choice that CTRL keeps at its reset
+	 * value, so every later CTRL write carries it along.
+	 */
+	hs->ctrl_fixed = readl(hs->base + HARBOR_SD_CTRL) &
+			 HARBOR_SD_CTRL_SAMPLE_FALL;
 
 	/*
 	 * The controller input clock. Harbor's device tree states the rate
@@ -483,6 +618,19 @@ static int harbor_sd_probe(struct platform_device *pdev)
 	 */
 	mmc->f_max = min(mmc->f_max, hs->clk_freq / 2);
 
+	/*
+	 * The engine holds a command with busy until DAT0 is high again, and
+	 * gives up after the number of SD clocks that the firmware node states.
+	 * At the fastest clock that is the shortest time it waits.
+	 */
+	if (!device_property_read_u32(dev, "harbor,busy-timeout-clocks",
+				      &busy_clocks) &&
+	    busy_clocks) {
+		mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY;
+		mmc->max_busy_timeout = div64_u64((u64)busy_clocks * 1000,
+						  max(mmc->f_max, 1u));
+	}
+
 	mmc->max_blk_size = HARBOR_SD_MAX_BLK_SIZE;
 	mmc->max_blk_count = HARBOR_SD_MAX_BLK_COUNT;
 	mmc->max_segs = HARBOR_SD_MAX_SEGS;
@@ -503,6 +651,9 @@ static int harbor_sd_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_free_dma;
 
+	hs->dbg = debugfs_create_dir(dev_name(dev), harbor_sd_debugfs);
+	debugfs_create_file("regs", 0444, hs->dbg, hs, &harbor_sd_regs_fops);
+
 	return 0;
 
 err_free_dma:
@@ -517,6 +668,7 @@ static void harbor_sd_remove(struct platform_device *pdev)
 {
 	struct harbor_sd *hs = platform_get_drvdata(pdev);
 
+	debugfs_remove_recursive(hs->dbg);
 	mmc_remove_host(hs->mmc);
 	harbor_sd_write_ctrl(hs, 0);
 	dma_free_coherent(hs->dev, HARBOR_SD_MAX_SEGS * sizeof(*hs->desc),
@@ -541,7 +693,26 @@ static struct platform_driver harbor_sd_driver = {
 	    .of_match_table = harbor_sd_of_match,
 	},
 };
-module_platform_driver(harbor_sd_driver);
+
+static int __init harbor_sd_init(void)
+{
+	int ret;
+
+	harbor_sd_debugfs = debugfs_create_dir("harbor_sdio", NULL);
+	ret = platform_driver_register(&harbor_sd_driver);
+	if (ret)
+		debugfs_remove(harbor_sd_debugfs);
+
+	return ret;
+}
+module_init(harbor_sd_init);
+
+static void __exit harbor_sd_exit(void)
+{
+	platform_driver_unregister(&harbor_sd_driver);
+	debugfs_remove(harbor_sd_debugfs);
+}
+module_exit(harbor_sd_exit);
 
 MODULE_AUTHOR("Lilith Semiconductor");
 MODULE_DESCRIPTION("Harbor SD/SDIO/eMMC host controller driver");

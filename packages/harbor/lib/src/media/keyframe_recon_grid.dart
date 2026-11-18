@@ -123,9 +123,9 @@ class HarborKeyframeReconGrid extends BridgeModule {
     pred.input('have_above').srcConnection! <= haveA;
     pred.input('have_left').srcConnection! <= haveL;
     pred.input('above').srcConnection! <=
-        [for (var i = 3; i >= 0; i--) above[i]].swizzle();
+        [for (var i = 3; i >= 0; i--) above[i]].concat();
     pred.input('left').srcConnection! <=
-        [for (var i = 3; i >= 0; i--) left[i]].swizzle();
+        [for (var i = 3; i >= 0; i--) left[i]].concat();
     pred.input('above_left').srcConnection! <= corner;
 
     // transform (runtime tx_type, sequential).
@@ -154,7 +154,7 @@ class HarborKeyframeReconGrid extends BridgeModule {
     const sIdle = 0, sPred = 1, sTxWait = 2, sWrite = 3, sDone = 4;
     final st = Logic(name: 'st', width: 3);
     output('done') <= st.eq(Const(sDone, width: 3));
-    output('frame') <= [for (var i = nPix - 1; i >= 0; i--) frame[i]].swizzle();
+    output('frame') <= [for (var i = nPix - 1; i >= 0; i--) frame[i]].concat();
 
     Combinational([
       txStart < Const(0),

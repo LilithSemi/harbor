@@ -47,10 +47,9 @@ class HarborInvTxfm4x4 extends BridgeModule {
 
     Logic kc(int v) => Const(BigInt.from(v).toUnsigned(w), width: w);
     Logic ashr(Logic x, int s) =>
-        s == 0 ? x : [x[w - 1].replicate(s), x.getRange(s, w)].swizzle();
+        s == 0 ? x : [x[w - 1].replicate(s), x.getRange(s, w)].concat();
     // Reinterpret the low 32 bits as a signed value (libaom `(int32_t)` cast).
-    Logic s32(Logic v) =>
-        [v[31].replicate(w - 32), v.getRange(0, 32)].swizzle();
+    Logic s32(Logic v) => [v[31].replicate(w - 32), v.getRange(0, 32)].concat();
     Logic addW(Logic a, Logic b) => (a + b).getRange(0, w);
     Logic subW(Logic a, Logic b) => (a - b).getRange(0, w);
     // Full signed product, low w bits (operands fit so no wrap).
@@ -203,6 +202,6 @@ class HarborInvTxfm4x4 extends BridgeModule {
       }
     }
 
-    output('residual') <= res.reversed.toList().swizzle();
+    output('residual') <= res.reversed.toList().concat();
   }
 }

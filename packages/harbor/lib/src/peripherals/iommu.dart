@@ -232,7 +232,7 @@ class HarborIommu extends BridgeModule
     final tlbHit = (hitValid & hitTag.eq(tlbTagOf)).named('tlb_hit');
 
     // Sv39 root and per-level VPN.
-    final rootAddr = [ddtp.getRange(12, 64), Const(0, width: 12)].swizzle();
+    final rootAddr = [ddtp.getRange(12, 64), Const(0, width: 12)].concat();
     final levelVpn = mux(
       walkLevel.eq(Const(2, width: 2)),
       vpn2,
@@ -249,8 +249,8 @@ class HarborIommu extends BridgeModule
     final translatedPpnOffset = [
       hitPpn,
       offset,
-    ].swizzle().zeroExtend(64); // {ppn, offset}
-    final walkPpnOffset = [ptePpn, offset].swizzle().zeroExtend(64);
+    ].concat().zeroExtend(64); // {ppn, offset}
+    final walkPpnOffset = [ptePpn, offset].concat().zeroExtend(64);
 
     interrupt <= ipsr.or();
 
@@ -405,7 +405,7 @@ class HarborIommu extends BridgeModule
                                   [
                                     ptePpn,
                                     Const(0, width: 12),
-                                  ].swizzle().zeroExtend(64),
+                                  ].concat().zeroExtend(64),
                               walkLevel < (walkLevel - Const(1, width: 2)),
                               ioState < Const(sWalk, width: 2),
                             ],

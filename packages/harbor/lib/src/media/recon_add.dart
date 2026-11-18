@@ -31,7 +31,7 @@ class HarborReconAdd extends BridgeModule {
       final r = input('residual').getRange(i * rw, i * rw + rw);
       // sum = pred + sign-extended residual, in a sumW-bit signed field.
       final sum =
-          (p.zeroExtend(sumW) + [r[rw - 1].replicate(sumW - rw), r].swizzle())
+          (p.zeroExtend(sumW) + [r[rw - 1].replicate(sumW - rw), r].concat())
               .getRange(0, sumW);
       final neg = sum[sumW - 1];
       final tooBig = ~neg & sum.gt(Const(maxV, width: sumW));
@@ -43,6 +43,6 @@ class HarborReconAdd extends BridgeModule {
         ),
       );
     }
-    output('recon') <= outs.reversed.toList().swizzle();
+    output('recon') <= outs.reversed.toList().concat();
   }
 }

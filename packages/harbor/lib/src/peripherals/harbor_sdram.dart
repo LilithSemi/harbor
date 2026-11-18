@@ -11,12 +11,13 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../blackbox/ecp5/ecp5.dart';
 import '../bus/bus_exports.dart';
-import '../clock/cdc.dart';
 import '../clock/wishbone_cdc_fifo.dart';
 import '../soc/acpi.dart';
+import '../soc/board_zon.dart' show HarborMemoryInfo, HarborMemoryKind;
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../soc/target.dart';
+import 'display.dart';
 import 'memory_waist_beats.dart';
 import 'sdram_config.dart';
 import 'sdram_cycles.dart';
@@ -29,11 +30,16 @@ import 'sim_dram.dart';
 
 /// SoC wrapper for the sdr sdram controller.
 ///
+/// The bus is 32 or 64 bits wide ([busDataWidth]). A beat is two or four
+/// 16-bit sdram words, the low word first, and each byte strobe goes to the
+/// dqm of its word. A word with no strobe still goes out, with its dqm high.
+///
 /// A Wishbone [protocol] has a classic Wishbone port with the ERR, CTI and
 /// BTE signals of a Wishbone memory slave. It ignores CTI and BTE, so each
 /// beat is one classic access, and it never drives ERR:
 ///
-///   bus (clk, Wishbone B4 32b) -> HarborWishboneCdcFifoBridge 'sdram_cdc'
+///   bus (clk, Wishbone B4 32b or 64b) -> HarborWishboneCdcFifoBridge
+///     'sdram_cdc'
 ///     with flops on its memory side (skipped when [busClockSync])
 ///     -> SdramWishbonePort -> SdramPortSlice -> SdramArbiter -> SdramEngine
 ///     -> SdramPhyEcp5 -> sdram_* pads
@@ -42,7 +48,7 @@ import 'sim_dram.dart';
 /// the memory side has taken it, so no acked write is lost on a bus
 /// reset. With it true, writes are posted (about 3x faster back to
 /// back), but a posted write still in the clock-crossing fifo is lost on
-/// a bus reset. Either reset sets the sticky `bus_error`.
+/// a bus reset. On a crossed build, either reset sets the sticky `bus_error`.
 ///
 /// An AXI4 or TileLink [protocol] has a memory slave port:
 ///
@@ -53,18 +59,27 @@ import 'sim_dram.dart';
 ///
 /// That port answers in acceptance order per direction. A burst goes to the
 /// arbiter as sdram requests of up to [SdramMemoryPort.maxWords] words, one
-/// for each aligned 4-beat block, so a long burst never holds the engine
-/// for longer than a scanout request does. A write gets its response when
+/// for each aligned block of 16 bytes (4 beats of 32 bits or 2 beats of 64
+/// bits), so a long burst never holds the engine for longer than a scanout
+/// request does. Blocks in one open row follow each other with no extra row
+/// cycles. A write gets its response when
 /// the arbiter has taken its last sdram request, so writes are not posted
 /// across the crossing. A request that a reset cuts off ends with an error
 /// response, which sets the sticky `bus_error`.
 ///
-/// Everything after the crossing runs on `mem_clk`. The target must be a
+/// Everything after the crossing runs on `mem_clk`. With [busClockSync] the
+/// bus clock is `mem_clk`, so there is no `mem_clk` port and no crossing,
+/// and everything runs on `clk`. The target must be a
 /// Lattice ecp5 or a [HarborSimTarget], which replaces the whole stack with
 /// [HarborSimDram] on the bus clock.
 ///
 /// `mem_reset` re-initializes the device, so its contents are not
-/// guaranteed after one. A bus `reset` alone keeps the sdram contents.
+/// guaranteed after one. A bus `reset` alone keeps the sdram contents. With
+/// [busClockSync] there is one clock and one reset: no `mem_clk` and no
+/// `mem_reset` port, and every bus `reset` also re-initializes the device,
+/// so its contents are lost. After the first init, a reset starts with a
+/// precharge all, then runs the full power-up wait and init. `scan_reset`
+/// follows `reset` too. `bus_error` stays low.
 ///
 /// A scanout port ([scanoutPorts] is 0 or 1) is a read port for a display,
 /// such as [HarborDualClockDisplay], that joins the arbiter next to the bus
@@ -78,8 +93,10 @@ import 'sim_dram.dart';
 /// a page. A port has at
 /// most [scanoutMaxInFlight] requests in flight, which bounds the wait of
 /// the bus port, see [busWaitBound]. A bus `reset` drops only the reads of
-/// the bus port. `scan_reset` follows `mem_reset` only (the bus reset on a
-/// [HarborSimTarget] build), and a scanout port client must reset on it.
+/// the bus port. `scan_reset` follows `mem_reset` only, and a scanout port
+/// client must reset on it. On a [HarborSimTarget] build and with
+/// [busClockSync] there is no `mem_reset`, so `scan_reset` follows the bus
+/// `reset`.
 ///
 /// Two items of the scanout design are not done yet. A page-size CSR would
 /// let software pick a framebuffer stride that starts each line on a new
@@ -104,7 +121,10 @@ class HarborSdram extends BridgeModule
   /// Build target. Must be an ECP5 [HarborFpgaTarget] or a [HarborSimTarget].
   final HarborDeviceTarget? target;
 
-  /// Ecp5 phy knobs.
+  /// Ecp5 phy knobs, with the capture edge picked from [clockHz] when the
+  /// caller left it null. The edge must be inside the read window for the
+  /// board flight in the config, else the constructor throws an
+  /// [ArgumentError].
   final HarborSdramPhyConfig phy;
 
   /// Refreshes the scheduler may postpone before it must catch up.
@@ -114,8 +134,8 @@ class HarborSdram extends BridgeModule
   final int maxPulledInRefresh;
 
   /// When true, the bus clock is the same as `mem_clk`, so no `mem_clk`
-  /// port exists and the cdc bridge is skipped. `mem_reset` stays. It needs
-  /// a Wishbone [protocol].
+  /// port and no `mem_reset` port exist, the clock crossing is skipped and
+  /// the device follows the bus `reset`. Works on every [protocol].
   final bool busClockSync;
 
   /// When true, a write is acked as soon as the cdc bridge queues it,
@@ -127,7 +147,7 @@ class HarborSdram extends BridgeModule
   /// Bus address width.
   final int busAddressWidth;
 
-  /// Bus data width. Only 32 is supported.
+  /// Bus data width, 32 or 64.
   final int busDataWidth;
 
   /// Fabric kind of the bus port.
@@ -161,6 +181,16 @@ class HarborSdram extends BridgeModule
   /// 80 MB/s at 125 MHz, which is at or below the 80.5 MB/s of a 640x480
   /// 32 bpp display.
   final int scanoutMaxInFlight;
+
+  /// The line the scanout port must deliver, or null for no guarantee. With
+  /// a line, the arbiter grants the bus port nothing while the scanout port
+  /// has a request or a read in flight, so the bus gets the time between the
+  /// lines. The build throws an [ArgumentError] if [scanoutLineBound] is
+  /// longer than the line period. See [HarborScanoutLine].
+  final HarborScanoutLine? scanoutLine;
+
+  /// [scanoutLineBound] of [scanoutLine], or null without a line.
+  int? scanoutLineBoundCycles;
 
   /// Plain register stages on the request and the return path of each
   /// scanout port, so the port client can sit far from the controller. The
@@ -201,7 +231,7 @@ class HarborSdram extends BridgeModule
     required this.baseAddress,
     required this.clockHz,
     this.target,
-    this.phy = const HarborSdramPhyConfig(),
+    HarborSdramPhyConfig phy = const HarborSdramPhyConfig(),
     this.maxPostponedRefresh = 8,
     this.maxPulledInRefresh = 8,
     this.busClockSync = false,
@@ -216,11 +246,20 @@ class HarborSdram extends BridgeModule
     int? cdcDepth,
     this.scanoutPorts = 0,
     this.scanoutMaxInFlight = 3,
+    this.scanoutLine,
     this.readPortStages = 0,
     this.simReadLatency = 1,
     this.simWriteLatency = 1,
     super.name = 'sdram',
-  }) : busAddressWidth = busAddressWidth ?? config.sizeBytes.bitLength,
+  }) : phy = _resolvePhy(
+         config,
+         clockHz,
+         target,
+         phy,
+         maxPostponedRefresh,
+         maxPulledInRefresh,
+       ),
+       busAddressWidth = busAddressWidth ?? config.sizeBytes.bitLength,
        outstanding = _outstanding(protocol, outstanding),
        cdcDepth = _cdcDepth(
          target,
@@ -242,7 +281,14 @@ class HarborSdram extends BridgeModule
            ),
            clockHz: clockHz,
            target: target,
-           phy: phy,
+           phy: _resolvePhy(
+             config,
+             clockHz,
+             target,
+             phy,
+             maxPostponedRefresh,
+             maxPulledInRefresh,
+           ),
            busClockSync: busClockSync,
            postedWrites: postedWrites,
            busAddressWidth: busAddressWidth ?? config.sizeBytes.bitLength,
@@ -261,30 +307,39 @@ class HarborSdram extends BridgeModule
            ),
            scanoutPorts: scanoutPorts,
            scanoutMaxInFlight: scanoutMaxInFlight,
+           scanoutGuard: scanoutLine != null,
            readPortStages: readPortStages,
            simReadLatency: simReadLatency,
            simWriteLatency: simWriteLatency,
            exclusive: exclusive,
          ),
        ) {
-    if (busDataWidth != 32) {
-      throw ArgumentError('HarborSdram needs a 32-bit bus, got $busDataWidth');
+    if (busDataWidth != 32 && busDataWidth != 64) {
+      throw ArgumentError.value(
+        busDataWidth,
+        'busDataWidth',
+        'HarborSdram needs a 32-bit or 64-bit bus',
+      );
+    }
+    if (target is HarborSimTarget && scanoutPorts > 0 && busDataWidth != 32) {
+      throw ArgumentError.value(
+        busDataWidth,
+        'busDataWidth',
+        'a HarborSimTarget build with scanout ports needs a 32-bit bus',
+      );
+    }
+    if (config.dataWidth != 16) {
+      throw ArgumentError.value(
+        config.dataWidth,
+        'config',
+        'HarborSdram needs a 16-bit sdram part',
+      );
     }
     if (this.outstanding < 1) {
       throw ArgumentError.value(
         this.outstanding,
         'outstanding',
         'must be >= 1',
-      );
-    }
-    // A mem_reset resets the port of a busClockSync build. Only a Wishbone
-    // master can run its cycle again. An AXI4 or TileLink master would wait
-    // for a response that never comes.
-    if (busClockSync && protocol != HarborFabricKind.wishbone) {
-      throw ArgumentError.value(
-        protocol,
-        'protocol',
-        'busClockSync needs a Wishbone port',
       );
     }
     if (exclusive != null && protocol != HarborFabricKind.axi4) {
@@ -362,6 +417,47 @@ class HarborSdram extends BridgeModule
       maxPulledInRefresh,
     );
 
+    final line = scanoutLine;
+    if (line != null) {
+      if (scanoutPorts != 1) {
+        throw ArgumentError.value(
+          scanoutLine,
+          'scanoutLine',
+          'needs scanoutPorts of 1',
+        );
+      }
+      if (!scanoutLineFits(
+        cycles,
+        config,
+        line.words,
+        line.periodCycles,
+        maxInFlight: scanoutMaxInFlight,
+        syncCycles: line.syncCycles,
+      )) {
+        final worst = scanoutLineBound(
+          cycles,
+          config,
+          line.words,
+          periodCycles: line.periodCycles,
+          maxInFlight: scanoutMaxInFlight,
+        );
+        throw ArgumentError.value(
+          scanoutLine,
+          'scanoutLine',
+          'the worst case line fetch takes $worst cycles, and it needs a bus '
+              'request and ${line.syncCycles + 3} cycles more inside the line '
+              'period of ${line.periodCycles} cycles',
+        );
+      }
+      scanoutLineBoundCycles = scanoutLineBound(
+        cycles,
+        config,
+        line.words,
+        periodCycles: line.periodCycles,
+        maxInFlight: scanoutMaxInFlight,
+      );
+    }
+
     _addScanPorts();
     if (target is HarborSimTarget) {
       if (protocol == HarborFabricKind.wishbone) {
@@ -374,7 +470,8 @@ class HarborSdram extends BridgeModule
       return;
     }
     final memClkPort = busClockSync ? null : addInput('mem_clk', Logic());
-    final memResetPort = addInput('mem_reset', Logic());
+    // A same-clock build has one reset: the device follows the bus reset.
+    final memResetPort = busClockSync ? reset : addInput('mem_reset', Logic());
     final fpgaTarget = target;
     if (fpgaTarget is! HarborFpgaTarget ||
         fpgaTarget.vendor != HarborFpgaVendor.ecp5) {
@@ -493,6 +590,28 @@ class HarborSdram extends BridgeModule
         : null,
   );
 
+  static HarborSdramPhyConfig _resolvePhy(
+    HarborSdramConfig config,
+    int clockHz,
+    HarborDeviceTarget? target,
+    HarborSdramPhyConfig phy,
+    int maxPostponed,
+    int maxPulledIn,
+  ) {
+    if (target is! HarborFpgaTarget) return phy;
+    return phy.resolve(
+      clockHz: clockHz,
+      config: config,
+      casLatency: _cycles(
+        config,
+        clockHz,
+        target,
+        maxPostponed,
+        maxPulledIn,
+      ).casLatency,
+    );
+  }
+
   static String _definitionName({
     required HarborSdramConfig config,
     required HarborSdramCycles cycles,
@@ -510,6 +629,7 @@ class HarborSdram extends BridgeModule
     required int cdcDepth,
     required int scanoutPorts,
     required int scanoutMaxInFlight,
+    required bool scanoutGuard,
     required int readPortStages,
     required int simReadLatency,
     required int simWriteLatency,
@@ -535,11 +655,12 @@ class HarborSdram extends BridgeModule
             '_${c.wr}_${c.refi}_${c.powerUp}_${c.initRefreshes}'
             '_${c.readHiz}_${c.rowAgeLimit}_${c.maxPostponed}'
             '_${c.maxPulledIn}',
-        'p${phy.captureCycles}${phy.captureEdge.index}'
+        'p${phy.captureCycles}${phy.edge.index}'
             '${phy.captureCycleOffset}_${phy.dqDelayTaps ?? 'x'}',
         if (busClockSync) 'sync',
         if (postedWrites) 'posted',
         's${scanoutPorts}f$scanoutMaxInFlight',
+        if (scanoutGuard) 'guard',
         if (readPortStages > 0 && !sim) 'rs$readPortStages',
         if (sim) 'rl${simReadLatency}wl$simWriteLatency',
         ?exclusive?.tag,
@@ -717,18 +838,6 @@ class HarborSdram extends BridgeModule
     final engineDataReset = localReset('engine_data');
     final timersReset = localReset('timers');
     final phyReset = localReset('phy');
-    // The true power-on reset, synced into mem_clk, separate from a later
-    // standalone mem_reset. The engine uses it to tell a fresh power-up
-    // from a reset that may find a bank still open.
-    // One more flop after the synchronizer, so the flops on the raw bus
-    // reset drive one load and can sit near its source.
-    final coldReset = Ecp5Fd1s3bx(
-      d: harborCdcJoinReset(memClk, Const(0), reset, name: 'sdram_cold_reset'),
-      ck: memClk,
-      pd: Const(0),
-      name: 'sdram_cold_reset_copy',
-    ).q;
-
     final Logic frontReset, engineAbort;
     Logic? abortNext;
     // The arbiter took a write of the bus port, from the slice.
@@ -783,15 +892,16 @@ class HarborSdram extends BridgeModule
         engineDataReset: engineDataReset,
         timersReset: timersReset,
         phyReset: phyReset,
-        coldReset: coldReset,
       );
       return;
     }
 
+    // Without a crossing the port reset is the bus reset joined with the
+    // device reset, as the crossing gives it.
     final port = _busPort(
       memClk,
-      cdcReset,
-      fabric: HarborFabricClock(clk: clk, reset: reset),
+      busClockSync ? (reset | cdcReset).named('bus_joined_reset') : cdcReset,
+      fabric: busClockSync ? null : HarborFabricClock(clk: clk, reset: reset),
     );
     bus = port;
     // The joined reset asserts without the clock, so it goes through two
@@ -845,7 +955,6 @@ class HarborSdram extends BridgeModule
       engineDataReset: engineDataReset,
       timersReset: timersReset,
       phyReset: phyReset,
-      coldReset: coldReset,
     );
   }
 
@@ -873,21 +982,7 @@ class HarborSdram extends BridgeModule
   ) {
     if (busClockSync) {
       final frontReset = (reset | frontLocalReset).named('front_reset');
-      // Set by a mem_reset after the first release, cleared by the bus
-      // reset.
-      final armed = Logic(name: 'mem_reset_armed');
-      final busErr = Logic(name: 'bus_error_r');
-      Sequential(clk, [
-        If(
-          reset,
-          then: [armed < Const(0), busErr < Const(0)],
-          orElse: [
-            If(~frontLocalReset, then: [armed < Const(1)]),
-            If(frontLocalReset & armed, then: [busErr < Const(1)]),
-          ],
-        ),
-      ]);
-      addOutput('bus_error') <= busErr;
+      addOutput('bus_error') <= Const(0);
       return (
         cdc: null,
         frontReset: frontReset,
@@ -979,7 +1074,6 @@ class HarborSdram extends BridgeModule
     required Logic engineDataReset,
     required Logic timersReset,
     required Logic phyReset,
-    required Logic coldReset,
   }) {
     final scanPorts = [
       for (var i = 0; i < scanoutPorts; i++)
@@ -1022,7 +1116,7 @@ class HarborSdram extends BridgeModule
       keepReadsOnAbort: {for (var i = 1; i <= scanoutPorts; i++) i},
       abort: engineAbort,
       abortNext: abortNext,
-      coldReset: coldReset,
+      warmAfterFirstInit: true,
       timersReset: timersReset,
       port: enginePort,
       phyRdData: phyRdData,
@@ -1049,6 +1143,7 @@ class HarborSdram extends BridgeModule
       clk: memClk,
       reset: arbiterReset,
       abort: frontReset,
+      holdBestEffort: scanoutLine == null ? null : _scanBusy,
       ports: [slicedPort, ...scanPorts],
       configs: [
         HarborSdramPortConfig(name: clientName),
@@ -1148,30 +1243,138 @@ class HarborSdram extends BridgeModule
     return entries * entryCycles(c, scanoutMaxWords) + refreshCycles(c) + 9;
   }
 
+  /// `mem_clk` cycles from a line start in the pixel domain until the
+  /// scanout request is in the sdram clock domain, and from the last word
+  /// until the line done is back, for the clock rates [memHz] and [pixelHz].
+  /// The line period loses them. Each side takes the request or done toggle
+  /// through two flops of the receiving clock and an edge detect, which is 3
+  /// receiving cycles, and the pixel side is one pixel clock longer. The
+  /// total is 4 `mem_clk` cycles for the registers of the display, and the
+  /// pixel side counts `3 * memHz / pixelHz` rounded up.
+  static int scanoutSyncCyclesFor(int memHz, int pixelHz) =>
+      4 + (3 * memHz + pixelHz - 1) ~/ pixelHz;
+
+  /// Cycles from the take of a scanout request to its first word, for a
+  /// request of [words] words: the request slot, the arbiter register, the
+  /// engine pick and command registers, the cas latency, the phy and the
+  /// return register, then the words.
+  static int scanoutRoundTrip(HarborSdramCycles c, int words) =>
+      words + c.casLatency + 7;
+
+  /// Cycles that one refresh adds in the way of a scanout read: a precharge
+  /// all that cuts a read in flight, the refresh, the activate that opens the
+  /// row again, the cas latency and the pipeline.
+  static int scanoutRefreshCost(HarborSdramCycles c) =>
+      c.rp + c.rfc + c.rcd + c.casLatency + 3;
+
+  /// The most `mem_clk` cycles one line of [lineWords] words of the sdram
+  /// takes, from the line start in the pixel domain to the line done, when
+  /// the bus port yields to the scanout port ([HarborSdram.scanoutLine]).
+  /// The line period is [periodCycles]. It is the sum of:
+  /// - the requests: a line is `ceil(lineWords / 8) + 1` requests of
+  ///   [scanoutMaxWords] words, because the first request can start inside
+  ///   a block. With [maxInFlight] in flight, a request takes the larger of
+  ///   its words and [scanoutRoundTrip] over [maxInFlight], so there is no
+  ///   bubble while the round trip is not longer than [maxInFlight] requests,
+  /// - the round trip of the first request,
+  /// - the row opens: a precharge and an activate for each row the line
+  ///   touches, at most one more than its size in rows,
+  /// - two bus requests of [busChunkWords] words, each [entryCycles], that
+  ///   were running or granted before the hold started,
+  /// - the refreshes: the postponed ones that fall due in this line, at most
+  ///   `min(maxPostponed, ceil(period / refi) + 1)`, and one more for an idle
+  ///   refresh that starts at the line start, each [scanoutRefreshCost].
+  static int scanoutLineBound(
+    HarborSdramCycles c,
+    HarborSdramConfig config,
+    int lineWords, {
+    required int periodCycles,
+    int maxInFlight = 3,
+    int busChunkWords = scanoutMaxWords,
+  }) {
+    final due = (periodCycles + c.refi - 1) ~/ c.refi + 1;
+    final refreshes = (due < c.maxPostponed ? due : c.maxPostponed) + 1;
+    return scanoutStreamBound(c, config, lineWords, maxInFlight: maxInFlight) +
+        2 * entryCycles(c, busChunkWords) +
+        refreshes * scanoutRefreshCost(c);
+  }
+
+  /// The part of [scanoutLineBound] for the scanout port alone: the requests,
+  /// the round trip of the first one and the row opens.
+  static int scanoutStreamBound(
+    HarborSdramCycles c,
+    HarborSdramConfig config,
+    int lineWords, {
+    int maxInFlight = 3,
+  }) {
+    final requests = (lineWords + scanoutMaxWords - 1) ~/ scanoutMaxWords + 1;
+    final trip = scanoutRoundTrip(c, scanoutMaxWords);
+    final perRequest = scanoutMaxWords > (trip + maxInFlight - 1) ~/ maxInFlight
+        ? scanoutMaxWords
+        : (trip + maxInFlight - 1) ~/ maxInFlight;
+    final pageWords = config.pageBytes ~/ (config.dataWidth ~/ 8);
+    final rows = (lineWords + pageWords - 1) ~/ pageWords + 1;
+    return requests * perRequest + trip + rows * (c.rp + c.rcd);
+  }
+
+  /// True when [scanoutLineBound] for a line of [lineWords] words, plus one
+  /// bus request of [scanoutMaxWords] words and 3 cycles, fits in
+  /// [periodCycles] less [syncCycles]. Each line then leaves the bus
+  /// port time for one request, so the bus port is not starved.
+  static bool scanoutLineFits(
+    HarborSdramCycles c,
+    HarborSdramConfig config,
+    int lineWords,
+    int periodCycles, {
+    int maxInFlight = 3,
+    required int syncCycles,
+  }) =>
+      scanoutLineBound(
+            c,
+            config,
+            lineWords,
+            periodCycles: periodCycles,
+            maxInFlight: maxInFlight,
+          ) +
+          entryCycles(c, scanoutMaxWords) +
+          3 <=
+      periodCycles - syncCycles;
+
   /// [realtimeWaitBound] for this controller.
   int get scanoutWaitBound => realtimeWaitBound(cycles);
 
   /// [bestEffortWaitBound] for the bus port of this controller, in
   /// `mem_clk` cycles, plus one cycle in the [SdramPortSlice] in front of
-  /// the arbiter. It holds for each sdram request of the bus port with any
-  /// [outstanding], because [SdramMemoryPort] sends requests of at most
-  /// [scanoutMaxWords] words.
-  int get busWaitBound => bestEffortWaitBound(cycles, scanoutMaxInFlight) + 1;
+  /// the arbiter, plus [scanoutLineBoundCycles] when [scanoutLine] is set,
+  /// because the bus port waits for a whole line fetch. It holds for each
+  /// sdram request of the bus port with any [outstanding], because
+  /// [SdramMemoryPort] sends requests of at most [scanoutMaxWords] words.
+  int get busWaitBound =>
+      bestEffortWaitBound(cycles, scanoutMaxInFlight) +
+      1 +
+      (scanoutLineBoundCycles ?? 0);
 
   /// The sdram requests [SdramMemoryPort] sends for a burst of [beats]
-  /// beats of 2^[size] bytes and type [burst]. A full size INCR or WRAP
-  /// burst takes one per 4-beat block it touches, at most beats / 4 + 1. A
-  /// FIXED or narrow burst takes one per beat.
+  /// beats of 2^[size] bytes (a full beat when null) and type [burst] on a
+  /// bus of [dataWidth] bits.
+  /// A full size INCR or WRAP burst takes one per block of 16 bytes it
+  /// touches, at most beats / 4 + 1 on 32 bits and beats / 2 + 1 on 64 bits.
+  /// A FIXED or narrow burst takes one per beat.
   static int busRequestsFor(
     int beats, {
-    int size = 2,
+    int? size,
     HarborMemoryBurst burst = HarborMemoryBurst.incr,
+    int dataWidth = 32,
   }) {
     if (beats < 1 || beats > 256) {
       throw ArgumentError.value(beats, 'beats', 'must be 1..256');
     }
-    if (size < 2 || burst == HarborMemoryBurst.fixed) return beats;
-    return (beats + 3) ~/ 4 + 1;
+    final beatLog2 = (dataWidth ~/ 8).bitLength - 1;
+    if ((size ?? beatLog2) < beatLog2 || burst == HarborMemoryBurst.fixed) {
+      return beats;
+    }
+    final blockBeats = 16 ~/ (dataWidth ~/ 8);
+    return (beats + blockBeats - 1) ~/ blockBeats + 1;
   }
 
   /// The most `mem_clk` cycles the scanout port adds to a bus burst once it
@@ -1180,9 +1383,11 @@ class HarborSdram extends BridgeModule
   /// request behind others in flight also waits for theirs.
   int busBurstWaitBound(
     int beats, {
-    int size = 2,
+    int? size,
     HarborMemoryBurst burst = HarborMemoryBurst.incr,
-  }) => busRequestsFor(beats, size: size, burst: burst) * busWaitBound;
+  }) =>
+      busRequestsFor(beats, size: size, burst: burst, dataWidth: busDataWidth) *
+      busWaitBound;
 
   /// Joins scanout port [i] to [sp], an arbiter port. Every port output
   /// comes from a register. A take is held back while
@@ -1244,6 +1449,7 @@ class HarborSdram extends BridgeModule
     final words = input('${p}_rq_words');
 
     final Logic readyNext;
+    final Logic headNext;
     if (readPortStages == 0) {
       final slotValid = Logic(name: '${p}_slot_valid');
       final slotAddr = Logic(name: '${p}_slot_addr', width: sp.addrWidth);
@@ -1256,12 +1462,13 @@ class HarborSdram extends BridgeModule
       // enable.
       final slotNext = take | (slotValid & ~sp.reqReady);
       readyNext = ~slotNext & countNext.neq(scanoutMaxInFlight);
+      headNext = slotNext;
       Sequential(clk, [
         If(~slotValid, then: [slotAddr < addr, slotWords < words]),
         If(rst, then: [slotValid < 0], orElse: [slotValid < slotNext]),
       ]);
     } else {
-      _scanQueue(p, clk, rst, sp, take, addr, words);
+      headNext = _scanQueue(p, clk, rst, sp, take, addr, words);
       readyNext = ~take & countNext.neq(scanoutMaxInFlight);
     }
     Sequential(clk, [
@@ -1274,12 +1481,36 @@ class HarborSdram extends BridgeModule
         orElse: [count < countNext, ready < readyNext],
       ),
     ]);
+
+    // The local hold term is a register built from the next state: high
+    // while the slot or the queue holds a request or a read is in flight,
+    // and for 2 cycles after, which covers the gap between two requests of a
+    // line. Only the request that is offered and not yet taken is
+    // combinational.
+    final localNext = (countNext.neq(0) | headNext).named('${p}_local_next');
+    final local = Logic(name: '${p}_local');
+    final tail = Logic(name: '${p}_local_d0');
+    final busyLocal = Logic(name: '${p}_busy_local');
+    Sequential(clk, [
+      If(
+        rst,
+        then: [local < 0, tail < 0, busyLocal < 0],
+        orElse: [
+          local < localNext,
+          tail < local,
+          busyLocal < (localNext | local | tail),
+        ],
+      ),
+    ]);
+    _scanBusy = (input('${p}_rq_valid') | busyLocal).named('${p}_busy');
   }
+
+  Logic? _scanBusy;
 
   /// The [readPortStages] request stages of scanout port [p] and the queue
   /// at their end that drives [sp]. Each taken request is one entry until
   /// the arbiter takes it.
-  void _scanQueue(
+  Logic _scanQueue(
     String p,
     Logic clk,
     Logic rst,
@@ -1338,6 +1569,7 @@ class HarborSdram extends BridgeModule
       );
     }
     Sequential(clk, seq);
+    return (vAfter[0] | v).named('${p}_head_next');
   }
 
   /// Stops the simulation when [bad] is high on a [clk] edge out of reset.
@@ -1397,10 +1629,23 @@ class HarborSdram extends BridgeModule
     },
   );
 
+  /// Bytes at the top of the sdram that the firmware must not use as RAM.
+  /// A device that keeps a buffer there sets it, and [systemMemory] ends
+  /// below it. The firmware reads `/memory` only, so a `reserved-memory` node
+  /// does not keep it away.
+  int firmwareReservedBytes = 0;
+
   @override
   List<BusAddressRange> get systemMemory => [
-    BusAddressRange(baseAddress, config.sizeBytes),
+    BusAddressRange(baseAddress, config.sizeBytes - firmwareReservedBytes),
   ];
+
+  @override
+  HarborMemoryInfo get memoryInfo => HarborMemoryInfo(
+    kind: HarborMemoryKind.sdram,
+    sizeBytes: config.sizeBytes,
+    widthBits: config.dataWidth,
+  );
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(
@@ -1421,6 +1666,48 @@ class HarborSdram extends BridgeModule
     baseAddress: baseAddress,
     size: config.sizeBytes,
   );
+}
+
+/// The line that a scanout port must deliver in time: [words] 16-bit words
+/// each [periodCycles] `mem_clk` cycles. See [HarborSdram.scanoutLine].
+class HarborScanoutLine {
+  /// Words of 16 bits in the longest line.
+  final int words;
+
+  /// Cycles of the controller clock in one line period.
+  final int periodCycles;
+
+  /// `mem_clk` cycles that the line period loses to the crossings, see
+  /// [HarborSdram.scanoutSyncCyclesFor].
+  final int syncCycles;
+
+  const HarborScanoutLine({
+    required this.words,
+    required this.periodCycles,
+    required this.syncCycles,
+  });
+
+  /// The line of [timing] for the largest of [formats], with the pixel clock
+  /// at [pixelClockHz] and the controller at [sdramClockHz], on an sdram of
+  /// [wordBytes] bytes for each word (`config.dataWidth ~/ 8`).
+  factory HarborScanoutLine.forMode({
+    required HarborDisplayTiming timing,
+    required List<HarborPixelFormat> formats,
+    required int pixelClockHz,
+    required int sdramClockHz,
+    int wordBytes = 2,
+  }) => HarborScanoutLine(
+    words:
+        formats
+            .map((f) => f.lineBytes(0, timing.hActive))
+            .reduce((a, b) => a > b ? a : b) ~/
+        wordBytes,
+    periodCycles: timing.hTotal * sdramClockHz ~/ pixelClockHz,
+    syncCycles: HarborSdram.scanoutSyncCyclesFor(sdramClockHz, pixelClockHz),
+  );
+
+  @override
+  String toString() => 'HarborScanoutLine($words words, $periodCycles cycles)';
 }
 
 /// The device side of the Wishbone port `bus`.

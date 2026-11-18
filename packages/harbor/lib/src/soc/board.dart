@@ -1,4 +1,20 @@
+import '../peripherals/led_engine.dart';
 import 'target.dart';
+
+/// The LEDs that one channel of a `HarborLedEngine` drives on a board.
+class HarborBoardLedChannel {
+  /// The channel kind and pin map.
+  final HarborLedChannelConfig config;
+
+  /// The pin catalog name of each pin of [config], in the order of its pin
+  /// map.
+  final List<String> pins;
+
+  const HarborBoardLedChannel(this.config, this.pins);
+
+  /// The pixel count that the channel needs.
+  int get pixels => config.pixelsUsed;
+}
 
 /// A physical FPGA board: a named bundle of the vendor part, the on-board
 /// oscillator, a catalog of usable pins, and how to program it.
@@ -54,8 +70,8 @@ class HarborBoard {
   /// single-ended clock.
   final String? clockNPortName;
 
-  /// Xilinx speed grade of the fitted part (`'1'`, `'2'`, ...). See
-  /// [HarborFpgaTarget.speedGrade].
+  /// Speed grade of the fitted part. The default is `'6'` for ECP5 and `'1'`
+  /// for the other vendors. See [HarborFpgaTarget.speedGrade].
   final String speedGrade;
 
   /// Package balls that reach a global clock net with no clock buffer.
@@ -79,6 +95,10 @@ class HarborBoard {
   /// gives a buffer that was not necessary.
   final Set<String> clockCapableSites;
 
+  /// The user LEDs as channels of a `HarborLedEngine`, with the pin catalog
+  /// name of each pin. Empty for a board that has no preset.
+  final List<HarborBoardLedChannel> ledChannels;
+
   const HarborBoard({
     required this.name,
     required this.vendor,
@@ -91,9 +111,10 @@ class HarborBoard {
     this.progCommand,
     this.clockPortName = 'clk',
     this.clockNPortName,
-    this.speedGrade = '1',
+    String? speedGrade,
     this.clockCapableSites = const {},
-  });
+    this.ledChannels = const [],
+  }) : speedGrade = speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1');
 
   /// Whether [pin] is on a ball that reaches a global clock net with no clock
   /// buffer, per [clockCapableSites].
@@ -136,18 +157,48 @@ class HarborBoard {
     'orangecrab-25f': _orangeCrab25f,
     'arty-s7-50': _artyS7_50,
     'ax7203': _ax7203,
+    'kc705': _kc705,
   };
 
   /// Resolves a board preset by name, throwing if it is unknown.
+  ///
+  /// The name is `<preset>` or `<preset>:<grade>`. A suffix returns the preset
+  /// with [speedGrade] set to the grade and [name] set to the full string. The
+  /// grade must be valid for the vendor of the preset.
   static HarborBoard get(String name) {
-    final board = byName[name];
+    final colon = name.indexOf(':');
+    final preset = colon < 0 ? name : name.substring(0, colon);
+    final board = byName[preset];
     if (board == null) {
       throw ArgumentError(
         'Unknown board "$name". Known: ${byName.keys.join(', ')}.',
       );
     }
-    return board;
+    if (colon < 0) return board;
+    final grade = name.substring(colon + 1);
+    HarborFpgaTarget.checkSpeedGrade(board.vendor, grade);
+    return board._withSpeedGrade(name, grade);
   }
+
+  /// The preset name without a speed grade suffix.
+  String get preset => name.split(':').first;
+
+  HarborBoard _withSpeedGrade(String newName, String grade) => HarborBoard(
+    name: newName,
+    vendor: vendor,
+    device: device,
+    package: package,
+    oscillatorHz: oscillatorHz,
+    pins: pins,
+    interfaces: interfaces,
+    ddrDqsComplementPins: ddrDqsComplementPins,
+    progCommand: progCommand,
+    clockPortName: clockPortName,
+    clockNPortName: clockNPortName,
+    speedGrade: grade,
+    clockCapableSites: clockCapableSites,
+    ledChannels: ledChannels,
+  );
 
   String get _vendorPrefix => switch (vendor) {
     HarborFpgaVendor.ice40 => 'ice40',
@@ -244,6 +295,7 @@ class HarborBoard {
       _checkPerstPull(e.key, e.value);
     }
 
+    HarborFpgaTarget.checkSpeedGrade(vendor, speedGrade);
     return HarborFpgaTarget(
       name: '$_vendorPrefix-$device',
       vendor: vendor,
@@ -364,6 +416,31 @@ const _ulx3s85f = HarborBoard(
   },
   // openFPGALoader knows the ULX3S. Loads the bitstream over USB.
   progCommand: 'openFPGALoader -b ulx3s \$(TOP).bit',
+  // Eight active high LEDs, each one a plain LED on its own pixel.
+  ledChannels: [
+    HarborBoardLedChannel(
+      HarborLedChannelConfig.pwm([
+        HarborLedPin(0, HarborLedByte.b),
+        HarborLedPin(1, HarborLedByte.b),
+        HarborLedPin(2, HarborLedByte.b),
+        HarborLedPin(3, HarborLedByte.b),
+        HarborLedPin(4, HarborLedByte.b),
+        HarborLedPin(5, HarborLedByte.b),
+        HarborLedPin(6, HarborLedByte.b),
+        HarborLedPin(7, HarborLedByte.b),
+      ]),
+      [
+        'led[0]',
+        'led[1]',
+        'led[2]',
+        'led[3]',
+        'led[4]',
+        'led[5]',
+        'led[6]',
+        'led[7]',
+      ],
+    ),
+  ],
 );
 
 /// OrangeCrab r0.2 with the Lattice ECP5 LFE5U-25F (CSFBGA285), 48 MHz oscillator.
@@ -565,7 +642,7 @@ const _orangeCrab25f = HarborBoard(
 /// nextpnr-xilinx + prjxray, the only Xilinx flow that runs on aarch64).
 ///
 /// Covers the oscillator, the USB-UART bridge (the HW-proven Weir-boot pins),
-/// a TMDS adapter on Pmod JB, and the DDR3L sdram_* sites.
+/// a TMDS adapter on Pmod JA, and the DDR3L sdram_* sites.
 ///
 /// The DDR3L part is a Micron MT41K128M16: 256 MB, x16, sites from the
 /// litex/migen `arty_s7` platform. Every project that drives this board wants
@@ -589,9 +666,10 @@ const _artyS7_50 = HarborBoard(
     'clk': 'R2', // 100 MHz board oscillator
     'uart_tx': 'R12 LVCMOS33', // FPGA -> USB-UART bridge RX (Pmod/onboard)
     'uart_rx': 'V12 LVCMOS33', // FPGA <- USB-UART bridge TX
-    // A passive TMDS adapter (the MuseLab/iCESugar PMOD-HDMI) on header JB.
-    // These are the same eight balls as `pmod@jb`, read as a display instead,
-    // so a build binds one or the other and never both.
+    // A passive TMDS adapter (the MuseLab/iCESugar PMOD-HDMI) on header JA.
+    // Header pins 1 to 4 are the balls of `pmod@ja`, read as a display instead,
+    // so a build binds one or the other and never both. `pmod@jb` shares no
+    // ball with the display and stays free for an SPI Pmod.
     //
     // Both pins of a lane are plain LVCMOS33, NOT a differential pair, which
     // is what the iCESugar reference design does: the open Xilinx flow has no
@@ -601,8 +679,9 @@ const _artyS7_50 = HarborBoard(
     // The adapter pairs a lane ACROSS the two rows of the header (its pin 1
     // with its pin 12), while the FPGA pairs balls WITHIN a row, so a lane's
     // two balls are not an FPGA pair and are not length matched. That is fine
-    // at a 25 MHz pixel clock, and it is why JB is the header to use: JC has
-    // only two of the four lanes on true pairs and JD has none.
+    // at a 25 MHz pixel clock. Pair quality does not pick the header, because
+    // every pin is LVCMOS33 and the lane is driven as two single-ended pins.
+    // JA is the header the adapter is wired to on the bench.
     //
     // Lane order matches the display's `gpdi` bus: 0 blue, 1 green, 2 red,
     // 3 clock. Polarity comes from the adapter schematic, which puts the MINUS
@@ -615,16 +694,32 @@ const _artyS7_50 = HarborBoard(
     // would read as if it applied and would not. If the lanes need taming, add
     // it to the XDC writer first, and check that nextpnr-xilinx accepts it.
     //
-    // Sites from the Digilent Arty-S7-50 master XDC (JB1=P17 JB2=P18 JB3=R18
-    // JB4=T18, JB7=P14 JB8=P15 JB9=N15 JB10=P16), all bank 14.
-    'gpdi_dp[0]': 'N15 LVCMOS33', // blue +, header pin 9
-    'gpdi_dp[1]': 'P15 LVCMOS33', // green +, header pin 8
-    'gpdi_dp[2]': 'P14 LVCMOS33', // red +, header pin 7
-    'gpdi_dp[3]': 'P16 LVCMOS33', // clock +, header pin 10
-    'gpdi_dn[0]': 'R18 LVCMOS33', // blue -, header pin 3
-    'gpdi_dn[1]': 'P18 LVCMOS33', // green -, header pin 2
-    'gpdi_dn[2]': 'P17 LVCMOS33', // red -, header pin 1
-    'gpdi_dn[3]': 'T18 LVCMOS33', // clock -, header pin 4
+    // Sites from the Digilent Arty-S7-50 master XDC (JA1=L17 JA2=L18 JA3=M14
+    // JA4=N14, JA7=M16 JA8=M17 JA9=M18 JA10=N18), all bank 14.
+    'gpdi_dp[0]': 'M18 LVCMOS33', // blue +, header pin 9
+    'gpdi_dp[1]': 'M17 LVCMOS33', // green +, header pin 8
+    'gpdi_dp[2]': 'M16 LVCMOS33', // red +, header pin 7
+    'gpdi_dp[3]': 'N18 LVCMOS33', // clock +, header pin 10
+    'gpdi_dn[0]': 'M14 LVCMOS33', // blue -, header pin 3
+    'gpdi_dn[1]': 'L18 LVCMOS33', // green -, header pin 2
+    'gpdi_dn[2]': 'L17 LVCMOS33', // red -, header pin 1
+    'gpdi_dn[3]': 'N14 LVCMOS33', // clock -, header pin 4
+    // User LEDs. Sites from the Digilent Arty-S7-50 master XDC. The LiteX
+    // digilent_arty_s7 platform gives the same sites. Both are bank 15,
+    // LVCMOS33. The reference manual says the four plain LEDs are anode
+    // connected and light on a logic high, and that the RGB LED inputs drive
+    // a transistor that inverts, so a logic high lights the RGB LED too. All
+    // ten pins are active high. The XDC names led[0] to led[3] LD2 to LD5.
+    'led[0]': 'E18 LVCMOS33',
+    'led[1]': 'F13 LVCMOS33',
+    'led[2]': 'E13 LVCMOS33',
+    'led[3]': 'H15 LVCMOS33',
+    'led0_r': 'J15 LVCMOS33',
+    'led0_g': 'G17 LVCMOS33',
+    'led0_b': 'F15 LVCMOS33',
+    'led1_r': 'E15 LVCMOS33',
+    'led1_g': 'F18 LVCMOS33',
+    'led1_b': 'E14 LVCMOS33',
     // DDR3L (Micron MT41K128M16, 256 MB, x16). Address a[13:0] gives 14 row
     // lines. Lane 0 is DM0/DQS0 with DQ[7:0], lane 1 is DM1/DQS1 with
     // DQ[15:8], in litex site order.
@@ -686,7 +781,8 @@ const _artyS7_50 = HarborBoard(
   // with `iface=pmod@ja` (e.g. a PmodSD SD card in SPI mode) binds its pads
   // here. MISO gets a pull-up so an empty socket reads high, not floating.
   // Sites from the Digilent Arty-S7-50 master XDC (JA1=L17 JA2=L18 JA3=M14
-  // JA4=N14; JB1=P17 JB2=P18 JB3=R18 JB4=T18), all bank 14 LVCMOS33.
+  // JA4=N14; JB1=P17 JB2=P18 JB3=R18 JB4=T18; JD1=V15 JD2=U12 JD3=V13 JD4=T12), all bank 14
+  // LVCMOS33. The LiteX digilent_arty_s7 platform gives the same JD sites.
   interfaces: {
     'pmod@ja': {
       'cs': 'L17 LVCMOS33',
@@ -700,7 +796,44 @@ const _artyS7_50 = HarborBoard(
       'miso': 'R18 LVCMOS33 PULLTYPE=PULLUP',
       'sck': 'T18 LVCMOS33',
     },
+    'pmod@jd': {
+      'cs': 'V15 LVCMOS33',
+      'mosi': 'U12 LVCMOS33',
+      'miso': 'V13 LVCMOS33 PULLTYPE=PULLUP',
+      'sck': 'T12 LVCMOS33',
+    },
   },
+  // Four plain LEDs on pixels 0 to 3 and two RGB LEDs on pixels 4 and 5, all
+  // active high. The Digilent Arty S7 Reference Manual advises at most 50%
+  // duty on the RGB LEDs, so their ceiling is 128 of 255.
+  ledChannels: [
+    HarborBoardLedChannel(
+      HarborLedChannelConfig.pwm([
+        HarborLedPin(0, HarborLedByte.b),
+        HarborLedPin(1, HarborLedByte.b),
+        HarborLedPin(2, HarborLedByte.b),
+        HarborLedPin(3, HarborLedByte.b),
+        HarborLedPin(4, HarborLedByte.r, maxDuty: 128),
+        HarborLedPin(4, HarborLedByte.g, maxDuty: 128),
+        HarborLedPin(4, HarborLedByte.b, maxDuty: 128),
+        HarborLedPin(5, HarborLedByte.r, maxDuty: 128),
+        HarborLedPin(5, HarborLedByte.g, maxDuty: 128),
+        HarborLedPin(5, HarborLedByte.b, maxDuty: 128),
+      ]),
+      [
+        'led[0]',
+        'led[1]',
+        'led[2]',
+        'led[3]',
+        'led0_r',
+        'led0_g',
+        'led0_b',
+        'led1_r',
+        'led1_g',
+        'led1_b',
+      ],
+    ),
+  ],
 );
 
 /// Alinx AX7203 with the Xilinx Artix-7 XC7A200T-2FBG484I, 200 MHz
@@ -949,4 +1082,345 @@ const _ax7203 = HarborBoard(
   // R4 is the P side of a bank 34 MRCC pair (p.10). B17 and E19 are the
   // RGMII RX clocks, on SRCC pins.
   clockCapableSites: {'R4', 'B17', 'E19'},
+);
+
+/// Xilinx KC705 with the Kintex-7 XC7K325T-2FFG900C, 200 MHz differential
+/// oscillator, via the openXC7 flow.
+///
+/// Sites and IO standards come from the Xilinx KC705 board file
+/// (`part0_pins.xml`, XilinxBoardStore 2021.2, board revision 1.6), which
+/// follows the master XDC. The DDR3 SODIMM, the ADV7511 HDMI pads and the
+/// SI5324 pads are not in that file. They come from the litex-boards
+/// `xilinx_kc705` platform, and each group is marked "LiteX". Where the two
+/// disagree, the Xilinx file wins.
+///
+/// Banks 14 and 15 are fixed at 2.5 V. Banks 12, 13, 16, 17 and 18 are on
+/// VADJ, which is 2.5 V by default and can be 1.8 V or 3.3 V, so their
+/// LVCMOS25 pins assume the default. Banks 32 to 34 run at 1.5 V. The DDR3
+/// pins are SSTL15 (UG810 Table 1-3). The `MGT` pin-map marker suppresses an
+/// invalid IOSTANDARD property on transceiver and reference-clock pads.
+///
+/// This preset lists the pads for later DDR3, PCIe x8, GMII Ethernet, HDMI
+/// and SFP work. The reset button is active high. A `HarborSoC` with clock
+/// domains takes an active-low `reset_n`, so a top must invert `reset`.
+const _kc705 = HarborBoard(
+  name: 'kc705',
+  vendor: HarborFpgaVendor.openXc7,
+  device: 'xc7k325t',
+  package: 'ffg900',
+  speedGrade: '2',
+  oscillatorHz: 200000000,
+  clockNPortName: 'clk_n',
+  progCommand: 'openFPGALoader -b kc705 \$(TOP).bit',
+  pins: {
+    // SYSCLK 200 MHz oscillator on the bank 33 MRCC pair. DIFF_SSTL15 is from
+    // part0_pins.xml. UG810 Table 1-9 says LVDS. Both are valid on a 1.5 V
+    // bank.
+    'clk': 'AD12 DIFF_SSTL15',
+    'clk_n': 'AD11 DIFF_SSTL15',
+    // CPU_RESET push button, active high (Xilinx). A top must invert it for
+    // the active-low `reset_n` port of a HarborSoC.
+    'reset': 'AB7 LVCMOS15',
+    // CP2103 USB-UART. The sites are Xilinx and LVCMOS25 is LiteX.
+    'uart_tx': 'K24 LVCMOS25',
+    'uart_rx': 'M19 LVCMOS25',
+    // User LEDs, active high (Xilinx sites and IO standards).
+    'led[0]': 'AB8 LVCMOS15',
+    'led[1]': 'AA8 LVCMOS15',
+    'led[2]': 'AC9 LVCMOS15',
+    'led[3]': 'AB9 LVCMOS15',
+    'led[4]': 'AE26 LVCMOS25',
+    'led[5]': 'G19 LVCMOS25',
+    'led[6]': 'E18 LVCMOS25',
+    'led[7]': 'F16 LVCMOS25',
+    // Push buttons C, N, S, W, E, active high (Xilinx).
+    'btn_c': 'G12 LVCMOS25',
+    'btn_n': 'AA12 LVCMOS15',
+    'btn_s': 'AB12 LVCMOS15',
+    'btn_w': 'AC6 LVCMOS15',
+    'btn_e': 'AG5 LVCMOS15',
+    // DIP switches (Xilinx).
+    'dip[0]': 'Y29 LVCMOS25',
+    'dip[1]': 'W29 LVCMOS25',
+    'dip[2]': 'AA28 LVCMOS25',
+    'dip[3]': 'Y28 LVCMOS25',
+    // N25Q128 quad SPI flash (Xilinx). CCLK is driven through STARTUPE2.
+    'spi_cs_n': 'U19 LVCMOS25',
+    'spi_io[0]': 'P24 LVCMOS25',
+    'spi_io[1]': 'R25 LVCMOS25',
+    'spi_io[2]': 'R20 LVCMOS25',
+    'spi_io[3]': 'R21 LVCMOS25',
+    // PCIe x8 edge connector (Xilinx). Reference clock is MGTREFCLK1 of quad
+    // 115. PERST# is bank 16, 2.5 V.
+    'pcie_refclk_p': 'U8 MGT',
+    'pcie_refclk_n': 'U7 MGT',
+    'pcie_perst_n': 'G25 LVCMOS25 PULLTYPE=PULLUP',
+    'pcie_rxp[0]': 'M6 MGT',
+    'pcie_rxp[1]': 'P6 MGT',
+    'pcie_rxp[2]': 'R4 MGT',
+    'pcie_rxp[3]': 'T6 MGT',
+    'pcie_rxp[4]': 'V6 MGT',
+    'pcie_rxp[5]': 'W4 MGT',
+    'pcie_rxp[6]': 'Y6 MGT',
+    'pcie_rxp[7]': 'AA4 MGT',
+    'pcie_rxn[0]': 'M5 MGT',
+    'pcie_rxn[1]': 'P5 MGT',
+    'pcie_rxn[2]': 'R3 MGT',
+    'pcie_rxn[3]': 'T5 MGT',
+    'pcie_rxn[4]': 'V5 MGT',
+    'pcie_rxn[5]': 'W3 MGT',
+    'pcie_rxn[6]': 'Y5 MGT',
+    'pcie_rxn[7]': 'AA3 MGT',
+    'pcie_txp[0]': 'L4 MGT',
+    'pcie_txp[1]': 'M2 MGT',
+    'pcie_txp[2]': 'N4 MGT',
+    'pcie_txp[3]': 'P2 MGT',
+    'pcie_txp[4]': 'T2 MGT',
+    'pcie_txp[5]': 'U4 MGT',
+    'pcie_txp[6]': 'V2 MGT',
+    'pcie_txp[7]': 'Y2 MGT',
+    'pcie_txn[0]': 'L3 MGT',
+    'pcie_txn[1]': 'M1 MGT',
+    'pcie_txn[2]': 'N3 MGT',
+    'pcie_txn[3]': 'P1 MGT',
+    'pcie_txn[4]': 'T1 MGT',
+    'pcie_txn[5]': 'U3 MGT',
+    'pcie_txn[6]': 'V1 MGT',
+    'pcie_txn[7]': 'Y1 MGT',
+    // 88E1111 PHY in GMII mode, bank 14 and 15, 2.5 V (Xilinx sites and IO
+    // standards).
+    'eth0_gmii_gtx_clk': 'K30 LVCMOS25',
+    'eth0_gmii_tx_clk': 'M28 LVCMOS25',
+    'eth0_gmii_txd[0]': 'N27 LVCMOS25',
+    'eth0_gmii_txd[1]': 'N25 LVCMOS25',
+    'eth0_gmii_txd[2]': 'M29 LVCMOS25',
+    'eth0_gmii_txd[3]': 'L28 LVCMOS25',
+    'eth0_gmii_txd[4]': 'J26 LVCMOS25',
+    'eth0_gmii_txd[5]': 'K26 LVCMOS25',
+    'eth0_gmii_txd[6]': 'L30 LVCMOS25',
+    'eth0_gmii_txd[7]': 'J28 LVCMOS25',
+    'eth0_gmii_tx_en': 'M27 LVCMOS25',
+    'eth0_gmii_tx_er': 'N29 LVCMOS25',
+    'eth0_gmii_rx_clk': 'U27 LVCMOS25',
+    'eth0_gmii_rxd[0]': 'U30 LVCMOS25',
+    'eth0_gmii_rxd[1]': 'U25 LVCMOS25',
+    'eth0_gmii_rxd[2]': 'T25 LVCMOS25',
+    'eth0_gmii_rxd[3]': 'U28 LVCMOS25',
+    'eth0_gmii_rxd[4]': 'R19 LVCMOS25',
+    'eth0_gmii_rxd[5]': 'T27 LVCMOS25',
+    'eth0_gmii_rxd[6]': 'T26 LVCMOS25',
+    'eth0_gmii_rxd[7]': 'T28 LVCMOS25',
+    'eth0_gmii_rx_dv': 'R28 LVCMOS25',
+    'eth0_gmii_rx_er': 'V26 LVCMOS25',
+    'eth0_gmii_crs': 'R30 LVCMOS25',
+    'eth0_gmii_col': 'W19 LVCMOS25',
+    'eth0_mdc': 'R23 LVCMOS25',
+    'eth0_mdio': 'J21 LVCMOS25',
+    'eth0_rst_n': 'L20 LVCMOS25',
+    'eth0_int_n': 'N30 LVCMOS25',
+    // Shared I2C bus and PCA9548 mux reset (Xilinx). The ADV7511 sits behind
+    // the mux. The board has external pull-ups.
+    'i2c_scl': 'K21 LVCMOS25',
+    'i2c_sda': 'L21 LVCMOS25',
+    'i2c_mux_reset_n': 'P23 LVCMOS25',
+    // SFP cage, quad 117 channel 2 (UG810 Table 1-14). On boards before
+    // Rev 1.1 the RX pair is swapped on the SFP+ connector. The 125 MHz
+    // oscillator is MGTREFCLK0 of quad 117 (Xilinx name SGMIICLK_Q0).
+    // TX_DISABLE and LOS use LVCMOS25 from LiteX. The Xilinx file lists LVDS.
+    'sfp_txp': 'H2 MGT',
+    'sfp_txn': 'H1 MGT',
+    'sfp_rxp': 'G4 MGT',
+    'sfp_rxn': 'G3 MGT',
+    'sfp_refclk_p': 'G8 MGT',
+    'sfp_refclk_n': 'G7 MGT',
+    'sfp_tx_disable': 'Y20 LVCMOS25',
+    'sfp_los': 'P19 LVCMOS25',
+    // SI5324 clock synthesizer, all LiteX. CLKOUT feeds MGTREFCLK0 of quad 116.
+    'si5324_clkout_p': 'L8 MGT',
+    'si5324_clkout_n': 'L7 MGT',
+    'si5324_clkin_p': 'W27 LVDS_25',
+    'si5324_clkin_n': 'W28 LVDS_25',
+    'si5324_rst_n': 'AE20 LVCMOS25',
+    'si5324_int_n': 'AG24 LVCMOS25',
+    // ADV7511 HDMI transmitter, all LiteX. hdmi_d[0] to hdmi_d[17] go to the
+    // ADV7511 D8 to D25 inputs (UG810 Table 1-21).
+    'hdmi_clk': 'K18 LVCMOS25',
+    'hdmi_de': 'H17 LVCMOS25',
+    'hdmi_hsync': 'J18 LVCMOS25',
+    'hdmi_vsync': 'H20 LVCMOS25',
+    'hdmi_int_n': 'AH24 LVCMOS25',
+    'hdmi_spdif': 'J17 LVCMOS25',
+    'hdmi_spdif_out': 'G20 LVCMOS25',
+    'hdmi_d[0]': 'B23 LVCMOS25',
+    'hdmi_d[1]': 'A23 LVCMOS25',
+    'hdmi_d[2]': 'E23 LVCMOS25',
+    'hdmi_d[3]': 'D23 LVCMOS25',
+    'hdmi_d[4]': 'F25 LVCMOS25',
+    'hdmi_d[5]': 'E25 LVCMOS25',
+    'hdmi_d[6]': 'E24 LVCMOS25',
+    'hdmi_d[7]': 'D24 LVCMOS25',
+    'hdmi_d[8]': 'F26 LVCMOS25',
+    'hdmi_d[9]': 'E26 LVCMOS25',
+    'hdmi_d[10]': 'G23 LVCMOS25',
+    'hdmi_d[11]': 'G24 LVCMOS25',
+    'hdmi_d[12]': 'J19 LVCMOS25',
+    'hdmi_d[13]': 'H19 LVCMOS25',
+    'hdmi_d[14]': 'L17 LVCMOS25',
+    'hdmi_d[15]': 'L18 LVCMOS25',
+    'hdmi_d[16]': 'K19 LVCMOS25',
+    'hdmi_d[17]': 'K20 LVCMOS25',
+    // DDR3 SODIMM, all LiteX. Banks 32, 33 and 34 are 1.5 V. DQ and DQS use
+    // SSTL15 with IN_TERM, the same choice as the AX7203 preset, because the
+    // open flow has no DCI.
+    'sdram_ck[0]': 'AG10 DIFF_SSTL15',
+    'sdram_ck_n[0]': 'AH10 DIFF_SSTL15',
+    'sdram_cke[0]': 'AF10 SSTL15',
+    'sdram_cs_n[0]': 'AC12 SSTL15',
+    'sdram_ras_n': 'AD9 SSTL15',
+    'sdram_cas_n': 'AC11 SSTL15',
+    'sdram_we_n': 'AE9 SSTL15',
+    'sdram_odt[0]': 'AD8 SSTL15',
+    // Rank 1 of the SODIMM (UG810 Table 1-4).
+    'sdram_ck[1]': 'AE11 DIFF_SSTL15',
+    'sdram_ck_n[1]': 'AF11 DIFF_SSTL15',
+    'sdram_cke[1]': 'AE10 SSTL15',
+    'sdram_cs_n[1]': 'AE8 SSTL15',
+    'sdram_odt[1]': 'AC10 SSTL15',
+    'sdram_reset_n': 'AK3 LVCMOS15',
+    'sdram_ba[0]': 'AH9 SSTL15',
+    'sdram_ba[1]': 'AG9 SSTL15',
+    'sdram_ba[2]': 'AK9 SSTL15',
+    'sdram_addr[0]': 'AH12 SSTL15',
+    'sdram_addr[1]': 'AG13 SSTL15',
+    'sdram_addr[2]': 'AG12 SSTL15',
+    'sdram_addr[3]': 'AF12 SSTL15',
+    'sdram_addr[4]': 'AJ12 SSTL15',
+    'sdram_addr[5]': 'AJ13 SSTL15',
+    'sdram_addr[6]': 'AJ14 SSTL15',
+    'sdram_addr[7]': 'AH14 SSTL15',
+    'sdram_addr[8]': 'AK13 SSTL15',
+    'sdram_addr[9]': 'AK14 SSTL15',
+    'sdram_addr[10]': 'AF13 SSTL15',
+    'sdram_addr[11]': 'AE13 SSTL15',
+    'sdram_addr[12]': 'AJ11 SSTL15',
+    'sdram_addr[13]': 'AH11 SSTL15',
+    'sdram_addr[14]': 'AK10 SSTL15',
+    'sdram_addr[15]': 'AK11 SSTL15',
+    'sdram_dm[0]': 'Y16 SSTL15',
+    'sdram_dm[1]': 'AB17 SSTL15',
+    'sdram_dm[2]': 'AF17 SSTL15',
+    'sdram_dm[3]': 'AE16 SSTL15',
+    'sdram_dm[4]': 'AK5 SSTL15',
+    'sdram_dm[5]': 'AJ3 SSTL15',
+    'sdram_dm[6]': 'AF6 SSTL15',
+    'sdram_dm[7]': 'AC7 SSTL15',
+    'sdram_dqs[0]': 'AC16 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[1]': 'Y19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[2]': 'AJ18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[3]': 'AH16 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[4]': 'AH7 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[5]': 'AG2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[6]': 'AG4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs[7]': 'AD2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[0]': 'AC15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[1]': 'Y18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[2]': 'AK18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[3]': 'AJ16 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[4]': 'AJ7 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[5]': 'AH1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[6]': 'AG3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dqs_n[7]': 'AD1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[0]': 'AA15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[1]': 'AA16 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[2]': 'AC14 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[3]': 'AD14 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[4]': 'AA17 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[5]': 'AB15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[6]': 'AE15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[7]': 'Y15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[8]': 'AB19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[9]': 'AD16 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[10]': 'AC19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[11]': 'AD17 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[12]': 'AA18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[13]': 'AB18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[14]': 'AE18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[15]': 'AD18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[16]': 'AG19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[17]': 'AK19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[18]': 'AG18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[19]': 'AF18 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[20]': 'AH19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[21]': 'AJ19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[22]': 'AE19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[23]': 'AD19 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[24]': 'AK16 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[25]': 'AJ17 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[26]': 'AG15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[27]': 'AF15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[28]': 'AH17 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[29]': 'AG14 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[30]': 'AH15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[31]': 'AK15 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[32]': 'AK8 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[33]': 'AK6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[34]': 'AG7 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[35]': 'AF7 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[36]': 'AF8 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[37]': 'AK4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[38]': 'AJ8 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[39]': 'AJ6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[40]': 'AH5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[41]': 'AH6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[42]': 'AJ2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[43]': 'AH2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[44]': 'AH4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[45]': 'AJ4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[46]': 'AK1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[47]': 'AJ1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[48]': 'AF1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[49]': 'AF2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[50]': 'AE4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[51]': 'AE3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[52]': 'AF3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[53]': 'AF5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[54]': 'AE1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[55]': 'AE5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[56]': 'AC1 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[57]': 'AD3 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[58]': 'AC4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[59]': 'AC5 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[60]': 'AE6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[61]': 'AD6 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[62]': 'AC2 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+    'sdram_dq[63]': 'AD4 SSTL15 IN_TERM=UNTUNED_SPLIT_50',
+  },
+  // SYSCLK_P (AD12), PHY_RXCLK (U27) and PHY_TXCLK (M28) are MRCC or SRCC
+  // balls in the package pin file.
+  clockCapableSites: {'AD12', 'U27', 'M28'},
+  // Eight active high LEDs, each one a plain LED on its own pixel.
+  ledChannels: [
+    HarborBoardLedChannel(
+      HarborLedChannelConfig.pwm([
+        HarborLedPin(0, HarborLedByte.b),
+        HarborLedPin(1, HarborLedByte.b),
+        HarborLedPin(2, HarborLedByte.b),
+        HarborLedPin(3, HarborLedByte.b),
+        HarborLedPin(4, HarborLedByte.b),
+        HarborLedPin(5, HarborLedByte.b),
+        HarborLedPin(6, HarborLedByte.b),
+        HarborLedPin(7, HarborLedByte.b),
+      ]),
+      [
+        'led[0]',
+        'led[1]',
+        'led[2]',
+        'led[3]',
+        'led[4]',
+        'led[5]',
+        'led[6]',
+        'led[7]',
+      ],
+    ),
+  ],
 );

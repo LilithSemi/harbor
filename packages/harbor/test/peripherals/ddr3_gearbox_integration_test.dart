@@ -199,7 +199,7 @@ void main() {
           controllerGearRatio: gear,
         );
         await ddr.build();
-        return ddr.generateSynth();
+        return ddr.dumpSystemVerilog();
       }
 
       test(

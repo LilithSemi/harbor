@@ -342,7 +342,8 @@ class HarborSeqHeaderParse extends BridgeModule {
     output('film_grain_params_present') <= rFilmGrain;
     output('bit_depth') <= rBitDepth;
     output('mono_chrome') <= rMono;
-    output('num_planes') <= mux(rMono, Const(1, width: 2), Const(3, width: 2));
+    output('num_planes') <=
+        mux<Logic>(rMono, Const(1, width: 2), Const(3, width: 2));
     output('color_primaries') <= rColorPrim;
     output('transfer_characteristics') <= rTransfer;
     output('matrix_coefficients') <= rMatrix;
@@ -719,13 +720,14 @@ class HarborSeqHeaderParse extends BridgeModule {
                 then: [st < sc(sColorTwelve)],
                 orElse: [
                   rBitDepth <
-                      mux(bit0, Const(10, width: 5), Const(8, width: 5)),
+                      mux<Logic>(bit0, Const(10, width: 5), Const(8, width: 5)),
                   st < sc(sColorMono),
                 ],
               ),
             ]),
             CaseItem(sc(sColorTwelve), [
-              rBitDepth < mux(bit0, Const(12, width: 5), Const(10, width: 5)),
+              rBitDepth <
+                  mux<Logic>(bit0, Const(12, width: 5), Const(10, width: 5)),
               ...step(sc(sColorMono)),
             ]),
             CaseItem(sc(sColorMono), [

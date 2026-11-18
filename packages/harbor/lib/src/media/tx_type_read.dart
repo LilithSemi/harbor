@@ -79,14 +79,14 @@ class HarborTxTypeRead extends BridgeModule {
     ec.input('cdf').srcConnection! <=
         [
           for (var s = _maxSyms - 1; s >= 0; s--) Const(extTxCdf[s], width: 16),
-        ].swizzle();
+        ].concat();
     ec.input('num_syms').srcConnection! <= Const(_maxSyms, width: 5);
     ec.input('bytes_in').srcConnection! <=
         [
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 

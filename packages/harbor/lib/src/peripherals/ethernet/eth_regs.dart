@@ -256,12 +256,12 @@ class HarborEthRegs extends Module {
           wdata.getRange(8 * b, 8 * b + _bits(old.width, b)),
           old.getRange(8 * b, 8 * b + _bits(old.width, b)),
         ),
-    ].rswizzle();
+    ].rconcat();
     // Write data with the bytes that `sel` does not select set to 0.
     final wMasked = [
       for (var b = 0; b < 4; b++)
         mux(sel[b], wdata.getRange(8 * b, 8 * b + 8), c(0, 8)),
-    ].rswizzle().named('w_masked');
+    ].rconcat().named('w_masked');
     Logic wBit(int i) => wMasked[i];
 
     final access = act;
@@ -293,7 +293,7 @@ class HarborEthRegs extends Module {
       promiscR ?? c(0, 1),
       rxEnR,
       txEnR,
-    ].swizzle().named('ctrl_read');
+    ].concat().named('ctrl_read');
 
     // `tx_en` and `rx_en` are flops, one cycle after CTRL. They are low
     // while `soft_pend` or `soft_reset` was high in the cycle before. The
@@ -337,7 +337,7 @@ class HarborEthRegs extends Module {
       txRingErrS,
       rxRunning,
       txRunning,
-    ].swizzle().named('status_read');
+    ].concat().named('status_read');
     final txRingRise = (txRingErr & ~txRingErrD).named('tx_ring_rise');
     final rxRingRise = (rxRingErr & ~rxRingErrD).named('rx_ring_rise');
 
@@ -355,14 +355,14 @@ class HarborEthRegs extends Module {
       txErr,
       rxDone,
       txDone,
-    ].swizzle().named('int_set');
+    ].concat().named('int_set');
     final irqR = Logic(name: 'irq_r');
     addOutput('irq') <= irqR;
 
     // MAC address and multicast hash.
     final macLo = Logic(name: 'mac_lo', width: 32);
     final macHi = Logic(name: 'mac_hi', width: 16);
-    addOutput('mac_addr', width: 48) <= [macHi, macLo].swizzle();
+    addOutput('mac_addr', width: 48) <= [macHi, macLo].concat();
     final hashLo = config.multicastHash
         ? Logic(name: 'hash_lo', width: 32)
         : null;
@@ -370,7 +370,7 @@ class HarborEthRegs extends Module {
         ? Logic(name: 'hash_hi', width: 32)
         : null;
     addOutput('mc_hash', width: 64) <=
-        (config.multicastHash ? [hashHi!, hashLo!].swizzle() : c(0, 64));
+        (config.multicastHash ? [hashHi!, hashLo!].concat() : c(0, 64));
 
     // Rings.
     final lowBits = config.descBytes.bitLength - 1;
@@ -434,7 +434,7 @@ class HarborEthRegs extends Module {
         mWrite,
         mPhy,
         mReg,
-      ].swizzle(),
+      ].concat(),
     ).named('mdio_ctrl_next');
     final mdioCtrlRead = [
       c(0, 11),
@@ -446,7 +446,7 @@ class HarborEthRegs extends Module {
       mWrite,
       mPhy,
       mReg,
-    ].swizzle().named('mdio_ctrl_read');
+    ].concat().named('mdio_ctrl_read');
 
     // Counters.
     final counters = <int, Logic>{};
@@ -479,14 +479,14 @@ class HarborEthRegs extends Module {
       if (hashLo != null) HarborEthReg.mcHashLo: hashLo,
       if (hashHi != null) HarborEthReg.mcHashHi: hashHi,
       for (final r in rings) ...{
-        r.loOff: [r.lo, c(0, lowBits)].swizzle().zeroExtend(32),
+        r.loOff: [r.lo, c(0, lowBits)].concat().zeroExtend(32),
         if (hiW > 0) r.loOff + 4: r.hi!.zeroExtend(32),
         r.sizeOff: r.size.zeroExtend(32),
         r.tailOff: r.tailMasked.zeroExtend(32),
         r.tailOff + 4: r.head.zeroExtend(32),
       },
       HarborEthReg.mdioCtrl: mdioCtrlRead,
-      HarborEthReg.mdioData: [mAddr ?? c(0, 16), mData].swizzle(),
+      HarborEthReg.mdioData: [mAddr ?? c(0, 16), mData].concat(),
       HarborEthReg.mdioDiv: mDiv.zeroExtend(32),
       ...counters,
     };
@@ -513,9 +513,9 @@ class HarborEthRegs extends Module {
         mux(sizeIn.gt(12), c(12, 4), sizeIn),
       );
       final loNext = merge(
-        [r.lo, c(0, lowBits)].swizzle().zeroExtend(32),
+        [r.lo, c(0, lowBits)].concat().zeroExtend(32),
       ).getRange(lowBits, lowBits + loW);
-      final base = [if (hiW > 0) r.hi!, r.lo, c(0, lowBits)].swizzle();
+      final base = [if (hiW > 0) r.hi!, r.lo, c(0, lowBits)].concat();
       // The DMA takes a new ring only in idle, where it also applies its
       // ring_reset. Until then it keeps the ring of its frame.
       final apply = (r.pend & ~r.busy).named('${r.name}_ring_apply');
@@ -634,7 +634,7 @@ class HarborEthRegs extends Module {
           If(
             wrAt(HarborEthReg.mdioData),
             then: [
-              mAddr < merge([mAddr, c(0, 16)].swizzle()).getRange(16, 32),
+              mAddr < merge([mAddr, c(0, 16)].concat()).getRange(16, 32),
             ],
           ),
         If(wrAt(HarborEthReg.mdioDiv), then: [mDiv < merge(mDiv)]),

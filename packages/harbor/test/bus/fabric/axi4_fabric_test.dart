@@ -396,8 +396,8 @@ Future<void> _awWaitsForW(HarborFabricTopology t) async {
 }
 
 // A Lite master reaches a full slave and a full master reaches a Lite
-// slave. A burst or a narrow access to the Lite slave gets SLVERR on every
-// beat, and a write gets one B after all its W beats.
+// slave. A burst to the Lite slave runs as single beats, a narrow access
+// gets SLVERR, and a write gets one B after all its W beats.
 Future<void> _lite(HarborFabricTopology t) async {
   final b = await Bench.start(
     t,
@@ -453,14 +453,21 @@ Future<void> _lite(HarborFabricTopology t) async {
   await b.sim.stop();
   checkAll(b, writes: writes);
   must(m0.rBeats.where((x) => x.$1 == 2).map((x) => (x.$3, x.$4)).toList(), [
-    (2, 0),
-    (2, 0),
-    (2, 0),
-    (2, 1),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (0, 1),
   ]);
-  must(m0.bResp.where((x) => x.$1 == 2).toList(), [(2, 2), (2, 2)]);
-  must(sL.awOrder.map((x) => x.addr).toSet(), {0x10010, 0x10030});
-  must(sL.arOrder.length, 3);
+  must(m0.bResp.where((x) => x.$1 == 2).toList(), [(2, 0), (2, 2)]);
+  must(sL.awOrder.map((x) => x.addr).toSet(), {
+    0x10010,
+    0x10020,
+    0x10024,
+    0x10028,
+    0x1002c,
+    0x10030,
+  });
+  must(sL.arOrder.length, 7);
   must(b.busError(), 0);
 }
 

@@ -51,7 +51,7 @@ void main() {
       }
       expect(ddr.output('cal_state').width, 6);
       expect(ddr.output('cal_attempts').width, 8);
-      final sv = ddr.generateSynth();
+      final sv = ddr.dumpSystemVerilog();
       for (final n in ['init_done', 'cal_done', 'cal_failed', 'cal_state']) {
         expect(sv, matches(RegExp('output logic (\\[5:0\\] )?$n\\b')));
       }
@@ -74,7 +74,7 @@ Future<void> _fastSimOrder(int ddrPeriod) async {
   {
     final ddr = _ddr(target: _artix, fastSim: true);
     final clk = SimpleClockGenerator(10).clk;
-    final ddrClk = SimpleClockGenerator(ddrPeriod).clk;
+    final ddrClk = SimpleClockGenerator(ddrPeriod + (ddrPeriod & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final ddrReset = Logic(name: 'ddr_reset')..inject(1);
     ddr.input('clk').srcConnection! <= clk;

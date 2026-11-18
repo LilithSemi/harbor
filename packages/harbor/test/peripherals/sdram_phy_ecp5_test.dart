@@ -15,11 +15,10 @@ void main() {
   void positiveCase(int periodPs, int casLatency, double fpgaToSdramNs) {
     final mhz = periodPs == 8000 ? '125 MHz CL3' : '100 MHz CL2';
     test('$mhz passes at fpgaToSdramNs=$fpgaToSdramNs', () async {
-      final tAcNs = casLatency == 3 ? 5.0 : 6.0;
       expect(
         sdramPhyCaptureOk(
           periodPs: periodPs,
-          tAcNs: tAcNs,
+          casLatency: casLatency,
           fpgaToSdramNs: fpgaToSdramNs,
           phy: const HarborSdramPhyConfig(),
         ),

@@ -161,8 +161,9 @@ class Ddr3BurstAdapter extends Module {
     final wrOut = Logic(name: 'wr_out', width: wrOutW);
     final seqW = auxWidth - 1;
     final rdSeq = seqW > 0 ? Logic(name: 'rd_seq', width: seqW) : null;
-    final rdTag = (rdSeq == null ? Const(0) : [rdSeq, Const(0)].swizzle())
-        .named('rd_tag');
+    final rdTag = (rdSeq == null ? Const(0) : [rdSeq, Const(0)].concat()).named(
+      'rd_tag',
+    );
 
     // The one held dirty burst (write combining).
     final wbValid = Logic(name: 'wc_valid');
@@ -189,7 +190,7 @@ class Ddr3BurstAdapter extends Module {
             if (w < ratio - 1) Const(0, width: (ratio - 1 - w) * busDataWidth),
             sData,
             if (w > 0) Const(0, width: w * busDataWidth),
-          ].swizzle(),
+          ].concat(),
       },
       defaultValue: Const(0, width: ddrDataWidth),
       conditionalType: ConditionalType.unique,
@@ -202,7 +203,7 @@ class Ddr3BurstAdapter extends Module {
             if (w < ratio - 1) Const(0, width: (ratio - 1 - w) * busSelWidth),
             sSel,
             if (w > 0) Const(0, width: w * busSelWidth),
-          ].swizzle(),
+          ].concat(),
       },
       defaultValue: Const(0, width: ddrSelWidth),
       conditionalType: ConditionalType.unique,
@@ -223,7 +224,7 @@ class Ddr3BurstAdapter extends Module {
     // One byte-enable bit becomes eight data-mask bits.
     Logic expandSel(Logic sel) => [
       for (var b = ddrSelWidth - 1; b >= 0; b--) sel[b].replicate(8),
-    ].swizzle();
+    ].concat();
 
     // The held burst with the current narrow write merged into it. Bytes the
     // new write does not select keep their held value.

@@ -137,7 +137,7 @@ class HarborFpUnpack extends Module {
             ~expZero,
             mantField,
             if (maxMant > m) Const(0, width: maxMant - m),
-          ].swizzle(),
+          ].concat(),
         ),
       );
       zeros.add((expZero & mantZero) | flush);

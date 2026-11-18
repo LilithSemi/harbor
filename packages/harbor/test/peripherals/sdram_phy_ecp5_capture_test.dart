@@ -20,12 +20,11 @@ void main() {
     int sampleOffsetCycles = 0,
   }) {
     test(name, () async {
-      final tAcNs = casLatency == 3 ? 5.0 : 6.0;
       if (sampleOffsetCycles == 0) {
         expect(
           sdramPhyCaptureOk(
             periodPs: periodPs,
-            tAcNs: tAcNs,
+            casLatency: casLatency,
             fpgaToSdramNs: fpgaToSdramNs,
             phy: phy,
           ),
@@ -101,7 +100,7 @@ void main() {
     expect(
       sdramPhyCaptureOk(
         periodPs: 10000,
-        tAcNs: 6.0,
+        casLatency: 2,
         fpgaToSdramNs: 2.5,
         phy: phy,
       ),

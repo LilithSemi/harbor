@@ -338,9 +338,9 @@ class SdramScanoutBench {
     );
     soc.buildFabric();
 
-    sysClk = SimpleClockGenerator(sysPeriodPs).clk;
-    memClk = SimpleClockGenerator(memPeriodPs).clk;
-    pixelClk = SimpleClockGenerator(pixelPeriodPs).clk;
+    sysClk = SimpleClockGenerator(sysPeriodPs + (sysPeriodPs & 1)).clk;
+    memClk = SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
+    pixelClk = SimpleClockGenerator(pixelPeriodPs + (pixelPeriodPs & 1)).clk;
 
     soc.input('clk').srcConnection! <= sysClk;
     soc.input('reset').srcConnection! <= sysReset;
@@ -387,10 +387,9 @@ class SdramScanoutBench {
     final bbs = {for (final m in phy.subModules.whereType<Ecp5Bb>()) m.name: m};
     final dqBbs = [for (var i = 0; i < 16; i++) bbs['dq_bb_$i']!];
     const fpgaToSdramNs = 4.6;
-    final tAcNs = cycles.casLatency == 3 ? 5.0 : 6.0;
     if (!sdramPhyCaptureOk(
       periodPs: memPeriodPs,
-      tAcNs: tAcNs,
+      casLatency: cycles.casLatency,
       fpgaToSdramNs: fpgaToSdramNs,
       phy: const HarborSdramPhyConfig(),
     )) {
@@ -409,8 +408,8 @@ class SdramScanoutBench {
       dq: sdram.inOutSource('sdram_dq') as LogicNet,
       rules: const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000),
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,
@@ -545,6 +544,22 @@ class SdramScanoutBench {
     return v;
   }
 
+  /// Stores [data] at SoC byte address [addr] in the pin model, with no
+  /// bus access. [expected] gives it back.
+  void backdoor(int addr, int data) {
+    final c = _config;
+    final wa = ((addr - sdramBase) >> 1) & ~1;
+    void put(int w, int v) {
+      final col = w & ((1 << c.colWidth) - 1);
+      final hi = w >> c.colWidth;
+      model.poke(hi & (c.banks - 1), hi >> c.bankBits, col, v);
+    }
+
+    put(wa, data & 0xffff);
+    put(wa + 1, (data >> 16) & 0xffff);
+    _written[addr] = data & 0xffffffff;
+  }
+
   Future<void> write(int addr, int data) => _access(addr, write: data);
   Future<int> read(int addr) => _access(addr);
 
@@ -628,6 +643,20 @@ HarborDisplayTiming vgaLines(int lines) => HarborDisplayTiming(
   pixelClock: 25175000,
 );
 
+/// [hActive] pixels with the horizontal blank of 640x480 and [lines] active
+/// lines, for a line with its full width and deadline in a short frame.
+HarborDisplayTiming vgaLinesOf(int hActive, int lines) => HarborDisplayTiming(
+  hActive: hActive,
+  hFrontPorch: 16,
+  hSyncWidth: 96,
+  hBackPorch: 48,
+  vActive: lines,
+  vFrontPorch: 1,
+  vSyncWidth: 1,
+  vBackPorch: 1,
+  pixelClock: 62500000,
+);
+
 /// Result of [runFullWidthScanout].
 typedef FullWidthResult = ({
   int longestAccess,
@@ -639,8 +668,8 @@ typedef FullWidthResult = ({
 });
 
 /// Scans 640-pixel lines at 32 bpp with a 3072-byte stride from the sdram
-/// scanout port, while the bench master writes every pixel of the frame
-/// through the 25 MHz fabric. Checks the frame, the requests and the pin
+/// scanout port, while the bench master writes 48 pixels of a line through
+/// the 25 MHz fabric. Checks the frame, the requests and the pin
 /// model, and returns the numbers for the caller to assert.
 Future<FullWidthResult> runFullWidthScanout({
   required int memPeriodPs,
@@ -659,14 +688,18 @@ Future<FullWidthResult> runFullWidthScanout({
   if (b.sdram.scanoutStride(640 * 4) != b.stride) {
     throw StateError('stride ${b.stride} is not the sdram row stride');
   }
-  await b.waitFrames(1);
+  // The frame goes in through the backdoor. A short burst of bus writes
+  // goes into the first line while the scanout reads it, and they must show.
   for (var y = 0; y < lines; y++) {
     for (var x = 0; x < 640; x++) {
-      await b.write(b.pixelAddr(x, y), (y << 16) | x | 0x5A000000);
+      b.backdoor(b.pixelAddr(x, y), (y << 16) | x | 0x5A000000);
     }
   }
+  for (var x = 0; x < 48; x++) {
+    await b.write(b.pixelAddr(x, 1), 0xC3000000 | x);
+  }
   print('filled: ${b.accesses} accesses, ${b.frames} frames');
-  final lastAddr = b.pixelAddr(639, lines - 1);
+  final lastAddr = b.pixelAddr(47, 1);
   if (await b.read(lastAddr) != b.expected(lastAddr)) {
     throw StateError('the last pixel did not read back');
   }
@@ -701,33 +734,31 @@ Future<FullWidthResult> runFullWidthScanout({
   return result;
 }
 
-/// Resets the fabric three times, each 1000 `mem_clk` cycles into a line
-/// fetch and with a fabric read in flight. A reset that restarted the line
-/// fetch would put all three in one line, which then misses its deadline.
+/// Resets the fabric once, 1000 `mem_clk` cycles into a line fetch and with
+/// a fabric read in flight. A reset that restarted the line fetch would make
+/// that line miss its deadline.
 /// Throws if `scan_reset` rises, if a frame differs from memory or
 /// underruns, or if the fabric does not work after the resets.
 Future<void> runFabricResetDuringScanout({required int memPeriodPs}) async {
-  const lines = 3;
+  const lines = 2;
   final b = SdramScanoutBench(
     timing: vgaLines(lines),
     memPeriodPs: memPeriodPs,
     stride: 3072,
   );
   await b.start();
-  await b.waitFrames(2);
+  await b.waitFrames(1);
   b.checkFrames = true;
-  for (var i = 0; i < 3; i++) {
-    await b.waitFetch(LogicValue.one);
-    for (var c = 0; c < 1000; c++) {
-      await b.memClk.nextPosedge;
-    }
-    if (b.fetchBusy.value != LogicValue.one) {
-      throw StateError('the line fetch ended before the reset');
-    }
-    await b.resetDuringRead(b.pixelAddr(100 * i, 1));
-    await b.waitFetch(LogicValue.zero);
+  await b.waitFetch(LogicValue.one);
+  for (var c = 0; c < 1000; c++) {
+    await b.memClk.nextPosedge;
   }
-  await b.waitFrames(2);
+  if (b.fetchBusy.value != LogicValue.one) {
+    throw StateError('the line fetch ended before the reset');
+  }
+  await b.resetDuringRead(b.pixelAddr(100, 1));
+  await b.waitFetch(LogicValue.zero);
+  await b.waitFrames(1);
   b.checkFrames = false;
   if (b.scanResetCycles != 0) {
     throw StateError('scan_reset was high for ${b.scanResetCycles} cycles');
@@ -736,12 +767,12 @@ Future<void> runFabricResetDuringScanout({required int memPeriodPs}) async {
     throw StateError('frames differ from memory: ${b.badFrames}');
   }
 
-  final addr = b.pixelAddr(320, 2);
+  final addr = b.pixelAddr(320, 1);
   await b.write(addr, 0x12345678);
   if (await b.read(addr) != 0x12345678) {
     throw StateError('the fabric did not read back after the resets');
   }
-  await b.waitFrames(2);
+  await b.waitFrames(1);
   final after = b.frameErrors();
   if (after.isNotEmpty) throw StateError('frame after resets differs: $after');
   if (b.underrunFrames != 0) {

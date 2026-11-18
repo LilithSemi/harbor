@@ -383,7 +383,7 @@ class HarborCoeffContext extends BridgeModule {
           mux(
             si.lte(Const(eob1, width: si.width)),
             Const(1, width: 2),
-            mux(
+            mux<Logic>(
               si.lte(Const(eob2, width: si.width)),
               Const(2, width: 2),
               Const(3, width: 2),
@@ -452,7 +452,7 @@ class HarborCoeffContext extends BridgeModule {
         mux(
           cZero,
           Const(0, width: 4),
-          mux(nearEob, Const(7, width: 4), Const(14, width: 4)),
+          mux<Logic>(nearEob, Const(7, width: 4), Const(14, width: 4)),
         );
   }
 

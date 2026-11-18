@@ -107,7 +107,7 @@ HarborEthPhyRxOut harborEthPhyNibbleRx(
     clk,
     reset,
     byteIn: dv & (half | forced),
-    byteData: [rxd, mux(half, low, Const(5, width: 4))].swizzle(),
+    byteData: [rxd, mux(half, low, Const(5, width: 4))].concat(),
     byteEr: acc | rxEr,
     frameEnd: active & ~dv,
     dribble: half,

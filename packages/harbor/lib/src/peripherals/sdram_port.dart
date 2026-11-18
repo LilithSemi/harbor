@@ -161,6 +161,9 @@ int _arbiterIndexWidth(int n) => n <= 1 ? 1 : (n - 1).bitLength;
 /// `rd_data` registers, one cycle after the engine. A client can then sit
 /// far from the engine and the path still has a whole cycle.
 ///
+/// While [holdBestEffort] is high, no best effort port is granted. A request
+/// that was taken still runs, and the bus side keeps its order.
+///
 /// `abort` is the bus side reset. It drops a held read request of an
 /// abortable port only ([HarborSdramPortConfig.abortable]). Taken writes
 /// stay in the request register, the write queue and the buffer, and still
@@ -170,6 +173,7 @@ class SdramArbiter extends Module {
     required Logic clk,
     required Logic reset,
     Logic? abort,
+    Logic? holdBestEffort,
     required List<SdramPortInterface> ports,
     required List<HarborSdramPortConfig> configs,
     required SdramPortInterface engine,
@@ -209,6 +213,9 @@ class SdramArbiter extends Module {
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
     abort = addInput('abort', abort ?? Const(0));
+    final hold = holdBestEffort == null
+        ? Const(0)
+        : addInput('hold_best_effort', holdBestEffort);
 
     final clients = [
       for (var i = 0; i < n; i++)
@@ -239,10 +246,18 @@ class SdramArbiter extends Module {
       ];
     }
 
+    // A best effort request does not compete while [holdBestEffort] is high.
+    final competing = [
+      for (var i = 0; i < n; i++)
+        configs[i].realtime
+            ? clients[i].reqValid
+            : (clients[i].reqValid & ~hold).named('${configs[i].name}_comp'),
+    ];
+
     Logic selFor(int g) {
       Logic v = Const(0, width: idxWidth);
       for (final idx in orderFor(g).reversed) {
-        v = mux(clients[idx].reqValid, Const(idx, width: idxWidth), v);
+        v = mux(competing[idx], Const(idx, width: idxWidth), v);
       }
       return v;
     }
@@ -250,7 +265,7 @@ class SdramArbiter extends Module {
     Logic selValidFor(int g) {
       Logic v = Const(0);
       for (final idx in orderFor(g).reversed) {
-        v = mux(clients[idx].reqValid, Const(1), v);
+        v = mux(competing[idx], Const(1), v);
       }
       return v;
     }
@@ -347,7 +362,7 @@ class SdramArbiter extends Module {
     ].reduce((x, y) => x | y);
     final headValid = pickByHead([for (final c in clients) c.wrValid]);
     final headWord = pickByHead([
-      for (final c in clients) [c.wrMask, c.wrData].swizzle(),
+      for (final c in clients) [c.wrMask, c.wrData].concat(),
     ]);
 
     final load = (wqValid[0] & notFull & headValid).named('wr_load');
@@ -653,7 +668,7 @@ class SdramPortSlice extends Module {
     a.wrMask <= qWord[0].getRange(16, 18);
     final push = c.wrValid & wrReady;
     final pop = a.wrReady;
-    final word = [c.wrMask, c.wrData].swizzle();
+    final word = [c.wrMask, c.wrData].concat();
     final v0 = mux(pop, qValid[1], qValid[0]);
     final v1 = mux(pop, Const(0), qValid[1]);
     final w0 = mux(pop, qWord[1], qWord[0]);

@@ -125,7 +125,7 @@ void main() {
                   good.getRange(dq * b + 8 * l, dq * b + 8 * l + 8),
                   ~good.getRange(dq * b + 8 * l, dq * b + 8 * l + 8),
                 ),
-          ].swizzle();
+          ].concat();
       phyRdy <= model.idelayctrlRdy;
       levelDone <= lev.done;
 
@@ -206,7 +206,7 @@ void main() {
       // Every byte of the read data is the tick count.
       final tick = Logic(name: 'tick', width: 8);
       Sequential(clk, reset: ~rstN, [tick < tick + 1]);
-      phyData <= [for (var i = 0; i < dq; i++) tick].swizzle();
+      phyData <= [for (var i = 0; i < dq; i++) tick].concat();
       await ctrl.build();
       rstN.inject(0);
       Simulator.setMaxSimTime(20000000);

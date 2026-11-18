@@ -101,8 +101,8 @@ Future<_Bench> _setUp({
   bool levelAck = true,
 }) async {
   final cdc = HarborCdcHandshake(dataWidth: _width, name: 'cdc_under_test');
-  final srcClk = SimpleClockGenerator(srcPeriod).clk;
-  final dstClk = SimpleClockGenerator(dstPeriod).clk;
+  final srcClk = SimpleClockGenerator(srcPeriod + (srcPeriod & 1)).clk;
+  final dstClk = SimpleClockGenerator(dstPeriod + (dstPeriod & 1)).clk;
   final reset = Logic(name: 'cdc_reset');
   final srcData = Logic(name: 'cdc_src_data', width: _width);
   final srcValid = Logic(name: 'cdc_src_valid');

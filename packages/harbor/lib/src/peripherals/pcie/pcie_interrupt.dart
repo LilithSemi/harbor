@@ -46,7 +46,11 @@ class HarborPcieInterrupt extends Module {
       mux(
         mmEnable.eq(1),
         Const(0x03, width: 8),
-        mux(mmEnable.eq(2), Const(0x0f, width: 8), Const(0xff, width: 8)),
+        mux<Logic>(
+          mmEnable.eq(2),
+          Const(0x0f, width: 8),
+          Const(0xff, width: 8),
+        ),
       ),
     ).named('granted_mask');
     final lowest = (latched & (~latched + 1)).named('lowest');
@@ -56,8 +60,8 @@ class HarborPcieInterrupt extends Module {
         [
           for (var i = 0; i < 8; i++)
             if (i & (1 << bit) != 0) lowest[i],
-        ].swizzle().or(),
-    ].swizzle().named('lowest_index');
+        ].concat().or(),
+    ].concat().named('lowest_index');
     final msiVector = mux(
       lowestInRange,
       lowestIndex.zeroExtend(8),

@@ -218,7 +218,7 @@ class HarborAplic extends BridgeModule
                               i--
                             )
                               pending[i],
-                          ].swizzle().zeroExtend(32),
+                          ].concat().zeroExtend(32),
                     ],
                   ),
                 ],
@@ -263,7 +263,7 @@ class HarborAplic extends BridgeModule
                               i--
                             )
                               enabled[i],
-                          ].swizzle().zeroExtend(32),
+                          ].concat().zeroExtend(32),
                     ],
                   ),
                 ],

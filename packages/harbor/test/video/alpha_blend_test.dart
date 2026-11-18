@@ -95,7 +95,7 @@ void main() {
     await b.build();
     expect(b.definitionName, 'HarborAlphaBlend_ecp5');
     expect(b.subModules.whereType<Ecp5Mult18x18d>(), hasLength(3));
-    final sv = b.generateSynth();
+    final sv = b.dumpSystemVerilog();
     expect('REG_OUTPUT_CLK'.allMatches(sv), hasLength(3));
   });
 }

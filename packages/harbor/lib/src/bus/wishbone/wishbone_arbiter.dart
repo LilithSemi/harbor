@@ -18,8 +18,10 @@ import 'wishbone_interface.dart';
 ///
 /// When [maxGrantCycles] is set, a master that has held the grant for that
 /// many cycles loses it at the end of its next transfer if another master is
-/// waiting. This can split a read-modify-write that a
-/// master holds under one CYC, so it is off by default.
+/// waiting. This can split a read-modify-write that a master holds under one
+/// CYC. The arbiter has no cap by default. `HarborSoC.buildFabric` sets one
+/// of 16 cycles on a fabric with two or more
+/// masters, so a master that polls back to back cannot starve the others.
 class WishboneArbiter extends BridgeModule {
   final int numMasters;
 
@@ -140,7 +142,10 @@ class WishboneArbiter extends BridgeModule {
 /// shows one cycle after the request. With no request the grant stays on
 /// the last owner. [terminate] is high when the owner's transfer ends. With
 /// [maxGrantCycles], an owner that held the grant that long loses it at the
-/// end of a transfer when another master waits (see [WishboneArbiter]).
+/// end of a transfer when another master waits (see [WishboneArbiter]). The
+/// cap takes the grant only at a transfer end where [safeEnd] is high, so
+/// the fabric can cut after a read or after a write that waited for its
+/// response. A null [safeEnd] counts as high.
 /// [prefix] goes in front of every signal name.
 Logic harborWishboneGrant({
   required Logic clk,
@@ -149,11 +154,12 @@ Logic harborWishboneGrant({
   required Logic terminate,
   BusArbitration arbitration = BusArbitration.roundRobin,
   int? maxGrantCycles,
+  Logic? safeEnd,
   String prefix = '',
 }) {
   final numMasters = requests.length;
   final cap = maxGrantCycles;
-  final requestsVec = requests.rswizzle().named('${prefix}requests');
+  final requestsVec = requests.rconcat().named('${prefix}requests');
 
   // A master that lost the grant to the cap stays out of arbitration until
   // another master takes the grant.
@@ -178,7 +184,7 @@ Logic harborWishboneGrant({
 
   // The grant is a register. A combinational grant would put arbitration,
   // address decode and the slave ACK in one long path.
-  final grantVec = grantSignals.rswizzle();
+  final grantVec = grantSignals.rconcat();
   final heldReg = Logic(name: '${prefix}held_grant', width: numMasters);
   final heldReqVec = (heldReg & requestsVec).named('${prefix}held_req');
   final heldValid = heldReqVec.or().named('${prefix}held_valid');
@@ -201,9 +207,13 @@ Logic harborWishboneGrant({
     final othersWait = (requestsVec & ~heldReg).or().named(
       '${prefix}others_wait',
     );
-    final preempt = (heldValid & count.eq(cap) & terminate & othersWait).named(
-      '${prefix}preempt',
-    );
+    final preempt =
+        (heldValid &
+                count.eq(cap) &
+                terminate &
+                (safeEnd ?? Const(1)) &
+                othersWait)
+            .named('${prefix}preempt');
     final freeVec = (requestsVec & ~blocked!).named('${prefix}free_requests');
     Sequential(clk, [
       If(

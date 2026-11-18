@@ -67,7 +67,7 @@ void main() {
       expect(built('HarborFpEstimate'), isFalse);
       expect(defs.where((d) => d.startsWith('HarborDivSqrt')), isEmpty);
 
-      final sv = dut.generateSynth();
+      final sv = dut.dumpSystemVerilog();
       expect(sv, isNot(contains('HarborFpMiscPath')));
       expect(sv, isNot(contains('div_in')));
       final full = HarborFpu(
@@ -75,7 +75,7 @@ void main() {
         tagWidth: 4,
       );
       await full.build();
-      final fullSv = full.generateSynth();
+      final fullSv = full.dumpSystemVerilog();
       expect(sv.length, lessThan(fullSv.length * 0.8));
     });
 

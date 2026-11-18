@@ -57,7 +57,7 @@ class IserdesE2SimModel extends Module {
     final bs = Logic(name: 'bs_rot', width: bsW);
 
     Sequential(clkdiv, reset: reset, [
-      sr < [sr.getRange(0, dataWidth - 1), ddly].swizzle(),
+      sr < [sr.getRange(0, dataWidth - 1), ddly].concat(),
       If(
         bitslip,
         then: [

@@ -53,6 +53,6 @@ class HarborPaletteRecon extends BridgeModule {
       final idx = input('indices').getRange(i * 3, i * 3 + 3);
       outs.add(selColor(idx));
     }
-    output('pixels') <= outs.reversed.toList().swizzle();
+    output('pixels') <= outs.reversed.toList().concat();
   }
 }

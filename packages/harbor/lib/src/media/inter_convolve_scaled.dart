@@ -254,7 +254,7 @@ class HarborInterConvolveScaled extends BridgeModule {
     Logic constW(int c) => Const(BigInt.from(c).toUnsigned(w), width: w);
     Logic asr(Logic x, int n) {
       if (n <= 0) return x;
-      return [x[w - 1].replicate(n), x.getRange(n, w)].swizzle();
+      return [x[w - 1].replicate(n), x.getRange(n, w)].concat();
     }
 
     Logic addC(Logic x, int c) => (x + constW(c)).getRange(0, w);
@@ -345,7 +345,7 @@ class HarborInterConvolveScaled extends BridgeModule {
     // the vertical barrel shift.
     final imCol = <Logic>[
       for (var x = 0; x < width; x++)
-        [for (var iy = ph - 1; iy >= 0; iy--) im[iy][x]].swizzle(),
+        [for (var iy = ph - 1; iy >= 0; iy--) im[iy][x]].concat(),
     ];
     final colShW = (ph * w).bitLength;
     final brW = ph.bitLength; // holds base row in 0..ph-8
@@ -402,7 +402,7 @@ class HarborInterConvolveScaled extends BridgeModule {
 
     final packed = [
       for (var i = width * height - 1; i >= 0; i--) outParts[i],
-    ].swizzle();
+    ].concat();
     if (isCompound && !doAverage) {
       output('conv') <= packed;
     } else {

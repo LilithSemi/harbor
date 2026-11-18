@@ -66,7 +66,7 @@ void main() {
       freeClk: bit(),
     );
     await dut.build();
-    final sv = dut.generateSynth();
+    final sv = dut.dumpSystemVerilog();
     expect(dut.definitionName, endsWith('_Free'));
     expect(sv, contains('HarborPcieResetCounters_F'));
     expect(dut.resetStatus.width, 64);
@@ -193,7 +193,7 @@ void main() {
         ),
       );
       await dut.build();
-      final sv = dut.generateSynth();
+      final sv = dut.dumpSystemVerilog();
       expect(sv, contains('PCIE_2_1'));
       expect(sv, contains('GTPE2_COMMON'));
       expect(sv, contains('GTPE2_CHANNEL'));
@@ -223,7 +223,7 @@ void main() {
         config: const HarborPcieEndpointConfig(packetMemoryEntries: 1024),
       );
       await dut.build();
-      final sv = dut.generateSynth();
+      final sv = dut.dumpSystemVerilog();
       expect(sv, contains('HarborBram_68x1024'));
       expect(sv, contains('HarborBram_69x1024'));
       expect(sv, contains(".VC0_RX_RAM_LIMIT(13'h3FF)"));
@@ -308,7 +308,7 @@ void main() {
         ),
       );
       await dut.build();
-      final sv = dut.generateSynth();
+      final sv = dut.dumpSystemVerilog();
       expect(sv, contains(".BAR2(32'hff00000c)"));
       expect(sv, contains(".BAR3(32'hffffffff)"));
       expect(sv, contains('.MSI_CAP_MULTIMSGCAP(3)'));
@@ -337,7 +337,7 @@ void main() {
       ),
     );
     await dut.build();
-    final sv = dut.generateSynth();
+    final sv = dut.dumpSystemVerilog();
     expect(sv, contains(".BAR2(32'h00000000)"));
     expect(sv, contains(".BAR3(32'h00000000)"));
     expect(sv, contains('.MSI_CAP_MULTIMSGCAP(0)'));
@@ -375,7 +375,7 @@ void main() {
       pipeStages: 2,
     );
     await dut.build();
-    final sv = dut.generateSynth();
+    final sv = dut.dumpSystemVerilog();
     expect(dut.pipeStages, 2);
     expect(dut.definitionName, 'HarborPcieEndpoint_Xilinx7_X1_Pipe2_LinkWd');
     expect(sv, contains('HarborGtpPciePhy_X1_Pipe2_LinkWd'));
@@ -427,7 +427,7 @@ void main() {
         timeouts: const HarborGtpPcieTimeouts(linkWait: 0),
       );
       await off.build();
-      final sv = off.generateSynth();
+      final sv = off.dumpSystemVerilog();
       expect(off.definitionName, 'HarborPcieEndpoint_Xilinx7_X1_Pipe1');
       expect(sv, contains('HarborArtix7PciePhy_X1_Pipe1 '));
       expect(sv, contains('HarborGtpPciePhy_X1_Pipe1 '));

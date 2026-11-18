@@ -219,7 +219,7 @@ class HarborVectorLane extends BridgeModule {
     );
     _out('in_ready', ctl.inReady);
     _out('out_valid', ctl.outValid);
-    _out('slot_valid', ctl.slotValids.rswizzle());
+    _out('slot_valid', ctl.slotValids.rconcat());
 
     _main.input('clk').srcConnection! <= clk;
     _main.input('reset').srcConnection! <= reset;
@@ -414,7 +414,7 @@ class HarborVectorLane extends BridgeModule {
         // Zero-extends to outW, so dest bits above laneWidth never pass
         // through a packed beat (only matters when an intWidths width is
         // wider than laneWidth).
-        final groupResult = sliceResults.rswizzle().zeroExtend(outW);
+        final groupResult = sliceResults.rconcat().zeroExtend(outW);
         final groupFlags = sliceFlags.reduce((x, y) => x | y);
         final sel = route.eq(Const(gi + 1, width: routeW));
         result = mux(sel, groupResult, result);

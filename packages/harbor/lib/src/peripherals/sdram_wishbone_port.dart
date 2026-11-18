@@ -5,9 +5,9 @@ import 'package:rohd/rohd.dart';
 
 import 'sdram_port.dart';
 
-/// Turns one 32-bit wishbone access into two 16-bit sdram words: the low
-/// word at the even word address, the high word at the next one. `sel`
-/// splits the same way.
+/// Turns one 32-bit or 64-bit wishbone access into two or four 16-bit sdram
+/// words: the low word at the first word address, the others at the next
+/// ones. `sel` splits the same way.
 ///
 /// The port latches the write data and `sel` when it starts a request. If
 /// `cyc` drops before the ack, the request still runs to completion on
@@ -23,6 +23,10 @@ import 'sdram_port.dart';
 class SdramWishbonePort extends Module {
   Logic get ack => output('ack');
   Logic get datR => output('dat_r');
+
+  /// 16-bit sdram words in one access: 2 for a 32-bit bus, 4 for a 64-bit
+  /// bus.
+  final int words;
 
   /// The ACK flop without the `cyc` gate, for a master that gates it with
   /// its own `cyc`.
@@ -41,7 +45,7 @@ class SdramWishbonePort extends Module {
     Logic? writeTaken,
     int portId = 0,
     super.name = 'sdram_wb_port',
-  }) {
+  }) : words = datW.width ~/ 16 {
     final wordAddrWidth = port.addrWidth;
     if (adr.width < wordAddrWidth + 1) {
       throw ArgumentError(
@@ -49,8 +53,16 @@ class SdramWishbonePort extends Module {
         '${adr.width}',
       );
     }
-    if (datW.width != 32 || sel.width != 4) {
-      throw ArgumentError('datW must be 32 bits wide and sel 4 bits wide');
+    final dw = datW.width;
+    if ((dw != 32 && dw != 64) || sel.width != dw ~/ 8) {
+      throw ArgumentError(
+        'datW must be 32 or 64 bits wide and sel one bit per byte',
+      );
+    }
+    final wpa = words;
+    final wpaBits = wpa.bitLength - 1;
+    if (port.wordsWidth < wpa.bitLength) {
+      throw ArgumentError('the client port must hold $wpa words');
     }
     if (port.wrLookahead) {
       throw ArgumentError('a wishbone front end port must not be lookahead');
@@ -62,13 +74,13 @@ class SdramWishbonePort extends Module {
     cyc = addInput('cyc', cyc);
     we = addInput('we', we);
     adr = addInput('adr', adr, width: adr.width);
-    datW = addInput('dat_w', datW, width: 32);
-    sel = addInput('sel', sel, width: 4);
+    datW = addInput('dat_w', datW, width: dw);
+    sel = addInput('sel', sel, width: dw ~/ 8);
     if (writeTaken != null) writeTaken = addInput('wr_taken', writeTaken);
 
     addOutput('ack');
     addOutput('ack_pulse');
-    addOutput('dat_r', width: 32);
+    addOutput('dat_r', width: dw);
 
     port = SdramPortInterface(
       addrWidth: port.addrWidth,
@@ -77,23 +89,28 @@ class SdramWishbonePort extends Module {
     )..pairConnectIO(this, port, PairRole.consumer);
 
     // The sdram word address is the byte address without its own bit 0,
-    // with that address's own bit 0 forced to 0: the low word of a 32-bit
-    // access always lands on the even word.
+    // with the low bits that count the words of an access forced to 0: the
+    // first word of an access always lands on an aligned word.
     final wordAddrRaw = adr.getRange(1, 1 + wordAddrWidth);
-    final evenWordAddr = [
-      wordAddrRaw.getRange(1, wordAddrWidth),
-      Const(0),
-    ].swizzle();
+    final alignedWordAddr = [
+      wordAddrRaw.getRange(wpaBits, wordAddrWidth),
+      Const(0, width: wpaBits),
+    ].concat();
 
-    final loData = datW.getRange(0, 16);
-    final loMask = sel.getRange(0, 2);
-    final hiWord = [sel.getRange(2, 4), datW.getRange(16, 32)].swizzle();
+    Logic dataWord(int i) => datW.getRange(16 * i, 16 * i + 16);
+    Logic maskWord(int i) => sel.getRange(2 * i, 2 * i + 2);
+    final loData = dataWord(0);
+    final loMask = maskWord(0);
 
     // Phase sequencing, bookkeeping only: nothing downstream reads these
     // bits directly, they only pick which dedicated register loads next.
-    const pIdle = 0, pReq = 1, pWr0 = 2, pWr1 = 3, pRd0 = 4, pRd1 = 5;
-    const pAck = 6, pGap = 7;
-    final phase = Logic(name: 'phase', width: 3);
+    // Phase wr(i) presents word i of a write, rd(i) takes word i of a read.
+    const pIdle = 0, pReq = 1;
+    int wr(int i) => 2 + i;
+    int rd(int i) => 2 + wpa + i;
+    final pAck = 2 + 2 * wpa, pGap = 3 + 2 * wpa;
+    final pWrLast = wr(wpa - 1), pRdLast = rd(wpa - 1);
+    final phase = Logic(name: 'phase', width: (pGap).bitLength);
 
     final reqAddrReg = Logic(name: 'req_addr_r', width: wordAddrWidth);
     final reqWriteReg = Logic(name: 'req_write_r');
@@ -101,9 +118,15 @@ class SdramWishbonePort extends Module {
     final wrValidReg = Logic(name: 'wr_valid_r');
     final wrDataReg = Logic(name: 'wr_data_r', width: 16);
     final wrMaskReg = Logic(name: 'wr_mask_r', width: 2);
-    final loWordReg = Logic(name: 'lo_word_r', width: 16);
-    final datRReg = Logic(name: 'dat_r_r', width: 32);
-    final hiWordReg = Logic(name: 'hi_word_r', width: 18);
+    final loWordRegs = [
+      for (var i = 0; i < wpa - 1; i++)
+        Logic(name: 'lo_word_${i}_r', width: 16),
+    ];
+    final datRReg = Logic(name: 'dat_r_r', width: dw);
+    // Mask and data of the words after the first, held until they go out.
+    final hiWordRegs = [
+      for (var i = 1; i < wpa; i++) Logic(name: 'hi_word_${i}_r', width: 18),
+    ];
     final ackReg = Logic(name: 'ack_r');
     // The master dropped cyc after this request started.
     final aborted = Logic(name: 'aborted');
@@ -114,7 +137,7 @@ class SdramWishbonePort extends Module {
     port.reqValid <= reqValidReg;
     port.reqWrite <= reqWriteReg;
     port.reqAddr <= reqAddrReg;
-    port.reqWords <= Const(2, width: port.wordsWidth);
+    port.reqWords <= Const(wpa, width: port.wordsWidth);
     port.wrValid <= wrValidReg;
     port.wrData <= wrDataReg;
     port.wrMask <= wrMaskReg;
@@ -126,11 +149,12 @@ class SdramWishbonePort extends Module {
     output('ack_pulse') <= ackReg;
     output('dat_r') <= datRReg;
 
-    Const st(int p) => Const(p, width: 3);
+    Logic st(int p) => Const(p, width: phase.width);
 
     final committed =
-        phase.eq(st(pWr0)) |
-        phase.eq(st(pWr1)) |
+        [
+          for (var i = 0; i < wpa; i++) phase.eq(st(wr(i))),
+        ].reduce((a, b) => a | b) |
         (phase.eq(st(pReq)) & reqWriteReg & port.reqReady);
     final drop = (reset | (abort & ~committed)).named('drop');
     final takenNow =
@@ -176,16 +200,17 @@ class SdramWishbonePort extends Module {
                     reqValidReg < Const(0),
                     If(
                       reqWriteReg,
-                      then: [phase < st(pWr0), wrValidReg < Const(1)],
-                      orElse: [phase < st(pRd0)],
+                      then: [phase < st(wr(0)), wrValidReg < Const(1)],
+                      orElse: [phase < st(rd(0))],
                     ),
                   ],
                 ),
               ]),
-              CaseItem(st(pWr0), [
-                If(port.wrReady, then: [phase < st(pWr1)]),
-              ]),
-              CaseItem(st(pWr1), [
+              for (var i = 0; i < wpa - 1; i++)
+                CaseItem(st(wr(i)), [
+                  If(port.wrReady, then: [phase < st(wr(i + 1))]),
+                ]),
+              CaseItem(st(pWrLast), [
                 If(
                   port.wrReady,
                   then: [wrValidReg < Const(0), wordsOut < Const(1)],
@@ -199,10 +224,11 @@ class SdramWishbonePort extends Module {
                   ],
                 ),
               ]),
-              CaseItem(st(pRd0), [
-                If(port.rdValid, then: [phase < st(pRd1)]),
-              ]),
-              CaseItem(st(pRd1), [
+              for (var i = 0; i < wpa - 1; i++)
+                CaseItem(st(rd(i)), [
+                  If(port.rdValid, then: [phase < st(rd(i + 1))]),
+                ]),
+              CaseItem(st(pRdLast), [
                 If(
                   port.rdValid & port.rdLast,
                   then: [phase < st(pAck), ackReg < cyc & ~aborted & ~abort],
@@ -224,9 +250,9 @@ class SdramWishbonePort extends Module {
           reqAddrReg < Const(0, width: wordAddrWidth),
           wrDataReg < Const(0, width: 16),
           wrMaskReg < Const(0, width: 2),
-          loWordReg < Const(0, width: 16),
-          datRReg < Const(0, width: 32),
-          hiWordReg < Const(0, width: 18),
+          for (final r in loWordRegs) r < Const(0, width: 16),
+          datRReg < Const(0, width: dw),
+          for (final r in hiWordRegs) r < Const(0, width: 18),
         ],
         orElse: [
           Case(phase, [
@@ -234,33 +260,36 @@ class SdramWishbonePort extends Module {
               If(
                 cyc,
                 then: [
-                  reqAddrReg < evenWordAddr,
+                  reqAddrReg < alignedWordAddr,
                   wrDataReg < loData,
                   wrMaskReg < loMask,
-                  hiWordReg < hiWord,
+                  for (var i = 1; i < wpa; i++)
+                    hiWordRegs[i - 1] < [maskWord(i), dataWord(i)].concat(),
                 ],
               ),
             ]),
-            CaseItem(st(pWr0), [
-              If(
-                port.wrReady,
-                then: [
-                  wrDataReg < hiWordReg.getRange(0, 16),
-                  wrMaskReg < hiWordReg.getRange(16, 18),
-                ],
-              ),
+            for (var i = 0; i < wpa - 1; i++)
+              CaseItem(st(wr(i)), [
+                If(
+                  port.wrReady,
+                  then: [
+                    wrDataReg < hiWordRegs[i].getRange(0, 16),
+                    wrMaskReg < hiWordRegs[i].getRange(16, 18),
+                  ],
+                ),
+              ]),
+            CaseItem(st(pWrLast), [
+              If(port.wrReady, then: [datRReg < Const(0, width: dw)]),
             ]),
-            CaseItem(st(pWr1), [
-              If(port.wrReady, then: [datRReg < Const(0, width: 32)]),
-            ]),
-            CaseItem(st(pRd0), [
-              If(port.rdValid, then: [loWordReg < port.rdData]),
-            ]),
-            CaseItem(st(pRd1), [
+            for (var i = 0; i < wpa - 1; i++)
+              CaseItem(st(rd(i)), [
+                If(port.rdValid, then: [loWordRegs[i] < port.rdData]),
+              ]),
+            CaseItem(st(pRdLast), [
               If(
                 port.rdValid & port.rdLast,
                 then: [
-                  datRReg < [port.rdData, loWordReg].swizzle(),
+                  datRReg < [...loWordRegs, port.rdData].rconcat(),
                 ],
               ),
             ]),

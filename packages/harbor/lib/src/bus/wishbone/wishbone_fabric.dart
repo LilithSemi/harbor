@@ -167,7 +167,7 @@ class HarborWishboneFabric extends HarborFabricModule {
           a.sel,
           a.cti ?? Const(0, width: 3),
           a.bte ?? Const(0, width: 2),
-        ].rswizzle(),
+        ].rconcat(),
     ];
     final hit = [
       for (var m = 0; m < nm; m++)
@@ -186,10 +186,20 @@ class HarborWishboneFabric extends HarborFabricModule {
     ];
     // Transfers that end at each slave, for the grant cap.
     final term = [for (var t = 0; t < ns; t++) Logic()];
+    // High when the transfer that ends leaves its owner at a point where
+    // CYC can drop: after a read, and after a write transfer that waited for
+    // its response (CTI 111, or the last beat of a burst block).
+    final safe = [for (var t = 0; t < ns; t++) Logic()];
+    final busSafe = Logic();
 
     // A slave that only one master can reach needs no grant register.
-    Logic grantOf(List<Logic> req, Logic term, String prefix, int reachers) =>
-        reachers <= 1
+    Logic grantOf(
+      List<Logic> req,
+      Logic term,
+      String prefix,
+      int reachers,
+      Logic safeEnd,
+    ) => reachers <= 1
         ? Const(1, width: nm, fill: true)
         : harborWishboneGrant(
             clk: c,
@@ -197,6 +207,7 @@ class HarborWishboneFabric extends HarborFabricModule {
             requests: req,
             terminate: term,
             maxGrantCycles: cap,
+            safeEnd: cap != null ? safeEnd : null,
             prefix: prefix,
           );
 
@@ -207,7 +218,13 @@ class HarborWishboneFabric extends HarborFabricModule {
       for (var t = 0; t < ns; t++) {
         final req = [for (var m = 0; m < nm; m++) ma[m].cyc & hit[m][t]];
         final reachers = masters.where((m) => m.reaches(slaves[t].name));
-        final g = grantOf(req, term[t], '${slaves[t].name}_', reachers.length);
+        final g = grantOf(
+          req,
+          term[t],
+          '${slaves[t].name}_',
+          reachers.length,
+          safe[t],
+        );
         own.add([for (var m = 0; m < nm; m++) g[m] & req[m]]);
       }
       for (var m = 0; m < nm; m++) {
@@ -215,7 +232,13 @@ class HarborWishboneFabric extends HarborFabricModule {
       }
     } else {
       final busTerm = Logic();
-      final g = grantOf([for (final a in ma) a.cyc], busTerm, 'bus_', nm);
+      final g = grantOf(
+        [for (final a in ma) a.cyc],
+        busTerm,
+        'bus_',
+        nm,
+        busSafe,
+      );
       addOutput('grant', width: nm) <= g;
       final gm = [for (var m = 0; m < nm; m++) g[m] & ma[m].cyc];
       for (var t = 0; t < ns; t++) {
@@ -225,6 +248,9 @@ class HarborWishboneFabric extends HarborFabricModule {
         errOwn.add(gm[m] & ma[m].stb & noHit[m]);
       }
       busTerm <= anyOf([for (var t = 0; t < ns; t++) term[t]]) | anyOf(errOwn);
+      busSafe <=
+          anyOf([for (var t = 0; t < ns; t++) safe[t] & term[t]]) |
+              anyOf(errOwn);
     }
 
     // Slave sides, and what each answers to its owner.
@@ -239,6 +265,14 @@ class HarborWishboneFabric extends HarborFabricModule {
         for (var m = 0; m < nm; m++) o[m] & ma[m].stb,
       ]).named('${p}_strobed');
       final [we, adr, dat, sel, cti, bte] = harborUnpack(pick(o, mReq), reqW);
+      final beatLog2 = (dataW ~/ 8).bitLength - 1;
+      final blockLog2 = wishboneBurstBeats.bitLength - 1;
+      final blockEnd = blockLog2 == 0
+          ? Const(1)
+          : adr
+                .getRange(beatLog2, beatLog2 + blockLog2)
+                .eq(Const(wishboneBurstBeats - 1, width: blockLog2));
+      safe[t] <= ~we | cti.neq(Const(2, width: 3)) | blockEnd;
       s.cyc <= cyc & ~dead[t];
       s.stb <= stb & ~dead[t];
       s.we <= we;

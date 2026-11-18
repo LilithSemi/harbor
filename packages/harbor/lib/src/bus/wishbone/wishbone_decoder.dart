@@ -270,7 +270,7 @@ class WishboneDecoder extends BridgeModule {
               orElse: [
                 If(
                   timedOut & orphanValid!,
-                  then: [dropped < (dropped | hitBits.rswizzle())],
+                  then: [dropped < (dropped | hitBits.rconcat())],
                 ),
               ],
             ),
@@ -295,7 +295,7 @@ class WishboneDecoder extends BridgeModule {
                   timedOut,
                   then: [
                     orphanValid < 1,
-                    orphanOh! < hitBits.rswizzle(),
+                    orphanOh! < hitBits.rconcat(),
                     oWe < m.we,
                     oAdr < m.adr,
                     oDat < m.datMosi,

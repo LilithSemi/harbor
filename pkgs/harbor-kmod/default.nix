@@ -15,6 +15,7 @@ stdenv.mkDerivation {
       ../../packages/harbor_kmod/Makefile
       ../../packages/harbor_kmod/gpio
       ../../packages/harbor_kmod/spi
+      ../../packages/harbor_kmod/spi_flash
       ../../packages/harbor_kmod/i2c
       ../../packages/harbor_kmod/sdio
       ../../packages/harbor_kmod/dma
@@ -29,6 +30,7 @@ stdenv.mkDerivation {
       ../../packages/harbor_kmod/media
       ../../packages/harbor_kmod/audio
       ../../packages/harbor_kmod/efuse
+      ../../packages/harbor_kmod/led
     ];
   };
 
@@ -38,12 +40,18 @@ stdenv.mkDerivation {
     "KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
   ];
 
-  # The Makefile builds a module only when the kernel has the subsystem that
-  # the module needs, so the set of modules changes with the kernel. Install
-  # the modules that the build made, and make sure that it made some.
-  installPhase = ''
-    runHook preInstall
+  # Kbuild installs the selected modules and their signing certificates.
+  # Copying only .ko files drops the .ko.cer files needed by NixOS's module tree.
+  installFlags = [
+    "INSTALL_MOD_PATH=${placeholder "out"}"
+    "INSTALL_MOD_DIR=extra/harbor"
+  ];
 
+  # Kbuild strips modules before signing them; do not modify them afterwards.
+  dontStrip = true;
+
+  # The enabled kernel subsystems determine which modules are built.
+  preInstall = ''
     modules=$(find . -name '*.ko' -print)
     if [ -z "$modules" ]; then
       echo "harbor-kmod: the build made no modules" >&2
@@ -51,9 +59,6 @@ stdenv.mkDerivation {
     fi
 
     echo "harbor-kmod: installing$(echo "$modules" | sed 's|^\./| |' | tr -d '\n')"
-    install -D -t $out/lib/modules/${kernel.modDirVersion}/extra/harbor $modules
-
-    runHook postInstall
   '';
 
   meta = {

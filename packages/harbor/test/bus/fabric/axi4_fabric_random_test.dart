@@ -122,8 +122,29 @@ Future<void> _random(
   must(b.busError(), 0);
 }
 
+// One slave: the slave FIFOs are the only request stage. s0 has fewer ID
+// bits than the full IDs, so it also remaps.
+const _oneSlave = [SlaveCfg('s0', 2, 4, 0x00000, 0x10000)];
+const _oneSlaveTimeout = [SlaveCfg('s0', 5, 8, 0x00000, 0x10000, timeout: 64)];
+const _oneLiteSlave = [
+  SlaveCfg('s3', 0, 1, 0x30000, 0x8000, timeout: 64, lite: true),
+];
+
 void main() {
   for (final topology in HarborFabricTopology.values) {
+    for (final (name, masters, slaves) in [
+      ('one slave', masters3, _oneSlave),
+      ('one slave with a timeout', masters3, _oneSlaveTimeout),
+      ('one AXI4-Lite slave', _mastersLite, _oneLiteSlave),
+    ]) {
+      test(
+        '${topology.name} random traffic, $name',
+        () => isolated(
+          () => _random(topology, 4, masters: masters, slaves: slaves),
+        ),
+        timeout: const Timeout(Duration(minutes: 10)),
+      );
+    }
     for (final seed in [1, 2]) {
       test(
         '${topology.name} random traffic, seed $seed',

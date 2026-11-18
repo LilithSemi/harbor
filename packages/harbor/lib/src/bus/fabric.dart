@@ -178,6 +178,10 @@ abstract class HarborFabricModule extends Module with HarborBusErrorSource {
   Logic? get foldError => tryOutput('fold_error');
 }
 
+/// The Wishbone grant hold cap a fabric with two or more masters uses when
+/// the caller gives none.
+const harborDefaultWishboneGrantCap = 16;
+
 /// Builds and checks bus fabrics on the SoC bus clock, natively for one
 /// [HarborFabricKind].
 abstract final class HarborFabric {
@@ -186,7 +190,9 @@ abstract final class HarborFabric {
   /// [wishboneBurstBeats] is the aligned block of a Wishbone memory burst.
   /// The address map check uses it on Wishbone fabrics. [maxGrantCycles] is
   /// the Wishbone grant hold cap (see [WishboneArbiter.maxGrantCycles]). It
-  /// is for Wishbone fabrics only.
+  /// is for Wishbone fabrics only. It defaults to
+  /// [harborDefaultWishboneGrantCap] on a fabric with two or more masters.
+  /// Null or 0 turns the cap off. A fabric with one master has no cap.
   static HarborFabricModule build({
     required HarborFabricKind kind,
     required HarborFabricTopology topology,
@@ -195,10 +201,19 @@ abstract final class HarborFabric {
     required List<HarborFabricMaster> masters,
     required List<HarborFabricSlave> slaves,
     int wishboneBurstBeats = 8,
-    int? maxGrantCycles,
+    int? maxGrantCycles = harborDefaultWishboneGrantCap,
     String name = 'fabric',
   }) {
-    if (maxGrantCycles != null && kind != HarborFabricKind.wishbone) {
+    if (maxGrantCycles != null && maxGrantCycles < 0) {
+      throw ArgumentError.value(
+        maxGrantCycles,
+        'maxGrantCycles',
+        'must be 0 (off) or >= 1',
+      );
+    }
+    if (maxGrantCycles != null &&
+        maxGrantCycles != harborDefaultWishboneGrantCap &&
+        kind != HarborFabricKind.wishbone) {
       throw ArgumentError.value(
         maxGrantCycles,
         'maxGrantCycles',
@@ -232,7 +247,9 @@ abstract final class HarborFabric {
           masters: masters,
           slaves: slaves,
           wishboneBurstBeats: wishboneBurstBeats,
-          maxGrantCycles: maxGrantCycles,
+          maxGrantCycles: masters.length < 2 || maxGrantCycles == 0
+              ? null
+              : maxGrantCycles,
           name: name,
         );
     }
@@ -293,6 +310,21 @@ abstract final class HarborFabric {
     errors.addAll(validateAddressMappings(mappings));
     return errors;
   }
+
+  /// True when a fabric of [kind] can deliver a multi-beat burst to a slave
+  /// port with the [HarborFabricSlave.memory] flag [memory].
+  ///
+  /// - AXI4: every slave. An AXI4-Lite slave gets the burst as single beat
+  ///   requests from the fabric.
+  /// - Wishbone: every slave. A classic slave sees the beats of a burst as
+  ///   classic cycles.
+  /// - TileLink: memory slaves only. A TL-UL slave takes one beat or less,
+  ///   and a larger message to it ends denied.
+  static bool slaveTakesBursts(HarborFabricKind kind, {required bool memory}) =>
+      switch (kind) {
+        HarborFabricKind.axi4 || HarborFabricKind.wishbone => true,
+        HarborFabricKind.tilelink => memory,
+      };
 
   /// Throws [ArgumentError] when the master and slave lists cannot form a
   /// fabric of [kind]. Each builder calls it first.

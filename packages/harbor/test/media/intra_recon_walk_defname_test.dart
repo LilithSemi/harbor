@@ -14,7 +14,7 @@ void main() {
       'reserved-name clash)', () async {
     final walk = HarborIntraReconWalk();
     await walk.build();
-    final sv = walk.generateSynth();
+    final sv = walk.dumpSystemVerilog();
 
     for (final prefix in [
       'HarborIntraPredAvail',

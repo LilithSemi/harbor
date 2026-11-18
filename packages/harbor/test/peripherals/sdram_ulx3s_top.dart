@@ -92,7 +92,7 @@ class SdramBistMaster extends Module {
         lfsr >>> 1,
       );
 
-      adr <= [idx, Const(0, width: 2)].swizzle().zeroExtend(adrWidth);
+      adr <= [idx, Const(0, width: 2)].concat().zeroExtend(adrWidth);
       datW <= lfsr;
       we <= ~reading;
 
@@ -152,7 +152,7 @@ class SdramBistMaster extends Module {
     final pattern = idxW.zeroExtend(32) ^ Const(0xc0ffee00, width: 32);
     final last = step.eq(Const(n - 1, width: stepWidth));
 
-    adr <= [idxW, Const(0, width: 2)].swizzle().zeroExtend(adrWidth);
+    adr <= [idxW, Const(0, width: 2)].concat().zeroExtend(adrWidth);
     datW <= pattern;
     we <= ~reading;
 
@@ -270,7 +270,7 @@ class SdramUlx3sTop extends BridgeModule {
           bist.fail,
           bist.pass,
           sdram.output('init_done'),
-        ].swizzle();
+        ].concat();
 
     for (final p in sdramPadPorts) {
       pullUpPort(sdram.port(p), newPortName: p);

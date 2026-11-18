@@ -91,7 +91,7 @@ class DviTransmitter extends Module {
 
     // Channel 0 carries the sync signals during blanking ({c1, c0} = {vsync,
     // hsync}). Channels 1 and 2 carry CTL1..CTL0 and CTL3..CTL2, 0 for DVI.
-    final sym0 = encode(blue, [vsync, hsync].swizzle(), 0);
+    final sym0 = encode(blue, [vsync, hsync].concat(), 0);
     final sym1 = encode(
       green,
       hdmiCtl?.getRange(0, 2) ?? Const(0, width: 2),
@@ -137,9 +137,9 @@ class DviTransmitter extends Module {
     // TMDS clock channel: a fixed 0b1111100000 pattern is the pixel clock.
     final chClk = serialize(Const(0x3E0, width: 10));
 
-    gpdi <= [chClk.q, ch2.q, ch1.q, ch0.q].swizzle();
+    gpdi <= [chClk.q, ch2.q, ch1.q, ch0.q].concat();
     if (complement) {
-      gpdiN <= [chClk.qn, ch2.qn, ch1.qn, ch0.qn].swizzle();
+      gpdiN <= [chClk.qn, ch2.qn, ch1.qn, ch0.qn].concat();
     }
   }
 }

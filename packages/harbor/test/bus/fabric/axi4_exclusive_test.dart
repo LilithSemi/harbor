@@ -1229,7 +1229,7 @@ void main() {
           exclusive: ids,
         );
         await m.build();
-        return m.generateSynth();
+        return m.dumpSystemVerilog();
       }
 
       final plain = await sv(null);

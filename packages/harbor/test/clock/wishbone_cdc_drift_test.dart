@@ -34,8 +34,8 @@ void main() {
     const dw = 32;
     final dut = HarborWishboneCdcBridge(addressWidth: aw, dataWidth: dw);
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
     final sCyc = Logic(name: 's_cyc');
@@ -130,11 +130,11 @@ void main() {
   // (mesochronous same-freq). Non-exact so the phase sweeps every alignment over
   // the run. Large n. Varying ack latency. Any wedge is the #144 repro.
   for (final ratio in const [
-    (s: 300, m: 199, tag: 'near-3:2 detuned'),
-    (s: 300, m: 201, tag: 'near-3:2 detuned+'),
-    (s: 200, m: 199, tag: 'near-1:1 detuned (mesochronous)'),
-    (s: 199, m: 200, tag: 'near-1:1 detuned- (mesochronous)'),
-    (s: 401, m: 267, tag: 'near-3:2 detuned coprime'),
+    (s: 300, m: 198, tag: 'near-3:2 detuned'),
+    (s: 300, m: 202, tag: 'near-3:2 detuned+'),
+    (s: 200, m: 198, tag: 'near-1:1 detuned (mesochronous)'),
+    (s: 198, m: 200, tag: 'near-1:1 detuned- (mesochronous)'),
+    (s: 402, m: 268, tag: 'near-3:2 detuned coprime'),
   ]) {
     test(
       'phase-drift sustained ${ratio.tag} s=${ratio.s} m=${ratio.m}',

@@ -137,7 +137,7 @@ class HarborLrFrameWalk extends BridgeModule {
           region.add(px);
         }
       }
-      final padded = region.reversed.toList().swizzle();
+      final padded = region.reversed.toList().concat();
 
       final unit = HarborLrUnit(width: width, height: height, name: 'lru_$u');
       addSubModule(unit);
@@ -166,6 +166,6 @@ class HarborLrFrameWalk extends BridgeModule {
     }
 
     final outParts = [for (final p in outPlane) p!];
-    output('out') <= outParts.reversed.toList().swizzle();
+    output('out') <= outParts.reversed.toList().concat();
   }
 }

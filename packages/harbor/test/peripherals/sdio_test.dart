@@ -6,6 +6,7 @@ import 'package:test/test.dart';
 
 import '../util/mem_target.dart';
 import '../util/reg_bus.dart';
+import '../util/sd_cmd_probe.dart';
 
 // Register byte offsets: each register in its own 8-byte slot (the byte-addressed
 // fabric decodes byte-offset >> 3).
@@ -20,6 +21,7 @@ const _blkSize = 0x50;
 const _intStatus = 0x60;
 const _intEnable = 0x68;
 const _admaAddr = 0x70;
+const _diag = 0x90;
 
 /// Reference SD CRC7 (x^7 + x^3 + 1) over an MSB-first bit list, mirroring the
 /// hardware. Returns 7 bits, MSB-first.
@@ -78,8 +80,14 @@ List<int> _wordBitsMsb(int word) => [
 /// The 4-bit-wide DAT line groups for one 32-bit word: a start group (0), then
 /// 8 data nibbles (byte 0 first, high nibble first, DAT3 = bit 7), then 16
 /// per-lane CRC16 groups. Each value is the 4-bit vector on DAT[3:0].
-List<int> _fourBitStream(int word) {
-  final bytes = [for (var i = 0; i < 4; i++) (word >> (i * 8)) & 0xFF];
+List<int> _fourBitStream(int word) => _fourBitWords([word]);
+
+/// One 4-bit block of [words]: start, data, per-lane CRC16, end.
+List<int> _fourBitWords(List<int> words) {
+  final bytes = [
+    for (final word in words)
+      for (var i = 0; i < 4; i++) (word >> (i * 8)) & 0xFF,
+  ];
   final data = <int>[];
   for (final b in bytes) {
     data.add((b >> 4) & 0xF);
@@ -144,6 +152,17 @@ void main() {
   });
 
   group('HarborSdioController', () {
+    test('rxFifoDepth must be a power of two, at least 2', () {
+      for (final depth in [0, 1, 12]) {
+        expect(
+          () => HarborSdioController(baseAddress: 0, rxFifoDepth: depth),
+          throwsA(
+            isA<ArgumentError>().having((e) => e.name, 'name', 'rxFifoDepth'),
+          ),
+        );
+      }
+    });
+
     test('creates with SD config', () {
       final sdio = HarborSdioController(baseAddress: 0x60000000);
       expect(sdio.bus, isNotNull);
@@ -159,6 +178,26 @@ void main() {
         config: const HarborSdioConfig.emmc(),
       );
       expect(emmc.dtNode.compatible.first, equals('harbor,sdhci-emmc'));
+    });
+
+    test('the busy timeout is one second at the maximum SD clock', () {
+      final sd = HarborSdioController(
+        baseAddress: 0x60000000,
+        config: const HarborSdioConfig.sd(),
+      );
+      expect(sd.writeBusyTimeout, equals(50000000));
+      expect(
+        sd.dtNode.properties['harbor,busy-timeout-clocks'],
+        equals(50000000),
+      );
+      final custom = HarborSdioController(
+        baseAddress: 0x60000000,
+        writeBusyTimeout: 1000,
+      );
+      expect(
+        custom.dtNode.properties['harbor,busy-timeout-clocks'],
+        equals(1000),
+      );
     });
 
     test('bus width in DT', () {
@@ -177,6 +216,18 @@ void main() {
       );
       expect(a.definitionName, isNot(equals(b.definitionName)));
     });
+
+    test('active-low card detect has a distinct definition name', () {
+      final activeHigh = HarborSdioController(baseAddress: 0x60000000);
+      final activeLow = HarborSdioController(
+        baseAddress: 0x60000000,
+        config: const HarborSdioConfig(cardDetectActiveLow: true),
+      );
+      expect(
+        activeHigh.definitionName,
+        isNot(equals(activeLow.definitionName)),
+      );
+    });
   });
 
   group('HarborSdioController CMD engine', () {
@@ -184,15 +235,19 @@ void main() {
     late Logic clk, reset, stb, we, adr, mosi;
     late Logic cmdIn, cmdOut, cmdOe, sdClk, irq;
     late Logic datIn, datOut, datOe;
+    late Logic cardDetectLine;
     late MasterTop top;
+    var cmdProbe = SdCmdProbe();
     late BeatMemory memory;
 
     // 32-bit word [i] of the ADMA memory.
     int mem(int i) => memory.readBytes(4 * i, 4);
 
+    // The frames these tests send carry no valid CRC7 or index, so the
+    // command skips those checks.
     Future<void> busWrite(int addr, int data) async {
       adr.inject(addr);
-      mosi.inject(data);
+      mosi.inject(addr == _cmd ? data | 0x3000 : data);
       we.inject(1);
       stb.inject(1);
       await clk.nextPosedge;
@@ -243,9 +298,12 @@ void main() {
       int ackDelay = 0,
       int fifoDepth = 16,
       int dmaDataWidth = 32,
+      HarborSdioConfig? config,
+      int cardDetectLevel = 0,
     }) async {
       sdio = HarborSdioController(
         baseAddress: 0x60000000,
+        config: config ?? const HarborSdioConfig.sd(),
         rxFifoDepth: fifoDepth,
         dmaDataWidth: dmaDataWidth,
       );
@@ -267,6 +325,7 @@ void main() {
       mosi = Logic(name: 'mosi', width: 32);
       cmdIn = Logic(name: 'cmd_in');
       datIn = Logic(name: 'dat_in', width: 4);
+      cardDetectLine = Logic(name: 'card_detect');
 
       top.input('clk').srcConnection! <= clk;
       top.input('reset').srcConnection! <= reset;
@@ -278,7 +337,7 @@ void main() {
       top.input('bus_SEL').srcConnection! <=
           Const(0xF, width: top.input('bus_SEL').width);
       top.input('sd_cmd_in').srcConnection! <= cmdIn;
-      top.input('sd_cd').srcConnection! <= Const(0);
+      top.input('sd_cd').srcConnection! <= cardDetectLine;
       top.input('sd_dat_in').srcConnection! <= datIn;
 
       // [ackDelay] holds every beat off for that many cycles, the way a real
@@ -304,6 +363,7 @@ void main() {
       mosi.inject(0);
       cmdIn.inject(1); // CMD line idles high
       datIn.inject(0);
+      cardDetectLine.inject(cardDetectLevel);
       memory.start();
       Simulator.setMaxSimTime(2000000);
       unawaited(Simulator.run());
@@ -320,6 +380,48 @@ void main() {
 
     tearDown(() async {
       await Simulator.reset();
+    });
+
+    test(
+      'card-detect STATUS bit preserves normal active-high default',
+      () async {
+        await setUpDut();
+        expect(await busRead(_status) & 1, equals(0));
+        cardDetectLine.inject(1);
+        expect(await busRead(_status) & 1, equals(1));
+        await Simulator.endSimulation();
+      },
+    );
+
+    test(
+      'active-low card-detect maps inserted-low to STATUS present',
+      () async {
+        await setUpDut(
+          config: const HarborSdioConfig(cardDetectActiveLow: true),
+          cardDetectLevel: 0,
+        );
+        expect(await busRead(_status) & 1, equals(1));
+        cardDetectLine.inject(1);
+        expect(await busRead(_status) & 1, equals(0));
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('a build with a fixed sample edge ignores CTRL[8] writes', () async {
+      await setUpDut(config: const HarborSdioConfig(sampleReadOnFall: true));
+      expect((await busRead(_ctrl)) & 0x100, equals(0x100));
+      await busWrite(_ctrl, 0x1);
+      expect((await busRead(_ctrl)) & 0x100, equals(0x100));
+      await Simulator.endSimulation();
+    });
+
+    test('a default build lets CTRL[8] be written', () async {
+      await setUpDut();
+      await busWrite(_ctrl, 0x101);
+      expect((await busRead(_ctrl)) & 0x100, equals(0x100));
+      await busWrite(_ctrl, 0x1);
+      expect((await busRead(_ctrl)) & 0x100, equals(0));
+      await Simulator.endSimulation();
     });
 
     test('serializes a command frame with a correct CRC7', () async {
@@ -380,7 +482,7 @@ void main() {
       var k = 0;
       for (var i = 0; i < 1200; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive &&
             !sending &&
@@ -396,6 +498,359 @@ void main() {
       expect(await busRead(_intStatus) & 0x01, equals(0x01)); // cmd-done
       expect(await busRead(_resp0), equals(payload));
       await Simulator.endSimulation();
+    });
+
+    // Sends [frame] on CMD after the host releases the line, one bit per SD
+    // period, and waits for the interrupt.
+    Future<void> respond(List<int> frame) async {
+      var sawDrive = false;
+      var k = 0;
+      for (var i = 0; i < 3000; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        if (sawDrive &&
+            !sending &&
+            sdClk.value.toInt() == 0 &&
+            k < frame.length) {
+          cmdIn.inject(frame[k]);
+          k++;
+        }
+        if (irq.value.toInt() == 1) break;
+      }
+      expect(k, equals(frame.length));
+      await busWrite(_intStatus, 0x1FF);
+    }
+
+    // Sends a command with no response and writes [clear] to INT_STATUS in
+    // the cycle that sets cmd-done. Returns INT_STATUS after it.
+    Future<int> clearAsCmdDoneSets(int clear) async {
+      await setUpDut();
+      Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+      await busWrite(_cmd, 0);
+      var hit = false;
+      for (var i = 0; i < 400 && !hit; i++) {
+        await clk.nextPosedge;
+        // cmd-done sets at the next edge: the end bit held its SD clock.
+        if (sig('cmd_state').value.toInt() == 4 &&
+            sig('sd_fall').value.toInt() == 1) {
+          adr.inject(_intStatus);
+          mosi.inject(clear);
+          we.inject(1);
+          stb.inject(1);
+          hit = true;
+        }
+      }
+      expect(hit, isTrue);
+      await clk.nextPosedge;
+      expect(sig('cmd_state').value.toInt(), 0);
+      stb.inject(0);
+      we.inject(0);
+      await clk.nextPosedge;
+      return busRead(_intStatus);
+    }
+
+    test('cmd-done set wins over its own clear in the same cycle', () async {
+      expect(await clearAsCmdDoneSets(0x01) & 0x01, 0x01);
+      await Simulator.endSimulation();
+    });
+
+    test('cmd-done set survives a clear of another bit in its cycle', () async {
+      expect(await clearAsCmdDoneSets(0x10) & 0x01, 0x01);
+      await Simulator.endSimulation();
+    });
+
+    // A PIO read of [words] through a 4-word FIFO that the CPU leaves full.
+    // With [popOnPush], the CPU reads DATA in the cycle of the next push.
+    // Returns the words the CPU reads and INT_STATUS.
+    Future<(List<int>, int)> pioFullRead(
+      List<int> words, {
+      required bool popOnPush,
+    }) async {
+      await setUpDut(fifoDepth: 4);
+      Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+      await busWrite(_blkSize, words.length * 4);
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      final stream = [..._resp48(0), ..._fourBitWords(words), 0xF];
+      var cardDone = false;
+      unawaited(() async {
+        var sawDrive = false;
+        var idx = 0;
+        while (idx < stream.length) {
+          await clk.nextPosedge;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
+          if (sending) sawDrive = true;
+          if (sawDrive && !sending && sdClk.value.toInt() == 0) {
+            if (idx < 48) {
+              cmdIn.inject(stream[idx]);
+            } else {
+              datIn.inject(stream[idx]);
+            }
+            idx++;
+          }
+        }
+        cardDone = true;
+      }());
+      while (sig('rx_fifo_count').value.toInt() < 4) {
+        await clk.nextPosedge;
+      }
+      final got = <int>[];
+      if (popOnPush) {
+        while (sig('rx_push').value.toInt() != 1) {
+          await clk.nextPosedge;
+        }
+        // DATA read in the push cycle.
+        adr.inject(_data);
+        we.inject(0);
+        stb.inject(1);
+        await clk.nextPosedge;
+        got.add(top.output('bus_DAT_MISO').value.toInt());
+        stb.inject(0);
+        await clk.nextPosedge;
+      } else {
+        while (sig('rx_push').value.toInt() != 1) {
+          await clk.nextPosedge;
+        }
+        await clk.nextPosedge;
+      }
+      while (!cardDone || sig('rx_fifo_count').value.toInt() > 0) {
+        if (sig('rx_fifo_count').value.toInt() > 0) {
+          got.add(await busRead(_data));
+        } else {
+          await clk.nextPosedge;
+        }
+      }
+      return (got, await busRead(_intStatus));
+    }
+
+    final pioWords = [for (var i = 0; i < 8; i++) 0x5A000000 + i * 0x10101];
+
+    test('a PIO pop in the push cycle of a full FIFO keeps the word', () async {
+      final (got, st) = await pioFullRead(pioWords, popOnPush: true);
+      expect(got, pioWords);
+      expect(st & 0x40, 0);
+      await Simulator.endSimulation();
+    });
+
+    test('a PIO push into a full FIFO with no pop flags an overrun', () async {
+      final (got, st) = await pioFullRead(pioWords, popOnPush: false);
+      expect(got, [...pioWords.take(4), ...pioWords.skip(5)]);
+      expect(st & 0x40, 0x40);
+      await Simulator.endSimulation();
+    });
+
+    test('a DMA command that times out leaves no ADMA work for PIO', () async {
+      await setUpDut();
+      Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+      await busWrite(_blkSize, 4);
+      await busWrite(_admaAddr, 0x40);
+      // A direct DMA read. The card never answers.
+      cmdIn.inject(1);
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
+      for (var i = 0; i < 6000; i++) {
+        await clk.nextPosedge;
+        if (irq.value.toInt() == 1) break;
+      }
+      expect(await busRead(_intStatus) & 0x10, 0x10);
+      await busWrite(_intStatus, 0x1FF);
+      expect(sig('adma_state').value.toInt(), 0);
+
+      // A PIO read of one word. No DMA request may go out.
+      var dmaReqs = 0;
+      final sub = clk.posedge.listen((_) {
+        if (sig('dma_req_valid').value.toInt() == 1) dmaReqs++;
+      });
+      const word = 0x600DF00D;
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      final stream = [..._resp48(0), ..._fourBitStream(word), 0xF];
+      var sawDrive = false;
+      var idx = 0;
+      for (var i = 0; i < 6000 && idx < stream.length; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        if (sawDrive && !sending && sdClk.value.toInt() == 0) {
+          if (idx < 48) {
+            cmdIn.inject(stream[idx]);
+          } else {
+            datIn.inject(stream[idx]);
+          }
+          idx++;
+        }
+      }
+      for (var i = 0; i < 50; i++) {
+        await clk.nextPosedge;
+      }
+      await sub.cancel();
+      expect(dmaReqs, 0);
+      expect(await busRead(_data), word);
+      await Simulator.endSimulation();
+    });
+
+    // Sends a short response and then [stream] on DAT, in the background.
+    // The future ends when the last group is out.
+    Future<void> card(List<int> stream, {int gap = 0}) async {
+      final all = [..._resp48(0), for (var i = 0; i < gap; i++) 0xF, ...stream];
+      var sawDrive = false;
+      var idx = 0;
+      while (idx < all.length) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        if (sawDrive && !sending && sdClk.value.toInt() == 0) {
+          if (idx < 48) {
+            cmdIn.inject(all[idx]);
+          } else {
+            datIn.inject(all[idx]);
+          }
+          idx++;
+        }
+      }
+    }
+
+    Future<void> cycles(int n) async {
+      for (var i = 0; i < n; i++) {
+        await clk.nextPosedge;
+      }
+    }
+
+    test(
+      'a DAT reset in a PIO read empties the ring for the next read',
+      () async {
+        await setUpDut(fifoDepth: 8);
+        Logic sig(String n) => sdio.signals.firstWhere((x) => x.name == n);
+        final first = [for (var i = 0; i < 8; i++) 0x11000000 + i];
+        await busWrite(_blkSize, 32);
+        await busWrite(_ctrl, 0x01 | (1 << 4));
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+        final c1 = card([..._fourBitWords(first), 0xF]);
+        while (sig('rx_fifo_count').value.toInt() < 5) {
+          await clk.nextPosedge;
+        }
+        for (var i = 0; i < 3; i++) {
+          expect(await busRead(_data), first[i]);
+        }
+        expect(sig('rx_fifo_rd').value.toInt(), isNot(0));
+        // DAT reset in the middle of the block.
+        await busWrite(_ctrl, 0x01 | (1 << 4) | (1 << 9));
+        expect(sig('rx_fifo_count').value.toInt(), 0);
+        expect(await busRead(_status) & (1 << 9), 0);
+        await c1;
+        datIn.inject(0xF);
+        await cycles(40);
+
+        final second = [0x22220000, 0x22221111];
+        await busWrite(_blkSize, 8);
+        await busWrite(_intEnable, 0x02);
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+        await card([..._fourBitWords(second), 0xF]);
+        for (var i = 0; i < 200 && irq.value.toInt() == 0; i++) {
+          await clk.nextPosedge;
+        }
+        expect(await busRead(_intStatus) & 0x0A, 0x02);
+        expect([await busRead(_data), await busRead(_data)], second);
+        expect(await busRead(_status) & (1 << 9), 0);
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('DATA_TIMEOUT 0 waits for the start bit with no timeout, and '
+        'STATUS[15:12] shows the DAT state', () async {
+      await setUpDut();
+      const word = 0xABCD1234;
+      await busWrite(0x78, 0);
+      await busWrite(_blkSize, 4);
+      await busWrite(_intEnable, 0x102);
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      datIn.inject(0xF);
+      expect((await busRead(_status) >> 12) & 0xF, 0);
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      // The card waits 3000 SD clocks before its start bit.
+      final c = card([..._fourBitStream(word), 0xF], gap: 3000);
+      await cycles(3000);
+      expect(irq.value.toInt(), 0);
+      expect((await busRead(_status) >> 12) & 0xF, 1); // block start hunt
+      await c;
+      for (var i = 0; i < 200 && irq.value.toInt() == 0; i++) {
+        await clk.nextPosedge;
+      }
+      expect(await busRead(_intStatus) & 0x10A, 0x02);
+      expect((await busRead(_status) >> 12) & 0xF, 0);
+      expect(await busRead(_data), word);
+      await Simulator.endSimulation();
+    });
+
+    test('RESP0-3 follow the type of the last response', () async {
+      await setUpDut();
+      const words = [0x11112223, 0x33334444, 0x55556666, 0x77778888];
+      // R2: start, tx, 111111, CID/CSD bits [127:0], end.
+      final r2 = [
+        0,
+        0,
+        ..._bitsMsb(0x3F, 6),
+        for (var i = 3; i >= 0; i--) ..._bitsMsb(words[i], 32),
+        1,
+      ];
+      Future<List<int>> resps() async => [
+        for (var i = 0; i < 4; i++) await busRead(_resp0 + 8 * i),
+      ];
+
+      await busWrite(_cmd, 2 | (2 << 6));
+      await respond(r2);
+      expect(await resps(), equals(words));
+      await busWrite(_cmd, 13 | (1 << 6));
+      await respond(_resp48(0x0BADCAFE));
+      expect(await resps(), equals([0x0BADCAFE, 0, 0, 0]));
+      await busWrite(_cmd, 2 | (2 << 6));
+      await respond(r2);
+      expect(await resps(), equals(words));
+      // A command with no response keeps the last one.
+      await busWrite(_cmd, 0);
+      for (var i = 0; i < 400; i++) {
+        await clk.nextPosedge;
+      }
+      expect(await resps(), equals(words));
+      await Simulator.endSimulation();
+    });
+
+    test('a card read times out after DATA_TIMEOUT SD clocks', () async {
+      // SD clocks from the response end bit to the timeout, per DATA_TIMEOUT.
+      final clocks = <int>[];
+      for (final timeout in [1, 2, 7, 20]) {
+        await setUpDut();
+        await busWrite(_intEnable, 0x100);
+        await busWrite(0x78, timeout);
+        await busWrite(_blkSize, 16);
+        datIn.inject(0xF);
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+        var sawDrive = false;
+        var k = 0;
+        var rises = -1;
+        var prev = sdClk.value.toInt();
+        final frame = _resp48(0);
+        for (var i = 0; i < 4000; i++) {
+          await clk.nextPosedge;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
+          if (sending) sawDrive = true;
+          final now = sdClk.value.toInt();
+          if (sawDrive && !sending && now == 0 && k < frame.length) {
+            cmdIn.inject(frame[k]);
+            k++;
+            if (k == frame.length) rises = 0;
+          }
+          if (rises >= 0 && prev == 0 && now == 1) rises++;
+          prev = now;
+          if (irq.value.toInt() == 1) break;
+        }
+        expect(await busRead(_intStatus) & 0x100, equals(0x100));
+        clocks.add(rises);
+        await Simulator.endSimulation();
+        await Simulator.reset();
+      }
+      // One SD clock more per step of DATA_TIMEOUT.
+      expect([for (final c in clocks) c - clocks[0]], equals([0, 1, 6, 19]));
     });
 
     test('reports a timeout when the card never responds', () async {
@@ -415,6 +870,145 @@ void main() {
       }
       expect(done, isTrue);
       expect(await busRead(_intStatus) & 0x10, equals(0x10)); // timeout bit
+      await Simulator.endSimulation();
+    });
+
+    test('discards a preloaded PIO word after response timeout', () async {
+      await setUpDut();
+      const staleWord = 0xdeadbeef;
+      const freshWord = 0x12345678;
+      await busWrite(_blkSize, 4);
+      await busWrite(_intEnable, 0x11); // command done / response timeout
+      // PIO software can preload DATA before it issues a write command.
+      await busWrite(_data, staleWord);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 24 | (1 << 6) | (1 << 8)); // CMD24, then no response
+      cmdIn.inject(1);
+
+      var timedOut = false;
+      for (var cycle = 0; cycle < 1000; cycle++) {
+        await clk.nextPosedge;
+        if (irq.value.toInt() == 1) {
+          timedOut = true;
+          break;
+        }
+      }
+      expect(timedOut, isTrue);
+      expect(await busRead(_intStatus) & 0x10, equals(0x10));
+      await busWrite(_intStatus, 0x10);
+
+      // A successful read leaves the abandoned PIO word in the write holding
+      // register unless timeout cleanup explicitly invalidates it.
+      await busWrite(_intEnable, 0x12); // data-done + command timeout
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      final readResponse = _resp48(0);
+      const readWord = 0xa5a5f00f;
+      final readStream = [
+        0,
+        ..._wordBitsMsb(readWord),
+        ..._crc16(_wordBitsMsb(readWord)),
+      ];
+      final readTotal = readResponse.length + readStream.length;
+      var sawReadCommand = false;
+      var readIndex = 0;
+      var previousLow = sdClk.value.toInt() == 0;
+      for (var cycle = 0; cycle < 6000; cycle++) {
+        await clk.nextPosedge;
+        final commandDriving = cmdProbe.sending(cmdOe, cmdOut);
+        if (commandDriving) sawReadCommand = true;
+        final low = sdClk.value.toInt() == 0;
+        if (sawReadCommand &&
+            !commandDriving &&
+            low &&
+            !previousLow &&
+            readIndex < readTotal) {
+          if (readIndex < readResponse.length) {
+            cmdIn.inject(readResponse[readIndex]);
+          } else {
+            datIn.inject(readStream[readIndex - readResponse.length]);
+          }
+          readIndex++;
+        }
+        previousLow = low;
+        if (irq.value.toInt() == 1) break;
+      }
+      expect(await busRead(_intStatus) & 0x02, equals(0x02));
+      expect(await busRead(_data), equals(readWord));
+      await busWrite(_intStatus, 0xff);
+
+      // Start the next PIO write without supplying its new word yet. There
+      // must be no DAT activity until fresh DATA arrives, even though the old
+      // word was valid before the timed-out command.
+      await busWrite(_cmdArg, 1);
+      await busWrite(_cmd, 24 | (1 << 6) | (1 << 8));
+      datIn.inject(1);
+      final response = _resp48(0);
+      var sawWriteCommand = false;
+      var responseIndex = 0;
+      var responseEndSeen = false;
+      var waitAfterResponse = 0;
+      var staleStarted = false;
+      previousLow = sdClk.value.toInt() == 0;
+      for (var cycle = 0; cycle < 1000 && waitAfterResponse < 8; cycle++) {
+        await clk.nextPosedge;
+        final commandDriving = cmdProbe.sending(cmdOe, cmdOut);
+        if (commandDriving) sawWriteCommand = true;
+        final low = sdClk.value.toInt() == 0;
+        final fall = previousLow == false && low;
+        final rise = previousLow && !low;
+        if (sawWriteCommand &&
+            !commandDriving &&
+            fall &&
+            responseIndex < response.length) {
+          cmdIn.inject(response[responseIndex++]);
+        }
+        if (rise && responseIndex == response.length) {
+          responseEndSeen = true;
+          waitAfterResponse++;
+        }
+        if (responseEndSeen && (datOe.value.toInt() & 1) == 1)
+          staleStarted = true;
+        previousLow = low;
+      }
+      expect(responseIndex, equals(response.length));
+      expect(
+        staleStarted,
+        isFalse,
+        reason: 'old DATA word started the new write',
+      );
+
+      // Supply the new PIO word, then verify the actual emitted start, payload
+      // and CRC all correspond to this transfer.
+      await busWrite(_data, freshWord);
+      final dataBits = _wordBitsMsb(freshWord);
+      // The controller drives the end bit after the CRC. Compare the start,
+      // payload, and CRC only.
+      final expectedWrite = [0, ...dataBits, ..._crc16(dataBits)];
+      const status = [0, 0, 1, 0, 1, 0, 1];
+      var statusIndex = 0;
+      var sawData = false;
+      final captured = <int>[];
+      var previousClk = sdClk.value.toInt();
+      for (var cycle = 0; cycle < 4000; cycle++) {
+        await clk.nextPosedge;
+        final dataDriving = (datOe.value.toInt() & 1) == 1;
+        if (dataDriving) sawData = true;
+        final currentClk = sdClk.value.toInt();
+        if (previousClk == 0 && currentClk == 1 && dataDriving) {
+          captured.add(datOut.value.toInt() & 1);
+        }
+        if (sawData &&
+            !dataDriving &&
+            currentClk == 0 &&
+            statusIndex < status.length) {
+          datIn.inject(status[statusIndex++]);
+        }
+        previousClk = currentClk;
+        if (irq.value.toInt() == 1) break;
+      }
+      expect(captured.take(expectedWrite.length), equals(expectedWrite));
+      expect(await busRead(_intStatus) & 0x20, equals(0));
       await Simulator.endSimulation();
     });
 
@@ -440,7 +1034,7 @@ void main() {
       var idx = 0;
       for (var i = 0; i < 6000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -459,6 +1053,53 @@ void main() {
       expect(status & 0x02, equals(0x02)); // data-done
       expect(status & 0x08, equals(0)); // no CRC error
       expect(await busRead(_data), equals(word));
+      await Simulator.endSimulation();
+    });
+
+    test('reset during RX discards uninitialized FIFO payload', () async {
+      await setUpDut();
+
+      await busWrite(_blkSize, 8); // two words; stop after the first arrives
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+
+      final resp = _resp48(0);
+      const word = 0x5aa5c33c;
+      final groups = _fourBitStream(word).take(9).toList();
+      final total = resp.length + groups.length;
+      var sawDrive = false;
+      var prevSdLow = sdClk.value.toInt() == 0;
+      var idx = 0;
+      for (var i = 0; i < 6000 && idx < total; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        final sdLow = sdClk.value.toInt() == 0;
+        if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
+          if (idx < resp.length) {
+            cmdIn.inject(resp[idx]);
+          } else {
+            datIn.inject(groups[idx - resp.length]);
+          }
+          idx++;
+        }
+        prevSdLow = sdLow;
+      }
+      expect(idx, equals(total), reason: 'first RX word was not delivered');
+      await clk.nextPosedge; // let the FIFO push settle
+
+      reset.inject(1);
+      await clk.nextPosedge;
+      reset.inject(0);
+      await clk.nextPosedge;
+      await busWrite(_clkDiv, 0);
+      await busWrite(_intEnable, 0x11);
+      await busWrite(_ctrl, 1);
+
+      // A fresh read command resets the valid count. Its empty DATA read must
+      // retain the reset-era value while FIFO payload flops remain unreset.
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      expect(await busRead(_data), equals(0));
       await Simulator.endSimulation();
     });
 
@@ -488,7 +1129,7 @@ void main() {
         var idx = 0;
         for (var i = 0; i < 6000; i++) {
           await clk.nextPosedge;
-          final sending = cmdOe.value.toInt() == 1;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
           if (sending) sawDrive = true;
           final sdLow = sdClk.value.toInt() == 0;
           if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -527,19 +1168,23 @@ void main() {
 
       final resp = _resp48(0);
       final dataBits = _wordBitsMsb(word);
-      // start + 32 data + 16 CRC (the end bit is driven with OE already low).
+      // start + 32 data + 16 CRC. The end bit follows and is not compared.
       final expected = [0, ...dataBits, ..._crc16(dataBits)];
-      // Card CRC status token (010 = accepted), then busy-low then busy-high.
-      const statusBusy = [0, 0, 1, 0, 0, 1];
+      // Card CRC status token (010 = accepted) and its end bit, then busy-low
+      // then busy-high.
+      const statusBusy = [0, 0, 1, 0, 1, 0, 1];
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
+      var sdRiseCount = 0;
+      var responseEndRise = -1;
+      var writeStartRise = -1;
       final captured = <int>[];
       var prevClk = sdClk.value.toInt();
       for (var i = 0; i < 8000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
-        final datDriving = datOe.value.toInt() == 1;
+        final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
         if (sawCmd &&
             !cmdSending &&
@@ -550,8 +1195,15 @@ void main() {
           ri++;
         }
         final c = sdClk.value.toInt();
-        if (prevClk == 0 && c == 1 && datDriving) {
-          captured.add(datOut.value.toInt() & 1);
+        if (prevClk == 0 && c == 1) {
+          sdRiseCount++;
+          if (ri == resp.length && responseEndRise < 0) {
+            responseEndRise = sdRiseCount;
+          }
+          if (datDriving) {
+            if (writeStartRise < 0) writeStartRise = sdRiseCount;
+            captured.add(datOut.value.toInt() & 1);
+          }
         }
         prevClk = c;
         if (sawDat &&
@@ -566,10 +1218,123 @@ void main() {
 
       expect(captured.length, greaterThanOrEqualTo(expected.length));
       expect(captured.sublist(0, expected.length), equals(expected));
+      expect(responseEndRise, greaterThan(0));
+      expect(writeStartRise, greaterThan(responseEndRise));
+      expect(writeStartRise - responseEndRise, greaterThanOrEqualTo(2));
       expect(si, equals(statusBusy.length)); // token + busy consumed
       final status = await busRead(_intStatus);
       expect(status & 0x02, equals(0x02)); // data-done
       expect(status & 0x20, equals(0)); // no write error (status accepted)
+      await Simulator.endSimulation();
+    });
+
+    test(
+      'DAT3 is held high and DAT0..2 are released outside a write',
+      () async {
+        await setUpDut();
+        await busWrite(_intEnable, 0x11);
+        for (var i = 0; i < 20; i++) {
+          await clk.nextPosedge;
+          expect(datOe.value.toInt(), equals(0x8));
+          expect(datOut.value.toInt() & 0x8, equals(0x8));
+        }
+        final diag = await busRead(_diag);
+        expect((diag >> 16) & 0xF, equals(0x8));
+        expect(diag & 0x2, equals(0x2));
+        expect(top.output('sd_diag').value.toInt() & 0xF0000, equals(0x80000));
+        // CMD0 keeps the same drive through the whole command.
+        await busWrite(_cmdArg, 0);
+        await busWrite(_cmd, 0);
+        for (var i = 0; i < 600; i++) {
+          await clk.nextPosedge;
+          expect(datOe.value.toInt(), equals(0x8));
+          expect(datOut.value.toInt() & 0x8, equals(0x8));
+        }
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('DAT3 is released in reset and held high once enabled', () async {
+      await setUpDut();
+      reset.inject(1);
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      expect(datOe.value.toInt(), equals(0));
+      reset.inject(0);
+      await clk.nextPosedge;
+      expect(datOe.value.toInt(), equals(0));
+      await busWrite(_ctrl, 0x1);
+      expect(datOe.value.toInt(), equals(0x8));
+      expect(datOut.value.toInt() & 0x8, equals(0x8));
+      await busWrite(_ctrl, 0x0);
+      expect(datOe.value.toInt(), equals(0));
+      await Simulator.endSimulation();
+    });
+
+    Future<void> startWrite1Bit() async {
+      await busWrite(_blkSize, 4);
+      await busWrite(_intEnable, 0x32);
+      await busWrite(_data, 0x11223344);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 24 | (1 << 6) | (1 << 8));
+      datIn.inject(1);
+      final resp = _resp48(0);
+      var sawCmd = false, ri = 0;
+      for (var i = 0; i < 4000; i++) {
+        await clk.nextPosedge;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
+        if (cmdSending) sawCmd = true;
+        if (sawCmd &&
+            !cmdSending &&
+            sdClk.value.toInt() == 0 &&
+            ri < resp.length) {
+          cmdIn.inject(resp[ri]);
+          ri++;
+        }
+        if ((datOe.value.toInt() & 1) == 1) return;
+      }
+      fail('the write never drove DAT0');
+    }
+
+    test('a 1-bit write keeps DAT3 high and DAT1, DAT2 released', () async {
+      await setUpDut();
+      await startWrite1Bit();
+      var driven = 0;
+      for (var i = 0; i < 400; i++) {
+        await clk.nextPosedge;
+        final oe = datOe.value.toInt();
+        expect(oe & 0x6, equals(0), reason: 'DAT1 and DAT2 stay released');
+        expect(oe & 0x8, equals(0x8), reason: 'DAT3 stays driven');
+        expect(datOut.value.toInt() & 0x8, equals(0x8));
+        if (oe & 1 == 1) driven++;
+      }
+      expect(driven, greaterThan(40));
+      await Simulator.endSimulation();
+    });
+
+    test('clearing enable in a write releases the DAT pads', () async {
+      await setUpDut();
+      await startWrite1Bit();
+      await busWrite(_ctrl, 0x0);
+      for (var i = 0; i < 20; i++) {
+        await clk.nextPosedge;
+        expect(datOe.value.toInt() & 0x7, equals(0));
+      }
+      final status = await busRead(_intStatus);
+      expect(status & 0x22, equals(0x22)); // write error and data-done
+      expect((await busRead(_status)) & 0x100, equals(0)); // not busy
+      await Simulator.endSimulation();
+    });
+
+    test('a DAT reset in a write releases the DAT pads', () async {
+      await setUpDut();
+      await startWrite1Bit();
+      await busWrite(_ctrl, 0x201);
+      for (var i = 0; i < 20; i++) {
+        await clk.nextPosedge;
+        expect(datOe.value.toInt(), equals(0x8));
+        expect(datOut.value.toInt() & 0x7, equals(0));
+      }
       await Simulator.endSimulation();
     });
 
@@ -595,9 +1360,9 @@ void main() {
         var sawCmd = false, sawDat = false, ri = 0, si = 0;
         for (var i = 0; i < 8000; i++) {
           await clk.nextPosedge;
-          final cmdSending = cmdOe.value.toInt() == 1;
+          final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
           if (cmdSending) sawCmd = true;
-          final datDriving = datOe.value.toInt() == 1;
+          final datDriving = (datOe.value.toInt() & 1) == 1;
           if (datDriving) sawDat = true;
           if (sawCmd &&
               !cmdSending &&
@@ -642,7 +1407,7 @@ void main() {
       var idx = 0;
       for (var i = 0; i < 6000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive && !sending && sdClk.value.toInt() == 0 && idx < total) {
           if (idx < resp.length) {
@@ -676,16 +1441,24 @@ void main() {
 
       final resp = _resp48(0);
       final expected = _fourBitStream(word); // start + data + CRC, end excluded
-      const statusBusy = [0, 0, 1, 0, 0, 1]; // status token on DAT0, then busy
+      const statusBusy = [
+        0,
+        0,
+        1,
+        0,
+        1,
+        0,
+        1,
+      ]; // status token on DAT0, then busy
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
       final captured = <int>[];
       var prevClk = sdClk.value.toInt();
       for (var i = 0; i < 8000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
-        final datDriving = datOe.value.toInt() == 1;
+        final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
         if (sawCmd &&
             !cmdSending &&
@@ -739,7 +1512,7 @@ void main() {
       var prevSdLow = sdClk.value.toInt() == 0;
       for (var i = 0; i < 6000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -777,16 +1550,16 @@ void main() {
       final resp = _resp48(0);
       final dataBits = _wordBitsMsb(word);
       final expected = [0, ...dataBits, ..._crc16(dataBits)];
-      const statusBusy = [0, 0, 1, 0, 0, 1];
+      const statusBusy = [0, 0, 1, 0, 1, 0, 1];
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
       final captured = <int>[];
       var prevClk = sdClk.value.toInt();
       for (var i = 0; i < 8000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
-        final datDriving = datOe.value.toInt() == 1;
+        final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
         if (sawCmd &&
             !cmdSending &&
@@ -833,7 +1606,7 @@ void main() {
       for (var i = 0; i < 40000; i++) {
         await clk.nextPosedge;
         cycles++;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         if (sawDrive && !sending && sdClk.value.toInt() == 0 && idx < total) {
           if (idx < resp.length) {
@@ -943,7 +1716,7 @@ void main() {
         var prevSdLow = sdClk.value.toInt() == 0;
         for (var i = 0; i < 200000; i++) {
           await clk.nextPosedge;
-          final sending = cmdOe.value.toInt() == 1;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
           if (sending) sawDrive = true;
           final sdLow = sdClk.value.toInt() == 0;
           if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -992,59 +1765,66 @@ void main() {
     // exactly the regime where an unguarded push wraps the write pointer over
     // unread entries and the transfer returns a mix of old and new words. Every
     // word must come back exactly once, in order, with no overrun reported.
-    test('an ADMA read is byte-stable when the FIFO is pressed full', () async {
-      // 11 distinct words through a 4-deep FIFO, memory acking far slower than
-      // the SD side fills, so the FIFO sits at its limit for most of the block.
-      final words = [for (var i = 0; i < 11; i++) 0x1000_0000 + i * 0x11111];
+    for (final depth in [2, 4, 8, 32]) {
+      test('an ADMA read is byte-stable when a $depth-word FIFO is pressed '
+          'full', () async {
+        // 11 distinct words through the FIFO, memory acking far slower than
+        // the SD side fills, so the FIFO sits at its limit for most of the block.
+        final words = [for (var i = 0; i < 11; i++) 0x1000_0000 + i * 0x11111];
 
-      // Descriptor at word 0/1; the buffer is word 5 (byte 0x14), so 11 words
-      // land in 5..15 without running off the 16-word model.
-      await setUpDut(
-        dmaMem: [0x14, 0x80000000 | (11 * 4)],
-        ackDelay: 150,
-        fifoDepth: 4,
-      );
-      await busWrite(_blkSize, words.length * 4);
-      await busWrite(_intEnable, 0x12);
-      await busWrite(_admaAddr, 0x14);
-      await busWrite(_cmdArg, 0);
-      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
+        // Descriptor at word 0/1; the buffer is word 5 (byte 0x14), so 11 words
+        // land in 5..15 without running off the 16-word model.
+        await setUpDut(
+          dmaMem: [0x14, 0x80000000 | (11 * 4)],
+          ackDelay: 150,
+          fifoDepth: depth,
+        );
+        await busWrite(_blkSize, words.length * 4);
+        await busWrite(_intEnable, 0x12);
+        await busWrite(_admaAddr, 0x14);
+        await busWrite(_cmdArg, 0);
+        await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 10));
 
-      final resp = _resp48(0);
-      final dataBits = [for (final w in words) ..._wordBitsMsb(w)];
-      final datStream = [0, ...dataBits, ..._crc16(dataBits)];
-      final total = resp.length + datStream.length;
+        final resp = _resp48(0);
+        final dataBits = [for (final w in words) ..._wordBitsMsb(w)];
+        final datStream = [0, ...dataBits, ..._crc16(dataBits)];
+        final total = resp.length + datStream.length;
 
-      var sawDrive = false, idx = 0;
-      var prevSdLow = sdClk.value.toInt() == 0;
-      for (var i = 0; i < 200000; i++) {
-        await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
-        if (sending) sawDrive = true;
-        final sdLow = sdClk.value.toInt() == 0;
-        if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
-          if (idx < resp.length) {
-            cmdIn.inject(resp[idx]);
-          } else {
-            datIn.inject(datStream[idx - resp.length]);
+        var sawDrive = false, idx = 0;
+        var prevSdLow = sdClk.value.toInt() == 0;
+        for (var i = 0; i < 200000; i++) {
+          await clk.nextPosedge;
+          final sending = cmdProbe.sending(cmdOe, cmdOut);
+          if (sending) sawDrive = true;
+          final sdLow = sdClk.value.toInt() == 0;
+          if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
+            if (idx < resp.length) {
+              cmdIn.inject(resp[idx]);
+            } else {
+              datIn.inject(datStream[idx - resp.length]);
+            }
+            idx++;
           }
-          idx++;
+          prevSdLow = sdLow;
+          if (irq.value.toInt() == 1) break;
         }
-        prevSdLow = sdLow;
-        if (irq.value.toInt() == 1) break;
-      }
 
-      final status = await busRead(_intStatus);
-      expect(status & 0x02, equals(0x02)); // data-done
-      expect(status & 0x08, equals(0)); // no CRC error
-      expect(status & 0x40, equals(0), reason: 'RX FIFO overran');
-      // Every word landed exactly once and in order. A wrapped write pointer
-      // shows up here as a repeated or skipped word, not as a CRC error.
-      for (var i = 0; i < words.length; i++) {
-        expect(mem(5 + i), equals(words[i]), reason: 'word $i came back wrong');
-      }
-      await Simulator.endSimulation();
-    });
+        final status = await busRead(_intStatus);
+        expect(status & 0x02, equals(0x02)); // data-done
+        expect(status & 0x08, equals(0)); // no CRC error
+        expect(status & 0x40, equals(0), reason: 'RX FIFO overran');
+        // Every word landed exactly once and in order. A wrapped write pointer
+        // shows up here as a repeated or skipped word, not as a CRC error.
+        for (var i = 0; i < words.length; i++) {
+          expect(
+            mem(5 + i),
+            equals(words[i]),
+            reason: 'word $i came back wrong',
+          );
+        }
+        await Simulator.endSimulation();
+      });
+    }
 
     /// Runs one ADMA card-read of [words] and returns how many memory beats and
     /// full-width beats reached the memory.
@@ -1060,7 +1840,7 @@ void main() {
       var prevSdLow = sdClk.value.toInt() == 0;
       for (var i = 0; i < 200000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1240,7 +2020,7 @@ void main() {
       var prevSdLow = sdClk.value.toInt() == 0;
       for (var i = 0; i < 40000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1323,16 +2103,16 @@ void main() {
       final resp = _resp48(0);
       final dataBits = [..._wordBitsMsb(w0), ..._wordBitsMsb(w1)];
       final expected = [0, ...dataBits, ..._crc16(dataBits)];
-      const statusBusy = [0, 0, 1, 0, 0, 1];
+      const statusBusy = [0, 0, 1, 0, 1, 0, 1];
 
       var sawCmd = false, sawDat = false, ri = 0, si = 0;
       final captured = <int>[];
       var prevClk = sdClk.value.toInt();
       for (var i = 0; i < 12000; i++) {
         await clk.nextPosedge;
-        final cmdSending = cmdOe.value.toInt() == 1;
+        final cmdSending = cmdProbe.sending(cmdOe, cmdOut);
         if (cmdSending) sawCmd = true;
-        final datDriving = datOe.value.toInt() == 1;
+        final datDriving = (datOe.value.toInt() & 1) == 1;
         if (datDriving) sawDat = true;
         if (sawCmd &&
             !cmdSending &&
@@ -1390,7 +2170,7 @@ void main() {
         target: spartan7,
       );
       await sdio.build();
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, contains('IDELAYE2')); // input-delay tuning tap
       expect(sv, isNot(contains('DELAYG'))); // no Lattice primitive
       expect(sv, isNot(contains('IDDR'))); // SDR104 is not DDR
@@ -1403,7 +2183,7 @@ void main() {
         target: ecp5,
       );
       await sdio.build();
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, contains('DELAYG'));
       expect(sv, isNot(contains('IDELAYE2')));
     });
@@ -1415,7 +2195,7 @@ void main() {
         target: spartan7,
       );
       await sdio.build();
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, contains('IDELAYE2'));
       expect(sv, contains('IDDR')); // DDR capture gearing
     });
@@ -1427,7 +2207,7 @@ void main() {
         target: spartan7,
       );
       await sdio.build();
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, isNot(contains('IDELAYE2')));
       expect(sv, isNot(contains('IDDR')));
     });
@@ -1456,7 +2236,7 @@ void main() {
       // The ADMA master is a Wishbone memory master interface.
       expect(() => sdio.interface('dma'), returnsNormally);
 
-      final sv = sdio.generateSynth();
+      final sv = sdio.dumpSystemVerilog();
       expect(sv, contains('inout wire sd_cmd')); // bidirectional pad
       expect(sv, contains('inout wire sd_dat0')); // per-lane pads
       expect(sv, contains('inout wire sd_dat3'));
@@ -1527,6 +2307,8 @@ void main() {
       await sdio.build();
 
       final cmdOe = sdio.output('sd_cmd_oe');
+      final cmdOut = sdio.output('sd_cmd_out');
+      final cmdProbe = SdCmdProbe();
       final sdClk = sdio.output('sd_clk');
       final irq = sdio.output('interrupt');
 
@@ -1586,7 +2368,8 @@ void main() {
       await busWrite(_intEnable, 0x12);
       await busWrite(_cmdArg, 0);
       // index 17, short response, data present, read direction.
-      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      // The canned response has no valid CRC7 or index, so skip both checks.
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9) | (3 << 12));
 
       final resp = _resp48(0);
       final dataBits = [..._wordBitsMsb(wordA), ..._wordBitsMsb(wordB)];
@@ -1598,7 +2381,7 @@ void main() {
       var idx = 0;
       for (var i = 0; i < 10000; i++) {
         await clk.nextPosedge;
-        final sending = cmdOe.value.toInt() == 1;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
         if (sending) sawDrive = true;
         final sdLow = sdClk.value.toInt() == 0;
         if (sawDrive && !sending && sdLow && !prevSdLow && idx < total) {
@@ -1715,6 +2498,19 @@ void _registerTests(HarborFabricKind kind) {
         await Simulator.endSimulation();
       },
     );
+
+    test('empty card-read DATA returns zero after reset', () async {
+      await setUpDut();
+
+      // Start a card-read command without delivering any DAT bits. DATA is
+      // invalid while the RX count is zero; keep the reset-era zero value
+      // observable even though the FIFO payload flops are not reset.
+      await wr(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      expect((await rd(_status) >> 9) & 1, equals(0));
+      expect(await rd(_data), equals(0));
+
+      await Simulator.endSimulation();
+    });
 
     test('a write with no byte selected changes nothing', () async {
       await setUpDut();

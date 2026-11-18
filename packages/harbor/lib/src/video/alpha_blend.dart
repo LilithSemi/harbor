@@ -84,7 +84,7 @@ class HarborAlphaBlend extends Module {
       final pri2 = reg(reg(pri, '${n}_pri_s1'), '${n}_pri_s2');
       // Stage 3: the sum plus one half. It is from 128 to 65153.
       final pri255 =
-          [pri2, Const(0, width: 8)].swizzle().zeroExtend(18) -
+          [pri2, Const(0, width: 8)].concat().zeroExtend(18) -
           pri2.zeroExtend(18);
       final s = reg(
         (p + pri255 + Const(128, width: 18)).getRange(0, 17),

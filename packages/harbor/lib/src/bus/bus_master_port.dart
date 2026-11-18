@@ -418,7 +418,7 @@ class BusMasterPort {
     tl.aOpcode <=
         mux(
           we,
-          mux(
+          mux<Logic>(
             sel.and(),
             Const(TileLinkAOpcode.putFullData.value, width: 3),
             Const(TileLinkAOpcode.putPartialData.value, width: 3),

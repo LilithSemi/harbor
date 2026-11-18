@@ -3017,7 +3017,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
     Logic packCdf(List<int> icdf) => [
       for (var s = maxSyms - 1; s >= 0; s--)
         Const(s < icdf.length ? icdf[s] : 0, width: 16),
-    ].swizzle();
+    ].concat();
     Logic romSel(List<int> table, Logic idx, int w) {
       Logic v = Const(table.last, width: w);
       for (var i = table.length - 2; i >= 0; i--) {
@@ -3096,7 +3096,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 
@@ -3789,7 +3789,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
         : Const(0);
     // eob derived values (coeffPrefix).
     final class2d = classReg.eq(Const(0, width: 2));
-    final eobPtDecCtx = mux(
+    final eobPtDecCtx = mux<Logic>(
       class2d,
       Const(cEobPt2d, width: cw),
       Const(cEobPt1d, width: cw),
@@ -3829,7 +3829,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
             : cIdx.zeroExtend(ccScanW));
     cc.input('tx_class').srcConnection! <= classReg;
     cc.input('levels').srcConnection! <=
-        [for (var i = bufLen - 1; i >= 0; i--) levels[i]].swizzle();
+        [for (var i = bufLen - 1; i >= 0; i--) levels[i]].concat();
     final baseEobCtx = cc.output('base_eob_ctx');
     final base2dCtx = cc.output('base_ctx_2d');
     final baseGenCtx = cc.output('base_ctx_gen');
@@ -3851,7 +3851,11 @@ class HarborKeyframeModeWalk extends BridgeModule {
     );
     final nonEob1Base = mux(class2dc, base2dPath, baseFlatFor(baseGenCtx));
     final baseFlat = mux(isEobMinus1, baseEobFlat(), nonEob1Base);
-    final baseNsyms = mux(isEobMinus1, Const(3, width: 5), Const(4, width: 5));
+    final baseNsyms = mux<Logic>(
+      isEobMinus1,
+      Const(3, width: 5),
+      Const(4, width: 5),
+    );
     final br2dPath = mux(
       isC0c,
       brGenCtx.zeroExtend(cw),
@@ -3883,7 +3887,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
       return mux(
         bits.eq(Const(1, width: 2)),
         Const(7, width: 3), // -1
-        mux(
+        mux<Logic>(
           bits.eq(Const(2, width: 2)),
           Const(1, width: 3),
           Const(0, width: 3),
@@ -3907,7 +3911,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
       return mux(
         bits.eq(Const(1, width: 2)),
         Const(0x1f, width: 5), // -1
-        mux(
+        mux<Logic>(
           bits.eq(Const(2, width: 2)),
           Const(1, width: 5),
           Const(0, width: 5),
@@ -3931,7 +3935,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
     final dcSignCtxV = mux(
       dcSignSum[4],
       Const(1, width: 2), // sum < 0 -> ctx 1
-      mux(
+      mux<Logic>(
         dcSignSum.eq(Const(0, width: 5)),
         Const(0, width: 2),
         Const(2, width: 2),
@@ -3982,7 +3986,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
       final cSignV = mux(
         cSum[2],
         Const(1, width: 2),
-        mux(
+        mux<Logic>(
           cSum.eq(Const(0, width: 3)),
           Const(0, width: 2),
           Const(2, width: 2),
@@ -4046,7 +4050,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
       final cSign8 = mux(
         posN.gt(negN),
         Const(2, width: 2),
-        mux(posN.eq(negN), Const(0, width: 2), Const(1, width: 2)),
+        mux<Logic>(posN.eq(negN), Const(0, width: 2), Const(1, width: 2)),
       );
       chromaDcSign8Ctx = (Const(cDcSignC0, width: cw) + cSign8.zeroExtend(cw))
           .getRange(0, cw);
@@ -4087,7 +4091,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                 mux(
                   eb.eq(Const(17, width: 5)),
                   Const(4, width: 3),
-                  mux(
+                  mux<Logic>(
                     eb.eq(Const(16, width: 5)),
                     Const(5, width: 3),
                     Const(0, width: 3),
@@ -4104,13 +4108,13 @@ class HarborKeyframeModeWalk extends BridgeModule {
       final maxW = mux(
         isKc(2) | isKc(4),
         Const(16, width: 7),
-        mux(isKc(1) | isKc(5), Const(4, width: 7), Const(8, width: 7)),
+        mux<Logic>(isKc(1) | isKc(5), Const(4, width: 7), Const(8, width: 7)),
       );
       // height: k0=4 k1=8 k2=8 k3=16 k4=4 k5=16
       final maxH = mux(
         isKc(3) | isKc(5),
         Const(16, width: 7),
-        mux(isKc(1) | isKc(2), Const(8, width: 7), Const(4, width: 7)),
+        mux<Logic>(isKc(1) | isKc(2), Const(8, width: 7), Const(4, width: 7)),
       );
       final aTx = mux(lAvailU, selList(aboveTxfm, aAbs(ec2)), maxW);
       final lTx = mux(lAvailL, selList(leftTxfm, er), maxH);
@@ -4164,7 +4168,11 @@ class HarborKeyframeModeWalk extends BridgeModule {
     final leafIs64 = tx32 ? eb.eq(Const(12, width: 5)) : Const(0);
     Logic? tx32Ctx;
     if (tx32) {
-      final thr = mux(leafIs64, Const(64, width: 7), Const(32, width: 7));
+      final thr = mux<Logic>(
+        leafIs64,
+        Const(64, width: 7),
+        Const(32, width: 7),
+      );
       final aTx = mux(
         lAvailU,
         selList(aboveTxfm, aAbs(ec2)),
@@ -4231,7 +4239,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
       final dcCtxS = mux(
         dcSumS[2],
         Const(1, width: 2),
-        mux(
+        mux<Logic>(
           dcSumS.eq(Const(0, width: 3)),
           Const(0, width: 2),
           Const(2, width: 2),
@@ -4287,7 +4295,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
       final dcCtx16 = mux(
         dcSum16[4],
         Const(1, width: 2),
-        mux(
+        mux<Logic>(
           dcSum16.eq(Const(0, width: 5)),
           Const(0, width: 2),
           Const(2, width: 2),
@@ -4329,7 +4337,11 @@ class HarborKeyframeModeWalk extends BridgeModule {
       Logic divBy3(Logic v) => mux(
         v.gte(Const(6, width: 5)),
         Const(2, width: 5),
-        mux(v.gte(Const(3, width: 5)), Const(1, width: 5), Const(0, width: 5)),
+        mux<Logic>(
+          v.gte(Const(3, width: 5)),
+          Const(1, width: 5),
+          Const(0, width: 5),
+        ),
       ).getRange(0, 5);
       final signU = divBy3(jsP1);
       final signV = (jsP1 - (signU * Const(3, width: 5)).getRange(0, 5))
@@ -4418,7 +4430,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
               : cIdx.zeroExtend(cc8ScanW));
       cc8.input('tx_class').srcConnection! <= classReg;
       cc8.input('levels').srcConnection! <=
-          [for (var i = bufLen8 - 1; i >= 0; i--) levels8[i]].swizzle();
+          [for (var i = bufLen8 - 1; i >= 0; i--) levels8[i]].concat();
       final baseEobCtx8 = cc8.output('base_eob_ctx');
       final base2dCtx8 = cc8.output('base_ctx_2d');
       final baseGenCtx8 = cc8.output('base_ctx_gen');
@@ -4480,7 +4492,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                 .getRange(0, cw);
       }
       // eob_pt-64 ctx (2D vs 1D) and eob_extra-8 ctx.
-      eobPt8Ctx = mux(
+      eobPt8Ctx = mux<Logic>(
         class2d8,
         Const(cEobPt8_2d, width: cw),
         Const(cEobPt8_1d, width: cw),
@@ -4550,7 +4562,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
               : cIdx.zeroExtend(cc16ScanW));
       cc16.input('tx_class').srcConnection! <= Const(0, width: 2); // 2D
       cc16.input('levels').srcConnection! <=
-          [for (var i = bufLen16 - 1; i >= 0; i--) levels16[i]].swizzle();
+          [for (var i = bufLen16 - 1; i >= 0; i--) levels16[i]].concat();
       final baseEobCtx16 = cc16.output('base_eob_ctx');
       final base2dCtx16 = cc16.output('base_ctx_2d');
       final baseGenCtx16 = cc16.output('base_ctx_gen');
@@ -4653,7 +4665,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
               : cIdx.zeroExtend(cc32ScanW));
       cc32.input('tx_class').srcConnection! <= Const(0, width: 2); // 2D
       cc32.input('levels').srcConnection! <=
-          [for (var i = bufLen32 - 1; i >= 0; i--) levels32[i]].swizzle();
+          [for (var i = bufLen32 - 1; i >= 0; i--) levels32[i]].concat();
       final baseEobCtx32 = cc32.output('base_eob_ctx');
       final base2dCtx32 = cc32.output('base_ctx_2d');
       final baseGenCtx32 = cc32.output('base_ctx_gen');
@@ -4662,22 +4674,22 @@ class HarborKeyframeModeWalk extends BridgeModule {
       final br2dCtx32 = cc32.output('br_ctx_2d');
       // CDF bank base per leaf size (32x32 txsCtx=3 vs 64x64 txsCtx=4), br is
       // shared (group 3), eob_pt is shared (1024-bin).
-      final baseBank = mux(
+      final baseBank = mux<Logic>(
         leafIs64,
         Const(cBase64_0, width: cw),
         Const(cBase32_0, width: cw),
       );
-      final baseEobBank = mux(
+      final baseEobBank = mux<Logic>(
         leafIs64,
         Const(cBaseEob64_0, width: cw),
         Const(cBaseEob32_0, width: cw),
       );
-      final eobExtraBank = mux(
+      final eobExtraBank = mux<Logic>(
         leafIs64,
         Const(cEobExtra64_0, width: cw),
         Const(cEobExtra32_0, width: cw),
       );
-      final txbBank = mux(
+      final txbBank = mux<Logic>(
         leafIs64,
         Const(cTxb64, width: cw),
         Const(cTxb32, width: cw),
@@ -4727,7 +4739,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
       deq32.input('sign').srcConnection! <= signReg;
       // av1_get_tx_scale: 32x32 area 1024 -> 1, 64x64 area 4096 -> 2.
       deq32.input('shift').srcConnection! <=
-          mux(leafIs64, Const(2, width: 2), Const(1, width: 2));
+          mux<Logic>(leafIs64, Const(2, width: 2), Const(1, width: 2));
       dqCoeff32b = deq32.output('dq_coeff');
     }
 
@@ -4785,7 +4797,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
           (scW <= cidxW ? cIdx.getRange(0, scW) : cIdx.zeroExtend(scW));
       ccC422.input('tx_class').srcConnection! <= Const(0, width: 2); // 2D
       ccC422.input('levels').srcConnection! <=
-          [for (var i = bufLenRectB - 1; i >= 0; i--) levels8x16[i]].swizzle();
+          [for (var i = bufLenRectB - 1; i >= 0; i--) levels8x16[i]].concat();
       final beC = ccC422.output('base_eob_ctx');
       final b2C = ccC422.output('base_ctx_2d');
       final bgC = ccC422.output('base_ctx_gen');
@@ -4885,7 +4897,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
             (sw <= cidxW ? cIdx.getRange(0, sw) : cIdx.zeroExtend(sw));
         cc.input('tx_class').srcConnection! <= classReg;
         cc.input('levels').srcConnection! <=
-            [for (var i = lv.length - 1; i >= 0; i--) lv[i]].swizzle();
+            [for (var i = lv.length - 1; i >= 0; i--) lv[i]].concat();
         return cc;
       }
 
@@ -4918,27 +4930,27 @@ class HarborKeyframeModeWalk extends BridgeModule {
       final br2dCtx32 = ccSel('br_ctx_2d');
       final brGenCtx32 = ccSel('br_ctx_gen');
       // bank bases: txsCtx=1 (8x8 slice) or txsCtx=2 (16x16 slice).
-      final baseBank = mux(
+      final baseBank = mux<Logic>(
         kindBig,
         Const(cBase16_0, width: cw),
         Const(cBase8_0, width: cw),
       );
-      final brBank = mux(
+      final brBank = mux<Logic>(
         kindBig,
         Const(cBr16_0, width: cw),
         Const(cBr8_0, width: cw),
       );
-      final baseEobBank = mux(
+      final baseEobBank = mux<Logic>(
         kindBig,
         Const(cBaseEob16_0, width: cw),
         Const(cBaseEob8_0, width: cw),
       );
-      final eobExtraBank = mux(
+      final eobExtraBank = mux<Logic>(
         kindBig,
         Const(cEobExtra16_0, width: cw),
         Const(cEobExtra8_0, width: cw),
       );
-      final txbBank = mux(
+      final txbBank = mux<Logic>(
         kindBig,
         Const(cTxb16, width: cw),
         Const(cTxb8, width: cw),
@@ -4972,17 +4984,17 @@ class HarborKeyframeModeWalk extends BridgeModule {
       br32Flat = (brBank + brSubCtx32).getRange(0, cw);
       // eob_pt: 16x8/8x16 -> eob_pt-128, 16x4/4x16 -> eob_pt-64 (cEobPt8),
       // 8x4/4x8 -> eob_pt-32.
-      final eobPt64 = mux(
+      final eobPt64 = mux<Logic>(
         class2d32,
         Const(cEobPt8_2d, width: cw),
         Const(cEobPt8_1d, width: cw),
       );
-      final eobPt128 = mux(
+      final eobPt128 = mux<Logic>(
         class2d32,
         Const(cEobPt128_2d, width: cw),
         Const(cEobPt128_1d, width: cw),
       );
-      final eobPt32 = mux(
+      final eobPt32 = mux<Logic>(
         class2d32,
         Const(cEobPt32_2d, width: cw),
         Const(cEobPt32_1d, width: cw),
@@ -5055,81 +5067,77 @@ class HarborKeyframeModeWalk extends BridgeModule {
     output('sym_count') <= symCount;
     output('chk') <= chk;
     output('above_ctx') <=
-        [for (var i = ctxN - 1; i >= 0; i--) aboveCtx[i]].swizzle();
+        [for (var i = ctxN - 1; i >= 0; i--) aboveCtx[i]].concat();
     output('left_ctx') <=
-        [for (var i = ctxN - 1; i >= 0; i--) leftCtx[i]].swizzle();
+        [for (var i = ctxN - 1; i >= 0; i--) leftCtx[i]].concat();
     output('above_skip') <=
-        [for (var i = ctxN - 1; i >= 0; i--) aboveSkip[i]].swizzle();
+        [for (var i = ctxN - 1; i >= 0; i--) aboveSkip[i]].concat();
     output('above_ymode') <=
-        [for (var i = ctxN - 1; i >= 0; i--) aboveYm[i]].swizzle();
+        [for (var i = ctxN - 1; i >= 0; i--) aboveYm[i]].concat();
     if (coeffPrefix) {
       output('leaf_ymodes') <=
-          [for (var i = maxLeafOut - 1; i >= 0; i--) ymodeOut[i]].swizzle();
+          [for (var i = maxLeafOut - 1; i >= 0; i--) ymodeOut[i]].concat();
       output('leaf_angles') <=
-          [for (var i = maxLeafOut - 1; i >= 0; i--) angleOut[i]].swizzle();
+          [for (var i = maxLeafOut - 1; i >= 0; i--) angleOut[i]].concat();
       if (enableFilterIntra) {
         output('leaf_use_filter_intra') <=
-            [for (var i = maxLeafOut - 1; i >= 0; i--) fiUseOut[i]].swizzle();
+            [for (var i = maxLeafOut - 1; i >= 0; i--) fiUseOut[i]].concat();
         output('leaf_filter_intra_modes') <=
-            [for (var i = maxLeafOut - 1; i >= 0; i--) fiModeOut[i]].swizzle();
+            [for (var i = maxLeafOut - 1; i >= 0; i--) fiModeOut[i]].concat();
       }
       if (enablePalette) {
         output('leaf_has_pal_y') <=
-            [for (var i = maxLeafOut - 1; i >= 0; i--) palHasYOut[i]].swizzle();
+            [for (var i = maxLeafOut - 1; i >= 0; i--) palHasYOut[i]].concat();
         output('leaf_pal_y_size') <=
-            [
-              for (var i = maxLeafOut - 1; i >= 0; i--) palYSizeOut[i],
-            ].swizzle();
+            [for (var i = maxLeafOut - 1; i >= 0; i--) palYSizeOut[i]].concat();
         output('leaf_pal_y_colors') <=
             [
               for (var i = maxLeafOut * 8 - 1; i >= 0; i--) palYColOut[i],
-            ].swizzle();
+            ].concat();
         output('leaf_pal_y_mapchk') <=
             [
               for (var i = maxLeafOut - 1; i >= 0; i--) palYMapChkOut[i],
-            ].swizzle();
+            ].concat();
         if (chroma) {
           output('leaf_has_pal_uv') <=
               [
                 for (var i = maxLeafOut - 1; i >= 0; i--) palHasUVOut[i],
-              ].swizzle();
+              ].concat();
           output('leaf_pal_uv_size') <=
               [
                 for (var i = maxLeafOut - 1; i >= 0; i--) palUVSizeOut[i],
-              ].swizzle();
+              ].concat();
           output('leaf_pal_u_colors') <=
               [
                 for (var i = maxLeafOut * 8 - 1; i >= 0; i--) palUColOut[i],
-              ].swizzle();
+              ].concat();
           output('leaf_pal_v_colors') <=
               [
                 for (var i = maxLeafOut * 8 - 1; i >= 0; i--) palVColOut[i],
-              ].swizzle();
+              ].concat();
           output('leaf_pal_uv_mapchk') <=
               [
                 for (var i = maxLeafOut - 1; i >= 0; i--) palUVMapChkOut[i],
-              ].swizzle();
+              ].concat();
         }
       }
       output('leaf_txtypes') <=
-          [for (var i = maxLeafOut - 1; i >= 0; i--) txtypeOut[i]].swizzle();
+          [for (var i = maxLeafOut - 1; i >= 0; i--) txtypeOut[i]].concat();
       output('leaf_coeffs') <=
           [
             for (var i = maxLeafOut * leafCoeffN - 1; i >= 0; i--) coeffsOut[i],
-          ].swizzle();
+          ].concat();
       if (txLeaf) {
         output('leaf_log2size') <=
-            [for (var i = maxLeafOut - 1; i >= 0; i--) log2Out[i]].swizzle();
+            [for (var i = maxLeafOut - 1; i >= 0; i--) log2Out[i]].concat();
         output('leaf_rect_kinds') <=
-            [
-              for (var i = maxLeafOut - 1; i >= 0; i--) rectKindOut[i],
-            ].swizzle();
+            [for (var i = maxLeafOut - 1; i >= 0; i--) rectKindOut[i]].concat();
         output('leaf_tx_depth') <=
-            [for (var i = maxLeafOut - 1; i >= 0; i--) txDepthOut[i]].swizzle();
+            [for (var i = maxLeafOut - 1; i >= 0; i--) txDepthOut[i]].concat();
         // swizzle list index 0 = MSB, emit sub-block 3 down to 0 so sub-block s
         // lands at [s*4 +: 4].
         output('leaf_sub_txtypes') <=
-            [for (var i = 3; i >= 0; i--) subTxType[i]].swizzle();
+            [for (var i = 3; i >= 0; i--) subTxType[i]].concat();
       }
     }
     if (chroma) {
@@ -5137,27 +5145,27 @@ class HarborKeyframeModeWalk extends BridgeModule {
       output('leaf_cfl_alpha_idx') <= cflIdxReg;
       output('leaf_cfl_signs') <= cflSignsReg;
       output('leaf_u_coeffs') <=
-          [for (var i = chromaN - 1; i >= 0; i--) uCoeffsRam[i]].swizzle();
+          [for (var i = chromaN - 1; i >= 0; i--) uCoeffsRam[i]].concat();
       output('leaf_v_coeffs') <=
-          [for (var i = chromaN - 1; i >= 0; i--) vCoeffsRam[i]].swizzle();
+          [for (var i = chromaN - 1; i >= 0; i--) vCoeffsRam[i]].concat();
       output('leaf_luma_txtypes') <=
-          [for (var i = maxLeafOut - 1; i >= 0; i--) lumaTxOut[i]].swizzle();
+          [for (var i = maxLeafOut - 1; i >= 0; i--) lumaTxOut[i]].concat();
       output('leaf_uv_modes') <=
-          [for (var i = maxLeafOut - 1; i >= 0; i--) uvModeOut[i]].swizzle();
+          [for (var i = maxLeafOut - 1; i >= 0; i--) uvModeOut[i]].concat();
       output('leaf_uv_angles') <=
-          [for (var i = maxLeafOut - 1; i >= 0; i--) uvAngleOut[i]].swizzle();
+          [for (var i = maxLeafOut - 1; i >= 0; i--) uvAngleOut[i]].concat();
       output('leaf_cfl_alpha_idxs') <=
-          [for (var i = maxLeafOut - 1; i >= 0; i--) cflIdxOut[i]].swizzle();
+          [for (var i = maxLeafOut - 1; i >= 0; i--) cflIdxOut[i]].concat();
       output('leaf_cfl_signs_arr') <=
-          [for (var i = maxLeafOut - 1; i >= 0; i--) cflSignsOut[i]].swizzle();
+          [for (var i = maxLeafOut - 1; i >= 0; i--) cflSignsOut[i]].concat();
       output('leaf_u_coeffs_arr') <=
           [
             for (var i = maxLeafOut * chromaN - 1; i >= 0; i--) uCoeffsOut[i],
-          ].swizzle();
+          ].concat();
       output('leaf_v_coeffs_arr') <=
           [
             for (var i = maxLeafOut * chromaN - 1; i >= 0; i--) vCoeffsOut[i],
-          ].swizzle();
+          ].concat();
     }
 
     const sIdle = 0, sPreload = 1, sInit = 2, sPop = 3, sRead = 4, sReadCap = 5, sLeaf = 6, sSkipDec = 7, sSkipCap = 8, sYmDec = 9, sYmCap = 10, sAngChk = 11, sAngDec = 12, sAngCap = 13, sUpd = 14, sDone = 15, sTxbDec = 16, sTxbCap = 17, sExtTxDec = 18, sExtTxCap = 19, sEobPt = 20, sEobPtCap = 21, sExtra = 22, sExtraCap = 23, sByp = 24, sBypDec = 25, sBypCap = 26, sBaseDec = 27, sBaseCap = 28, sBrDec = 29, sBrCap = 30, sNext = 31, sPbCheck = 32, sPbSignLoad = 33, sPbSignDec = 34, sPbSignCap = 35, sPbGolChk = 36, sPbGolLeadLoad = 37, sPbGolLeadDec = 38, sPbGolLeadCap = 39, sPbGolReadLoad = 40, sPbGolReadDec = 41, sPbGolReadCap = 42, sPbDeq = 43, sPbNext = 44,
@@ -5238,7 +5246,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
       palUVSizeCtx = (Const(cPalUVSize0, width: cw) + palBctx.zeroExtend(cw))
           .getRange(0, cw);
       // cache merge: plane byte offset (Y=0, U=8) then dynamic byte select.
-      final off = mux(
+      final off = mux<Logic>(
         palPlane!.eq(Const(0, width: 2)),
         Const(0, width: 5),
         Const(8, width: 5),
@@ -5301,7 +5309,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
           mux(rrGt0, mapAt(abIdx), Const(8, width: 4));
       palTokCtx = palCtxMod.output('ctx');
       // full color-index CDF ctx: bank (Y/UV) + (n-2)*5 + wavefront ctx.
-      final colBank = mux(
+      final colBank = mux<Logic>(
         palTokPlane!.eq(Const(0, width: 1)),
         Const(cPalYColor0, width: cw),
         Const(cPalUVColor0, width: cw),
@@ -5471,7 +5479,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                 .getRange(0, cw),
                             mux(
                               leafIsRect,
-                              (mux(
+                              (mux<Logic>(
                                         leafRectCat1,
                                         Const(cTxSz16_0, width: cw),
                                         Const(cTxSz0, width: cw),
@@ -5483,7 +5491,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                           )
                         : mux(
                             leafIsRect,
-                            (mux(
+                            (mux<Logic>(
                                       leafRectCat1,
                                       Const(cTxSz16_0, width: cw),
                                       Const(cTxSz0, width: cw),
@@ -5493,7 +5501,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                             Const(cTxSz0, width: cw),
                           );
                     if (!tx32) return base16OrRect;
-                    final txszBank = mux(
+                    final txszBank = mux<Logic>(
                       leafIs64,
                       Const(cTxSz64_0, width: cw),
                       Const(cTxSz32_0, width: cw),
@@ -7759,7 +7767,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                       final c8 = mux(
                         sym.getRange(0, 4).eq(Const(2, width: 4)),
                         Const(2, width: 2),
-                        mux(
+                        mux<Logic>(
                           sym.getRange(0, 4).eq(Const(3, width: 4)),
                           Const(1, width: 2),
                           Const(0, width: 2),
@@ -8075,7 +8083,11 @@ class HarborKeyframeModeWalk extends BridgeModule {
                         mux(
                           pbLevelReg.eq(Const(0, width: 21)),
                           Const(0, width: 2),
-                          mux(signReg, Const(1, width: 2), Const(2, width: 2)),
+                          mux<Logic>(
+                            signReg,
+                            Const(1, width: 2),
+                            Const(2, width: 2),
+                          ),
                         ),
                   ],
                 ),
@@ -8536,7 +8548,11 @@ class HarborKeyframeModeWalk extends BridgeModule {
                     ? mux(
                         leafRect!,
                         txDepthReg!,
-                        mux(leafTx, Const(0, width: 2), Const(1, width: 2)),
+                        mux<Logic>(
+                          leafTx,
+                          Const(0, width: 2),
+                          Const(1, width: 2),
+                        ),
                       )
                     : Const(0, width: 2);
                 // A 16x16 depth-1 (four TX_8X8) leaf reports depth 1, leaf16SplitReg
@@ -8619,7 +8635,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                     ? [
                         for (var i = 7; i >= 0; i--) palColU[i],
                         for (var i = 7; i >= 0; i--) palColY[i],
-                      ].swizzle()
+                      ].concat()
                     : Const(0, width: 128);
                 return <Conditional>[
                   for (var k = 0; k < aboveCtxN; k++)
@@ -8677,7 +8693,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                     rectKindReg!.eq(Const(2, width: 3)) |
                                         rectKindReg.eq(Const(4, width: 3)),
                                     Const(16, width: 7),
-                                    mux(
+                                    mux<Logic>(
                                       rectKindReg.eq(Const(1, width: 3)) |
                                           rectKindReg.eq(Const(5, width: 3)),
                                       Const(4, width: 7),
@@ -8687,7 +8703,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                   tx32
                                       ? mux(
                                           leafTx32Reg!,
-                                          mux(
+                                          mux<Logic>(
                                             leafIs64,
                                             Const(64, width: 7),
                                             Const(32, width: 7),
@@ -8696,13 +8712,13 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                               ? mux(
                                                   leafTx16Reg!,
                                                   Const(16, width: 7),
-                                                  mux(
+                                                  mux<Logic>(
                                                     leafTx,
                                                     Const(8, width: 7),
                                                     Const(4, width: 7),
                                                   ),
                                                 )
-                                              : mux(
+                                              : mux<Logic>(
                                                   leafTx,
                                                   Const(8, width: 7),
                                                   Const(4, width: 7),
@@ -8712,13 +8728,13 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                       ? mux(
                                           leafTx16Reg!,
                                           Const(16, width: 7),
-                                          mux(
+                                          mux<Logic>(
                                             leafTx,
                                             Const(8, width: 7),
                                             Const(4, width: 7),
                                           ),
                                         )
-                                      : mux(
+                                      : mux<Logic>(
                                           leafTx,
                                           Const(8, width: 7),
                                           Const(4, width: 7),
@@ -8744,7 +8760,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                     rectKindReg!.eq(Const(3, width: 3)) |
                                         rectKindReg.eq(Const(5, width: 3)),
                                     Const(16, width: 7),
-                                    mux(
+                                    mux<Logic>(
                                       rectKindReg.eq(Const(1, width: 3)) |
                                           rectKindReg.eq(Const(2, width: 3)),
                                       Const(8, width: 7),
@@ -8754,7 +8770,7 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                   tx32
                                       ? mux(
                                           leafTx32Reg!,
-                                          mux(
+                                          mux<Logic>(
                                             leafIs64,
                                             Const(64, width: 7),
                                             Const(32, width: 7),
@@ -8763,13 +8779,13 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                               ? mux(
                                                   leafTx16Reg!,
                                                   Const(16, width: 7),
-                                                  mux(
+                                                  mux<Logic>(
                                                     leafTx,
                                                     Const(8, width: 7),
                                                     Const(4, width: 7),
                                                   ),
                                                 )
-                                              : mux(
+                                              : mux<Logic>(
                                                   leafTx,
                                                   Const(8, width: 7),
                                                   Const(4, width: 7),
@@ -8779,13 +8795,13 @@ class HarborKeyframeModeWalk extends BridgeModule {
                                       ? mux(
                                           leafTx16Reg!,
                                           Const(16, width: 7),
-                                          mux(
+                                          mux<Logic>(
                                             leafTx,
                                             Const(8, width: 7),
                                             Const(4, width: 7),
                                           ),
                                         )
-                                      : mux(
+                                      : mux<Logic>(
                                           leafTx,
                                           Const(8, width: 7),
                                           Const(4, width: 7),

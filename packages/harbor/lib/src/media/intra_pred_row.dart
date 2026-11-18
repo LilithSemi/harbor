@@ -273,7 +273,7 @@ class HarborIntraPredRow extends BridgeModule {
     final rowE = row.zeroExtend(dw);
     // arithmetic shift right by 6 of a dw-bit two's complement value.
     Logic ashr6(Logic v) =>
-        [v[dw - 1].replicate(6), v.getRange(6, dw)].swizzle();
+        [v[dw - 1].replicate(6), v.getRange(6, dw)].concat();
     // (v & 0x3F) >> 1 -> bits [1..5], 5-bit shift for the 2-tap blend.
     Logic shiftOf(Logic v) => v.getRange(1, 6);
     // 2-tap blend with a RUNTIME shift (0..31): round((32-s)*a + s*b, 5).
@@ -465,6 +465,6 @@ class HarborIntraPredRow extends BridgeModule {
       outs.add(mux(isDir, dirPx[c], ndPx));
     }
     assert(_dc == 0);
-    output('pred_row') <= [for (var c = bs - 1; c >= 0; c--) outs[c]].swizzle();
+    output('pred_row') <= [for (var c = bs - 1; c >= 0; c--) outs[c]].concat();
   }
 }

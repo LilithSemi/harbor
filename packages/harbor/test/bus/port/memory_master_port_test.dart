@@ -27,7 +27,8 @@ class _Bench {
     double stall = 0.3,
     double axiStall = 0.3,
     double errorRate = 0,
-  }) : sim = Sim(MemMasterShell(config)),
+    int? busAddressWidth,
+  }) : sim = Sim(MemMasterShell(config, busAddressWidth: busAddressWidth)),
        rng = Random(seed) {
     req = WaistRequester(
       sim,
@@ -112,6 +113,7 @@ Future<_Bench> _random(
   double idle = 0.2,
   double stall = 0.3,
   double axiStall = 0.3,
+  int? busAddressWidth,
 }) async {
   final b = _Bench(
     config,
@@ -121,6 +123,7 @@ Future<_Bench> _random(
     stall: stall,
     axiStall: axiStall,
     errorRate: 0.05,
+    busAddressWidth: busAddressWidth,
   );
   await b.start();
   for (var i = 0; i < count; i++) {
@@ -145,6 +148,29 @@ void main() {
 
   test('random IDs against a memory that reorders IDs', () async {
     await _random(c32, seed: 11);
+  });
+
+  test('a 16-bit waist on a 64-bit AXI4 bus', () async {
+    const c16 = HarborMemoryWaistConfig(
+      addressWidth: 16,
+      dataWidth: 32,
+      idWidth: 4,
+      outstanding: 4,
+    );
+    final b = await _random(c16, seed: 13, busAddressWidth: 64);
+    final master = b.sim.dut.subModules.whereType<HarborAxi4MemoryMaster>();
+    expect(master.single.definitionName, endsWith('_b64'));
+    expect(b.sim.dut.output('bus_AWADDR').width, 64);
+    for (final (kind, width) in [
+      (HarborFabricKind.axi4, 8),
+      (HarborFabricKind.wishbone, 64),
+      (HarborFabricKind.tilelink, 64),
+    ]) {
+      expect(
+        () => MemMasterShell(c16, kind: kind, busAddressWidth: width),
+        throwsArgumentError,
+      );
+    }
   });
 
   test('one ID per direction keeps N requests in flight', () async {

@@ -254,7 +254,7 @@ class HarborDeblockLumaFrame extends BridgeModule {
     }
 
     output('out') <=
-        [for (var i = width * height - 1; i >= 0; i--) grid[i]].swizzle();
+        [for (var i = width * height - 1; i >= 0; i--) grid[i]].concat();
   }
 
   /// Vertical-edge filter length at mi (yu, xu) whose top-left pixel x is

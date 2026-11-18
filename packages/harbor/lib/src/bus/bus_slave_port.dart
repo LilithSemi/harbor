@@ -332,12 +332,12 @@ class BusSlavePort {
     final idx = addr.getRange(2, 2 + (words - 1).bitLength);
     return [
       for (var i = words - 1; i >= 0; i--)
-        mux(
+        mux<Logic>(
           idx.eq(Const(i, width: idx.width)),
           Const(0xf, width: 4),
           Const(0, width: 4),
         ),
-    ].swizzle();
+    ].concat();
   }
 
   // AW, W and AR each go into a holding register. A write runs once both AW
@@ -428,7 +428,7 @@ class BusSlavePort {
     ]);
 
     // SLVERR is 0b10, OKAY is 0b00.
-    Logic resp(Logic e) => [e, Const(0)].swizzle();
+    Logic resp(Logic e) => [e, Const(0)].concat();
 
     axi.awReady <= ~awHeld;
     axi.wReady <= ~wHeld;
@@ -561,7 +561,7 @@ class BusSlavePort {
     final respOpcode = mux(
       withData,
       Const(TileLinkDOpcode.accessAckData.value, width: 3),
-      mux(
+      mux<Logic>(
         aOpcode.eq(Const(5, width: 3)),
         Const(2, width: 3),
         Const(TileLinkDOpcode.accessAck.value, width: 3),
@@ -701,7 +701,7 @@ extension BusSlavePortByteLane on BusSlavePort {
           oldValue.getRange(b * 8, b * 8 + _byteBits(width, b)),
         ),
     ];
-    return bytes.rswizzle();
+    return bytes.rconcat();
   }
 
   /// [BusSlavePort.dataIn] at byte address [offset], with every byte [sel]
@@ -721,7 +721,7 @@ extension BusSlavePortByteLane on BusSlavePort {
           Const(0, width: _byteBits(width, b)),
         ),
     ];
-    return bytes.rswizzle();
+    return bytes.rconcat();
   }
 
   /// Width of byte [b] of a [width]-bit register: 8, except the last byte of

@@ -116,7 +116,7 @@ class Ddr3CalHarness extends BridgeModule {
           : Const(0, width: 16);
       return [
         for (var b = 7; b >= 0; b--) (lo ^ hi ^ Const(patConsts[b], width: 16)),
-      ].swizzle();
+      ].concat();
     }
 
     // Controller: driven by the memtest master.
@@ -355,7 +355,7 @@ class Ddr3CalHarness extends BridgeModule {
     final ledRunning = hb[24];
     final ledCalDone = calDoneSeen;
     addOutput('led', width: 4) <=
-        [ledFail, ledPass, ledRunning, ledCalDone].swizzle();
+        [ledFail, ledPass, ledRunning, ledCalDone].concat();
 
     // --- UART status frame (13 bytes): 0xAA, d1, d2, d3 (LSB-first 32-bit words).
     // d1[2:0]=mem_state, [3]=cal_done, [4]=fail, [12:5]=pass_count,
@@ -369,9 +369,9 @@ class Ddr3CalHarness extends BridgeModule {
       failLatched,
       calDoneSeen,
       memState,
-    ].swizzle();
+    ].concat();
     final d2 = failExp.getRange(0, 32);
-    final d3 = [failAddr.getRange(0, 16), failRead.getRange(0, 16)].swizzle();
+    final d3 = [failAddr.getRange(0, 16), failRead.getRange(0, 16)].concat();
     Logic frameByte(Logic idx) {
       final map = <Logic, Logic>{Const(0, width: 6): Const(0xAA, width: 8)};
       for (var i = 0; i < 4; i++) {
@@ -413,7 +413,7 @@ class Ddr3CalHarness extends BridgeModule {
             ~sending,
             then: [
               // load the next frame byte: {stop=1, data[7:0], start=0}.
-              shiftReg < [Const(1), frameByte(frameIdx), Const(0)].swizzle(),
+              shiftReg < [Const(1), frameByte(frameIdx), Const(0)].concat(),
               sending < Const(1),
               bitCnt < Const(10, width: 4),
               baudCnt < Const(baudDiv - 1, width: 16),
@@ -429,7 +429,7 @@ class Ddr3CalHarness extends BridgeModule {
                 baudCnt.eq(0),
                 then: [
                   baudCnt < Const(baudDiv - 1, width: 16),
-                  shiftReg < [Const(1), shiftReg.getRange(1, 10)].swizzle(),
+                  shiftReg < [Const(1), shiftReg.getRange(1, 10)].concat(),
                   bitCnt < bitCnt - 1,
                   If(bitCnt.eq(1), then: [sending < Const(0)]),
                 ],
@@ -449,6 +449,8 @@ Future<void> main(List<String> args) async {
     ..createSync(recursive: true);
   final h = Ddr3CalHarness();
   await h.build();
-  File('${outDir.path}/creek_ddr3_cal.sv').writeAsStringSync(h.generateSynth());
+  File(
+    '${outDir.path}/creek_ddr3_cal.sv',
+  ).writeAsStringSync(h.dumpSystemVerilog());
   stdout.writeln('wrote ${outDir.path}/creek_ddr3_cal.sv');
 }

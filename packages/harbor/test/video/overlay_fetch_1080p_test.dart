@@ -32,8 +32,8 @@ Future<List<int>> _scan({
   required int sysPs,
   int lines = 6,
 }) async {
-  final pixelClk = SimpleClockGenerator(_pixelPs).clk;
-  final sysClk = SimpleClockGenerator(sysPs).clk;
+  final pixelClk = SimpleClockGenerator(_pixelPs + (_pixelPs & 1)).clk;
+  final sysClk = SimpleClockGenerator(sysPs + (sysPs & 1)).clk;
   final pixelReset = Logic(name: 'pixel_reset');
   final sysReset = Logic(name: 'sys_reset');
   final frameStart = Logic(name: 'frame_start');
@@ -213,8 +213,8 @@ Future<(int, bool)> _display({required int sysPs}) async {
     pixelClock: 148500000,
   );
   const pitch = 2048;
-  final pixelClk = SimpleClockGenerator(_pixelPs).clk;
-  final sysClk = SimpleClockGenerator(sysPs).clk;
+  final pixelClk = SimpleClockGenerator(_pixelPs + (_pixelPs & 1)).clk;
+  final sysClk = SimpleClockGenerator(sysPs + (sysPs & 1)).clk;
   final pixelReset = Logic(name: 'pixel_reset');
   final sysReset = Logic(name: 'sys_reset');
   final memory = HarborMemoryWaist(

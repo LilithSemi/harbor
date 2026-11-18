@@ -145,10 +145,34 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// IBUFDS, so the XDC also constrains this net.
   static const differentialClockNet = 'sysclk_diff';
 
-  /// Xilinx speed grade (`'1'`, `'2'`, `'2L'`, `'3'`). It completes the part
-  /// name that the openXC7 flow gives to prjxray, for example
-  /// `xc7a200tfbg484-2`. Other vendors ignore it.
+  /// Speed grade of the part.
+  ///
+  /// Xilinx: `'1'`, `'2'`, `'2L'`, `'3'`. It completes the part name that the
+  /// openXC7 flow gives to prjxray, for example `xc7a200tfbg484-2`.
+  /// ECP5: `'6'`, `'7'` or `'8'`, passed to nextpnr-ecp5 as `--speed`.
+  /// iCE40 has no grade. See [checkSpeedGrade].
   final String speedGrade;
+
+  /// The speed grade that a vendor uses when a target gives none.
+  static String defaultSpeedGrade(HarborFpgaVendor vendor) =>
+      vendor == HarborFpgaVendor.ecp5 ? '6' : '1';
+
+  /// Throws an [ArgumentError] if [grade] is not valid for [vendor].
+  static void checkSpeedGrade(HarborFpgaVendor vendor, String grade) {
+    final ok = switch (vendor) {
+      HarborFpgaVendor.ecp5 => const {'6', '7', '8'}.contains(grade),
+      HarborFpgaVendor.ice40 => grade == '1',
+      HarborFpgaVendor.vivado ||
+      HarborFpgaVendor.openXc7 => RegExp(r'^[1-3][A-Z]*$').hasMatch(grade),
+    };
+    if (!ok) {
+      throw ArgumentError.value(
+        grade,
+        'speedGrade',
+        'is not a valid speed grade for ${vendor.name}',
+      );
+    }
+  }
 
   /// Optional bitstream programming command for a `prog` Makefile target
   /// (e.g. `'openFPGALoader -b ulx3s \$(TOP).bit'`). When null, no `prog`
@@ -164,6 +188,13 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// Runs the full `synth_ecp5`, including its `autoname` pass. Other
   /// vendors ignore it.
   final bool ecp5Autoname;
+
+  /// Optional cost for the open-XC7 Xilinx LUT6 cells during ABC9 mapping.
+  ///
+  /// When set, Yosys maps the design into 6-input LUTs without MUXF7/MUXF8
+  /// cells, and this positive value overrides the LUT6 area cost used by
+  /// ABC9. Null keeps the standard `synth_xilinx` flow unchanged.
+  final int? xilinxLut6Cost;
 
   /// Whether this FPGA supports eFuse OTP storage.
   ///
@@ -215,11 +246,15 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
     this.clockNPortName,
-    this.speedGrade = '1',
+    String? speedGrade,
     this.progCommand,
     this.ecp5Autoname = false,
+    this.xilinxLut6Cost,
     this.useHimbaechel = false,
-  }) : assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
+  }) : speedGrade =
+           speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1'),
+       assert(xilinxLut6Cost == null || xilinxLut6Cost > 0),
+       assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
        _xilinxFamily = null;
 
   /// iCE40 UP5K target using Yosys + nextpnr-ice40.
@@ -237,7 +272,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
        clockNPortName = null,
        speedGrade = '1',
        useHimbaechel = false,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Lattice ECP5 target using Yosys + nextpnr-ecp5.
   const HarborFpgaTarget.ecp5({
@@ -247,14 +283,15 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.pinMap = const {},
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
+    this.speedGrade = '6',
     this.progCommand,
     this.ecp5Autoname = false,
   }) : name = 'ecp5-$device',
        vendor = HarborFpgaVendor.ecp5,
        clockNPortName = null,
-       speedGrade = '1',
        useHimbaechel = false,
-       _xilinxFamily = null;
+       _xilinxFamily = null,
+       xilinxLut6Cost = null;
 
   /// Xilinx Spartan-7 target using Vivado or openXC7.
   ///
@@ -272,12 +309,14 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
+    this.xilinxLut6Cost,
   }) : name = 'spartan7-$device',
        vendor = useOpenXc7 || useHimbaechel
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.spartan7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       assert(xilinxLut6Cost == null || xilinxLut6Cost > 0);
 
   /// Xilinx Artix-7 target using Vivado or openXC7.
   ///
@@ -300,7 +339,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.artix7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Xilinx Kintex-7 target using Vivado or openXC7.
   ///
@@ -323,7 +363,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.kintex7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Yosys synthesis target string for this FPGA family.
   String get _yosysSynthTarget => switch (vendor) {
@@ -428,7 +469,32 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         // has caused unrelated issues before, so it is NOT used here. De-congest
         // that path a targeted way instead (register-duplicate s2_bank with a
         // synth-flow keep, or floorplan the controller).
-        buf.writeln('synth_xilinx -top $topCell -flatten');
+        final lut6Cost = xilinxLut6Cost;
+        if (lut6Cost == null) {
+          buf.writeln('synth_xilinx -top $topCell -flatten');
+        } else {
+          // This staged flow lets ABC9 run before Xilinx LUT mapping. The
+          // abc9_lut cell attribute supplies the custom LUT6 cost. Keep the
+          // `=LUT6` selector on setattr: ordinary selection patterns exclude
+          // library modules and would leave their mapping cost unchanged.
+          buf.writeln(
+            'synth_xilinx -top $topCell -flatten -run begin:map_luts',
+          );
+          buf.writeln('select -assert-any =LUT6');
+          buf.writeln('setattr -mod -set abc9_lut $lut6Cost =LUT6');
+          buf.writeln('select -assert-any =LUT6 =A:abc9_lut=$lut6Cost %i');
+          buf.writeln('opt_expr -mux_undef -noclkinv');
+          buf.writeln('abc9 -maxlut 6');
+          buf.writeln('clean');
+          buf.writeln('xilinx_srl -fixed -minlen 3');
+          buf.writeln(
+            'techmap -map +/xilinx/lut_map.v -map +/xilinx/cells_map.v '
+            '-D LUT_WIDTH=6',
+          );
+          buf.writeln('xilinx_dffopt');
+          buf.writeln('opt_lut_ins -tech xilinx');
+          buf.writeln('synth_xilinx -top $topCell -run finalize:');
+        }
         buf.writeln('write_json $topCell.json');
     }
 
@@ -458,8 +524,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
             '--asc $topCell.asc'
             '${frequency > 0 ? " --freq ${(frequency / 1e6).toStringAsFixed(0)}" : ""}';
       case HarborFpgaVendor.ecp5:
+        checkSpeedGrade(vendor, speedGrade);
         final ecp5Size = _ecp5DeviceSize(device);
         return 'nextpnr-ecp5 --$ecp5Size --package $package '
+            '--speed $speedGrade '
             '--json $topCell.json '
             '--lpf $topCell.lpf '
             '--textcfg $topCell.config'
@@ -680,22 +748,28 @@ class HarborFpgaTarget extends HarborDeviceTarget {
 
   /// Generates the nextpnr-xilinx `--pre-pack` clock over-constraint
   /// (`support/nextpnr/clocks.py`). nextpnr-xilinx does not propagate the XDC
-  /// `create_clock` through a PLLE2/MMCM or BUFG, so every derived clock (the
-  /// core net `O`, the DDR controller net `ddr_clk`) reaches the timing engine
-  /// UNCONSTRAINED - zero margin, setup-only, single-corner. addClock at a rate
-  /// ABOVE the real one restores a timing budget: it drives timing-aware
+  /// `create_clock` through a PLLE2/MMCM or BUFG, so the named oscillator/core
+  /// aliases and DDR controller net reach the timing engine UNCONSTRAINED -
+  /// zero margin, setup-only, single-corner. addClock restores a timing budget:
+  /// the core and DDR are added ABOVE their real rates, while the source is
+  /// added at its actual rate. This drives timing-aware
   /// placement/routing to prioritise these paths and surfaces true silicon
   /// margin as an honest WNS. The core is over-constrained modestly (it already
   /// runs well under its routing ceiling); the DDR controller carries the larger
   /// margin because it is far more slack-critical per cycle.
   String generateClockConstraintPy({
     required double coreClkMhz,
+    required String coreClockNet,
+    required String sourceClockNet,
+    required double sourceClkMhz,
     required double ddrCtrlMhz,
   }) {
     final coreTarget = (coreClkMhz * 1.4);
     final ddrTarget = (ddrCtrlMhz * 1.25);
     final buf = StringBuffer();
-    buf.writeln('# --pre-pack over-constraint for the PLL/BUFG-derived clocks');
+    buf.writeln(
+      '# --pre-pack over-constraint for source and PLL/BUFG-derived clocks',
+    );
     buf.writeln(
       '# that nextpnr-xilinx leaves UNCONSTRAINED (create_clock does',
     );
@@ -706,7 +780,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     );
     buf.writeln('for net, mhz in [');
     buf.writeln(
-      "    ('O', ${coreTarget.toStringAsFixed(2)}),"
+      "    ('$sourceClockNet', ${sourceClkMhz.toStringAsFixed(2)}),"
+      '  # board oscillator, real ~${sourceClkMhz.toStringAsFixed(1)} MHz',
+    );
+    buf.writeln(
+      "    ('$coreClockNet', ${coreTarget.toStringAsFixed(2)}),"
       '  # core, real ~${coreClkMhz.toStringAsFixed(1)} MHz',
     );
     buf.writeln(
@@ -719,6 +797,21 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     buf.writeln("        print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
     buf.writeln('    except Exception as e:');
     buf.writeln("        print('ADDCLOCK %s FAILED: %s' % (net, e))");
+    return buf.toString();
+  }
+
+  /// Generates `support/nextpnr/pll_clocks.py` for a design with PLL clocks
+  /// and no DDR3 tree. Each net in [mhzByNet] gets an `addClock` at its real
+  /// rate, because nextpnr gives a clock that comes from a MMCM and a BUFG a
+  /// default 12 MHz target. A failed `addClock` stops the build.
+  String generatePllClockConstraintPy(Map<String, double> mhzByNet) {
+    final buf = StringBuffer('for net, mhz in [\n');
+    for (final e in mhzByNet.entries) {
+      buf.writeln("    ('${e.key}', ${e.value.toStringAsFixed(2)}),");
+    }
+    buf.writeln(']:');
+    buf.writeln('    ctx.addClock(net, mhz)');
+    buf.writeln("    print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
     return buf.toString();
   }
 
@@ -741,7 +834,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   }
 
   /// Generates a complete Makefile for the FPGA build flow.
-  String generateMakefile(String topCell) {
+  ///
+  /// With [pllClockScript], an openXC7 Makefile also takes
+  /// `support/nextpnr/pll_clocks.py` as a `--pre-pack` script. That script
+  /// has no `--timing-allow-fail`, so a missed clock fails the build.
+  String generateMakefile(String topCell, {bool pllClockScript = false}) {
     final buf = StringBuffer();
     buf.writeln('# Auto-generated Makefile for $name');
     buf.writeln('TOP = $topCell');
@@ -886,8 +983,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       );
       buf.writeln('# bitstream when the aggressive target is not met.');
       buf.writeln(
-        'PREPACK := \$(if \$(wildcard support/nextpnr/clocks.py),'
-        '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
+        pllClockScript
+            ? 'PREPACK := \$(if \$(wildcard support/nextpnr/pll_clocks.py),'
+                  '--pre-pack support/nextpnr/pll_clocks.py,)'
+            : 'PREPACK := \$(if \$(wildcard support/nextpnr/clocks.py),'
+                  '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
       );
       buf.writeln();
       buf.writeln('pnr: \$(TOP).fasm');

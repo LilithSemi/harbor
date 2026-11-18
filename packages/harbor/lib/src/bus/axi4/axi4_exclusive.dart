@@ -274,7 +274,7 @@ class HarborAxi4ExclusiveMonitor {
     final exBad = ~pow2 | bytesLog.gt(geo.g) | ~aligned;
     final rest = geo.preWidth - 1;
     if (!write || rest == 0) {
-      return rest == 0 ? exBad : [Const(0, width: rest), exBad].swizzle();
+      return rest == 0 ? exBad : [Const(0, width: rest), exBad].concat();
     }
 
     // The bytes a write can change, as [lo, hi] in the page of [addr]. A

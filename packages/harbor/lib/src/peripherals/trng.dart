@@ -179,7 +179,7 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
           ready < Const(1),
 
           // Shift the raw noise bit into the entropy pool every cycle.
-          pool < [pool.getRange(0, 31), noiseBit].swizzle(),
+          pool < [pool.getRange(0, 31), noiseBit].concat(),
 
           // Repetition-count: count consecutive identical samples. [repCount]
           // holds the length of the current identical-sample run (a fresh run
@@ -264,7 +264,7 @@ class HarborTrng extends BridgeModule with HarborDeviceTreeNodeProvider {
                 // STATUS: bit0 ready, bit1 health failed.
                 CaseItem(statusOff, [
                   datOut32 <
-                      [Const(0, width: 30), healthFailed, ready].swizzle(),
+                      [Const(0, width: 30), healthFailed, ready].concat(),
                 ]),
               ]),
             ],

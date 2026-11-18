@@ -130,7 +130,7 @@ class HarborKeyframeDecodeMultiSbHoriz extends BridgeModule {
             0,
             2,
           ),
-      ].swizzle();
+      ].concat();
       final reconYModes = ymCap;
       final reconTxTypes = ttCap;
       final reconCoeffs = [
@@ -138,12 +138,12 @@ class HarborKeyframeDecodeMultiSbHoriz extends BridgeModule {
           Const(0, width: 192 * 16),
           coeffCap.getRange(l * 64 * 16, l * 64 * 16 + 64 * 16),
         ],
-      ].swizzle();
+      ].concat();
       int posVal(int row, int col) => row | (col << miBits);
       final reconPositions = [
         for (var l = maxLeaves - 1; l >= 0; l--)
           Const(posVal(l >> 1, l & 1), width: 2 * miBits),
-      ].swizzle();
+      ].concat();
       return (
         leafCount: reconLeafCount,
         positions: reconPositions,
@@ -195,7 +195,7 @@ class HarborKeyframeDecodeMultiSbHoriz extends BridgeModule {
     final sb0Right = [
       for (var rr = f - 1; rr >= 0; rr--)
         frame0.getRange((rr * f + (f - 1)) * 8, (rr * f + (f - 1)) * 8 + 8),
-    ].swizzle();
+    ].concat();
 
     // recon SB1 (sb_c = 2 mi units right, left = SB0 right column)
     final recon1 = HarborIntraReconWalk(

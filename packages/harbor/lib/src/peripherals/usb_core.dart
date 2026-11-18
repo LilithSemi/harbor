@@ -281,8 +281,8 @@ class HarborUsbCore extends BridgeModule {
 
     final bmRequestType = setupBytes[0].named('bm_request_type');
     final bRequest = setupBytes[1].named('b_request');
-    final wValue = [setupBytes[3], setupBytes[2]].swizzle().named('w_value');
-    final wLength = [setupBytes[7], setupBytes[6]].swizzle().named('w_length');
+    final wValue = [setupBytes[3], setupBytes[2]].concat().named('w_value');
+    final wLength = [setupBytes[7], setupBytes[6]].concat().named('w_length');
 
     // IN data stage bookkeeping, shared by the ROM path and the function
     // path. OUT reuses the same byte counter (never active at once).
@@ -447,7 +447,7 @@ class HarborUsbCore extends BridgeModule {
     // Standard endpoint-recipient requests: GET_STATUS, SET_FEATURE and
     // CLEAR_FEATURE(ENDPOINT_HALT), USB 2.0 9.4.5.
     // ==================================================================
-    final wIndex = [setupBytes[5], setupBytes[4]].swizzle().named('w_index');
+    final wIndex = [setupBytes[5], setupBytes[4]].concat().named('w_index');
     final reqEpNum = wIndex.slice(3, 0).named('req_ep_num');
     final reqEpDirIn = wIndex.slice(7, 7).named('req_ep_dir_in');
 
@@ -563,7 +563,7 @@ class HarborUsbCore extends BridgeModule {
     }
 
     Logic orAcross(List<Logic> bits) =>
-        bits.isEmpty ? Const(0, width: 1) : bits.rswizzle().or();
+        bits.isEmpty ? Const(0, width: 1) : bits.rconcat().or();
 
     final getStatusEpOutMatch = orAcross(
       outEpMatchBits,
@@ -1180,7 +1180,7 @@ class HarborUsbCore extends BridgeModule {
           setupBytes[2],
           setupBytes[1],
           setupBytes[0],
-        ].swizzle();
+        ].concat();
     func.port('ep0_out_data') <= outByte;
     func.port('ep0_out_valid') <= outHeld;
     func.port('ep0_out_end') <= ep0OutEndQ;
@@ -1203,24 +1203,24 @@ class HarborUsbCore extends BridgeModule {
     if (numOutEps > 0) {
       outEpReqList.add(func.port('out_ep_req'));
       outDataGetList.add(func.port('out_ep_data_get'));
-      outStallList.add(func.port('out_ep_stall') | hostHaltOutBits.rswizzle());
+      outStallList.add(func.port('out_ep_stall') | hostHaltOutBits.rconcat());
     }
     if (numInEps > 0) {
       inEpReqList.add(func.port('in_ep_req'));
       inEpDataPutList.add(func.port('in_ep_data_put'));
       inEpDataList.add(func.port('in_ep_data'));
       inEpDataDoneList.add(func.port('in_ep_data_done'));
-      inStallList.add(func.port('in_ep_stall') | hostHaltInBits.rswizzle());
+      inStallList.add(func.port('in_ep_stall') | hostHaltInBits.rconcat());
     }
 
-    pe.input('out_ep_data_get').srcConnection! <= outDataGetList.rswizzle();
-    pe.input('out_ep_req').srcConnection! <= outEpReqList.rswizzle();
-    pe.input('out_ep_stall').srcConnection! <= outStallList.rswizzle();
-    pe.input('in_ep_stall').srcConnection! <= inStallList.rswizzle();
-    pe.input('in_ep_req').srcConnection! <= inEpReqList.rswizzle();
-    pe.input('in_ep_data_done').srcConnection! <= inEpDataDoneList.rswizzle();
-    pe.input('in_ep_data').srcConnection! <= inEpDataList.rswizzle();
-    pe.input('in_ep_data_put').srcConnection! <= inEpDataPutList.rswizzle();
+    pe.input('out_ep_data_get').srcConnection! <= outDataGetList.rconcat();
+    pe.input('out_ep_req').srcConnection! <= outEpReqList.rconcat();
+    pe.input('out_ep_stall').srcConnection! <= outStallList.rconcat();
+    pe.input('in_ep_stall').srcConnection! <= inStallList.rconcat();
+    pe.input('in_ep_req').srcConnection! <= inEpReqList.rconcat();
+    pe.input('in_ep_data_done').srcConnection! <= inEpDataDoneList.rconcat();
+    pe.input('in_ep_data').srcConnection! <= inEpDataList.rconcat();
+    pe.input('in_ep_data_put').srcConnection! <= inEpDataPutList.rconcat();
 
     // SET_CONFIGURATION/SET_INTERFACE reset every extra endpoint's data
     // toggle. CLEAR_FEATURE(ENDPOINT_HALT) resets only the addressed one.
@@ -1234,7 +1234,7 @@ class HarborUsbCore extends BridgeModule {
       for (var i = 0; i < numOutEps; i++)
         (toggleResetAllDone | (clearFeatureEpStatusDone & outEpMatchBits[i]))
             .named('out_ep_toggle_reset_${i + 1}'),
-    ].rswizzle();
+    ].rconcat();
     final inEpToggleReset = [
       // ep0's IN side never needs this: a SETUP preempts a packet the
       // function is writing or has armed to send (HarborUsbFsInPe's
@@ -1245,7 +1245,7 @@ class HarborUsbCore extends BridgeModule {
       for (var i = 0; i < numInEps; i++)
         (toggleResetAllDone | (clearFeatureEpStatusDone & inEpMatchBits[i]))
             .named('in_ep_toggle_reset_${i + 1}'),
-    ].rswizzle();
+    ].rconcat();
     pe.input('out_ep_toggle_reset').srcConnection! <= outEpToggleReset;
     pe.input('in_ep_toggle_reset').srcConnection! <= inEpToggleReset;
 

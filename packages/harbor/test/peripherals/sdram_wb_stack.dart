@@ -107,8 +107,10 @@ class SdramWbStack {
   List<String> get errors => model.errors;
 
   Future<void> start() async {
-    sysClk = SimpleClockGenerator(sysPeriodPs).clk;
-    memClk = busClockSync ? sysClk : SimpleClockGenerator(memPeriodPs).clk;
+    sysClk = SimpleClockGenerator(sysPeriodPs + (sysPeriodPs & 1)).clk;
+    memClk = busClockSync
+        ? sysClk
+        : SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
 
     cyc = Logic(name: 'wb_cyc');
     we = Logic(name: 'wb_we');
@@ -142,7 +144,7 @@ class SdramWbStack {
     if (!busClockSync) {
       sdram.input('mem_clk').srcConnection! <= memClk;
     }
-    sdram.input('mem_reset').srcConnection! <= memReset;
+    if (!busClockSync) sdram.input('mem_reset').srcConnection! <= memReset;
     sdram.input('bus_CYC').srcConnection! <= cyc;
     sdram.input('bus_STB').srcConnection! <= cyc;
     sdram.input('bus_WE').srcConnection! <= we;
@@ -165,10 +167,9 @@ class SdramWbStack {
     final phy = sdram.subModules.whereType<SdramPhyEcp5>().single;
     final bbs = {for (final m in phy.subModules.whereType<Ecp5Bb>()) m.name: m};
     final dqBbs = [for (var i = 0; i < 16; i++) bbs['dq_bb_$i']!];
-    final tAcNs = cycles.casLatency == 3 ? 5.0 : 6.0;
     if (!sdramPhyCaptureOk(
       periodPs: memPeriodPs,
-      tAcNs: tAcNs,
+      casLatency: cycles.casLatency,
       fpgaToSdramNs: fpgaToSdramNs,
       phy: const HarborSdramPhyConfig(),
     )) {
@@ -191,8 +192,8 @@ class SdramWbStack {
       dq: sdram.inOutSource('sdram_dq') as LogicNet,
       rules: rules,
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,

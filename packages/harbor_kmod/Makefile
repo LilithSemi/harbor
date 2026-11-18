@@ -36,6 +36,8 @@ obj-m += $(call module-if,$(CONFIG_HWMON),hwmon/harbor_temp.o)
 obj-m += $(call module-if,$(CONFIG_VIDEO_DEV),media/harbor_media.o)
 obj-m += $(call module-if,$(CONFIG_SND_SOC),audio/harbor_audio.o)
 obj-m += $(call module-if,$(CONFIG_NVMEM),efuse/harbor_efuse.o)
+obj-m += $(call module-if,$(CONFIG_MTD),spi_flash/harbor_spi_flash.o)
+obj-m += $(call module-if,$(CONFIG_LEDS_CLASS_MULTICOLOR),led/harbor_led.o)
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules

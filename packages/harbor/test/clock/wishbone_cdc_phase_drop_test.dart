@@ -33,7 +33,7 @@ void main() {
   Future<(int, String)> run({
     required int n,
     int sPeriod = 300,
-    int mPeriod = 199,
+    int mPeriod = 198,
     int ackDelay = 3,
     int ackHold = 6,
     int guardCycles = 2000,
@@ -47,8 +47,8 @@ void main() {
       syncStages: 2,
     );
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
     final sCyc = Logic(name: 's_cyc');

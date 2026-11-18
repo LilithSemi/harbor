@@ -364,7 +364,7 @@ void main() {
     dut.input('m_ack').srcConnection! <= delayedAck;
     dut.input('m_err').srcConnection! <= Const(0);
     dut.input('m_dat_r').srcConnection! <=
-        mux(
+        mux<Logic>(
           isHi,
           Const(0x22222222, width: narrow),
           Const(0x11111111, width: narrow),

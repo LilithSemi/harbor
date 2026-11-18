@@ -134,7 +134,7 @@ class _Harness {
     required this.addressBytes,
     bool stuckWip = false,
     int size = 1024 * 1024,
-    int writePollLimit = (1 << 20) - 1,
+    int? clockHz,
   }) : model = _SpiNorModel(addressBytes: addressBytes, stuckWip: stuckWip) {
     clk = SimpleClockGenerator(10).clk;
     reset = Logic(name: 'reset');
@@ -154,11 +154,13 @@ class _Harness {
         readCommand: 0x03,
         addressBytes: addressBytes,
         dummyCycles: 0,
+        eraseTimeoutMs: 1,
+        programTimeoutMs: 1,
       ),
       baseAddress: 0x20000000,
       busAddressWidth: 32,
       busDataWidth: 32,
-      writePollLimit: writePollLimit,
+      clockHz: clockHz ?? 100000000,
     );
   }
 
@@ -273,6 +275,7 @@ void main() {
   test('I3: addressBytes other than 3/4 throws at construction', () {
     expect(
       () => HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig(
           size: 1024 * 1024,
           mode: HarborSpiFlashMode.standard,
@@ -476,8 +479,8 @@ void main() {
 
   // I4: WIP never clears -> watchdog times out, wr_err set, wr_busy drops.
   test('I4: stuck WIP times out (wr_err), does not hang', () async {
-    // Small watchdog bound so the timeout is reached quickly in simulation.
-    final h = _Harness(addressBytes: 3, stuckWip: true, writePollLimit: 8);
+    // 272 clocks, about 8 polls, so the timeout comes quickly in simulation.
+    final h = _Harness(addressBytes: 3, stuckWip: true, clockHz: 272000);
     await h.build();
     h.startModel();
 

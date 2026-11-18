@@ -381,10 +381,10 @@ class HarborKeyframeIntraFrame extends BridgeModule {
     final recPositions = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         Const(posVal(leafMi(l)[0], leafMi(l)[1]), width: 2 * recMiBits),
-    ].swizzle();
+    ].concat();
     final recLog2s = [
       for (var l = maxLeaves - 1; l >= 0; l--) Const(recLog2, width: recLog2W),
-    ].swizzle();
+    ].concat();
 
     // ROM select helper.
     Logic romSel(List<int> table, Logic idx, int w) {
@@ -403,9 +403,9 @@ class HarborKeyframeIntraFrame extends BridgeModule {
     Logic lumaAt(Logic fr, int r, int c) =>
         fr.getRange((r * f + c) * 8, (r * f + c) * 8 + 8);
     Logic lumaBottomRow(Logic fr) =>
-        [for (var c = f - 1; c >= 0; c--) lumaAt(fr, f - 1, c)].swizzle();
+        [for (var c = f - 1; c >= 0; c--) lumaAt(fr, f - 1, c)].concat();
     Logic lumaRightCol(Logic fr) =>
-        [for (var r = f - 1; r >= 0; r--) lumaAt(fr, r, f - 1)].swizzle();
+        [for (var r = f - 1; r >= 0; r--) lumaAt(fr, r, f - 1)].concat();
     Logic lumaBrPixel(Logic fr) => lumaAt(fr, f - 1, f - 1);
 
     final zeroLumaRow = Const(0, width: f * 8);
@@ -466,21 +466,21 @@ class HarborKeyframeIntraFrame extends BridgeModule {
     // pass-through when its flag is off.
     if (!applyLoopFilters) {
       output('frame_y') <=
-          [for (var i = frameW * frameH - 1; i >= 0; i--) yRam[i]].swizzle();
+          [for (var i = frameW * frameH - 1; i >= 0; i--) yRam[i]].concat();
       output('frame_u') <=
-          [for (var i = chW * chH - 1; i >= 0; i--) uRam[i]].swizzle();
+          [for (var i = chW * chH - 1; i >= 0; i--) uRam[i]].concat();
       output('frame_v') <=
-          [for (var i = chW * chH - 1; i >= 0; i--) vRam[i]].swizzle();
+          [for (var i = chW * chH - 1; i >= 0; i--) vRam[i]].concat();
     } else {
       final reconY = [
         for (var i = frameW * frameH - 1; i >= 0; i--) yFrozen[i],
-      ].swizzle();
+      ].concat();
       final reconU = [
         for (var i = chW * chH - 1; i >= 0; i--) uFrozen[i],
-      ].swizzle();
+      ].concat();
       final reconV = [
         for (var i = chW * chH - 1; i >= 0; i--) vFrozen[i],
-      ].swizzle();
+      ].concat();
 
       final miRows = sbRows * sbMi;
       final miCols = sbCols * sbMi;
@@ -503,7 +503,7 @@ class HarborKeyframeIntraFrame extends BridgeModule {
       // 2) whose 4:2:0 chroma is TX_8X8 (tx idx 1), all blocks intra (is_inter
       // 0), 16x16 prediction blocks. Levels broadcast the frame-header slots.
       Logic bcast(Logic v, int count) =>
-          [for (var i = 0; i < count; i++) v].swizzle();
+          [for (var i = 0; i < count; i++) v].concat();
       deblock.input('mi_tx_y').srcConnection! <= bcast(Const(2, width: 5), nMi);
       deblock.input('mi_tx_uv').srcConnection! <=
           bcast(Const(1, width: 5), nMi);
@@ -780,7 +780,7 @@ class HarborKeyframeIntraFrame extends BridgeModule {
           cflAc.add(((a + b + cc + d) << 1).getRange(0, cflAcBits));
         }
       }
-      cflAcB.add([for (var k = cN - 1; k >= 0; k--) cflAc[k]].swizzle());
+      cflAcB.add([for (var k = cN - 1; k >= 0; k--) cflAc[k]].concat());
 
       // FULL-PLANE availability + neighbours from the chroma RAM.
       haveAboveB.add(Const(gbr > 0 ? 1 : 0));
@@ -791,13 +791,13 @@ class HarborKeyframeIntraFrame extends BridgeModule {
         aboveB[p].add(
           gbr > 0
               ? [for (var x = cBs - 1; x >= 0; x--) cRamAt(ram, r0 - 1, c0 + x)]
-                    .swizzle()
+                    .concat()
               : zeroChromaEdge,
         );
         leftB[p].add(
           gbc > 0
               ? [for (var y = cBs - 1; y >= 0; y--) cRamAt(ram, r0 + y, c0 - 1)]
-                    .swizzle()
+                    .concat()
               : zeroChromaEdge,
         );
         cornerB[p].add(

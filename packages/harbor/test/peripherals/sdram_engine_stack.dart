@@ -33,6 +33,7 @@ class SdramEngineStackTop extends Module {
     required List<SdramPortInterface> ports,
     required LogicNet dqPad,
     required int maxGrantWords,
+    HarborSdramPhyConfig phyConfig = const HarborSdramPhyConfig(),
     List<int>? portMaxGrantWords,
     List<bool>? portRealtime,
     List<bool>? portSlice,
@@ -79,6 +80,7 @@ class SdramEngineStackTop extends Module {
       dqOut: dqOut,
       dqOe: dqOe,
       dqPad: dq,
+      phy: phyConfig,
     );
 
     // A bare port sitting only between the arbiter and the engine, the
@@ -207,6 +209,7 @@ class SdramEngineStack {
   final HarborSdramConfig config;
   final HarborSdramCycles cycles;
   final double fpgaToSdramNs;
+  late final HarborSdramPhyConfig phyConfig;
   final int maxGrantWords;
   final bool fastInit;
 
@@ -371,7 +374,7 @@ class SdramEngineStack {
   }
 
   Future<void> start() async {
-    clk = SimpleClockGenerator(periodPs).clk;
+    clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
     final dqPad = LogicNet(name: 'dq_pad', width: 16);
     reset.inject(1);
     for (final iface in portIfaces) {
@@ -388,9 +391,15 @@ class SdramEngineStack {
         s.inject(0);
       }
     }
+    phyConfig = const HarborSdramPhyConfig().resolve(
+      clockHz: clockHz,
+      config: config,
+      casLatency: cycles.casLatency,
+    );
     top = SdramEngineStackTop(
       config,
       cycles,
+      phyConfig: phyConfig,
       clk: clk,
       reset: reset,
       ports: portIfaces,
@@ -406,12 +415,11 @@ class SdramEngineStack {
     final phy = top.phy;
     final bbs = {for (final m in phy.subModules.whereType<Ecp5Bb>()) m.name: m};
     final dqBbs = [for (var i = 0; i < 16; i++) bbs['dq_bb_$i']!];
-    final tAcNs = cycles.casLatency == 3 ? 5.0 : 6.0;
     if (!sdramPhyCaptureOk(
       periodPs: periodPs,
-      tAcNs: tAcNs,
+      casLatency: cycles.casLatency,
       fpgaToSdramNs: fpgaToSdramNs,
-      phy: const HarborSdramPhyConfig(),
+      phy: phyConfig,
     )) {
       throw ArgumentError('fpgaToSdramNs $fpgaToSdramNs misses the window');
     }
@@ -433,8 +441,8 @@ class SdramEngineStack {
       dq: dqPad,
       rules: rules,
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,

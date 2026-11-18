@@ -57,7 +57,7 @@ class HarborWedgeMask extends BridgeModule {
     // Pack LSB-first row-major: pixel k occupies bits [k*7, k*7+7). swizzle is
     // MSB-first, so emit index n-1 down to 0.
     output('mask') <=
-        [for (var i = n - 1; i >= 0; i--) Const(m[i], width: 7)].swizzle();
+        [for (var i = n - 1; i >= 0; i--) Const(m[i], width: 7)].concat();
   }
 
   /// av1_is_wedge_used: wedge is signalled for these block sizes.

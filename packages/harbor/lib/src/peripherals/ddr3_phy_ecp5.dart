@@ -270,7 +270,7 @@ class Ddr3PhyEcp5 extends Ddr3PhyBase {
       ctrlClk: controllerClk,
       sclk: sclk,
       reset: fabRst,
-      word: [dm, data].swizzle(),
+      word: [dm, data].concat(),
       name: 'data_tx_regear',
     );
     // Two more CK/2 cycles on the commands put the write data, captured one
@@ -336,11 +336,11 @@ class Ddr3PhyEcp5 extends Ddr3PhyBase {
         [
           for (var i = params.baBits - 1; i >= 0; i--)
             cmdPad(params.rowBits + i, 'ba_$i'),
-        ].swizzle();
+        ].concat();
     addOutput('o_ddr3_addr', width: params.rowBits) <=
         [
           for (var i = params.rowBits - 1; i >= 0; i--) cmdPad(i, 'addr_$i'),
-        ].swizzle();
+        ].concat();
 
     // --- read / write enable delay lines (litedram TappedDelayLine) ---
     Logic slotIs(int slot, int cmd3) =>
@@ -510,7 +510,7 @@ class Ddr3PhyEcp5 extends Ddr3PhyBase {
 
       // Write gearing shared by DM and DQ (litedram bl8_chunk mux).
       Logic writeBeats(List<Logic> beats, String name) {
-        final o = beats.rswizzle().named('${name}_o_data');
+        final o = beats.rconcat().named('${name}_o_data');
         final od = Logic(name: '${name}_o_data_d', width: 8);
         final muxed = Logic(name: '${name}_o_data_muxed', width: 4);
         Sequential(sclk, reset: fabRst, [
@@ -629,13 +629,13 @@ class Ddr3PhyEcp5 extends Ddr3PhyBase {
         );
         // One register, then a litedram BitSlip over Ddr3Ecp5ReadLeveler
         // .bitslips beat positions.
-        final q = [iddr.q3, iddr.q2, iddr.q1, iddr.q0].swizzle();
+        final q = [iddr.q3, iddr.q2, iddr.q1, iddr.q0].concat();
         final qd = Logic(name: 'dq_i_d_$gi', width: 4);
         final rw = 4 * (Ddr3Ecp5ReadLeveler.bitslips ~/ 4 + 1);
         final r = Logic(name: 'dq_i_bitslip_r_$gi', width: rw);
         Sequential(sclk, reset: fabRst, [
           qd < q,
-          r < [qd, r.getRange(4, rw)].swizzle(),
+          r < [qd, r.getRange(4, rw)].concat(),
         ]);
         final o = (r >>> laneSlip[l].zeroExtend(r.width)).getRange(0, 4);
         for (var b = 0; b < 4; b++) {
@@ -643,15 +643,15 @@ class Ddr3PhyEcp5 extends Ddr3PhyBase {
         }
       }
     }
-    addOutput('o_ddr3_dm', width: lanes) <= dmPads.rswizzle();
-    burstSeen <= burstBits.rswizzle();
+    addOutput('o_ddr3_dm', width: lanes) <= dmPads.rconcat();
+    burstSeen <= burstBits.rconcat();
 
     // --- CK/2 -> CK/4 receive regear ---
     final rx = Ddr3Ecp5RxRegear(
       ctrlClk: controllerClk,
       sclk: sclk,
       reset: fabRst,
-      half: [for (final b in readHalf) b!].rswizzle(),
+      half: [for (final b in readHalf) b!].rconcat(),
       name: 'read_rx_regear',
     );
     output('o_controller_iserdes_data') <= rx.word;
@@ -763,7 +763,7 @@ class Ddr3Ecp5RxRegear extends Module {
       If(
         ph.eq(0),
         then: [
-          pair < [half, p1].swizzle(),
+          pair < [half, p1].concat(),
         ],
       ),
     ]);
@@ -921,8 +921,10 @@ class Ddr3Ecp5ReadLeveler extends Module {
     ];
 
     Logic slice(Logic v, Logic idx) =>
-        (v >>> [idx, Const(0, width: 3)].swizzle().zeroExtend(v.width))
-            .getRange(0, delays);
+        (v >>> [idx, Const(0, width: 3)].concat().zeroExtend(v.width)).getRange(
+          0,
+          delays,
+        );
     Logic popcount(Logic v) => [
       for (var i = 0; i < delays; i++) v[i].zeroExtend(4),
     ].reduce((a, c) => a + c);
@@ -936,7 +938,7 @@ class Ddr3Ecp5ReadLeveler extends Module {
       defaultValue: Const(0, width: 3),
       conditionalType: ConditionalType.unique,
     );
-    final pointIdx = [b, d].swizzle().zeroExtend(8);
+    final pointIdx = [b, d].concat().zeroExtend(8);
     final pointBit = (Const(1, width: vecW) << pointIdx).named('point_bit');
 
     Sequential(clk, reset: reset, [
@@ -994,7 +996,7 @@ class Ddr3Ecp5ReadLeveler extends Module {
             seq.eq(_seqEnd),
             then: [
               state <
-                  mux(
+                  mux<Logic>(
                     toFinal,
                     Const(_stDone, width: 3),
                     Const(_stWait, width: 3),
@@ -1035,9 +1037,9 @@ class Ddr3Ecp5ReadLeveler extends Module {
                 (seq.gte(_seqSyncOn) & seq.lt(_seqSyncOff)));
     output('o_clear_burst') <= state.eq(_stIdle) | inApply;
     output('o_read_clk_sel') <=
-        [for (var l = 0; l < lanes; l++) mux(applied, finD[l], d)].rswizzle();
+        [for (var l = 0; l < lanes; l++) mux(applied, finD[l], d)].rconcat();
     output('o_slip') <=
-        [for (var l = 0; l < lanes; l++) mux(applied, finB[l], b)].rswizzle();
+        [for (var l = 0; l < lanes; l++) mux(applied, finB[l], b)].rconcat();
   }
 }
 
@@ -1081,7 +1083,7 @@ class Ddr3Ecp5Init extends Module {
 
     Conditional at(int n, List<Conditional> then) => If(cnt.eq(n), then: then);
     Sequential(clk, reset: reset, [
-      lockS < [lockS[0], lock].swizzle(),
+      lockS < [lockS[0], lock].concat(),
       lockD < lockS[1],
       If(
         newLock & ~running & ~doneR,

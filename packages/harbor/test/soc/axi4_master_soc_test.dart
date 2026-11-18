@@ -123,18 +123,31 @@ int _word(int i) => (0x9e3779b9 * (i + 1)) & 0xffffffff;
 
 /// Writes byte [offset] of the uart's register window, on a 32-bit bus:
 /// the byte goes in its lane of the word it packs into.
-Future<void> _uartWrite(RegBus bus, int base, int offset, int value) async {
+Future<void> _uartWrite(
+  RegBus bus,
+  int base,
+  int offset,
+  int value, {
+  bool word = false,
+}) async {
+  if (word) return bus.write(base + 4 * offset, value);
   const lanes = 4;
   final lane = offset % lanes;
   await bus.write(base + offset - lane, value << (8 * lane), sel: 1 << lane);
 }
 
 /// Reads byte [offset] of the uart's register window back out of its lane.
-Future<int> _uartRead(RegBus bus, int base, int offset) async {
+Future<int> _uartRead(
+  RegBus bus,
+  int base,
+  int offset, {
+  bool word = false,
+}) async {
+  if (word) return (await bus.read(base + 4 * offset)) & 0xFF;
   const lanes = 4;
   final lane = offset % lanes;
-  final word = await bus.read(base + offset - lane);
-  return (word >> (8 * lane)) & 0xFF;
+  final data = await bus.read(base + offset - lane);
+  return (data >> (8 * lane)) & 0xFF;
 }
 
 /// Wires the fabric and sdram clocks, builds [soc], attaches the sdram pin
@@ -165,7 +178,7 @@ Future<SdramPinModel> _bootSdram(
   const fpgaToSdramNs = 4.6;
   if (!sdramPhyCaptureOk(
     periodPs: memPeriodPs,
-    tAcNs: sdram.cycles.casLatency == 3 ? 5.0 : 6.0,
+    casLatency: sdram.cycles.casLatency,
     fpgaToSdramNs: fpgaToSdramNs,
     phy: const HarborSdramPhyConfig(),
   )) {
@@ -184,8 +197,8 @@ Future<SdramPinModel> _bootSdram(
     dq: soc.inOutSource('sdram_dq') as LogicNet,
     rules: const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000),
     fpgaToSdramNs: fpgaToSdramNs,
-    fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-    fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+    fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+    fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
     refreshPolicy: SdramRefreshPolicy(
       maxPostponed: sdram.cycles.maxPostponed,
       maxPulledIn: sdram.cycles.maxPulledIn,
@@ -248,8 +261,11 @@ void main() {
         baseAddress: _uart,
         busAddressWidth: 32,
         busDataWidth: 32,
+        // An AXI4-Lite read cannot select one packed register.
+        regShift: kind == HarborFabricKind.axi4 ? 2 : 0,
         fabricKind: kind,
       );
+      final word = kind == HarborFabricKind.axi4;
       uart.port('rx').getsLogic(Const(1));
       soc.addPeripheral(uart);
 
@@ -339,15 +355,15 @@ void main() {
 
       // And write a couple of bytes out through the uart: 8N1, DLAB
       // clear, then THR twice.
-      await _uartWrite(bus, _uart, 3, 0x03);
-      await _uartWrite(bus, _uart, 0, 0x55);
+      await _uartWrite(bus, _uart, 3, 0x03, word: word);
+      await _uartWrite(bus, _uart, 0, 0x55, word: word);
       var txLow = false;
       fabricClk.posedge.listen((_) {
         if (uart.tx.value.isValid && uart.tx.value.toInt() == 0) {
           txLow = true;
         }
       });
-      await _uartWrite(bus, _uart, 0, 0xA5);
+      await _uartWrite(bus, _uart, 0, 0xA5, word: word);
 
       // Poll the DMA with idle cycles between reads, so a master that
       // kept its grant back to back would not starve it.
@@ -371,7 +387,7 @@ void main() {
       }
 
       expect(txLow, isTrue, reason: 'tx went low for a start bit');
-      final lsr = await _uartRead(bus, _uart, 5);
+      final lsr = await _uartRead(bus, _uart, 5, word: word);
       expect(lsr & 0x60, 0x60, reason: 'thre and temt once tx drains');
 
       expect(busError.value.toInt(), 0);

@@ -21,6 +21,7 @@ void main() {
         'flush': Logic(),
         'mem_done': Logic(),
         'mem_valid': Logic(),
+        'mem_last': Logic(),
         'mem_rdata': Logic(width: 64),
         'mem_fault': Logic(),
       };
@@ -45,9 +46,11 @@ void main() {
         await clk.nextPosedge;
       }
       ports['mem_done']!.inject(1);
+      ports['mem_last']!.inject(1);
       ports['mem_fault']!.inject(pageFault ? 1 : 0);
       await clk.nextPosedge;
       ports['mem_done']!.inject(0);
+      ports['mem_last']!.inject(0);
       ports['mem_fault']!.inject(0);
       await clk.nextPosedge;
 

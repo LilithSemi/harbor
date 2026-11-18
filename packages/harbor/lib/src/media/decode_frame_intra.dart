@@ -101,14 +101,14 @@ class HarborDecodeFrameIntra extends BridgeModule {
     rec.input('ac_q').srcConnection! <= input('ac_q');
     rec.input('mode').srcConnection! <= blk.output('y_mode').getRange(0, 3);
     rec.input('above').srcConnection! <=
-        [for (var c = 7; c >= 0; c--) aboveAt(c)].swizzle();
+        [for (var c = 7; c >= 0; c--) aboveAt(c)].concat();
     rec.input('left').srcConnection! <=
         [
           for (var r = 7; r >= 0; r--)
             (r < 4
                 ? mux(firstCol, Const(128, width: 8), leftCol[r])
                 : Const(128, width: 8)),
-        ].swizzle();
+        ].concat();
     rec.input('above_left').srcConnection! <= aboveLeftPix();
     Logic recon(int r, int c) =>
         rec.output('recon').getRange((r * 8 + c) * 8, (r * 8 + c) * 8 + 8);
@@ -194,7 +194,7 @@ class HarborDecodeFrameIntra extends BridgeModule {
     ]);
 
     output('frame') <=
-        [for (var i = fw * fh - 1; i >= 0; i--) frame[i]].swizzle();
+        [for (var i = fw * fh - 1; i >= 0; i--) frame[i]].concat();
     output('done') <= state.eq(Const(fDone, width: 2));
   }
 }

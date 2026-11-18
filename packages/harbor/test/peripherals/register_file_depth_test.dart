@@ -24,7 +24,7 @@ void main() {
             );
             expect(rf.readLatency, 1);
             await rf.build();
-            final sv = rf.generateSynth();
+            final sv = rf.dumpSystemVerilog();
             expect(
               RegExp(r'RAMB36E1 #').allMatches(sv).length,
               ((entries + 1023) ~/ 1024) * ((width + 31) ~/ 32) * ports,
@@ -53,7 +53,7 @@ void main() {
         target: ecp5,
       );
       await rf.build();
-      final sv = rf.generateSynth();
+      final sv = rf.dumpSystemVerilog();
       expect(
         RegExp(r'DP16KD #').allMatches(sv).length,
         ((entries + 2047) ~/ 2048) * 4 * 2,
@@ -71,7 +71,7 @@ void main() {
         target: ice40,
       );
       await rf.build();
-      final sv = rf.generateSynth();
+      final sv = rf.dumpSystemVerilog();
       expect(
         RegExp(r'SB_RAM40_4KNR ').allMatches(sv).length,
         ((entries + 255) ~/ 256) * 2,
@@ -126,7 +126,7 @@ void main() {
     expect(names['flop'], isNot(names['ebr']));
     expect(names['flop'], endsWith('_flop'));
     expect(names['ebr'], endsWith('_ecp5'));
-    expect(top.generateSynth(), contains(names['ebr']));
+    expect(top.dumpSystemVerilog(), contains(names['ebr']));
   });
 }
 

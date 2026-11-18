@@ -16,6 +16,7 @@ void main() {
         HarborFabricKind.tilelink,
         fabricPeriod: 26,
         seed: 2,
+        longPart: 2,
       );
     },
     timeout: const Timeout(Duration(hours: 6)),

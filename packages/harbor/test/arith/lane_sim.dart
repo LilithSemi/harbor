@@ -359,7 +359,7 @@ class LaneSim {
         }
       };
     }
-    if (g is Swizzle) {
+    if (g is Concat) {
       return () {
         var k = 0;
         for (final part in ins) {

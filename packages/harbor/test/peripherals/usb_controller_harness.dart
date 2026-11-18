@@ -273,8 +273,8 @@ buildUsbControllerHarness({
     busDataWidth: busDataWidth,
   );
 
-  final clk = SimpleClockGenerator(busPeriod).clk;
-  final usbClk = SimpleClockGenerator(usbPeriod).clk;
+  final clk = SimpleClockGenerator(busPeriod + (busPeriod & 1)).clk;
+  final usbClk = SimpleClockGenerator(usbPeriod + (usbPeriod & 1)).clk;
   final reset = Logic(name: 'reset');
   final usbReset = Logic(name: 'usb_reset');
   final dp = Logic(name: 'dp');

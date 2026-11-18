@@ -83,7 +83,7 @@ Future<_Result> _run(
   int framePeriod = 2000,
 }) async {
   const period = 10;
-  final clk = SimpleClockGenerator(period).clk;
+  final clk = SimpleClockGenerator(period + (period & 1)).clk;
   final reset = Logic(name: 'reset');
   final on = Logic(name: 'on');
   final stall = Logic(name: 'stall');
@@ -259,7 +259,7 @@ void main() {
     () async {
       for (final r in HdmiAudioRate.values) {
         const period = 10;
-        final clk = SimpleClockGenerator(period).clk;
+        final clk = SimpleClockGenerator(period + (period & 1)).clk;
         final reset = Logic();
         final sel = Logic(width: 2);
         final gen = HdmiAudioRateGen(

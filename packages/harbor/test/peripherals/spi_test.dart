@@ -34,6 +34,59 @@ void main() {
       expect(dt.reg.start, equals(0x10002000));
     });
 
+    test('caller children follow the SD slot on the DT node', () {
+      final spi = HarborSpiController(
+        baseAddress: 0x10002000,
+        sdCard: true,
+        children: const [HarborDeviceTreeChild(name: 'dev@1')],
+      );
+      final names = [for (final c in spi.dtNode.children) c.name];
+      expect(names, equals(['mmc@0', 'dev@1']));
+      final plain = HarborSpiController(baseAddress: 0x10002000);
+      expect(plain.dtNode.children, isEmpty);
+    });
+
+    test('a child needs a chip select the controller has', () {
+      expect(
+        () => HarborSpiController(
+          baseAddress: 0x1000,
+          children: const [
+            HarborDeviceTreeChild(name: 'dev@1', properties: {'reg': 1}),
+          ],
+        ),
+        throwsA(isA<ArgumentError>().having((e) => e.name, 'name', 'children')),
+      );
+      expect(
+        HarborSpiController(
+          baseAddress: 0x1000,
+          csCount: 2,
+          children: const [
+            HarborDeviceTreeChild(name: 'dev@1', properties: {'reg': 1}),
+          ],
+        ).dtNode.children,
+        hasLength(1),
+      );
+    });
+
+    test('a child cannot take the chip select of the SD card', () {
+      for (final child in const [
+        HarborDeviceTreeChild(name: 'dev@0', properties: {'reg': 0}),
+        HarborDeviceTreeChild(name: 'mmc@0', properties: {'reg': 1}),
+      ]) {
+        expect(
+          () => HarborSpiController(
+            baseAddress: 0x1000,
+            csCount: 2,
+            sdCard: true,
+            children: [child],
+          ),
+          throwsA(
+            isA<ArgumentError>().having((e) => e.name, 'name', 'children'),
+          ),
+        );
+      }
+    });
+
     test('supports both bus protocols', () {
       final wb = HarborSpiController(
         baseAddress: 0x1000,

@@ -108,7 +108,7 @@ class HarborIntraReconBlockSeq extends BridgeModule {
       for (var c = 0; c < bs; c++) {
         final p = predRow.getRange(c * 8, c * 8 + 8).zeroExtend(18);
         final res = residualAt(c); // 16b two's complement
-        final sum = (p + [res[15].replicate(2), res].swizzle()).getRange(0, 18);
+        final sum = (p + [res[15].replicate(2), res].concat()).getRange(0, 18);
         // signed clip to [0, 255]: negative -> 0, > 255 -> 255.
         final neg = sum[17];
         final big = sum.getRange(8, 18).or(); // any bit >= 8 set -> > 255
@@ -130,8 +130,7 @@ class HarborIntraReconBlockSeq extends BridgeModule {
     final blk = [
       for (var i = 0; i < bs * bs; i++) Logic(name: 'b_$i', width: 8),
     ];
-    output('block') <=
-        [for (var i = bs * bs - 1; i >= 0; i--) blk[i]].swizzle();
+    output('block') <= [for (var i = bs * bs - 1; i >= 0; i--) blk[i]].concat();
 
     const sIdle = 0, sTxWait = 1, sRows = 2, sDone = 3;
     final st = Logic(name: 'st', width: 2);

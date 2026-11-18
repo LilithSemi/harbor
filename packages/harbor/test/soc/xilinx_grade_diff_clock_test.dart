@@ -67,7 +67,7 @@ void main() {
       s.addPeripheral(HarborUart(baseAddress: 0x10000000));
       await s.build();
       expect(s.inputs.keys, containsAll(['clk', 'clk_n']));
-      final sv = s.generateSynth();
+      final sv = s.dumpSystemVerilog();
       expect(sv, contains(RegExp(r'IBUFDS\s+sysclk_ibufds')));
       expect(s.boardClk.name, HarborFpgaTarget.differentialClockNet);
     });
@@ -78,7 +78,7 @@ void main() {
       await s.build();
       expect(s.inputs.keys, isNot(contains('clk_n')));
       expect(s.boardClk, same(s.input('clk')));
-      expect(s.generateSynth(), isNot(contains('IBUFDS')));
+      expect(s.dumpSystemVerilog(), isNot(contains('IBUFDS')));
     });
 
     test('a non-Xilinx target refuses it', () {

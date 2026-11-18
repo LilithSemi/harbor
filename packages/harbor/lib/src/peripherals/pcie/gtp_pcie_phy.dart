@@ -782,7 +782,7 @@ class HarborGtpPciePhy extends Module {
     final timedOut = Logic(name: 'timed_out');
     final rateFail = Logic(name: 'rate_fail');
 
-    Const s(HarborGtpResetState v) => Const(v.code, width: 4);
+    Logic s(HarborGtpResetState v) => Const(v.code, width: 4);
     // The timer compares are registered: hit_n is high when the timer was
     // n - 2 in the last cycle. timer_zero is high when the timer was cleared
     // at the last edge, so the timer did not count up.
@@ -1114,5 +1114,5 @@ class HarborGtpPciePhy extends Module {
   static const _rBack = 3;
   static const _rDone = 4;
 
-  static Const _r(int v) => Const(v, width: 3);
+  static Logic _r(int v) => Const(v, width: 3);
 }

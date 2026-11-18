@@ -50,7 +50,7 @@ class HarborDeblock4 extends BridgeModule {
 
     // arithmetic shift right.
     Logic ashr(Logic x, int sh) =>
-        [x[w - 1].replicate(sh), x.getRange(sh, w)].swizzle();
+        [x[w - 1].replicate(sh), x.getRange(sh, w)].concat();
 
     final p1 = input('p1'),
         p0 = input('p0'),

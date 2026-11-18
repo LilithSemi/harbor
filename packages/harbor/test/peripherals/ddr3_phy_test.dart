@@ -40,11 +40,12 @@ void main() {
       );
 
       await phy.build();
-      final sv = phy.generateSynth();
+      final sv = phy.dumpSystemVerilog();
 
       expect(sv, contains('IDELAYCTRL'));
       expect(sv, contains('OBUFDS'));
-      expect(sv, contains('ODDR'));
+      expect(sv, contains('ck_oserdes'));
+      expect(sv, isNot(contains('ck_oddr')));
       // Read-return port widths track the x16 geometry.
       expect(phy.iserdesData.width, p.dqBits * p.lanes * 8); // 128
       expect(phy.iserdesDqs.width, p.lanes * 8); // 16
@@ -87,7 +88,7 @@ void main() {
       );
 
       await phy.build();
-      final sv = phy.generateSynth();
+      final sv = phy.dumpSystemVerilog();
 
       // One command SERDES per command-word bit.
       expect(RegExp('cmd_oserdes').allMatches(sv).length, cmdLen);
@@ -144,7 +145,7 @@ void main() {
       );
 
       await phy.build();
-      final sv = phy.generateSynth();
+      final sv = phy.dumpSystemVerilog();
 
       // One write serdes, IOBUF, read IDELAY and read ISERDES per DQ pin.
       expect(RegExp('dq_oserdes').allMatches(sv).length, dq);
@@ -194,7 +195,7 @@ void main() {
       );
 
       await phy.build();
-      final sv = phy.generateSynth();
+      final sv = phy.dumpSystemVerilog();
 
       // One DM serdes+OBUF per lane, differential DQS IOBUFDS per lane.
       expect(RegExp('dm_oserdes').allMatches(sv).length, p.lanes);

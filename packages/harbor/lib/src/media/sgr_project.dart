@@ -59,7 +59,7 @@ class HarborSgrProject extends BridgeModule {
     final shifted = [
       pre2[w - 1].replicate(shift),
       pre2.getRange(shift, w),
-    ].swizzle();
+    ].concat();
 
     // int16_t truncation of the rounded projection, then clip_pixel_highbd(bd).
     final outw = shifted.getRange(0, 16);

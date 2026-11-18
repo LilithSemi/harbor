@@ -39,7 +39,7 @@ class HarborFrameDeblock extends BridgeModule {
     Logic filterLine(List<Logic> line8) {
       final f = HarborDeblockFilter(name: 'flt_${inst++}');
       addSubModule(f);
-      f.input('line').srcConnection! <= line8.reversed.toList().swizzle();
+      f.input('line').srcConnection! <= line8.reversed.toList().concat();
       f.input('blimit').srcConnection! <= blimit;
       f.input('limit').srcConnection! <= limit;
       f.input('thresh').srcConnection! <= thresh;
@@ -71,6 +71,6 @@ class HarborFrameDeblock extends BridgeModule {
       }
     }
 
-    output('out') <= outPx.reversed.toList().swizzle();
+    output('out') <= outPx.reversed.toList().concat();
   }
 }

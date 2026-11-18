@@ -286,7 +286,7 @@ class HarborSram extends BridgeModule
       Const(0, width: 1),
       wordAddr.getRange(0, addrBits).zeroExtend(blockWordDepth.bitLength - 1),
       Const(0, width: 5),
-    ].swizzle().getRange(0, blockAddrWidth);
+    ].concat().getRange(0, blockAddrWidth);
 
     final bankOutputs = <Logic>[];
     for (var d = 0; d < depthBlocks; d++) {
@@ -308,7 +308,7 @@ class HarborSram extends BridgeModule
             (bitLo ~/ 8 + b) < bytesPerWord
                 ? (stb & we & bankEnable & sel[bitLo ~/ 8 + b])
                 : Const(0),
-        ].swizzle();
+        ].concat();
 
         final bram = XilinxRamb36e1(name: 'bram_${d}_$w');
         addSubModule(bram);
@@ -338,7 +338,7 @@ class HarborSram extends BridgeModule
 
       final bankData = sliceOutputs.length == 1
           ? sliceOutputs.first.zeroExtend(dataWidth)
-          : sliceOutputs.rswizzle().getRange(0, dataWidth);
+          : sliceOutputs.rconcat().getRange(0, dataWidth);
       bankOutputs.add(bankData);
     }
 
@@ -420,7 +420,7 @@ class HarborSram extends BridgeModule
         final localAddr = [
           wordAddr.getRange(0, addrBits).zeroExtend(bramAddrWidth - 3),
           Const(0, width: 3),
-        ].swizzle();
+        ].concat();
 
         final bram = Ecp5Dp16kd(
           name: 'bram_${d}_$lane',
@@ -446,7 +446,7 @@ class HarborSram extends BridgeModule
       }
 
       // Concatenate byte lanes for this bank
-      final bankData = bankDataParts.rswizzle().getRange(0, dataWidth);
+      final bankData = bankDataParts.rconcat().getRange(0, dataWidth);
 
       bankOutputs.add(bankData);
     }
@@ -543,14 +543,14 @@ class HarborSram extends BridgeModule
                 ? sel[(bitLo + n * 4) ~/ 8]
                 : Const(0),
         ];
-        spram.input('MASKWREN').srcConnection! <= maskBits.swizzle();
+        spram.input('MASKWREN').srcConnection! <= maskBits.concat();
 
         sliceOutputs.add(spram.output('DATAOUT').getRange(0, sliceWidth));
       }
 
       final bankData = sliceOutputs.length == 1
           ? sliceOutputs.first.zeroExtend(dataWidth)
-          : sliceOutputs.rswizzle().getRange(0, dataWidth);
+          : sliceOutputs.rconcat().getRange(0, dataWidth);
       bankOutputs.add(bankData);
     }
 
@@ -618,7 +618,7 @@ class HarborSram extends BridgeModule
           datIn.getRange(b * 8, b * 8 + 8),
           datOut.getRange(b * 8, b * 8 + 8),
         ),
-    ].rswizzle().named('rmw_merged');
+    ].rconcat().named('rmw_merged');
     Sequential(clk, [
       If(
         _reset,
@@ -725,7 +725,7 @@ class HarborSram extends BridgeModule
             old.getRange(b * 8, b * 8 + 8),
           ),
       ];
-      return bytes.rswizzle();
+      return bytes.rconcat();
     }
 
     // For simulation or small memories: Yosys will infer BRAM from this
@@ -872,7 +872,7 @@ class _PdkSramMacro extends BridgeModule {
         ? [
             for (var b = dataWidth - 1; b >= 0; b--)
               macro.level('writeMask', input(pin('writeMask')))[b ~/ maskBits],
-          ].swizzle()
+          ].concat()
         : Const(1, width: dataWidth, fill: true);
     final mem = [
       for (var i = 0; i < words; i++) Logic(name: 'm$i', width: dataWidth),

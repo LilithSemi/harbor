@@ -184,7 +184,7 @@ void main() {
         const HarborFpgaTarget.ecp5(device: 'lfe5u-85f', package: 'CABGA381'),
       );
       await h.build();
-      final sv = h.generateSynth();
+      final sv = h.dumpSystemVerilog();
       expect('EHXPLLL'.allMatches(sv).length, equals(1));
       expect(sv, contains('CLKOS_ENABLE'));
       expect(sv, contains('CLKOS_DIV'));

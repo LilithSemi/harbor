@@ -22,7 +22,7 @@ class HarborUvlcReader extends BridgeModule {
 
     final bytes = input('bytes');
     Logic byte(int i) => bytes.getRange(i * 8, i * 8 + 8);
-    final stream = [for (var i = 0; i < maxBytes; i++) byte(i)].swizzle();
+    final stream = [for (var i = 0; i < maxBytes; i++) byte(i)].concat();
 
     final off = input('bit_offset');
     final shifted = (stream << off.zeroExtend(totalBits)).getRange(

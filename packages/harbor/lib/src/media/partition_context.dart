@@ -54,6 +54,6 @@ class HarborPartitionContext extends BridgeModule {
     final aboveP = (input('above_ctx') >>> bsl.zeroExtend(8)).getRange(0, 1);
     final leftP = (input('left_ctx') >>> bsl.zeroExtend(8)).getRange(0, 1);
     output('ctx') <=
-        ([leftP, aboveP].swizzle()).getRange(0, 2); // left*2 + above
+        ([leftP, aboveP].concat()).getRange(0, 2); // left*2 + above
   }
 }

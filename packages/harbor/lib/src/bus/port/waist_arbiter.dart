@@ -228,7 +228,7 @@ class HarborWaistArbiter extends Module {
             s[i].reqWrite,
             s[i].reqExclusive,
             s[i].reqId.zeroExtend(sw),
-          ].swizzle(),
+          ].concat(),
           outReady: inReady[i],
           clear: flush == null ? null : fl[i],
         ),
@@ -273,8 +273,8 @@ class HarborWaistArbiter extends Module {
       if (iw > xb + sw) Const(0, width: iw - xb - sw),
       g,
       word.getRange(0, sw),
-    ].swizzle();
-    final reqWord = [word.getRange(sw), reqId].swizzle().named('req_word');
+    ].concat();
+    final reqWord = [word.getRange(sw), reqId].concat().named('req_word');
     final reqSlice = harborRegSlice(
       clk,
       reset,
@@ -330,7 +330,7 @@ class HarborWaistArbiter extends Module {
       reset,
       'wdata',
       inValid: wValid,
-      inData: [wLastQ, wStrb, wData].swizzle(),
+      inData: [wLastQ, wStrb, wData].concat(),
       outReady: m.wdataReady,
     );
     for (var i = 0; i < nSrc; i++) {
@@ -358,7 +358,7 @@ class HarborWaistArbiter extends Module {
         m.rdataLast,
         m.rdataErr,
         m.rdataData,
-      ].swizzle(),
+      ].concat(),
       outReady: rReady,
     );
     // The waist allows RDATA_READY and WRESP_READY only while a response
@@ -377,7 +377,7 @@ class HarborWaistArbiter extends Module {
         m.wrespId.getRange(0, xb + sw),
         m.wrespExOkay,
         m.wrespErr,
-      ].swizzle(),
+      ].concat(),
       outReady: bReady,
     );
     m.wrespReady <= bSlice.ready & mbOwed.neq(0) & ~reset;

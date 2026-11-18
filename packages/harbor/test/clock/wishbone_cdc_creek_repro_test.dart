@@ -30,8 +30,8 @@ void main() {
       syncStages: syncStages,
     );
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
     final sCyc = Logic(name: 's_cyc');
@@ -113,7 +113,7 @@ void main() {
     (s: 40, m: 12), // 25 MHz : 83 MHz
     (s: 48, m: 14),
     (s: 40, m: 10), // integer 4:1 (mesochronous-like)
-    (s: 33, m: 10),
+    (s: 34, m: 10),
   ]) {
     for (final ackDelay in const [1, 4, 8]) {
       test(

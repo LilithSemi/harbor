@@ -382,7 +382,7 @@ class HarborPcieEndpoint extends Module {
     if (watch) addOutput('link_retrains', width: 8) <= phy.linkRetrains!;
     addOutput('reset_status', width: 64) <= counters.status;
     addOutput('completer_id', width: 16) <=
-        [busNumber, deviceNumber, functionNumber].swizzle();
+        [busNumber, deviceNumber, functionNumber].concat();
     addOutput('rx_data', width: 64) <= stream.rxData;
     addOutput('rx_keep', width: 8) <= stream.rxKeep;
     addOutput('rx_last') <= stream.rxLast;

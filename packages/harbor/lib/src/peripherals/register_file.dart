@@ -69,6 +69,18 @@ class HarborRegisterFile extends BridgeModule {
   /// other entry.
   final bool reservedZero;
 
+  /// Opt in to the 64-bit-wide RAMB36E1 simple-dual-port backend for Xilinx
+  /// register files with one write port, one bank, and at most 64 data bits.
+  /// Each read port gets one 72-bit SDP block instead of two x36 TDP blocks.
+  /// The default stays on the existing x36 backend until users select it.
+  final bool useXilinxSdp72;
+
+  /// Adds a `wr_strb` input with one bit for each byte of the word. A write
+  /// changes only the bytes whose bit is set. It needs one write port, one
+  /// bank and a [dataWidth] that is a multiple of 8. Files without it keep
+  /// their layout.
+  final bool byteWrite;
+
   /// Read latency in cycles: 0 = combinational/mid-cycle read (flop array,
   /// iCE40 negedge EBR), 1 = registered full-cycle read (ECP5 posedge EBR). A
   /// non-zero latency keeps the read off the combinational ALU path (timing)
@@ -98,6 +110,13 @@ class HarborRegisterFile extends BridgeModule {
   /// of [numEntries]. Banking constrains only the write arbiter, not the
   /// physical layout (flops are naturally multi-read/multi-write).
   List<Logic>? _storage;
+
+  /// Byte strobe of the write port, or null without [byteWrite].
+  Logic? _wrStrb;
+
+  /// Write enable of byte [lane] of a block: [en] alone without [byteWrite].
+  Logic _laneWrite(Logic en, int lane) =>
+      _wrStrb == null || lane >= _wrStrb!.width ? en : en & _wrStrb![lane];
 
   /// Testbench hook to read an entry's value (simulation model only).
   LogicValue? getData(LogicValue addr) => _storage?[addr.toInt()].value;
@@ -152,17 +171,20 @@ class HarborRegisterFile extends BridgeModule {
     required int writeBufferDepth,
     required bool reservedZero,
     required String backend,
+    required bool byteWrite,
   }) =>
       'HarborRegisterFile_E${numEntries}_W${dataWidth}_'
       'R${numReadPorts}_W${numWritePorts}_B${numBanks}_'
       'L${readLatency}_BUF${writeBufferDepth}_Z${reservedZero ? 1 : 0}_'
-      '$backend';
+      '$backend${byteWrite ? '_BW' : ''}';
 
   /// Name of the storage backend that [target] selects for this shape.
   static String _backendName(
     HarborDeviceTarget? target,
     int numWritePorts,
     int numBanks,
+    int dataWidth,
+    bool useXilinxSdp72,
   ) {
     if (target is! HarborFpgaTarget) return 'flop';
     switch (target.vendor) {
@@ -172,7 +194,8 @@ class HarborRegisterFile extends BridgeModule {
         return 'ecp5';
       case HarborFpgaVendor.vivado:
       case HarborFpgaVendor.openXc7:
-        return (numWritePorts == 1 && numBanks == 1) ? 'xilinx' : 'flop';
+        if (numWritePorts != 1 || numBanks != 1) return 'flop';
+        return useXilinxSdp72 && dataWidth <= 64 ? 'xilinxSdp72' : 'xilinx';
     }
   }
 
@@ -184,6 +207,8 @@ class HarborRegisterFile extends BridgeModule {
     this.numBanks = 1,
     this.writeBufferDepth = 0,
     this.reservedZero = true,
+    this.useXilinxSdp72 = false,
+    this.byteWrite = false,
     HarborDeviceTarget? target,
     int? forceReadLatency,
     String? name,
@@ -211,7 +236,14 @@ class HarborRegisterFile extends BridgeModule {
                _defaultReadLatency(target, numWritePorts, numBanks),
            writeBufferDepth: writeBufferDepth,
            reservedZero: reservedZero,
-           backend: _backendName(target, numWritePorts, numBanks),
+           backend: _backendName(
+             target,
+             numWritePorts,
+             numBanks,
+             dataWidth,
+             useXilinxSdp72,
+           ),
+           byteWrite: byteWrite,
          ),
          name: name ?? 'regfile',
        ) {
@@ -227,6 +259,14 @@ class HarborRegisterFile extends BridgeModule {
     if (numEntries % numBanks != 0) {
       throw ArgumentError(
         'numEntries ($numEntries) must be divisible by numBanks ($numBanks).',
+      );
+    }
+    if (byteWrite &&
+        (numWritePorts != 1 || numBanks != 1 || dataWidth % 8 != 0)) {
+      throw ArgumentError(
+        'byteWrite needs one write port, one bank and whole bytes '
+        '(got numWritePorts=$numWritePorts, numBanks=$numBanks, '
+        'dataWidth=$dataWidth).',
       );
     }
     if (writeBufferDepth < 0) {
@@ -247,6 +287,10 @@ class HarborRegisterFile extends BridgeModule {
       createPort(_wrName(w, 'data'), PortDirection.input, width: dataWidth);
       createPort(_wrName(w, 'ready'), PortDirection.output);
     }
+    if (byteWrite) {
+      createPort('wr_strb', PortDirection.input, width: dataWidth ~/ 8);
+    }
+    _wrStrb = byteWrite ? input('wr_strb') : null;
 
     final clk = input('clk');
     final reset = input('reset');
@@ -281,6 +325,7 @@ class HarborRegisterFile extends BridgeModule {
             target.vendor == HarborFpgaVendor.openXc7) &&
         numWritePorts == 1 &&
         numBanks == 1;
+    final isXilinxSdp72 = isXilinxBram && useXilinxSdp72 && dataWidth <= 64;
 
     if ((isIce40Ebr || isEcp5Ebr) && (numWritePorts != 1 || numBanks != 1)) {
       // Banked multi-write EBR is project_hdl_dualissue Phase 2.
@@ -309,6 +354,16 @@ class HarborRegisterFile extends BridgeModule {
       } else {
         _buildEcp5Ebr(clk, rdAddrs, rdDatas, wrEns[0], wrAddrs[0], wrDatas[0]);
       }
+      wrReadys[0] <= ~reset;
+    } else if (isXilinxSdp72) {
+      _buildXilinxSdp72(
+        clk,
+        rdAddrs,
+        rdDatas,
+        wrEns[0],
+        wrAddrs[0],
+        wrDatas[0],
+      );
       wrReadys[0] <= ~reset;
     } else if (isXilinxBram) {
       _buildXilinxBram(clk, rdAddrs, rdDatas, wrEns[0], wrAddrs[0], wrDatas[0]);
@@ -392,7 +447,32 @@ class HarborRegisterFile extends BridgeModule {
       'rfRdwHitQ_$r',
     );
     final data = _registerN(clk, wrData, readLatency, 'rfRdwData_$r');
-    return mux(hit, data, ram).named('rfRead_$r');
+    final strb = _wrStrb;
+    if (strb == null) return mux(hit, data, ram).named('rfRead_$r');
+    final strbQ = _registerN(clk, strb, readLatency, 'rfRdwStrb_$r');
+    return [
+      for (var l = 0; l < strb.width; l++)
+        mux(
+          hit & strbQ[l],
+          data.getRange(l * 8, l * 8 + 8),
+          ram.getRange(l * 8, l * 8 + 8),
+        ),
+    ].rconcat().named('rfRead_$r');
+  }
+
+  /// [data] where [en] is high, with only the strobed bytes under
+  /// [byteWrite]. Elsewhere [old].
+  Logic _mergeBytes(Logic data, Logic old, [Logic? en]) {
+    final strb = _wrStrb;
+    if (strb == null) return en == null ? data : mux(en, data, old);
+    return [
+      for (var l = 0; l < strb.width; l++)
+        mux(
+          en == null ? strb[l] : en & strb[l],
+          data.getRange(l * 8, l * 8 + 8),
+          old.getRange(l * 8, l * 8 + 8),
+        ),
+    ].rconcat();
   }
 
   /// Number of block RAMs of `1 << blockBits` words that hold every entry.
@@ -488,7 +568,15 @@ class HarborRegisterFile extends BridgeModule {
           ebr.input('WDATA').srcConnection! <=
               wrData.getRange(lo, hi).zeroExtend(ebrWidth);
           // MASK is a no-write mask. 0 writes every bit.
-          ebr.input('MASK').srcConnection! <= Const(0, width: ebrWidth);
+          ebr.input('MASK').srcConnection! <=
+              (_wrStrb == null
+                  ? Const(0, width: ebrWidth)
+                  : [
+                      for (var b = 0; b < ebrWidth; b++)
+                        lo + b < dataWidth
+                            ? ~_wrStrb![(lo + b) ~/ 8]
+                            : Const(0),
+                    ].rconcat());
 
           // Read port (negedge of clk, internal to the NR primitive, whose
           // read clock port is RCLKN).
@@ -502,7 +590,7 @@ class HarborRegisterFile extends BridgeModule {
         words.add(
           slices.length == 1
               ? slices.first.zeroExtend(dataWidth)
-              : slices.rswizzle().getRange(0, dataWidth),
+              : slices.rconcat().getRange(0, dataWidth),
         );
       }
 
@@ -547,13 +635,15 @@ class HarborRegisterFile extends BridgeModule {
     const ebrWidth = 9;
     const ebrAddrBits = 14;
     const blockBits = ebrAddrBits - 3;
-    final widthEbrs = (dataWidth + ebrWidth - 1) ~/ ebrWidth;
+    // With byte writes each block holds one byte, so its WE is that byte.
+    final sliceBits = byteWrite ? 8 : ebrWidth;
+    final widthEbrs = (dataWidth + sliceBits - 1) ~/ sliceBits;
     final depthEbrs = _depthBlocks(blockBits);
     // x9 addressing: the word index sits in AD[13:3], low 3 bits tied zero.
     // An x18 write needs its byte enables in AD[1:0]. x9 is the mode that
     // silicon tests showed to work, so it stays.
     Logic toAd(Logic a) =>
-        [_blockAddr(a, blockBits, blockBits), Const(0, width: 3)].swizzle();
+        [_blockAddr(a, blockBits, blockBits), Const(0, width: 3)].concat();
     final wrAd = toAd(wrAddr);
 
     for (var r = 0; r < rdAddrs.length; r++) {
@@ -565,8 +655,8 @@ class HarborRegisterFile extends BridgeModule {
         final slices = <Logic>[];
 
         for (var w = 0; w < widthEbrs; w++) {
-          final lo = w * ebrWidth;
-          final hi = (lo + ebrWidth) > dataWidth ? dataWidth : lo + ebrWidth;
+          final lo = w * sliceBits;
+          final hi = (lo + sliceBits) > dataWidth ? dataWidth : lo + sliceBits;
           final sliceWidth = hi - lo;
 
           // Separate write and read ports, so a write does not take the read
@@ -577,7 +667,7 @@ class HarborRegisterFile extends BridgeModule {
             dataWidthB: ebrWidth,
             clkA: clk,
             ceA: Const(1),
-            weA: blockWrite,
+            weA: _laneWrite(blockWrite, byteWrite ? w : 0),
             oceA: Const(0),
             rstA: Const(0),
             adA: wrAd,
@@ -596,7 +686,7 @@ class HarborRegisterFile extends BridgeModule {
         words.add(
           slices.length == 1
               ? slices.first.zeroExtend(dataWidth)
-              : slices.rswizzle().getRange(0, dataWidth),
+              : slices.rconcat().getRange(0, dataWidth),
         );
       }
 
@@ -621,6 +711,105 @@ class HarborRegisterFile extends BridgeModule {
           rdAddrs[r].eq(Const(0, width: addrWidth)),
           readLatency,
           'rfEbrX0_$r',
+        );
+        rdDatas[r] <= mux(isX0, Const(0, width: dataWidth), raw);
+      } else {
+        rdDatas[r] <= raw;
+      }
+    }
+  }
+
+  /// Opt-in Xilinx 7-series RAMB36E1 simple-dual-port storage. One 72-bit
+  /// block stores each word (64 data bits plus eight unused parity bits), so
+  /// one block serves each read replica. Port A reads and port B writes. This
+  /// preserves the one-cycle synchronous-read latency of the x36 backend.
+  void _buildXilinxSdp72(
+    Logic clk,
+    List<Logic> rdAddrs,
+    List<Logic> rdDatas,
+    Logic wrEn,
+    Logic wrAddr,
+    Logic wrData,
+  ) {
+    if (dataWidth < 1 || dataWidth > 64) {
+      throw ArgumentError(
+        'RAMB36E1 SDP72 register files require dataWidth in 1..64 '
+        '(got $dataWidth).',
+      );
+    }
+
+    // A RAMB36E1 in SDP72 mode has 512 words, with the word-address field in
+    // ADDR[14:6]. Keep the low six pins zero; the packer ties pin 15 high.
+    const blockBits = 9;
+    final depthBlocks = _depthBlocks(blockBits);
+    Logic toAd(Logic a) => [
+      Const(0, width: 1),
+      _blockAddr(a, blockBits, blockBits),
+      Const(0, width: 6),
+    ].concat().getRange(0, 16);
+
+    final wrAd = toAd(wrAddr);
+    final paddedWrite = wrData.zeroExtend(64);
+    final enabledBytes = (dataWidth + 7) ~/ 8;
+
+    for (var r = 0; r < rdAddrs.length; r++) {
+      final rdAd = toAd(rdAddrs[r]);
+      final depthWords = <Logic>[];
+
+      for (var d = 0; d < depthBlocks; d++) {
+        final blockWrite = _depthWrite(wrEn, wrAddr, d, blockBits);
+        final bram = XilinxRamb36e1(
+          name: 'rf_sdp72_r${r}_d$d',
+          ramMode: 'SDP',
+          readWidthA: 72,
+          writeWidthA: 0,
+          readWidthB: 0,
+          writeWidthB: 72,
+        );
+        addSubModule(bram);
+
+        // SDP x72 maps the read port to A and write port to B. The 64 data
+        // bits span DIADI/DIBDI and DOADO/DOBDO; the parity pins carry zeros.
+        bram.input('CLKARDCLK').srcConnection! <= clk;
+        bram.input('ENARDEN').srcConnection! <= Const(1);
+        bram.input('ADDRARDADDR').srcConnection! <= rdAd;
+        bram.input('WEA').srcConnection! <= Const(0, width: 4);
+        bram.input('REGCEAREGCE').srcConnection! <= Const(0);
+        bram.input('RSTRAMARSTRAM').srcConnection! <= Const(0);
+        bram.input('DIADI').srcConnection! <= paddedWrite.getRange(0, 32);
+        bram.input('DIPADIP').srcConnection! <= Const(0, width: 4);
+
+        bram.input('CLKBWRCLK').srcConnection! <= clk;
+        bram.input('ENBWREN').srcConnection! <= blockWrite;
+        bram.input('ADDRBWRADDR').srcConnection! <= wrAd;
+        bram.input('WEBWE').srcConnection! <=
+            [
+              for (var lane = 0; lane < 8; lane++)
+                lane < enabledBytes ? _laneWrite(blockWrite, lane) : Const(0),
+            ].rconcat();
+        bram.input('REGCEB').srcConnection! <= Const(0);
+        bram.input('RSTRAMB').srcConnection! <= Const(0);
+        bram.input('DIBDI').srcConnection! <= paddedWrite.getRange(32, 64);
+        bram.input('DIPBDIP').srcConnection! <= Const(0, width: 4);
+
+        final readWord = [
+          bram.output('DOADO'),
+          bram.output('DOBDO'),
+        ].rconcat().getRange(0, 64);
+        depthWords.add(readWord.getRange(0, dataWidth));
+      }
+
+      final rawBram = _depthSelect(clk, r, rdAddrs[r], depthWords, blockBits);
+      // SDP read/write collisions are implementation-defined at the RAM
+      // outputs. The existing write-first bypass keeps Harbor semantics.
+      final raw = _rdwBypass(clk, r, wrEn, wrAddr, wrData, rdAddrs[r], rawBram);
+
+      if (reservedZero) {
+        final isX0 = _registerN(
+          clk,
+          rdAddrs[r].eq(Const(0, width: addrWidth)),
+          readLatency,
+          'rfSdp72X0_$r',
         );
         rdDatas[r] <= mux(isX0, Const(0, width: dataWidth), raw);
       } else {
@@ -656,7 +845,7 @@ class HarborRegisterFile extends BridgeModule {
       Const(0, width: 1),
       _blockAddr(a, blockBits, blockBits),
       Const(0, width: 5),
-    ].swizzle().getRange(0, 16);
+    ].concat().getRange(0, 16);
     final wrAd = toAd(wrAddr);
 
     for (var r = 0; r < rdAddrs.length; r++) {
@@ -684,7 +873,9 @@ class HarborRegisterFile extends BridgeModule {
               wrData.getRange(lo, hi).zeroExtend(blockDataWidth);
           bram.input('DIPADIP').srcConnection! <= Const(0, width: 4);
           bram.input('WEA').srcConnection! <=
-              [blockWrite, blockWrite, blockWrite, blockWrite].swizzle();
+              [
+                for (var i = 0; i < 4; i++) _laneWrite(blockWrite, w * 4 + i),
+              ].rconcat();
           bram.input('REGCEAREGCE').srcConnection! <= Const(0);
           bram.input('RSTRAMARSTRAM').srcConnection! <= Const(0);
 
@@ -703,7 +894,7 @@ class HarborRegisterFile extends BridgeModule {
 
         final word = slices.length == 1
             ? slices.first.zeroExtend(dataWidth)
-            : slices.rswizzle().getRange(0, dataWidth);
+            : slices.rconcat().getRange(0, dataWidth);
         depthWords.add(word);
       }
       final rawBram = _depthSelect(clk, r, rdAddrs[r], depthWords, blockBits);
@@ -835,7 +1026,10 @@ class HarborRegisterFile extends BridgeModule {
                   bankWinAddr[entry % numBanks].eq(
                     Const(entry, width: addrWidth),
                   ),
-              then: [storage[entry] < bankWinData[entry % numBanks]],
+              then: [
+                storage[entry] <
+                    _mergeBytes(bankWinData[entry % numBanks], storage[entry]),
+              ],
             ),
         ],
       ),
@@ -883,7 +1077,7 @@ class HarborRegisterFile extends BridgeModule {
       final collide = (bwEn & bwAddr.eq(rdAddrs[r]) & notZero).named(
         'rfFlopRdw_$r',
       );
-      final bypassed = mux(collide, bwData, rdComb[r]);
+      final bypassed = _mergeBytes(bwData, rdComb[r], collide);
       rdDatas[r] <= _registerN(clk, bypassed, readLatency, 'rfRdLat_$r');
     }
   }

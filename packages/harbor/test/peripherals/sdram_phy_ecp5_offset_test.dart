@@ -25,7 +25,7 @@ void main() {
       expect(
         sdramPhyCaptureOk(
           periodPs: 8000,
-          tAcNs: 5.0,
+          casLatency: 3,
           fpgaToSdramNs: 7.5,
           phy: phy,
         ),
@@ -48,7 +48,7 @@ void main() {
       expect(
         sdramPhyCaptureOk(
           periodPs: 8000,
-          tAcNs: 5.0,
+          casLatency: 3,
           fpgaToSdramNs: 4.0,
           phy: phy,
         ),

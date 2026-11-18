@@ -20,7 +20,7 @@ void main() {
     expect(rf.readLatency, equals(1));
 
     await rf.build();
-    final sv = rf.generateSynth();
+    final sv = rf.dumpSystemVerilog();
     expect(sv, contains('RAMB36E1'));
     expect(sv, isNot(contains('DP16KD')));
   });
@@ -30,7 +30,7 @@ void main() {
     expect(rf.readLatency, equals(1));
 
     await rf.build();
-    final sv = rf.generateSynth();
+    final sv = rf.dumpSystemVerilog();
     expect(sv, contains('DP16KD'));
     expect(sv, isNot(contains('RAMB36E1')));
   });
@@ -45,7 +45,7 @@ void main() {
     expect(rf.readLatency, equals(0));
 
     await rf.build();
-    final sv = rf.generateSynth();
+    final sv = rf.dumpSystemVerilog();
     expect(sv, isNot(contains('RAMB36E1')));
   });
 

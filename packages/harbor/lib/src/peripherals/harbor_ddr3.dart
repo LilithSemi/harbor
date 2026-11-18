@@ -12,6 +12,8 @@ import '../bus/port/memory_waist.dart';
 import '../bus/port/port_cdc.dart';
 import '../clock/cdc.dart';
 import '../soc/acpi.dart';
+import '../soc/board_zon.dart'
+    show HarborMemoryFormFactor, HarborMemoryInfo, HarborMemoryKind;
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../soc/target.dart';
@@ -118,6 +120,10 @@ class HarborDdr3 extends BridgeModule
   /// false (default), wb2 stays tied off and dtNode is unchanged from train=hw.
   final bool runtimeTrainable;
 
+  /// How the DRAM is fitted to the board. A socketed DRAM has a fitted size
+  /// that the build cannot know.
+  final HarborMemoryFormFactor memoryFormFactor;
+
   /// The fabric kind of [bus] and [trainBus].
   final HarborFabricKind protocol;
 
@@ -158,6 +164,13 @@ class HarborDdr3 extends BridgeModule
   /// and there is no PHY: the controller side of the PHY goes to the `phy_*`
   /// ports, for a model on `ddr_clk`.
   final bool fastSim;
+
+  /// Memory clock cycles that the controller reset guard keeps rst_n low
+  /// after the domain reset releases. The guard covers the openXC7 MMCM lock.
+  /// The JEDEC 200 us and 500 us waits stay in the init ROM. The default is
+  /// 4095. A shorter hold is for simulation only. [fastSim] fixes the hold at
+  /// 15 cycles, so a value other than 4095 with [fastSim] is refused.
+  final int powerOnCycles;
 
   /// Under Verilator, present the DRAM as a host-side C++ mmap model instead of
   /// a Verilated behavioral RAM. The memory bus is routed to top-level ports and
@@ -207,6 +220,7 @@ class HarborDdr3 extends BridgeModule
     this.ckPeriodPs = 3333,
     this.controllerGearRatio = 1,
     this.runtimeTrainable = false,
+    this.memoryFormFactor = HarborMemoryFormFactor.chip,
     this.simExternalMem = false,
     this.protocol = HarborFabricKind.wishbone,
     this.idWidth = 1,
@@ -216,6 +230,7 @@ class HarborDdr3 extends BridgeModule
     int? outstanding,
     int? readWords,
     this.fastSim = false,
+    this.powerOnCycles = 4095,
     this.writeCombine = false,
     int? readGap,
     super.name = 'ddr3',
@@ -243,6 +258,7 @@ class HarborDdr3 extends BridgeModule
                readWords ??
                defaultReadWords(outstanding ?? defaultOutstanding(protocol)),
            fastSim: fastSim,
+           powerOnCycles: powerOnCycles,
            writeCombine: writeCombine,
            readGap: readGap ?? defaultReadGap(protocol),
            exclusive: exclusive,
@@ -293,6 +309,20 @@ class HarborDdr3 extends BridgeModule
         this.outstanding,
         'outstanding',
         'must be >= 1',
+      );
+    }
+    if (powerOnCycles < 1 || powerOnCycles > 4095) {
+      throw ArgumentError.value(
+        powerOnCycles,
+        'powerOnCycles',
+        'must be 1 to 4095',
+      );
+    }
+    if (fastSim && powerOnCycles != 4095) {
+      throw ArgumentError.value(
+        powerOnCycles,
+        'powerOnCycles',
+        'fastSim fixes the hold at 15 cycles',
       );
     }
     final xilinx = switch (target) {
@@ -557,6 +587,7 @@ class HarborDdr3 extends BridgeModule
     required int outstanding,
     required int readWords,
     required bool fastSim,
+    required int powerOnCycles,
     required bool writeCombine,
     required int readGap,
     required HarborAxi4Exclusive? exclusive,
@@ -585,7 +616,8 @@ class HarborDdr3 extends BridgeModule
           '_d${busDataWidth}_ck${ckPeriodPs}_g$controllerGearRatio'
           '${runtimeTrainable ? '_rt' : ''}${writeCombine ? '_wc' : ''}$dm'
           '_${protocol.name}_i${idWidth}_n${outstanding}_q$cdc$burst'
-          '${fastSim ? '_fast' : ''}';
+          '${fastSim ? '_fast' : ''}'
+          '${powerOnCycles != 4095 ? '_p$powerOnCycles' : ''}';
     }
     final c = config;
     return harborStableDefinitionName(
@@ -605,6 +637,7 @@ class HarborDdr3 extends BridgeModule
         'rw$readWords',
         'rg$readGap',
         if (fastSim) 'fast',
+        if (powerOnCycles != 4095) 'p$powerOnCycles',
         ?exclusive?.tag,
       ],
     );
@@ -897,7 +930,7 @@ struct DramStore {
                 ctrl.calFailed ?? Const(0),
                 ctrl.calState.eq(Ddr3Controller.calStateDone) & ctrl.initDone,
                 ctrl.initDone,
-              ].swizzle(),
+              ].concat(),
         ],
       ),
     ]);
@@ -927,7 +960,7 @@ struct DramStore {
     hs.input('src_clk').srcConnection! <= ddrClk;
     hs.input('src_reset').srcConnection! <= ddrReset;
     hs.input('src_data').srcConnection! <=
-        [ctrl.calStarts, ctrl.calState].swizzle();
+        [ctrl.calStarts, ctrl.calState].concat();
     hs.input('src_valid').srcConnection! <= Const(1);
     hs.input('dst_clk').srcConnection! <= clk;
     hs.input('dst_reset').srcConnection! <= reset;
@@ -966,8 +999,8 @@ struct DramStore {
     int busDW,
     int busAW,
   ) {
-    // Power-on reset on the DDR clock: hold rst_n low for 4096 cycles after the
-    // domain reset releases (openXC7 MMCM LOCKED may never reach the fabric), the
+    // Power-on reset on the DDR clock: hold rst_n low for [powerOnCycles] cycles
+    // after the domain reset releases (openXC7 MMCM LOCKED may never reach the fabric), the
     // same guard the standalone harness proved.
     final porCnt = Logic(name: 'ddr_por_cnt', width: 12);
     final rstN = Logic(name: 'ddr_rst_n');
@@ -977,7 +1010,7 @@ struct DramStore {
         then: [porCnt < Const(0, width: 12), rstN < Const(0)],
         orElse: [
           If(
-            porCnt.lt(fastSim ? 15 : 4095),
+            porCnt.lt(fastSim ? 15 : powerOnCycles),
             then: [porCnt < porCnt + 1, rstN < Const(0)],
             orElse: [rstN < Const(1)],
           ),
@@ -1278,10 +1311,6 @@ struct DramStore {
       dqPad: dqPad,
       dqsPad: dqsPad,
       dqsNPad: dqsNPad,
-      himbaechel: switch (target) {
-        HarborFpgaTarget(useHimbaechel: true) => true,
-        _ => false,
-      },
     );
 
     // Lattice ECP5 PHY (gearRatio 1 only, so straight from the controller).
@@ -1502,6 +1531,23 @@ struct DramStore {
   List<BusAddressRange> get systemMemory => [
     BusAddressRange(baseAddress, usableSize),
   ];
+
+  @override
+  HarborMemoryInfo get memoryInfo => HarborMemoryInfo(
+    kind: switch (config.type) {
+      HarborDdrType.ddr => HarborMemoryKind.ddr,
+      HarborDdrType.ddr2 => HarborMemoryKind.ddr2,
+      HarborDdrType.ddr3 || HarborDdrType.ddr3l => HarborMemoryKind.ddr3,
+      HarborDdrType.ddr4 => HarborMemoryKind.ddr4,
+      HarborDdrType.ddr5 => HarborMemoryKind.ddr5,
+      HarborDdrType.lpddr4 => HarborMemoryKind.lpddr4,
+      HarborDdrType.lpddr5 => HarborMemoryKind.lpddr5,
+    },
+    sizeBytes: usableSize,
+    maxSizeBytes: config.size,
+    widthBits: config.dataWidth,
+    formFactor: memoryFormFactor,
+  );
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(

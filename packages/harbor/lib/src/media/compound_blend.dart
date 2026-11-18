@@ -57,10 +57,10 @@ class HarborCompoundBlend extends BridgeModule {
 
     // Logical right shift by [s] bits of a non-negative value at width w.
     Logic lshr(Logic x, int s) =>
-        [Const(0, width: s), x.getRange(s, w)].swizzle();
+        [Const(0, width: s), x.getRange(s, w)].concat();
     // Arithmetic right shift by [s] bits at width w (sign-extends MSB).
     Logic ashr(Logic x, int s) =>
-        [x[w - 1].replicate(s), x.getRange(s, w)].swizzle();
+        [x[w - 1].replicate(s), x.getRange(s, w)].concat();
 
     final parts = <Logic>[];
     for (var k = 0; k < n; k++) {
@@ -99,7 +99,7 @@ class HarborCompoundBlend extends BridgeModule {
       parts.add(clipped);
     }
 
-    output('out') <= parts.reversed.toList().swizzle();
+    output('out') <= parts.reversed.toList().concat();
   }
 }
 
@@ -136,7 +136,7 @@ class HarborDiffwtdMask extends BridgeModule {
 
     // Logical right shift by [s] of a non-negative value at width w.
     Logic lshr(Logic x, int s) =>
-        [Const(0, width: s), x.getRange(s, w)].swizzle();
+        [Const(0, width: s), x.getRange(s, w)].concat();
 
     final parts = <Logic>[];
     for (var k = 0; k < n; k++) {
@@ -166,6 +166,6 @@ class HarborDiffwtdMask extends BridgeModule {
       parts.add(out);
     }
 
-    output('mask') <= parts.reversed.toList().swizzle();
+    output('mask') <= parts.reversed.toList().concat();
   }
 }

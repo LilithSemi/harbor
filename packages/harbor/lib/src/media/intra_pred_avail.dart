@@ -73,9 +73,9 @@ class HarborIntraPredAvail extends BridgeModule {
     addSubModule(pred);
     pred.input('mode').srcConnection! <= mode;
     pred.input('above').srcConnection! <=
-        [for (var i = bs - 1; i >= 0; i--) aboveC[i]].swizzle();
+        [for (var i = bs - 1; i >= 0; i--) aboveC[i]].concat();
     pred.input('left').srcConnection! <=
-        [for (var i = bs - 1; i >= 0; i--) leftC[i]].swizzle();
+        [for (var i = bs - 1; i >= 0; i--) leftC[i]].concat();
     pred.input('above_left').srcConnection! <= cornerC;
     final predFull = pred.output('pred');
 
@@ -107,7 +107,7 @@ class HarborIntraPredAvail extends BridgeModule {
       ),
     );
     final isDc = mode.eq(Const(0, width: 4));
-    final predDc = [for (var i = 0; i < bs * bs; i++) dcVal].swizzle();
+    final predDc = [for (var i = 0; i < bs * bs; i++) dcVal].concat();
 
     output('pred') <= mux(isDc, predDc, predFull);
   }

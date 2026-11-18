@@ -156,7 +156,7 @@ class HarborCdefFilter extends BridgeModule {
     final taps = <Logic>[];
     // Primary taps.
     for (var k = 0; k < 2; k++) {
-      final tap = mux(
+      final tap = mux<Logic>(
         pri[coeffShift],
         Const(priTaps[1][k], width: w),
         Const(priTaps[0][k], width: w),
@@ -204,7 +204,7 @@ class HarborCdefFilter extends BridgeModule {
     final shifted = [
       rounded[w - 1].replicate(4),
       rounded.getRange(4, w),
-    ].swizzle();
+    ].concat();
     final outVal = (cur.zeroExtend(w) + shifted).getRange(0, w);
 
     // clippingRequired -> clamp(out, minV, maxV), else lowbd store = out & 0xff.

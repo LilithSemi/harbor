@@ -128,7 +128,8 @@ class HarborWishboneReadRetry extends Module {
                   prevValid < Const(0),
                   tries < Const(0, width: triesW),
                   mCycReg < Const(1),
-                  state < mux(sWe, Const(1, width: 2), Const(2, width: 2)),
+                  state <
+                      mux<Logic>(sWe, Const(1, width: 2), Const(2, width: 2)),
                 ],
               ),
             ]),

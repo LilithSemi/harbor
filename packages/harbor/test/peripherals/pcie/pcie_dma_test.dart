@@ -1339,11 +1339,11 @@ void main() {
     test('an empty info list emits no info logic', () async {
       final empty = _dma();
       await empty.build();
-      expect(empty.generateSynth(), isNot(contains('info_word')));
+      expect(empty.dumpSystemVerilog(), isNot(contains('info_word')));
       Simulator.reset();
       final full = _dma(infoWords: const [0x12345678]);
       await full.build();
-      expect(full.generateSynth(), contains('info_word'));
+      expect(full.dumpSystemVerilog(), contains('info_word'));
     });
   });
 }

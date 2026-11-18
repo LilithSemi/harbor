@@ -816,8 +816,8 @@ void main() {
       );
       await div.dut.build();
       await sqrt.dut.build();
-      expect(div.dut.generateSynth(), isNot(contains('x_q')));
-      expect(sqrt.dut.generateSynth(), isNot(contains('unpack_b')));
+      expect(div.dut.dumpSystemVerilog(), isNot(contains('x_q')));
+      expect(sqrt.dut.dumpSystemVerilog(), isNot(contains('unpack_b')));
     });
   });
 

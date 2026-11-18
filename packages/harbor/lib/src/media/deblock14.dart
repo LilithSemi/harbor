@@ -49,7 +49,7 @@ class HarborDeblock14 extends BridgeModule {
     }
 
     Logic ashr(Logic x, int sh) =>
-        [x[w - 1].replicate(sh), x.getRange(sh, w)].swizzle();
+        [x[w - 1].replicate(sh), x.getRange(sh, w)].concat();
     Logic mul(Logic a, int k) => (a.zeroExtend(w) * kc(k)).getRange(0, w);
     // round_pow2(sum, n) = (sum + (1<<(n-1))) >> n, unsigned sum -> bd-bit.
     Logic rp(Logic sum, int n) => (sum + kc(1 << (n - 1))).getRange(n, n + bd);

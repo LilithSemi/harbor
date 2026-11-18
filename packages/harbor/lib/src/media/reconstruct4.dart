@@ -41,7 +41,7 @@ class HarborReconstruct4 extends BridgeModule {
       return (level(i).signExtend(32) * q).getRange(0, 16);
     }
 
-    final deqPacked = [for (var i = 15; i >= 0; i--) deq(i)].swizzle();
+    final deqPacked = [for (var i = 15; i >= 0; i--) deq(i)].concat();
 
     final idct = HarborInverseDct4(name: 'idct');
     addSubModule(idct);
@@ -65,7 +65,7 @@ class HarborReconstruct4 extends BridgeModule {
     pred.input('left').srcConnection! <= input('left');
     pred.input('above_left').srcConnection! <= input('above_left');
     pred.input('residual').srcConnection! <=
-        [for (var i = 63; i >= 0; i--) res64[i]].swizzle();
+        [for (var i = 63; i >= 0; i--) res64[i]].concat();
 
     output('recon') <= pred.output('recon');
   }

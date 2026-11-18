@@ -488,8 +488,10 @@ class Ddr3FabricRun {
     int ddrPeriod = 10,
     List<String> cores = const [],
   }) async {
-    final fabricClk = SimpleClockGenerator(fabricPeriod).clk;
-    final ddrClk = SimpleClockGenerator(ddrPeriod).clk;
+    final fabricClk = SimpleClockGenerator(
+      fabricPeriod + (fabricPeriod & 1),
+    ).clk;
+    final ddrClk = SimpleClockGenerator(ddrPeriod + (ddrPeriod & 1)).clk;
     for (final input in top.inputs.values) {
       if (input.name != 'clk' && input.name != 'ddr_clk') {
         input.srcConnection!.put(0);

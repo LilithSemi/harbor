@@ -114,7 +114,7 @@ class HarborEthRxFilter extends Module {
       final table = addInput('mc_hash', mcHash!, width: 64);
       final index = [
         for (var i = 0; i < 6; i++) c[i],
-      ].swizzle().named('hash_index');
+      ].concat().named('hash_index');
       final live = (hashMcast & table[hashIdx]).named('hash_live');
       hashHit = mux(hashFirst, live, hashKeep).named('hash_hit');
       Sequential(clk, [

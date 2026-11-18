@@ -150,7 +150,7 @@ class HarborFilterIntra extends BridgeModule {
       final shifted = [
         added[_w - 1].replicate(_scaleBits),
         added.getRange(_scaleBits, _w),
-      ].swizzle();
+      ].concat();
       // clipPixel: negative -> 0, >255 -> 255, else low 8 bits.
       final neg = shifted[_w - 1];
       final gt255 = shifted.gt(Const(255, width: _w));
@@ -195,6 +195,6 @@ class HarborFilterIntra extends BridgeModule {
         parts.add(buf[r + 1][c + 1]!);
       }
     }
-    output('pred') <= parts.reversed.toList().swizzle();
+    output('pred') <= parts.reversed.toList().concat();
   }
 }
