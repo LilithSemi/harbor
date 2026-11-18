@@ -1007,9 +1007,21 @@ class HarborL1DCache extends BridgeModule {
   /// including hits, and authorize the complete refill footprint.
   ///
   /// Physical aliases have the same index, so this opt-in removes the virtual
-  /// cache's page-size capacity bound. Tags must retain the full address width.
+  /// cache's page-size capacity bound. Tags keep all [cacheAddrBits] bits.
   /// It does not translate addresses or change [cacheableBase].
   final bool physicalAddresses;
+
+  /// Width in bits of a physical address. The [reqAddr] and [invalAddr] ports
+  /// have this width, so a request cannot carry a bit above it. Null means
+  /// [xlen]. It needs [physicalAddresses].
+  final int physAddrBits;
+
+  /// Width in bits of the cacheable address range. The tags keep exactly this
+  /// many address bits, and an address at or above `1 << cacheAddrBits`
+  /// bypasses the cache like one below [cacheableBase]. It must not exceed
+  /// [physAddrBits]. Null means [physAddrBits]. It needs [physicalAddresses],
+  /// and [reqAddrBits] must be null or equal to it.
+  final int cacheAddrBits;
 
   /// Bits of the address that translation does not change (log2 of the page
   /// size). Sv32, Sv39 and Sv48 all use 4 KB base pages, so 12. The store
@@ -1158,6 +1170,8 @@ class HarborL1DCache extends BridgeModule {
     this.xlen = 64,
     this.cacheableBase = 0x80000000,
     this.physicalAddresses = false,
+    int? physAddrBits,
+    int? cacheAddrBits,
     this.ctxBits = 0,
     this.checkMemLast = true,
     this.snoop = false,
@@ -1168,7 +1182,9 @@ class HarborL1DCache extends BridgeModule {
     // [_L1TagStore]). Null uses flops.
     HarborDeviceTarget? target,
     super.name = 'l1d',
-  }) : super('HarborL1DCache') {
+  }) : physAddrBits = physAddrBits ?? xlen,
+       cacheAddrBits = cacheAddrBits ?? physAddrBits ?? xlen,
+       super('HarborL1DCache') {
     if (config.ways != 1) {
       throw ArgumentError(
         'HarborL1DCache is direct-mapped (ways must be 1, got ${config.ways}).',
@@ -1180,15 +1196,43 @@ class HarborL1DCache extends BridgeModule {
     if (snoop && !physicalAddresses) {
       throw ArgumentError('A snooping cache needs physicalAddresses: true.');
     }
-    if (physicalAddresses && reqAddrBits != null && reqAddrBits != xlen) {
+    if (!physicalAddresses && (physAddrBits != null || cacheAddrBits != null)) {
       throw ArgumentError(
-        'Physical cache tags must retain all $xlen address bits.',
+        'physAddrBits and cacheAddrBits need physicalAddresses: true.',
       );
     }
+    if (this.physAddrBits < 1 || this.physAddrBits > xlen) {
+      throw ArgumentError(
+        'physAddrBits (${this.physAddrBits}) must be from 1 to $xlen.',
+      );
+    }
+    if (this.cacheAddrBits < 1 || this.cacheAddrBits > this.physAddrBits) {
+      throw ArgumentError(
+        'cacheAddrBits (${this.cacheAddrBits}) must be from 1 to physAddrBits '
+        '(${this.physAddrBits}).',
+      );
+    }
+    if (physicalAddresses &&
+        reqAddrBits != null &&
+        reqAddrBits != this.cacheAddrBits) {
+      throw ArgumentError(
+        'Physical cache tags must retain all ${this.cacheAddrBits} cacheable '
+        'address bits: set cacheAddrBits, not reqAddrBits.',
+      );
+    }
+    if (physicalAddresses &&
+        this.cacheAddrBits < 63 &&
+        cacheableBase >= 1 << this.cacheAddrBits) {
+      throw ArgumentError(
+        'cacheableBase (0x${cacheableBase.toRadixString(16)}) is outside the '
+        '${this.cacheAddrBits}-bit cacheable range, so no address is cacheable.',
+      );
+    }
+    final portBits = physicalAddresses ? this.physAddrBits : xlen;
 
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
-    createPort('req_addr', PortDirection.input, width: xlen);
+    createPort('req_addr', PortDirection.input, width: portBits);
     createPort('req_valid', PortDirection.input);
     if (ctxBits > 0) {
       createPort('req_ctx', PortDirection.input, width: ctxBits);
@@ -1196,7 +1240,7 @@ class HarborL1DCache extends BridgeModule {
     createPort('req_write', PortDirection.input);
     if (snoop) {
       createPort('inval_valid', PortDirection.input);
-      createPort('inval_addr', PortDirection.input, width: xlen);
+      createPort('inval_addr', PortDirection.input, width: portBits);
       createPort('inval_hold', PortDirection.input);
       addOutput('inval_busy');
       addOutput('fill_line', width: xlen);
@@ -1228,6 +1272,8 @@ class HarborL1DCache extends BridgeModule {
 
     final clk = input('clk');
     final reset = input('reset');
+    final reqAddr = this.reqAddr.zeroExtend(xlen);
+    final invalAddr = snoop ? this.invalAddr.zeroExtend(xlen) : null;
 
     final wordBytes = xlen ~/ 8;
     final lineWords = config.lineSize ~/ wordBytes;
@@ -1269,12 +1315,16 @@ class HarborL1DCache extends BridgeModule {
     // cache has about which address a line holds, so any encoding that maps two
     // addresses onto one tag produces a false HIT and serves the wrong data.
     // Only a lossless width is correct.
-    final reqBits = reqAddrBits ?? xlen;
+    final reqBits = physicalAddresses
+        ? this.cacheAddrBits
+        : (reqAddrBits ?? xlen);
     final addrBits = reqBits > xlen ? xlen : reqBits;
     if (addrBits <= tagLo) {
       throw ArgumentError(
-        'reqAddrBits ($reqBits) must exceed the index and offset bits '
-        '($tagLo), or a line has no tag at all.',
+        '${physicalAddresses ? 'cacheAddrBits' : 'reqAddrBits'} ($reqBits'
+        '${physicalAddresses && cacheAddrBits == null ? ', from physAddrBits' : ''}) '
+        'must exceed the index and offset bits ($tagLo), or a line has no '
+        'tag at all.',
       );
     }
     // The index must come from bits BELOW the 4 KB page offset, so the cache
@@ -1325,7 +1375,7 @@ class HarborL1DCache extends BridgeModule {
     );
     tagRam.rdAddr[0] <= idxOf(reqAddr);
     if (snoop) {
-      tagRam.rdAddr[1] <= idxOf(invalAddr);
+      tagRam.rdAddr[1] <= idxOf(invalAddr!);
     }
 
     final ramLatency = HarborRegisterFile.blockRamReadLatency(target) ?? 1;
@@ -1445,7 +1495,11 @@ class HarborL1DCache extends BridgeModule {
             .named('blockHit');
 
     // Only DRAM (>= cacheableBase) is cacheable, everything else bypasses.
-    Logic cacheableOf(Logic a) => a.gte(Const(cacheableBase, width: xlen));
+    Logic inRangeOf(Logic a) => a.getRange(this.cacheAddrBits).eq(0);
+    Logic cacheableOf(Logic a) {
+      final aboveBase = a.gte(Const(cacheableBase, width: xlen));
+      return this.cacheAddrBits >= xlen ? aboveBase : aboveBase & inRangeOf(a);
+    }
 
     // Loads. A store never uses the hit/fill path (no write-allocate).
     final loadEn = (reqValid & ~reqWrite).named('loadEn');
@@ -1525,9 +1579,13 @@ class HarborL1DCache extends BridgeModule {
     // tag compare is not on the path to the RAM write enable. The address tag
     // alone decides the hit: a line of the same address from another context
     // holds the same bytes.
+    final storeTagHit =
+        lineValid.valid[0] &
+        tagRam.read(0).getRange(0, tagBits).eq(tagOf(addrQ));
     final storeHitNow =
-        (lineValid.valid[0] &
-                tagRam.read(0).getRange(0, tagBits).eq(tagOf(addrQ)))
+        (this.cacheAddrBits < xlen
+                ? storeTagHit & inRangeOf(addrQ)
+                : storeTagHit)
             .named('storeHitNow');
     final storeHit = mux(storeFirst, storeHitNow, storeHitQ).named('storeHit');
     final storeAck = (storing & memDone & memValid).named('storeAck');
@@ -1633,7 +1691,7 @@ class HarborL1DCache extends BridgeModule {
       invalBusy <= invalBusyNow;
       fillLine <= memAddrR;
       Sequential(clk, [
-        snpAddr < invalAddr,
+        snpAddr < invalAddr!,
         snpClrIdx < snpIdx,
         If(
           reset,
