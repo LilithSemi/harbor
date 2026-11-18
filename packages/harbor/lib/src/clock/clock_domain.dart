@@ -306,14 +306,27 @@ class HarborClockGenerator {
   /// The target device (determines which PLL primitive to use).
   final HarborDeviceTarget? target;
 
+  /// A software reset request, or null for none. Every domain reset asserts
+  /// while it is high, in addition to [inputReset] and the PLL lock. The
+  /// request is not in [hardResetOf].
+  final Logic? softReset;
+
   final List<HarborClockDomain> _domains = [];
+  final Map<Logic, Logic> _hardResets = {};
 
   HarborClockGenerator({
     required this.parent,
     required this.inputClk,
     required this.inputReset,
     this.target,
+    this.softReset,
   });
+
+  /// The reset of [domain] without the software reset request: its reset
+  /// source and PLL lock, with the same re-timing. It is the reset of
+  /// [domain] when the generator has no [softReset].
+  Logic hardResetOf(HarborClockDomain domain) =>
+      _hardResets[domain.reset] ?? domain.reset;
 
   /// All created clock domains.
   List<HarborClockDomain> get domains => List.unmodifiable(_domains);
@@ -329,6 +342,14 @@ class HarborClockGenerator {
   /// held reset clears the pipe within two edges regardless of power-up
   /// state.
   Logic _domainReset(Logic domClk, Logic assertSrc, String name) {
+    final soft = softReset;
+    if (soft == null) return _retimed(domClk, assertSrc, name);
+    final full = _retimed(domClk, assertSrc | soft, name);
+    _hardResets[full] = _retimed(domClk, assertSrc, '${name}Hard');
+    return full;
+  }
+
+  Logic _retimed(Logic domClk, Logic assertSrc, String name) {
     final pipe = Logic(name: '${name}RstSync', width: 2);
     Sequential(domClk, reset: assertSrc, [
       pipe < [pipe[0], Const(1)].concat(),
@@ -1285,10 +1306,13 @@ class HarborClockGenerator {
   HarborClockDomain _createAsicPll(HarborClockConfig config, int sourceFreq) {
     // ASIC: no specific PLL primitive, just pass through
     // The actual PLL would be an analog block from the PDK
+    final soft = softReset;
+    final reset = soft == null ? inputReset : (inputReset | soft);
+    if (soft != null) _hardResets[reset] = inputReset;
     final domain = HarborClockDomain(
       config: config,
       clk: inputClk,
-      reset: inputReset,
+      reset: reset,
     );
     _domains.add(domain);
     return domain;

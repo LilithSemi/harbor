@@ -26,6 +26,7 @@ import '../peripherals/harbor_ddr3.dart';
 import '../peripherals/harbor_sdram.dart';
 import '../peripherals/led_engine.dart';
 import '../peripherals/maskrom.dart';
+import '../peripherals/reset_controller.dart';
 import '../peripherals/spi_flash.dart';
 import '../peripherals/sram.dart';
 import 'acpi.dart';
@@ -168,9 +169,30 @@ class HarborSoC extends BridgeModule {
     final domain = domainFor(clockDomainName);
     final (clk, reset) = domain != null
         ? (domain.clk, domain.reset)
-        : (_boardClk, input('reset'));
+        : (_boardClk, _systemReset);
     module.input('clk').srcConnection! <= clk;
-    module.input('reset').srcConnection! <= reset;
+    if (module is HarborResetController) {
+      // The controller makes the soft reset, so its own reset is the hard
+      // reset only.
+      // The reset of its own domain, held with the PLL lock and without the
+      // soft reset request, which the controller makes itself.
+      module.input('por').srcConnection! <=
+          (domain != null ? _clockGen.hardResetOf(domain) : _hardReset);
+      final pin = _pinReset;
+      if (pin == null) {
+        module.input('ext_reset').srcConnection! <= Const(0);
+      } else {
+        final sync = Logic(name: 'ext_reset_sync', width: 2);
+        Sequential(clk, [
+          sync < [sync[0], pin].concat(),
+        ]);
+        module.input('ext_reset').srcConnection! <= sync[1];
+      }
+      module.input('wdog_reset').srcConnection! <= (_resetWatchdog ?? Const(0));
+      module.input('debug_reset').srcConnection! <= (_resetDebug ?? Const(0));
+    } else {
+      module.input('reset').srcConnection! <= reset;
+    }
   }
 
   /// The clock domain a peripheral registered under [clockDomainName] actually
@@ -193,6 +215,23 @@ class HarborSoC extends BridgeModule {
   }
 
   late final HarborClockGenerator _clockGen;
+
+  // The reset that is not the soft reset: the reset pin or the power-on
+  // reset. The SoC reset adds the soft reset request to it.
+  late final Logic _hardReset;
+
+  // The reset of everything on the SoC, with the soft reset request.
+  late final Logic _systemReset;
+
+  // The reset pin, active high, or null when the SoC has only the power-on
+  // reset. The reset controller reports it as an external reset.
+  late final Logic? _pinReset;
+
+  Logic? _softResetRequest;
+  HarborResetController? _resetController;
+  String? _resetControllerDomain;
+  Logic? _resetWatchdog;
+  Logic? _resetDebug;
 
   late final Logic _boardClk;
 
@@ -283,6 +322,11 @@ class HarborSoC extends BridgeModule {
   /// path already takes a real external `reset` pin.
   final bool externalReset;
 
+  /// Adds a software reset request to the SoC reset. The request comes from
+  /// the controller that [addResetController] takes, and [buildFabric] throws
+  /// when there is none.
+  final bool softReset;
+
   /// Reservation slots per monitored memory slave that masters added with
   /// `exclusiveIds: HarborExclusive.auto` share (see
   /// [HarborExclusive.slotCounts]).
@@ -311,6 +355,7 @@ class HarborSoC extends BridgeModule {
     this.interruptGsiBase = 0,
     this.interruptContexts = const [],
     this.externalReset = false,
+    this.softReset = false,
     this.cpus = const [],
     this.target,
     this.exclusiveSlotBudget = HarborExclusive.defaultSlotBudget,
@@ -361,7 +406,7 @@ class HarborSoC extends BridgeModule {
       createPort('reset_n', PortDirection.input);
     }
 
-    final Logic resetSignal;
+    Logic resetSignal;
     if (usePowerOnReset) {
       final porCount = Logic(name: 'porCount', width: 8);
       Sequential(_boardClk, [
@@ -374,11 +419,23 @@ class HarborSoC extends BridgeModule {
     } else {
       resetSignal = input('reset');
     }
+    _hardReset = resetSignal;
+    if (softReset) {
+      _softResetRequest = Logic(name: 'softResetRequest');
+      resetSignal = (resetSignal | _softResetRequest!).named('sysResetSoft');
+    }
+    _systemReset = resetSignal;
+    _pinReset = !usePowerOnReset
+        ? input('reset')
+        : externalReset
+        ? ~input('reset_n')
+        : null;
 
     _clockGen = HarborClockGenerator(
       parent: this,
       inputClk: _boardClk,
-      inputReset: resetSignal,
+      inputReset: _hardReset,
+      softReset: _softResetRequest,
       target: target,
     );
 
@@ -506,6 +563,86 @@ class HarborSoC extends BridgeModule {
     }
   }
 
+  // Throws when the hold of [controller] on [clockDomainName] is under 4
+  // edges of the slowest clock domain. A domain added later can make it so.
+  void _checkResetHold(
+    HarborResetController controller,
+    String? clockDomainName,
+  ) {
+    final need = requiredResetHoldCycles(clockDomainName);
+    if (controller.minHoldCycles >= need) return;
+    final fix = need > HarborResetController.maxMinHoldCycles
+        ? 'No valid minHoldCycles exists for this clock ratio, since the '
+              'most it takes is ${HarborResetController.maxMinHoldCycles}. '
+              'Put the controller on a slower clock domain.'
+        : 'Build it with HarborResetController(minHoldCycles: $need).';
+    throw ArgumentError(
+      'the reset controller needs minHoldCycles of at least $need, which '
+      'is 4 edges of the slowest clock domain, but it has '
+      '${controller.minHoldCycles}. $fix',
+    );
+  }
+
+  /// The least reset hold time in cycles of a controller on the domain
+  /// [clockDomainName]: 4 edges of the slowest clock domain. A SoC with no
+  /// clock domains needs none.
+  int requiredResetHoldCycles(String? clockDomainName) {
+    final own = domainFor(clockDomainName)?.config.frequency;
+    if (own == null || _clockDomains.isEmpty) return 1;
+    final slowest = _clockDomains.values
+        .map((d) => d.config.frequency)
+        .reduce((a, b) => a < b ? a : b);
+    return (4 * own + slowest - 1) ~/ slowest;
+  }
+
+  /// Adds [controller] and ORs its `system_reset` into the SoC reset beside
+  /// the reset pin, so a write of 0xDEAD to its SW_RST_KEY register reboots
+  /// the SoC. The SoC needs `softReset: true`, and it takes one controller.
+  ///
+  /// - The controller runs on the hard reset only, the reset pin or the
+  ///   power-on reset, so it keeps its state and its reset cause through a
+  ///   soft reset. It holds the soft reset for its hold time, 256 clock
+  ///   cycles by default, and then releases it on a clock edge.
+  /// - The controller resets its own bus port with the SoC reset, so a
+  ///   response that is still in the port at the start of a reset never
+  ///   reaches the fabric after it.
+  /// - The reset pin is the controller's `ext_reset`, so a pin reset reads as
+  ///   external. A SoC that has only a reset pin and no power-on reset
+  ///   (simulation, ASIC) also reads external after a cold boot.
+  /// - The controller needs `minHoldCycles` of at least
+  ///   [requiredResetHoldCycles], and this throws when it has less.
+  /// - [watchdog] and [debug] are optional reset requests for its `wdog_reset`
+  ///   and `debug_reset` inputs. A controller on another fabric clock is not
+  ///   accepted, since its bus port would then reset itself.
+  T addResetController<T extends HarborResetController>(
+    T controller, {
+    String? clockDomainName,
+    Logic? watchdog,
+    Logic? debug,
+  }) {
+    final request = _softResetRequest;
+    if (request == null) {
+      throw StateError('addResetController needs softReset: true');
+    }
+    if (_resetController != null) {
+      throw StateError('a SoC takes one reset controller');
+    }
+    if (controller.tryInput(BusSlavePort.fabricClkPort) != null) {
+      throw ArgumentError(
+        'the reset controller must run on the fabric clock, without a '
+        'crossing',
+      );
+    }
+    _checkResetHold(controller, clockDomainName);
+    _resetController = controller;
+    _resetControllerDomain = clockDomainName;
+    _resetWatchdog = watchdog;
+    _resetDebug = debug;
+    addPeripheral(controller, clockDomainName: clockDomainName);
+    request <= controller.systemReset;
+    return controller;
+  }
+
   /// Gets a clock domain by name.
   ///
   /// Returns null if no domain with that name exists. Falls back to
@@ -524,7 +661,7 @@ class HarborSoC extends BridgeModule {
       final d = _clockDomains['sys'] ?? _clockDomains.values.first;
       return (d.clk, d.reset);
     }
-    return (_boardClk, input('reset'));
+    return (_boardClk, _systemReset);
   }
 
   /// Joins a differential board clock (`clk` and the target's
@@ -985,6 +1122,12 @@ class HarborSoC extends BridgeModule {
     final errors = validate();
     if (errors.isNotEmpty) {
       throw StateError('Validation errors in $name:\n${errors.join("\n")}');
+    }
+    if (softReset && _resetController == null) {
+      throw StateError('$name has softReset but no reset controller');
+    }
+    if (_resetController case final c?) {
+      _checkResetHold(c, _resetControllerDomain);
     }
 
     if (_peripherals.isEmpty) {
