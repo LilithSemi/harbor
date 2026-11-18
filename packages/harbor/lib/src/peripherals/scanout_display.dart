@@ -6,6 +6,8 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
+import '../bus/port/memory_port.dart';
+import '../bus/port/memory_waist.dart';
 import '../clock/clock_domain.dart';
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
@@ -56,6 +58,14 @@ enum HarborFramebufferPlacement {
 /// | 0x50   | PIXEL_CLOCK | ro     | pixel clock in Hz |
 /// | 0x58   | FORMAT      | rw     | pixel format code in use, see [harborPixelFormatBitOrder] |
 /// | 0x60   | FORMATS     | ro     | bit n is set when format code n is supported |
+/// | 0x68   | UNDERRUN_COUNT | ro  | 15:0 underruns since reset, saturating |
+///
+/// With [fabricMemory] the display reads the framebuffer through a memory
+/// master port `fb` of the fabric kind, with bursts of [burstBeats] beats, so
+/// it can read any memory of the SoC. It has no `rq_*`, `rd_*`, `scan_*` and
+/// `init_done` ports, and the scanout runs on `clk`. Add it to a SoC with
+/// `addMaster(display, busInterfaceName: 'fb', memory: true, realtime: true)`.
+/// FB_STRIDE is a multiple of [burstBeats] words of the bus.
 ///
 /// A write to CTRL or FB_BASE starts an update. The display copies CTRL,
 /// FB_BASE and FORMAT together and takes them at the next frame start, so
@@ -111,6 +121,7 @@ class HarborScanoutDisplay extends BridgeModule
   static const pixelClockOffset = 0x50;
   static const formatOffset = 0x58;
   static const formatsOffset = 0x60;
+  static const underrunCountOffset = 0x68;
 
   /// STATUS bit: the display took the enable bit.
   static const statusRunning = 1 << 0;
@@ -196,6 +207,16 @@ class HarborScanoutDisplay extends BridgeModule
   /// True when the display is on after a reset.
   final bool enableOnReset;
 
+  /// True when the display reads the framebuffer through the memory master
+  /// port [fb] and has no sdram scanout port.
+  final bool fabricMemory;
+
+  /// Beats of a framebuffer burst, with [fabricMemory].
+  final int burstBeats;
+
+  /// The memory master port of a build with [fabricMemory].
+  late final HarborMemoryMasterPort fb;
+
   /// True when the build has the `init_done` input.
   final bool gateOnInitDone;
 
@@ -228,6 +249,9 @@ class HarborScanoutDisplay extends BridgeModule
   /// An underrun happened and INT_STATUS did not clear it.
   Logic get underrun => output('underrun');
 
+  /// Underruns since reset, saturating at 0xffff (UNDERRUN_COUNT).
+  Logic get underrunCount => output('underrun_count');
+
   /// A bus error happened and INT_STATUS did not clear it.
   Logic get busError => output('bus_error');
 
@@ -249,13 +273,16 @@ class HarborScanoutDisplay extends BridgeModule
     this.placement = HarborFramebufferPlacement.fixed,
     this.simpleFramebuffer = true,
     this.enableOnReset = false,
-    this.gateOnInitDone = true,
+    bool gateOnInitDone = true,
+    this.fabricMemory = false,
+    this.burstBeats = 16,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     this.busAddressWidth = 12,
     this.busDataWidth = 32,
     bool crossFabricClock = false,
     super.name = 'display',
-  }) : super(
+  }) : gateOnInitDone = gateOnInitDone && !fabricMemory,
+       super(
          harborStableDefinitionName('HarborScanoutDisplay', [
            ...BusSlavePort.definitionNameParts(
              kind: fabricKind,
@@ -273,7 +300,8 @@ class HarborScanoutDisplay extends BridgeModule
            'b${framebufferBase.toRadixString(16)}',
            if (placement == HarborFramebufferPlacement.firmware) 'fw',
            if (enableOnReset) 'on',
-           if (gateOnInitDone) 'g',
+           if (gateOnInitDone && !fabricMemory) 'g',
+           if (fabricMemory) 'fm$burstBeats',
            target is HarborFpgaTarget ? target.vendor.name : 'generic',
          ]),
        ) {
@@ -286,13 +314,15 @@ class HarborScanoutDisplay extends BridgeModule
     createPort('pixel_reset', PortDirection.input);
     createPort('shift_clk', PortDirection.input);
     createPort('shift_reset', PortDirection.input);
-    createPort('scan_clk', PortDirection.input);
-    createPort('scan_reset', PortDirection.input);
-    createPort('rq_ready', PortDirection.input);
-    createPort('rd_valid', PortDirection.input);
-    createPort('rd_data', PortDirection.input, width: 16);
-    if (gateOnInitDone) createPort('init_done', PortDirection.input);
-    createPort('error_in', PortDirection.input);
+    if (!fabricMemory) {
+      createPort('scan_clk', PortDirection.input);
+      createPort('scan_reset', PortDirection.input);
+      createPort('rq_ready', PortDirection.input);
+      createPort('rd_valid', PortDirection.input);
+      createPort('rd_data', PortDirection.input, width: 16);
+      if (this.gateOnInitDone) createPort('init_done', PortDirection.input);
+      createPort('error_in', PortDirection.input);
+    }
 
     bus = BusSlavePort.create(
       module: this,
@@ -335,7 +365,7 @@ class HarborScanoutDisplay extends BridgeModule
 
     // The sdram init flag crosses into the register clock.
     Logic memReady;
-    if (gateOnInitDone) {
+    if (this.gateOnInitDone) {
       memReady = input('init_done');
       for (var i = 0; i < 2; i++) {
         memReady = flop(clk, memReady, reset: reset).named('init_done_sync$i');
@@ -364,6 +394,22 @@ class HarborScanoutDisplay extends BridgeModule
       for (final f in formats) abi(f),
     ], 8).named('active_code');
 
+    if (fabricMemory) {
+      fb = HarborMemoryMasterPort.create(
+        module: this,
+        name: 'fb',
+        kind: fabricKind,
+        config: HarborMemoryWaistConfig(
+          addressWidth: 32,
+          dataWidth: busDataWidth,
+          idWidth: 1,
+          outstanding: 2,
+        ),
+        clk: clk,
+        reset: input('reset'),
+      );
+    }
+
     display = HarborDualClockDisplay(
       target: target,
       timing: timing,
@@ -371,16 +417,18 @@ class HarborScanoutDisplay extends BridgeModule
       pixelReset: input('pixel_reset'),
       shiftClk: input('shift_clk'),
       shiftReset: input('shift_reset'),
-      sysClk: input('scan_clk'),
-      sysReset: input('scan_reset'),
+      sysClk: fabricMemory ? clk : input('scan_clk'),
+      sysReset: fabricMemory ? reset : input('scan_reset'),
       controlClk: clk,
       controlReset: reset,
       enable: enableEff,
       update: update,
       fbBase: [fbStage, Const(0, width: 2)].concat(),
-      rqReady: input('rq_ready'),
-      rdValid: input('rd_valid'),
-      rdData: input('rd_data'),
+      memory: fabricMemory ? fb.waist : null,
+      burstWords: burstBeats,
+      rqReady: fabricMemory ? null : input('rq_ready'),
+      rdValid: fabricMemory ? null : input('rd_valid'),
+      rdData: fabricMemory ? null : input('rd_data'),
       lineStride: multi ? null : strides.first,
       formats: formats,
       formatSel: multi ? fmtStage : null,
@@ -388,9 +436,11 @@ class HarborScanoutDisplay extends BridgeModule
       outputType: HarborDisplayInterface.dvi,
     );
 
-    addOutput('rq_valid') <= display.rqValid;
-    addOutput('rq_addr', width: 32) <= display.rqAddr;
-    addOutput('rq_words', width: display.rqWords.width) <= display.rqWords;
+    if (!fabricMemory) {
+      addOutput('rq_valid') <= display.rqValid;
+      addOutput('rq_addr', width: 32) <= display.rqAddr;
+      addOutput('rq_words', width: display.rqWords.width) <= display.rqWords;
+    }
     addOutput('gpdi', width: 4) <= display.gpdi;
     if (display.tryOutput('gpdi_n') != null) {
       addOutput('gpdi_n', width: 4) <= display.gpdiN;
@@ -399,6 +449,7 @@ class HarborScanoutDisplay extends BridgeModule
     addOutput('running') <= display.active;
     addOutput('update_pending');
     addOutput('underrun');
+    addOutput('underrun_count', width: 16);
     addOutput('bus_error');
     addOutput('mem_ready');
 
@@ -406,12 +457,14 @@ class HarborScanoutDisplay extends BridgeModule
     final anyPending = (pending | dirty | update).named('any_pending');
     output('update_pending') <= anyPending;
     final vblankEvent = display.vblank & ~vblankPrev;
-    final busErrorEvent = (display.busError | input('error_in')).named(
-      'bus_error_event',
-    );
+    final busErrorEvent =
+        (fabricMemory ? display.busError : display.busError | input('error_in'))
+            .named('bus_error_event');
+    final underrunCounter = Logic(name: 'underrun_counter', width: 16);
     final underrunEvent = display.underrun & ~underrunPrev;
     output('interrupt') <= (intStatus & intEnable).or();
     output('underrun') <= underrunFlag;
+    output('underrun_count') <= underrunCounter;
     output('bus_error') <= busErrorFlag;
     output('mem_ready') <= memReady;
 
@@ -465,6 +518,7 @@ class HarborScanoutDisplay extends BridgeModule
         vblankPrev: 0,
         underrunPrev: 0,
         enablePrev: 0,
+        underrunCounter: 0,
       },
       [
         update < fire,
@@ -500,6 +554,10 @@ class HarborScanoutDisplay extends BridgeModule
         ),
         If(vblankEvent, then: [vblankFlag < Const(1)]),
         If(underrunEvent, then: [underrunFlag < Const(1)]),
+        If(
+          underrunEvent & underrunCounter.neq(Const(0xffff, width: 16)),
+          then: [underrunCounter < underrunCounter + 1],
+        ),
         If(busErrorEvent, then: [busErrorFlag < Const(1)]),
         If(writeAt(intEnableOffset), then: [intEnable < intMerged]),
       ],
@@ -562,6 +620,9 @@ class HarborScanoutDisplay extends BridgeModule
         CaseItem(Const(formatsOffset, width: 12), [
           readData < Const(display.planeFormats.first, width: 32),
         ]),
+        CaseItem(Const(underrunCountOffset, width: 12), [
+          readData < underrunCounter.zeroExtend(32),
+        ]),
       ]),
     ]);
 
@@ -608,11 +669,12 @@ class HarborScanoutDisplay extends BridgeModule
     }
     for (final (i, f) in formats.indexed) {
       final line = f.lineBytes(0, timing.hActive);
-      if (strides[i] < line || strides[i] % 4 != 0) {
+      final step = fabricMemory ? burstBeats * (busDataWidth ~/ 8) : 4;
+      if (strides[i] < line || strides[i] % step != 0) {
         throw ArgumentError.value(
           strides[i],
           'strides',
-          '${f.name} needs a multiple of 4 and at least $line',
+          '${f.name} needs a multiple of $step and at least $line',
         );
       }
     }

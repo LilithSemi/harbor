@@ -420,6 +420,157 @@ extension HarborSocScanoutDisplay on HarborSoC {
     }
     return display;
   }
+
+  /// Adds a display that reads the framebuffer from [memory] through the
+  /// fabric, as a real-time master with bursts of [burstBeats] beats.
+  ///
+  /// The display builds with [HarborScanoutDisplay.fabricMemory], and the
+  /// helper joins its `fb` port with `addMaster(realtime: true)` and
+  /// `targetRanges: [memory]`. The framebuffer is placed by the firmware: the
+  /// display node has no `memory-region`, FB_BASE resets to 0 and the display
+  /// is off after a reset. The display node names [memory] in
+  /// `harbor,scanout-memory`. Pixel and shift clocks, the pin and the status
+  /// pins work as in [addScanoutDisplay]. The stride of a format is the line
+  /// bytes rounded up to [burstBeats] words of the bus.
+  ///
+  /// [memory] is the address range of a memory that the display reads.
+  /// [busDataWidth] is the width of the fabric.
+  HarborScanoutDisplay addFabricScanoutDisplay({
+    required BusAddressRange memory,
+    required HarborDisplayTiming timing,
+    List<HarborPixelFormat> formats = const [HarborPixelFormat.rgb565],
+    required int baseAddress,
+    int? pixelClockHz,
+    int pixelClockTolerancePpm = 10000,
+    String shiftDomain = 'shift',
+    String pixelDomain = 'pixel',
+    String? busDomain,
+    int busAddressWidth = 32,
+    int busDataWidth = 32,
+    int burstBeats = 16,
+    String pinName = 'gpdi_dp',
+    String? runningPin,
+    String? underrunPin,
+    String? updatePendingPin,
+    String? busErrorPin,
+    String name = 'display',
+  }) {
+    final target = this.target;
+    if (target == null) {
+      throw StateError('a scanout display needs a SoC target');
+    }
+    final wordBytes = busDataWidth ~/ 8;
+    final step = burstBeats * wordBytes;
+    final strides = [
+      for (final f in formats)
+        (f.lineBytes(0, timing.hActive) + step - 1) ~/ step * step,
+    ];
+    final frame = strides.reduce(max) * timing.vActive;
+
+    var shift = clockDomain(shiftDomain);
+    var pixel = clockDomain(pixelDomain);
+    if ((shift == null) != (pixel == null)) {
+      throw StateError(
+        'give both the $shiftDomain and $pixelDomain domains, or neither',
+      );
+    }
+    if (shift == null) {
+      final sys = clockDomain('sys');
+      final source = sys?.config.sourceFrequency;
+      if (sys == null || source == null) {
+        throw StateError(
+          'add a sys domain with a source frequency before the display '
+          'domains, so the bus clock stays the sys clock',
+        );
+      }
+      shift = addClockDomain(
+        HarborScanoutDisplay.clockConfig(
+          pixelClockHz: _reachablePixelClock(
+            target,
+            source,
+            pixelClockHz ?? timing.pixelClock,
+            pixelClockTolerancePpm,
+          ),
+          sourceClockHz: source,
+          shiftName: shiftDomain,
+          pixelName: pixelDomain,
+        ),
+      );
+      pixel = clockDomain(pixelDomain)!;
+    }
+    final realPixelHz = pixel!.config.frequency;
+    if (shift.config.frequency != 5 * realPixelHz) {
+      throw StateError(
+        'the $shiftDomain clock must be 5 times the $pixelDomain clock',
+      );
+    }
+    final mode = HarborDisplayTiming(
+      hActive: timing.hActive,
+      hFrontPorch: timing.hFrontPorch,
+      hSyncWidth: timing.hSyncWidth,
+      hBackPorch: timing.hBackPorch,
+      vActive: timing.vActive,
+      vFrontPorch: timing.vFrontPorch,
+      vSyncWidth: timing.vSyncWidth,
+      vBackPorch: timing.vBackPorch,
+      pixelClock: realPixelHz,
+      hSyncPositive: timing.hSyncPositive,
+      vSyncPositive: timing.vSyncPositive,
+    );
+
+    final display = addPeripheral(
+      HarborScanoutDisplay(
+        baseAddress: baseAddress,
+        timing: mode,
+        formats: formats,
+        strides: strides,
+        framebufferBase: 0,
+        placement: HarborFramebufferPlacement.firmware,
+        scanoutMemory: memory,
+        framebufferSize: frame,
+        target: target,
+        simpleFramebuffer: false,
+        fabricMemory: true,
+        burstBeats: burstBeats,
+        fabricKind: fabricKind,
+        busAddressWidth: busAddressWidth,
+        busDataWidth: busDataWidth,
+        name: name,
+      ),
+      clockDomainName: busDomain,
+    );
+    display.input('pixel_clk').srcConnection! <= pixel.clk;
+    display.input('pixel_reset').srcConnection! <= pixel.reset;
+    display.input('shift_clk').srcConnection! <= shift.clk;
+    display.input('shift_reset').srcConnection! <= shift.reset;
+    addMaster(
+      display,
+      busInterfaceName: 'fb',
+      memory: true,
+      outstanding: 2,
+      realtime: true,
+      writeStallFree: true,
+      targetRanges: [memory],
+      burstRanges: [memory],
+    );
+    exposePin(display, 'gpdi', externalName: pinName);
+    if (display.tryOutput('gpdi_n') != null) {
+      exposePin(
+        display,
+        'gpdi_n',
+        externalName: pinName.replaceFirst('dp', 'dn'),
+      );
+    }
+    for (final (port, pin) in [
+      ('running', runningPin),
+      ('underrun', underrunPin),
+      ('update_pending', updatePendingPin),
+      ('bus_error', busErrorPin),
+    ]) {
+      if (pin != null) exposePin(display, port, externalName: pin);
+    }
+    return display;
+  }
 }
 
 /// The pixel clock of an ECP5 PLL that is nearest to [wantHz] and that has a
