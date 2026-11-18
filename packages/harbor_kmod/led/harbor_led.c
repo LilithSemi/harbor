@@ -273,10 +273,12 @@ static void hled_setup_timing(struct harbor_led *hl)
 #define HLED_TICKS(ns) \
 	min_t(u64, DIV_ROUND_CLOSEST_ULL((u64)(ns) * tick_hz, NSEC_PER_SEC), 0x7fff)
 
-	hled_check_ticks(hl, HLED_TICKS(HLED_T0H_NS), HLED_T0H_NS, tick_hz);
-	hled_check_ticks(hl, HLED_TICKS(HLED_T0L_NS), HLED_T0L_NS, tick_hz);
-	hled_check_ticks(hl, HLED_TICKS(HLED_T1H_NS), HLED_T1H_NS, tick_hz);
-	hled_check_ticks(hl, HLED_TICKS(HLED_T1L_NS), HLED_T1L_NS, tick_hz);
+	if (hl->has_serial) {
+		hled_check_ticks(hl, HLED_TICKS(HLED_T0H_NS), HLED_T0H_NS, tick_hz);
+		hled_check_ticks(hl, HLED_TICKS(HLED_T0L_NS), HLED_T0L_NS, tick_hz);
+		hled_check_ticks(hl, HLED_TICKS(HLED_T1H_NS), HLED_T1H_NS, tick_hz);
+		hled_check_ticks(hl, HLED_TICKS(HLED_T1L_NS), HLED_T1L_NS, tick_hz);
+	}
 
 	for (ch = 0; ch < hl->channels; ch++) {
 		if (!hl->serial[ch])

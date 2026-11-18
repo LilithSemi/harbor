@@ -12,6 +12,9 @@ Out-of-tree Linux kernel drivers for Harbor SoC peripherals.
 | `harbor_sdio` | `harbor,sdio`, `harbor,sdhci` | SD/SDIO/eMMC host controller (ADMA) |
 | `harbor_spi_flash` | `harbor,spi-flash-port` | MTD driver for the SPI flash write port |
 | `harbor_display` | `harbor,display` | DRM driver for the sdram scanout display, one fixed mode, vblank interrupt. It takes buffers of the full screen size only: a dumb buffer of another size is refused. It takes its buffers from the `memory-region` of the node, or from the default DMA pool or CMA area when the node has none. |
+| `harbor_led` | `harbor,led-engine` | LED class driver for the LED engine: one multicolor or mono LED per pixel, WS2812 serial and pwm channels. Needs `CONFIG_LEDS_CLASS_MULTICOLOR`. |
+
+An image that loads only the modules on an allow list must name each driver it needs, for example `harbor_led`. Otherwise the device appears in the tree with no driver bound.
 
 ## Peripherals with upstream Linux support
 
