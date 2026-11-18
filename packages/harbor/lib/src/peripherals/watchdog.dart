@@ -30,9 +30,15 @@ class HarborWatchdog extends BridgeModule
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
         HarborSvdPeripheralProvider,
-        HarborNarrowSlaveOk {
+        HarborNarrowSlaveOk,
+        HarborInputClockConsumer {
   /// Base address in the SoC memory map.
   final int baseAddress;
+
+  /// Rate in Hz of the clock the counter runs on. Emitted as
+  /// `clock-frequency`, because the driver turns a timeout in seconds into
+  /// cycles with it. The SoC fills it in from the clock domain when it is 0.
+  int clockFrequency;
 
   /// Counter width in bits.
   final int counterWidth;
@@ -52,6 +58,7 @@ class HarborWatchdog extends BridgeModule
   HarborWatchdog({
     required this.baseAddress,
     this.counterWidth = 32,
+    this.clockFrequency = 0,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     bool crossFabricClock = false,
     String? name,
@@ -224,9 +231,21 @@ class HarborWatchdog extends BridgeModule
   }
 
   @override
+  int get inputClockHz => clockFrequency;
+
+  @override
+  void provideInputClockHz(int hz) {
+    if (clockFrequency == 0) clockFrequency = hz;
+  }
+
+  @override
   HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(
     compatible: ['harbor,watchdog'],
     reg: BusAddressRange(baseAddress, 0x1000),
+    properties: {
+      if (clockFrequency > 0) 'clock-frequency': clockFrequency,
+      'harbor,counter-width': counterWidth,
+    },
   );
 
   @override
@@ -236,6 +255,8 @@ class HarborWatchdog extends BridgeModule
     memory: [BusAddressRange(baseAddress, 0x1000)],
     properties: {
       'compatible': ['harbor,watchdog'],
+      if (clockFrequency > 0) 'clock-frequency': clockFrequency,
+      'harbor,counter-width': counterWidth,
     },
   );
 

@@ -45,6 +45,23 @@ void main() {
       expect(tl.bus.kind, equals(HarborFabricKind.tilelink));
     });
 
+    test('DT and ACPI carry clock-frequency only when the rate is known', () {
+      final none = HarborWatchdog(baseAddress: 0x10005000);
+      expect(none.dtNode.properties, isNot(contains('clock-frequency')));
+      final wdt = HarborWatchdog(
+        baseAddress: 0x10005000,
+        clockFrequency: 25000000,
+      );
+      expect(wdt.dtNode.properties['clock-frequency'], equals(25000000));
+      expect(wdt.acpiDevice.properties['clock-frequency'], equals(25000000));
+      expect(wdt.dtNode.properties['harbor,counter-width'], equals(32));
+      expect(wdt.acpiDevice.properties['harbor,counter-width'], equals(32));
+      final narrow = HarborWatchdog(baseAddress: 0x10005000, counterWidth: 16);
+      expect(narrow.dtNode.properties['harbor,counter-width'], equals(16));
+      wdt.provideInputClockHz(50000000);
+      expect(wdt.inputClockHz, equals(25000000));
+    });
+
     test('different counter widths get different definition names', () {
       final a = HarborWatchdog(baseAddress: 0x1000, counterWidth: 32);
       final b = HarborWatchdog(baseAddress: 0x1000, counterWidth: 16);
