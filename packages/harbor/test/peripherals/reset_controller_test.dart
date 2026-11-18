@@ -42,18 +42,21 @@ void main() {
 void registerTests(HarborFabricKind kind) {
   group('HarborResetController register access (${kind.name})', () {
     late HarborResetController rc;
-    late Logic clk, por;
+    late Logic clk, por, wired, wdog;
     late RegBus bus;
 
     setUp(() async {
       rc = HarborResetController(baseAddress: 0x10005000, fabricKind: kind);
       clk = SimpleClockGenerator(10).clk;
       por = Logic(name: 'por');
+      wired = Logic(name: 'wired')..inject(0);
+      wdog = Logic(name: 'wdog')..inject(0);
 
       rc.input('clk').srcConnection! <= clk;
       rc.input('por').srcConnection! <= por;
       rc.input('ext_reset').srcConnection! <= Const(0);
-      rc.input('wdog_reset').srcConnection! <= Const(0);
+      rc.input('wdog_reset').srcConnection! <= wdog;
+      rc.input('watchdog_wired').srcConnection! <= wired;
       rc.input('debug_reset').srcConnection! <= Const(0);
       bus = RegBus.attach(rc, clk);
 
@@ -78,6 +81,67 @@ void registerTests(HarborFabricKind kind) {
     // Regression: the decode used to match only the low 6 bits of the byte
     // address inside an 8-bit (256-byte) window, aliasing each register
     // every 0x40 bytes. Confirms distinct registers and full-address decode.
+    Future<void> restart(int wiredValue) async {
+      wired.inject(wiredValue);
+      por.inject(1);
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      por.inject(0);
+      for (var i = 0; i < 300; i++) {
+        await clk.nextPosedge;
+      }
+    }
+
+    // Pulses wdog_reset for two clocks and counts the clocks of system reset
+    // over the next 400.
+    Future<int> pulseWatchdog() async {
+      var held = 0;
+      final count = clk.posedge.listen((_) {
+        if (rc.systemReset.value.toInt() == 1) held++;
+      });
+      wdog.inject(1);
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      wdog.inject(0);
+      for (var i = 0; i < 400; i++) {
+        await clk.nextPosedge;
+      }
+      await count.cancel();
+      return held;
+    }
+
+    test(
+      'a wdog_reset pulse resets the system when WDOG_RST_EN is 1',
+      () async {
+        await restart(1);
+        expect(await bus.read(_wdogEn), 1);
+        expect(await pulseWatchdog(), greaterThan(0));
+        expect(await bus.read(0x08) & 7, HarborResetSource.watchdog.index);
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('a wdog_reset pulse does nothing when WDOG_RST_EN is 0', () async {
+      await restart(0);
+      expect(await pulseWatchdog(), 0);
+      expect(await bus.read(0x08) & 7, HarborResetSource.por.index);
+      await Simulator.endSimulation();
+    });
+
+    test('software clearing WDOG_RST_EN stops a watchdog reset', () async {
+      await restart(1);
+      await bus.write(_wdogEn, 0);
+      expect(await bus.read(_wdogEn), 0);
+      expect(await pulseWatchdog(), 0);
+      expect(await bus.read(0x08) & 7, HarborResetSource.por.index);
+      await Simulator.endSimulation();
+    });
+
+    test('WDOG_RST_EN reads 0 after reset when no watchdog is wired', () async {
+      expect(await bus.read(_wdogEn), equals(0));
+      await Simulator.endSimulation();
+    });
+
     test('every register decodes at its own 8-byte slot', () async {
       await bus.write(_holdTime, 0x1234);
       expect(await bus.read(_holdTime), equals(0x1234));

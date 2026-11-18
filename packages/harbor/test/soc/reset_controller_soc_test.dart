@@ -12,6 +12,7 @@ import '../util/reg_bus.dart';
 
 const _reset = 0x10005000;
 const _gpio = 0x10001000;
+const _wdog = 0x10006000;
 const _output = 0x08;
 
 class _Cpu extends BridgeModule {
@@ -143,6 +144,235 @@ void main() {
       await Simulator.endSimulation();
     });
   }
+
+  for (final kind in HarborFabricKind.values) {
+    test('${kind.name}: a watchdog expiry resets the SoC with no reset '
+        'controller write', () async {
+      final soc = HarborSoC(
+        name: 'wdt_${kind.name}',
+        compatible: 'test,wdt',
+        fabricKind: kind,
+        softReset: true,
+        target: const HarborSimTarget(frequency: 50000000),
+        clocks: [
+          HarborClockConfig.fixed(
+            name: 'sys',
+            frequency: 50000000,
+            sourceFrequency: 50000000,
+            isPrimary: true,
+          ),
+        ],
+      );
+      final cpu = soc.addMaster(_Cpu(kind));
+      final gpio = soc.addPeripheral(
+        HarborGpio(
+          baseAddress: _gpio,
+          pinCount: 32,
+          busAddressWidth: 32,
+          fabricKind: kind,
+          name: 'gpio',
+        ),
+      );
+      final wdt = soc.addPeripheral(
+        HarborWatchdog(baseAddress: _wdog, fabricKind: kind),
+      );
+      final rc = soc.addResetController(
+        HarborResetController(baseAddress: _reset, fabricKind: kind),
+        watchdog: wdt.resetOut,
+      );
+      cpu.pullUp(soc);
+      soc.buildFabric();
+
+      expect(wdt.dtNode.properties['clock-frequency'], 50000000);
+      expect(
+        RegExp(
+          r'harbor,watchdog[^}]*clock-frequency = <(0x2faf080|50000000)>',
+        ).hasMatch(soc.generateDts()),
+        isTrue,
+      );
+
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset')..inject(1);
+      soc.input('clk').srcConnection! <= clk;
+      soc.input('reset').srcConnection! <= reset;
+      gpio.input('gpio_in').srcConnection! <= Const(0, width: 32);
+      final bus = RegBus.attach(soc, clk, name: 'cpu', kind: kind);
+      await soc.build();
+      bus.idle();
+      Simulator.setMaxSimTime(4000000);
+      unawaited(Simulator.run());
+      for (var i = 0; i < 8; i++) {
+        await clk.nextPosedge;
+      }
+      reset.inject(0);
+      for (var i = 0; i < 300; i++) {
+        await clk.nextPosedge;
+      }
+
+      expect(await bus.read(_reset + 0x28), 1);
+      await bus.write(_gpio + _output, 0x1234);
+      expect(gpio.gpioOut.value.toInt(), 0x1234);
+
+      // Arm the watchdog: 200 cycles, enable and reset_en.
+      await bus.write(_wdog + 0x10, 200);
+      await bus.write(_wdog + 0x00, 0x03);
+      bus.timeout = 30;
+      var held = 0;
+      final count = clk.posedge.listen((_) {
+        if (rc.systemReset.value.toInt() == 1) held++;
+      });
+      for (var i = 0; i < 900; i++) {
+        await clk.nextPosedge;
+      }
+      await count.cancel();
+      bus.timeout = 10000;
+      expect(held, greaterThanOrEqualTo(256));
+      expect(rc.systemReset.value.toInt(), 0);
+      expect(gpio.gpioOut.value.toInt(), 0);
+      expect(
+        await bus.read(_reset + 0x08) & 7,
+        HarborResetSource.watchdog.index,
+      );
+      // The watchdog comes back disabled, and the enable stays 1.
+      expect(await bus.read(_wdog + 0x00) & 1, 0);
+      expect(await bus.read(_reset + 0x28), 1);
+      await Simulator.endSimulation();
+    });
+  }
+
+  for (final wired in [false, true]) {
+    test('the WDOG_RST_EN reset value follows the wiring (watchdog '
+        '${wired ? 'wired' : 'absent'})', () async {
+      const kind = HarborFabricKind.wishbone;
+      final soc = HarborSoC(
+        name: 'wdt_wired_$wired',
+        compatible: 'test,wdt',
+        fabricKind: kind,
+        softReset: true,
+        target: const HarborSimTarget(frequency: 50000000),
+        clocks: [
+          HarborClockConfig.fixed(
+            name: 'sys',
+            frequency: 50000000,
+            sourceFrequency: 50000000,
+            isPrimary: true,
+          ),
+        ],
+      );
+      final cpu = soc.addMaster(_Cpu(kind));
+      final wdt = wired
+          ? soc.addPeripheral(HarborWatchdog(baseAddress: _wdog))
+          : null;
+      soc.addResetController(
+        HarborResetController(baseAddress: _reset),
+        watchdog: wdt?.resetOut,
+      );
+      cpu.pullUp(soc);
+      soc.buildFabric();
+
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset')..inject(1);
+      soc.input('clk').srcConnection! <= clk;
+      soc.input('reset').srcConnection! <= reset;
+      final bus = RegBus.attach(soc, clk, name: 'cpu', kind: kind);
+      await soc.build();
+      bus.idle();
+      Simulator.setMaxSimTime(4000000);
+      unawaited(Simulator.run());
+      for (var i = 0; i < 8; i++) {
+        await clk.nextPosedge;
+      }
+      reset.inject(0);
+      for (var i = 0; i < 300; i++) {
+        await clk.nextPosedge;
+      }
+      expect(await bus.read(_reset + 0x28), wired ? 1 : 0);
+      await Simulator.endSimulation();
+    });
+  }
+
+  test(
+    'a controller added through addPeripheral reads WDOG_RST_EN 0',
+    () async {
+      const kind = HarborFabricKind.wishbone;
+      final soc = HarborSoC(
+        name: 'wdt_plain',
+        compatible: 'test,wdt',
+        fabricKind: kind,
+        target: const HarborSimTarget(frequency: 50000000),
+        clocks: [
+          HarborClockConfig.fixed(
+            name: 'sys',
+            frequency: 50000000,
+            sourceFrequency: 50000000,
+            isPrimary: true,
+          ),
+        ],
+      );
+      final cpu = soc.addMaster(_Cpu(kind));
+      soc.addPeripheral(HarborResetController(baseAddress: _reset));
+      cpu.pullUp(soc);
+      soc.buildFabric();
+      final clk = SimpleClockGenerator(10).clk;
+      final reset = Logic(name: 'reset')..inject(1);
+      soc.input('clk').srcConnection! <= clk;
+      soc.input('reset').srcConnection! <= reset;
+      final bus = RegBus.attach(soc, clk, name: 'cpu', kind: kind);
+      await soc.build();
+      bus.idle();
+      Simulator.setMaxSimTime(4000000);
+      unawaited(Simulator.run());
+      for (var i = 0; i < 8; i++) {
+        await clk.nextPosedge;
+      }
+      reset.inject(0);
+      for (var i = 0; i < 300; i++) {
+        await clk.nextPosedge;
+      }
+      expect(await bus.read(_reset + 0x28), 0);
+      await Simulator.endSimulation();
+    },
+  );
+
+  test('a watchdog on another clock domain than the controller throws', () {
+    final soc = HarborSoC(
+      name: 'wdt_cross',
+      compatible: 'test,wdt',
+      softReset: true,
+      target: const HarborSimTarget(frequency: 50000000),
+      clocks: [
+        HarborClockConfig.fixed(
+          name: 'ref',
+          frequency: 50000000,
+          sourceFrequency: 50000000,
+          isPrimary: true,
+        ),
+        HarborClockConfig.fixed(
+          name: 'sys',
+          frequency: 25000000,
+          sourceFrequency: 50000000,
+        ),
+      ],
+    );
+    final wdt = soc.addPeripheral(
+      HarborWatchdog(baseAddress: _wdog, crossFabricClock: true),
+      clockDomainName: 'ref',
+    );
+    expect(
+      () => soc.addResetController(
+        HarborResetController(baseAddress: _reset),
+        clockDomainName: 'sys',
+        watchdog: wdt.resetOut,
+      ),
+      throwsA(
+        isA<ArgumentError>().having(
+          (e) => e.message.toString(),
+          'message',
+          contains('different clock domains'),
+        ),
+      ),
+    );
+  });
 
   test('a controller on a derived clock domain holds the reset for its hold '
       'time in that clock, and a reset pin reads as external', () async {

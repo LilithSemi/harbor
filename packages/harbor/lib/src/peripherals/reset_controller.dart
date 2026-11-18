@@ -46,6 +46,12 @@ enum HarborResetSource {
 /// The node is a `syscon` with a `syscon-reboot` child that writes 0xDEAD at
 /// offset 0x30, so the Linux restart handler triggers the software reset.
 /// `HarborSoC.addResetController` ORs [systemReset] into the SoC reset.
+///
+/// WDOG_RST_EN takes the `watchdog_wired` input at hard reset. The SoC ties
+/// it to 1 when it wires a watchdog to `wdog_reset`, or an expiry resets
+/// nothing, and to 0 otherwise. The watchdog is disabled after any reset and
+/// software must arm it, so the 1 cannot reset a SoC that does not use the
+/// watchdog. Software can clear the register.
 class HarborResetController extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
@@ -115,6 +121,7 @@ class HarborResetController extends BridgeModule
     createPort('por', PortDirection.input); // power-on reset
     createPort('ext_reset', PortDirection.input); // external reset pin
     createPort('wdog_reset', PortDirection.input); // from watchdog
+    createPort('watchdog_wired', PortDirection.input); // WDOG_RST_EN reset
     createPort('debug_reset', PortDirection.input); // from debug module
 
     addOutput('system_reset');
@@ -174,7 +181,7 @@ class HarborResetController extends BridgeModule
             orElse: [cause < Const(HarborResetSource.por.index, width: 3)],
           ),
           domainRstReg < Const(0, width: domainCount),
-          wdogEn < Const(0),
+          wdogEn < input('watchdog_wired'),
           swResetPending < Const(0),
           bus.ack < Const(0),
           bus.dataOut < Const(0, width: 32),

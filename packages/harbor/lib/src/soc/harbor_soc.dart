@@ -189,6 +189,8 @@ class HarborSoC extends BridgeModule {
         module.input('ext_reset').srcConnection! <= sync[1];
       }
       module.input('wdog_reset').srcConnection! <= (_resetWatchdog ?? Const(0));
+      module.input('watchdog_wired').srcConnection! <=
+          Const(_resetWatchdog == null ? 0 : 1);
       module.input('debug_reset').srcConnection! <= (_resetDebug ?? Const(0));
     } else {
       module.input('reset').srcConnection! <= reset;
@@ -611,6 +613,9 @@ class HarborSoC extends BridgeModule {
   ///   (simulation, ASIC) also reads external after a cold boot.
   /// - The controller needs `minHoldCycles` of at least
   ///   [requiredResetHoldCycles], and this throws when it has less.
+  /// - A [watchdog] makes WDOG_RST_EN 1 after reset, so an expiry resets the
+  ///   SoC. Without one it is 0. The watchdog must run on the clock domain of
+  ///   the controller, and this throws when it does not.
   /// - [watchdog] and [debug] are optional reset requests for its `wdog_reset`
   ///   and `debug_reset` inputs. A controller on another fabric clock is not
   ///   accepted, since its bus port would then reset itself.
@@ -632,6 +637,21 @@ class HarborSoC extends BridgeModule {
         'the reset controller must run on the fabric clock, without a '
         'crossing',
       );
+    }
+    if (watchdog != null) {
+      for (final e in _peripherals) {
+        if (!identical(e.module, watchdog.parentModule)) continue;
+        if (!identical(
+          domainFor(e.clockDomainName),
+          domainFor(clockDomainName),
+        )) {
+          throw ArgumentError(
+            'the watchdog ${e.module.name} and the reset controller run on '
+            'different clock domains, and wdog_reset has no synchroniser. '
+            'Put both on one domain.',
+          );
+        }
+      }
     }
     _checkResetHold(controller, clockDomainName);
     _resetController = controller;
