@@ -71,6 +71,68 @@ enum _XilinxFamily {
   kintex7,
 }
 
+/// Bits that a [HarborBitstreamPatch] sets in one word of a frame.
+class HarborFramePatch {
+  /// Frame address.
+  final int frame;
+
+  /// Index of the 32-bit word in the frame.
+  final int word;
+
+  /// Bits that are set in the word. The other bits do not change.
+  final int orMask;
+
+  const HarborFramePatch({
+    required this.frame,
+    required this.word,
+    required this.orMask,
+  });
+
+  /// The frame address as the text of a frame file.
+  String get frameText =>
+      '0x${frame.toRadixString(16).toUpperCase().padLeft(8, '0')}';
+
+  /// The mask as 8 hex digits.
+  String get maskText =>
+      '0x${orMask.toRadixString(16).toUpperCase().padLeft(8, '0')}';
+}
+
+/// Edits that a board needs in the bitstream, which the tools do not make.
+///
+/// The openXC7 Makefile appends [fasmLines] to the FASM after nextpnr, and
+/// sets the bits of [frames] after fasm2frames. The Makefile has the patch
+/// only when the design uses [whenPin] of the board catalog.
+class HarborBitstreamPatch {
+  /// Name of the pin of the board catalog that needs the patch.
+  final String whenPin;
+
+  /// FASM lines to append.
+  final List<String> fasmLines;
+
+  /// Frame bits to set.
+  final List<HarborFramePatch> frames;
+
+  const HarborBitstreamPatch({
+    required this.whenPin,
+    this.fasmLines = const [],
+    this.frames = const [],
+  });
+
+  /// Throws an [ArgumentError] when a FASM line has a character that the
+  /// Makefile quoting does not take: a quote, a dollar sign or a line break.
+  void check() {
+    for (final line in fasmLines) {
+      if (line.contains(RegExp("['\\\$\\n\\r]"))) {
+        throw ArgumentError.value(
+          line,
+          'fasmLines',
+          "has ', \$ or a line break",
+        );
+      }
+    }
+  }
+}
+
 /// FPGA target with vendor-specific toolchain configuration.
 ///
 /// ```dart
@@ -174,6 +236,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     }
   }
 
+  /// Edits that the openXC7 Makefile makes to the FASM and the frames of a
+  /// design. A patch is in the Makefile only when [pinMap] has its pin.
+  final List<HarborBitstreamPatch> bitstreamPatches;
+
   /// Optional bitstream programming command for a `prog` Makefile target
   /// (e.g. `'openFPGALoader -b ulx3s \$(TOP).bit'`). When null, no `prog`
   /// target is emitted.
@@ -251,8 +317,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.ecp5Autoname = false,
     this.xilinxLut6Cost,
     this.useHimbaechel = false,
-  }) : speedGrade =
-           speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1'),
+    this.bitstreamPatches = const [],
+  }) : speedGrade = speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1'),
        assert(xilinxLut6Cost == null || xilinxLut6Cost > 0),
        assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
        _xilinxFamily = null;
@@ -266,7 +332,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
     this.progCommand,
-  }) : name = 'ice40-$device',
+  }) : bitstreamPatches = const [],
+       name = 'ice40-$device',
        vendor = HarborFpgaVendor.ice40,
        _xilinxFamily = null,
        clockNPortName = null,
@@ -286,7 +353,8 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.speedGrade = '6',
     this.progCommand,
     this.ecp5Autoname = false,
-  }) : name = 'ecp5-$device',
+  }) : bitstreamPatches = const [],
+       name = 'ecp5-$device',
        vendor = HarborFpgaVendor.ecp5,
        clockNPortName = null,
        useHimbaechel = false,
@@ -310,6 +378,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
     this.xilinxLut6Cost,
+    this.bitstreamPatches = const [],
   }) : name = 'spartan7-$device',
        vendor = useOpenXc7 || useHimbaechel
            ? HarborFpgaVendor.openXc7
@@ -334,6 +403,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
+    this.bitstreamPatches = const [],
   }) : name = 'artix7-$device',
        vendor = useOpenXc7 || useHimbaechel
            ? HarborFpgaVendor.openXc7
@@ -358,6 +428,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
+    this.bitstreamPatches = const [],
   }) : name = 'kintex7-$device',
        vendor = useOpenXc7 || useHimbaechel
            ? HarborFpgaVendor.openXc7
@@ -833,12 +904,46 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     return buf.toString();
   }
 
+  /// Throws when a KC705 class part (xc7k325t, ffg900) has the PCIe reference
+  /// clock pin in the design and no patch. The tools do not set the inter-quad
+  /// reference clock path of this part, and the link does not come up without
+  /// it. A target that a caller rebuilds from a board drops the patches.
+  void _checkKc705RefclkPatch(
+    List<HarborBitstreamPatch> patches,
+    Set<String>? knownPorts,
+  ) {
+    const pin = 'pcie_refclk_p';
+    if (vendor != HarborFpgaVendor.openXc7 ||
+        device.toLowerCase() != 'xc7k325t' ||
+        package.toLowerCase() != 'ffg900' ||
+        !pinMap.containsKey(pin) ||
+        !_emitPin(pin, knownPorts) ||
+        patches.isNotEmpty) {
+      return;
+    }
+    throw StateError(
+      'The design has $pin on $device-$package and the target has no '
+      'bitstream patch for the PCIe reference clock. Build the target with '
+      'HarborBoard.fpgaTarget, which also takes extraConstraints, or pass '
+      'bitstreamPatches.',
+    );
+  }
+
   /// Generates a complete Makefile for the FPGA build flow.
   ///
   /// With [pllClockScript], an openXC7 Makefile also takes
   /// `support/nextpnr/pll_clocks.py` as a `--pre-pack` script. That script
   /// has no `--timing-allow-fail`, so a missed clock fails the build.
-  String generateMakefile(String topCell, {bool pllClockScript = false}) {
+  ///
+  /// [knownPorts] is the set of top-level port base names of the design. A
+  /// [bitstreamPatches] entry is in the Makefile only when the design has its
+  /// pin, with the rule of [generateConstraints]. With null the design is
+  /// taken to have every pin of [pinMap].
+  String generateMakefile(
+    String topCell, {
+    bool pllClockScript = false,
+    Set<String>? knownPorts,
+  }) {
     final buf = StringBuffer();
     buf.writeln('# Auto-generated Makefile for $name');
     buf.writeln('TOP = $topCell');
@@ -990,6 +1095,18 @@ class HarborFpgaTarget extends HarborDeviceTarget {
                   '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
       );
       buf.writeln();
+      final patches = [
+        for (final p in bitstreamPatches)
+          if (pinMap.containsKey(p.whenPin) && _emitPin(p.whenPin, knownPorts))
+            p,
+      ];
+      _checkKc705RefclkPatch(patches, knownPorts);
+      if (patches.isNotEmpty) {
+        // A failed patch step must not leave a file that a new run takes as
+        // up to date.
+        buf.writeln('.DELETE_ON_ERROR:');
+        buf.writeln();
+      }
       buf.writeln('pnr: \$(TOP).fasm');
       buf.writeln('\$(TOP).fasm: \$(TOP).json \$(TOP).$constraintExtension');
       if (useHimbaechel) {
@@ -1017,6 +1134,14 @@ class HarborFpgaTarget extends HarborDeviceTarget {
           "\tsed -i 's/\\.VREF\\.V_675_MV\$\$/.VREF.V_750_MV/' \$(TOP).fasm",
         );
       }
+      for (final patch in patches) {
+        patch.check();
+      }
+      for (final patch in patches) {
+        for (final line in patch.fasmLines) {
+          buf.writeln("\techo '$line' >> \$(TOP).fasm");
+        }
+      }
       buf.writeln();
       buf.writeln('pack: \$(TOP).$bitstreamExtension');
       buf.writeln('\$(TOP).frames: \$(TOP).fasm');
@@ -1024,6 +1149,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         '\tfasm2frames --db-root \$(XRAY_DB)/\$(FAMILY) --part \$(PART) '
         '\$(TOP).fasm \$(TOP).frames',
       );
+      for (final patch in patches) {
+        for (final f in patch.frames) {
+          buf.writeln(_framePatchRecipe(f));
+        }
+      }
       buf.writeln('\$(TOP).$bitstreamExtension: \$(TOP).frames');
       buf.writeln(
         '\txc7frames2bit --part_file \$(XRAY_DB)/\$(FAMILY)/\$(PART)/part.yaml '
@@ -1049,6 +1179,18 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     );
     return buf.toString();
   }
+
+  /// The Makefile line that sets [patch] in `$(TOP).frames`. It stops the
+  /// build when the frame is not in the file.
+  static String _framePatchRecipe(HarborFramePatch patch) =>
+      '\tperl -pi -e \'if (/^${patch.frameText}\\s/i) { chomp; '
+      'my (\$\$a, \$\$w) = split / /, \$\$_, 2; '
+      'my @w = split /,/, \$\$w; '
+      '\$\$w[${patch.word}] = sprintf("0x%08X", '
+      'hex(\$\$w[${patch.word}]) | ${patch.maskText}); '
+      '\$\$_ = "\$\$a " . join(",", @w) . "\\n"; \$\$hit = 1 } '
+      'END { die "frame ${patch.frameText} is not in the frames\\n" '
+      'unless \$\$hit }\' \$(TOP).frames';
 
   /// Generates a pin constraint file in the vendor's format.
   ///

@@ -2094,7 +2094,11 @@ class HarborSoC extends BridgeModule {
               _xilinxPllClockMhz.isNotEmpty &&
               !_hasDdr3ClockTree;
           File('$path/Makefile').writeAsStringSync(
-            t.generateMakefile(name, pllClockScript: pllScript),
+            t.generateMakefile(
+              name,
+              pllClockScript: pllScript,
+              knownPorts: knownPorts,
+            ),
           );
 
           // OpenOCD config, auto-emitted when the SoC has a JTAG debug master.

@@ -99,6 +99,10 @@ class HarborBoard {
   /// name of each pin. Empty for a board that has no preset.
   final List<HarborBoardLedChannel> ledChannels;
 
+  /// Edits that the openXC7 Makefile makes to the FASM and the frames. See
+  /// [HarborBitstreamPatch].
+  final List<HarborBitstreamPatch> bitstreamPatches;
+
   const HarborBoard({
     required this.name,
     required this.vendor,
@@ -114,6 +118,7 @@ class HarborBoard {
     String? speedGrade,
     this.clockCapableSites = const {},
     this.ledChannels = const [],
+    this.bitstreamPatches = const [],
   }) : speedGrade = speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1');
 
   /// Whether [pin] is on a ball that reaches a global clock net with no clock
@@ -198,6 +203,7 @@ class HarborBoard {
     speedGrade: grade,
     clockCapableSites: clockCapableSites,
     ledChannels: ledChannels,
+    bitstreamPatches: bitstreamPatches,
   );
 
   String get _vendorPrefix => switch (vendor) {
@@ -240,6 +246,10 @@ class HarborBoard {
   /// [extraPins] adds board-specific pins not in the catalog. [frequency]
   /// overrides the target clock (defaults to [oscillatorHz]).
   ///
+  /// [extraConstraints] go to the target as they are. The [bitstreamPatches]
+  /// of the board always go to the target, and the Makefile has a patch only
+  /// when the design has its pin.
+  ///
   /// [ddrDllOn] picks the DDR3 DQS mapping (see [ddrPinsFor]) for a board
   /// with [ddrDqsComplementPins]. Pass the DLL mode the DDR3 controller
   /// config actually builds with; this preset does not assume one, so
@@ -250,6 +260,7 @@ class HarborBoard {
     Map<String, String> extraPins = const {},
     bool? ddrDllOn,
     bool useHimbaechel = false,
+    Map<String, String> extraConstraints = const {},
   }) {
     if (useHimbaechel && vendor != HarborFpgaVendor.openXc7) {
       throw ArgumentError('Himbächel is only available for openXC7 boards.');
@@ -308,6 +319,8 @@ class HarborBoard {
       speedGrade: speedGrade,
       progCommand: progCommand,
       useHimbaechel: useHimbaechel,
+      extraConstraints: extraConstraints,
+      bitstreamPatches: bitstreamPatches,
     );
   }
 }
@@ -1112,6 +1125,23 @@ const _kc705 = HarborBoard(
   oscillatorHz: 200000000,
   clockNPortName: 'clk_n',
   progCommand: 'openFPGALoader -b kc705 \$(TOP).bit',
+  bitstreamPatches: [
+    // The reference clock is in quad 115 and lane 0 is in quad 116. The
+    // netlist uses the reference clock as a local one, so the tools do not
+    // set the north reference clock path of quad 116. FASM lines of the
+    // tile pair and one frame bit set it.
+    HarborBitstreamPatch(
+      whenPin: 'pcie_refclk_p',
+      fasmLines: [
+        'GTX_CHANNEL_3_X219Y254.GTXE2_CHANNEL.GTREFCLK1_USED',
+        'GTX_COMMON_X219Y231.GTXE2_COMMON.GTREFCLK0_USED',
+        'GTX_COMMON_X219Y231.GTXE2_COMMON.GTREFCLK1_USED',
+      ],
+      frames: [
+        HarborFramePatch(frame: 0x00002C9F, word: 46, orMask: 0x00020000),
+      ],
+    ),
+  ],
   pins: {
     // SYSCLK 200 MHz oscillator on the bank 33 MRCC pair. DIFF_SSTL15 is from
     // part0_pins.xml. UG810 Table 1-9 says LVDS. Both are valid on a 1.5 V
@@ -1151,7 +1181,10 @@ const _kc705 = HarborBoard(
     'spi_io[2]': 'R20 LVCMOS25',
     'spi_io[3]': 'R21 LVCMOS25',
     // PCIe x8 edge connector (Xilinx). Reference clock is MGTREFCLK1 of quad
-    // 115. PERST# is bank 16, 2.5 V.
+    // 115, IBUFDS_GTE2_X0Y1. PERST# is bank 16, 2.5 V. Lanes 0 to 3 are quad
+    // 116 channels 3 to 0, and lane 0 is GTXE2_CHANNEL_X0Y7. Lanes 4 to 7 are
+    // quad 115 channels 3 to 0. The bitstream patch above sets the path from
+    // the reference clock in quad 115 to quad 116.
     'pcie_refclk_p': 'U8 MGT',
     'pcie_refclk_n': 'U7 MGT',
     'pcie_perst_n': 'G25 LVCMOS25 PULLTYPE=PULLUP',
