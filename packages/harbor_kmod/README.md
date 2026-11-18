@@ -65,4 +65,4 @@ gpio@10001000 {
 
 ## License
 
-GPL-2.0-or-later
+GPL-2.0-or-later. The license text is in [LICENSE](LICENSE). The rest of Harbor is Apache-2.0.
