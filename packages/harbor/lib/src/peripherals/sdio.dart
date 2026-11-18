@@ -538,6 +538,7 @@ class HarborSdioController extends BridgeModule
 
     // Response NCR timeout, in SD clocks (spec allows up to 64, round up).
     const respTimeout = 128;
+    final timeoutW = respTimeout.bitLength;
 
     // Registers
     final ctrlEnable = Logic(name: 'ctrl_enable');
@@ -605,7 +606,7 @@ class HarborSdioController extends BridgeModule
     final cmdOe = Logic(name: 'cmd_oe');
     final respShift = Logic(name: 'resp_shift', width: 128);
     final respCnt = Logic(name: 'resp_cnt', width: 8);
-    final toCnt = Logic(name: 'to_cnt', width: 16);
+    final toCnt = Logic(name: 'to_cnt', width: timeoutW);
 
     // DAT engine state. PIO block read/write at 1/4/8-bit width (selected at
     // runtime via CTRL[5:4]): [laneCount] bits move per SD clock, one per lane,
@@ -720,7 +721,7 @@ class HarborSdioController extends BridgeModule
     final statCntW = writeBusyStartClocks.bitLength;
     final statCnt = Logic(name: 'dat_stat_cnt', width: statCntW);
     final busySeen = Logic(name: 'dat_busy_seen');
-    final statWaitCnt = Logic(name: 'dat_stat_wait', width: 16);
+    final statWaitCnt = Logic(name: 'dat_stat_wait', width: timeoutW);
     final busyW = this.writeBusyTimeout.bitLength;
     final busyCnt = Logic(name: 'dat_busy_wait', width: busyW);
     // Keep the write-data start at least two SD clock cycles after the
@@ -1262,7 +1263,7 @@ class HarborSdioController extends BridgeModule
         (state.eq(Const(sWait, width: 3)) &
                 respEdge &
                 cmdIn &
-                toCnt.eq(Const(respTimeout, width: 16)))
+                toCnt.eq(Const(respTimeout, width: timeoutW)))
             .named('cmd_timeout_now');
 
     // INT_STATUS bits a write clears in this cycle.
@@ -1331,7 +1332,7 @@ class HarborSdioController extends BridgeModule
           cmdOe < Const(0),
           respShift < Const(0, width: 128),
           respCnt < Const(0, width: 8),
-          toCnt < Const(0, width: 16),
+          toCnt < Const(0, width: timeoutW),
           datState < Const(dIdle, width: 4),
           for (final c in crc16) c < Const(0, width: 16),
           byteShift < Const(0, width: 8),
@@ -1350,7 +1351,7 @@ class HarborSdioController extends BridgeModule
           statShift < Const(0, width: 3),
           statCnt < Const(0, width: statCntW),
           busySeen < Const(0),
-          statWaitCnt < Const(0, width: 16),
+          statWaitCnt < Const(0, width: timeoutW),
           busyCnt < Const(0, width: busyW),
           wrNwrCnt < Const(0, width: 2),
           wrLineFree < Const(1),
@@ -1468,7 +1469,7 @@ class HarborSdioController extends BridgeModule
                     // Wait for the card to drive the response.
                     orElse: [
                       state < Const(sWait, width: 3),
-                      toCnt < Const(0, width: 16),
+                      toCnt < Const(0, width: timeoutW),
                     ],
                   ),
                 ],
@@ -1498,9 +1499,9 @@ class HarborSdioController extends BridgeModule
                           ),
                     ],
                     orElse: [
-                      toCnt < (toCnt + Const(1, width: 16)),
+                      toCnt < (toCnt + Const(1, width: timeoutW)),
                       If(
-                        toCnt.eq(Const(respTimeout, width: 16)),
+                        toCnt.eq(Const(respTimeout, width: timeoutW)),
                         then: [
                           state < Const(sIdle, width: 3),
                           busy < Const(0),
@@ -1955,7 +1956,7 @@ class HarborSdioController extends BridgeModule
                   then: [
                     datOeReg < Const(0),
                     datState < Const(dWStatWait, width: 4),
-                    statWaitCnt < Const(0, width: 16),
+                    statWaitCnt < Const(0, width: timeoutW),
                   ],
                 ),
               ]),
@@ -1972,9 +1973,9 @@ class HarborSdioController extends BridgeModule
                         statCnt < Const(3, width: statCntW),
                       ],
                       orElse: [
-                        statWaitCnt < (statWaitCnt + Const(1, width: 16)),
+                        statWaitCnt < (statWaitCnt + Const(1, width: timeoutW)),
                         If(
-                          statWaitCnt.eq(Const(respTimeout, width: 16)),
+                          statWaitCnt.eq(Const(respTimeout, width: timeoutW)),
                           then: [
                             // No token: treat as a write error and finish.
                             datState < Const(dIdle, width: 4),
