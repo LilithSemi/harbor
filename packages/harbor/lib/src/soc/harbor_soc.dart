@@ -933,6 +933,27 @@ class HarborSoC extends BridgeModule {
   /// pulled up with [exposePin].
   final Map<BridgeModule, Map<String, String>> _exposedPins = {};
 
+  /// The clock nets and rates of every [HarborClockRateProvider] module in
+  /// the hierarchy of the SoC, a bus peripheral or not. Each module gets its
+  /// instance path from the SoC, with `.` between the names. Call it after
+  /// the build.
+  Map<String, double> _peripheralClockMhz() {
+    final rates = <String, double>{};
+    void walk(Module m, String path) {
+      if (m is HarborClockRateProvider) {
+        rates.addAll((m as HarborClockRateProvider).clockRates(path));
+      }
+      for (final child in m.subModules) {
+        walk(child, '$path.${child.uniqueInstanceName}');
+      }
+    }
+
+    for (final child in subModules) {
+      walk(child, child.uniqueInstanceName);
+    }
+    return rates;
+  }
+
   /// Lines of every [HarborPinConstraintProvider] peripheral, each line once.
   List<String> _devicePinConstraints(HarborFpgaTarget t) {
     final lines = <String>{};
@@ -2088,10 +2109,12 @@ class HarborSoC extends BridgeModule {
           File(
             '$path/synth.tcl',
           ).writeAsStringSync(t.generateYosysTcl(name, svFiles: svFiles));
+          final providedClocks = _peripheralClockMhz();
+          final pllClocks = {..._xilinxPllClockMhz, ...providedClocks};
           final pllScript =
               t.vendor == HarborFpgaVendor.openXc7 &&
               !t.useHimbaechel &&
-              _xilinxPllClockMhz.isNotEmpty &&
+              pllClocks.isNotEmpty &&
               !_hasDdr3ClockTree;
           File('$path/Makefile').writeAsStringSync(
             t.generateMakefile(
@@ -2126,6 +2149,7 @@ class HarborSoC extends BridgeModule {
           // the train SERDES pinned off the dead _SING tile through pre-place.
           // Himbächel pairs the SERDES during packing, so it only uses the
           // clock constraint script below.
+          var clocksPyWritten = false;
           if (t.vendor == HarborFpgaVendor.openXc7) {
             final ddr = peripherals.whereType<HarborDdr3>().firstOrNull;
             if (ddr != null) {
@@ -2154,6 +2178,7 @@ class HarborSoC extends BridgeModule {
               // identical for the legacy path.
               final ddrCtrlMhz = xilinxDdr3Clocks?.controllerClkMhz;
               if (coreMhz != null && sourceMhz != null && ddrCtrlMhz != null) {
+                clocksPyWritten = true;
                 Directory('$path/support/nextpnr').createSync(recursive: true);
                 File('$path/support/nextpnr/clocks.py').writeAsStringSync(
                   t.generateClockConstraintPy(
@@ -2162,30 +2187,57 @@ class HarborSoC extends BridgeModule {
                     sourceClockNet: 'sysosc_clk',
                     sourceClkMhz: sourceMhz,
                     ddrCtrlMhz: ddrCtrlMhz,
+                    extraClocks: providedClocks,
                   ),
                 );
               }
             }
-            if (!_hasDdr3ClockTree && _xilinxPllClockMhz.isNotEmpty) {
-              if (t.useHimbaechel) {
-                // Himbächel can lack Python hooks, so the XDC carries the rate.
-                final xdc = File('$path/$name.${t.constraintExtension}');
-                final lines = StringBuffer(xdc.readAsStringSync());
-                for (final e in _xilinxPllClockMhz.entries) {
-                  lines.writeln(
-                    'create_clock -period '
-                    '${(1000 / e.value).toStringAsFixed(3)} '
-                    '[get_nets ${e.key}]',
-                  );
-                }
-                xdc.writeAsStringSync(lines.toString());
-              } else {
-                Directory('$path/support/nextpnr').createSync(recursive: true);
-                File('$path/support/nextpnr/pll_clocks.py').writeAsStringSync(
-                  t.generatePllClockConstraintPy(_xilinxPllClockMhz),
+            if (_hasDdr3ClockTree &&
+                !t.useHimbaechel &&
+                providedClocks.isNotEmpty &&
+                !clocksPyWritten) {
+              throw StateError(
+                'The clock rates of ${providedClocks.keys.join(', ')} need '
+                'support/nextpnr/clocks.py, and a design with a DDR3 clock '
+                'tree writes it only with a DDR3 controller and the rates of '
+                'its clocks. Use Himbächel or add the controller.',
+              );
+            }
+            // Himbächel can lack Python hooks, so the XDC carries the rates.
+            // With a DDR3 clock tree the PLL nets are not timed here.
+            final xdcClocks = _hasDdr3ClockTree ? providedClocks : pllClocks;
+            if (t.useHimbaechel && xdcClocks.isNotEmpty) {
+              final xdc = File('$path/$name.${t.constraintExtension}');
+              final lines = StringBuffer(xdc.readAsStringSync());
+              for (final e in xdcClocks.entries) {
+                lines.writeln(
+                  'create_clock -period '
+                  '${(1000 / e.value).toStringAsFixed(3)} '
+                  '[get_nets ${e.key}]',
                 );
               }
+              xdc.writeAsStringSync(lines.toString());
+            } else if (!t.useHimbaechel &&
+                !_hasDdr3ClockTree &&
+                pllClocks.isNotEmpty) {
+              Directory('$path/support/nextpnr').createSync(recursive: true);
+              File(
+                '$path/support/nextpnr/pll_clocks.py',
+              ).writeAsStringSync(t.generatePllClockConstraintPy(pllClocks));
             }
+          } else if (t.vendor == HarborFpgaVendor.vivado &&
+              providedClocks.isNotEmpty) {
+            // Vivado names a net in a flat design with `/` between the names.
+            final xdc = File('$path/$name.${t.constraintExtension}');
+            final lines = StringBuffer(xdc.readAsStringSync());
+            for (final e in providedClocks.entries) {
+              lines.writeln(
+                'create_clock -period '
+                '${(1000 / e.value).toStringAsFixed(3)} '
+                '[get_nets ${e.key.replaceAll('.', '/')}]',
+              );
+            }
+            xdc.writeAsStringSync(lines.toString());
           }
 
           // Peripheral-contributed pins. The peripheral names its own cells;

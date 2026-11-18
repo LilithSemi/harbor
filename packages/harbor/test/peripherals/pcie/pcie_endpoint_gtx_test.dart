@@ -183,6 +183,26 @@ void main() {
     );
   });
 
+  test('the default GTX definition names are fixed', () async {
+    final dut = endpoint(_kintex);
+    await dut.build();
+    final names = <String>{};
+    void walk(Module m) {
+      if (m.definitionName.contains('Gtx') ||
+          m.definitionName.contains('Kintex7')) {
+        names.add(m.definitionName);
+      }
+      m.subModules.forEach(walk);
+    }
+
+    walk(dut);
+    expect(names, {
+      'HarborPcieEndpoint_Xilinx7_X1_Gtx_G2_Pipe1_LinkWd',
+      'HarborKintex7PciePhy_X1_G2_Pipe1_LinkWd',
+      'HarborGtxPciePhy_X1_G2_Pipe1_LinkWd',
+    });
+  });
+
   test('timeouts are in the definition name', () {
     String name(HarborGtxPcieTimeouts t) =>
         endpoint(_kintex, gtxTimeouts: t).definitionName;

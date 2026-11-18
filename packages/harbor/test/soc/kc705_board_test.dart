@@ -360,7 +360,7 @@ void main() {
       }
       expect(
         board.fpgaTarget(pins: ['clk', 'clk_n']).generateMakefile('Top'),
-        isNot(contains('DELETE_ON_ERROR')),
+        contains('\n.DELETE_ON_ERROR:\n'),
       );
     });
 

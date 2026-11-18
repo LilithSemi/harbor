@@ -148,7 +148,8 @@ class HarborGtxPcieTimeouts {
   /// Cycles that the MMCM lock, and RXCDRLOCK when the PHY waits for it, stay
   /// high in [HarborGtxResetState.clockLock] before USERRDY rises. The user
   /// clocks are then stable when the TX sync starts. UG476 gives no time for
-  /// this wait. The default is 2^10 cycles, 8 us at 125 MHz. A lock loss in the wait starts the count again.
+  /// this wait. The default is 2^10 cycles, 8 us at 125 MHz. A lock loss in
+  /// the wait starts the count again.
   final int clockSettle;
 
   /// Cycles between the start of [HarborGtxResetState.txDlySReset] and the

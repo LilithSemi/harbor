@@ -57,7 +57,10 @@ void main() {
     final py = _read(dir, 'support/nextpnr/pll_clocks.py');
     expect(py, contains("('sys_clk', 100.00)"));
     expect(py, contains('ctx.addClock(net, mhz)'));
-    expect(py, isNot(contains('except')));
+    expect(
+      py.substring(py.indexOf('for net, mhz in')),
+      isNot(contains('except')),
+    );
     expect(_exists(dir, 'support/nextpnr/clocks.py'), isFalse);
     expect(_read(dir, 'PllSoc.xdc'), isNot(contains('[get_nets sys_clk]')));
     expect(

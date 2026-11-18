@@ -116,7 +116,7 @@ class HarborPipeClock extends Module {
 
     final inBuf = XilinxBufg(name: 'txoutclk_bufg');
     inBuf.input('I').srcConnection! <= txOutClk;
-    final refClk = inBuf.output('O');
+    final refClk = inBuf.output('O').named('txoutclk_buf');
 
     final mmcm = XilinxMmcme2Adv(
       clkfboutMult: 10,

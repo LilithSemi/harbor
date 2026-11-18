@@ -57,7 +57,7 @@ class HarborPcieEndpointConfig {
 /// oscillator. The reset counters use it to see PERST# on the pin. No
 /// endpoint clock runs while PERST# is low: PERST# resets the MMCM, and the
 /// host can stop the reference clock.
-class HarborPcieEndpoint extends Module {
+class HarborPcieEndpoint extends Module with HarborClockRateProvider {
   Logic get txP => output('tx_p');
   Logic get txN => output('tx_n');
   Logic get userClk => output('user_clk');
@@ -545,6 +545,26 @@ class HarborPcieEndpoint extends Module {
   int get _linkWait => gtx ? gtxTimeouts.linkWait : timeouts.linkWait;
 
   late final HarborPciePhy _phy;
+
+  /// The pipe clocks and their rates in MHz. [instance] is the path to this
+  /// endpoint from the top module, `pcie_endpoint` for the default name in the
+  /// top module.
+  ///
+  /// `pclk` is 250 MHz with [gen2] and 125 MHz without. `userclk1` is the
+  /// user clock of the PHY. The net `txoutclk_buf` is TXOUTCLK after its
+  /// buffer, 100 MHz from the reference clock. A GTX PHY also has the
+  /// 62.5 MHz `oob_clk`.
+  @override
+  Map<String, double> clockRates(String instance) {
+    final pipe =
+        '$instance.${_phy.name}.${gtx ? 'gtx' : 'gtp'}_pcie_phy.pipe_clock';
+    return {
+      '$pipe.txoutclk_buf': 100,
+      '$pipe.pclk': gen2 ? 250 : 125,
+      '$pipe.userclk1': _phy.userClkHz / 1e6,
+      if (gtx) '$pipe.oob_clk': 62.5,
+    };
+  }
 
   /// Hard block parameters of the endpoint, for a GTX PHY. USER_CLK_FREQ
   /// comes from the divide of the user clock MMCM output: 1 for 62.5 MHz and

@@ -834,6 +834,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     required String sourceClockNet,
     required double sourceClkMhz,
     required double ddrCtrlMhz,
+    Map<String, double> extraClocks = const {},
   }) {
     final coreTarget = (coreClkMhz * 1.4);
     final ddrTarget = (ddrCtrlMhz * 1.25);
@@ -868,23 +869,55 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     buf.writeln("        print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
     buf.writeln('    except Exception as e:');
     buf.writeln("        print('ADDCLOCK %s FAILED: %s' % (net, e))");
+    if (extraClocks.isNotEmpty) {
+      buf.writeln();
+      buf.write(_netCheckPy);
+      buf.writeln('# Clocks of the devices. A missing net stops the build.');
+      buf.writeln('for net, mhz in [');
+      for (final e in extraClocks.entries) {
+        buf.writeln("    ('${e.key}', ${e.value.toStringAsFixed(2)}),");
+      }
+      buf.writeln(']:');
+      buf.writeln('    require_net(net)');
+      buf.writeln('    ctx.addClock(net, mhz)');
+      buf.writeln("    print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
+    }
     return buf.toString();
   }
 
   /// Generates `support/nextpnr/pll_clocks.py` for a design with PLL clocks
   /// and no DDR3 tree. Each net in [mhzByNet] gets an `addClock` at its real
   /// rate, because nextpnr gives a clock that comes from a MMCM and a BUFG a
-  /// default 12 MHz target. A failed `addClock` stops the build.
+  /// default 12 MHz target.
+  ///
+  /// nextpnr only warns when `addClock` gets a net that is not in the design,
+  /// and then it keeps its default target. The script looks each net up first
+  /// and stops the build when a net is missing.
   String generatePllClockConstraintPy(Map<String, double> mhzByNet) {
-    final buf = StringBuffer('for net, mhz in [\n');
+    final buf = StringBuffer(_netCheckPy);
+    buf.writeln('for net, mhz in [');
     for (final e in mhzByNet.entries) {
       buf.writeln("    ('${e.key}', ${e.value.toStringAsFixed(2)}),");
     }
     buf.writeln(']:');
+    buf.writeln('    require_net(net)');
     buf.writeln('    ctx.addClock(net, mhz)');
     buf.writeln("    print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
     return buf.toString();
   }
+
+  /// Python that defines `require_net`. It raises when `ctx.getNetByAlias`,
+  /// the lookup that `addClock` uses, finds no net of the name or fails.
+  static const _netCheckPy = '''
+def require_net(net):
+    try:
+        found = ctx.getNetByAlias(net) is not None
+    except Exception:
+        found = False
+    if not found:
+        raise Exception("net '%s' does not exist in design" % net)
+
+''';
 
   /// Generates the nextpnr-xilinx `--pre-route` BEL-placement diagnostic
   /// (`support/nextpnr/show_bels.py`) for the openXC7 DDR3 flow. It prints
@@ -1101,12 +1134,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
             p,
       ];
       _checkKc705RefclkPatch(patches, knownPorts);
-      if (patches.isNotEmpty) {
-        // A failed patch step must not leave a file that a new run takes as
-        // up to date.
-        buf.writeln('.DELETE_ON_ERROR:');
-        buf.writeln();
-      }
+      // A failed step must not leave a file that a new run takes as up to
+      // date.
+      buf.writeln('.DELETE_ON_ERROR:');
+      buf.writeln();
       buf.writeln('pnr: \$(TOP).fasm');
       buf.writeln('\$(TOP).fasm: \$(TOP).json \$(TOP).$constraintExtension');
       if (useHimbaechel) {
@@ -1116,7 +1147,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
           '--json \$(TOP).json --write \$(TOP)_routed.json '
           '-o fasm=\$(TOP).fasm \$(PREPACK) --placer \$(PLACER) '
           '--router \$(ROUTER) --threads \$(THREADS) --seed \$(SEED) '
-          '\$(PNRFLAGS)',
+          '-l \$(TOP)_pnr.log \$(PNRFLAGS)',
         );
       } else {
         buf.writeln(
@@ -1124,9 +1155,17 @@ class HarborFpgaTarget extends HarborDeviceTarget {
           '--xdc \$(TOP).$constraintExtension '
           '--json \$(TOP).json --write \$(TOP)_routed.json '
           '--fasm \$(TOP).fasm \$(PREPACK) \$(PREPLACE) \$(PREROUTE) '
-          '--placer \$(PLACER) --seed \$(SEED) \$(PNRFLAGS)',
+          '--placer \$(PLACER) --seed \$(SEED) -l \$(TOP)_pnr.log '
+          '\$(PNRFLAGS)',
         );
       }
+      // nextpnr only warns when a clock constraint matches no net, and then
+      // it does not apply the constraint. addClock gives its own warning.
+      buf.writeln(
+        "\t! grep -E 'matched nothing, so the .*constraint was NOT applied|ignoring clock constraint' "
+        "\$(TOP)_pnr.log || { echo 'A clock constraint matched no net, see "
+        "\$(TOP)_pnr.log' >&2; exit 1; }",
+      );
       // nextpnr-xilinx always writes the 0.675 V internal VREF (SSTL135) for
       // a bank with SSTL inputs and ignores INTERNAL_VREF. SSTL15 needs 0.75 V.
       if (sstlVrefMv == 750) {
@@ -2705,6 +2744,23 @@ mixin HarborNextpnrPreplaceProvider {
   /// pin on [ctx]. Return null (not an empty string) for a part or a family
   /// this peripheral has no verified placement for.
   String? nextpnrPreplacePy(HarborNextpnrPreplaceContext ctx);
+}
+
+/// A device that states the rates of its own clocks, for the nets that the
+/// open flows do not time from the pin constraints. Such a net is the output
+/// of a MMCM or of a clock buffer, which nextpnr times at 12 MHz when it has
+/// no rate.
+///
+/// The SoC calls [clockRates] and gives the rates to the nextpnr clock script,
+/// or to the constraint file in a flow that has no script. A standalone top
+/// can pass the result to [HarborFpgaTarget.generatePllClockConstraintPy].
+mixin HarborClockRateProvider {
+  /// The clock nets of the device and their rates in MHz.
+  ///
+  /// [instance] is the name of the device in the top module, or the path to
+  /// it from the top module with `.` between the names. Each net name has the
+  /// same form, from the top module.
+  Map<String, double> clockRates(String instance);
 }
 
 /// A device that adds timing constraints for its own pins, such as the
