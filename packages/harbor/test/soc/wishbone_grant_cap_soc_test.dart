@@ -75,14 +75,8 @@ class _BlockReader extends BridgeModule {
         input('reset'),
         then: [sent < 0, got < 0, waiting < 0],
         orElse: [
-          If(
-            mem.reqValid & mem.reqReady,
-            then: [sent < sent + 1, waiting < 1],
-          ),
-          If(
-            mem.rdataValid,
-            then: [got < got + 1, waiting < 0],
-          ),
+          If(mem.reqValid & mem.reqReady, then: [sent < sent + 1, waiting < 1]),
+          If(mem.rdataValid, then: [got < got + 1, waiting < 0]),
         ],
       ),
     ]);

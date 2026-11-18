@@ -812,6 +812,14 @@ class HarborSoC extends BridgeModule {
   /// exclusive access for this master (see [HarborFabricMaster.exclusiveIds]
   /// and [memoryBusShape]).
   ///
+  /// [realtime] makes this a real-time master (see
+  /// [HarborFabricMaster.realtime]): it wins arbitration, and the bursts of
+  /// the other masters are capped while it waits (see
+  /// [buildFabric]'s `realtimeBurstCap`).
+  ///
+  /// [writeStallFree] declares that this master never stalls write data
+  /// inside a burst (see [HarborFabricMaster.writeStallFree]).
+  ///
   /// [targetRanges] lists the address ranges this master is meant to reach.
   /// [buildFabric] throws when a range is not fully covered by the slaves of
   /// the master's channel. Null skips the check.
@@ -838,6 +846,8 @@ class HarborSoC extends BridgeModule {
     int? outstanding,
     int? readChannel,
     int? exclusiveIds,
+    bool realtime = false,
+    bool writeStallFree = false,
     List<BusAddressRange>? targetRanges,
     List<BusAddressRange>? burstRanges,
   }) {
@@ -851,6 +861,8 @@ class HarborSoC extends BridgeModule {
         outstanding: outstanding,
         readChannel: readChannel,
         exclusiveIds: exclusiveIds,
+        realtime: realtime,
+        writeStallFree: writeStallFree,
         targetRanges: targetRanges,
         burstRanges: burstRanges,
       ),
@@ -1112,12 +1124,16 @@ class HarborSoC extends BridgeModule {
   /// on a Wishbone fabric with two or more masters, so a master that polls
   /// back to back cannot starve the others. Pass null or 0 to turn it off.
   /// [busTimeoutCycles] is off by default.
+  /// [realtimeBurstCap] is the most beats of a burst another master sends
+  /// to a slave in one grant while a real-time master waits (see
+  /// [HarborFabric.build]). It has no effect without a real-time master.
   void buildFabric({
     bool pipeline = false,
     Map<String, Set<String>>? channelSlaves,
     HarborMemConverge converge = HarborMemConverge.arbiter,
     int? busTimeoutCycles,
     int? maxGrantCycles = harborDefaultWishboneGrantCap,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
   }) {
     final errors = validate();
     if (errors.isNotEmpty) {
@@ -1356,6 +1372,8 @@ class HarborSoC extends BridgeModule {
           reach: reach[m.channel],
           readChannel: m.readChannel,
           exclusiveIds: slotsOf[m],
+          realtime: m.realtime,
+          writeStallFree: m.writeStallFree,
         ),
       );
     }
@@ -1375,6 +1393,7 @@ class HarborSoC extends BridgeModule {
         slaves: ss,
         wishboneBurstBeats: burstBeats,
         maxGrantCycles: maxGrantCycles,
+        realtimeBurstCap: realtimeBurstCap,
         name: name,
       );
       fabrics.add(f);
@@ -1460,6 +1479,8 @@ class HarborSoC extends BridgeModule {
             outstanding: m.outstanding,
             memory: m.memory,
             exclusiveIds: m.exclusiveIds,
+            realtime: m.realtime,
+            writeStallFree: m.writeStallFree,
           ),
       ], ss);
     }
@@ -1474,6 +1495,8 @@ class HarborSoC extends BridgeModule {
               interface: leg,
               outstanding: shapeOf(i).outstanding,
               memory: shapeOf(i).memory,
+              realtime: masters[c]!.any((m) => m.realtime),
+              writeStallFree: masters[c]!.every((m) => m.writeStallFree),
             ),
         ],
         [realSlave(i)],
@@ -2353,6 +2376,12 @@ class _MasterEntry {
   /// AXI4 exclusive slots, as in [HarborFabricMaster.exclusiveIds].
   final int? exclusiveIds;
 
+  /// Real-time flag, as in [HarborFabricMaster.realtime].
+  final bool realtime;
+
+  /// Write stall flag, as in [HarborFabricMaster.writeStallFree].
+  final bool writeStallFree;
+
   /// Address ranges the master must reach, or null for no check.
   final List<BusAddressRange>? targetRanges;
 
@@ -2372,6 +2401,8 @@ class _MasterEntry {
     this.outstanding,
     this.readChannel,
     this.exclusiveIds,
+    this.realtime = false,
+    this.writeStallFree = false,
     this.targetRanges,
     this.burstRanges,
   });

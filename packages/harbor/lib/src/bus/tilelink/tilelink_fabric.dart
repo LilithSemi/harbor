@@ -66,6 +66,14 @@ class _Resp {
 /// TileLink has no order between sources, and a master has one message per
 /// source in flight, so the fabric keeps no order between messages.
 ///
+/// A master with [HarborFabricMaster.realtime] wins every arbitration for a
+/// target. A message cannot be cut, so `realtimeBurstCap` does not apply: a
+/// real-time message waits for the message that holds the target, and the
+/// largest message of the other masters sets the wait (see
+/// [HarborFabric.realtimeWaitBound]). A build that needs a short wait keeps
+/// the messages of the other masters small, for example with the burst
+/// length of their memory ports.
+///
 /// A message that hits no slave, or that its slave cannot take, goes to an
 /// internal error slave. It takes all A beats, then answers denied with the
 /// full D beats, and AccessAckData beats are also corrupt. A TL-UL slave
@@ -295,6 +303,9 @@ class HarborTileLinkFabric extends HarborFabricModule {
       ]);
     }
 
+    final rt = [for (final m in masters) m.realtime];
+    final hasRt = rt.contains(true);
+
     // Arbitration with a lock that holds a target for the rest of a
     // message.
     final grant = [
@@ -302,9 +313,12 @@ class HarborTileLinkFabric extends HarborFabricModule {
     ];
     if (topology == HarborFabricTopology.crossbar) {
       for (var t = 0; t < nt; t++) {
-        final rr = roundRobin('${tName[t]}_a', c, r, [
-          for (var m = 0; m < nm; m++) firstReq[m][t],
-        ]);
+        final rr = roundRobin(
+          '${tName[t]}_a',
+          c,
+          r,
+          realtimeFirst([for (var m = 0; m < nm; m++) firstReq[m][t]], rt),
+        );
         for (var m = 0; m < nm; m++) {
           grant[m][t] <= rr[m] | contReq[m][t];
         }
@@ -314,9 +328,14 @@ class HarborTileLinkFabric extends HarborFabricModule {
       }
     } else {
       final busLock = Logic(name: 'bus_a_lock');
-      final rr = roundRobin('bus_a', c, r, [
-        for (var m = 0; m < nm; m++) anyOf(firstReq[m]) & ~busLock,
-      ]);
+      final rr = roundRobin(
+        'bus_a',
+        c,
+        r,
+        realtimeFirst([
+          for (var m = 0; m < nm; m++) anyOf(firstReq[m]) & ~busLock,
+        ], rt),
+      );
       final g = [for (var m = 0; m < nm; m++) rr[m] | anyOf(contReq[m])];
       for (var m = 0; m < nm; m++) {
         mPop[m] <= g[m];
@@ -515,14 +534,29 @@ class HarborTileLinkFabric extends HarborFabricModule {
     } else {
       final lock = Logic(name: 'bus_d_lock');
       final lockT = Logic(name: 'bus_d_lock_target', width: tW);
-      final g = roundRobin('bus_d', c, r, [
+      final dReq = [
         for (var t = 0; t < nt; t++)
           resp[t].valid &
               anyOf([
                 for (var m = 0; m < nm; m++) dest[t][m] & outs[m].pushReady,
               ]) &
               (~lock | lockT.eq(Const(t, width: tW))),
-      ]);
+      ];
+      // A response for a real-time master goes first.
+      var dArb = dReq;
+      if (hasRt) {
+        final rtD = [
+          for (var t = 0; t < nt; t++)
+            dReq[t] &
+                anyOf([
+                  for (var m = 0; m < nm; m++)
+                    if (rt[m]) dest[t][m],
+                ]),
+        ];
+        final rtAny = anyOf(rtD);
+        dArb = [for (var t = 0; t < nt; t++) dReq[t] & (rtD[t] | ~rtAny)];
+      }
+      final g = roundRobin('bus_d', c, r, dArb);
       final any = anyOf(g);
       final last = pick(g, dLast);
       for (var m = 0; m < nm; m++) {
@@ -828,7 +862,8 @@ class HarborTileLinkFabric extends HarborFabricModule {
       'd${c0.dataWidth}',
       for (final m in masters)
         'M${m.name}${port(m.name, m.interface, m.memory)}'
-            'o${m.outstandingOn(HarborFabricKind.tilelink)}${m.reachTag(slaves)}',
+            'o${m.outstandingOn(HarborFabricKind.tilelink)}${m.reachTag(slaves)}'
+            '${m.realtime ? 'Q' : ''}',
       for (final s in slaves)
         'S${s.name}${port(s.name, s.interface, s.memory)}n${s.outstanding}'
             '${s.offset ? 'O' : ''}t${s.timeout}r${s.range.start.toRadixString(16)}'

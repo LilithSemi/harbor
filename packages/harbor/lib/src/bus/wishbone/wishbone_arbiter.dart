@@ -147,6 +147,17 @@ class WishboneArbiter extends BridgeModule {
 /// the fabric can cut after a read or after a write that waited for its
 /// response. A null [safeEnd] counts as high.
 /// [prefix] goes in front of every signal name.
+///
+/// With [realtime] (one flag per request) and [realtimeBeats], a request of
+/// a real-time master wins over the others. An owner that is not real-time
+/// loses the grant at the end of its transfer number [realtimeBeats] while
+/// a real-time request waits, and [realtimeCut] is high during that last
+/// transfer, so the fabric can end a burst there. Pass a fresh [Logic] as
+/// [realtimeCut]. [strobes] (one per request) lets a real-time request take
+/// the grant from an owner that holds CYC with STB low, when [safeEnd] was
+/// high at the end of its last transfer (a null [safeEnd] counts as high).
+/// With no real-time flag the logic is the same as with
+/// none of the three.
 Logic harborWishboneGrant({
   required Logic clk,
   required Logic reset,
@@ -154,21 +165,58 @@ Logic harborWishboneGrant({
   required Logic terminate,
   BusArbitration arbitration = BusArbitration.roundRobin,
   int? maxGrantCycles,
+  List<bool>? realtime,
+  int realtimeBeats = 16,
+  Logic? realtimeCut,
+  List<Logic>? strobes,
   Logic? safeEnd,
   String prefix = '',
 }) {
   final numMasters = requests.length;
   final cap = maxGrantCycles;
+  final hasRt = realtime != null && realtime.contains(true);
+  if (hasRt && realtime.length != numMasters) {
+    throw ArgumentError.value(
+      realtime,
+      'realtime',
+      'needs one flag per request',
+    );
+  }
   final requestsVec = requests.rconcat().named('${prefix}requests');
 
   // A master that lost the grant to the cap stays out of arbitration until
   // another master takes the grant.
-  final blocked = cap != null
+  final blocked = cap != null || hasRt
       ? Logic(name: '${prefix}blocked', width: numMasters)
       : null;
-  final arbReqVec = blocked == null
+  final rtMask = hasRt
+      ? Const(
+          BigInt.parse(
+            [
+              for (var i = numMasters - 1; i >= 0; i--) realtime[i] ? '1' : '0',
+            ].join(),
+            radix: 2,
+          ),
+          width: numMasters,
+        )
+      : null;
+  final rtReq = hasRt
+      ? (requestsVec & rtMask!).named('${prefix}rt_requests')
+      : null;
+  var arbReqVec = blocked == null
       ? requestsVec
       : (requestsVec & ~blocked).named('${prefix}arb_requests');
+  if (hasRt) {
+    // A waiting real-time request shuts the other requests out. A real-time
+    // master that the grant cap blocked does not, or no master would get the
+    // grant until the block clears.
+    final rtFree = arbReqVec & rtMask!;
+    arbReqVec = mux(
+      rtFree.or(),
+      rtFree,
+      arbReqVec,
+    ).named('${prefix}rt_arb_requests');
+  }
   final arbRequests = [for (var i = 0; i < numMasters; i++) arbReqVec[i]];
 
   final grantSignals = <Logic>[];
@@ -194,7 +242,7 @@ Logic harborWishboneGrant({
     heldReg,
   ).named('${prefix}next_grant');
 
-  if (cap == null) {
+  if (cap == null && !hasRt) {
     Sequential(clk, [
       If(
         reset,
@@ -203,17 +251,75 @@ Logic harborWishboneGrant({
       ),
     ]);
   } else {
-    final count = Logic(name: '${prefix}hold_count', width: cap.bitLength);
-    final othersWait = (requestsVec & ~heldReg).or().named(
-      '${prefix}others_wait',
-    );
-    final preempt =
-        (heldValid &
-                count.eq(cap) &
-                terminate &
-                (safeEnd ?? Const(1)) &
-                othersWait)
-            .named('${prefix}preempt');
+    final count = cap != null
+        ? Logic(name: '${prefix}hold_count', width: cap.bitLength)
+        : null;
+    Logic? preempt;
+    if (cap != null) {
+      // A real-time owner gives the grant up to real-time requests only.
+      final othersWait = hasRt
+          ? mux(
+              (heldReg & rtMask!).or(),
+              (rtReq! & ~heldReg).or(),
+              (requestsVec & ~heldReg).or(),
+            ).named('${prefix}others_wait')
+          : (requestsVec & ~heldReg).or().named('${prefix}others_wait');
+      preempt =
+          (heldValid &
+                  count!.eq(cap) &
+                  terminate &
+                  (safeEnd ?? Const(1)) &
+                  othersWait)
+              .named('${prefix}preempt');
+    }
+    final rtCount = hasRt
+        ? Logic(name: '${prefix}rt_count', width: realtimeBeats.bitLength)
+        : null;
+    if (hasRt) {
+      // The cut flag of a transfer is set when the transfer starts and holds
+      // to its end, so CTI does not change in the middle of a transfer. A
+      // non real-time owner is cut at the end of its transfer number
+      // realtimeBeats, or at the end of the first transfer that starts after
+      // that while a real-time request waits. An owner that holds CYC with
+      // no transfer in progress loses the grant at once.
+      final rtWaits = (rtReq! & ~heldReg).or().named('${prefix}rt_waits');
+      final ownerOther = (heldValid & (heldReg & ~rtMask!).or()).named(
+        '${prefix}owner_other',
+      );
+      final cutReg = Logic(name: '${prefix}rt_cut_reg');
+      final idleOk = Logic(name: '${prefix}rt_idle_ok');
+      final cutNext = mux(
+        heldValid,
+        ownerOther & rtWaits & rtCount!.gte(realtimeBeats - 2),
+        rtWaits & (realtimeBeats <= 1 ? Const(1) : Const(0)),
+      ).named('${prefix}rt_cut_next');
+      Sequential(clk, [
+        If(
+          reset,
+          then: [cutReg < 0, idleOk < 1],
+          orElse: [
+            If(
+              terminate | ~heldValid,
+              then: [
+                cutReg < cutNext,
+                idleOk < mux(heldValid, safeEnd ?? Const(1), Const(1)),
+              ],
+            ),
+          ],
+        ),
+      ]);
+      final cutBeat = (ownerOther & cutReg).named('${prefix}rt_cut_beat');
+      if (realtimeCut != null) realtimeCut <= cutBeat;
+      var rtPreempt = cutBeat & terminate;
+      if (strobes != null) {
+        final ownerStb = (heldReg & strobes.rconcat()).or();
+        rtPreempt = rtPreempt | (ownerOther & rtWaits & ~ownerStb & idleOk);
+      }
+      rtPreempt = rtPreempt.named('${prefix}rt_preempt');
+      preempt = preempt == null
+          ? rtPreempt
+          : (preempt | rtPreempt).named('${prefix}preempt_any');
+    }
     final freeVec = (requestsVec & ~blocked!).named('${prefix}free_requests');
     Sequential(clk, [
       If(
@@ -221,16 +327,18 @@ Logic harborWishboneGrant({
         then: [
           heldReg < Const(0, width: numMasters),
           blocked < Const(0, width: numMasters),
-          count < 0,
+          if (count != null) count < 0,
+          if (rtCount != null) rtCount < 0,
         ],
         orElse: [
           If(
-            preempt,
+            preempt!,
             // An empty grant for one cycle drops CYC between the owners.
             then: [
               heldReg < Const(0, width: numMasters),
               blocked < heldReqVec,
-              count < 0,
+              if (count != null) count < 0,
+              if (rtCount != null) rtCount < 0,
             ],
             orElse: [
               heldReg < nextGrant,
@@ -238,13 +346,25 @@ Logic harborWishboneGrant({
                 (heldReg & ~blocked).or() | ~freeVec.or(),
                 then: [blocked < Const(0, width: numMasters)],
               ),
-              If(
-                heldValid,
-                then: [
-                  If(count.lt(cap), then: [count < count + 1]),
-                ],
-                orElse: [count < 0],
-              ),
+              if (count != null)
+                If(
+                  heldValid,
+                  then: [
+                    If(count.lt(cap!), then: [count < count + 1]),
+                  ],
+                  orElse: [count < 0],
+                ),
+              if (rtCount != null)
+                If(
+                  heldValid,
+                  then: [
+                    If(
+                      terminate & rtCount.lt(realtimeBeats),
+                      then: [rtCount < rtCount + 1],
+                    ),
+                  ],
+                  orElse: [rtCount < 0],
+                ),
             ],
           ),
         ],

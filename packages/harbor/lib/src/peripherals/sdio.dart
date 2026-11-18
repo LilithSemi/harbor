@@ -255,7 +255,9 @@ class HarborSdioConfig with HarborPrettyString {
 /// it. Reads (descriptors and card-write data) go out only when no write is
 /// in flight. Add it to a SoC with
 /// `soc.addMaster(sdio, busInterfaceName: 'dma', memory: true,
-/// outstanding: sdio.dmaOutstanding)`.
+/// outstanding: sdio.dmaOutstanding, writeStallFree: true)`. The ADMA sends a
+/// write request only when it holds a batch of [dmaWriteBatch] words, so it
+/// never stalls write data inside a burst.
 ///
 /// An error response (Wishbone ERR, AXI4 SLVERR or DECERR, TileLink denied
 /// or corrupt) on a descriptor fetch, a data read or a data write stops the

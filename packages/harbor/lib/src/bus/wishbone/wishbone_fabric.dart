@@ -32,6 +32,21 @@ import 'wishbone_interface.dart';
 ///   points at, and `maxGrantCycles` cannot take it back, because no
 ///   transfer ends.
 ///
+/// A master with [HarborFabricMaster.realtime] wins the grant of every bus
+/// it asks for. While a real-time request waits, another master keeps the
+/// grant for at most `realtimeBurstCap` transfers: the transfer that makes
+/// the cap goes to the slave with CTI 111 in place of CTI 010, and the
+/// grant goes to the real-time master when it ends. The cut master keeps CYC
+/// and STB, so the slave sees the rest of its burst as a new burst after the
+/// real-time transfer. The cut flag is set when a transfer starts, so CTI holds
+/// for the whole transfer. A master that holds CYC with STB low loses the
+/// grant to a real-time request at once, unless its last transfer was a
+/// write that did not wait for its response (CTI 010 before the end of the
+/// burst block): a cut there would lose the write error. Such a master keeps
+/// the grant while its write data stalls, so the wait bound holds for write
+/// sources that do not stall inside a burst (see
+/// [HarborFabric.realtimeWaitBound]).
+///
 /// An access that hits no slave ends with ERR. A slave with a timeout that
 /// does not answer a strobe in time is cut off until reset: CYC to it drops,
 /// its late answers are dropped, and every access to it ends with ERR. A
@@ -54,6 +69,10 @@ class HarborWishboneFabric extends HarborFabricModule {
   /// Grant hold cap in cycles. Null turns the cap off.
   final int? maxGrantCycles;
 
+  /// Most transfers another master keeps a grant while a real-time request
+  /// waits. Unused when no master is real-time.
+  final int realtimeBurstCap;
+
   /// The owner of the bus, one bit per master. Null on a crossbar.
   Logic? get grant => tryOutput('grant');
 
@@ -65,6 +84,7 @@ class HarborWishboneFabric extends HarborFabricModule {
     required this.slaves,
     this.wishboneBurstBeats = 8,
     this.maxGrantCycles,
+    this.realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
     super.name = 'fabric',
   }) : super(
          definitionName: _definitionName(
@@ -73,6 +93,7 @@ class HarborWishboneFabric extends HarborFabricModule {
            slaves,
            wishboneBurstBeats,
            maxGrantCycles,
+           realtimeBurstCap,
          ),
        ) {
     final cap = maxGrantCycles;
@@ -194,8 +215,17 @@ class HarborWishboneFabric extends HarborFabricModule {
     // High when the transfer that ends leaves its owner at a point where
     // CYC can drop: after a read, and after a write transfer that waited for
     // its response (CTI 111, or the last beat of a burst block).
+    // Built only with the grant cap or a real-time master.
+    final needSafe = cap != null || masters.any((m) => m.realtime);
     final safe = [for (var t = 0; t < ns; t++) Logic()];
     final busSafe = Logic();
+
+    final rt = [for (final m in masters) m.realtime];
+    final hasRt = rt.contains(true);
+    // Ends a burst at the cap, per slave on a crossbar and for the bus on a
+    // shared fabric.
+    final cut = [for (var t = 0; t < ns; t++) Logic()];
+    final busCut = Logic();
 
     // A slave that only one master can reach needs no grant register.
     Logic grantOf(
@@ -203,18 +233,28 @@ class HarborWishboneFabric extends HarborFabricModule {
       Logic term,
       String prefix,
       int reachers,
+      Logic cutOut,
+      List<Logic> strobes,
       Logic safeEnd,
-    ) => reachers <= 1
-        ? Const(1, width: nm, fill: true)
-        : harborWishboneGrant(
-            clk: c,
-            reset: r,
-            requests: req,
-            terminate: term,
-            maxGrantCycles: cap,
-            safeEnd: cap != null ? safeEnd : null,
-            prefix: prefix,
-          );
+    ) {
+      if (reachers <= 1) {
+        if (hasRt) cutOut <= Const(0);
+        return Const(1, width: nm, fill: true);
+      }
+      return harborWishboneGrant(
+        clk: c,
+        reset: r,
+        requests: req,
+        terminate: term,
+        maxGrantCycles: cap,
+        realtime: hasRt ? rt : null,
+        realtimeBeats: realtimeBurstCap,
+        realtimeCut: hasRt ? cutOut : null,
+        strobes: hasRt ? strobes : null,
+        safeEnd: hasRt || cap != null ? safeEnd : null,
+        prefix: prefix,
+      );
+    }
 
     // own[t][m]: master m drives slave t this cycle.
     final own = <List<Logic>>[];
@@ -228,6 +268,8 @@ class HarborWishboneFabric extends HarborFabricModule {
           term[t],
           '${slaves[t].name}_',
           reachers.length,
+          cut[t],
+          hasRt ? [for (var m = 0; m < nm; m++) ma[m].stb & hit[m][t]] : [],
           safe[t],
         );
         own.add([for (var m = 0; m < nm; m++) g[m] & req[m]]);
@@ -242,6 +284,8 @@ class HarborWishboneFabric extends HarborFabricModule {
         busTerm,
         'bus_',
         nm,
+        busCut,
+        hasRt ? [for (final a in ma) a.stb] : [],
         busSafe,
       );
       addOutput('grant', width: nm) <= g;
@@ -253,9 +297,11 @@ class HarborWishboneFabric extends HarborFabricModule {
         errOwn.add(gm[m] & ma[m].stb & noHit[m]);
       }
       busTerm <= anyOf([for (var t = 0; t < ns; t++) term[t]]) | anyOf(errOwn);
-      busSafe <=
-          anyOf([for (var t = 0; t < ns; t++) safe[t] & term[t]]) |
-              anyOf(errOwn);
+      if (needSafe) {
+        busSafe <=
+            anyOf([for (var t = 0; t < ns; t++) safe[t] & term[t]]) |
+                anyOf(errOwn);
+      }
     }
 
     // Slave sides, and what each answers to its owner.
@@ -270,14 +316,16 @@ class HarborWishboneFabric extends HarborFabricModule {
         for (var m = 0; m < nm; m++) o[m] & ma[m].stb,
       ]).named('${p}_strobed');
       final [we, adr, dat, sel, cti, bte] = harborUnpack(pick(o, mReq), reqW);
-      final beatLog2 = (dataW ~/ 8).bitLength - 1;
-      final blockLog2 = wishboneBurstBeats.bitLength - 1;
-      final blockEnd = blockLog2 == 0
-          ? Const(1)
-          : adr
-                .getRange(beatLog2, beatLog2 + blockLog2)
-                .eq(Const(wishboneBurstBeats - 1, width: blockLog2));
-      safe[t] <= ~we | cti.neq(Const(2, width: 3)) | blockEnd;
+      if (needSafe) {
+        final beatLog2 = (dataW ~/ 8).bitLength - 1;
+        final blockLog2 = wishboneBurstBeats.bitLength - 1;
+        final blockEnd = blockLog2 == 0
+            ? Const(1)
+            : adr
+                  .getRange(beatLog2, beatLog2 + blockLog2)
+                  .eq(Const(wishboneBurstBeats - 1, width: blockLog2));
+        safe[t] <= ~we | cti.neq(Const(2, width: 3)) | blockEnd;
+      }
       s.cyc <= cyc & ~dead[t];
       s.stb <= stb & ~dead[t];
       s.we <= we;
@@ -285,7 +333,14 @@ class HarborWishboneFabric extends HarborFabricModule {
       s.adr <= (base == 0 ? adr : adr - Const(base, width: addrW));
       s.datMosi <= dat;
       s.sel <= sel;
-      if (s.cti != null) s.cti! <= cti;
+      if (s.cti != null) {
+        // The transfer that makes the cap ends its burst.
+        final end = topology == HarborFabricTopology.crossbar ? cut[t] : busCut;
+        s.cti! <=
+            (hasRt
+                ? mux(end & cti.eq(Const(2, width: 3)), Const(7, width: 3), cti)
+                : cti);
+      }
       if (s.bte != null) s.bte! <= bte;
 
       final ack = (s.ack & stb & ~dead[t]).named('${p}_ack_in');
@@ -373,6 +428,7 @@ class HarborWishboneFabric extends HarborFabricModule {
     List<HarborFabricSlave> slaves,
     int burstBeats,
     int? maxGrantCycles,
+    int realtimeBurstCap,
   ) {
     if (masters.isEmpty) {
       throw ArgumentError.value(masters, 'masters', 'must not be empty');
@@ -391,9 +447,10 @@ class HarborWishboneFabric extends HarborFabricModule {
       'd${c0.dataWidth}',
       'b$burstBeats',
       'g${maxGrantCycles ?? 0}',
+      if (masters.any((m) => m.realtime)) 'q$realtimeBurstCap',
       for (final m in masters)
         'M${m.name}${port(m.name, m.interface, m.memory)}'
-            '${m.reachTag(slaves)}',
+            '${m.reachTag(slaves)}${m.realtime ? 'Q' : ''}',
       for (final s in slaves)
         'S${s.name}${port(s.name, s.interface, s.memory)}'
             '${s.offset ? 'O' : ''}t${s.timeout}'

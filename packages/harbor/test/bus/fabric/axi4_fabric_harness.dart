@@ -28,12 +28,20 @@ class MasterCfg {
   /// This master's explicit read channel at every multi-channel slave it
   /// reaches. Null spreads it round robin.
   final int? readChannel;
+
+  /// A real-time master (see [HarborFabricMaster.realtime]).
+  final bool realtime;
+
+  /// AXI4 exclusive slots (see [HarborFabricMaster.exclusiveIds]).
+  final int? exclusiveIds;
   const MasterCfg(
     this.name,
     this.idWidth,
     this.outstanding, {
     this.lite = false,
     this.readChannel,
+    this.realtime = false,
+    this.exclusiveIds,
   });
 }
 
@@ -121,6 +129,7 @@ class FabricShell extends BridgeModule {
     HarborFabricTopology topology, {
     List<MasterCfg> masters = masters3,
     List<SlaveCfg> slaves = slaves3,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
   }) : super('FabricTestShell_${topology.name}', name: 'shell') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -135,10 +144,13 @@ class FabricShell extends BridgeModule {
           outstanding: m.outstanding,
           memory: !m.lite,
           readChannel: m.readChannel,
+          realtime: m.realtime,
+          exclusiveIds: m.exclusiveIds,
         ),
       );
     }
     final ss = <HarborFabricSlave>[];
+    final monitor = HarborAxi4Fabric.exclusiveOf(ms);
     for (final s in slaves) {
       final intf = _intf(s.idWidth, s.lite);
       exposeInterface(this, intf, s.name, PairDirection.fromConsumer);
@@ -162,6 +174,7 @@ class FabricShell extends BridgeModule {
           memory: !s.lite,
           readInterfaces: readIntfs,
           offset: s.offset,
+          exclusive: s.lite ? null : monitor,
         ),
       );
     }
@@ -172,6 +185,7 @@ class FabricShell extends BridgeModule {
       reset: input('reset'),
       masters: ms,
       slaves: ss,
+      realtimeBurstCap: realtimeBurstCap,
     );
     createPort('bus_error', PortDirection.output);
     output('bus_error') <= fabric.busError;
@@ -203,8 +217,14 @@ class Bench {
     int seed = 1,
     double stall = 0.3,
     int maxTime = 4000000,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
   }) async {
-    final shell = FabricShell(topology, masters: masters, slaves: slaves);
+    final shell = FabricShell(
+      topology,
+      masters: masters,
+      slaves: slaves,
+      realtimeBurstCap: realtimeBurstCap,
+    );
     final sim = Sim(shell);
     final rng = Random(seed);
     final b = Bench._(sim, masters, slaves, rng);

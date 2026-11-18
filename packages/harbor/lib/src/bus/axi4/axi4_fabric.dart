@@ -14,6 +14,10 @@ import 'axi4_exclusive.dart';
 import 'axi4_interface.dart';
 import 'axi4_lite_interface.dart';
 
+// Orders response codes from best to worst: EXOKAY, OKAY, SLVERR, DECERR.
+Logic _respKey(Logic r) =>
+    mux(r.eq(0), Const(1, width: 2), mux(r.eq(1), Const(0, width: 2), r));
+
 Logic _resp(Axi4RespField f) => Const(f.value, width: Axi4Interface.respWidth);
 
 // A request on its way to one target.
@@ -113,8 +117,12 @@ class _Remap {
 // group keeps the target its requests went to.
 class _Tracker {
   final Logic ok;
+  final Logic _total;
 
-  _Tracker._(this.ok);
+  _Tracker._(this.ok, this._total);
+
+  /// High when the master has no request in flight.
+  Logic get idle => _total.eq(0);
 
   factory _Tracker(
     String name,
@@ -161,7 +169,7 @@ class _Tracker {
         tgts[i] < harborLoad(tgts[i], issue & ~hasMatch & free[i], target),
       ],
     ]);
-    return _Tracker._(ok.named('${name}_ok'));
+    return _Tracker._(ok.named('${name}_ok'), total);
   }
 }
 
@@ -227,14 +235,27 @@ class HarborAxi4Fabric extends HarborFabricModule {
   /// Requests the internal error slave holds in flight.
   static const int errorOutstanding = 2;
 
+  /// Most beats of a burst of a master that is not real-time that go to a
+  /// slave in one request, while a real-time master reaches that slave.
+  /// Unused when no master is real-time.
+  final int realtimeBurstCap;
+
   HarborAxi4Fabric({
     required this.topology,
     required Logic clk,
     required Logic reset,
     required this.masters,
     required this.slaves,
+    this.realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
     super.name = 'fabric',
-  }) : super(definitionName: _definitionName(topology, masters, slaves)) {
+  }) : super(
+         definitionName: _definitionName(
+           topology,
+           masters,
+           slaves,
+           realtimeBurstCap,
+         ),
+       ) {
     final (addrW, dataW, _) = _shape(masters.first.interface);
     for (final m in masters) {
       final (a, d, _) = _shape(m.interface);
@@ -393,6 +414,66 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final mPop = [
       for (var m = 0; m < nm; m++) [Logic(), Logic()],
     ];
+
+    // Real-time masters win arbitration. A burst of another master that goes
+    // to a slave a real-time master reaches, and is longer than the cap, goes
+    // as bursts of at most the cap (see [HarborFabric.build]).
+    final rt = [for (final m in masters) m.realtime];
+    final hasRt = rt.contains(true);
+    final cap = realtimeBurstCap;
+    const lenW = Axi4Interface.lenWidth;
+    final splitOn = hasRt && cap < (1 << lenW);
+    final splitT = [
+      for (var t = 0; t < nt; t++)
+        splitOn &&
+            t < nst &&
+            sLite[t] == null &&
+            masters.any((m) => m.realtime && m.reaches(slaves[tSlave[t]].name)),
+    ];
+    final splitM = [
+      for (final m in masters)
+        splitOn &&
+            !m.realtime &&
+            m.interface is Axi4Interface &&
+            splitT.contains(true),
+    ];
+    // Per master and direction: the burst has more pieces to send, how many
+    // beats the piece has less one, and the pieces granted that are not the
+    // last one of their burst.
+    final mMore = [
+      for (var m = 0; m < nm; m++) [Logic(), Logic()],
+    ];
+    final mPieceLen = [
+      for (var m = 0; m < nm; m++)
+        [for (var d = 0; d < 2; d++) Logic(width: lenW)],
+    ];
+    final mFire = [
+      for (var m = 0; m < nm; m++) [Logic(), Logic()],
+    ];
+    final mNonFinal = [
+      for (var m = 0; m < nm; m++) [Logic(), Logic()],
+    ];
+    // Pieces of a master whose write data has not all passed.
+    final wPieces = [
+      for (var m = 0; m < nm; m++)
+        Logic(name: '${masters[m].name}_w_pieces', width: 4),
+    ];
+    // The master takes the grant [fire] for the piece it presents. The
+    // request leaves the master FIFO with the last piece.
+    void grantTo(int m, int dir, Logic fire) {
+      if (!splitM[m]) {
+        mPop[m][dir] <= fire;
+        if (hasRt) mFire[m][dir] <= fire;
+        return;
+      }
+      mFire[m][dir] <= fire;
+      mPop[m][dir] <= fire & ~mMore[m][dir];
+      mNonFinal[m][dir] <= fire & mMore[m][dir];
+    }
+
+    final mIdle = [
+      for (var m = 0; m < nm; m++) <Logic?>[null, null],
+    ];
     final mFull = <List<Logic>>[];
     final mRest = <List<Logic>>[];
     final mTgt = <List<List<Logic>>>[];
@@ -446,10 +527,93 @@ class HarborAxi4Fabric extends HarborFabricModule {
           restW,
         ]);
         final tgt = decodeIndex(tgtIdx, nt);
+        var pieceRest = rest;
+        Logic? splitOk;
+        if (splitM[m]) {
+          // The piece the master offers now: at most the cap beats of what
+          // is left of the burst, from the address the earlier pieces ended
+          // at.
+          final [addr, len, size, burst, lock, cache, prot, qos] = harborUnpack(
+            rest,
+            restWidths,
+          );
+          const lw = lenW + 1;
+          final p = '${mn}_${d.toLowerCase()}_split';
+          final done = Logic(name: '${p}_done', width: lw);
+          final busy = Logic(name: '${p}_busy');
+          final remain = (len.zeroExtend(lw) + 1) - done;
+          final eligible = anyOf([
+            for (var t = 0; t < nt; t++)
+              if (splitT[t]) tgt[t],
+          ]);
+          final incr = burst.eq(Const(1, width: Axi4Interface.burstWidth));
+          // A legal exclusive burst (16 beats or fewer) goes whole, or the
+          // monitor would see pieces. An exclusive burst above 16 beats is
+          // illegal and splits like any other.
+          final more =
+              (eligible &
+                      incr &
+                      (~lock | len.gt(Const(15, width: lenW))) &
+                      remain.gt(Const(cap, width: lw)))
+                  .named('${p}_more');
+          mMore[m][dir] <= more;
+          final pieceLen = mux(
+            more,
+            Const(cap - 1, width: lenW),
+            (remain - 1).getRange(0, lenW),
+          );
+          mPieceLen[m][dir] <= pieceLen;
+          final w = innerW + lw + 8;
+          final aligned = (addr.zeroExtend(w) >> size) << size;
+          final offset = done.zeroExtend(w) << size;
+          final pieceAddr = mux(
+            done.eq(0),
+            addr,
+            (aligned + offset).getRange(0, innerW),
+          );
+          pieceRest = harborPack([
+            pieceAddr,
+            pieceLen,
+            size,
+            burst,
+            lock,
+            cache,
+            prot,
+            qos,
+          ]);
+          Sequential(c, reset: r, [
+            If(
+              mFire[m][dir],
+              then: [
+                If(more, then: [done < done + Const(cap, width: lw)]),
+                If(~more, then: [done < 0]),
+              ],
+            ),
+            busy < (busy | mNonFinal[m][dir]) & ~mDone[m][dir],
+          ]);
+          // A burst that splits starts when the master has nothing else in
+          // flight, and any other request waits until it ends. So each
+          // response of the master belongs to the burst that splits.
+          mIdle[m][dir] = Logic(name: '${p}_idle');
+          splitOk = done.neq(0) | (~busy & (~more | mIdle[m][dir]!));
+          if (dir == 0) {
+            // Pieces of one burst overlap, as far as the master and the
+            // fabric hold their write routes.
+            final room = wPieces[m].lt(
+              Const(
+                min(15, masters[m].outstandingOn(HarborFabricKind.axi4)),
+                width: 4,
+              ),
+            );
+            splitOk = splitOk & room;
+          }
+        } else if (hasRt) {
+          mPieceLen[m][dir] <= rest.getRange(innerW, innerW + lenW);
+        }
         final full = pW > 0
             ? [Const(m, width: pW), hid.zeroExtend(maxId)].concat()
             : hid.zeroExtend(maxId);
-        final ok = _Tracker(
+        final tracker = _Tracker(
           '${mn}_${d.toLowerCase()}_order',
           c,
           r,
@@ -459,9 +623,11 @@ class HarborAxi4Fabric extends HarborFabricModule {
           issue: mPop[m][dir],
           done: mDone[m][dir],
           doneId: mDoneId[m][dir],
-        ).ok;
+        );
+        final ok = splitOk == null ? tracker.ok : tracker.ok & splitOk;
+        if (splitOk != null) mIdle[m][dir]! <= tracker.idle;
         mFull[m].add(full);
-        mRest[m].add(rest);
+        mRest[m].add(pieceRest);
         mTgt[m].add(tgt);
         mTgtIdx[m].add(tgtIdx);
         req[m].add([
@@ -490,9 +656,27 @@ class HarborAxi4Fabric extends HarborFabricModule {
       final lastOne = cnt.eq(Const(n - 1, width: cw));
       final awWant = anyOf([for (var m = 0; m < nm; m++) req[m][0][t]]);
       final arWant = anyOf([for (var m = 0; m < nm; m++) req[m][1][t]]);
+      // A real-time request in one direction takes the last slot from a
+      // request in the other direction.
+      var prefer = preferRead;
+      if (hasRt) {
+        final awRt = anyOf([
+          for (var m = 0; m < nm; m++)
+            if (rt[m]) req[m][0][t],
+        ]);
+        final arRt = anyOf([
+          for (var m = 0; m < nm; m++)
+            if (rt[m]) req[m][1][t],
+        ]);
+        prefer = mux(
+          arRt & ~awRt,
+          Const(1),
+          mux(awRt & ~arRt, Const(0), preferRead),
+        );
+      }
       outOk.add([
-        ~full & ~(lastOne & arWant & preferRead),
-        ~full & ~(lastOne & awWant & ~preferRead),
+        ~full & ~(lastOne & arWant & prefer),
+        ~full & ~(lastOne & awWant & ~prefer),
       ]);
       Sequential(c, reset: r, [
         cnt <
@@ -511,6 +695,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final tMaster = [for (var t = 0; t < nt; t++) <Logic>[]];
     final awBusTarget = <Logic>[];
     final awBusMaster = <Logic>[];
+    final awBusLen = <Logic>[];
     for (var dir = 0; dir < 2; dir++) {
       final d = dir == 0 ? 'aw' : 'ar';
       final gated = [
@@ -522,21 +707,27 @@ class HarborAxi4Fabric extends HarborFabricModule {
       if (topology == HarborFabricTopology.crossbar) {
         final grants = <List<Logic>>[];
         for (var t = 0; t < nt; t++) {
-          final g = roundRobin('${tName[t]}_$d', c, r, [
-            for (var m = 0; m < nm; m++) gated[m][t],
-          ]);
+          final g = roundRobin(
+            '${tName[t]}_$d',
+            c,
+            r,
+            realtimeFirst([for (var m = 0; m < nm; m++) gated[m][t]], rt),
+          );
           grants.add(g);
           tFire[t][dir] <= anyOf(g);
           tReq[t].add(_Req(tFire[t][dir], pick(g, full), pick(g, rest)));
           tMaster[t].add(indexOf(g, mW));
         }
         for (var m = 0; m < nm; m++) {
-          mPop[m][dir] <= anyOf([for (var t = 0; t < nt; t++) grants[t][m]]);
+          grantTo(m, dir, anyOf([for (var t = 0; t < nt; t++) grants[t][m]]));
         }
       } else {
-        final g = roundRobin('bus_$d', c, r, [
-          for (var m = 0; m < nm; m++) anyOf(gated[m]),
-        ]);
+        final g = roundRobin(
+          'bus_$d',
+          c,
+          r,
+          realtimeFirst([for (var m = 0; m < nm; m++) anyOf(gated[m])], rt),
+        );
         final busFull = pick(g, full);
         final busRest = pick(g, rest);
         final busMaster = indexOf(g, mW);
@@ -547,13 +738,18 @@ class HarborAxi4Fabric extends HarborFabricModule {
           tMaster[t].add(busMaster);
         }
         for (var m = 0; m < nm; m++) {
-          mPop[m][dir] <= g[m];
+          grantTo(m, dir, g[m]);
         }
         if (dir == 0) {
           awBusTarget.add(
             pick(g, [for (var m = 0; m < nm; m++) mTgtIdx[m][0]]),
           );
           awBusMaster.add(busMaster);
+          if (hasRt) {
+            awBusLen.add(
+              pick(g, [for (var m = 0; m < nm; m++) mPieceLen[m][0]]),
+            );
+          }
         }
       }
     }
@@ -600,8 +796,25 @@ class HarborAxi4Fabric extends HarborFabricModule {
           pop: wPop[m],
         ),
     ];
-    final wData = [for (final f in wHead) f.data];
-    final wLast = [for (final f in wHead) f.data[-1]];
+    // With a real-time master the fabric ends each write piece itself: the
+    // last beat of a piece is the one the piece length names. A piece of a
+    // request that did not split ends with the beat the master marks.
+    final pieceLen = [for (var m = 0; m < nm; m++) Logic(width: lenW)];
+    final wCount = [
+      for (var m = 0; m < nm; m++)
+        Logic(name: '${masters[m].name}_w_count', width: lenW),
+    ];
+    final wPieceEnd = [for (var m = 0; m < nm; m++) Logic()];
+    Logic withLast(Logic data, Logic last) =>
+        [last, data.getRange(0, data.width - 1)].concat();
+    final wLast = [
+      for (var m = 0; m < nm; m++)
+        hasRt ? wCount[m].eq(pieceLen[m]) : wHead[m].data[-1],
+    ];
+    final wData = [
+      for (var m = 0; m < nm; m++)
+        hasRt ? withLast(wHead[m].data, wLast[m]) : wHead[m].data,
+    ];
     final tBeat = <_WBeat>[];
     if (topology == HarborFabricTopology.crossbar) {
       final xfer = [
@@ -614,11 +827,25 @@ class HarborAxi4Fabric extends HarborFabricModule {
             clk: c,
             reset: r,
             depth: masters[m].outstandingOn(HarborFabricKind.axi4),
-            pushValid: mPop[m][0],
-            pushData: mTgtIdx[m][0],
+            pushValid: hasRt ? mFire[m][0] : mPop[m][0],
+            pushData: hasRt
+                ? harborPack([mTgtIdx[m][0], mPieceLen[m][0]])
+                : mTgtIdx[m][0],
             popReady: wPop[m] & wLast[m],
           ),
       ];
+      final routeTgt = [
+        for (var m = 0; m < nm; m++)
+          hasRt
+              ? harborUnpack(routes[m].popData, [tW, lenW]).first
+              : routes[m].popData,
+      ];
+      if (hasRt) {
+        for (var m = 0; m < nm; m++) {
+          pieceLen[m] <= harborUnpack(routes[m].popData, [tW, lenW])[1];
+          wPieceEnd[m] <= wPop[m] & wLast[m];
+        }
+      }
       for (var t = 0; t < nt; t++) {
         final from = [for (var m = 0; m < nm; m++) xfer[m][t]];
         final beat = _WBeat(anyOf(from), pick(from, wData), pick(from, wLast));
@@ -635,7 +862,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
           xfer[m][t] <=
               wHead[m].valid &
                   routes[m].popValid &
-                  routes[m].popData.eq(Const(t, width: tW)) &
+                  routeTgt[m].eq(Const(t, width: tW)) &
                   src.popValid &
                   src.popData.eq(Const(m, width: mW)) &
                   wReady[t];
@@ -655,11 +882,19 @@ class HarborAxi4Fabric extends HarborFabricModule {
           0,
           (n, m) => n + m.outstandingOn(HarborFabricKind.axi4),
         ),
-        pushValid: anyOf([for (var m = 0; m < nm; m++) mPop[m][0]]),
-        pushData: harborPack([awBusMaster.first, awBusTarget.first]),
+        pushValid: anyOf([
+          for (var m = 0; m < nm; m++) hasRt ? mFire[m][0] : mPop[m][0],
+        ]),
+        pushData: hasRt
+            ? harborPack([awBusMaster.first, awBusTarget.first, awBusLen.first])
+            : harborPack([awBusMaster.first, awBusTarget.first]),
         popReady: orderPop,
       );
-      final [mh, th] = harborUnpack(order.popData, [mW, tW]);
+      final [mh, th, ...more] = harborUnpack(order.popData, [
+        mW,
+        tW,
+        if (hasRt) lenW,
+      ]);
       final mOh = decodeIndex(mh, nm);
       final tOh = decodeIndex(th, nt);
       final xfer =
@@ -667,14 +902,47 @@ class HarborAxi4Fabric extends HarborFabricModule {
                   pick(mOh, [for (final f in wHead) f.valid]) &
                   pick(tOh, wReady))
               .named('bus_w_xfer');
-      final data = pick(mOh, wData);
-      final last = pick(mOh, wLast);
+      final Logic data;
+      final Logic last;
+      if (hasRt) {
+        final count = Logic(name: 'bus_w_count', width: lenW);
+        last = count.eq(more.first);
+        data = withLast(pick(mOh, [for (final f in wHead) f.data]), last);
+        Sequential(c, reset: r, [
+          If(xfer, then: [count < mux(last, Const(0, width: lenW), count + 1)]),
+        ]);
+      } else {
+        data = pick(mOh, wData);
+        last = pick(mOh, wLast);
+      }
       orderPop <= xfer & last;
       for (var m = 0; m < nm; m++) {
         wPop[m] <= xfer & mOh[m];
+        if (hasRt) wPieceEnd[m] <= xfer & mOh[m] & last;
       }
       for (var t = 0; t < nt; t++) {
         tBeat.add(_WBeat(xfer & tOh[t], data, last));
+      }
+    }
+
+    if (hasRt) {
+      for (var m = 0; m < nm; m++) {
+        if (topology == HarborFabricTopology.crossbar) {
+          Sequential(c, reset: r, [
+            If(
+              wPop[m],
+              then: [
+                wCount[m] < mux(wLast[m], Const(0, width: lenW), wCount[m] + 1),
+              ],
+            ),
+          ]);
+        }
+        Sequential(c, reset: r, [
+          wPieces[m] <
+              wPieces[m] +
+                  mFire[m][0].zeroExtend(4) -
+                  wPieceEnd[m].zeroExtend(4),
+        ]);
       }
     }
 
@@ -745,14 +1013,39 @@ class HarborAxi4Fabric extends HarborFabricModule {
       final pushData = <Logic>[];
       final outs = <HarborRegFifo>[];
       final items = <List<Logic>>[];
+      // A master with split bursts has one burst in flight, so each
+      // response is of that burst. The pieces granted that are not its
+      // last one end with a slave side last (R) or B that the master does
+      // not see. B of a piece with an error leaves its code for the B of
+      // the last piece.
+      final pieces = [
+        for (var m = 0; m < nm; m++)
+          splitM[m]
+              ? Logic(name: '${masters[m].name}_${d}_pieces', width: lenW + 1)
+              : null,
+      ];
+      final worst = [
+        for (var m = 0; m < nm; m++)
+          splitM[m] && dir == 0
+              ? Logic(name: '${masters[m].name}_b_worst', width: 2)
+              : null,
+      ];
       for (var m = 0; m < nm; m++) {
         final a = ma[m];
+        final more = pieces[m]?.neq(0);
         items.add([
           for (var t = 0; t < nt; t++)
             harborPack([
               mids[t].getRange(0, a.idWidth),
-              resp[t].payload,
-              if (dir == 1) resp[t].last,
+              if (worst[m] != null)
+                mux(
+                  _respKey(worst[m]!).gt(_respKey(resp[t].payload)),
+                  worst[m]!,
+                  resp[t].payload,
+                )
+              else
+                resp[t].payload,
+              if (dir == 1) more != null ? resp[t].last & ~more : resp[t].last,
             ]),
         ]);
         final data = Logic(width: items[m].first.width);
@@ -794,6 +1087,45 @@ class HarborAxi4Fabric extends HarborFabricModule {
         }
         mDoneId[m][dir] <= data.getRange(0, a.idWidth);
       }
+      // Pushes a response of master [m] to its FIFO. [raw] is high when a
+      // response for [m] is taken, with [last] and [payload] of its target.
+      void pushTo(
+        int m,
+        Logic raw,
+        Logic Function() last,
+        Logic Function() payload,
+      ) {
+        final n = pieces[m];
+        if (n == null) {
+          push[m] <= raw;
+          return;
+        }
+        final nonFinal = mNonFinal[m][dir];
+        if (dir == 1) {
+          push[m] <= raw;
+          final end = raw & last() & n.neq(0);
+          Sequential(c, reset: r, [
+            n < n + nonFinal.zeroExtend(lenW + 1) - end.zeroExtend(lenW + 1),
+          ]);
+          return;
+        }
+        final swallow = raw & n.neq(0);
+        push[m] <= raw & ~swallow;
+        final w = worst[m]!;
+        Sequential(c, reset: r, [
+          n < n + nonFinal.zeroExtend(lenW + 1) - swallow.zeroExtend(lenW + 1),
+          If(
+            swallow,
+            then: [
+              If(_respKey(payload()).gt(_respKey(w)), then: [w < payload()]),
+            ],
+            orElse: [
+              If(raw, then: [w < 0]),
+            ],
+          ),
+        ]);
+      }
+
       if (topology == HarborFabricTopology.crossbar) {
         final grants = <List<Logic>>[];
         for (var m = 0; m < nm; m++) {
@@ -802,7 +1134,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
               resp[t].valid & dest[t][m] & outs[m].pushReady,
           ]);
           grants.add(g);
-          push[m] <= anyOf(g);
+          final raw = anyOf(g);
+          pushTo(
+            m,
+            raw,
+            () => pick(g, [for (final x in resp) x.last]),
+            () => pick(g, [for (final x in resp) x.payload]),
+          );
           pushData[m] <= pick(g, items[m]);
         }
         for (var t = 0; t < nt; t++) {
@@ -817,7 +1155,12 @@ class HarborAxi4Fabric extends HarborFabricModule {
                 ]),
         ]);
         for (var m = 0; m < nm; m++) {
-          push[m] <= anyOf([for (var t = 0; t < nt; t++) g[t] & dest[t][m]]);
+          pushTo(
+            m,
+            anyOf([for (var t = 0; t < nt; t++) g[t] & dest[t][m]]),
+            () => pick(g, [for (final x in resp) x.last]),
+            () => pick(g, [for (final x in resp) x.payload]),
+          );
           pushData[m] <= pick(g, items[m]);
         }
         for (var t = 0; t < nt; t++) {
@@ -1732,6 +2075,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     HarborFabricTopology topology,
     List<HarborFabricMaster> masters,
     List<HarborFabricSlave> slaves,
+    int realtimeBurstCap,
   ) {
     if (masters.isEmpty) {
       throw ArgumentError.value(masters, 'masters', 'must not be empty');
@@ -1745,10 +2089,12 @@ class HarborAxi4Fabric extends HarborFabricModule {
       topology.name,
       'a$addrW',
       'd$dataW',
+      if (masters.any((m) => m.realtime)) 'q$realtimeBurstCap',
       for (final m in masters)
         'M${m.name}${id(m.interface)}'
             'o${m.outstandingOn(HarborFabricKind.axi4)}${m.reachTag(slaves)}'
-            '${m.readChannel != null ? 'rc${m.readChannel}' : ''}',
+            '${m.readChannel != null ? 'rc${m.readChannel}' : ''}'
+            '${m.realtime ? 'Q' : ''}',
       for (final s in slaves)
         'S${s.name}${id(s.interface)}n${s.outstanding}'
             '${_widthTag(s, addrW, dataW)}${s.offset ? 'O' : ''}'

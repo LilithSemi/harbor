@@ -67,6 +67,18 @@ List<Logic> roundRobin(String name, Logic clk, Logic reset, List<Logic> req) {
   return [for (var i = 0; i < n; i++) g[i]];
 }
 
+/// [req] with the requests of masters that are not real-time held back
+/// while a real-time request is up. [rt] has one flag per request. With no
+/// real-time flag it returns [req] unchanged.
+List<Logic> realtimeFirst(List<Logic> req, List<bool> rt) {
+  if (!rt.contains(true)) return req;
+  final any = anyOf([
+    for (var i = 0; i < req.length; i++)
+      if (rt[i]) req[i],
+  ]);
+  return [for (var i = 0; i < req.length; i++) rt[i] ? req[i] : req[i] & ~any];
+}
+
 /// High when [addr] is in [range].
 Logic inRange(Logic addr, BusAddressRange range) {
   final w = addr.width;

@@ -667,16 +667,13 @@ void main() {
     });
 
     test('the grant cap is on by default for two or more masters', () {
-      String name({
-        int masters = 2,
-        int? cap,
-        bool defaultCap = false,
-      }) => _native(
-        wb,
-        masters: [for (var i = 0; i < masters; i++) PortCfg('m$i')],
-        maxGrantCycles: cap,
-        defaultCap: defaultCap,
-      ).definitionName;
+      String name({int masters = 2, int? cap, bool defaultCap = false}) =>
+          _native(
+            wb,
+            masters: [for (var i = 0; i < masters; i++) PortCfg('m$i')],
+            maxGrantCycles: cap,
+            defaultCap: defaultCap,
+          ).definitionName;
       // The default value is the cap of 16, an opt-out of null or 0 is none.
       expect(name(defaultCap: true), name(cap: 16));
       expect(name(defaultCap: true), isNot(name(cap: null)));

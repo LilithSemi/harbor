@@ -31,6 +31,9 @@ class PortCfg {
   /// Slaves a master reaches, or null for all.
   final Set<String>? reach;
 
+  /// A real-time master.
+  final bool realtime;
+
   const PortCfg(
     this.name, {
     this.width = 1,
@@ -41,6 +44,7 @@ class PortCfg {
     this.size = 0,
     this.timeout = 0,
     this.reach,
+    this.realtime = false,
   });
 
   BusAddressRange get range => BusAddressRange(base, size);
@@ -79,6 +83,7 @@ class NativeShell extends BridgeModule {
     required List<PortCfg> slaves,
     int? maxGrantCycles,
     int burstBeats = 8,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
   }) : super('NativeFabricShell_${kind.name}_${topology.name}', name: 'shell') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -93,6 +98,7 @@ class NativeShell extends BridgeModule {
           outstanding: m.outstanding,
           memory: m.memory,
           reach: m.reach,
+          realtime: m.realtime,
         ),
       );
     }
@@ -120,6 +126,7 @@ class NativeShell extends BridgeModule {
       slaves: ss,
       maxGrantCycles: maxGrantCycles,
       wishboneBurstBeats: burstBeats,
+      realtimeBurstCap: realtimeBurstCap,
     );
     createPort('bus_error', PortDirection.output);
     output('bus_error') <= fabric.busError;
@@ -210,12 +217,14 @@ class TlBench {
     int seed = 1,
     double stall = 0.3,
     int maxTime = 8000000,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
   }) async {
     final shell = NativeShell(
       HarborFabricKind.tilelink,
       topology,
       masters: masters,
       slaves: slaves,
+      realtimeBurstCap: realtimeBurstCap,
     );
     final sim = Sim(shell);
     final rng = Random(seed);
@@ -463,6 +472,7 @@ class WbBench {
     double wait = 0.3,
     int? maxGrantCycles,
     int maxTime = 8000000,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
   }) async {
     final shell = NativeShell(
       HarborFabricKind.wishbone,
@@ -470,6 +480,7 @@ class WbBench {
       masters: masters,
       slaves: slaves,
       maxGrantCycles: maxGrantCycles,
+      realtimeBurstCap: realtimeBurstCap,
     );
     final sim = Sim(shell);
     final rng = Random(seed);

@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:rohd/rohd.dart';
 
 import 'axi4/axi4_exclusive.dart';
@@ -6,6 +8,7 @@ import 'bus.dart';
 import 'bus_error_source.dart';
 import 'port/fabric_kind.dart';
 import 'tilelink/tilelink_fabric.dart';
+import 'tilelink/tilelink_interface.dart';
 import 'wishbone/wishbone_arbiter.dart';
 import 'wishbone/wishbone_fabric.dart';
 
@@ -66,6 +69,17 @@ class HarborFabricMaster {
   /// True when this master uses exclusive access.
   bool get exclusive => (exclusiveIds ?? 0) != 0;
 
+  /// True for a real-time master. Its requests win arbitration, and while
+  /// one waits, the bursts of the other masters toward the same slave are
+  /// capped (see [HarborFabric.build]).
+  final bool realtime;
+
+  /// True when this master never stalls its write data inside a burst: it
+  /// holds the data of a whole burst before it sends the request, or each
+  /// beat follows the last without a gap. The real-time wait bound holds only
+  /// with such masters (see [HarborFabric.realtimeWaitBound]).
+  final bool writeStallFree;
+
   const HarborFabricMaster({
     required this.name,
     required this.interface,
@@ -74,6 +88,8 @@ class HarborFabricMaster {
     this.reach,
     this.readChannel,
     this.exclusiveIds,
+    this.realtime = false,
+    this.writeStallFree = false,
   });
 
   /// The outstanding limit of this master on a fabric of [kind].
@@ -201,6 +217,23 @@ abstract final class HarborFabric {
   /// is for Wishbone fabrics only. It defaults to
   /// [harborDefaultWishboneGrantCap] on a fabric with two or more masters.
   /// Null or 0 turns the cap off. A fabric with one master has no cap.
+  ///
+  /// A master with [HarborFabricMaster.realtime] wins every arbitration it
+  /// is part of. [realtimeBurstCap] is the most beats of a burst of another
+  /// master that go to a slave in one grant while a real-time request
+  /// waits, and [realtimeWaitBound] gives the resulting wait. A fabric with
+  /// no real-time master ignores it and builds the same logic as before.
+  ///
+  /// - Wishbone: a burst of another master ends with CTI 111 at the capped
+  ///   beat. The master keeps CYC and STB, and it gets the rest of its
+  ///   burst after the real-time transfer.
+  /// - AXI4: a burst longer than the cap goes to the slave as bursts of up
+  ///   to [realtimeBurstCap] beats, each with its own grant. The master
+  ///   still sees one burst. Only INCR bursts split: a FIXED or WRAP burst
+  ///   has 16 beats or fewer and goes whole.
+  /// - TileLink: a message cannot be cut, so the cap does not apply. A
+  ///   real-time message waits for the message that holds the target. The
+  ///   largest message of the other masters sets the bound.
   static HarborFabricModule build({
     required HarborFabricKind kind,
     required HarborFabricTopology topology,
@@ -210,8 +243,16 @@ abstract final class HarborFabric {
     required List<HarborFabricSlave> slaves,
     int wishboneBurstBeats = 8,
     int? maxGrantCycles = harborDefaultWishboneGrantCap,
+    int realtimeBurstCap = defaultRealtimeBurstCap,
     String name = 'fabric',
   }) {
+    if (realtimeBurstCap < 1) {
+      throw ArgumentError.value(
+        realtimeBurstCap,
+        'realtimeBurstCap',
+        'must be >= 1',
+      );
+    }
     if (maxGrantCycles != null && maxGrantCycles < 0) {
       throw ArgumentError.value(
         maxGrantCycles,
@@ -236,6 +277,7 @@ abstract final class HarborFabric {
           reset: reset,
           masters: masters,
           slaves: slaves,
+          realtimeBurstCap: realtimeBurstCap,
           name: name,
         );
       case HarborFabricKind.tilelink:
@@ -258,9 +300,260 @@ abstract final class HarborFabric {
           maxGrantCycles: masters.length < 2 || maxGrantCycles == 0
               ? null
               : maxGrantCycles,
+          realtimeBurstCap: realtimeBurstCap,
           name: name,
         );
     }
+  }
+
+  /// The default of [build]'s `realtimeBurstCap`, in beats.
+  static const int defaultRealtimeBurstCap = 16;
+
+  /// The most cycles a real-time request waits before a slave starts to
+  /// serve it, in a fabric of [kind] built with [realtimeBurstCap] [cap].
+  /// One beat takes [beatCycles] cycles at the slave. Each memory access that
+  /// comes before the first beat of the request, with the access of the
+  /// request itself, costs [accessCycles] (the worst first access latency of
+  /// the memory itself) plus [pathCycles] (the register stages of the path
+  /// between the master and the memory, see [pathCyclesOf]). The bound is the
+  /// wait until the first response beat, so a caller does not add the access
+  /// of the memory again.
+  ///
+  /// - [masters] holds every master that reaches the slave. At least one
+  ///   has [HarborFabricMaster.realtime]. A real-time master has up to one
+  ///   transfer ahead of the request, for each other real-time master.
+  /// - [realtimeBeats] is the longest transfer of a real-time master in
+  ///   beats. Real-time masters are not capped.
+  /// - [slaveOutstanding] is the [HarborFabricSlave.outstanding] of the
+  ///   slave.
+  /// - [sharedSlaves] is the number of slaves that share one response
+  ///   channel with the slave: all slaves on a shared fabric, 1 on a
+  ///   crossbar.
+  /// - [maxMessageBeats] is the beats of the largest TileLink message of
+  ///   the other masters. Null takes it from the size field of their ports,
+  ///   which is a very large figure, so a build that wants a useful bound
+  ///   gives it.
+  /// - [wishboneBurstBeats] is the aligned burst block of the Wishbone
+  ///   memory slave.
+  /// - [wishboneGrantCap] is the Wishbone grant hold cap of the fabric (see
+  ///   [harborDefaultWishboneGrantCap] after the cap lands). An owner holds
+  ///   the grant for at most that many cycles, so a burst that the real-time
+  ///   cap does not cut ends there, and the bound uses the smaller of the two
+  ///   for `cap`. Null means no grant cap.
+  ///
+  /// Formulas, with `r` for the real-time masters, `rt` for [realtimeBeats],
+  /// `bc` for [beatCycles] and `ac` for [accessCycles] plus [pathCycles]:
+  /// - Wishbone: `(oc + 1 + (r - 1) * rt + (burst - 1)) * bc + n * ac + 3`,
+  ///   with `oc = min(cap, grant cap)`,
+  ///   with `n = ceil((cap + 1) / burst) + 1 + (r - 1) * ceil(rt / burst) +
+  ///   1` accesses: the blocks the owner can cross, one more for the burst
+  ///   that the slave finishes after a cut, the blocks of the other
+  ///   real-time masters, and the access of the request itself.
+  ///   The owner of the bus ends its burst at the cap, and a transfer
+  ///   already in progress when the real-time request comes ends first.
+  ///   After a cut the slave finishes the aligned block of its burst, up to
+  ///   `burst - 1` beats. A grant is a register, so the next owner starts 2
+  ///   cycles after the end and 1 more cycle covers the cut transfer. The
+  ///   wait for the write response of the last write transfer is part of
+  ///   `ac`.
+  /// - AXI4: `shared * (outstanding + r - 1) * (max(max(cap, 16), rt) * bc +
+  ///   ac + 4) + ac + 8`. The slave has up to `outstanding` requests ahead and
+  ///   each other real-time master adds one request ahead. A request is a
+  ///   burst of at most the cap (a FIXED or WRAP burst has up to 16 beats),
+  ///   and the response channel is shared with the other slaves. A request
+  ///   crosses the fabric stages in a few cycles.
+  /// - TileLink: `(shared * outstanding + r) * (max(maxMessage, rt) * bc +
+  ///   ac) + ac + 8`. A message cannot be cut, so the cap does not apply.
+  ///
+  /// The AXI4 bound is for reads. It holds when every master takes R and B
+  /// beats at once (RREADY and BREADY high) and sends write data without
+  /// stalls. A real-time write path needs more terms.
+  ///
+  /// The bound throws [ArgumentError] when a master that is not real-time
+  /// does not declare [HarborFabricMaster.writeStallFree], unless
+  /// [allowUnproven] is set. [allowUnproven] is a recorded best-effort flag.
+  static int realtimeWaitBound({
+    required HarborFabricKind kind,
+    required List<HarborFabricMaster> masters,
+    required int cap,
+    int slaveOutstanding = 1,
+    int sharedSlaves = 1,
+    int? realtimeBeats,
+    int? maxMessageBeats,
+    int beatCycles = 1,
+    int accessCycles = 0,
+    int pathCycles = 0,
+    int wishboneBurstBeats = 8,
+    int? wishboneGrantCap,
+    bool allowUnproven = false,
+  }) {
+    if (cap < 1) {
+      throw ArgumentError.value(cap, 'cap', 'must be >= 1');
+    }
+    if (slaveOutstanding < 1 ||
+        sharedSlaves < 1 ||
+        beatCycles < 1 ||
+        accessCycles < 0 ||
+        pathCycles < 0 ||
+        wishboneBurstBeats < 1) {
+      throw ArgumentError(
+        'slaveOutstanding, sharedSlaves, beatCycles and wishboneBurstBeats '
+        'must be >= 1, accessCycles and pathCycles >= 0',
+      );
+    }
+    final r = masters.where((m) => m.realtime).length;
+    if (r < 1) {
+      throw ArgumentError.value(masters, 'masters', 'has no realtime master');
+    }
+    if (!allowUnproven) {
+      final open = [
+        for (final m in masters)
+          if (!m.realtime && !m.writeStallFree) m.name,
+      ];
+      if (open.isNotEmpty) {
+        throw ArgumentError(
+          'the bound holds only for masters that never stall write data '
+          'inside a burst, and $open do not declare writeStallFree. Declare '
+          'it, or pass allowUnproven to take the bound without that proof.',
+        );
+      }
+    }
+    final rt = realtimeBeats ?? cap;
+    final ac = accessCycles + pathCycles;
+    final ownerCap = wishboneGrantCap == null || wishboneGrantCap < 1
+        ? cap
+        : min(cap, wishboneGrantCap);
+    switch (kind) {
+      case HarborFabricKind.wishbone:
+        int blocks(int beats) =>
+            (beats + wishboneBurstBeats - 1) ~/ wishboneBurstBeats;
+        final accesses = blocks(ownerCap + 1) + 1 + (r - 1) * blocks(rt) + 1;
+        return (ownerCap + 1 + (r - 1) * rt + (wishboneBurstBeats - 1)) *
+                beatCycles +
+            accesses * ac +
+            3;
+      case HarborFabricKind.axi4:
+        final int piece = max<int>(max<int>(cap, 16), rt);
+        return sharedSlaves *
+                (slaveOutstanding + r - 1) *
+                (piece * beatCycles + ac + 4) +
+            ac +
+            8;
+      case HarborFabricKind.tilelink:
+        final int message =
+            maxMessageBeats ?? _tileLinkMaxMessageBeats(masters);
+        return (sharedSlaves * slaveOutstanding + r) *
+                (max<int>(message, rt) * beatCycles + ac) +
+            ac +
+            8;
+    }
+  }
+
+  /// Register stages of the path of one access, from the master to the first
+  /// response beat, as an upper bound. A caller passes the sum as
+  /// `pathCycles` of [realtimeWaitBound].
+  ///
+  /// - [fabrics] is the number of fabrics the access crosses: 1, or 2 through
+  ///   a channel fabric and a converge fabric.
+  /// - A fabric has 2 stages on Wishbone (the grant register and the
+  ///   response), and 4 on AXI4 and TileLink (the request FIFOs of the master
+  ///   and the slave side, the response FIFO, and the response arbitration).
+  /// - [memoryPorts] is the number of memory master and slave port pairs. A
+  ///   pair has 8 stages: the request, data and response FIFOs of both ports.
+  /// - [registerStages] is the number of `WishboneRegisterStage` slices on
+  ///   the path (`HarborSoC.buildFabric` with `pipeline`, or a master with
+  ///   `pipeline`). Each costs 2 cycles.
+  /// - [cdcCycles] is the latency of each clock crossing on the path, from
+  ///   its own documentation.
+  static int pathCyclesOf({
+    required HarborFabricKind kind,
+    int fabrics = 1,
+    int memoryPorts = 1,
+    int registerStages = 0,
+    int cdcCycles = 0,
+  }) =>
+      fabrics * (kind == HarborFabricKind.wishbone ? 2 : 4) +
+      memoryPorts * 8 +
+      registerStages * 2 +
+      cdcCycles;
+
+  /// The wait of a real-time request that goes through a channel fabric and
+  /// then a converge fabric to a slave (see `HarborSoC.buildFabric`).
+  ///
+  /// It is [realtimeWaitBound] of the channel fabric, with [channelMasters],
+  /// plus [realtimeWaitBound] of the converge fabric, with [convergeMasters]
+  /// (the legs of the channels, one of them real-time), less one access
+  /// ([accessCycles] plus [pathCycles]). Both fabrics charge the access of
+  /// each transfer ahead, because a transfer ahead in either fabric has its
+  /// own memory access, and the access of the request itself counts once.
+  /// [pathCycles] is the path of the whole access (`pathCyclesOf` with
+  /// `fabrics: 2`). [channelSharedSlaves] and [convergeSharedSlaves] are the
+  /// [sharedSlaves] of each fabric, and [slaveOutstanding] and
+  /// [channelSlaveOutstanding] are the limits at the slave and at the leg
+  /// (the same by default). The other parameters are those of
+  /// [realtimeWaitBound].
+  static int realtimeWaitBoundThrough({
+    required HarborFabricKind kind,
+    required List<HarborFabricMaster> channelMasters,
+    required List<HarborFabricMaster> convergeMasters,
+    required int cap,
+    int slaveOutstanding = 1,
+    int? channelSlaveOutstanding,
+    int channelSharedSlaves = 1,
+    int convergeSharedSlaves = 1,
+    int? realtimeBeats,
+    int? maxMessageBeats,
+    int beatCycles = 1,
+    int accessCycles = 0,
+    int pathCycles = 0,
+    int wishboneBurstBeats = 8,
+    int? wishboneGrantCap,
+    bool allowUnproven = false,
+  }) =>
+      realtimeWaitBound(
+        kind: kind,
+        masters: channelMasters,
+        cap: cap,
+        slaveOutstanding: channelSlaveOutstanding ?? slaveOutstanding,
+        sharedSlaves: channelSharedSlaves,
+        realtimeBeats: realtimeBeats,
+        maxMessageBeats: maxMessageBeats,
+        beatCycles: beatCycles,
+        accessCycles: accessCycles,
+        pathCycles: pathCycles,
+        wishboneBurstBeats: wishboneBurstBeats,
+        wishboneGrantCap: wishboneGrantCap,
+        allowUnproven: allowUnproven,
+      ) +
+      realtimeWaitBound(
+        kind: kind,
+        masters: convergeMasters,
+        cap: cap,
+        slaveOutstanding: slaveOutstanding,
+        sharedSlaves: convergeSharedSlaves,
+        realtimeBeats: realtimeBeats,
+        maxMessageBeats: maxMessageBeats,
+        beatCycles: beatCycles,
+        accessCycles: accessCycles,
+        pathCycles: pathCycles,
+        wishboneBurstBeats: wishboneBurstBeats,
+        wishboneGrantCap: wishboneGrantCap,
+        allowUnproven: allowUnproven,
+      ) -
+      (accessCycles + pathCycles);
+
+  static int _tileLinkMaxMessageBeats(List<HarborFabricMaster> masters) {
+    var most = 1;
+    for (final m in masters) {
+      if (m.realtime) continue;
+      final intf = m.interface;
+      if (intf is! TileLinkInterface) continue;
+      final c = intf.config;
+      final bytes = BigInt.one << ((1 << c.sizeWidth) - 1);
+      final beats = (bytes ~/ BigInt.from(c.dataWidth ~/ 8)).toInt();
+      most = max(most, max(1, beats));
+    }
+    return most;
   }
 
   /// Checks the slave regions of a fabric. Returns error messages, empty
