@@ -781,7 +781,8 @@ const _artyS7_50 = HarborBoard(
   // with `iface=pmod@ja` (e.g. a PmodSD SD card in SPI mode) binds its pads
   // here. MISO gets a pull-up so an empty socket reads high, not floating.
   // Sites from the Digilent Arty-S7-50 master XDC (JA1=L17 JA2=L18 JA3=M14
-  // JA4=N14; JB1=P17 JB2=P18 JB3=R18 JB4=T18), all bank 14 LVCMOS33.
+  // JA4=N14; JB1=P17 JB2=P18 JB3=R18 JB4=T18; JD1=V15 JD2=U12 JD3=V13 JD4=T12), all bank 14
+  // LVCMOS33. The LiteX digilent_arty_s7 platform gives the same JD sites.
   interfaces: {
     'pmod@ja': {
       'cs': 'L17 LVCMOS33',
@@ -794,6 +795,12 @@ const _artyS7_50 = HarborBoard(
       'mosi': 'P18 LVCMOS33',
       'miso': 'R18 LVCMOS33 PULLTYPE=PULLUP',
       'sck': 'T18 LVCMOS33',
+    },
+    'pmod@jd': {
+      'cs': 'V15 LVCMOS33',
+      'mosi': 'U12 LVCMOS33',
+      'miso': 'V13 LVCMOS33 PULLTYPE=PULLUP',
+      'sck': 'T12 LVCMOS33',
     },
   },
   // Four plain LEDs on pixels 0 to 3 and two RGB LEDs on pixels 4 and 5, all

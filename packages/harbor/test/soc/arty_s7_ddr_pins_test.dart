@@ -110,4 +110,25 @@ void main() {
       isEmpty,
     );
   });
+
+  test('pmod@jd uses the JD sites and collides with nothing', () {
+    final jd = board.interfaces['pmod@jd']!;
+    expect(jd['cs'], equals('V15 LVCMOS33'));
+    expect(jd['mosi'], equals('U12 LVCMOS33'));
+    expect(jd['miso'], equals('V13 LVCMOS33 PULLTYPE=PULLUP'));
+    expect(jd['sck'], equals('T12 LVCMOS33'));
+
+    String site(String p) => p.split(' ').first;
+    final jdSites = jd.values.map(site).toSet();
+    expect(jdSites, hasLength(4));
+    for (final other in const ['pmod@ja', 'pmod@jb']) {
+      final sites = board.interfaces[other]!.values.map(site).toSet();
+      expect(jdSites.intersection(sites), isEmpty, reason: other);
+    }
+    final named = board.pins.entries
+        .where((e) => e.key.startsWith('gpdi_'))
+        .map((e) => site(e.value))
+        .toSet();
+    expect(jdSites.intersection(named), isEmpty);
+  });
 }
