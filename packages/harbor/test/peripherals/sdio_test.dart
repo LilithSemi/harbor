@@ -18,6 +18,7 @@ const _cmdArg = 0x20;
 const _resp0 = 0x28;
 const _data = 0x48;
 const _blkSize = 0x50;
+const _blkCount = 0x58;
 const _intStatus = 0x60;
 const _intEnable = 0x68;
 const _admaAddr = 0x70;
@@ -1424,6 +1425,193 @@ void main() {
       expect(status & 0x02, equals(0x02)); // data-done
       expect(status & 0x08, equals(0)); // no CRC error on any lane
       expect(await busRead(_data), equals(word));
+      await Simulator.endSimulation();
+    });
+
+    // Runs a 4-bit card read of [blocks] through the pads: the response, then
+    // each block followed by its end bit. [risingData] puts a data group on
+    // the DAT lines at the SD rising edge, for a host that samples on the
+    // falling edge. Returns once the interrupt rises, or with [stopOnIrq]
+    // false once every group is sent.
+    Future<void> runFourBitRead({
+      required List<List<int>> blocks,
+      bool risingData = false,
+      bool stopOnIrq = true,
+    }) async {
+      final resp = _resp48(0);
+      final datStream = [
+        for (final b in blocks) ...[...b, 0xF],
+      ];
+      final total = resp.length + datStream.length;
+      var sawDrive = false;
+      var prevSdLow = sdClk.value.toInt() == 0;
+      var idx = 0;
+      for (var i = 0; i < 20000; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        final sdLow = sdClk.value.toInt() == 0;
+        final fell = sdLow && !prevSdLow;
+        final rose = !sdLow && prevSdLow;
+        prevSdLow = sdLow;
+        if (sawDrive && !sending && idx < total) {
+          if (idx < resp.length) {
+            if (fell) cmdIn.inject(resp[idx++]);
+          } else if (risingData ? rose : fell) {
+            datIn.inject(datStream[idx - resp.length]);
+            idx++;
+          }
+        }
+        if (idx == total && fell) datIn.inject(0xF);
+        if (stopOnIrq && irq.value.toInt() == 1) break;
+        if (!stopOnIrq && idx == total && fell) break;
+      }
+      if (stopOnIrq) {
+        expect(irq.value.toInt(), equals(1), reason: 'the read must finish');
+      }
+      // Keep the clock running while the last group lands.
+      for (var i = 0; i < 20; i++) {
+        await clk.nextPosedge;
+      }
+    }
+
+    for (final risingData in [false, true]) {
+      final edge = risingData ? 'falling edge sample' : 'rising edge sample';
+      for (final lane in risingData ? [2] : [0, 1, 2, 3]) {
+        test('a CMD17 CRC bit flipped on DAT$lane raises the data-CRC-error '
+            'interrupt ($edge)', () async {
+          await setUpDut();
+          const word = 0xC3A5F00F;
+          await busWrite(_blkSize, 4);
+          await busWrite(_intEnable, 0x1a);
+          await busWrite(
+            _ctrl,
+            0x01 | (1 << 4) | (risingData ? (1 << 8) : 0),
+          );
+          await busWrite(_cmdArg, 0);
+          final block = _fourBitWords([word]);
+          block[9 + 3] ^= 1 << lane;
+          await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+          await runFourBitRead(
+            blocks: [block],
+            risingData: risingData,
+          );
+          final status = await busRead(_intStatus);
+          expect(status & 0x08, equals(0x08));
+          expect(status & 0x02, equals(0x02));
+          await Simulator.endSimulation();
+        });
+      }
+    }
+
+    test('a CMD17 data bit flipped raises the data-CRC-error interrupt', () async {
+      await setUpDut();
+      const word = 0xC3A5F00F;
+      await busWrite(_blkSize, 4);
+      await busWrite(_intEnable, 0x1a);
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      await busWrite(_cmdArg, 0);
+      final block = _fourBitWords([word]);
+      block[1 + 4] ^= 1 << 2;
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      await runFourBitRead(blocks: [block]);
+      final status = await busRead(_intStatus);
+      expect(status & 0x08, equals(0x08));
+      await Simulator.endSimulation();
+    });
+
+    test('a CMD17 block with a good CRC16 on every lane leaves the error bit '
+        'clear', () async {
+      await setUpDut();
+      await busWrite(_blkSize, 4);
+      await busWrite(_intEnable, 0x1a);
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 17 | (1 << 6) | (1 << 8) | (1 << 9));
+      await runFourBitRead(blocks: [_fourBitWords([0xC3A5F00F])]);
+      final status = await busRead(_intStatus);
+      expect(status & 0x0A, equals(0x02));
+      await Simulator.endSimulation();
+    });
+
+    for (final risingData in [false, true]) {
+      test('CMD18 with a bad first block and a good second block latches the '
+          'error and clears it (${risingData ? 'falling' : 'rising'} edge '
+          'sample)', () async {
+        await setUpDut();
+        const w1 = 0x11223344;
+        const w2 = 0x55667788;
+        await busWrite(_blkSize, 4);
+        await busWrite(_blkCount, 2);
+        await busWrite(_intEnable, 0x02);
+        await busWrite(_ctrl, 0x01 | (1 << 4) | (risingData ? (1 << 8) : 0));
+        await busWrite(_cmdArg, 0);
+        final bad = _fourBitWords([w1]);
+        bad[9 + 7] ^= 1 << 1;
+        await busWrite(_cmd, 18 | (1 << 6) | (1 << 8) | (1 << 9));
+        await runFourBitRead(
+          blocks: [bad, _fourBitWords([w2])],
+          risingData: risingData,
+        );
+        var status = await busRead(_intStatus);
+        expect(status & 0x08, equals(0x08), reason: 'bad block 1 latches');
+        expect(status & 0x02, equals(0x02), reason: 'block 2 completes');
+        expect(await busRead(_data), equals(w1));
+        expect(await busRead(_data), equals(w2));
+        await busWrite(_intStatus, 0x08);
+        status = await busRead(_intStatus);
+        expect(status & 0x08, equals(0), reason: 'the clear takes the bit');
+        await Simulator.endSimulation();
+      });
+    }
+
+    for (final risingData in [false, true]) {
+      test('CMD18 data-CRC-error cleared during block 2 stays clear after a '
+          'good block 2 (${risingData ? 'falling' : 'rising'} edge sample)',
+          () async {
+        await setUpDut();
+        await busWrite(_blkSize, 4);
+        await busWrite(_blkCount, 2);
+        await busWrite(_intEnable, 0x08);
+        await busWrite(_ctrl, 0x01 | (1 << 4) | (risingData ? (1 << 8) : 0));
+        await busWrite(_cmdArg, 0);
+        final bad = _fourBitWords([0x11223344]);
+        bad[9 + 7] ^= 1 << 1;
+        await busWrite(_cmd, 18 | (1 << 6) | (1 << 8) | (1 << 9));
+        final card = runFourBitRead(
+          blocks: [bad, _fourBitWords([0x55667788])],
+          risingData: risingData,
+          stopOnIrq: false,
+        );
+        for (var i = 0; i < 20000 && irq.value.toInt() == 0; i++) {
+          await clk.nextPosedge;
+        }
+        expect(irq.value.toInt(), equals(1), reason: 'block 1 raises INT[3]');
+        await busWrite(_intStatus, 0x08);
+        await card;
+        final status = await busRead(_intStatus);
+        expect(status & 0x08, equals(0), reason: 'a good block 2 stays clean');
+        expect(status & 0x02, equals(0x02), reason: 'data-done');
+        await Simulator.endSimulation();
+      });
+    }
+
+    test('CMD18 with a good first block and a bad second block flags only '
+        'the second', () async {
+      await setUpDut();
+      await busWrite(_blkSize, 4);
+      await busWrite(_blkCount, 2);
+      await busWrite(_intEnable, 0x02);
+      await busWrite(_ctrl, 0x01 | (1 << 4));
+      await busWrite(_cmdArg, 0);
+      final bad = _fourBitWords([0x55667788]);
+      bad[9 + 2] ^= 1 << 3;
+      await busWrite(_cmd, 18 | (1 << 6) | (1 << 8) | (1 << 9));
+      await runFourBitRead(
+        blocks: [_fourBitWords([0x11223344]), bad],
+      );
+      final status = await busRead(_intStatus);
+      expect(status & 0x0A, equals(0x0A));
       await Simulator.endSimulation();
     });
 
