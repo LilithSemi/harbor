@@ -386,10 +386,12 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 	if (!data)
 		return;
 
-	if ((ist & HARBOR_SD_INT_DATA_TMO) || !(ist & HARBOR_SD_INT_DATA_DONE))
+	if (ist & HARBOR_SD_INT_DATA_TMO)
 		data->error = -ETIMEDOUT;
 	else if (ist & HARBOR_SD_INT_ADMA_ERR)
 		data->error = -EIO;
+	else if (!(ist & HARBOR_SD_INT_DATA_DONE))
+		data->error = -ETIMEDOUT;
 	else if (ist & HARBOR_SD_INT_DATA_CRC)
 		data->error = -EILSEQ;
 	else if (ist & HARBOR_SD_INT_WRITE_ERR)
