@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:rohd/rohd.dart';
 
 import '../bus/bus.dart';
+import '../bus/port/fabric_kind.dart';
 import '../clock/clock_domain.dart';
 import '../peripherals/display.dart';
 import '../peripherals/harbor_sdram.dart';
@@ -430,7 +431,10 @@ extension HarborSocScanoutDisplay on HarborSoC {
   /// display node has no `memory-region`, FB_BASE resets to 0 and the display
   /// is off after a reset. The display node names [memory] in
   /// `harbor,scanout-memory`. Pixel and shift clocks, the pin and the status
-  /// pins work as in [addScanoutDisplay]. The stride of a format is the line
+  /// pins work as in [addScanoutDisplay]. [underrunCountPin] pulls up the 16 bit
+  /// UNDERRUN_COUNT. [realtime] false joins the master as a plain master, to
+  /// show what a loaded bus does to the display. The display runs on the default bus clock, and the fb
+  /// port joins the fabric on it. The stride of a format is the line
   /// bytes rounded up to [burstBeats] words of the bus.
   ///
   /// [memory] is the address range of a memory that the display reads.
@@ -444,15 +448,16 @@ extension HarborSocScanoutDisplay on HarborSoC {
     int pixelClockTolerancePpm = 10000,
     String shiftDomain = 'shift',
     String pixelDomain = 'pixel',
-    String? busDomain,
     int busAddressWidth = 32,
     int busDataWidth = 32,
     int burstBeats = 16,
+    bool realtime = true,
     String pinName = 'gpdi_dp',
     String? runningPin,
     String? underrunPin,
     String? updatePendingPin,
     String? busErrorPin,
+    String? underrunCountPin,
     String name = 'display',
   }) {
     final target = this.target;
@@ -537,7 +542,6 @@ extension HarborSocScanoutDisplay on HarborSoC {
         busDataWidth: busDataWidth,
         name: name,
       ),
-      clockDomainName: busDomain,
     );
     display.input('pixel_clk').srcConnection! <= pixel.clk;
     display.input('pixel_reset').srcConnection! <= pixel.reset;
@@ -547,8 +551,8 @@ extension HarborSocScanoutDisplay on HarborSoC {
       display,
       busInterfaceName: 'fb',
       memory: true,
-      outstanding: 2,
-      realtime: true,
+      outstanding: fabricKind == HarborFabricKind.wishbone ? 1 : 2,
+      realtime: realtime,
       writeStallFree: true,
       targetRanges: [memory],
       burstRanges: [memory],
@@ -566,6 +570,7 @@ extension HarborSocScanoutDisplay on HarborSoC {
       ('underrun', underrunPin),
       ('update_pending', updatePendingPin),
       ('bus_error', busErrorPin),
+      ('underrun_count', underrunCountPin),
     ]) {
       if (pin != null) exposePin(display, port, externalName: pin);
     }

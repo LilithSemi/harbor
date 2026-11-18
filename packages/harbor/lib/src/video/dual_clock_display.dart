@@ -952,6 +952,22 @@ class HarborDualClockDisplay extends Module {
       addOutput('rq_words', width: scanout.rqWords.width) <= scanout.rqWords;
     }
     underrun <= status(scanout.underrun, 'all');
+    // Late or skipped lines of a build with one plane, counted in the pixel
+    // domain and sent to the control domain as gray code.
+    if (scanout.tryOutput('underrun_count') != null) {
+      final raw = scanout.output('underrun_count');
+      addOutput('underrun_count', width: 16) <=
+          (ownControl
+              ? _grayCross(
+                  raw,
+                  srcClk: pixelClk,
+                  srcReset: pixelReset,
+                  dstClk: ctrlClk,
+                  dstReset: ctrlReset,
+                  name: 'underrun_count',
+                )
+              : raw);
+    }
     // The vertical blank level, registered in the pixel domain before it
     // goes to the control domain.
     output('vblank') <=

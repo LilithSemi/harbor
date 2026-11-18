@@ -332,10 +332,18 @@ class HarborDualClockScanout extends Module {
                      'b$burstWords',
                      'i${memory.config.idWidth}',
                      'n${memory.config.outstanding}',
+                     if (memory.config.dataWidth != 32)
+                       'd${memory.config.dataWidth}',
                    ],
                  ],
                ),
        ) {
+    if (planar && memory != null && memory.config.dataWidth != 32) {
+      throw ArgumentError(
+        'a planar or overlay scanout reads a 32 bit memory waist, got '
+        '${memory.config}',
+      );
+    }
     if (!planar) {
       if (wordsPerLine == null || vActive == null || vActive < 1) {
         throw ArgumentError('a one plane build needs wordsPerLine and vActive');
@@ -461,6 +469,7 @@ class HarborDualClockScanout extends Module {
 
     addOutput('pixel', width: 32);
     addOutput('underrun');
+    addOutput('underrun_count', width: 16);
 
     final reqToggle = Logic(name: 'req_toggle'); // pixel domain
     final reqAddr = Logic(name: 'req_addr', width: 32); // pixel, quasi-static
@@ -478,6 +487,9 @@ class HarborDualClockScanout extends Module {
     final more = fetchLine.lt(vActive).named('line_left');
     final outstanding = Logic(name: 'outstanding');
     final underrunReg = Logic(name: 'underrun_reg');
+    // One pulse for each late or skipped line, and their count.
+    final underrunPulse = Logic(name: 'underrun_pulse');
+    final underrunCount = Logic(name: 'underrun_count_r', width: 16);
     // Line 0 waits for the line in flight at the frame start.
     final wait0 = Logic(name: 'wait0');
     final dSync0 = Logic(name: 'd_sync0');
@@ -570,6 +582,7 @@ class HarborDualClockScanout extends Module {
 
     pixel <= buffer.rdData;
     underrun <= underrunReg;
+    output('underrun_count') <= underrunCount;
 
     // Issue a request: toggle req, latch payload, advance the line pointer.
     final fetchNext = (fetchAddr + stride).named('fetch_next');
@@ -593,6 +606,11 @@ class HarborDualClockScanout extends Module {
 
     // Pixel-domain sequential.
     Sequential(pixelClk, reset: pixelReset, [
+      underrunPulse < Const(0),
+      If(
+        underrunPulse & underrunCount.neq(Const(0xffff, width: 16)),
+        then: [underrunCount < underrunCount + 1],
+      ),
       dSync0 < doneToggle,
       dSync1 < dSync0,
       dPrev < dSync1,
@@ -626,10 +644,12 @@ class HarborDualClockScanout extends Module {
                 Iff(lineStart, [
                   readSel < ~readSel,
                   underrunReg < Const(1),
+                  underrunPulse < Const(1),
                   ...skip(),
                 ]),
                 ElseIf(firstLine & (wait0 | busy), [
                   underrunReg < Const(1),
+                  underrunPulse < Const(1),
                   If(wait0, then: [wait0 < Const(0), ...skip()]),
                 ]),
                 ElseIf(~outstanding & more, [
@@ -646,7 +666,10 @@ class HarborDualClockScanout extends Module {
               If.block([
                 Iff(lineStart, [
                   readSel < ~readSel,
-                  If(busy, then: [underrunReg < Const(1)]),
+                  If(
+                    busy,
+                    then: [underrunReg < Const(1), underrunPulse < Const(1)],
+                  ),
                   phase < Const(1, width: 2),
                 ]),
                 ElseIf(doneEdge, [phase < Const(3, width: 2)]),
@@ -659,7 +682,11 @@ class HarborDualClockScanout extends Module {
                   readSel < ~readSel,
                   If(
                     busy,
-                    then: [underrunReg < Const(1), phase < Const(1, width: 2)],
+                    then: [
+                      underrunReg < Const(1),
+                      underrunPulse < Const(1),
+                      phase < Const(1, width: 2),
+                    ],
                     orElse: [If(more, then: issue(fetchAddr, readSel))],
                   ),
                 ],

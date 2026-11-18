@@ -273,7 +273,7 @@ class HarborScanoutDisplay extends BridgeModule
     this.placement = HarborFramebufferPlacement.fixed,
     this.simpleFramebuffer = true,
     this.enableOnReset = false,
-    bool gateOnInitDone = true,
+    bool? gateOnInitDone,
     this.fabricMemory = false,
     this.burstBeats = 16,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
@@ -281,7 +281,7 @@ class HarborScanoutDisplay extends BridgeModule
     this.busDataWidth = 32,
     bool crossFabricClock = false,
     super.name = 'display',
-  }) : gateOnInitDone = gateOnInitDone && !fabricMemory,
+  }) : gateOnInitDone = gateOnInitDone ?? !fabricMemory,
        super(
          harborStableDefinitionName('HarborScanoutDisplay', [
            ...BusSlavePort.definitionNameParts(
@@ -300,12 +300,24 @@ class HarborScanoutDisplay extends BridgeModule
            'b${framebufferBase.toRadixString(16)}',
            if (placement == HarborFramebufferPlacement.firmware) 'fw',
            if (enableOnReset) 'on',
-           if (gateOnInitDone && !fabricMemory) 'g',
+           if (gateOnInitDone ?? !fabricMemory) 'g',
            if (fabricMemory) 'fm$burstBeats',
            target is HarborFpgaTarget ? target.vendor.name : 'generic',
          ]),
        ) {
     _check();
+    if (fabricMemory && this.gateOnInitDone) {
+      throw ArgumentError(
+        'a display with fabricMemory reads the fabric, which has no init_done '
+        'to gate on',
+      );
+    }
+    if (fabricMemory && crossFabricClock) {
+      throw ArgumentError(
+        'a display with fabricMemory runs its fb port on the clk of the '
+        'register port, so crossFabricClock is not supported',
+      );
+    }
     final multi = formats.length > 1;
 
     createPort('clk', PortDirection.input);
@@ -343,6 +355,8 @@ class HarborScanoutDisplay extends BridgeModule
     final fmtBits = max(1, (formats.length - 1).bitLength);
     int abi(HarborPixelFormat f) => harborPixelFormatBitOrder.indexOf(f);
 
+    // Low bits of the word address that FB_BASE ignores.
+    final alignBits = fabricMemory ? (busDataWidth ~/ 8).bitLength - 3 : 0;
     final resetFb = framebufferBase >> 2;
     final enableStage = Logic(name: 'enable_stage');
     final fbStage = Logic(name: 'fb_stage', width: 30);
@@ -407,6 +421,7 @@ class HarborScanoutDisplay extends BridgeModule
         ),
         clk: clk,
         reset: input('reset'),
+        readOnly: true,
       );
     }
 
@@ -461,10 +476,15 @@ class HarborScanoutDisplay extends BridgeModule
         (fabricMemory ? display.busError : display.busError | input('error_in'))
             .named('bus_error_event');
     final underrunCounter = Logic(name: 'underrun_counter', width: 16);
+    // The display counts late and skipped lines. Without that count, the
+    // register block counts frames of an underrun.
+    final lineCount =
+        display.tryOutput('underrun_count') ??
+        display.tryOutput('plane_underrun_count_0');
     final underrunEvent = display.underrun & ~underrunPrev;
     output('interrupt') <= (intStatus & intEnable).or();
     output('underrun') <= underrunFlag;
-    output('underrun_count') <= underrunCounter;
+    output('underrun_count') <= (lineCount ?? underrunCounter);
     output('bus_error') <= busErrorFlag;
     output('mem_ready') <= memReady;
 
@@ -531,7 +551,20 @@ class HarborScanoutDisplay extends BridgeModule
         If(update, then: [snapFb < fbStage, snapFmt < fmtStage]),
         If(took, then: [activeFb < snapFb, activeFmt < snapFmt]),
         If(writeCtrl, then: [enableStage < bus.dataIn[0]]),
-        If(writeFb, then: [fbStage < fbMerged.getRange(2, 32)]),
+        // A 64 bit waist reads whole beats, so FB_BASE keeps no bit below the
+        // beat.
+        If(
+          writeFb,
+          then: [
+            fbStage <
+                (alignBits == 0
+                    ? fbMerged.getRange(2, 32)
+                    : [
+                        fbMerged.getRange(2 + alignBits, 32),
+                        Const(0, width: alignBits),
+                      ].concat()),
+          ],
+        ),
         if (multi)
           If(
             writeAt(formatOffset, bytes: 1),
@@ -621,7 +654,7 @@ class HarborScanoutDisplay extends BridgeModule
           readData < Const(display.planeFormats.first, width: 32),
         ]),
         CaseItem(Const(underrunCountOffset, width: 12), [
-          readData < underrunCounter.zeroExtend(32),
+          readData < (lineCount ?? underrunCounter).zeroExtend(32),
         ]),
       ]),
     ]);
@@ -683,6 +716,13 @@ class HarborScanoutDisplay extends BridgeModule
       throw ArgumentError(
         'a framebuffer that the firmware places has a framebufferBase of 0, '
         'no simple-framebuffer node, and a display that is off after a reset',
+      );
+    }
+    if (fabricMemory && framebufferBase % (busDataWidth ~/ 8) != 0) {
+      throw ArgumentError.value(
+        framebufferBase,
+        'framebufferBase',
+        'must be a multiple of ${busDataWidth ~/ 8} on a fabric memory build',
       );
     }
     if (framebufferBase % 4 != 0 || framebufferBase < 0) {
