@@ -1033,6 +1033,9 @@ class HarborSdioController extends BridgeModule
     // the width of the cap is larger than the cap and cannot win, so each
     // compare is only as wide as the cap.
     Logic minCap(List<Logic> terms) {
+      // With a cap of one beat every term is at least one, because a request
+      // needs a word, a whole beat of bytes and room to the 4 KB boundary.
+      if (dmaBurstBeats == 1) return Const(1, width: cw);
       final w = dmaBurstBeats.bitLength;
       Logic m = Const(dmaBurstBeats, width: w);
       for (final t in terms) {
