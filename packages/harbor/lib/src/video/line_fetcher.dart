@@ -7,14 +7,17 @@ import '../bus/port/memory_waist.dart';
 /// master waist and streams it into an external line buffer.
 ///
 /// On a [fetchStart] pulse it reads [words] sequential 32-bit words starting
-/// at [fetchAddr] (a waist of 64 bits gives two words in each beat, low word
-/// first, and rounds [words] up to whole beats; [fetchAddr] must then be a
-/// multiple of 8 and the line buffer takes one word each cycle, so the beat
-/// after one waits a cycle), driving [wrEn]/[wrIdx]/[wrData] to write each word into
+/// at [fetchAddr], driving [wrEn]/[wrIdx]/[wrData] to write each word into
 /// the buffer selected by [fillSel]. The inputs go through one register, so
 /// the line starts one cycle after [fetchStart]. [busy] is high from the
 /// cycle after [fetchStart] until the line is complete, [done] pulses for one
 /// cycle when the line is complete.
+///
+/// A waist of 64 bits gives two words in each beat, low word first. The
+/// buffer takes one word each cycle, so the beat after a 64-bit beat waits
+/// one cycle. [fetchAddr] must be a multiple of 8 then. A line of an odd word
+/// count ends with the low word of its last beat, and the high word is not
+/// written.
 ///
 /// Reads only, one ID (0), so responses stay in order. Each request is INCR,
 /// with the size of the waist word, and LEN set for `beats = min(burstWords,
@@ -167,7 +170,7 @@ class HarborLineFetcher extends Module {
 
     final rdataFire = Logic(name: 'rdata_fire');
 
-    // Request channel: reads only, one ID, INCR, 32-bit beats.
+    // Request channel: reads only, one ID, INCR, beats of the waist width.
     m.reqValid <= reqOut;
     m.reqId <= Const(0, width: idW);
     m.reqWrite <= Const(0);
@@ -188,6 +191,7 @@ class HarborLineFetcher extends Module {
     final hiPend = Logic(name: 'hi_pend');
     final hiData = Logic(name: 'hi_data', width: 32);
     final lastBeat = Logic(name: 'last_beat');
+    final oddLine = Logic(name: 'odd_line');
 
     // Ready for read data while a line is in flight.
     m.rdataReady <= (wpb == 2 ? (reading & ~hiPend) : (reading | firstValid));
@@ -229,6 +233,7 @@ class HarborLineFetcher extends Module {
               idx < rdataFire.zeroExtend(idxW),
               rdLeft < total - rdataFire.zeroExtend(ww),
               fillReg < fill1,
+              if (wpb == 2) oddLine < words1[0],
               reading < words1.neq(0) & ~(rdataFire & total.eq(1)),
               doneReg < rdataFire & total.eq(1),
             ],
@@ -249,16 +254,24 @@ class HarborLineFetcher extends Module {
             then: [
               idx < (idx + Const(1, width: idxW)),
               rdLeft < (rdLeft - Const(1, width: ww)),
-              if (wpb == 2) ...[
-                hiPend < Const(1),
-                hiData <
-                    mux(
-                      m.rdataErr,
-                      Const(0, width: 32),
-                      m.rdataData.getRange(32, 64),
-                    ),
-                If(rdLeft.eq(1), then: [lastBeat < Const(1)]),
-              ] else
+              if (wpb == 2)
+                // The last beat of a line of an odd word count has no high
+                // word to write.
+                If(
+                  rdLeft.eq(1) & oddLine,
+                  then: [reading < Const(0), doneReg < Const(1)],
+                  orElse: [
+                    hiPend < Const(1),
+                    hiData <
+                        mux(
+                          m.rdataErr,
+                          Const(0, width: 32),
+                          m.rdataData.getRange(32, 64),
+                        ),
+                    If(rdLeft.eq(1), then: [lastBeat < Const(1)]),
+                  ],
+                )
+              else
                 If(
                   rdLeft.eq(1),
                   then: [reading < Const(0), doneReg < Const(1)],
