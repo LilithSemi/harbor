@@ -278,6 +278,117 @@ void admaKindCases(HarborFabricKind kind, {List<int> widths = const [32, 64]}) {
       await Simulator.endSimulation();
     });
 
+    // A buffer address or length that is not a word multiple is an ADMA
+    // error, so no access reaches the fabric.
+    Future<void> alignCase(
+      AdmaBench b, {
+      required int state,
+      required int addr,
+    }) async {
+      await b.cardReadBlocks([
+        [1, 2, 3, 4],
+      ], cycles: 4000);
+      expect(
+        await b.rd(admaIntStatus) & (admaDataDone | admaAdmaErr),
+        admaAdmaErr,
+      );
+      expect(await b.rd(admaAdmaErrStatus), state);
+      expect(await b.rd(admaAdmaErrAddr), addr);
+      expect(b.probe.writes, isEmpty);
+      expect(b.probe.reads, isEmpty);
+      expect((await b.rd(admaStatus) >> 8) & 1, 0, reason: 'still busy');
+      b.checkShapes();
+      await Simulator.endSimulation();
+    }
+
+    test('a buffer address that is not a word multiple stops the walker '
+        '($tag)', () async {
+      final b = AdmaBench(kind, width);
+      await b.start();
+      await b.wr(admaBlkSize, 16);
+      await b.wr(admaAdmaAddr, 0x2002);
+      await b.wr(admaCmd, admaCmdRead);
+      await alignCase(b, state: 3, addr: 0x2002);
+    });
+
+    test('a descriptor table address that is not a word multiple stops the '
+        'walker ($tag)', () async {
+      final b = AdmaBench(kind, width);
+      await b.start();
+      await b.wr(admaBlkSize, 16);
+      await b.wr(admaAdmaAddr, 0x102);
+      await b.wr(admaCmd, admaCmdRead | admaTable);
+      await alignCase(b, state: 1, addr: 0x102);
+    });
+
+    test('a descriptor length that is not a word multiple stops the walker '
+        '($tag)', () async {
+      final b = AdmaBench(kind, width);
+      await b.start();
+      b.descriptors(0x100, [(0x2000, 6)]);
+      await b.wr(admaBlkSize, 16);
+      await b.wr(admaAdmaAddr, 0x100);
+      await b.wr(admaCmd, admaCmdRead | admaTable);
+      await b.cardReadBlocks([
+        [1, 2, 3, 4],
+      ], cycles: 4000);
+      expect(
+        await b.rd(admaIntStatus) & (admaDataDone | admaAdmaErr),
+        admaAdmaErr,
+      );
+      expect(await b.rd(admaAdmaErrStatus), 3);
+      expect(await b.rd(admaAdmaErrAddr), 0x2000);
+      expect(b.probe.writes, isEmpty);
+      expect((await b.rd(admaStatus) >> 8) & 1, 0, reason: 'still busy');
+      await Simulator.endSimulation();
+    });
+
+    // The first descriptor is good and the second has a buffer address that
+    // is not a word multiple. The block count still runs out: the second
+    // block goes out as zero words with a wrong CRC16 and the card rejects it.
+    test('a bad second descriptor ends a multi block card write ($tag)',
+        () async {
+      final b = AdmaBench(kind, width);
+      await b.start();
+      b.descriptors(0x180, [(0x2000, 8), (0x3002, 8)]);
+      const words = [0xA1B2C3D4, 0x01020304];
+      b.write32(0x2000, words[0]);
+      b.write32(0x2004, words[1]);
+      await b.wr(admaBlkSize, 8);
+      await b.wr(0x58, 2);
+      await b.wr(admaAdmaAddr, 0x180);
+      await b.wr(admaCmd, admaCmdWrite | admaTable);
+      final blocks = await b.cardWriteBlocks(
+        2,
+        8,
+        tokens: const [
+          [0, 0, 1, 0, 1],
+          [0, 1, 0, 1, 1],
+        ],
+        untilDone: true,
+      );
+      expect(blocks[0].sublist(1, 17), admaFourBitBlock(words).sublist(1, 17));
+      final data = blocks[1].sublist(1, 17);
+      final crc = blocks[1].sublist(17, 33);
+      expect(data.every((g) => g == 0), isTrue, reason: 'zero words');
+      for (var l = 0; l < 4; l++) {
+        expect(
+          [for (final g in crc) (g >> l) & 1],
+          isNot(admaCrc16([for (final g in data) (g >> l) & 1])),
+          reason: 'lane $l has a good CRC',
+        );
+      }
+      final st = await b.rd(admaIntStatus);
+      expect(
+        st & (admaDataDone | admaWriteErr | admaAdmaErr),
+        admaWriteErr | admaAdmaErr,
+      );
+      expect(await b.rd(admaAdmaErrStatus), 3);
+      expect(await b.rd(admaAdmaErrAddr), 0x3002);
+      expect((await b.rd(admaStatus) >> 8) & 1, 0, reason: 'still busy');
+      await Simulator.endSimulation();
+    });
+
     test('a card read works after a read path error ($tag)', () async {
       final b = AdmaBench(kind, width);
       await b.start();

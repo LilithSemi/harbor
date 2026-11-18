@@ -466,8 +466,8 @@ class AdmaBench {
 
   /// Answers the command, then takes [blocks] blocks of [blkBytes] bytes from
   /// the controller. After each block the card sends the CRC status token
-  /// [token], then idles high for [busyDelay] SD clocks, then holds DAT0 low
-  /// for [busyLen] SD clocks (0 is a card with no busy phase). Card outputs
+  /// [token] (or the entry of [tokens] for that block), then idles high for
+  /// [busyDelay] SD clocks, then holds DAT0 low for [busyLen] SD clocks (0 is a card with no busy phase). Card outputs
   /// change [lag] system clocks after the SD clock edge picked by
   /// [launchOnRise]. With [noisyOtherEdge] DAT is wrong for one clock around
   /// the other SD clock edge, as a line is while it changes. Returns the
@@ -480,6 +480,8 @@ class AdmaBench {
     int blocks,
     int blkBytes, {
     List<int> token = const [0, 0, 1, 0, 1],
+    List<List<int>>? tokens,
+    bool untilDone = false,
     int busyDelay = 0,
     int busyLen = 3,
     int lag = 0,
@@ -535,7 +537,9 @@ class AdmaBench {
         sinceEdge++;
       }
       if (!(pendingEdge && sinceEdge == lag)) {
-        if (irq.value.toInt() == 1 && taken.length == blocks) {
+        if (irq.value.toInt() == 1 &&
+            taken.length == blocks &&
+            (!untilDone || phase == 3)) {
           await clk.nextNegedge;
           return taken;
         }
@@ -550,12 +554,13 @@ class AdmaBench {
           if (respIdx == resp.length) phase = 1;
         }
       } else if (phase == 2) {
+        final tk = tokens == null ? token : tokens[taken.length - 1];
         if (wait > 0) {
           wait--;
-        } else if (step < token.length) {
-          drive(0xE | token[step++]);
+        } else if (step < tk.length) {
+          drive(0xE | tk[step++]);
         } else {
-          final k = step - token.length;
+          final k = step - tk.length;
           if (k < busyDelay) {
             drive(0xF);
           } else if (k < busyDelay + busyLen) {
@@ -573,7 +578,9 @@ class AdmaBench {
           step++;
         }
       }
-      if (irq.value.toInt() == 1 && taken.length == blocks) {
+      if (irq.value.toInt() == 1 &&
+            taken.length == blocks &&
+            (!untilDone || phase == 3)) {
         await clk.nextNegedge;
         return taken;
       }

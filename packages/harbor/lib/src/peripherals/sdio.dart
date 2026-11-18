@@ -767,6 +767,11 @@ class HarborSdioController extends BridgeModule
     final wrQHead = Logic(name: 'dma_wq_head', width: qW);
     // Set by an error in a card write. The CRC16 then goes out inverted.
     final wrAbort = Logic(name: 'dat_wr_abort');
+    // A buffer address or length that is not a word multiple is an ADMA error.
+    // This flag lasts one cycle and joins the bus errors in [dmaFault], with
+    // the error state in [alignState] and the address in [descAddr].
+    final alignPend = Logic(name: 'adma_align_pend');
+    final alignState = Logic(name: 'adma_align_state', width: 2);
 
     final mw = dmaPort.waist;
     final reqValid = Logic(name: 'dma_req_valid');
@@ -791,9 +796,8 @@ class HarborSdioController extends BridgeModule
     final wFire = (wActive & mw.wdataReady).named('dma_w_fire');
     final rFire = (rdPending & mw.rdataValid).named('dma_r_fire');
     final bFire = (mw.wrespValid & mw.wrespReady).named('dma_b_fire');
-    final dmaFault = ((rFire & mw.rdataErr) | (bFire & mw.wrespErr)).named(
-      'dma_fault',
-    );
+    final dmaFault = ((rFire & mw.rdataErr) | (bFire & mw.wrespErr) | alignPend)
+        .named('dma_fault');
     final writesBusy = (wActive | wInflight.neq(Const(0, width: ifW))).named(
       'dma_writes_busy',
     );
@@ -1034,7 +1038,9 @@ class HarborSdioController extends BridgeModule
     // compare is only as wide as the cap.
     Logic minCap(List<Logic> terms) {
       // With a cap of one beat every term is at least one, because a request
-      // needs a word, a whole beat of bytes and room to the 4 KB boundary.
+      // needs a word, a whole beat of bytes and room to the 4 KB boundary. The
+      // controller stops a transfer with an address or length that is not a
+      // word multiple, so a running walker always has word aligned buffers.
       if (dmaBurstBeats == 1) return Const(1, width: cw);
       final w = dmaBurstBeats.bitLength;
       Logic m = Const(dmaBurstBeats, width: w);
@@ -1296,6 +1302,13 @@ class HarborSdioController extends BridgeModule
     final respErrNow = (respLast & (respEndBad | respCrcBad | respIdxBad))
         .named('resp_err_now');
 
+    // Stops the walker for an address or length that is not a word multiple.
+    List<Conditional> alignError(Logic state) => [
+      admaState < Const(aIdle, width: 3),
+      alignPend < Const(1),
+      alignState < state,
+    ];
+
     Sequential(clk, [
       If(
         reset,
@@ -1370,6 +1383,8 @@ class HarborSdioController extends BridgeModule
           wrQTail < Const(0, width: qW),
           wrQHead < Const(0, width: qW),
           wrAbort < Const(0),
+          alignPend < Const(0),
+          alignState < Const(0, width: 2),
           reqValid < Const(0),
           reqWrite < Const(0),
           reqAddr < Const(0, width: 32),
@@ -1407,6 +1422,7 @@ class HarborSdioController extends BridgeModule
           ),
           bus.ack < Const(0),
           bus.dataOut < Const(0, width: dw),
+          alignPend < Const(0),
 
           // SD clock divider. Frozen while datStall holds, so the clock stays
           // low and the card pauses until the ADMA drains the pending read word
@@ -2218,12 +2234,21 @@ class HarborSdioController extends BridgeModule
             then: [
               admaErrState <
                   mux<Logic>(
-                    rFire & mw.rdataErr & admaState.eq(Const(aFetch, width: 3)),
-                    Const(1, width: 2),
-                    Const(3, width: 2),
+                    alignPend,
+                    alignState,
+                    mux<Logic>(
+                      rFire &
+                          mw.rdataErr &
+                          admaState.eq(Const(aFetch, width: 3)),
+                      Const(1, width: 2),
+                      Const(3, width: 2),
+                    ),
                   ),
               admaErrAddr <
                   mux<Logic>(
+                    alignPend,
+                    descAddr,
+                    mux<Logic>(
                     rFire & mw.rdataErr,
                     reqAddr,
                     [
@@ -2235,6 +2260,7 @@ class HarborSdioController extends BridgeModule
                         wrQ[i],
                         acc,
                       ),
+                    ),
                     ),
                   ),
             ],
@@ -2282,6 +2308,11 @@ class HarborSdioController extends BridgeModule
                       descEnd < rdWord[31],
                       fetchHi < Const(0),
                       admaState < Const(aNext, width: 3),
+                      If(
+                        descAddr.getRange(0, 2).neq(Const(0, width: 2)) |
+                            rdWord.getRange(0, 2).neq(Const(0, width: 2)),
+                        then: alignError(Const(3, width: 2)),
+                      ),
                     ],
                     orElse: [descAddr < rdWord, fetchHi < Const(1)],
                   ),
@@ -2608,6 +2639,23 @@ class HarborSdioController extends BridgeModule
                                     orElse: [
                                       admaState < Const(aMemRead, width: 3),
                                     ],
+                                  ),
+                                ],
+                              ),
+                              If(
+                                admaBase.getRange(0, 2).neq(Const(0, width: 2)) |
+                                    (~bus.dataIn[11] &
+                                        (blkCount.getRange(0, 2) *
+                                                blkSize.getRange(0, 2))
+                                            .neq(Const(0, width: 2))),
+                                then: [
+                                  descAddr < admaBase,
+                                  ...alignError(
+                                    mux(
+                                      bus.dataIn[11],
+                                      Const(1, width: 2),
+                                      Const(3, width: 2),
+                                    ),
                                   ),
                                 ],
                               ),
