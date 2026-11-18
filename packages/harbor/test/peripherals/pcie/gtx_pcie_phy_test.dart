@@ -17,11 +17,13 @@ const _timeouts = HarborGtxPcieTimeouts(
   clockSwitch: 8,
   syncRetries: 2,
   clockSettle: 30,
+  txSettle: 8,
 );
 
 HarborGtxPcieTimeouts _withLinkWait(
   int linkWait, {
   int dataLinkWait = 1 << 27,
+  int? txSettle,
 }) => HarborGtxPcieTimeouts(
   resetDone: _timeouts.resetDone,
   cpllLock: _timeouts.cpllLock,
@@ -31,6 +33,7 @@ HarborGtxPcieTimeouts _withLinkWait(
   clockSwitch: _timeouts.clockSwitch,
   syncRetries: _timeouts.syncRetries,
   clockSettle: _timeouts.clockSettle,
+  txSettle: txSettle ?? _timeouts.txSettle,
   linkWait: linkWait,
   dataLinkWait: dataLinkWait,
 );
@@ -113,6 +116,7 @@ class _Bench {
     bool perstEdge = true,
     int pipeStages = 1,
     int linkWait = 0,
+    int? txSettle,
     void Function(Gtxe2StatusModel m)? setup,
   }) async {
     final pclk = SimpleClockGenerator(8).clk;
@@ -149,7 +153,7 @@ class _Bench {
       debugBuild: skipTxPhaseAlign,
       waitForRxResetStatus: waitForRxResetStatus,
       pipeStages: pipeStages,
-      timeouts: _withLinkWait(linkWait),
+      timeouts: _withLinkWait(linkWait, txSettle: txSettle),
     );
     await phy.build();
     pipe.txData.inject(0);
@@ -199,6 +203,7 @@ class _Bench {
       'mmcm_lock': model.mmcmLock,
       'pclk_sel': phy.pclkSel,
       'txrate': channel.port('TXRATE'),
+      'dlysreset': channel.port('TXDLYSRESET'),
     };
     final last = <String, bool>{};
     var seenIdle = false;
@@ -485,6 +490,99 @@ void main() {
       final rdy = b.first('user_rdy_rise');
       expect(rdy - dropAt, greaterThanOrEqualTo(_timeouts.clockSettle));
       await b.finish();
+    });
+
+    test(
+      'TXDLYSRESET rises txSettle cycles after the TX sync starts',
+      () async {
+        final b = await _Bench.start();
+        await b.waitFor(_S.idle);
+        final entered = b.first('enter_txDlySReset');
+        final rise = b.first('dlysreset_rise');
+        expect(rise - entered, greaterThanOrEqualTo(_timeouts.txSettle));
+        expect(rise - entered, lessThan(_timeouts.txSettle + 4));
+        await b.finish();
+      },
+    );
+
+    test('a TX sync retry waits txSettle cycles again', () async {
+      final b = await _Bench.start(setup: (m) => m.phAlignStuck = true);
+      await b.waitFor(_S.txPhAlign);
+      await b.waitFor(_S.cpllReset, limit: 3000);
+      final entered = b.events['enter_txDlySReset']!;
+      final rises = b.events['dlysreset_rise']!;
+      expect(entered, hasLength(3));
+      for (var i = 0; i < 3; i++) {
+        expect(rises[i] - entered[i], greaterThanOrEqualTo(_timeouts.txSettle));
+      }
+      b.model.phAlignStuck = false;
+      await b.waitFor(_S.idle, limit: 3000);
+      await b.finish();
+    });
+
+    test(
+      'a TXDLYSRESETDONE edge in the settle window does not advance',
+      () async {
+        final b = await _Bench.start();
+        await b.waitFor(_S.txDlySReset);
+        await b.cycles(1);
+        b.model.dlyDoneForce = true;
+        await b.cycles(2);
+        b.model.dlyDoneForce = false;
+        await b.cycles(2);
+        expect(b.state, _S.txDlySReset);
+        expect(b.hi(b.channel.port('TXDLYSRESET')), isFalse);
+        await b.waitFor(_S.idle);
+        expect(b.model.txSyncRuns, 1);
+        await b.finish();
+      },
+    );
+
+    test('a retry from TXDLYSRESET gives one TXDLYSRESET edge each', () async {
+      final b = await _Bench.start(setup: (m) => m.dlySResetStuck = true);
+      await b.waitFor(_S.txDlySReset, limit: 3000);
+      await b.waitFor(_S.cpllReset, limit: 3000);
+      // syncRetries is 2: the sync runs three times in the one state, then
+      // the sequence restarts.
+      expect(b.events['enter_txDlySReset'], hasLength(1));
+      final entered = b.first('enter_txDlySReset');
+      expect(
+        b.events['dlysreset_rise']!.where((c) => c > entered),
+        hasLength(3),
+      );
+      expect(
+        b.events['dlysreset_fall']!.where((c) => c > entered),
+        hasLength(3),
+      );
+      b.model.dlySResetStuck = false;
+      await b.waitFor(_S.idle, limit: 3000);
+      await b.finish();
+    });
+
+    test('a txSettle of 0 raises TXDLYSRESET at once', () async {
+      final b = await _Bench.start(txSettle: 0);
+      await b.waitFor(_S.idle);
+      expect(
+        b.first('dlysreset_rise') - b.first('enter_txDlySReset'),
+        lessThan(4),
+      );
+      await b.finish();
+    });
+
+    test('a txSettle that does not fit the txSync bound throws', () {
+      expect(
+        () => HarborGtxPciePhy(
+          perstN: Logic(),
+          channel: HarborGtxChannelPorts(),
+          pipe: HarborPciePipeLane(),
+          timeouts: const HarborGtxPcieTimeouts(
+            linkWait: 0,
+            txSync: 100,
+            txSettle: 100,
+          ),
+        ),
+        throwsArgumentError,
+      );
     });
 
     test('a clockSettle that does not fit the lock bound throws', () {

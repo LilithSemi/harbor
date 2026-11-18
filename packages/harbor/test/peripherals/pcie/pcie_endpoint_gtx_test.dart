@@ -190,8 +190,9 @@ void main() {
       name(const HarborGtxPcieTimeouts()),
       name(const HarborGtxPcieTimeouts(txSync: 1 << 14)),
       name(const HarborGtxPcieTimeouts(clockSettle: 1 << 9)),
+      name(const HarborGtxPcieTimeouts(txSettle: 1 << 9)),
     };
-    expect(names, hasLength(3));
+    expect(names, hasLength(4));
   });
 
   test('gen1 on Kintex-7 states the user clock and the slot clock', () async {

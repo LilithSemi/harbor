@@ -52,6 +52,12 @@ class Gtxe2StatusModel {
   /// When true, TXPHALIGNDONE never rises.
   bool phAlignStuck = false;
 
+  /// When true, TXDLYSRESETDONE never follows TXDLYSRESET.
+  bool dlySResetStuck = false;
+
+  /// When true, TXDLYSRESETDONE is high whatever TXDLYSRESET does.
+  bool dlyDoneForce = false;
+
   /// When true, TXDLYSRESETDONE and TXPHINITDONE are one cycle pulses and
   /// TXPHALIGNDONE is one cycle pulse after TXPHALIGN and another one after
   /// TXDLYEN, as in the manual TX buffer bypass of UG476. Otherwise each done
@@ -201,9 +207,12 @@ class Gtxe2StatusModel {
     _dlyEnCount = _hi(ch.port('TXDLYEN')) && !_hi(ch.port('TXPHALIGN'))
         ? _dlyEnCount + 1
         : -1;
-    final dlyDone = pulseDones
-        ? _dlyCount == syncDelay
-        : after(ch.port('TXDLYSRESET'), _dlyCount);
+    final dlyDone =
+        dlyDoneForce ||
+        (!dlySResetStuck &&
+            (pulseDones
+                ? _dlyCount == syncDelay
+                : after(ch.port('TXDLYSRESET'), _dlyCount)));
     final phInitDone = pulseDones
         ? _phInitCount == syncDelay
         : after(ch.port('TXPHINIT'), _phInitCount);

@@ -94,7 +94,8 @@ enum HarborGtxResetState {
   /// USERRDY is high. Wait for TX and RX reset done.
   resetDone(6),
 
-  /// TXDLYSRESET until TXDLYSRESETDONE rises.
+  /// TXDLYSRESET until TXDLYSRESETDONE rises. TXDLYSRESET stays low for
+  /// [HarborGtxPcieTimeouts.txSettle] cycles after the state starts.
   txDlySReset(7),
 
   /// TXPHINIT until TXPHINITDONE rises.
@@ -150,6 +151,16 @@ class HarborGtxPcieTimeouts {
   /// this wait. The default is 2^10 cycles, 8 us at 125 MHz. A lock loss in the wait starts the count again.
   final int clockSettle;
 
+  /// Cycles between the start of [HarborGtxResetState.txDlySReset] and the
+  /// rise of TXDLYSRESET, on each start of the TX sync. TXUSERRDY, the user
+  /// clocks and the TX reset are then stable when the phase alignment starts.
+  /// UG476 ch.3 (TX buffer bypass, manual TX phase alignment) gives the
+  /// order of the alignment steps but no time for this wait. The default is
+  /// 2^10 cycles: 8 us at 125 MHz. A KC705 build with no wait had one TXPHINIT
+  /// retry before the link came up. 0 removes the wait. The count is part of
+  /// the [txSync] bound of the step. A done pulse in the wait is ignored.
+  final int txSettle;
+
   /// Number of times a TX sync step may time out and restart at
   /// [HarborGtxResetState.txDlySReset] without a new CPLL reset. After that
   /// the next timeout starts the whole sequence again.
@@ -177,6 +188,7 @@ class HarborGtxPcieTimeouts {
     this.txSync = 1 << 15,
     this.syncRetries = 8,
     this.clockSettle = 1 << 10,
+    this.txSettle = 1 << 10,
     this.rate = 1 << 14,
     this.clockSwitch = 16,
     this.linkWait = 1 << 25,
@@ -199,6 +211,7 @@ class HarborGtxPcieTimeouts {
       txSync,
       syncRetries,
       clockSettle,
+      txSettle,
       rate,
       clockSwitch,
       linkWait,
@@ -211,6 +224,7 @@ class HarborGtxPcieTimeouts {
       d.txSync,
       d.syncRetries,
       d.clockSettle,
+      d.txSettle,
       d.rate,
       d.clockSwitch,
       d.linkWait,
@@ -434,6 +448,13 @@ class HarborGtxPciePhy extends Module {
         timeouts.clockSettle,
         'clockSettle',
         'must be 0 or more and 4 below the clockLock bound',
+      );
+    }
+    if (timeouts.txSettle < 0 || timeouts.txSettle + 4 >= timeouts.txSync) {
+      throw ArgumentError.value(
+        timeouts.txSettle,
+        'txSettle',
+        'must be 0 or more and 4 below the txSync bound',
       );
     }
     final linkWait = timeouts.linkWait;
@@ -713,6 +734,31 @@ class HarborGtxPciePhy extends Module {
       Const(timeouts.clockSettle, width: settleCount.width),
     );
 
+    final fail = Logic(name: 'fail');
+    // TXDLYSRESET waits txSettle cycles after its state starts, and again
+    // after each failure.
+    final txSettleCount = Logic(
+      name: 'tx_settle_count',
+      width: timeouts.txSettle.bitLength + 1,
+    );
+    Sequential(pclk, [
+      If(
+        state.eq(s(_S.txDlySReset)) & ~fail,
+        then: [
+          If(
+            ~txSettleCount.eq(
+              Const(timeouts.txSettle, width: txSettleCount.width),
+            ),
+            then: [txSettleCount < txSettleCount + 1],
+          ),
+        ],
+        orElse: [txSettleCount < 0],
+      ),
+    ], reset: rst);
+    final txSettled = txSettleCount.eq(
+      Const(timeouts.txSettle, width: txSettleCount.width),
+    );
+
     final afterCpllLock = isState([
       _S.gtRelease,
       _S.clockLock,
@@ -764,7 +810,12 @@ class HarborGtxPciePhy extends Module {
             debugSkipTxPhaseAlign ? _S.idle : _S.txDlySReset,
             timeouts.resetDone,
           ),
-          wait(_S.txDlySReset, dlySDoneRise, _S.txPhInit, timeouts.txSync),
+          wait(
+            _S.txDlySReset,
+            dlySDoneRise & dlySReset,
+            _S.txPhInit,
+            timeouts.txSync,
+          ),
           wait(_S.txPhInit, phInitDoneRise, _S.txPhAlign, timeouts.txSync),
           wait(_S.txPhAlign, phAlignDoneRise, _S.txDlyEn, timeouts.txSync),
           wait(_S.txDlyEn, phAlignDoneRise, _S.idle, timeouts.txSync),
@@ -783,7 +834,6 @@ class HarborGtxPciePhy extends Module {
     // counts once.
     final holdHit = at(HarborGtxPcieTimeouts.cpllResetHold);
     final failNow = (timedOut | lostLock | rateFail).named('fail_now');
-    final fail = Logic(name: 'fail');
     final failCause = Logic(name: 'fail_cause', width: 4);
     Logic causeInSync(Logic c) => [
       _S.txDlySReset,
@@ -879,7 +929,7 @@ class HarborGtxPciePhy extends Module {
               _S.txDlyEn,
               _S.idle,
             ]),
-        dlySReset < nextIs([_S.txDlySReset]),
+        dlySReset < nextIs([_S.txDlySReset]) & txSettled,
         phInit < nextIs([_S.txPhInit]),
         phAlign < nextIs([_S.txPhAlign]),
         dlyEn <
