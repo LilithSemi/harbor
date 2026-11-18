@@ -243,7 +243,7 @@ class RegBus {
     final op = !write ? 4 : (sel == _allSel ? 0 : 1);
     _set('A_OPCODE', op);
     _set('A_PARAM', 0);
-    final narrow = !write && sel != _allSel;
+    final narrow = sel != _allSel && (!write || sel != 0);
     final lanes = narrow ? sel.toRadixString(2).replaceAll('0', '').length : 0;
     _set('A_SIZE', narrow ? (lanes - 1).bitLength : (bytes - 1).bitLength);
     _set('A_SOURCE', 0);

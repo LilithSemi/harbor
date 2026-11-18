@@ -6,6 +6,7 @@ import 'package:rohd_hcl/rohd_hcl.dart' show Axi4RespField;
 import '../../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus.dart' show BusAddressRange;
 import '../fabric.dart';
+import '../fabric_narrow.dart';
 import '../fabric_util.dart';
 import '../port/fabric_kind.dart';
 import '../port/reg_fifo.dart';
@@ -235,17 +236,18 @@ class HarborAxi4Fabric extends HarborFabricModule {
     super.name = 'fabric',
   }) : super(definitionName: _definitionName(topology, masters, slaves)) {
     final (addrW, dataW, _) = _shape(masters.first.interface);
-    for (final p in [
-      for (final m in masters) (m.name, m.interface),
-      for (final s in slaves) (s.name, s.interface),
-    ]) {
-      final (a, d, _) = _shape(p.$2);
+    for (final m in masters) {
+      final (a, d, _) = _shape(m.interface);
       if (a != addrW || d != dataW) {
         throw ArgumentError(
-          '${p.$1}: AXI4 widths (addr $a, data $d) differ from addr '
+          '${m.name}: AXI4 widths (addr $a, data $d) differ from addr '
           '$addrW, data $dataW',
         );
       }
+    }
+    for (final s in slaves) {
+      _shape(s.interface);
+      harborSlaveAdapts(s, kind: 'AXI4', addrW: addrW, dataW: dataW);
     }
     for (final (name, intf, memory) in [
       for (final m in masters) (m.name, m.interface, m.memory),
@@ -323,7 +325,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final sa = <Axi4Interface>[];
     final sLite = <Axi4LiteInterface?>[];
     for (final s in slaves) {
-      final (a, l) = _slavePort(s);
+      final (a, l) = _slavePort(s, c, r, addrW, dataW);
       sa.add(a);
       sLite.add(l);
       for (var k = 1; k < s.readChannels; k++) {
@@ -701,6 +703,12 @@ class HarborAxi4Fabric extends HarborFabricModule {
         innerW: innerW,
         range: slaves[tSlave[t]].range,
         offset: slaves[tSlave[t]].offset,
+        narrow: harborSlaveAdapts(
+          slaves[tSlave[t]],
+          kind: 'AXI4',
+          addrW: addrW,
+          dataW: dataW,
+        ),
       );
       if (x != null) dead.add(x);
     }
@@ -887,6 +895,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required int innerW,
     required BusAddressRange range,
     required bool offset,
+    required bool narrow,
   }) {
     final guard = timeout > 0;
     final dead = guard ? Logic(name: '${p}_cut_off') : Const(0);
@@ -980,6 +989,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
         k: k,
         restWidths: restWidths,
         slaveAddr: slaveAddr,
+        narrow: narrow,
       );
       arPending = pending.$1;
       wPending = pending.$2;
@@ -1360,7 +1370,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
   // The slave port as AXI4. For an AXI4-Lite slave, the AXI4 side only
   // carries handshakes and responses, and the slave path drives the port.
-  (Axi4Interface, Axi4LiteInterface?) _slavePort(HarborFabricSlave s) {
+  (Axi4Interface, Axi4LiteInterface?) _slavePort(
+    HarborFabricSlave s,
+    Logic clk,
+    Logic reset,
+    int addrW,
+    int dataW,
+  ) {
     final i = s.interface;
     String uniq(String n) => '${s.name}_$n';
     if (i is Axi4Interface) {
@@ -1369,8 +1385,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
         null,
       );
     }
-    final l = (i as Axi4LiteInterface).clone()
+    var l = (i as Axi4LiteInterface).clone()
       ..pairConnectIO(this, i, PairRole.provider, uniquify: uniq);
+    if (harborSlaveAdapts(s, kind: 'AXI4', addrW: addrW, dataW: dataW)) {
+      final wide = Axi4LiteInterface(addressWidth: addrW, dataWidth: dataW);
+      harborNarrowAxi4Lite(clk, reset, name: s.name, w: wide, n: l);
+      l = wide;
+    }
     final a = Axi4Interface(
       addressWidth: l.addressWidth,
       dataWidth: l.dataWidth,
@@ -1447,6 +1468,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required int k,
     required List<int> restWidths,
     required Logic Function(Logic) slaveAddr,
+    required bool narrow,
   }) {
     const lenW = Axi4Interface.lenWidth;
     const protW = Axi4Interface.protWidth;
@@ -1485,7 +1507,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
         addr.getRange(0, k),
         len,
         burst,
-        sz.neq(size) | badBurst,
+        (narrow ? len.neq(0) : sz.neq(size)) | badBurst,
         prot,
       ]);
     }
@@ -1677,6 +1699,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
     return [Const(start >> k, width: addrW - k), low].concat();
   }
 
+  // Names the widths of a slave that the fabric adapts, and nothing for a
+  // slave of the fabric widths.
+  static String _widthTag(HarborFabricSlave s, int addrW, int dataW) {
+    final (a, d, _) = _shape(s.interface);
+    return a == addrW && d == dataW ? '' : 'W${a}x$d';
+  }
+
   static const _restFields = [
     'ADDR',
     'LEN',
@@ -1722,7 +1751,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
             '${m.readChannel != null ? 'rc${m.readChannel}' : ''}',
       for (final s in slaves)
         'S${s.name}${id(s.interface)}n${s.outstanding}'
-            '${s.offset ? 'O' : ''}'
+            '${_widthTag(s, addrW, dataW)}${s.offset ? 'O' : ''}'
             't${s.timeout}r${s.range.start.toRadixString(16)}'
             'x${s.range.size.toRadixString(16)}'
             '${s.readChannels > 1 ? 'c${s.readChannels}' : ''}',

@@ -80,7 +80,8 @@ class HarborEthernetMac extends BridgeModule
         HarborAcpiDeviceProvider,
         HarborSvdPeripheralProvider,
         HarborPinConstraintProvider,
-        HarborInputClockConsumer {
+        HarborInputClockConsumer,
+        HarborNarrowSlaveOk {
   /// MAC configuration.
   final HarborEthernetConfig config;
 

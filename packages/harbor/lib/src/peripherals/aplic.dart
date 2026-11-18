@@ -27,7 +27,8 @@ class HarborAplic extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   final int sources;
   final int harts;
   final int priorityBits;

@@ -4,6 +4,7 @@ import 'package:rohd/rohd.dart';
 
 import '../../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../fabric.dart';
+import '../fabric_narrow.dart';
 import '../fabric_util.dart';
 import '../port/fabric_kind.dart';
 import '../port/reg_fifo.dart';
@@ -101,12 +102,19 @@ class HarborTileLinkFabric extends HarborFabricModule {
     final cfg0 = _tl(masters.first.name, masters.first.interface).config;
     final addrW = cfg0.addressWidth;
     final dataW = cfg0.dataWidth;
-    for (final (name, intf) in [
-      for (final m in masters) (m.name, m.interface),
-      for (final s in slaves) (s.name, s.interface),
+    final narrow = <bool>[];
+    for (final s in slaves) {
+      _tl(s.name, s.interface);
+      narrow.add(
+        harborSlaveAdapts(s, kind: 'TileLink', addrW: addrW, dataW: dataW),
+      );
+    }
+    for (final (name, intf, isSlave) in [
+      for (final m in masters) (m.name, m.interface, false),
+      for (final s in slaves) (s.name, s.interface, true),
     ]) {
       final t = _tl(name, intf).config;
-      if (t.addressWidth != addrW || t.dataWidth != dataW) {
+      if (!isSlave && (t.addressWidth != addrW || t.dataWidth != dataW)) {
         throw ArgumentError(
           '$name: TileLink widths (addr ${t.addressWidth}, data '
           '${t.dataWidth}) differ from addr $addrW, data $dataW',
@@ -158,13 +166,13 @@ class HarborTileLinkFabric extends HarborFabricModule {
         ),
     ];
     final sa = [
-      for (final s in slaves)
-        (s.interface as TileLinkInterface).clone()..pairConnectIO(
-          this,
-          s.interface,
-          PairRole.provider,
-          uniquify: (n) => '${s.name}_$n',
-        ),
+      for (final (t, s) in slaves.indexed)
+        _slavePort(s, narrow[t], c, r, addrW, dataW),
+    ];
+    // A TL-UL slave takes a message of one of its own beats or less.
+    final slaveBeatLog2 = [
+      for (var t = 0; t < slaves.length; t++)
+        narrow[t] ? (sCfg[t].dataWidth ~/ 8).bitLength - 1 : beatLog2,
     ];
     final tName = [for (final s in slaves) s.name, 'err'];
     final tSrcW = [for (final x in sCfg) x.sourceWidth, fw];
@@ -260,7 +268,13 @@ class HarborTileLinkFabric extends HarborFabricModule {
           (masters[m].reaches(slaves[t].name)
                   ? inRange(addr, slaves[t].range)
                   : Const(0)) &
-              _fits(slaves[t].memory, sCfg[t].sizeWidth, beatLog2, op, size),
+              _fits(
+                slaves[t].memory,
+                sCfg[t].sizeWidth,
+                slaveBeatLog2[t],
+                op,
+                size,
+              ),
       ];
       final tgt = [...hits, ~anyOf(hits)];
       mFirst.add(first);
@@ -760,6 +774,30 @@ class HarborTileLinkFabric extends HarborFabricModule {
         ]);
   }
 
+  // The slave port. A narrow slave gets a fabric width port in front of it.
+  TileLinkInterface _slavePort(
+    HarborFabricSlave s,
+    bool narrow,
+    Logic clk,
+    Logic reset,
+    int addrW,
+    int dataW,
+  ) {
+    final n = (s.interface as TileLinkInterface).clone()
+      ..pairConnectIO(
+        this,
+        s.interface,
+        PairRole.provider,
+        uniquify: (x) => '${s.name}_$x',
+      );
+    if (!narrow) return n;
+    final wide =
+        harborWidenPort(s.interface, addressWidth: addrW, dataWidth: dataW)
+            as TileLinkInterface;
+    harborNarrowTileLink(clk, reset, name: s.name, w: wide, n: n);
+    return wide;
+  }
+
   static TileLinkInterface _tl(String name, PairInterface p) => switch (p) {
     final TileLinkInterface t => t,
     _ => throw ArgumentError(
@@ -778,7 +816,10 @@ class HarborTileLinkFabric extends HarborFabricModule {
     final c0 = _tl(masters.first.name, masters.first.interface).config;
     String port(String name, PairInterface p, bool memory) {
       final t = _tl(name, p).config;
-      return '${memory ? 'H' : 'L'}s${t.sourceWidth}z${t.sizeWidth}';
+      final w = t.addressWidth == c0.addressWidth && t.dataWidth == c0.dataWidth
+          ? ''
+          : 'W${t.addressWidth}x${t.dataWidth}';
+      return '${memory ? 'H' : 'L'}s${t.sourceWidth}z${t.sizeWidth}$w';
     }
 
     return harborStableDefinitionName('HarborTileLinkFabric', [

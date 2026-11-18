@@ -127,7 +127,8 @@ class HarborDmaController extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// Outstanding requests the master memory port carries. Fixed at 1: the
   /// engine never has more than one read or write beat in flight.
   static const int masterOutstanding = 1;

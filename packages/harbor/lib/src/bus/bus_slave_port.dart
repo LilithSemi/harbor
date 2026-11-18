@@ -11,6 +11,15 @@ import 'wishbone/wishbone_interface.dart';
 
 export 'port/fabric_kind.dart';
 
+/// Marks a device whose register ports a fabric may adapt when they are
+/// narrower than the fabric.
+///
+/// Only a device that software reaches with register sized accesses may have
+/// it. A memory window, such as a flash XIP window, is read with wide loads
+/// and fetches, so it must be built at the fabric width and must not have it.
+/// A device without it throws on a fabric of another width.
+mixin HarborNarrowSlaveOk {}
+
 /// The register slave waist of a device, with the native port for one fabric
 /// kind built in front of it.
 ///

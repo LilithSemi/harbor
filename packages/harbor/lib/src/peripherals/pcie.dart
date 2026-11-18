@@ -156,7 +156,8 @@ class HarborPcieController extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// PCIe configuration.
   final HarborPcieConfig config;
 

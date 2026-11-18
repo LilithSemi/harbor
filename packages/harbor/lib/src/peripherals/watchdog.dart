@@ -29,7 +29,8 @@ class HarborWatchdog extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// Base address in the SoC memory map.
   final int baseAddress;
 

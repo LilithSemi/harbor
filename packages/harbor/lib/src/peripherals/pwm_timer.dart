@@ -31,7 +31,8 @@ class HarborPwmTimer extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// Number of timer/PWM channels.
   final int channels;
 

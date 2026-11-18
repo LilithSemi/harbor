@@ -137,6 +137,13 @@ class HarborFabricSlave {
   /// master IDs.
   final HarborAxi4Exclusive? exclusive;
 
+  /// True when the fabric may put a width adapter in front of this slave if
+  /// its port is narrower than the fabric. Only a register slave may set it.
+  /// Software reads a memory window such as a SPI flash XIP window with
+  /// wide loads, and a fetch reads whole words, so such a window must be
+  /// built with the fabric data width instead.
+  final bool narrowOk;
+
   const HarborFabricSlave({
     required this.name,
     required this.range,
@@ -147,6 +154,7 @@ class HarborFabricSlave {
     this.offset = false,
     this.readInterfaces = const [],
     this.exclusive,
+    this.narrowOk = false,
   });
 
   /// The value the fabric subtracts from each address to this slave.

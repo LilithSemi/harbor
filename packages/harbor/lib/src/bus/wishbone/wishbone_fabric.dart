@@ -2,6 +2,7 @@ import 'package:rohd/rohd.dart';
 
 import '../../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../fabric.dart';
+import '../fabric_narrow.dart';
 import '../fabric_util.dart';
 import '../port/fabric_kind.dart';
 import '../port/reg_fifo.dart';
@@ -88,24 +89,33 @@ class HarborWishboneFabric extends HarborFabricModule {
     final c0 = _wb(masters.first.name, masters.first.interface).config;
     final addrW = c0.addressWidth;
     final dataW = c0.dataWidth;
-    for (final (name, intf, memory, outstanding) in [
+    final narrow = <bool>[];
+    for (final s in slaves) {
+      _wb(s.name, s.interface);
+      narrow.add(
+        harborSlaveAdapts(s, kind: 'Wishbone', addrW: addrW, dataW: dataW),
+      );
+    }
+    for (final (name, intf, memory, outstanding, isSlave) in [
       for (final m in masters)
         (
           m.name,
           m.interface,
           m.memory,
           m.outstandingOn(HarborFabricKind.wishbone),
+          false,
         ),
-      for (final s in slaves) (s.name, s.interface, s.memory, s.outstanding),
+      for (final s in slaves)
+        (s.name, s.interface, s.memory, s.outstanding, true),
     ]) {
       final w = _wb(name, intf).config;
-      if (w.addressWidth != addrW || w.dataWidth != dataW) {
+      if (!isSlave && (w.addressWidth != addrW || w.dataWidth != dataW)) {
         throw ArgumentError(
           '$name: Wishbone widths (addr ${w.addressWidth}, data '
           '${w.dataWidth}) differ from addr $addrW, data $dataW',
         );
       }
-      if (w.effectiveSelWidth != dataW ~/ 8 ||
+      if (w.effectiveSelWidth != w.dataWidth ~/ 8 ||
           w.useRty ||
           w.tgaWidth != 0 ||
           w.tgdWidth != 0) {
@@ -147,13 +157,8 @@ class HarborWishboneFabric extends HarborFabricModule {
         ),
     ];
     final sa = [
-      for (final s in slaves)
-        (s.interface as WishboneInterface).clone()..pairConnectIO(
-          this,
-          s.interface,
-          PairRole.provider,
-          uniquify: (n) => '${s.name}_$n',
-        ),
+      for (final (t, s) in slaves.indexed)
+        _slavePort(s, narrow[t], addrW, dataW),
     ];
 
     // Request fields of each master, CTI and BTE 0 when it has none.
@@ -333,6 +338,28 @@ class HarborWishboneFabric extends HarborFabricModule {
     }
   }
 
+  // The slave port. A narrow slave gets a fabric width port in front of it.
+  WishboneInterface _slavePort(
+    HarborFabricSlave s,
+    bool narrow,
+    int addrW,
+    int dataW,
+  ) {
+    final n = (s.interface as WishboneInterface).clone()
+      ..pairConnectIO(
+        this,
+        s.interface,
+        PairRole.provider,
+        uniquify: (x) => '${s.name}_$x',
+      );
+    if (!narrow) return n;
+    final wide =
+        harborWidenPort(s.interface, addressWidth: addrW, dataWidth: dataW)
+            as WishboneInterface;
+    harborNarrowWishbone(w: wide, n: n);
+    return wide;
+  }
+
   static WishboneInterface _wb(String name, PairInterface p) => switch (p) {
     final WishboneInterface w => w,
     _ => throw ArgumentError(
@@ -354,7 +381,8 @@ class HarborWishboneFabric extends HarborFabricModule {
     String port(String name, PairInterface p, bool memory) {
       final w = _wb(name, p).config;
       return '${memory ? 'B' : 'C'}${w.useErr ? 'e' : ''}'
-          '${w.useCti ? 'c' : ''}${w.useBte ? 'x' : ''}';
+          '${w.useCti ? 'c' : ''}${w.useBte ? 'x' : ''}'
+          '${w.addressWidth == c0.addressWidth && w.dataWidth == c0.dataWidth ? '' : 'W${w.addressWidth}x${w.dataWidth}'}';
     }
 
     return harborStableDefinitionName('HarborWishboneFabric', [

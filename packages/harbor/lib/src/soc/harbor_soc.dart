@@ -12,6 +12,7 @@ import '../bus/bus.dart';
 import '../bus/bus_error_source.dart';
 import '../bus/bus_slave_port.dart';
 import '../bus/fabric.dart';
+import '../bus/fabric_narrow.dart';
 import '../bus/port/memory_port.dart';
 import '../bus/tilelink/tilelink_interface.dart';
 import '../bus/wishbone/wishbone_arbiter.dart';
@@ -1175,6 +1176,7 @@ class HarborSoC extends BridgeModule {
       timeout: timeoutOf(i),
       memory: shapeOf(i).memory,
       offset: true,
+      narrowOk: slaves[i].module is HarborNarrowSlaveOk,
     );
 
     // A master takes its module name, or the module name plus its bus
@@ -1277,7 +1279,20 @@ class HarborSoC extends BridgeModule {
         }
         // A leg to the converge fabric. It passes the full address on, and
         // on Wishbone it has ERR so a cut off reaches the master as ERR.
-        final leg = switch (slaveIntf(i)) {
+        // A narrow slave gets a leg of the fabric widths, and the converge
+        // fabric adapts it.
+        final (fabricAddrW, fabricDataW) = harborPortWidths(
+          masters[c]!.first.interface,
+        );
+        final (slaveAddrW, slaveDataW) = harborPortWidths(slaveIntf(i));
+        final leg = switch (slaveAddrW == fabricAddrW &&
+                slaveDataW == fabricDataW
+            ? slaveIntf(i)
+            : harborWidenPort(
+                slaveIntf(i),
+                addressWidth: fabricAddrW,
+                dataWidth: fabricDataW,
+              )) {
           final WishboneInterface w => WishboneInterface(
             w.config.copyWith(useErr: true),
           ),
