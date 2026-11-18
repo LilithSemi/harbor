@@ -209,7 +209,7 @@ void main() {
             var guard = 0;
             while (top.output('done').value != LogicValue.one &&
                 guard < 20000) {
-              await clk.nextPosedge;
+              await clk.nextNegedge;
               watchWrites();
               guard++;
             }
