@@ -638,12 +638,11 @@ class HarborSdioController extends BridgeModule
 
     final maxW = config.maxBusWidth.width;
     final datState = Logic(name: 'dat_state', width: 4);
-    // One CRC16 generator and CRC shift register per data lane.
+    // One CRC16 register per data lane. It runs over the data bits, then over
+    // the 16 CRC bits: a card read ends with a zero remainder, a card write
+    // shifts the register out.
     final crc16 = [
       for (var l = 0; l < maxW; l++) Logic(name: 'dat_crc16_$l', width: 16),
-    ];
-    final crcShift = [
-      for (var l = 0; l < maxW; l++) Logic(name: 'dat_crc_shift_$l', width: 16),
     ];
     final byteShift = Logic(name: 'dat_byte_shift', width: 8);
     final bitsInByte = Logic(name: 'dat_bits_in_byte', width: 4);
@@ -1335,7 +1334,6 @@ class HarborSdioController extends BridgeModule
           toCnt < Const(0, width: 16),
           datState < Const(dIdle, width: 4),
           for (final c in crc16) c < Const(0, width: 16),
-          for (final c in crcShift) c < Const(0, width: 16),
           byteShift < Const(0, width: 8),
           bitsInByte < Const(8, width: 4),
           byteCnt < Const(0, width: 13),
@@ -1664,7 +1662,7 @@ class HarborSdioController extends BridgeModule
 
           // DAT engine (1/4/8-bit PIO). Each SD clock moves [laneCount] bits,
           // one per active lane, MSB group first, each lane has its own CRC16.
-          () {
+          ...() {
             final bitsNext = mux(
               byteDone,
               Const(8, width: 4),
@@ -1674,27 +1672,38 @@ class HarborSdioController extends BridgeModule
             // byte), aligned so lane 0 is the lowest of the group.
             final wrShift = Const(8, width: 4) - laneCount.zeroExtend(4);
             final wrGroup = (byteShift >> wrShift).getRange(0, maxW) & laneMask;
-            // Next CRC16 per lane, for the bit that lane carries this clock.
-            final crcNextRd = [
+            // The CRC16 of each active lane steps on the edge that moves a bit.
+            // The bit is the data bit of the lane, or the top CRC bit while a
+            // card write sends the CRC, which shifts the register left.
+            final datRdPhase =
+                datState.eq(Const(dRead, width: 4)) |
+                datState.eq(Const(dRCrc, width: 4));
+            final datWrPhase =
+                datState.eq(Const(dWrite, width: 4)) |
+                datState.eq(Const(dWCrc, width: 4));
+            final crcStepEn = (datRdPhase & readEdge) | (datWrPhase & sdFall);
+            final crcNext = [
               for (var l = 0; l < maxW; l++)
-                mux(laneMask[l], _crc16Next(crc16[l], datIn[l]), crc16[l]),
-            ];
-            final crcNextWr = [
-              for (var l = 0; l < maxW; l++)
-                mux(laneMask[l], _crc16Next(crc16[l], wrGroup[l]), crc16[l]),
-            ];
-            // Read CRC shift-in (value after this clock) and the CRC drive vec.
-            final rxCrcNext = [
-              for (var l = 0; l < maxW; l++)
-                [crcShift[l].getRange(0, 15), datIn[l]].concat(),
+                _crc16Next(
+                  crc16[l],
+                  mux(
+                    datRdPhase,
+                    datIn[l],
+                    mux(
+                      datState.eq(Const(dWCrc, width: 4)),
+                      crc16[l][15],
+                      wrGroup[l],
+                    ),
+                  ),
+                ),
             ];
             final crcOutVec =
-                [for (var l = 0; l < maxW; l++) crcShift[l][15]].rconcat() &
+                [for (var l = 0; l < maxW; l++) crc16[l][15]].rconcat() &
                 laneMask;
-            // Read CRC mismatch on any active lane.
+            // A good card CRC leaves a zero remainder on every active lane.
             var crcBad = Const(0) as Logic;
             for (var l = 0; l < maxW; l++) {
-              crcBad = crcBad | (laneMask[l] & crc16[l].neq(rxCrcNext[l]));
+              crcBad = crcBad | (laneMask[l] & crcNext[l].or());
             }
             // Next data byte for write (within the current word).
             final nextByte = mux(
@@ -1707,7 +1716,10 @@ class HarborSdioController extends BridgeModule
               ),
             );
 
-            return Case(datState, [
+            return [
+              for (var l = 0; l < maxW; l++)
+                If(crcStepEn & laneMask[l], then: [crc16[l] < crcNext[l]]),
+              Case(datState, [
               // READ: hunt for the block start bit (0) on DAT0.
               CaseItem(Const(dRWait, width: 4), [
                 If(
@@ -1752,7 +1764,6 @@ class HarborSdioController extends BridgeModule
                   then: [
                     byteShift < mux(byteDone, Const(0, width: 8), rdFull),
                     bitsInByte < bitsNext,
-                    for (var l = 0; l < maxW; l++) crc16[l] < crcNextRd[l],
                     If(
                       byteDone,
                       then: [
@@ -1772,7 +1783,6 @@ class HarborSdioController extends BridgeModule
                           then: [
                             datState < Const(dRCrc, width: 4),
                             crcBitCnt < Const(16, width: 5),
-                            for (final c in crcShift) c < Const(0, width: 16),
                           ],
                         ),
                       ],
@@ -1785,7 +1795,6 @@ class HarborSdioController extends BridgeModule
                 If(
                   readEdge,
                   then: [
-                    for (var l = 0; l < maxW; l++) crcShift[l] < rxCrcNext[l],
                     crcBitCnt < (crcBitCnt - Const(1, width: 5)),
                     If(
                       crcBitCnt.eq(Const(1, width: 5)),
@@ -1863,7 +1872,6 @@ class HarborSdioController extends BridgeModule
                   sdFall,
                   then: [
                     datOutReg < wrGroup,
-                    for (var l = 0; l < maxW; l++) crc16[l] < crcNextWr[l],
                     byteShift < (byteShift << laneCount).getRange(0, 8),
                     bitsInByte < bitsNext,
                     If(
@@ -1878,8 +1886,6 @@ class HarborSdioController extends BridgeModule
                             // the holding register too, so a multi-block write
                             // starts its next block on a freshly supplied word
                             // instead of replaying this block's last one.
-                            for (var l = 0; l < maxW; l++)
-                              crcShift[l] < crcNextWr[l],
                             crcBitCnt < Const(16, width: 5),
                             dataValid < Const(0),
                             ...setInt(intDataReq),
@@ -1924,9 +1930,6 @@ class HarborSdioController extends BridgeModule
                   sdFall,
                   then: [
                     datOutReg < mux(wrAbort, ~crcOutVec & laneMask, crcOutVec),
-                    for (var l = 0; l < maxW; l++)
-                      crcShift[l] <
-                          [crcShift[l].getRange(0, 15), Const(0)].concat(),
                     crcBitCnt < (crcBitCnt - Const(1, width: 5)),
                     If(
                       crcBitCnt.eq(Const(1, width: 5)),
@@ -2112,7 +2115,8 @@ class HarborSdioController extends BridgeModule
                   ],
                 ),
               ]),
-            ]);
+              ]),
+            ];
           }(),
 
           // RX FIFO update. Push and pop can land in the same cycle, so the
