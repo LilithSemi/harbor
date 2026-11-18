@@ -603,7 +603,7 @@ class HarborSdioController extends BridgeModule
     final cmdCnt = Logic(name: 'cmd_cnt', width: 7);
     final cmdOut = Logic(name: 'cmd_out');
     final cmdOe = Logic(name: 'cmd_oe');
-    final respShift = Logic(name: 'resp_shift', width: 136);
+    final respShift = Logic(name: 'resp_shift', width: 128);
     final respCnt = Logic(name: 'resp_cnt', width: 8);
     final toCnt = Logic(name: 'to_cnt', width: 16);
 
@@ -1276,7 +1276,7 @@ class HarborSdioController extends BridgeModule
         .named('reg_read_hit');
 
     // Received response after the in-flight bit is shifted in.
-    final respNext = [respShift.getRange(0, 135), cmdIn].concat();
+    final respNext = [respShift.getRange(0, 127), cmdIn].concat();
 
     // Checks on the last response bit: end bit, CRC7 remainder and echoed
     // index. A card sends the transmission bit as 0.
@@ -1329,7 +1329,7 @@ class HarborSdioController extends BridgeModule
           cmdCnt < Const(0, width: 7),
           cmdOut < Const(1), // CMD idles high
           cmdOe < Const(0),
-          respShift < Const(0, width: 136),
+          respShift < Const(0, width: 128),
           respCnt < Const(0, width: 8),
           toCnt < Const(0, width: 16),
           datState < Const(dIdle, width: 4),
@@ -1617,7 +1617,7 @@ class HarborSdioController extends BridgeModule
                       // already parked in its memory state before the first data
                       // word and no startup words are dropped.
                       // Keep the frame. RESP0-3 take their bits on a read.
-                      respRaw < respNext.getRange(0, 128),
+                      respRaw < respNext,
                       respLong < cmdRespType.eq(Const(2, width: 2)),
                     ],
                   ),
