@@ -600,7 +600,8 @@ class HarborSdioController extends BridgeModule
 
     // CMD engine state.
     final state = Logic(name: 'cmd_state', width: 3);
-    final cmdShift = Logic(name: 'cmd_shift', width: 48);
+    final cmdShift = Logic(name: 'cmd_shift', width: 40);
+    final cmdCrc = Logic(name: 'cmd_crc', width: 7);
     final cmdCnt = Logic(name: 'cmd_cnt', width: 7);
     final cmdOut = Logic(name: 'cmd_out');
     final cmdOe = Logic(name: 'cmd_oe');
@@ -1192,20 +1193,15 @@ class HarborSdioController extends BridgeModule
     );
     interrupt <= (intView & intEnable).or();
 
-    // Command frame from the value being written to CMD (index + flags) plus
-    // the already-latched argument: {0, 1, index[5:0], arg[31:0]} then CRC7 and
-    // the end bit, MSB-first.
+    // Command content from the value being written to CMD (index + flags) plus
+    // the already-latched argument: {0, 1, index[5:0], arg[31:0]}. The send
+    // logic adds the CRC7 and the end bit, MSB-first.
     final wrIndex = bus.dataIn.getRange(0, 6);
     final cmdContent = [
       Const(0, width: 1),
       Const(1, width: 1),
       wrIndex,
       cmdArg,
-    ].concat();
-    final cmdFrame = [
-      cmdContent,
-      _crc7(cmdContent),
-      Const(1, width: 1),
     ].concat();
 
     // Raw bus view: [0] CMD level, [1] CMD pad enable, [11:4] DAT levels,
@@ -1326,7 +1322,8 @@ class HarborSdioController extends BridgeModule
           divCount < Const(0, width: 16),
           sdClkReg < Const(0),
           state < Const(sIdle, width: 3),
-          cmdShift < Const(0, width: 48),
+          cmdShift < Const(0, width: 40),
+          cmdCrc < Const(0, width: 7),
           cmdCnt < Const(0, width: 7),
           cmdOut < Const(1), // CMD idles high
           cmdOe < Const(0),
@@ -1441,8 +1438,22 @@ class HarborSdioController extends BridgeModule
               If(
                 sdFall & cmdOe,
                 then: [
-                  cmdOut < cmdShift[47],
-                  cmdShift < [cmdShift.getRange(0, 47), Const(0)].concat(),
+                  // Bits 48 to 9 are the content, which runs through the CRC7.
+                  // Then the CRC goes out, and the ones that fill it from the
+                  // right are the end bit.
+                  If(
+                    cmdCnt.gt(Const(8, width: 7)),
+                    then: [
+                      cmdOut < cmdShift[39],
+                      cmdShift <
+                          [cmdShift.getRange(0, 39), Const(0)].concat(),
+                      cmdCrc < _crc7Next(cmdCrc, cmdShift[39]),
+                    ],
+                    orElse: [
+                      cmdOut < cmdCrc[6],
+                      cmdCrc < [cmdCrc.getRange(0, 6), Const(1)].concat(),
+                    ],
+                  ),
                   cmdCnt < (cmdCnt - Const(1, width: 7)),
                   // The last bit is the end bit. Keep it driven for one more
                   // SD clock, so a pad with a slow pull-up reads it high.
@@ -2546,7 +2557,8 @@ class HarborSdioController extends BridgeModule
                           wrAbort < Const(0),
                           dmaFailed < Const(0),
                           dmaMode < bus.dataIn[10],
-                          cmdShift < cmdFrame,
+                          cmdShift < cmdContent,
+                          cmdCrc < Const(0, width: 7),
                           cmdCnt < Const(48, width: 7),
                           cmdOut < Const(1),
                           cmdOe < cmdHold.eq(Const(0, width: 8)),
@@ -2652,15 +2664,19 @@ class HarborSdioController extends BridgeModule
     ]);
   }
 
-  /// Bit-serial SD CRC7 (polynomial x^7 + x^3 + 1) over [data], which is
-  /// presented MSB-first. Returns the 7-bit CRC, MSB-first.
-  Logic _crc7(Logic data) {
-    var c = List<Logic>.generate(7, (_) => Const(0)); // c[0] = LSB
-    for (var i = data.width - 1; i >= 0; i--) {
-      final inv = data[i] ^ c[6];
-      c = [inv, c[0], c[1], c[2] ^ inv, c[3], c[4], c[5]];
-    }
-    return [c[6], c[5], c[4], c[3], c[2], c[1], c[0]].concat();
+  /// One step of the SD command CRC7 (polynomial x^7 + x^3 + 1) over [bit].
+  /// Seed with zero at the start of a frame.
+  Logic _crc7Next(Logic crc, Logic bit) {
+    final inv = bit ^ crc[6];
+    return [
+      crc[5],
+      crc[4],
+      crc[3],
+      crc[2] ^ inv,
+      crc[1],
+      crc[0],
+      inv,
+    ].concat();
   }
 
   /// One step of the SD data CRC16 (CCITT, x^16 + x^12 + x^5 + 1) over [bit].
