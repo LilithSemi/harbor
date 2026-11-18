@@ -114,8 +114,7 @@ class HarborBoard {
     String? speedGrade,
     this.clockCapableSites = const {},
     this.ledChannels = const [],
-  }) : speedGrade =
-           speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1');
+  }) : speedGrade = speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1');
 
   /// Whether [pin] is on a ball that reaches a global clock net with no clock
   /// buffer, per [clockCapableSites].
@@ -643,7 +642,7 @@ const _orangeCrab25f = HarborBoard(
 /// nextpnr-xilinx + prjxray, the only Xilinx flow that runs on aarch64).
 ///
 /// Covers the oscillator, the USB-UART bridge (the HW-proven Weir-boot pins),
-/// a TMDS adapter on Pmod JB, and the DDR3L sdram_* sites.
+/// a TMDS adapter on Pmod JA, and the DDR3L sdram_* sites.
 ///
 /// The DDR3L part is a Micron MT41K128M16: 256 MB, x16, sites from the
 /// litex/migen `arty_s7` platform. Every project that drives this board wants
@@ -667,9 +666,10 @@ const _artyS7_50 = HarborBoard(
     'clk': 'R2', // 100 MHz board oscillator
     'uart_tx': 'R12 LVCMOS33', // FPGA -> USB-UART bridge RX (Pmod/onboard)
     'uart_rx': 'V12 LVCMOS33', // FPGA <- USB-UART bridge TX
-    // A passive TMDS adapter (the MuseLab/iCESugar PMOD-HDMI) on header JB.
-    // These are the same eight balls as `pmod@jb`, read as a display instead,
-    // so a build binds one or the other and never both.
+    // A passive TMDS adapter (the MuseLab/iCESugar PMOD-HDMI) on header JA.
+    // Header pins 1 to 4 are the balls of `pmod@ja`, read as a display instead,
+    // so a build binds one or the other and never both. `pmod@jb` shares no
+    // ball with the display and stays free for an SPI Pmod.
     //
     // Both pins of a lane are plain LVCMOS33, NOT a differential pair, which
     // is what the iCESugar reference design does: the open Xilinx flow has no
@@ -679,8 +679,9 @@ const _artyS7_50 = HarborBoard(
     // The adapter pairs a lane ACROSS the two rows of the header (its pin 1
     // with its pin 12), while the FPGA pairs balls WITHIN a row, so a lane's
     // two balls are not an FPGA pair and are not length matched. That is fine
-    // at a 25 MHz pixel clock, and it is why JB is the header to use: JC has
-    // only two of the four lanes on true pairs and JD has none.
+    // at a 25 MHz pixel clock. Pair quality does not pick the header, because
+    // every pin is LVCMOS33 and the lane is driven as two single-ended pins.
+    // JA is the header the adapter is wired to on the bench.
     //
     // Lane order matches the display's `gpdi` bus: 0 blue, 1 green, 2 red,
     // 3 clock. Polarity comes from the adapter schematic, which puts the MINUS
@@ -693,16 +694,16 @@ const _artyS7_50 = HarborBoard(
     // would read as if it applied and would not. If the lanes need taming, add
     // it to the XDC writer first, and check that nextpnr-xilinx accepts it.
     //
-    // Sites from the Digilent Arty-S7-50 master XDC (JB1=P17 JB2=P18 JB3=R18
-    // JB4=T18, JB7=P14 JB8=P15 JB9=N15 JB10=P16), all bank 14.
-    'gpdi_dp[0]': 'N15 LVCMOS33', // blue +, header pin 9
-    'gpdi_dp[1]': 'P15 LVCMOS33', // green +, header pin 8
-    'gpdi_dp[2]': 'P14 LVCMOS33', // red +, header pin 7
-    'gpdi_dp[3]': 'P16 LVCMOS33', // clock +, header pin 10
-    'gpdi_dn[0]': 'R18 LVCMOS33', // blue -, header pin 3
-    'gpdi_dn[1]': 'P18 LVCMOS33', // green -, header pin 2
-    'gpdi_dn[2]': 'P17 LVCMOS33', // red -, header pin 1
-    'gpdi_dn[3]': 'T18 LVCMOS33', // clock -, header pin 4
+    // Sites from the Digilent Arty-S7-50 master XDC (JA1=L17 JA2=L18 JA3=M14
+    // JA4=N14, JA7=M16 JA8=M17 JA9=M18 JA10=N18), all bank 14.
+    'gpdi_dp[0]': 'M18 LVCMOS33', // blue +, header pin 9
+    'gpdi_dp[1]': 'M17 LVCMOS33', // green +, header pin 8
+    'gpdi_dp[2]': 'M16 LVCMOS33', // red +, header pin 7
+    'gpdi_dp[3]': 'N18 LVCMOS33', // clock +, header pin 10
+    'gpdi_dn[0]': 'M14 LVCMOS33', // blue -, header pin 3
+    'gpdi_dn[1]': 'L18 LVCMOS33', // green -, header pin 2
+    'gpdi_dn[2]': 'L17 LVCMOS33', // red -, header pin 1
+    'gpdi_dn[3]': 'N14 LVCMOS33', // clock -, header pin 4
     // User LEDs. Sites from the Digilent Arty-S7-50 master XDC. The LiteX
     // digilent_arty_s7 platform gives the same sites. Both are bank 15,
     // LVCMOS33. The reference manual says the four plain LEDs are anode
