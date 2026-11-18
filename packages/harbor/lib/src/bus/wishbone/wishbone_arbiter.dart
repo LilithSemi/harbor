@@ -148,6 +148,10 @@ class WishboneArbiter extends BridgeModule {
 /// response. A null [safeEnd] counts as high.
 /// [prefix] goes in front of every signal name.
 ///
+/// Wishbone has no LOCK signal, so a master that holds CYC for a read and a
+/// write that follows it can lose the grant between the two, at a transfer
+/// end that is safe to cut (see [safeEnd]).
+///
 /// With [realtime] (one flag per request) and [realtimeBeats], a request of
 /// a real-time master wins over the others. An owner that is not real-time
 /// loses the grant at the end of its transfer number [realtimeBeats] while
