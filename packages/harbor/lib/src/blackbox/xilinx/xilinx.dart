@@ -577,6 +577,35 @@ class XilinxBufg extends BridgeModule {
   }
 }
 
+/// Xilinx 7-series BUFGCTRL: a global clock buffer with a two input clock
+/// mux. S0 selects I0 and S1 selects I1. The enables and the ignore inputs
+/// are fixed.
+///
+/// The simulation model is a plain mux on S1. It has no glitch free switch,
+/// so a select change in simulation can show a short pulse that the real
+/// part does not make.
+class XilinxBufgctrl extends BridgeModule {
+  XilinxBufgctrl({
+    required Logic i0,
+    required Logic i1,
+    required Logic s0,
+    required Logic s1,
+    super.name = 'bufgctrl',
+  }) : super('BUFGCTRL', isSystemVerilogLeaf: true) {
+    final a = addInput('I0', i0);
+    final b = addInput('I1', i1);
+    addInput('S0', s0);
+    final sel = addInput('S1', s1);
+    addInput('CE0', Const(1));
+    addInput('CE1', Const(1));
+    addInput('IGNORE0', Const(0));
+    addInput('IGNORE1', Const(0));
+    addOutput('O');
+    // Sim only: S1 picks the clock. Synthesis gets the ports only.
+    output('O') <= mux(sel, b, a);
+  }
+}
+
 /// Xilinx 7-series BUFR: regional clock buffer. The ONLY primitive that can
 /// drive an ILOGIC/ISERDESE2 CLKDIV pin (via the HCLK_IOI RCLK tree). A BUFG
 /// cannot reach CLKDIV in the 7-series routing DB, so feeding CLKDIV from a BUFG

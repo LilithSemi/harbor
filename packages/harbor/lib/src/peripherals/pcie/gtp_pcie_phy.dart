@@ -486,6 +486,9 @@ class HarborGtpPcieLane extends Module {
 /// block, in the two directions, as PIPE_PIPELINE_STAGES does in the AMD
 /// core. The reset and rate logic see the GT side.
 class HarborGtpPciePhy extends Module {
+  /// Divide value of the user clock MMCM output for [lanes] lanes.
+  static int userClkDivide(int lanes) => lanes == 1 ? 16 : 8;
+
   /// Number of lanes, 1 or 4.
   final int lanes;
 
@@ -503,6 +506,9 @@ class HarborGtpPciePhy extends Module {
 
   /// Wait for RXRESETDONE and startup PHYSTATUS before TX buffer alignment.
   final bool waitForRxResetStatus;
+
+  /// Frequency of `userclk1` and `userclk2` in Hz.
+  int get userClkHz => HarborPipeClock.userClkHz(userClkDivide(lanes));
 
   /// PIPE clock.
   Logic get pclk => output('pclk');
@@ -625,7 +631,7 @@ class HarborGtpPciePhy extends Module {
         reset: mmcmReset == null
             ? (~perstN).named('mmcm_rst')
             : (~perstN | addInput('mmcm_reset', mmcmReset)).named('mmcm_rst'),
-        userClkDivide: lanes == 1 ? 16 : 8,
+        userClkDivide: userClkDivide(lanes),
         lockTimerBits: mmcmLockTimerBits,
       ).clocks;
     } else {
