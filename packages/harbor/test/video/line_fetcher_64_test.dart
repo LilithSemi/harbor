@@ -140,11 +140,9 @@ Future<void> _run({required double gap, Set<int> errBeats = const {}}) async {
     await clk.nextNegedge;
     // One write for each word and no more, in order, low word first.
     expect(writes, [for (var i = 0; i < n; i++) i], reason: 'write order');
-    var errWords = 0;
     for (var i = 0; i < n; i++) {
       final beat = addr + 8 * (i ~/ 2);
       final bad = errBeats.contains(beat);
-      if (bad) errWords++;
       expect(
         written[i],
         bad ? 0 : _word(addr ~/ 4 + i),
@@ -155,7 +153,6 @@ Future<void> _run({required double gap, Set<int> errBeats = const {}}) async {
       errPulses,
       errBeats.where((b) => b >= addr && b < addr + 8 * ((n + 1) ~/ 2)).length,
     );
-    expect(errWords, greaterThanOrEqualTo(0));
     // The requests run in order, cover the line, stay below burstWords and
     // do not cross 4 KiB.
     var next = addr;
@@ -171,6 +168,8 @@ Future<void> _run({required double gap, Set<int> errBeats = const {}}) async {
   }
 
   await fetch(0x0FC0, 40);
+  // Three beats to the 4 KiB boundary, so the first request is cut short.
+  await fetch(0x0FE8, 20);
   await fetch(0x2008, 37);
   await fetch(0x3000, 9);
   await Simulator.endSimulation();

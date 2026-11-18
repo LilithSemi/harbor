@@ -60,7 +60,7 @@ void main() {
     expect(await r.reg(HarborScanoutDisplay.intStatusOffset) & 0x4, 0x4);
     expect(await r.reg(HarborScanoutDisplay.statusOffset) & 0x10, 0x10);
     await r.write(HarborScanoutDisplay.intStatusOffset, 4);
-    expect(await r.reg(HarborScanoutDisplay.intStatusOffset) & 0x4, 0x4 & 0);
+    expect(await r.reg(HarborScanoutDisplay.intStatusOffset) & 0x4, 0);
     await Simulator.endSimulation();
   });
 

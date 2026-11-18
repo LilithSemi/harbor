@@ -32,7 +32,7 @@ void main() {
     await _pixels(const FetchCase(kind: HarborFabricKind.axi4));
   });
 
-  test('axi4 64 bit: xrgb8888 lines across 4 KiB in two bursts, a master with '
+  test('axi4 64 bit: xrgb8888 lines across 4 KiB inside a burst, a master with '
       'long bursts on the bus', () async {
     await _pixels(
       const FetchCase(
@@ -40,7 +40,7 @@ void main() {
         format: HarborPixelFormat.xrgb8888,
         hActive: 32,
         burstBeats: 8,
-        fbOffset: 0xFC0,
+        fbOffset: 0xFE0,
         lineClocks: 80,
         hammer: true,
       ),

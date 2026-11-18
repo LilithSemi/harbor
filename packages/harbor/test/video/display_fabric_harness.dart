@@ -1,6 +1,7 @@
 // A SoC with the scanout display as a fabric master, a 64 bit fabric, one
-// SRAM and a register master. The pixel clock is its own clock, half of the
-// system clock, so the line buffer crosses a real clock boundary.
+// SRAM and a register master. The pixel clock is its own clock, with a period
+// that is not a multiple of the system period, so the line buffer crosses a
+// real clock boundary.
 
 import 'dart:async';
 import 'dart:math';
@@ -329,7 +330,9 @@ Future<FetchRun> startFetch(FetchCase c, {bool writeFrame = true}) async {
   hammer?.pullUp(soc);
   soc.buildFabric();
 
-  final clk = SimpleClockGenerator(20).clk;
+  // A system period that does not divide the pixel period, so the toggle sync of the line buffer sees a phase
+  // that changes against the pixel clock.
+  final clk = SimpleClockGenerator(22).clk;
   final pixelClk = SimpleClockGenerator(40).clk;
   final shift = SimpleClockGenerator(8).clk;
   final reset = Logic(name: 'reset')..inject(1);
