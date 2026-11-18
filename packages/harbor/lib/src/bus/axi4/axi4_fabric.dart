@@ -343,6 +343,23 @@ class HarborAxi4Fabric extends HarborFabricModule {
     ];
 
     final ma = [for (final m in masters) _masterPort(m)];
+
+    // A master that declares writeStallFree sends the W beats of a burst
+    // with no gap.
+    for (var m = 0; m < nm; m++) {
+      if (!masters[m].writeStallFree) continue;
+      final a = ma[m];
+      var inBurst = false;
+      harborSimWatch(c, r, () {
+        final valid = simHigh(a.wValid);
+        final bad = inBurst && !valid
+            ? '${masters[m].name} declares writeStallFree and leaves a gap '
+                  'inside a write burst: WVALID low before WLAST'
+            : null;
+        if (valid && simHigh(a.wReady)) inBurst = !simHigh(a.wLast);
+        return bad;
+      });
+    }
     final sa = <Axi4Interface>[];
     final sLite = <Axi4LiteInterface?>[];
     for (final s in slaves) {

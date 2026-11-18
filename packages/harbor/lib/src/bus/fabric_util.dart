@@ -79,6 +79,32 @@ List<Logic> realtimeFirst(List<Logic> req, List<bool> rt) {
   return [for (var i = 0; i < req.length; i++) rt[i] ? req[i] : req[i] & ~any];
 }
 
+/// Simulation only: calls [check] at each rising edge of [clk] out of
+/// [reset], and stops the simulation with the message it returns. The
+/// generated RTL does not have it.
+void harborSimWatch(Logic clk, Logic reset, String? Function() check) {
+  clk.glitch.listen((args) {
+    if (!LogicValue.isPosedge(
+          args.previousValue,
+          args.newValue,
+          ignoreInvalid: true,
+        ) ||
+        reset.value != LogicValue.zero) {
+      return;
+    }
+    final message = check();
+    if (message != null) {
+      Simulator.throwException(Exception(message), StackTrace.current);
+    }
+  });
+}
+
+/// The value of [l] as a bool, false when it has an unknown bit.
+bool simHigh(Logic l) => l.value.isValid && l.value.toBigInt() != BigInt.zero;
+
+/// The value of [l] as an int, 0 when it has an unknown bit.
+int simInt(Logic l) => l.value.isValid ? l.value.toInt() : 0;
+
 /// High when [addr] is in [range].
 Logic inRange(Logic addr, BusAddressRange range) {
   final w = addr.width;

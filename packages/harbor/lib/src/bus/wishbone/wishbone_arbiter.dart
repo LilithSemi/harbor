@@ -254,6 +254,23 @@ Logic harborWishboneGrant({
     final count = cap != null
         ? Logic(name: '${prefix}hold_count', width: cap.bitLength)
         : null;
+    // High when the last transfer that ended leaves the owner at a point
+    // where CYC can drop (see [safeEnd]).
+    final idleOk = safeEnd == null ? null : Logic(name: '${prefix}idle_ok');
+    if (idleOk != null) {
+      Sequential(clk, [
+        If(
+          reset,
+          then: [idleOk < 1],
+          orElse: [
+            If(
+              terminate | ~heldValid,
+              then: [idleOk < mux(heldValid, safeEnd!, Const(1))],
+            ),
+          ],
+        ),
+      ]);
+    }
     Logic? preempt;
     if (cap != null) {
       // A real-time owner gives the grant up to real-time requests only.
@@ -271,6 +288,19 @@ Logic harborWishboneGrant({
                   (safeEnd ?? Const(1)) &
                   othersWait)
               .named('${prefix}preempt');
+      if (strobes != null && idleOk != null) {
+        // An owner that held the grant for the cap and holds CYC with STB
+        // low loses it too, when its last transfer ended at a safe point.
+        final ownerStb = (heldReg & strobes.rconcat()).or();
+        preempt =
+            (preempt |
+                    (heldValid &
+                        count.eq(cap) &
+                        othersWait &
+                        ~ownerStb &
+                        idleOk))
+                .named('${prefix}preempt_idle');
+      }
     }
     final rtCount = hasRt
         ? Logic(name: '${prefix}rt_count', width: realtimeBeats.bitLength)
@@ -287,7 +317,6 @@ Logic harborWishboneGrant({
         '${prefix}owner_other',
       );
       final cutReg = Logic(name: '${prefix}rt_cut_reg');
-      final idleOk = Logic(name: '${prefix}rt_idle_ok');
       final cutNext = mux(
         heldValid,
         ownerOther & rtWaits & rtCount!.gte(realtimeBeats - 2),
@@ -296,15 +325,9 @@ Logic harborWishboneGrant({
       Sequential(clk, [
         If(
           reset,
-          then: [cutReg < 0, idleOk < 1],
+          then: [cutReg < 0],
           orElse: [
-            If(
-              terminate | ~heldValid,
-              then: [
-                cutReg < cutNext,
-                idleOk < mux(heldValid, safeEnd ?? Const(1), Const(1)),
-              ],
-            ),
+            If(terminate | ~heldValid, then: [cutReg < cutNext]),
           ],
         ),
       ]);
@@ -313,7 +336,9 @@ Logic harborWishboneGrant({
       var rtPreempt = cutBeat & terminate;
       if (strobes != null) {
         final ownerStb = (heldReg & strobes.rconcat()).or();
-        rtPreempt = rtPreempt | (ownerOther & rtWaits & ~ownerStb & idleOk);
+        rtPreempt =
+            rtPreempt |
+            (ownerOther & rtWaits & ~ownerStb & (idleOk ?? Const(1)));
       }
       rtPreempt = rtPreempt.named('${prefix}rt_preempt');
       preempt = preempt == null

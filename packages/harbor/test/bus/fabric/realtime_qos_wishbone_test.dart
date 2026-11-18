@@ -15,6 +15,7 @@ import '../port/port_harness.dart';
 import '../port/memory_native_harness.dart';
 import 'axi4_fabric_harness.dart' show exposeInterface;
 import 'native_fabric_harness.dart';
+import 'wishbone_stage_harness.dart' show linkStage;
 import 'wishbone_fabric_random_test.dart' show mixedSessions;
 
 const _cap = 4;
@@ -193,7 +194,11 @@ class _MemShell extends BridgeModule {
   _MemShell(
     HarborFabricTopology t, {
     int grantCap = harborDefaultWishboneGrantCap,
-  }) : super('RtMemShell_${t.name}_g$grantCap', name: 'shell') {
+    bool stages = false,
+  }) : super(
+         'RtMemShell_${t.name}_g$grantCap${stages ? '_s' : ''}',
+         name: 'shell',
+       ) {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     final clk = input('clk');
@@ -212,6 +217,22 @@ class _MemShell extends BridgeModule {
       );
       exposeWaist(this, up, n, PairRole.consumer);
     }
+    // With stages, each memory master sits behind a register stage.
+    final fabricLinks = [
+      for (final (i, l) in links.indexed)
+        if (stages)
+          () {
+            final reg = WishboneRegisterStage(config: wcfg, name: 'stage$i');
+            addSubModule(reg);
+            reg.input('clk').srcConnection! <= clk;
+            reg.input('reset').srcConnection! <= reset;
+            final dn = WishboneInterface(wcfg);
+            linkStage(this, reg, l, dn);
+            return dn;
+          }()
+        else
+          l,
+    ];
     final slaveLink = WishboneInterface(wcfg);
     final down = HarborMemoryWaist(_memCfg);
     HarborWishboneMemorySlave(
@@ -228,8 +249,8 @@ class _MemShell extends BridgeModule {
       reset: reset,
       masters: [
         HarborFabricMaster(name: 'rt', interface: rt, realtime: true),
-        HarborFabricMaster(name: 'a', interface: links[0]),
-        HarborFabricMaster(name: 'b', interface: links[1]),
+        HarborFabricMaster(name: 'a', interface: fabricLinks[0]),
+        HarborFabricMaster(name: 'b', interface: fabricLinks[1]),
       ],
       slaves: [
         HarborFabricSlave(
@@ -308,8 +329,9 @@ Future<void> _memory(
   HarborFabricTopology t, {
   bool latency = false,
   bool failWrites = false,
+  bool stages = false,
 }) async {
-  final sim = Sim(_MemShell(t));
+  final sim = Sim(_MemShell(t, stages: stages));
   final rng = Random(9);
   final errors = <String>[];
   final rt = WbMaster(sim, 'rt', rng, gap: 0, keepCyc: 0);
@@ -461,6 +483,10 @@ void main() {
         masters: _masters2,
         grantCap: harborDefaultWishboneGrantCap,
       );
+    });
+    test('wishbone ${t.name}: failed writes keep their error behind register '
+        'stages with the default cap', () async {
+      await _memory(t, failWrites: true, stages: true);
     });
     test(
       'wishbone ${t.name}: two real-time masters stay under the bound',

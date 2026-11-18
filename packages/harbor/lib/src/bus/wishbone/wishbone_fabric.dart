@@ -177,6 +177,35 @@ class HarborWishboneFabric extends HarborFabricModule {
           uniquify: (n) => '${m.name}_$n',
         ),
     ];
+    // A master that declares writeStallFree never holds CYC with STB low for
+    // more than a few cycles after a write transfer of an incrementing burst.
+    // A register stage in front of the master leaves up to 3 such cycles
+    // between the beats, so the check allows them.
+    for (var m = 0; m < nm; m++) {
+      if (!masters[m].writeStallFree) continue;
+      final a = ma[m];
+      var afterIncrWrite = false;
+      var lowCycles = 0;
+      harborSimWatch(c, r, () {
+        final cyc = simHigh(a.cyc);
+        final stb = simHigh(a.stb);
+        String? bad;
+        lowCycles = afterIncrWrite && cyc && !stb ? lowCycles + 1 : 0;
+        if (lowCycles > 3) {
+          bad =
+              '${masters[m].name} declares writeStallFree and stalls inside '
+              'a write burst: CYC high with STB low for $lowCycles cycles '
+              'after a CTI 010 write';
+        }
+        if (!cyc) {
+          afterIncrWrite = false;
+        } else if (stb && simHigh(a.ack)) {
+          afterIncrWrite =
+              simHigh(a.we) && a.cti != null && simInt(a.cti!) == 2;
+        }
+        return bad;
+      });
+    }
     final sa = [
       for (final (t, s) in slaves.indexed)
         _slavePort(s, narrow[t], addrW, dataW),
@@ -250,7 +279,7 @@ class HarborWishboneFabric extends HarborFabricModule {
         realtime: hasRt ? rt : null,
         realtimeBeats: realtimeBurstCap,
         realtimeCut: hasRt ? cutOut : null,
-        strobes: hasRt ? strobes : null,
+        strobes: hasRt || cap != null ? strobes : null,
         safeEnd: hasRt || cap != null ? safeEnd : null,
         prefix: prefix,
       );
@@ -269,7 +298,7 @@ class HarborWishboneFabric extends HarborFabricModule {
           '${slaves[t].name}_',
           reachers.length,
           cut[t],
-          hasRt ? [for (var m = 0; m < nm; m++) ma[m].stb & hit[m][t]] : [],
+          needSafe ? [for (var m = 0; m < nm; m++) ma[m].stb & hit[m][t]] : [],
           safe[t],
         );
         own.add([for (var m = 0; m < nm; m++) g[m] & req[m]]);
@@ -285,7 +314,7 @@ class HarborWishboneFabric extends HarborFabricModule {
         'bus_',
         nm,
         busCut,
-        hasRt ? [for (final a in ma) a.stb] : [],
+        needSafe ? [for (final a in ma) a.stb] : [],
         busSafe,
       );
       addOutput('grant', width: nm) <= g;

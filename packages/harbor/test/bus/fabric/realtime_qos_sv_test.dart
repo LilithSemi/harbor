@@ -3,6 +3,8 @@
 // are of the SV that the tree before real-time QoS built for the same
 // configurations: commit 655ca67 for the fabric shells with the grant cap
 // off, and commit 122c86f for the SoCs, which have the default grant cap.
+// The Wishbone SoC hash moved when the grant cap learned to take the grant
+// from an idle owner, which is not a real-time change.
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
@@ -155,7 +157,7 @@ void main() {
     'axi4_shared': (-7900584569341212455, 759468),
     'soc_axi4': (6451994755986780406, 719575),
     'soc_tilelink': (-20490596120018683, 671334),
-    'soc_wishbone': (-3088906674796992804, 532841),
+    'soc_wishbone': (4450380808038980455, 535597),
     'tl_crossbar': (-6055400673713627179, 149394),
     'tl_shared': (3339608990310352046, 307715),
     'wb_crossbar': (8735552845619675350, 32986),

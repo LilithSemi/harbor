@@ -34,6 +34,9 @@ class PortCfg {
   /// A real-time master.
   final bool realtime;
 
+  /// The master declares that it never stalls write data inside a burst.
+  final bool writeStallFree;
+
   const PortCfg(
     this.name, {
     this.width = 1,
@@ -45,6 +48,7 @@ class PortCfg {
     this.timeout = 0,
     this.reach,
     this.realtime = false,
+    this.writeStallFree = false,
   });
 
   BusAddressRange get range => BusAddressRange(base, size);
@@ -99,6 +103,7 @@ class NativeShell extends BridgeModule {
           memory: m.memory,
           reach: m.reach,
           realtime: m.realtime,
+          writeStallFree: m.writeStallFree,
         ),
       );
     }

@@ -34,6 +34,9 @@ class MasterCfg {
 
   /// AXI4 exclusive slots (see [HarborFabricMaster.exclusiveIds]).
   final int? exclusiveIds;
+
+  /// The master declares that it never stalls write data inside a burst.
+  final bool writeStallFree;
   const MasterCfg(
     this.name,
     this.idWidth,
@@ -42,6 +45,7 @@ class MasterCfg {
     this.readChannel,
     this.realtime = false,
     this.exclusiveIds,
+    this.writeStallFree = false,
   });
 }
 
@@ -146,6 +150,7 @@ class FabricShell extends BridgeModule {
           readChannel: m.readChannel,
           realtime: m.realtime,
           exclusiveIds: m.exclusiveIds,
+          writeStallFree: m.writeStallFree,
         ),
       );
     }

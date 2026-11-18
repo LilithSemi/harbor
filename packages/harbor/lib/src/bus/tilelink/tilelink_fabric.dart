@@ -182,6 +182,29 @@ class HarborTileLinkFabric extends HarborFabricModule {
       for (var t = 0; t < slaves.length; t++)
         narrow[t] ? (sCfg[t].dataWidth ~/ 8).bitLength - 1 : beatLog2,
     ];
+    // A master that declares writeStallFree sends the beats of a Put message
+    // with no gap.
+    for (var m = 0; m < nm; m++) {
+      if (!masters[m].writeStallFree) continue;
+      final a = ma[m];
+      var left = 0;
+      harborSimWatch(c, r, () {
+        final valid = simHigh(a.aValid);
+        final bad = left > 0 && !valid
+            ? '${masters[m].name} declares writeStallFree and leaves a gap '
+                  'inside a Put message'
+            : null;
+        if (valid && simHigh(a.aReady)) {
+          if (left > 0) {
+            left--;
+          } else if (simInt(a.aOpcode) < 4) {
+            final size = simInt(a.aSize);
+            left = size > beatLog2 ? (1 << (size - beatLog2)) - 1 : 0;
+          }
+        }
+        return bad;
+      });
+    }
     final tName = [for (final s in slaves) s.name, 'err'];
     final tSrcW = [for (final x in sCfg) x.sourceWidth, fw];
     final tN = [for (final s in slaves) s.outstanding, errorOutstanding];
