@@ -279,7 +279,8 @@ class HarborMemoryMasterPort {
   /// TL-UH master and Wishbone a master with registered feedback bursts.
   ///
   /// [recoverTimeout] is the wait limit of the crossing after a device reset
-  /// (see [HarborMemoryWaistCdc.recoverTimeout]).
+  /// (see [HarborMemoryWaistCdc.recoverTimeout]). With a crossing, the native
+  /// port has one more ID bit than [config] says.
   ///
   /// [busAddressWidth] makes the AXI4 address wider than the waist address
   /// in [config]. The bus address is the waist address with zeros above it.
@@ -332,11 +333,17 @@ class HarborMemoryMasterPort {
       });
     }
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
+      // The native port has one more ID bit, for the epoch of the crossing.
       final inner = create(
         module: module,
         name: name,
         kind: kind,
-        config: config,
+        config: HarborMemoryWaistConfig(
+          addressWidth: config.addressWidth,
+          dataWidth: config.dataWidth,
+          idWidth: config.idWidth + 1,
+          outstanding: config.outstanding,
+        ),
         clk: fabricClock.clk,
         reset: fabricClock.reset,
         busAddressWidth: busAddressWidth,

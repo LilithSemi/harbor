@@ -28,11 +28,13 @@ const _slave = HarborMemoryWaistConfig(
   outstanding: 4,
 );
 
-HarborAxi4Exclusive _excl(int granule) => HarborAxi4Exclusive.forMasters(
-  [1, 1],
-  [HarborExclusive.auto, HarborExclusive.auto],
-  granuleBytes: granule,
-)!;
+/// A master crossing adds an epoch bit to the master ID, and the slave
+/// ID with it.
+HarborAxi4Exclusive _excl(int granule, {bool cross = false}) =>
+    HarborAxi4Exclusive.forMasters(cross ? [2, 2] : [1, 1], [
+      HarborExclusive.auto,
+      HarborExclusive.auto,
+    ], granuleBytes: granule)!;
 
 /// A memory master port with its waist on ports `<p>_*`. With [cross], the
 /// device runs on `clk` and the native port on `fclk`.
@@ -71,7 +73,15 @@ class _FabricTop extends BridgeModule {
     ]) {
       createPort(n, PortDirection.input);
     }
-    final excl = _excl(granule);
+    final excl = _excl(granule, cross: cross);
+    final slaveConfig = cross
+        ? const HarborMemoryWaistConfig(
+            addressWidth: 16,
+            dataWidth: 32,
+            idWidth: 3,
+            outstanding: 4,
+          )
+        : _slave;
     final ms = <HarborFabricMaster>[];
     for (final p in ['a', 'b']) {
       final m = addSubModule(_WaistMaster(p, cross: cross));
@@ -88,7 +98,7 @@ class _FabricTop extends BridgeModule {
         ),
       );
     }
-    final mem = addSubModule(MemSlaveShell(_slave, exclusive: excl));
+    final mem = addSubModule(MemSlaveShell(slaveConfig, exclusive: excl));
     for (final n in ['clk', 'reset']) {
       mem.input(n).srcConnection! <= input(n);
     }

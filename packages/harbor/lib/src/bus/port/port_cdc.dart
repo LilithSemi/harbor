@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:rohd/rohd.dart';
 
 import '../../clock/cdc.dart';
-import '../fabric_util.dart' show anyOf, widthOf;
+import '../fabric_util.dart' show widthOf;
 import 'memory_waist.dart';
 import 'reg_fifo.dart';
 
@@ -67,6 +67,13 @@ class HarborMemoryWaistCdc extends Module {
   /// Cycles after a device reset that the fabric side waits with no response
   /// before it gives up on the requests in flight. 0 turns the wait limit
   /// off. Only the master side uses it.
+  ///
+  /// The master side sends an epoch bit on top of the request ID, so the
+  /// fabric waist of a master crossing has one more ID bit than the device
+  /// waist. A give up flips the epoch and drops each response with the old
+  /// one. A response that comes after two give ups looks like a current one,
+  /// so [recoverTimeout] must be longer than the longest time the fabric can
+  /// owe a response.
   final int recoverTimeout;
 
   /// Default of [recoverTimeout].
@@ -124,10 +131,17 @@ class HarborMemoryWaistCdc extends Module {
              '${deviceResetCopy == null ? '' : '_r'}'
              '${slave || recoverTimeout == defaultRecoverTimeout ? '' : '_t$recoverTimeout'}',
        ) {
+    if (recoverTimeout < 0) {
+      throw ArgumentError.value(
+        recoverTimeout,
+        'recoverTimeout',
+        'must be >= 0',
+      );
+    }
     final config = fabric.config;
     if (device.config.addressWidth != config.addressWidth ||
         device.config.dataWidth != config.dataWidth ||
-        device.config.idWidth != config.idWidth ||
+        device.config.idWidth + (slave ? 0 : 1) != config.idWidth ||
         device.config.outstanding != config.outstanding) {
       throw ArgumentError('fabric $config and device ${device.config} differ');
     }
@@ -204,7 +218,7 @@ class HarborMemoryWaistCdc extends Module {
     final up = slave ? f : d;
     final dn = slave ? d : f;
 
-    final idW = config.idWidth;
+    final idW = device.config.idWidth;
     final dataW = config.dataWidth;
     const lenW = HarborMemoryWaistConfig.lenWidth;
     final reqWidths = [
@@ -513,13 +527,16 @@ class HarborMemoryWaistCdc extends Module {
     up.wrespExOkay <= bEx;
     wrF.pop(up.wrespReady & ~dWr);
 
-    // Fabric side: the responder. Write data goes out only for a write
-    // already sent, so a device reset never leaves stray beats behind.
+    // Fabric side: the responder. After a device reset, write data goes out
+    // as filler for each write already sent, so a device reset never leaves
+    // a write without its data. The ID to the fabric has the `epoch` bit on
+    // top. A timeout flips it, so a response to a request that was given up
+    // does not match the requests after it.
     final recover = Logic(name: 'recover');
     final mode = (recover | fJoinSync).named('fabric_mode_recover');
     final reqFire = Logic(name: 'f_req_fire');
     final wdLastFire = Logic(name: 'f_wdata_last_fire');
-    final expired = Logic(name: 'recover_expired');
+    final epoch = Logic(name: 'epoch');
     final [id, write, addr, len, size, burst, exclusive] = harborUnpack(
       reqF.rdData,
       reqWidths,
@@ -527,7 +544,7 @@ class HarborMemoryWaistCdc extends Module {
     final lenQ = HarborRegFifo(
       name: 'write_len_q',
       clk: fClk,
-      reset: fReset | expired,
+      reset: fReset,
       depth: n,
       pushValid: reqFire & write,
       pushData: len,
@@ -536,41 +553,17 @@ class HarborMemoryWaistCdc extends Module {
     final outR = Logic(name: 'out_reads', width: cntW);
     final outW = Logic(name: 'out_writes', width: cntW);
     final wBeat = Logic(name: 'w_beat', width: lenW);
+    // Oldest entries of the write length queue that still get filler data
+    // after a timeout.
+    final fill = Logic(name: 'filler_writes', width: cntW);
     addOutput('debug_reads', width: cntW) <= outR;
     addOutput('debug_writes', width: cntW) <= outW;
     addOutput('debug_recover') <= mode;
 
-    // Requests that a timeout gave up on keep a stale count per ID. A later
-    // response with that ID is dropped, so it cannot match a new request.
-    // Responses of one ID come in order, so the stale ones come first.
-    const staleW = 8;
-    final ids = 1 << idW;
-    final inflR = [
-      for (var i = 0; i < ids; i++) Logic(name: 'infl_reads_$i', width: cntW),
-    ];
-    final inflW = [
-      for (var i = 0; i < ids; i++) Logic(name: 'infl_writes_$i', width: cntW),
-    ];
-    final staleR = [
-      for (var i = 0; i < ids; i++)
-        Logic(name: 'stale_reads_$i', width: staleW),
-    ];
-    final staleWr = [
-      for (var i = 0; i < ids; i++)
-        Logic(name: 'stale_writes_$i', width: staleW),
-    ];
-    Logic isStale(Logic rid, List<Logic> stale) => anyOf([
-      for (var i = 0; i < ids; i++)
-        rid.eq(Const(i, width: idW)) & nonZero(stale[i]),
-    ]);
-    final staleRsp = isStale(dn.rdataId, staleR).named('stale_read_rsp');
-    final staleBrsp = isStale(dn.wrespId, staleWr).named('stale_write_rsp');
-    final anyStaleR = anyOf([for (final c in staleR) nonZero(c)]);
-    final anyStaleW = anyOf([for (final c in staleWr) nonZero(c)]);
-
+    final filling = (mode | nonZero(fill)).named('filler_data');
     final reqOpen = ~mode & lenQ.pushReady;
     dn.reqValid <= ~reqF.rdEmpty & reqOpen;
-    dn.reqId <= id;
+    dn.reqId <= [epoch, id].concat();
     dn.reqWrite <= write;
     dn.reqAddr <= addr;
     dn.reqLen <= len;
@@ -582,52 +575,55 @@ class HarborMemoryWaistCdc extends Module {
 
     final [wData, wStrb, wLast] = harborUnpack(wdF.rdData, wdWidths);
     final wOpen = lenQ.popValid;
-    dn.wdataValid <= wOpen & (mode | ~wdF.rdEmpty);
-    dn.wdataData <= wData & (~mode).replicate(dataW);
-    dn.wdataStrb <= mux(mode, Const(0, width: config.strbWidth), wStrb);
-    dn.wdataLast <= mux(mode, wBeat.eq(lenQ.popData), wLast);
-    wdF.pop(dn.wdataReady & wOpen & ~mode);
+    dn.wdataValid <= wOpen & (filling | ~wdF.rdEmpty);
+    dn.wdataData <= wData & (~filling).replicate(dataW);
+    dn.wdataStrb <= mux(filling, Const(0, width: config.strbWidth), wStrb);
+    dn.wdataLast <= mux(filling, wBeat.eq(lenQ.popData), wLast);
+    wdF.pop(dn.wdataReady & wOpen & ~filling);
     final wdFire = dn.wdataValid & dn.wdataReady;
     wdLastFire <= wdFire & dn.wdataLast;
 
-    // Responses to requests sent before a device reset are dropped. READY
-    // stays low while nothing is in flight.
-    final dropRd = mode | staleRsp;
-    final dropWr = mode | staleBrsp;
-    dn.rdataReady <= (dropRd | ~rdF.wrFull) & (nonZero(outR) | anyStaleR);
+    // A response with the wrong epoch belongs to a request that was given
+    // up. It is always taken and dropped. Responses to requests before a
+    // device reset are dropped too. READY stays low while nothing is in
+    // flight.
+    final rOld = dn.rdataValid & (dn.rdataId[idW] ^ epoch);
+    final bOld = dn.wrespValid & (dn.wrespId[idW] ^ epoch);
+    dn.rdataReady <= rOld | ((mode | ~rdF.wrFull) & nonZero(outR));
     rdF.push(
-      dn.rdataValid & dn.rdataReady & ~dropRd,
+      dn.rdataValid & dn.rdataReady & ~mode & ~rOld,
       harborPack([
-        dn.rdataId,
+        dn.rdataId.slice(idW - 1, 0),
         dn.rdataData,
         dn.rdataErr,
         dn.rdataLast,
         dn.rdataExOkay,
       ]),
     );
-    dn.wrespReady <= (dropWr | ~wrF.wrFull) & (nonZero(outW) | anyStaleW);
+    dn.wrespReady <= bOld | ((mode | ~wrF.wrFull) & nonZero(outW));
     wrF.push(
-      dn.wrespValid & dn.wrespReady & ~dropWr,
-      harborPack([dn.wrespId, dn.wrespErr, dn.wrespExOkay]),
+      dn.wrespValid & dn.wrespReady & ~mode & ~bOld,
+      harborPack([dn.wrespId.slice(idW - 1, 0), dn.wrespErr, dn.wrespExOkay]),
     );
-    final rDone = dn.rdataValid & dn.rdataReady & dn.rdataLast;
-    final bDone = dn.wrespValid & dn.wrespReady;
-    final rDoneLive = rDone & ~staleRsp;
-    final bDoneLive = bDone & ~staleBrsp;
+    final rTake = dn.rdataValid & dn.rdataReady;
+    final bTake = dn.wrespValid & dn.wrespReady;
+    final rDone = rTake & dn.rdataLast & ~rOld;
+    final bDone = bTake & ~bOld;
     final dropped = Logic(name: 'dropped', width: 16);
     addOutput('debug_dropped', width: 16) <= dropped;
     final reqR = reqFire & ~write;
     final reqW = reqFire & write;
 
     // A device reset can leave requests that never get a response. When
-    // nothing moves for [recoverTimeout] cycles, the fabric side gives them
-    // up: they become stale and the write length queue is cleared.
+    // nothing moves for [recoverTimeout] cycles, the fabric side gives up
+    // on the responses: the epoch flips and the counts clear. Filler data
+    // for the writes already sent stays owed.
     final expire = Logic(name: 'recover_expire');
     final timeouts = Logic(name: 'recover_timeouts', width: 8);
     addOutput('debug_recover_timeouts', width: 8) <= timeouts;
     if (recoverTimeout > 0) {
       final waiting = mode & (nonZero(outR) | nonZero(outW) | lenQ.popValid);
-      final progress = (dn.rdataValid & dn.rdataReady) | bDone | wdFire;
+      final progress = rTake | bTake | wdFire;
       final tw = widthOf(recoverTimeout);
       final timer = Logic(name: 'recover_timer', width: tw);
       expire <=
@@ -643,61 +639,37 @@ class HarborMemoryWaistCdc extends Module {
     }
 
     Sequential(fClk, reset: fReset, [
-      expired < expire,
+      If(expire, then: [epoch < ~epoch]),
       If(
         expire & ~timeouts.eq(Const(255, width: 8)),
         then: [timeouts < timeouts + 1],
       ),
       dropped <
           dropped +
-              (dn.rdataValid & dn.rdataReady & dropRd).zeroExtend(16) +
-              (bDone & dropWr).zeroExtend(16),
+              (rTake & (mode | rOld)).zeroExtend(16) +
+              (bTake & (mode | bOld)).zeroExtend(16),
       If.block([
-        Iff(expired, [wBeat < Const(0, width: lenW)]),
-        ElseIf(wdLastFire, [wBeat < Const(0, width: lenW)]),
+        Iff(wdLastFire, [wBeat < Const(0, width: lenW)]),
         ElseIf(wdFire, [wBeat < wBeat + 1]),
       ]),
       If.block([
+        Iff(expire, [fill < lenQ.count]),
+        ElseIf(wdLastFire & nonZero(fill), [fill < fill - 1]),
+      ]),
+      If.block([
         Iff(expire, [outR < 0]),
-        ElseIf(reqR & ~rDoneLive, [outR < outR + 1]),
-        ElseIf(rDoneLive & ~reqR, [outR < outR - 1]),
+        ElseIf(reqR & ~rDone, [outR < outR + 1]),
+        ElseIf(rDone & ~reqR, [outR < outR - 1]),
       ]),
       If.block([
         Iff(expire, [outW < 0]),
-        ElseIf(reqW & ~bDoneLive, [outW < outW + 1]),
-        ElseIf(bDoneLive & ~reqW, [outW < outW - 1]),
+        ElseIf(reqW & ~bDone, [outW < outW + 1]),
+        ElseIf(bDone & ~reqW, [outW < outW - 1]),
       ]),
-      for (var i = 0; i < ids; i++) ...[
-        for (final (infl, stale, req, done, rid, isStaleRsp, last) in [
-          (inflR[i], staleR[i], reqR, rDoneLive, dn.rdataId, staleRsp, rDone),
-          (inflW[i], staleWr[i], reqW, bDoneLive, dn.wrespId, staleBrsp, bDone),
-        ]) ...[
-          If.block([
-            Iff(expire, [infl < 0]),
-            ElseIf(
-              req &
-                  id.eq(Const(i, width: idW)) &
-                  ~(done & rid.eq(Const(i, width: idW))),
-              [infl < infl + 1],
-            ),
-            ElseIf(
-              done &
-                  rid.eq(Const(i, width: idW)) &
-                  ~(req & id.eq(Const(i, width: idW))),
-              [infl < infl - 1],
-            ),
-          ]),
-          If.block([
-            Iff(expire, [stale < stale + infl.zeroExtend(staleW)]),
-            ElseIf(last & isStaleRsp & rid.eq(Const(i, width: idW)), [
-              stale < stale - 1,
-            ]),
-          ]),
-        ],
-      ],
       If.block([
         Iff(fJoinSync, [recover < Const(1)]),
-        ElseIf(~lenQ.popValid & ~nonZero(outR) & ~nonZero(outW) & ~expire, [
+        ElseIf(expire, [recover < Const(0)]),
+        ElseIf(~lenQ.popValid & ~nonZero(outR) & ~nonZero(outW), [
           recover < Const(0),
         ]),
       ]),
