@@ -678,6 +678,7 @@ class HarborGtxPciePhy extends Module {
     final next = Logic(name: 'state_next', width: 4);
     final timer = Logic(name: 'timer', width: tw);
     final stepNext = Logic(name: 'step_next', width: 4);
+    final stepGo = Logic(name: 'step_go');
     final timedOut = Logic(name: 'timed_out');
     final rateFail = Logic(name: 'rate_fail');
     final cpllHold = Logic(name: 'cpll_hold');
@@ -704,7 +705,7 @@ class HarborGtxPciePhy extends Module {
       int bound,
     ) => CaseItem(s(st), [
       If.block([
-        Iff(done, [stepNext < s(to)]),
+        Iff(done, [stepNext < s(to), stepGo < 1]),
         ElseIf(at(bound), [timedOut < 1]),
       ]),
     ]);
@@ -784,12 +785,13 @@ class HarborGtxPciePhy extends Module {
 
     Combinational([
       stepNext < state,
+      stepGo < 0,
       timedOut < 0,
       Case(
         state,
         [
           CaseItem(s(_S.cfgWait), [
-            If(at(64), then: [stepNext < s(_S.cpllReset)]),
+            If(at(64), then: [stepNext < s(_S.cpllReset), stepGo < 1]),
           ]),
           wait(
             _S.cpllReset,
@@ -798,7 +800,7 @@ class HarborGtxPciePhy extends Module {
             timeouts.resetDone,
           ),
           wait(_S.cpllLock, cpllLocked, _S.gtRelease, timeouts.cpllLock),
-          CaseItem(s(_S.gtRelease), [stepNext < s(_S.clockLock)]),
+          CaseItem(s(_S.gtRelease), [stepNext < s(_S.clockLock), stepGo < 1]),
           wait(
             _S.clockLock,
             clockOk & settled,
@@ -823,7 +825,7 @@ class HarborGtxPciePhy extends Module {
           CaseItem(s(_S.idle), [
             If(
               rateTake & ~Const(debugSkipTxPhaseAlign ? 1 : 0),
-              then: [stepNext < s(_S.txDlySReset)],
+              then: [stepNext < s(_S.txDlySReset), stepGo < 1],
             ),
           ]),
         ],
@@ -836,12 +838,7 @@ class HarborGtxPciePhy extends Module {
     final holdHit = at(HarborGtxPcieTimeouts.cpllResetHold);
     final failNow = (timedOut | lostLock | rateFail).named('fail_now');
     final failCause = Logic(name: 'fail_cause', width: 4);
-    Logic causeInSync(Logic c) => [
-      _S.txDlySReset,
-      _S.txPhInit,
-      _S.txPhAlign,
-      _S.txDlyEn,
-    ].map((v) => c.eq(s(v))).reduce((a, b) => a | b);
+    final causeInSync = Logic(name: 'fail_cause_sync');
     final failTimeout = Logic(name: 'fail_timeout');
     // A watchdog restart takes the retry path, but it is not a failure.
     final restart = timeouts.linkWait == 0 ? null : Logic(name: 'link_restart');
@@ -850,11 +847,12 @@ class HarborGtxPciePhy extends Module {
     // [HarborGtxPcieTimeouts.syncRetries] times in a row. A lock loss, a
     // watchdog restart and any other timeout start the whole sequence.
     final syncTries = Logic(name: 'sync_tries', width: 8);
+    final triesLeft = Logic(name: 'sync_tries_left');
     final syncRetry =
         (fail &
                 failTimeout &
-                causeInSync(failCause) &
-                syncTries.lt(Const(timeouts.syncRetries, width: 8)) &
+                causeInSync &
+                triesLeft &
                 (restart == null ? Const(1) : ~restart))
             .named('sync_retry');
     final fullFail = (failOrRestart & ~syncRetry).named('full_fail');
@@ -864,6 +862,14 @@ class HarborGtxPciePhy extends Module {
           s(_S.txDlySReset),
           mux(fullFail, s(_S.cpllReset), stepNext),
         );
+
+    // High when next differs from state, without going through next.
+    final nextChanges =
+        (fail |
+                (restart == null
+                    ? stepGo
+                    : mux(restart, ~state.eq(s(_S.cpllReset)), stepGo)))
+            .named('next_changes');
 
     Logic nextIs(List<HarborGtxResetState> l) =>
         l.map((v) => next.eq(s(v))).reduce((a, b) => a | b);
@@ -886,19 +892,42 @@ class HarborGtxPciePhy extends Module {
         state < next,
         If(
           syncRetry,
-          then: [syncTries < syncTries + 1],
+          then: [
+            syncTries < syncTries + 1,
+            triesLeft <
+                syncTries.lt(
+                  Const(
+                    timeouts.syncRetries > 0 ? timeouts.syncRetries - 1 : 0,
+                    width: 8,
+                  ),
+                ),
+          ],
           orElse: [
-            If(fullFail | nextIs([_S.idle]), then: [syncTries < 0]),
+            If(
+              fullFail | nextIs([_S.idle]),
+              then: [
+                syncTries < 0,
+                triesLeft < Const(timeouts.syncRetries > 0 ? 1 : 0),
+              ],
+            ),
           ],
         ),
         fail < failNow & ~fail,
         failTimeout < (timedOut | rateFail),
         failCause < mux(rateFail, s(_S.rateChange), state),
-        timerZero < fail | ~next.eq(state),
+        causeInSync <
+            ~rateFail &
+                [
+                  _S.txDlySReset,
+                  _S.txPhInit,
+                  _S.txPhAlign,
+                  _S.txDlyEn,
+                ].map((v) => state.eq(s(v))).reduce((a, b) => a | b),
+        timerZero < nextChanges,
         for (final MapEntry(key: n, value: hit) in hits.entries)
           hit < timer.eq(Const(n - 2, width: tw)),
         If(
-          fail | ~next.eq(state),
+          nextChanges,
           then: [timer < 0],
           orElse: [
             If(~state.eq(s(_S.idle)), then: [timer < timer + 1]),
@@ -943,6 +972,7 @@ class HarborGtxPciePhy extends Module {
         state: s(_S.cfgWait),
         failState: s(_S.none),
         timerZero: Const(1),
+        triesLeft: Const(timeouts.syncRetries > 0 ? 1 : 0),
       },
     );
 
