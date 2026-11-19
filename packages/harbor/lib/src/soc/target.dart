@@ -153,6 +153,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// Uses nextpnr's Himbächel Xilinx backend for the openXC7 flow.
   final bool useHimbaechel;
 
+  /// The nextpnr placer the openXC7 Makefile uses by default: `static`,
+  /// `heap` or `sa`. The `PLACER` Make variable overrides it. The static
+  /// placer gives far shorter wires than heap on dense Xilinx designs.
+  final String placer;
+
   /// Device part number (e.g., `'up5k'`, `'lfe5u-45f'`, `'xc7s50'`).
   final String device;
 
@@ -317,6 +322,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.ecp5Autoname = false,
     this.xilinxLut6Cost,
     this.useHimbaechel = false,
+    this.placer = 'static',
     this.bitstreamPatches = const [],
   }) : speedGrade = speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1'),
        assert(xilinxLut6Cost == null || xilinxLut6Cost > 0),
@@ -339,6 +345,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
        clockNPortName = null,
        speedGrade = '1',
        useHimbaechel = false,
+       placer = 'static',
        ecp5Autoname = false,
        xilinxLut6Cost = null;
 
@@ -358,6 +365,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
        vendor = HarborFpgaVendor.ecp5,
        clockNPortName = null,
        useHimbaechel = false,
+       placer = 'static',
        _xilinxFamily = null,
        xilinxLut6Cost = null;
 
@@ -377,6 +385,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
+    this.placer = 'static',
     this.xilinxLut6Cost,
     this.bitstreamPatches = const [],
   }) : name = 'spartan7-$device',
@@ -403,6 +412,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
+    this.placer = 'static',
     this.bitstreamPatches = const [],
   }) : name = 'artix7-$device',
        vendor = useOpenXc7 || useHimbaechel
@@ -428,6 +438,7 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
+    this.placer = 'static',
     this.bitstreamPatches = const [],
   }) : name = 'kintex7-$device',
        vendor = useOpenXc7 || useHimbaechel
@@ -1079,13 +1090,14 @@ def require_net(net):
       );
       buf.writeln('THREADS ?= \$(shell nproc)');
       buf.writeln(
-        '# nextpnr placer: heap (analytical, default) or sa (annealing). heap is',
+        '# nextpnr placer: static (default), heap or sa. static gives much '
+        'shorter wires',
       );
       buf.writeln(
-        '# usually better on dense designs but its legalization is single-'
-        'threaded and slow; sa is an alternative when heap stalls.',
+        '# than heap on dense designs. heap is analytical and its '
+        'legalization is single-threaded.',
       );
-      buf.writeln('PLACER ?= heap');
+      buf.writeln('PLACER ?= $placer');
       if (useHimbaechel) {
         buf.writeln('ROUTER ?= router2');
       } else {

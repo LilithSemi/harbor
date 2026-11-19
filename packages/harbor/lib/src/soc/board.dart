@@ -260,6 +260,7 @@ class HarborBoard {
     Map<String, String> extraPins = const {},
     bool? ddrDllOn,
     bool useHimbaechel = false,
+    String placer = 'static',
     Map<String, String> extraConstraints = const {},
   }) {
     if (useHimbaechel && vendor != HarborFpgaVendor.openXc7) {
@@ -319,6 +320,7 @@ class HarborBoard {
       speedGrade: speedGrade,
       progCommand: progCommand,
       useHimbaechel: useHimbaechel,
+      placer: placer,
       extraConstraints: extraConstraints,
       bitstreamPatches: bitstreamPatches,
     );
