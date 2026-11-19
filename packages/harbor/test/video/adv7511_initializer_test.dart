@@ -112,10 +112,7 @@ Future<
     List<int> passEnds,
   })
 >
-_run({
-  required _Bus bus,
-  required int cycles,
-}) async {
+_run({required _Bus bus, required int cycles}) async {
   final dut = HarborAdv7511Initializer(
     clk: SimpleClockGenerator(10).clk,
     reset: Logic(),
@@ -173,7 +170,14 @@ _run({
 void main() {
   tearDown(() async => Simulator.reset());
 
-  final adv = {0x42: 0x60, 0x9E: 0x10, 0xF5: 0x75, 0xF6: 0x11};
+  final adv = {
+    0x42: 0x60,
+    0x9E: 0x10,
+    0xF5: 0x75,
+    0xF6: 0x11,
+    0x3E: 0x04,
+    0x3D: 0x55,
+  };
   final expectedPass = <String>[
     'mux 20',
     for (final (r, v) in adv7511RegisterTable)
@@ -181,32 +185,37 @@ void main() {
     for (final r in adv7511ReadRegisters) 'rd ${r.toRadixString(16)}',
   ];
 
-  test('writes the mux, the register list in order, and reads status back', () async {
-    final r = await _run(bus: _Bus(adv), cycles: 2 * 60000 + _repeat * 3);
-    final log = r.bus.log;
-    final n = expectedPass.length;
-    expect(log.length, greaterThanOrEqualTo(2 * n));
-    expect(log.sublist(0, n), expectedPass);
-    // The second pass repeats the whole sequence.
-    expect(log.sublist(n, 2 * n), expectedPass);
-    expect(r.dut.muxResetN.value.toInt(), 1);
-    // 0x60 in 0x42, PLL lock, chip ID 0x7511 and a finished pass.
-    expect(
-      r.dut.status.value.toInt(),
-      HarborAdv7511Initializer.statusHotPlug |
-          HarborAdv7511Initializer.statusSense |
-          HarborAdv7511Initializer.statusPllLocked |
-          HarborAdv7511Initializer.statusChipId |
-          HarborAdv7511Initializer.statusValid,
-    );
-    expect(r.passEnds.length, greaterThanOrEqualTo(2));
-    // The next pass starts about [_repeat] clocks after the last one ends.
-    final gap = r.passStarts[1] - r.passEnds[0];
-    expect(gap, inInclusiveRange(_repeat - 4, _repeat + 40));
-    // The bus is released between passes. The gap check counts clocks where
-    // a line is pulled after a pass ended and before the next START.
-    expect(gapBusy, lessThan(2));
-  });
+  test(
+    'writes the mux, the register list in order, and reads status back',
+    () async {
+      final r = await _run(bus: _Bus(adv), cycles: 2 * 60000 + _repeat * 3);
+      final log = r.bus.log;
+      final n = expectedPass.length;
+      expect(log.length, greaterThanOrEqualTo(2 * n));
+      expect(log.sublist(0, n), expectedPass);
+      // The second pass repeats the whole sequence.
+      expect(log.sublist(n, 2 * n), expectedPass);
+      expect(r.dut.muxResetN.value.toInt(), 1);
+      expect(r.dut.vic.value.toInt(), 0x04);
+      expect(r.dut.timing.value.toInt(), 0x55);
+      // 0x60 in 0x42, PLL lock, chip ID 0x7511 and a finished pass.
+      expect(
+        r.dut.status.value.toInt(),
+        HarborAdv7511Initializer.statusHotPlug |
+            HarborAdv7511Initializer.statusSense |
+            HarborAdv7511Initializer.statusPllLocked |
+            HarborAdv7511Initializer.statusChipId |
+            HarborAdv7511Initializer.statusValid,
+      );
+      expect(r.passEnds.length, greaterThanOrEqualTo(2));
+      // The next pass starts about [_repeat] clocks after the last one ends.
+      final gap = r.passStarts[1] - r.passEnds[0];
+      expect(gap, inInclusiveRange(_repeat - 4, _repeat + 40));
+      // The bus is released between passes. The gap check counts clocks where
+      // a line is pulled after a pass ended and before the next START.
+      expect(gapBusy, lessThan(2));
+    },
+  );
 
   test('a NACK sets the error flag and the pass still ends', () async {
     final r = await _run(

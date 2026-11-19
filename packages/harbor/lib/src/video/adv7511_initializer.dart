@@ -55,9 +55,10 @@ const adv7511RegisterTable = <(int, int)>[
   (0x2F, 0x77),
 ];
 
-/// The registers that the initializer reads back, in order. The read values
-/// go to the status word.
-const adv7511ReadRegisters = <int>[0x42, 0x9E, 0xF5, 0xF6];
+/// The registers that the initializer reads back, in order. The first four
+/// make the status word. 0x3E holds the detected VIC and 0x3D the detected
+/// timing data, and both go to the readback word as raw bytes.
+const adv7511ReadRegisters = <int>[0x42, 0x9E, 0xF5, 0xF6, 0x3E, 0x3D];
 
 /// Writes the PCA9548 channel select and the ADV7511 registers, and reads
 /// the status back.
@@ -76,7 +77,8 @@ const adv7511ReadRegisters = <int>[0x42, 0x9E, 0xF5, 0xF6];
 /// [status] bits: 0 hot plug detect (0x42 bit 6), 1 monitor sense (0x42
 /// bit 5), 2 PLL locked (0x9E bit 4), 3 chip ID 0x7511 in 0xF5 and 0xF6,
 /// 4 a byte got a NACK in the last pass, 5 a pass ended since the reset.
-/// [passes] counts the finished passes, saturating at 255.
+/// [passes] counts the finished passes, saturating at 255. [vic] and [timing]
+/// are the last read of 0x3E and 0x3D.
 class HarborAdv7511Initializer extends Module {
   static const muxAddress = 0x74;
   static const muxChannel5 = 0x20;
@@ -131,6 +133,12 @@ class HarborAdv7511Initializer extends Module {
   Logic get status => output('status');
   Logic get passes => output('passes');
 
+  /// Raw 0x3E, the detected VIC, from the last read.
+  Logic get vic => output('vic');
+
+  /// Raw 0x3D from the last read.
+  Logic get timing => output('timing');
+
   final int clockFrequency;
   final int i2cFrequency;
   final int repeatCycles;
@@ -172,6 +180,8 @@ class HarborAdv7511Initializer extends Module {
     addOutput('sda_oe');
     addOutput('status', width: 8);
     addOutput('passes', width: 8);
+    addOutput('vic', width: 8);
+    addOutput('timing', width: 8);
 
     final quarter = math.max(2, clockFrequency ~/ (i2cFrequency * 4));
     final divW = math.max(1, (quarter - 1).bitLength);
@@ -188,7 +198,10 @@ class HarborAdv7511Initializer extends Module {
     final q = Logic(name: 'q', width: 2);
     final bitn = Logic(name: 'bitn', width: 4);
     final rx = Logic(name: 'rx', width: 8);
-    final regs = [for (var i = 0; i < 4; i++) Logic(name: 'rd$i', width: 8)];
+    final regs = [
+      for (var i = 0; i < adv7511ReadRegisters.length; i++)
+        Logic(name: 'rd$i', width: 8),
+    ];
     final nackNow = Logic(name: 'nack_now');
     final sclLow = Logic(name: 'scl_low');
     final sdaLow = Logic(name: 'sda_low');
@@ -329,7 +342,7 @@ class HarborAdv7511Initializer extends Module {
                             If(
                               isRead & ack,
                               then: [
-                                for (var i = 0; i < 4; i++)
+                                for (var i = 0; i < regs.length; i++)
                                   If(data.eq(i), then: [regs[i] < rx]),
                               ],
                             ),
@@ -373,6 +386,8 @@ class HarborAdv7511Initializer extends Module {
     sdaOe <= sdaLow;
     status <= statusReg;
     passes <= passReg;
+    vic <= regs[4];
+    timing <= regs[5];
   }
 }
 

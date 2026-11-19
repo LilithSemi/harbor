@@ -60,6 +60,7 @@ enum HarborFramebufferPlacement {
 /// | 0x58   | FORMAT      | rw     | pixel format code in use, see [harborPixelFormatBitOrder] |
 /// | 0x60   | FORMATS     | ro     | bit n is set when format code n is supported |
 /// | 0x68   | UNDERRUN_COUNT | ro  | 15:0 underruns since reset, saturating |
+/// | 0x78   | ADV7511_STATUS | ro  | adv7511 build only, else 0. 7:0 status, 15:8 finished passes, 23:16 register 0x3E, 31:24 register 0x3D. See [HarborAdv7511Initializer.status] |
 ///
 /// With [fabricMemory] the display reads the framebuffer through a memory
 /// master port `fb` of the fabric kind, with bursts of [burstBeats] beats, so
@@ -123,6 +124,7 @@ class HarborScanoutDisplay extends BridgeModule
   static const formatOffset = 0x58;
   static const formatsOffset = 0x60;
   static const underrunCountOffset = 0x68;
+  static const adv7511StatusOffset = 0x78;
 
   /// STATUS bit: the display took the enable bit.
   static const statusRunning = 1 << 0;
@@ -718,6 +720,16 @@ class HarborScanoutDisplay extends BridgeModule
         CaseItem(Const(underrunCountOffset, width: 12), [
           readData < (lineCount ?? underrunCounter).zeroExtend(32),
         ]),
+        if (initializer != null)
+          CaseItem(Const(adv7511StatusOffset, width: 12), [
+            readData <
+                [
+                  initializer!.timing,
+                  initializer!.vic,
+                  initializer!.passes,
+                  initializer!.status,
+                ].concat(),
+          ]),
       ]),
     ]);
 
