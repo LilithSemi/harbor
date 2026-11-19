@@ -91,6 +91,54 @@ void main() {
     );
   });
 
+  test('ddr3Controller rate is exact to the realised Hz', () {
+    final ck300 = HarborSoC(
+      name: 'Ck300Soc',
+      compatible: 'test,ck300',
+      target: HarborBoard.get(
+        'kc705',
+      ).fpgaTarget(pins: ['clk', 'clk_n', 'uart_tx', 'uart_rx']),
+      clocks: [_core(), _bus(75000000)],
+      xilinxDdr3Tree: const XilinxDdr3TreeSpec.kc705(
+        coreClkHz: 50000000,
+        ddrCkHz: 300000000,
+      ),
+    );
+    expect(ck300.clockDomain('bus')!.config.frequency, 75000000);
+    expect(
+      () => _kc705(clocks: [_core(), _bus(83333433)]),
+      throwsA(isA<StateError>()),
+    );
+  });
+
+  test(
+    'ddr3Controller reset is high before the DDR lock and low after',
+    () async {
+      final soc = _kc705(clocks: [_core(), _bus(83333333)]);
+      final d = soc.clockDomain('bus')!;
+      final tree = soc.xilinxDdr3Clocks!;
+      final clk = SimpleClockGenerator(10).clk;
+      soc.input('clk').srcConnection! <= clk;
+      soc.input('clk_n').srcConnection! <= Logic();
+      await soc.build();
+      // The tree is a black box in sim, so the test drives its outputs.
+      tree.locked.put(0);
+      final seen = <String, LogicValue>{};
+      for (var t = 0; t < 200; t++) {
+        Simulator.registerAction(t * 6, () {
+          tree.controllerClk.put(t.isEven ? 1 : 0);
+          if (t == 100) tree.locked.put(1);
+          if (t == 90) seen['before'] = d.reset.value;
+          if (t == 150) seen['after'] = d.reset.value;
+        });
+      }
+      Simulator.setMaxSimTime(2000);
+      await Simulator.run();
+      expect(seen['before'], isNot(LogicValue.zero));
+      expect(seen['after'], LogicValue.zero);
+    },
+  );
+
   group('addClockDomainFromNet', () {
     HarborSoC sim() => HarborSoC(
       name: 'NetClockSoc',
@@ -98,7 +146,17 @@ void main() {
       target: const HarborSimTarget(frequency: 50000000),
     );
 
-    test('reset stays high until locked rises', () async {
+    /// Builds a SoC with one net domain, runs it, and calls [check] with the
+    /// SoC reset and lock inputs. The domain reset is read once the clocks run.
+    Future<void> run(
+      Future<void> Function(
+        HarborClockDomain d,
+        Logic clk,
+        Logic reset,
+        Logic locked,
+      )
+      check,
+    ) async {
       final soc = sim();
       final ext = soc.addInput('ext_clk', Logic());
       final lock = soc.addInput('ext_locked', Logic());
@@ -119,16 +177,42 @@ void main() {
       await soc.build();
       Simulator.setMaxSimTime(2000000);
       unawaited(Simulator.run());
-      for (var i = 0; i < 100; i++) {
+      for (var i = 0; i < 20; i++) {
         await clk.nextPosedge;
       }
-      expect(d.reset.value, isNot(LogicValue.zero));
-      locked.inject(1);
-      for (var i = 0; i < 10; i++) {
-        await clk.nextPosedge;
-      }
-      expect(d.reset.value, LogicValue.zero);
+      await check(d, clk, reset, locked);
       await Simulator.endSimulation();
+    }
+
+    test('reset is high before lock and low after', () async {
+      await run((d, clk, reset, locked) async {
+        reset.inject(0);
+        for (var i = 0; i < 20; i++) {
+          await clk.nextPosedge;
+        }
+        expect(d.reset.value, LogicValue.one);
+        locked.inject(1);
+        for (var i = 0; i < 10; i++) {
+          await clk.nextPosedge;
+        }
+        expect(d.reset.value, LogicValue.zero);
+      });
+    });
+
+    test('the SoC reset holds the domain with lock high', () async {
+      await run((d, clk, reset, locked) async {
+        reset.inject(0);
+        locked.inject(1);
+        for (var i = 0; i < 20; i++) {
+          await clk.nextPosedge;
+        }
+        expect(d.reset.value, LogicValue.zero);
+        reset.inject(1);
+        for (var i = 0; i < 5; i++) {
+          await clk.nextPosedge;
+        }
+        expect(d.reset.value, LogicValue.one);
+      });
     });
 
     test('a taken name throws', () {
@@ -138,6 +222,19 @@ void main() {
       expect(
         () => soc.addClockDomainFromNet(cfg, soc.addInput('c1', Logic())),
         throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('a call after buildFabric throws', () {
+      final soc = sim();
+      final ext = soc.addInput('ext_clk', Logic());
+      soc.buildFabric();
+      expect(
+        () => soc.addClockDomainFromNet(
+          HarborClockConfig.fixed(name: 'late', frequency: 25000000),
+          ext,
+        ),
+        throwsA(isA<StateError>()),
       );
     });
 

@@ -394,6 +394,8 @@ class HarborSoC extends BridgeModule {
   /// domain throws at [buildFabric].
   final String? fabricClockDomain;
 
+  bool _fabricBuilt = false;
+
   /// Creates a new SoC.
   ///
   /// Accepts an optional list of [clocks] to generate PLL-derived
@@ -598,15 +600,17 @@ class HarborSoC extends BridgeModule {
 
   /// Adds a clock domain driven by the net [clk], which another block makes.
   /// The rate of [config] must be the real rate of [clk], since the device
-  /// tree and the constraints read it. The reset of the domain holds until
-  /// [locked] is high, or until the lock timer ends. Call it before [build],
-  /// and not for a name that already has a domain.
+  /// tree reads it. This adds no timing constraint: the caller must constrain
+  /// the net, or the module that makes it must be a [HarborClockRateProvider].
+  /// The reset of the domain holds while the SoC hard reset or the soft reset
+  /// is high, and until [locked] is high or the lock timer ends. Call it before
+  /// [buildFabric] and [build], and not for a name that already has a domain.
   HarborClockDomain addClockDomainFromNet(
     HarborClockConfig config,
     Logic clk, {
     Logic? locked,
   }) {
-    if (hasBuilt) {
+    if (hasBuilt || _fabricBuilt) {
       throw StateError(
         'addClockDomainFromNet("${config.name}") was called after build',
       );
@@ -622,6 +626,7 @@ class HarborSoC extends BridgeModule {
       config,
       clk,
       locked: locked,
+      hardReset: _hardReset,
     );
   }
 
@@ -634,7 +639,8 @@ class HarborSoC extends BridgeModule {
       );
     }
     final mhz = tree.controllerClkMhz;
-    if ((config.frequencyMhz - mhz).abs() > mhz * 0.001) {
+    final hz = (mhz * 1e6).round();
+    if ((config.frequency - hz).abs() > hz * config.tolerancePpm / 1e6) {
       throw StateError(
         'clock "${config.name}" is ${config.frequencyMhz.toStringAsFixed(3)} '
         'MHz but the controller clock of the DDR3 tree is '
@@ -1287,6 +1293,7 @@ class HarborSoC extends BridgeModule {
     int? maxGrantCycles = harborDefaultWishboneGrantCap,
     int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
   }) {
+    _fabricBuilt = true;
     _fabricDomain; // throws when fabricClockDomain names no domain
     final errors = validate();
     if (errors.isNotEmpty) {

@@ -214,8 +214,9 @@ class HarborClockConfig with HarborPrettyString {
       buf.writeln('${c}source: $sourceFrequency Hz,');
     }
     if (isPrimary) buf.writeln('${c}primary,');
-    if (source != HarborClockSource.pll)
-      buf.writeln('${c}source: ${source.name},');
+    if (source != HarborClockSource.pll) {
+      buf.writeln('${c}clockSource: ${source.name},');
+    }
     buf.write('$p)');
     return buf.toString();
   }
@@ -382,6 +383,7 @@ class HarborClockGenerator {
     HarborClockConfig config,
     Logic providedClk, {
     Logic? locked,
+    Logic? hardReset,
   }) {
     // Reset hold until the providing PLL is up, BELT-AND-SUSPENDERS: release on
     // (PLL LOCKED) OR (a fixed fallback timer expires), whichever comes first.
@@ -396,16 +398,22 @@ class HarborClockGenerator {
     // anyway. The release is re-synchronised onto [providedClk]. No counter reset.
     // The FPGA INIT=0 power-up value initialises it.
     final lockCnt = Logic(name: '${config.name}_provLockCnt', width: 18);
-    Sequential(inputClk, [
+    // A target that is not an FPGA has no defined power-up value, so the
+    // timer takes the hard reset there.
+    final timerReset = target is HarborFpgaTarget ? null : inputReset;
+    Sequential(inputClk, reset: timerReset, [
       If(~lockCnt[17], then: [lockCnt < lockCnt + 1]),
     ]);
     final timerHold = ~lockCnt[17];
     // Assert while NOT-locked AND timer-not-expired => release on LOCKED or timer.
-    final assertSrc = (locked != null ? (~locked & timerHold) : timerHold)
+    final lockHold = locked != null ? (~locked & timerHold) : timerHold;
+    // [hardReset] holds the domain whatever the lock state.
+    final assertSrc = (hardReset != null ? (lockHold | hardReset) : lockHold)
         .named('${config.name}_provResetHold');
-    // [inputReset] (the raw-pin POR counter) is intentionally NOT mixed in: the
-    // timer above already covers power-up, and dropping it lets that POR counter
-    // DCE so the raw pin feeds ONLY the PLL (the UberDDR3 arrangement).
+    // [inputReset] (the raw-pin POR counter) is intentionally NOT mixed in
+    // unless the caller passes [hardReset]: the timer above already covers
+    // power-up, and dropping it lets that POR counter DCE so the raw pin feeds
+    // ONLY the PLL (the UberDDR3 arrangement).
     final domain = HarborClockDomain(
       config: config,
       clk: providedClk,
