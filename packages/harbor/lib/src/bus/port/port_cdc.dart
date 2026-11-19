@@ -71,9 +71,9 @@ class HarborMemoryWaistCdc extends Module {
   /// The master side sends an epoch bit on top of the request ID, so the
   /// fabric waist of a master crossing has one more ID bit than the device
   /// waist. A give up flips the epoch and drops each response with the old
-  /// one. A response that comes after two give ups looks like a current one,
-  /// so [recoverTimeout] must be longer than the longest time the fabric can
-  /// owe a response.
+  /// one. After two give ups an old response would look current. So the
+  /// fabric side gives up again only after it has seen every response owed
+  /// from the last give up, and stays in recover mode until then.
   final int recoverTimeout;
 
   /// Default of [recoverTimeout].
@@ -556,6 +556,11 @@ class HarborMemoryWaistCdc extends Module {
     // Oldest entries of the write length queue that still get filler data
     // after a timeout.
     final fill = Logic(name: 'filler_writes', width: cntW);
+    // Reads and writes of the old epoch that a give up left owed. The fabric
+    // side gives up again only when both are 0, so an old response cannot
+    // match the epoch after two flips.
+    final goneR = Logic(name: 'gone_reads', width: cntW);
+    final goneW = Logic(name: 'gone_writes', width: cntW);
     addOutput('debug_reads', width: cntW) <= outR;
     addOutput('debug_writes', width: cntW) <= outW;
     addOutput('debug_recover') <= mode;
@@ -622,7 +627,11 @@ class HarborMemoryWaistCdc extends Module {
     final timeouts = Logic(name: 'recover_timeouts', width: 8);
     addOutput('debug_recover_timeouts', width: 8) <= timeouts;
     if (recoverTimeout > 0) {
-      final waiting = mode & (nonZero(outR) | nonZero(outW) | lenQ.popValid);
+      final waiting =
+          mode &
+          (nonZero(outR) | nonZero(outW) | lenQ.popValid) &
+          ~nonZero(goneR) &
+          ~nonZero(goneW);
       final progress = rTake | bTake | wdFire;
       final tw = widthOf(recoverTimeout);
       final timer = Logic(name: 'recover_timer', width: tw);
@@ -655,6 +664,16 @@ class HarborMemoryWaistCdc extends Module {
       If.block([
         Iff(expire, [fill < lenQ.count]),
         ElseIf(wdLastFire & nonZero(fill), [fill < fill - 1]),
+      ]),
+      If.block([
+        Iff(expire, [goneR < outR]),
+        ElseIf(rTake & rOld & dn.rdataLast & nonZero(goneR), [
+          goneR < goneR - 1,
+        ]),
+      ]),
+      If.block([
+        Iff(expire, [goneW < outW]),
+        ElseIf(bTake & bOld & nonZero(goneW), [goneW < goneW - 1]),
       ]),
       If.block([
         Iff(expire, [outR < 0]),

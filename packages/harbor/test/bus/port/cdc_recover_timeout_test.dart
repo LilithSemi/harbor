@@ -312,7 +312,7 @@ Future<void> _otherId() async {
   await b.end();
 }
 
-/// Two give ups in a row. The epoch goes back to the first one, and the
+/// Two give ups, with the late answer of the first read between them. The epoch goes back to the first one, and the
 /// requests after the second still work.
 Future<void> _twice() async {
   final b = await _Bench.start(_timeout);
@@ -321,6 +321,8 @@ Future<void> _twice() async {
   await b.reset();
   await b.req(0, 0, 0x200);
   await b.until(() => b.ar.length == 2);
+  // The late answer of the first read must come before a second give up.
+  await b.rResp(b.ar[0].id, 0xdead);
   await b.reset();
   await b.req(0, 0, 0x300);
   await b.until(() => b.ar.length == 3);
@@ -329,6 +331,41 @@ Future<void> _twice() async {
   await b.rResp(b.ar[2].id, 0x33);
   await b.fall(20);
   must(b.rGot, [(id: 0, data: 0x33)]);
+  await b.end();
+}
+
+/// The first give up leaves read A owed. A second device reset must not
+/// give up again, or A's late response would look like the answer to a new
+/// read. The crossing stays in recover mode, takes A and the second read B
+/// as dropped responses, and then the new read C is answered once.
+Future<void> _aliasAfterSecondReset() async {
+  final b = await _Bench.start(_timeout);
+  await b.req(0, 0, 0x100);
+  await b.until(() => b.ar.isNotEmpty);
+  await b.reset();
+  await b.req(0, 0, 0x200);
+  await b.until(() => b.ar.length == 2);
+  must(b.timeouts, 1);
+  await b.reset();
+  await b.req(0, 0, 0x300);
+  await b.fall(_timeout * 4);
+  must(b.ar.length, 2, reason: 'no second give up while A is owed');
+  must(b.timeouts, 1);
+  await b.rResp(b.ar[0].id, 0xdead);
+  await b.rResp(b.ar[1].id, 0xbad);
+  await b.until(() => b.ar.length == 3);
+  must(b.ar.length, 3, reason: 'recover ends after the owed responses');
+  must(b.ar[2].addr, 0x300);
+  await b.rResp(b.ar[2].id, 0xbeef);
+  await b.fall(20);
+  must(b.rGot, [(id: 0, data: 0xbeef)]);
+  must(b.timeouts, 1);
+  // The R path is not stuck: another read works.
+  await b.req(0, 0, 0x400);
+  await b.until(() => b.ar.length == 4);
+  await b.rResp(b.ar[3].id, 0x44);
+  await b.fall(20);
+  must(b.rGot.last, (id: 0, data: 0x44));
   await b.end();
 }
 
@@ -365,6 +402,10 @@ void main() {
   test('a late burst is dropped', () => isolated(_staleBurst));
   test('a live ID works while another ID is stale', () => isolated(_otherId));
   test('a second give up flips the epoch back', () => isolated(_twice));
+  test(
+    'no second give up while old responses are owed',
+    () => isolated(_aliasAfterSecondReset),
+  );
   test('recoverTimeout 0 never gives up', () => isolated(_noLimit));
 
   test('a negative recoverTimeout names the field', () {
