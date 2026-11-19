@@ -776,6 +776,7 @@ class HarborGtxPciePhy extends Module {
     final lostK = Logic(name: 'fail_lost_k');
     final rateK = Logic(name: 'fail_rate_k');
     final wdK = Logic(name: 'fail_wd_k');
+    final wdPend = Logic(name: 'fail_wd_pend');
     final tmoQ = Logic(name: 'fail_tmo_q');
     final lostQ = Logic(name: 'fail_lost_q');
     final rateQf = Logic(name: 'fail_rate_q');
@@ -987,7 +988,9 @@ class HarborGtxPciePhy extends Module {
       wdK <
           (restartPulse == null
               ? Const(0)
-              : restartPulse & ~blockQ & ~wdK & ~wdQ),
+              : restartPulse & ~blockQ & ~wdK & ~wdQ & ~wdPend),
+      // One restart pulse counts once, however long it stays high.
+      wdPend < ((wdPend | wdK) & (restartPulse ?? Const(0))),
       // The cause is taken when the decision is made, and moves on with it.
       causeSync1 < (~rateD & orAll(syncStates)),
       code1 < mux(rateD, codeOf(_S.rateChange), stateCode),

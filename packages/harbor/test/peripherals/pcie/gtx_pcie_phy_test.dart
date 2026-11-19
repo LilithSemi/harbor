@@ -1060,6 +1060,20 @@ void main() {
       await b.finish();
     });
 
+    test('one watchdog event counts once', () async {
+      final b = await _Bench.start(linkWait: 400);
+      b.link(_detectQuiet);
+      await b.waitFor(_S.idle);
+      final retrains = b.phy.linkRetrains!;
+      await b.until(() => retrains.value.toInt() > 0, limit: 1000);
+      await b.waitFor(_S.cpllReset, limit: 50);
+      await b.waitFor(_S.idle);
+      await b.cycles(30);
+      expect(retrains.value.toInt(), 1);
+      expect(b.retries, 0);
+      await b.finish();
+    });
+
     test('link up stops the restarts', () async {
       final b = await _Bench.start(linkWait: 400);
       b.link(_detectQuiet);
