@@ -64,6 +64,13 @@ class HarborDdrConfig with HarborPrettyString {
   /// lane `dmRemapping[l]`. Null means pad `l` carries lane `l`.
   final List<int>? dmRemapping;
 
+  /// Puts one register on the ISERDES returns of a Xilinx PHY, next to the I/O
+  /// column. The controller logic can be far from there, and one cycle is not
+  /// long enough for that route at 83 MHz. The read calibration absorbs the
+  /// extra cycle. Ignored with the CK/8 controller, where the gearbox already
+  /// registers the returns.
+  final bool readReturnStage;
+
   const HarborDdrConfig({
     required this.type,
     required this.size,
@@ -76,6 +83,7 @@ class HarborDdrConfig with HarborPrettyString {
     this.casLatency = 6,
     this.density = DdrDensity.gb2,
     this.dmRemapping,
+    this.readReturnStage = false,
   });
 
   /// OrangeCrab r0.2 DDR3 config: Micron MT41K64M16, 1 Gb (128MB, 16-bit,
@@ -93,7 +101,8 @@ class HarborDdrConfig with HarborPrettyString {
       colWidth = 10,
       casLatency = 6,
       density = DdrDensity.gb1,
-      dmRemapping = const [1, 0];
+      dmRemapping = const [1, 0],
+      readReturnStage = false;
 
   /// Arty S7 DDR3L config: Micron MT41K128M16, 2 Gb (256MB, 16-bit, 333 MHz).
   /// 16K rows, 1K columns, 8 banks.
@@ -108,7 +117,8 @@ class HarborDdrConfig with HarborPrettyString {
       colWidth = 10,
       casLatency = 5,
       density = DdrDensity.gb2,
-      dmRemapping = null;
+      dmRemapping = null,
+      readReturnStage = false;
 
   /// Alinx AX7203 DDR3 config: two Micron MT41J256M16HA-125 (4 Gb x16 each)
   /// on a 32-bit bus, 1 GB, 400 MHz (800 MT/s, AX7203 manual p.6 and p.12).
@@ -130,7 +140,36 @@ class HarborDdrConfig with HarborPrettyString {
       colWidth = 10,
       casLatency = 6,
       density = DdrDensity.gb4,
-      dmRemapping = null;
+      dmRemapping = null,
+      readReturnStage = false;
+
+  /// Xilinx KC705 DDR3 config: the 1 GB single rank SODIMM carries eight 1 Gb
+  /// x8 devices on a 64-bit bus, and the controller drives 32 of those bits,
+  /// so 512 MB is usable. Each device has 14 row bits, 10 column bits and 8
+  /// banks. The default [DdrDensity] is kept: tRFC for 1 Gb is shorter, and a
+  /// longer wait between a refresh and the next command is always legal.
+  ///
+  /// [ckHz] is the CK rate. 333.33 MHz is the default. 300 MHz is the other
+  /// supported rate and runs the controller at 75 MHz. JEDEC allows a DLL on
+  /// tCK(avg) of 3.3 ns at most, and 300 MHz is 3.33 ns, so it is slightly
+  /// slower than the DLL range. Every timing in [DdrTiming] is in ns or in nCK
+  /// from [ckHz], so it stays legal at both rates with CL 6 and CWL 5.
+  ///
+  /// [readReturnStage] is on, because on this board the controller is placed
+  /// far from the DQ pins.
+  const HarborDdrConfig.kc705({int ckHz = 333333333})
+    : type = HarborDdrType.ddr3,
+      size = 512 * 1024 * 1024,
+      dataWidth = 32,
+      frequency = ckHz,
+      ranks = 1,
+      banks = 8,
+      rowWidth = 14,
+      colWidth = 10,
+      casLatency = 6,
+      density = DdrDensity.gb2,
+      dmRemapping = null,
+      readReturnStage = true;
 
   /// Frequency in MHz.
   double get frequencyMhz => frequency / 1e6;

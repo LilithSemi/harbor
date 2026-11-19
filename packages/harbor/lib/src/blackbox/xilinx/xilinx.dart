@@ -273,6 +273,17 @@ class XilinxDdr3TreeSpec {
     this.dqsPhaseDeg = 180.0,
     this.ddrGearRatio = 1,
   });
+
+  /// The KC705 tree from its 200 MHz oscillator. [ckHz] is 333.33 MHz or 300
+  /// MHz. At 300 MHz the VCO is 1200 MHz and the divides are exact: CK/4, the
+  /// controller clock, is 75 MHz and the IDELAYCTRL reference is 200 MHz.
+  const XilinxDdr3TreeSpec.kc705({
+    required this.coreClkHz,
+    this.ddrCkHz = 333333333,
+  }) : sourceHz = 200000000,
+       idelayRefHz = 200000000,
+       dqsPhaseDeg = 180.0,
+       ddrGearRatio = 1;
 }
 
 /// Solves one 7-series MMCME2 VCO for the four DDR3 clocks: DDR CK (fractional

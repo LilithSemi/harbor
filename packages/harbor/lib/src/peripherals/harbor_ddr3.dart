@@ -26,6 +26,7 @@ import 'ddr3_params.dart';
 import 'ddr3_phy.dart';
 import 'ddr3_phy_base.dart';
 import 'ddr3_phy_ecp5.dart';
+import 'ddr3_read_return_stage.dart';
 import 'memory_waist_beats.dart';
 import 'sim_dram.dart';
 
@@ -615,6 +616,7 @@ class HarborDdr3 extends BridgeModule
       return 'HarborDdr3_${phy}_s${config.size}_a${busAddressWidth}'
           '_d${busDataWidth}_ck${ckPeriodPs}_g$controllerGearRatio'
           '${runtimeTrainable ? '_rt' : ''}${writeCombine ? '_wc' : ''}$dm'
+          '${config.readReturnStage ? '_rr' : ''}'
           '_${protocol.name}_i${idWidth}_n${outstanding}_q$cdc$burst'
           '${fastSim ? '_fast' : ''}'
           '${powerOnCycles != 4095 ? '_p$powerOnCycles' : ''}';
@@ -634,6 +636,7 @@ class HarborDdr3 extends BridgeModule
             'b${c.banks}r${c.rowWidth}c${c.colWidth}l${c.casLatency}'
             '${c.density.name}',
         if (ecp5 && c.dmRemapping != null) 'dm${c.dmRemapping!.join()}',
+        if (c.readReturnStage) 'rr',
         'rw$readWords',
         'rg$readGap',
         if (fastSim) 'fast',
@@ -1370,10 +1373,23 @@ struct DramStore {
       phyDqs <= gb.output('o_c_iserdes_dqs');
       phyBsRef <= gb.output('o_c_iserdes_bitslip_reference');
     } else {
-      // gearRatio 1: direct controller<->PHY (byte-identical to the CK/4 stack).
-      phyData <= phy.iserdesData;
-      phyDqs <= phy.iserdesDqs;
-      phyBsRef <= phy.iserdesBitslipReference;
+      // gearRatio 1: direct controller<->PHY (byte-identical to the CK/4 stack),
+      // or one register stage on the returns when the config asks for it.
+      if (config.readReturnStage && !isEcp5) {
+        final stage = Ddr3ReadReturnStage(
+          clk: serdesClk,
+          data: phy.iserdesData,
+          dqs: phy.iserdesDqs,
+          bitslipReference: phy.iserdesBitslipReference,
+        );
+        phyData <= stage.data;
+        phyDqs <= stage.dqs;
+        phyBsRef <= stage.bitslipReference;
+      } else {
+        phyData <= phy.iserdesData;
+        phyDqs <= phy.iserdesDqs;
+        phyBsRef <= phy.iserdesBitslipReference;
+      }
     }
     phyRdy <= phy.idelayctrlRdy;
 
