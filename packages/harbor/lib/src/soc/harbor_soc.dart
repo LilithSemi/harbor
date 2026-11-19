@@ -239,11 +239,25 @@ class HarborSoC extends BridgeModule {
       return _clockDomains[clockDomainName];
     }
     if (_clockDomains.isEmpty) return null;
-    // Mirrors [defaultClock]: the conventional 'sys' bus domain, else the first
-    // registered one. NOT "the primary domain": on a SoC where sys is a CLKOS
-    // secondary those are different clocks, and picking the wrong one emits a
-    // plausible but wrong rate.
-    return _clockDomains['sys'] ?? _clockDomains.values.first;
+    return _fabricDomain;
+  }
+
+  /// The domain of the fabric and of every peripheral with no domain name.
+  ///
+  /// This is [fabricClockDomain] when it is set. Otherwise it is the
+  /// conventional 'sys' domain, else the first registered one. It is not the
+  /// primary domain: when sys is a CLKOS secondary, those are different
+  /// clocks. It is null when no domains exist.
+  HarborClockDomain? get _fabricDomain {
+    final name = fabricClockDomain;
+    if (name != null) {
+      return _clockDomains[name] ??
+          (throw StateError(
+            '$name: fabricClockDomain "$name" is not a clock domain '
+            '(domains: ${_clockDomains.keys.join(', ')})',
+          ));
+    }
+    return _clockDomains['sys'] ?? _clockDomains.values.firstOrNull;
   }
 
   late final HarborClockGenerator _clockGen;
@@ -374,6 +388,12 @@ class HarborSoC extends BridgeModule {
   /// The reservation granule of the memory exclusive monitors, in bytes.
   final int exclusiveGranuleBytes;
 
+  /// The name of the clock domain of the fabric, or null for the default.
+  ///
+  /// The default is the sys domain, else the first domain. A name with no
+  /// domain throws at [buildFabric].
+  final String? fabricClockDomain;
+
   /// Creates a new SoC.
   ///
   /// Accepts an optional list of [clocks] to generate PLL-derived
@@ -401,6 +421,7 @@ class HarborSoC extends BridgeModule {
     this.exclusiveGranuleBytes = HarborExclusive.defaultGranuleBytes,
     List<HarborClockConfig> clocks = const [],
     XilinxDdr3TreeSpec? xilinxDdr3Tree,
+    this.fabricClockDomain,
   }) : model = model ?? name,
        _explicitModel = model,
        super(name, name: name) {
@@ -768,13 +789,8 @@ class HarborSoC extends BridgeModule {
   /// If clock domains are configured, returns the first domain.
   /// Otherwise returns the raw input clock and reset.
   (Logic clk, Logic reset) get defaultClock {
-    if (_clockDomains.isNotEmpty) {
-      // Prefer the conventional 'sys' bus domain: it may not be the first
-      // registered entry when it is a CLKOS secondary of another PLL, and fall
-      // back to the first domain otherwise.
-      final d = _clockDomains['sys'] ?? _clockDomains.values.first;
-      return (d.clk, d.reset);
-    }
+    final d = _fabricDomain;
+    if (d != null) return (d.clk, d.reset);
     return (_boardClk, _systemReset);
   }
 
@@ -1103,14 +1119,10 @@ class HarborSoC extends BridgeModule {
         .where((e) => identical(e.module, peripheral))
         .firstOrNull;
     final domainName = entry?.clockDomainName;
-    // A peripheral with no explicit domain is wired to [defaultClock] (the
-    // 'sys' bus domain when present), NOT the primary input clock. Resolve the
-    // same fallback so the reported clock matches the one the peripheral's bus
-    // is actually clocked by, which is what a sim model must sample.
-    final domain =
-        (domainName != null ? _clockDomains[domainName] : null) ??
-        _clockDomains['sys'] ??
-        _clockDomains.values.firstOrNull;
+    // A peripheral with no explicit domain is wired to [defaultClock], not the
+    // primary input clock. [domainFor] gives the clock its bus runs on, which
+    // is what a sim model must sample.
+    final domain = domainFor(domainName);
     if (domain == null || domain.config.isPrimary) {
       return (port: 'clk', hz: primaryHz);
     }
@@ -1275,6 +1287,7 @@ class HarborSoC extends BridgeModule {
     int? maxGrantCycles = harborDefaultWishboneGrantCap,
     int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
   }) {
+    _fabricDomain; // throws when fabricClockDomain names no domain
     final errors = validate();
     if (errors.isNotEmpty) {
       throw StateError('Validation errors in $name:\n${errors.join("\n")}');
