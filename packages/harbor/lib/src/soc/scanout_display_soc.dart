@@ -439,6 +439,9 @@ extension HarborSocScanoutDisplay on HarborSoC {
   /// bytes rounded up to [burstBeats] words of the bus.
   ///
   /// [memory] is the address range of a memory that the display reads.
+  /// [memoryBytesPerSecond] is the rate of the memory port. An adv7511 build
+  /// without it takes [busDataWidth] times the bus clock, and the build throws
+  /// when a format needs more than [maxBandwidthShare] of it.
   /// [busDataWidth] is the width of the fabric.
   HarborScanoutDisplay addFabricScanoutDisplay({
     required BusAddressRange memory,
@@ -602,23 +605,26 @@ extension HarborSocScanoutDisplay on HarborSoC {
       hSyncPositive: timing.hSyncPositive,
       vSyncPositive: timing.vSyncPositive,
     );
-    if (memoryBytesPerSecond != null) {
+    final busHz = domainFor(null)?.config.frequency;
+    final portRate =
+        memoryBytesPerSecond ??
+        (adv7511 && busHz != null ? busDataWidth ~/ 8 * busHz : null);
+    if (portRate != null) {
       for (final f in fmts) {
         final need =
             f.lineBytes(0, mode.hActive) * mode.vActive * mode.refreshRate;
-        if (need > memoryBytesPerSecond * maxBandwidthShare) {
+        if (need > portRate * maxBandwidthShare) {
           throw ArgumentError(
             '${mode.resolution} ${f.name} needs '
             '${(need / 1e6).toStringAsFixed(1)} MB/s, which is more than '
             '${(maxBandwidthShare * 100).toStringAsFixed(0)}% of the '
-            '${(memoryBytesPerSecond / 1e6).toStringAsFixed(1)} MB/s of the '
+            '${(portRate / 1e6).toStringAsFixed(1)} MB/s of the '
             'memory port',
           );
         }
       }
     }
 
-    final busHz = domainFor(null)?.config.frequency;
     final display = addPeripheral(
       HarborScanoutDisplay(
         baseAddress: baseAddress,

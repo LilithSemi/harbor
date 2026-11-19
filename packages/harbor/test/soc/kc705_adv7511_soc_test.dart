@@ -51,7 +51,7 @@ const _hdmiPins = {
 HarborSoC _soc(
   HarborFpgaTarget target, {
   HarborDisplayTiming timing = const HarborDisplayTiming.xga1024x768(),
-  List<HarborPixelFormat>? formats,
+  List<HarborPixelFormat> formats = const [HarborPixelFormat.rgb565],
   int? memoryBytesPerSecond,
   int sysHz = 50000000,
 }) {
@@ -260,25 +260,16 @@ void main() {
 
   group('bandwidth of the memory port', () {
     final target = board.fpgaTarget(useHimbaechel: true, extraPins: _ddrExtra);
-    // 32 bits at 50 MHz.
-    const port = 200000000;
 
-    test('xrgb8888 at 1024x768 is over the limit', () {
+    test('xrgb8888 at 1024x768 throws on a 32 bit 50 MHz bus by default', () {
       expect(
-        () => _soc(target, memoryBytesPerSecond: port),
+        () => _soc(target, formats: const [HarborPixelFormat.xrgb8888]),
         throwsArgumentError,
       );
     });
 
     test('rgb565 at 1024x768 fits', () {
-      expect(
-        () => _soc(
-          target,
-          formats: const [HarborPixelFormat.rgb565],
-          memoryBytesPerSecond: port,
-        ),
-        returnsNormally,
-      );
+      expect(() => _soc(target), returnsNormally);
     });
 
     test('xrgb8888 at 800x600 fits', () {
@@ -286,10 +277,54 @@ void main() {
         () => _soc(
           target,
           timing: const HarborDisplayTiming.svga800x600(),
-          memoryBytesPerSecond: port,
+          formats: const [HarborPixelFormat.xrgb8888],
         ),
         returnsNormally,
       );
     });
+
+    test('a faster port takes xrgb8888 at 1024x768', () {
+      expect(
+        () => _soc(
+          target,
+          formats: const [HarborPixelFormat.xrgb8888],
+          memoryBytesPerSecond: 400000000,
+        ),
+        returnsNormally,
+      );
+    });
+  });
+
+  test('the display master reaches the read channel 1 of the DDR3', () async {
+    final soc = _soc(
+      board.fpgaTarget(useHimbaechel: true, extraPins: _ddrExtra),
+    );
+    soc.buildFabric();
+    final fabric = soc.fabrics.single as HarborAxi4Fabric;
+    final ddrSlave = fabric.slaves.singleWhere((s) => s.readChannels > 1);
+    expect(ddrSlave.readChannels, 2);
+    final display = fabric.masters.singleWhere(
+      (m) => m.name.contains('display'),
+    );
+    expect(display.readChannel, 1);
+    expect(display.reaches(ddrSlave.name), isTrue);
+    await soc.build();
+    final sv = soc.dumpSystemVerilog();
+    // The DDR3 r1 port is wired to the fabric r1 output, and the fabric
+    // takes the display fb port as its master.
+    expect(sv, contains('.bus_r1_ARVALID(ddr3_r1_ARVALID)'));
+    expect(sv, contains('.ddr3_r1_ARVALID(ddr3_r1_ARVALID)'));
+    expect(sv, contains('.display_fb_ARVALID(fb_ARVALID)'));
+    expect(sv, contains('.bus_r1_ARADDR(ddr3_r1_ARADDR)'));
+    expect(sv, contains('assign ddr3_r1_ARVALID = ddr3_r1_ar_pop;'));
+  });
+
+  test('the register block has the ADV7511 status register', () {
+    expect(rtl, contains("12'h78"));
+  });
+
+  test('the clock module names its definition by rate', () {
+    expect(rtl, contains('HarborAdv7511Clocks_130000000_200000000_b_18'));
+    expect(rtl, contains('.CLKOUT1_DIVIDE'));
   });
 }
