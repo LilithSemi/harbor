@@ -341,6 +341,36 @@ Future<void> _arHang(HarborFabricTopology t) async {
   must(b.errors, isEmpty);
 }
 
+// Two silent slaves are both cut off. The count is 2, and the slave that
+// answers still works.
+Future<void> _twoCutOff(HarborFabricTopology t) async {
+  final b = await Bench.start(
+    t,
+    stall: 0.2,
+    masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
+    slaves: const [
+      SlaveCfg('s0', 5, 4, 0x00000, 0x10000),
+      SlaveCfg('s1', 2, 2, 0x10000, 0x10000, timeout: 50),
+      SlaveCfg('s2', 2, 2, 0x20000, 0x10000, timeout: 50),
+    ],
+  );
+  final m0 = b.managers['m0']!;
+  final m1 = b.managers['m1']!;
+  b.memories['s1']!.ar.gate = () => false;
+  b.memories['s2']!.ar.gate = () => false;
+  must(b.timeoutCount(), 0);
+  m0
+    ..read(rd(1, 0x10000, 1))
+    ..read(rd(1, 0x20000, 1));
+  m1.read(rd(4, 0x0100, 1));
+  await b.drain(limit: 4000);
+  await b.sim.stop();
+  must(b.timeoutCount(), 2);
+  must(m0.rBeats.map((x) => x.$3).toList(), [2, 2, 2, 2]);
+  must(m1.rBeats.map((x) => x.$3).toList(), [0, 0]);
+  must(b.errors, isEmpty);
+}
+
 // A slave that takes AW but never takes W is cut off. The write gets SLVERR,
 // and writes to the other slave, queued behind it, still finish.
 Future<void> _wHang(HarborFabricTopology t) async {
@@ -546,6 +576,11 @@ void main() {
       test(
         'a slave that never takes AR is cut off',
         () => isolated(() => _arHang(t)),
+        timeout: long,
+      );
+      test(
+        'two silent slaves count 2',
+        () => isolated(() => _twoCutOff(t)),
         timeout: long,
       );
       test(

@@ -155,17 +155,27 @@ class HarborSoC extends BridgeModule {
     return port;
   }
 
+  Logic? _busTimeouts;
+
   /// Adds a `bus_timeouts` output (or [portName]) with the number of slaves
   /// that a bus timeout cut off since reset, summed over every fabric. It is
-  /// 8 bits wide and saturates at 255. Call it after [buildFabric].
+  /// 8 bits wide and saturates at 255. [buildFabric] adds it as `bus_timeouts`
+  /// when any slave has a timeout, and a later call returns that port.
   Logic exposeBusTimeouts({String portName = 'bus_timeouts'}) {
     if (fabrics.isEmpty) {
       throw StateError('exposeBusTimeouts needs buildFabric first');
+    }
+    if (_busTimeouts case final done?) {
+      if (portName != done.name) {
+        throw StateError('bus timeouts are already on ${done.name}');
+      }
+      return done;
     }
     final total = fabrics
         .map((f) => f.timeoutCount.zeroExtend(9))
         .reduce((a, b) => a + b);
     final port = addOutput(portName, width: 8);
+    _busTimeouts = port;
     port <=
         mux(
           total.gte(Const(255, width: 9)),
@@ -1191,6 +1201,8 @@ class HarborSoC extends BridgeModule {
   /// again. A board that lets a master such as PCIe DMA reach DDR3 early
   /// passes a long [addPeripheral] `busTimeoutCycles` for that memory, so the
   /// master gets an error response instead of waiting for ever.
+  /// A fabric with a timeout on any slave adds the `bus_timeouts` output (see
+  /// [exposeBusTimeouts]).
   /// [maxGrantCycles] sets the Wishbone grant hold cap (see
   /// [WishboneArbiter.maxGrantCycles]). It is [harborDefaultWishboneGrantCap]
   /// on a Wishbone fabric with two or more masters, so a master that polls
@@ -1450,6 +1462,13 @@ class HarborSoC extends BridgeModule {
       );
     }
 
+    void exposeTimeouts() {
+      if (_busTimeouts == null &&
+          Iterable<int>.generate(slaves.length).any((i) => timeoutOf(i) > 0)) {
+        exposeBusTimeouts();
+      }
+    }
+
     HarborFabricModule build(
       String name,
       HarborFabricTopology topology,
@@ -1482,6 +1501,7 @@ class HarborSoC extends BridgeModule {
         [for (final c in channels) ...masters[c]!],
         [for (var i = 0; i < slaves.length; i++) realSlave(i)],
       );
+      exposeTimeouts();
       return;
     }
 
@@ -1574,6 +1594,7 @@ class HarborSoC extends BridgeModule {
         [realSlave(i)],
       );
     }
+    exposeTimeouts();
   }
 
   // The masters in the order of the one fabric that [buildFabric] builds.

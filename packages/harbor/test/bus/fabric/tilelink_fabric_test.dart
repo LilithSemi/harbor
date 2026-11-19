@@ -230,10 +230,57 @@ Future<void> _timeout(HarborFabricTopology t) async {
   await b.drain(limit: 3000);
   await b.sim.stop();
   must(s1.msgs.length, seen);
+  must(b.timeoutCount(), 1);
   must(after[0].d.map((d) => (d.$5, d.$6)).toList(), [(1, 1)]);
   must(after[1].d.map((d) => (d.$5, d.$6)).toList(), [(1, 0)]);
   must(after[2].d.map((d) => (d.$5, d.$6)).toList(), [(0, 0)]);
   must(b.busError(), 1);
+  must(b.timeoutCount(), 1);
+  must(b.errors, isEmpty);
+}
+
+// Two silent slaves are both cut off. The count is 2, and the slave that
+// answers still works.
+Future<void> _twoCutOff(HarborFabricTopology t) async {
+  final b = await TlBench.start(
+    t,
+    stall: 0,
+    slaves: const [
+      PortCfg('s0', width: 5, outstanding: 4, base: 0x00000, size: 0x8000),
+      PortCfg(
+        's1',
+        width: 2,
+        outstanding: 4,
+        base: 0x10000,
+        size: 0x8000,
+        timeout: 40,
+      ),
+      PortCfg(
+        's2',
+        width: 2,
+        outstanding: 4,
+        base: 0x20000,
+        size: 0x8000,
+        timeout: 40,
+      ),
+    ],
+  );
+  b.memories['s1']!.a.gate = () => false;
+  b.memories['s2']!.a.gate = () => false;
+  must(b.timeoutCount(), 0);
+  final a = get(0x10000, 2);
+  final c = get(0x20000, 2);
+  final ok = get(0x0040, 2);
+  b
+    ..send('m0', a)
+    ..send('m1', c)
+    ..send('m2', ok);
+  await b.drain(limit: 3000);
+  await b.sim.stop();
+  must(a.d.map((d) => (d.$5, d.$6)).toList(), [(1, 1)]);
+  must(c.d.map((d) => (d.$5, d.$6)).toList(), [(1, 1)]);
+  must(ok.d.map((d) => (d.$5, d.$6)).toList(), [(0, 0)]);
+  must(b.timeoutCount(), 2);
   must(b.errors, isEmpty);
 }
 
@@ -308,6 +355,11 @@ void main() {
       test(
         'timeout cuts a slave off and drops late beats',
         () => isolated(() => _timeout(t)),
+        timeout: long,
+      );
+      test(
+        'two silent slaves count 2',
+        () => isolated(() => _twoCutOff(t)),
         timeout: long,
       );
     });

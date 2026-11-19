@@ -508,7 +508,6 @@ void main() {
       soc.addPeripheralSlave(mute, 'bus', const BusAddressRange(0x8000, 4096));
       soc.buildFabric(busTimeoutCycles: 16);
       soc.exposeBusError();
-      soc.exposeBusTimeouts();
       expect(soc.fabric!.busError, isNotNull);
       final (clk, _) = await _start(soc);
       void driveM(String n, int v) => m.input(n).srcConnection!.inject(v);
@@ -560,6 +559,7 @@ void main() {
       soc.addSubModule(slave);
       soc.addPeripheralSlave(slave, 'bus', const BusAddressRange(0, 4096));
       soc.buildFabric();
+      expect(soc.tryOutput('bus_timeouts'), isNull);
       soc.exposeBusError();
       final (clk, _) = await _start(soc);
       void driveM(String n, int v) => m.input(n).srcConnection!.inject(v);
