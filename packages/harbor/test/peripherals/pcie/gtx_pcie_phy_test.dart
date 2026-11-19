@@ -833,6 +833,17 @@ void main() {
       },
     );
 
+    test('one TX sync timeout gives one retry', () async {
+      final b = await _Bench.start(setup: (m) => m.phAlignStuck = true);
+      await b.until(() => b.retries == 1, limit: 400);
+      b.model.phAlignStuck = false;
+      await b.waitFor(_S.idle);
+      await b.cycles(100);
+      expect(b.retries, 1);
+      expect(b.failState, _S.txPhAlign);
+      await b.finish();
+    });
+
     test('lost CPLL lock in idle restarts the sequence', () async {
       final b = await _Bench.start();
       await b.waitFor(_S.idle);
@@ -842,6 +853,8 @@ void main() {
       expect(b.retries, 1);
       expect(b.flags, 0, reason: 'a lock loss is not a timeout');
       await b.waitFor(_S.idle);
+      await b.cycles(100);
+      expect(b.retries, 1);
       expect(b.traceFrom(_S.cpllReset), _goodOrder.sublist(1));
       await b.finish();
     });
@@ -977,17 +990,19 @@ void main() {
       b.pipe.pipeRate.inject(1);
       await b.until(() => b.hi(rateWait), limit: 100);
       final waited = await b.until(() => b.hi(rateFail));
-      // The compare and the failure go through flops, so it is a few cycles
-      // later than the bound.
-      expect(waited, inInclusiveRange(_timeouts.rate - 1, _timeouts.rate + 6));
+      expect(waited, _timeouts.rate);
       await b.waitFor(_S.cpllReset, limit: 200);
       expect(b.failState, _S.rateChange);
       expect(b.flags, 16);
       expect(b.retries, 1);
+      b.model.rateStuck = false;
       // The restart goes back to 2.5 GT/s with the 125 MHz clock.
       await b.cycles(3);
       expect(b.phy.pclkSel.value.toInt(), 0);
       expect(b.channel.port('TXRATE').value.toInt(), 0);
+      await b.waitFor(_S.idle);
+      await b.cycles(200);
+      expect(b.retries, 1);
       await b.finish();
     });
 
