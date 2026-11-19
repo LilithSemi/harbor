@@ -24,7 +24,7 @@ void main() {
           name: 'sys',
           rate: HarborFixedClockRate(100000000),
           sourceFrequency: 100000000,
-          providedByDdr3Tree: true,
+          source: HarborClockSource.ddr3Core,
         ),
       ],
       xilinxDdr3Tree: const XilinxDdr3TreeSpec(

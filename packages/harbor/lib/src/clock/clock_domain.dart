@@ -67,6 +67,20 @@ class HarborDynamicClockRate extends HarborClockRate {
       '(nom ${(nominalFrequency / 1e6).toStringAsFixed(0)} MHz)';
 }
 
+/// Where the clock of a [HarborClockConfig] comes from.
+enum HarborClockSource {
+  /// A PLL or MMCM of the clock generator, or the input clock itself.
+  pll,
+
+  /// The separate core PLL beside the Xilinx DDR3 clock tree. The SoC needs an
+  /// `xilinxDdr3Tree`.
+  ddr3Core,
+
+  /// The controller clock of the DDR3 clock tree, which is also the `ddr_clk`
+  /// of the DDR3 controller. The rate of the config must be its real rate.
+  ddr3Controller,
+}
+
 /// Configuration for a clock domain.
 ///
 /// Describes the desired frequency (fixed or dynamic) and relationship
@@ -111,13 +125,8 @@ class HarborClockConfig with HarborPrettyString {
   /// domains, see [HarborClockGenerator.createDomainWithSecondary].
   final ({String name, int frequency, int tolerancePpm})? coClkosSecondary;
 
-  /// Run this domain off the shared Xilinx DDR3-fast clock tree's spare core
-  /// CLKOUT instead of a dedicated PLL/MMCM. On a single-oscillator board (Arty
-  /// S7) a second MMCM on the raw clock pin cannot share the pin's one dedicated
-  /// clock-capable route, so the core clock is folded onto a spare output of the
-  /// DDR MMCM. When set, [HarborSoC] must be built with an `xilinxDdr3Tree` spec.
-  /// The domain is then clocked by that tree's `coreClk`. Ignored otherwise.
-  final bool providedByDdr3Tree;
+  /// Where the clock of this domain comes from. See [HarborClockSource].
+  final HarborClockSource source;
 
   /// Allowed error of the achieved frequency, in parts per million. 0 (the
   /// default) demands an exact PLL solution. A pixel clock may set this.
@@ -131,7 +140,7 @@ class HarborClockConfig with HarborPrettyString {
     this.isPrimary = false,
     this.forcePll = false,
     this.coClkosSecondary,
-    this.providedByDdr3Tree = false,
+    this.source = HarborClockSource.pll,
     this.tolerancePpm = 0,
   });
 
@@ -205,6 +214,8 @@ class HarborClockConfig with HarborPrettyString {
       buf.writeln('${c}source: $sourceFrequency Hz,');
     }
     if (isPrimary) buf.writeln('${c}primary,');
+    if (source != HarborClockSource.pll)
+      buf.writeln('${c}source: ${source.name},');
     buf.write('$p)');
     return buf.toString();
   }

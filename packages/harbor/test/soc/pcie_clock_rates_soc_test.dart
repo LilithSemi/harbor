@@ -133,7 +133,9 @@ Future<Directory> _generateDirect({
         name: 'sys',
         rate: const HarborFixedClockRate(100000000),
         sourceFrequency: 200000000,
-        providedByDdr3Tree: tree != null,
+        source: tree != null
+            ? HarborClockSource.ddr3Core
+            : HarborClockSource.pll,
       ),
       if (tree != null)
         const HarborClockConfig(

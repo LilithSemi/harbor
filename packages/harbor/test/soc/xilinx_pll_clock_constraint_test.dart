@@ -114,7 +114,7 @@ void main() {
             name: 'sys',
             rate: HarborFixedClockRate(100000000),
             sourceFrequency: 200000000,
-            providedByDdr3Tree: true,
+            source: HarborClockSource.ddr3Core,
           ),
           HarborClockConfig(
             name: 'aux',

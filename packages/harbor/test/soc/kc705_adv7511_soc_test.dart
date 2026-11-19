@@ -66,7 +66,7 @@ HarborSoC _soc(
         name: 'sys',
         rate: HarborFixedClockRate(sysHz),
         sourceFrequency: 200000000,
-        providedByDdr3Tree: true,
+        source: HarborClockSource.ddr3Core,
       ),
     ],
     xilinxDdr3Tree: XilinxDdr3TreeSpec(

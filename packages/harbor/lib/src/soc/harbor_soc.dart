@@ -282,7 +282,7 @@ class HarborSoC extends BridgeModule {
   /// The Xilinx DDR3-fast clock tree, built in this SoC's clock generation when
   /// [xilinxDdr3Tree] is provided. Null otherwise. Exposes the DDR CK / CLKDIV /
   /// IDELAYCTRL-ref / CK90 / DQS clocks for the DDR controller peripheral, and
-  /// its spare `coreClk` drives any [HarborClockConfig.providedByDdr3Tree] domain
+  /// its spare `coreClk` drives any [HarborClockSource.ddr3Core] domain
   /// (so the core runs off the SAME MMCM as the DDR clocks: one MMCM on the pin).
   late final XilinxDdr3Clocks? xilinxDdr3Clocks;
 
@@ -523,10 +523,14 @@ class HarborSoC extends BridgeModule {
     }
 
     for (final clkConfig in clocks) {
-      if (clkConfig.providedByDdr3Tree) {
+      if (clkConfig.source == HarborClockSource.ddr3Controller) {
+        _addDdr3ControllerClock(clkConfig);
+        continue;
+      }
+      if (clkConfig.source == HarborClockSource.ddr3Core) {
         if (corePll == null) {
           throw StateError(
-            'clock "${clkConfig.name}" is providedByDdr3Tree but no '
+            'clock "${clkConfig.name}" has source ddr3Core but no '
             'xilinxDdr3Tree/coreClkHz was supplied to build its core clock.',
           );
         }
@@ -569,6 +573,58 @@ class HarborSoC extends BridgeModule {
     }
     _addPllClock(config);
     return _clockDomains[config.name]!;
+  }
+
+  /// Adds a clock domain driven by the net [clk], which another block makes.
+  /// The rate of [config] must be the real rate of [clk], since the device
+  /// tree and the constraints read it. The reset of the domain holds until
+  /// [locked] is high, or until the lock timer ends. Call it before [build],
+  /// and not for a name that already has a domain.
+  HarborClockDomain addClockDomainFromNet(
+    HarborClockConfig config,
+    Logic clk, {
+    Logic? locked,
+  }) {
+    if (hasBuilt) {
+      throw StateError(
+        'addClockDomainFromNet("${config.name}") was called after build',
+      );
+    }
+    if (_clockDomains.containsKey(config.name)) {
+      throw ArgumentError.value(
+        config.name,
+        'config',
+        'a clock domain with this name exists',
+      );
+    }
+    return _clockDomains[config.name] = _clockGen.createDomainFromClock(
+      config,
+      clk,
+      locked: locked,
+    );
+  }
+
+  void _addDdr3ControllerClock(HarborClockConfig config) {
+    final tree = xilinxDdr3Clocks;
+    if (tree == null) {
+      throw StateError(
+        'clock "${config.name}" has source ddr3Controller but the SoC has '
+        'no xilinxDdr3Tree to give its controller clock.',
+      );
+    }
+    final mhz = tree.controllerClkMhz;
+    if ((config.frequencyMhz - mhz).abs() > mhz * 0.001) {
+      throw StateError(
+        'clock "${config.name}" is ${config.frequencyMhz.toStringAsFixed(3)} '
+        'MHz but the controller clock of the DDR3 tree is '
+        '${mhz.toStringAsFixed(3)} MHz.',
+      );
+    }
+    _clockDomains[config.name] = _clockGen.createDomainFromClock(
+      config,
+      tree.controllerClk,
+      locked: tree.locked,
+    );
   }
 
   void _addPllClock(HarborClockConfig clkConfig) {
