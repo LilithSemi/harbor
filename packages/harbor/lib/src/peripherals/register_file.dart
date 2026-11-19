@@ -769,6 +769,7 @@ class HarborRegisterFile extends BridgeModule {
           writeWidthA: 0,
           readWidthB: 0,
           writeWidthB: 72,
+          writeModeA: 'READ_FIRST',
           writeModeB: 'READ_FIRST',
         );
         addSubModule(bram);
