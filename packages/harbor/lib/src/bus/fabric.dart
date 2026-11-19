@@ -158,6 +158,8 @@ class HarborFabricSlave {
   /// Software reads a memory window such as a SPI flash XIP window with
   /// wide loads, and a fetch reads whole words, so such a window must be
   /// built with the fabric data width instead.
+  /// On AXI4, a read wider than the slave returns the lane at its address,
+  /// 0 in the other lanes and OKAY.
   final bool narrowOk;
 
   const HarborFabricSlave({
