@@ -777,6 +777,7 @@ class HarborGtxPciePhy extends Module {
     final rateK = Logic(name: 'fail_rate_k');
     final wdK = Logic(name: 'fail_wd_k');
     final wdPend = Logic(name: 'fail_wd_pend');
+    final badQ = Logic(name: 'fail_onehot_q');
     final tmoQ = Logic(name: 'fail_tmo_q');
     final lostQ = Logic(name: 'fail_lost_q');
     final rateQf = Logic(name: 'fail_rate_q');
@@ -925,7 +926,9 @@ class HarborGtxPciePhy extends Module {
     final afterCpllLock = Logic(name: 'after_cpll_lock');
     final afterMmcmLock = Logic(name: 'after_mmcm_lock');
     final lostD =
-        (((afterCpllLock & ~cpllLocked) | (afterMmcmLock & ~mmcmLocked)) &
+        (((afterCpllLock & ~cpllLocked) |
+                    (afterMmcmLock & ~mmcmLocked) |
+                    badQ) &
                 ~blockQ)
             .named('lost_d');
     final rateHit = Logic(name: 'rate_hit');
@@ -965,6 +968,55 @@ class HarborGtxPciePhy extends Module {
       st[_S.txDlyEn]!,
     ];
     final tmoAny = orAll(tmoK.values);
+
+    // A one-hot vector with no bit or two bits set is a failure. Groups of 4
+    // bits give an any and a multi flop. The first group reads as set and the
+    // last flop reads as clear while a failure is applied, so the flops hold
+    // no old result when it ends.
+    Logic oneHotBad(String name, List<Logic> bits) {
+      final anys = <Logic>[];
+      final multis = <Logic>[];
+      for (var lo = 0, i = 0; lo < bits.length; lo += 4, i++) {
+        final g = bits.sublist(lo, lo + 4 < bits.length ? lo + 4 : bits.length);
+        final a = Logic(name: '${name}_any$i');
+        final m = Logic(name: '${name}_multi$i');
+        final pairs = [
+          for (var x = 0; x < g.length; x++)
+            for (var y = x + 1; y < g.length; y++) g[x] & g[y],
+        ];
+        Sequential(
+          pclk,
+          [
+            a < (i == 0 ? orAll(g) | blockQ : orAll(g) & ~blockQ),
+            m < (orAll(pairs) & ~blockQ),
+          ],
+          reset: rst,
+          resetValues: {if (i == 0) a: Const(1)},
+        );
+        anys.add(a);
+        multis.add(m);
+      }
+      final cross = [
+        for (var x = 0; x < anys.length; x++)
+          for (var y = x + 1; y < anys.length; y++) anys[x] & anys[y],
+      ];
+      final bad = Logic(name: '${name}_bad');
+      Sequential(pclk, [
+        bad < (~orAll(anys) | orAll(multis) | orAll(cross)),
+      ], reset: rst);
+      return bad;
+    }
+
+    final badSt = oneHotBad('onehot_state', [for (final v in order) st[v]!]);
+    final badRate = oneHotBad('onehot_rate', [
+      rIdle,
+      rSwitch,
+      rWait,
+      rTake,
+      rBack,
+      rDone,
+    ]);
+    Sequential(pclk, [badQ < ((badSt | badRate) & ~blockQ)], reset: rst);
     final retryD = (failQ & failTmo2 & causeSync2 & triesLeft & ~wd2Q).named(
       'retry_d',
     );

@@ -806,6 +806,61 @@ void main() {
     });
   });
 
+  group('HarborGtxPciePhy one-hot checks', () {
+    test('a state with no bit set restarts the sequence once', () async {
+      final b = await _Bench.start();
+      await b.waitFor(_S.idle);
+      await b.pclk.nextNegedge;
+      for (final l in b.phy.internalSignals) {
+        if (l.name.startsWith('s_')) l.inject(0);
+      }
+      await b.waitFor(_S.cpllReset, limit: 100);
+      await b.waitFor(_S.idle);
+      await b.cycles(100);
+      expect(b.retries, 1);
+      expect(b.state, _S.idle);
+      await b.finish();
+    });
+
+    test('a state with two bits set restarts the sequence once', () async {
+      final b = await _Bench.start();
+      await b.waitFor(_S.idle);
+      await b.pclk.nextNegedge;
+      b.sig('s_txPhInit').inject(1);
+      await b.waitFor(_S.cpllReset, limit: 100);
+      await b.waitFor(_S.idle);
+      await b.cycles(100);
+      expect(b.retries, 1);
+      expect(b.state, _S.idle);
+      await b.finish();
+    });
+
+    test('a rate state with no bit set restarts the sequence once', () async {
+      final b = await _Bench.start();
+      await b.waitFor(_S.idle);
+      await b.pclk.nextNegedge;
+      b.sig('rate_idle').inject(0);
+      await b.waitFor(_S.cpllReset, limit: 100);
+      await b.waitFor(_S.idle);
+      await b.cycles(100);
+      expect(b.retries, 1);
+      expect(b.hi(b.sig('rate_idle')), isTrue);
+      await b.finish();
+    });
+
+    test('a rate state with two bits set restarts the sequence once', () async {
+      final b = await _Bench.start();
+      await b.waitFor(_S.idle);
+      await b.pclk.nextNegedge;
+      b.sig('rate_wait').inject(1);
+      await b.waitFor(_S.cpllReset, limit: 100);
+      await b.waitFor(_S.idle);
+      await b.cycles(100);
+      expect(b.retries, 1);
+      await b.finish();
+    });
+  });
+
   group('HarborGtxPciePhy rate change', () {
     for (final n in [0, 1, 2]) {
       test('pipeStages $n: the clock select moves first, then TXRATE, then '
