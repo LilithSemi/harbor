@@ -480,19 +480,6 @@ extension HarborSocScanoutDisplay on HarborSoC {
     if (!adv7511 && output != HarborDisplayInterface.dvi) {
       throw ArgumentError.value(output, 'output', 'use dvi or adv7511');
     }
-    final fmts =
-        formats ??
-        (adv7511
-            ? const [HarborPixelFormat.xrgb8888]
-            : const [HarborPixelFormat.rgb565]);
-    final wordBytes = busDataWidth ~/ 8;
-    final step = burstBeats * wordBytes;
-    final strides = [
-      for (final f in fmts)
-        (f.lineBytes(0, timing.hActive) + step - 1) ~/ step * step,
-    ];
-    final frame = strides.reduce(max) * timing.vActive;
-
     var shift = clockDomain(shiftDomain);
     var pixel = clockDomain(pixelDomain);
     if ((shift == null) != (pixel == null)) {
@@ -609,21 +596,46 @@ extension HarborSocScanoutDisplay on HarborSoC {
     final portRate =
         memoryBytesPerSecond ??
         (adv7511 && busHz != null ? busDataWidth ~/ 8 * busHz : null);
-    if (portRate != null) {
-      for (final f in fmts) {
-        final need =
-            f.lineBytes(0, mode.hActive) * mode.vActive * mode.refreshRate;
-        if (need > portRate * maxBandwidthShare) {
-          throw ArgumentError(
-            '${mode.resolution} ${f.name} needs '
-            '${(need / 1e6).toStringAsFixed(1)} MB/s, which is more than '
-            '${(maxBandwidthShare * 100).toStringAsFixed(0)}% of the '
-            '${(portRate / 1e6).toStringAsFixed(1)} MB/s of the '
-            'memory port',
-          );
-        }
-      }
+    bool fits(HarborPixelFormat f) =>
+        portRate == null ||
+        f.lineBytes(0, mode.hActive) * mode.vActive * mode.refreshRate <=
+            portRate * maxBandwidthShare;
+    String tooMuch(HarborPixelFormat f) {
+      final need =
+          f.lineBytes(0, mode.hActive) * mode.vActive * mode.refreshRate;
+      return '${mode.resolution} ${f.name} needs '
+          '${(need / 1e6).toStringAsFixed(1)} MB/s, which is more than '
+          '${(maxBandwidthShare * 100).toStringAsFixed(0)}% of the '
+          '${(portRate! / 1e6).toStringAsFixed(1)} MB/s of the '
+          'memory port';
     }
+
+    final List<HarborPixelFormat> fmts;
+    if (formats != null) {
+      for (final f in formats) {
+        if (!fits(f)) throw ArgumentError(tooMuch(f));
+      }
+      fmts = formats;
+    } else if (adv7511) {
+      final pick = [
+        HarborPixelFormat.xrgb8888,
+        HarborPixelFormat.rgb565,
+      ].where(fits).firstOrNull;
+      if (pick == null) throw ArgumentError(tooMuch(HarborPixelFormat.rgb565));
+      fmts = [pick];
+    } else {
+      if (!fits(HarborPixelFormat.rgb565)) {
+        throw ArgumentError(tooMuch(HarborPixelFormat.rgb565));
+      }
+      fmts = const [HarborPixelFormat.rgb565];
+    }
+    final wordBytes = busDataWidth ~/ 8;
+    final step = burstBeats * wordBytes;
+    final strides = [
+      for (final f in fmts)
+        (f.lineBytes(0, timing.hActive) + step - 1) ~/ step * step,
+    ];
+    final frame = strides.reduce(max) * timing.vActive;
 
     final display = addPeripheral(
       HarborScanoutDisplay(

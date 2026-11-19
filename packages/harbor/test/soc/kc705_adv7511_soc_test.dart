@@ -51,7 +51,7 @@ const _hdmiPins = {
 HarborSoC _soc(
   HarborFpgaTarget target, {
   HarborDisplayTiming timing = const HarborDisplayTiming.xga1024x768(),
-  List<HarborPixelFormat> formats = const [HarborPixelFormat.rgb565],
+  List<HarborPixelFormat>? formats,
   int? memoryBytesPerSecond,
   int sysHz = 50000000,
 }) {
@@ -125,6 +125,9 @@ const _ddrExtra = {
   'sdram_cs_n': 'AC12 SSTL15',
   'sdram_odt': 'AD8 SSTL15',
 };
+
+List<HarborPixelFormat> _scanoutFormats(HarborSoC soc) =>
+    soc.peripherals.whereType<HarborScanoutDisplay>().single.formats;
 
 void main() {
   final board = HarborBoard.get('kc705');
@@ -281,6 +284,15 @@ void main() {
         ),
         returnsNormally,
       );
+    });
+
+    test('the default format at 1024x768 is rgb565', () {
+      expect(_scanoutFormats(_soc(target)), [HarborPixelFormat.rgb565]);
+    });
+
+    test('the default format at 800x600 is xrgb8888', () {
+      final soc = _soc(target, timing: const HarborDisplayTiming.svga800x600());
+      expect(_scanoutFormats(soc), [HarborPixelFormat.xrgb8888]);
     });
 
     test('a faster port takes xrgb8888 at 1024x768', () {
