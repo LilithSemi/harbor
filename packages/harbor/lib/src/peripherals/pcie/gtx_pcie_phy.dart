@@ -701,6 +701,9 @@ class HarborGtxPciePhy extends Module {
     final timer = Logic(name: 'timer', width: tw);
     final stepNext = Logic(name: 'step_next', width: 4);
     final stepGo = Logic(name: 'step_go');
+    // A wait that ends is registered, and the state changes one cycle later.
+    final goQ = Logic(name: 'step_go_q');
+    final targetQ = Logic(name: 'step_target_q', width: 4);
     final timedOut = Logic(name: 'timed_out');
     final rateFail = Logic(name: 'rate_fail');
     final cpllHold = Logic(name: 'cpll_hold');
@@ -754,9 +757,16 @@ class HarborGtxPciePhy extends Module {
         orElse: [settleCount < 0],
       ),
     ], reset: rst);
-    final settled = settleCount.eq(
-      Const(timeouts.clockSettle, width: settleCount.width),
-    );
+    // The compare is registered, so the wait sees it one cycle late.
+    final settled = Logic(name: 'settled');
+    Sequential(pclk, [
+      settled <
+          (settleCount.eq(
+                Const(timeouts.clockSettle, width: settleCount.width),
+              ) &
+              state.eq(s(_S.clockLock)) &
+              clockOk),
+    ], reset: rst);
 
     final fail = Logic(name: 'fail');
     // TXDLYSRESET waits txSettle cycles after its state starts, and again
@@ -779,9 +789,15 @@ class HarborGtxPciePhy extends Module {
         orElse: [txSettleCount < 0],
       ),
     ], reset: rst);
-    final txSettled = txSettleCount.eq(
-      Const(timeouts.txSettle, width: txSettleCount.width),
-    );
+    final txSettled = Logic(name: 'tx_settled');
+    Sequential(pclk, [
+      txSettled <
+          (txSettleCount.eq(
+                Const(timeouts.txSettle, width: txSettleCount.width),
+              ) &
+              state.eq(s(_S.txDlySReset)) &
+              ~fail),
+    ], reset: rst);
 
     final afterCpllLock = isState([
       _S.gtRelease,
@@ -858,7 +874,7 @@ class HarborGtxPciePhy extends Module {
     // cause. The cycle after a failure cannot fail again, so a lock loss
     // counts once.
     final holdHit = at(HarborGtxPcieTimeouts.cpllResetHold);
-    final failNow = (timedOut | lostLock | rateFail).named('fail_now');
+    final failNow = ((timedOut & ~goQ) | lostLock | rateFail).named('fail_now');
     final failCause = Logic(name: 'fail_cause', width: 4);
     final causeInSync = Logic(name: 'fail_cause_sync');
     final failTimeout = Logic(name: 'fail_timeout');
@@ -882,15 +898,15 @@ class HarborGtxPciePhy extends Module {
         mux(
           syncRetry,
           s(_S.txDlySReset),
-          mux(fullFail, s(_S.cpllReset), stepNext),
+          mux(fullFail, s(_S.cpllReset), mux(goQ, targetQ, state)),
         );
 
     // High when next differs from state, without going through next.
     final nextChanges =
         (fail |
                 (restart == null
-                    ? stepGo
-                    : mux(restart, ~state.eq(s(_S.cpllReset)), stepGo)))
+                    ? goQ
+                    : mux(restart, ~state.eq(s(_S.cpllReset)), goQ)))
             .named('next_changes');
 
     Logic nextIs(List<HarborGtxResetState> l) =>
@@ -912,6 +928,8 @@ class HarborGtxPciePhy extends Module {
       pclk,
       [
         state < next,
+        goQ < stepGo & ~goQ & ~failOrRestart,
+        targetQ < stepNext,
         If(
           syncRetry,
           then: [
@@ -1010,11 +1028,15 @@ class HarborGtxPciePhy extends Module {
     // cycle. In wait the timer counts up on each cycle.
     final rateHit = Logic(name: 'rate_hit');
     final rateWait = rateState.eq(_r(_rWait));
+    final switchHit = Logic(name: 'switch_hit');
     rateFail <= rateWait & rateHit;
     final rw = timeouts.rate.bitLength;
     Sequential(pclk, [
       rateQ < _pipeDelay(pclk, p.pipeRate, pipeStages, 'rate'),
       rateHit < rateWait & rateTimer.eq(Const(timeouts.rate - 2, width: rw)),
+      switchHit <
+          rateState.eq(_r(_rSwitch)) &
+              rateTimer.eq(Const(timeouts.clockSwitch - 2, width: rw)),
       If(
         fullFail,
         then: [rateState < _r(_rIdle), rateTimer < 0, gtRate < 0, pclkSelQ < 0],
@@ -1035,7 +1057,7 @@ class HarborGtxPciePhy extends Module {
               CaseItem(_r(_rSwitch), [
                 rateTimer < rateTimer + 1,
                 If(
-                  rateTimer.eq(Const(timeouts.clockSwitch - 1, width: rw)),
+                  switchHit,
                   then: [
                     gtRate < rateQ,
                     rateState < _r(_rWait),
