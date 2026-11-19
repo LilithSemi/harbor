@@ -293,6 +293,7 @@ Future<void> _timeout(HarborFabricTopology t) async {
   must(m1.bResp, [(4, 2), (4, 0)]);
   must(m1.rBeats.map((x) => x.$3).toList(), [0, 0]);
   must(b.busError(), 1);
+  must(b.timeoutCount(), 1);
   must(b.errors, isEmpty);
 }
 
@@ -336,6 +337,43 @@ Future<void> _arHang(HarborFabricTopology t) async {
   must(m1.rBeats.map((x) => x.$3).toList(), [2, 2, 0]);
   must(s1.arOrder.length, 1);
   must(b.busError(), 1);
+  must(b.timeoutCount(), 1);
+  must(b.errors, isEmpty);
+}
+
+// A slave that takes AW but never takes W is cut off. The write gets SLVERR,
+// and writes to the other slave, queued behind it, still finish.
+Future<void> _wHang(HarborFabricTopology t) async {
+  final b = await Bench.start(
+    t,
+    stall: 0.2,
+    masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
+    slaves: const [
+      SlaveCfg('s0', 5, 4, 0x00000, 0x10000),
+      SlaveCfg('s1', 2, 2, 0x10000, 0x10000, timeout: 50),
+    ],
+  );
+  final m0 = b.managers['m0']!;
+  final m1 = b.managers['m1']!;
+  final s1 = b.memories['s1']!;
+  s1.w.gate = () => false;
+  m0.write(wr(1, 0x10000, 4));
+  m1
+    ..write(wr(4, 0x0100, 2))
+    ..write(wr(4, 0x0200, 3))
+    ..read(rd(4, 0x0100, 1));
+  await b.drain(limit: 4000);
+  must(m0.bResp, [(1, 2)]);
+  must(m1.bResp, [(4, 0), (4, 0)]);
+  must(m1.rBeats.map((x) => x.$3).toList(), [0, 0]);
+  must(b.busError(), 1);
+  must(b.timeoutCount(), 1);
+
+  // Later writes to the dead slave end with SLVERR at once.
+  m0.write(wr(1, 0x10040, 2));
+  await b.drain(limit: 4000);
+  await b.sim.stop();
+  must(m0.bResp, [(1, 2), (1, 2)]);
   must(b.errors, isEmpty);
 }
 
@@ -508,6 +546,11 @@ void main() {
       test(
         'a slave that never takes AR is cut off',
         () => isolated(() => _arHang(t)),
+        timeout: long,
+      );
+      test(
+        'a slave that never takes W is cut off and other writes finish',
+        () => isolated(() => _wHang(t)),
         timeout: long,
       );
       test(

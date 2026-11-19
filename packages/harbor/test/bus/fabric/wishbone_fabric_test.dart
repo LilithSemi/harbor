@@ -150,6 +150,7 @@ Future<void> _timeout(HarborFabricTopology t) async {
   must(b.busError(), 1);
   must(other.beats.first.ack, 1);
   must(other.beats.first.rdata, b.golden['s0']!.read(0x0800));
+  must(b.timeoutCount(), 1);
 }
 
 // A master with a reach set gets the decode error for every slave out of

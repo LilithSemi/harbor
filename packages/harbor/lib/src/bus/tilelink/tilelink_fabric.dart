@@ -146,6 +146,7 @@ class HarborTileLinkFabric extends HarborFabricModule {
     final c = addInput('clk', clk);
     final r = addInput('reset', reset);
     addOutput('bus_error');
+    addOutput('timeout_count', width: timeoutCountWidth(slaves.length));
 
     final nm = masters.length;
     final ns = slaves.length;
@@ -482,6 +483,7 @@ class HarborTileLinkFabric extends HarborFabricModule {
       dataW: dataW,
     );
     output('bus_error') <= anyOf(dead);
+    output('timeout_count') <= timeoutCountOf(dead, slaves.length);
 
     // D to the masters. The master index on top of the full source picks
     // the master, and a lock keeps the beats of a message together.

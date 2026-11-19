@@ -155,6 +155,26 @@ class HarborSoC extends BridgeModule {
     return port;
   }
 
+  /// Adds a `bus_timeouts` output (or [portName]) with the number of slaves
+  /// that a bus timeout cut off since reset, summed over every fabric. It is
+  /// 8 bits wide and saturates at 255. Call it after [buildFabric].
+  Logic exposeBusTimeouts({String portName = 'bus_timeouts'}) {
+    if (fabrics.isEmpty) {
+      throw StateError('exposeBusTimeouts needs buildFabric first');
+    }
+    final total = fabrics
+        .map((f) => f.timeoutCount.zeroExtend(9))
+        .reduce((a, b) => a + b);
+    final port = addOutput(portName, width: 8);
+    port <=
+        mux(
+          total.gte(Const(255, width: 9)),
+          Const(255, width: 8),
+          total.slice(7, 0),
+        );
+    return port;
+  }
+
   /// Modules already added as submodules + clock-wired. A module may be BOTH a
   /// master and a peripheral (a dual-role device like a DMA or an accelerator
   /// with CSR slave + bus master). This set keeps the second [addMaster] /
@@ -1167,7 +1187,10 @@ class HarborSoC extends BridgeModule {
   /// [busTimeoutCycles] is the timeout of every slave that does not hold
   /// memory (see [HarborFabricSlave.timeout]). A slave that times out is cut
   /// off until reset. Memory (system RAM, SRAM, flash, mask ROM) gets none,
-  /// and [addPeripheral] can set the timeout of one peripheral.
+  /// because DDR3 holds its bus until calibration ends and may calibrate
+  /// again. A board that lets a master such as PCIe DMA reach DDR3 early
+  /// passes a long [addPeripheral] `busTimeoutCycles` for that memory, so the
+  /// master gets an error response instead of waiting for ever.
   /// [maxGrantCycles] sets the Wishbone grant hold cap (see
   /// [WishboneArbiter.maxGrantCycles]). It is [harborDefaultWishboneGrantCap]
   /// on a Wishbone fabric with two or more masters, so a master that polls

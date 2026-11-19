@@ -196,6 +196,10 @@ abstract class HarborFabricModule extends Module with HarborBusErrorSource {
   @override
   Logic get busError => output('bus_error');
 
+  /// Slaves the fabric cut off, on the fabric clock. A slave stays cut off
+  /// until reset, so this is also the number of timeouts since reset.
+  Logic get timeoutCount => output('timeout_count');
+
   /// Sticky flag, high after an error went to a master that has no error
   /// signal, so the master saw a normal response. Null when every master
   /// has an error signal.

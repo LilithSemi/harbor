@@ -53,6 +53,16 @@ List<Logic> highestOf(List<Logic> v) =>
 Logic countOf(List<Logic> bits, int width) =>
     bits.map((b) => b.zeroExtend(width)).reduce((a, b) => a + b);
 
+/// Width of the `timeout_count` output of a fabric with [slaves] slaves.
+int timeoutCountWidth(int slaves) => widthOf(slaves);
+
+/// The number of cut off flags set in [dead], for a fabric with [slaves]
+/// slaves.
+Logic timeoutCountOf(List<Logic> dead, int slaves) {
+  final w = timeoutCountWidth(slaves);
+  return dead.isEmpty ? Const(0, width: w) : countOf(dead, w);
+}
+
 /// Round robin over [req]. The caller puts every condition of a transfer in
 /// [req], so a grant is always taken and the pointer moves on each grant.
 List<Logic> roundRobin(String name, Logic clk, Logic reset, List<Logic> req) {

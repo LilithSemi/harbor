@@ -311,6 +311,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final c = addInput('clk', clk);
     final r = addInput('reset', reset);
     addOutput('bus_error');
+    addOutput('timeout_count', width: timeoutCountWidth(slaves.length));
 
     final nm = masters.length;
     final ns = slaves.length;
@@ -1014,6 +1015,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
       dataW: dataW,
     );
     output('bus_error') <= anyOf(dead);
+    output('timeout_count') <= timeoutCountOf(dead, slaves.length);
 
     // Responses. The master index on top of the full ID picks the master.
     for (var dir = 0; dir < 2; dir++) {

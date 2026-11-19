@@ -135,6 +135,8 @@ class NativeShell extends BridgeModule {
     );
     createPort('bus_error', PortDirection.output);
     output('bus_error') <= fabric.busError;
+    createPort('timeout_count', PortDirection.output, width: 8);
+    output('timeout_count') <= fabric.timeoutCount.zeroExtend(8);
     if (fabric.foldError case final fold?) {
       createPort('fold_error', PortDirection.output);
       output('fold_error') <= fold;
@@ -264,6 +266,8 @@ class TlBench {
   }
 
   int busError() => sim.pre('bus_error');
+
+  int timeoutCount() => sim.pre('timeout_count');
 
   Future<void> drain({int limit = 200000}) =>
       waitUntil(sim, () => managers.values.every((m) => m.done), limit: limit);
@@ -516,6 +520,8 @@ class WbBench {
   }
 
   int busError() => sim.pre('bus_error');
+
+  int timeoutCount() => sim.pre('timeout_count');
 
   int foldError() => sim.pre('fold_error');
 

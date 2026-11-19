@@ -194,6 +194,8 @@ class FabricShell extends BridgeModule {
     );
     createPort('bus_error', PortDirection.output);
     output('bus_error') <= fabric.busError;
+    createPort('timeout_count', PortDirection.output, width: 8);
+    output('timeout_count') <= fabric.timeoutCount.zeroExtend(8);
   }
 }
 
@@ -309,6 +311,8 @@ class Bench {
   }
 
   int busError() => sim.pre('bus_error');
+
+  int timeoutCount() => sim.pre('timeout_count');
 
   /// Waits until every manager has all its responses.
   Future<void> drain({int limit = 30000}) => waitUntil(

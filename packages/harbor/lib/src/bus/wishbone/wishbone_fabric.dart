@@ -165,6 +165,7 @@ class HarborWishboneFabric extends HarborFabricModule {
     final c = addInput('clk', clk);
     final r = addInput('reset', reset);
     addOutput('bus_error');
+    addOutput('timeout_count', width: timeoutCountWidth(slaves.length));
 
     final nm = masters.length;
     final ns = slaves.length;
@@ -392,6 +393,7 @@ class HarborWishboneFabric extends HarborFabricModule {
       }
     }
     output('bus_error') <= anyOf(dead);
+    output('timeout_count') <= timeoutCountOf(dead, slaves.length);
 
     // Answers to each master.
     final folds = <Logic>[];
