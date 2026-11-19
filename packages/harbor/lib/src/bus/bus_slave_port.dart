@@ -164,7 +164,7 @@ class BusSlavePort {
     HarborFabricClock? fabricClock,
   }) {
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
-      harborMarkCrossed(module, name);
+      harborMarkCrossed(module, name, fabricClock.clk);
       return _crossed(
         module,
         name,

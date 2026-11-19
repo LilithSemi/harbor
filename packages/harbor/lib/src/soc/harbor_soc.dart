@@ -242,7 +242,7 @@ class HarborSoC extends BridgeModule {
     if (clockDomainName == null) return bound;
     final first = domainFor(bound);
     final now = domainFor(clockDomainName);
-    if (!identical(first, now)) {
+    if (!identical(first?.clk, now?.clk)) {
       throw StateError(
         '${module.name} is on clock domain "${first?.config.name}" from its '
         'first registration, and now on "${now?.config.name}". A module has '
@@ -1860,6 +1860,12 @@ class HarborSoC extends BridgeModule {
     module.input(BusSlavePort.fabricResetPort).srcConnection! <= reset;
   }
 
+  // True when [fabricClk], the fabric clock a port crosses to, is the
+  // `fabric_clk` input of [module], which the SoC drives.
+  bool _crossedToOwnClock(BridgeModule module, Logic? fabricClk) =>
+      fabricClk != null &&
+      identical(fabricClk, module.tryInput(BusSlavePort.fabricClkPort));
+
   /// Throws when a peripheral or a master runs on a clock other than the
   /// fabric clock and has a bus port with no crossing to it.
   void _checkClockDomains() {
@@ -1884,12 +1890,13 @@ class HarborSoC extends BridgeModule {
         'bus',
         for (final s in _secondarySlaves)
           if (identical(s.module, e.module)) s.busInterfaceName,
-      ].where((n) => !crossed.contains(n));
+      ].where((n) => !_crossedToOwnClock(e.module, crossed[n]));
       if (open.isNotEmpty) {
         throw StateError(
           'peripheral ${e.module.name} runs on clock domain '
           '"${domain.config.name}", not on the fabric clock. Port '
-          '${open.join(', ')} has no crossing. Build it with '
+          '${open.join(', ')} has no crossing to its '
+          '${BusSlavePort.fabricClkPort}. Build it with '
           'crossFabricClock so its port crosses to the fabric clock.',
         );
       }
@@ -1912,11 +1919,15 @@ class HarborSoC extends BridgeModule {
     for (final e in _masters) {
       final domain = domainFor(e.clockDomainName);
       if (domain == null || identical(domain.clk, fabricClk)) continue;
-      if (!harborCrossedPorts(e.module).contains(e.busInterfaceName)) {
+      if (!_crossedToOwnClock(
+        e.module,
+        harborCrossedPorts(e.module)[e.busInterfaceName],
+      )) {
         throw StateError(
           'master ${e.module.name} port ${e.busInterfaceName} runs on clock '
           'domain "${domain.config.name}", not on the fabric clock. Build the '
-          'port with a fabricClock so it crosses to the fabric clock.',
+          'port with a fabricClock built on the ${BusSlavePort.fabricClkPort} '
+          'input so it crosses to the fabric clock.',
         );
       }
       needFabricClk(e.module);

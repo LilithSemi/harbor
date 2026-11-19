@@ -951,19 +951,34 @@ struct DramStore {
 
   // The controller status on the one clock, with no crossing.
   void _buildStatusSameClock(Logic clk, Logic reset, Ddr3Controller ctrl) {
+    // Registered, so a flag has no glitch from the compare of the state.
+    final flags = Logic(name: 'status_flags', width: 3);
+    Sequential(clk, [
+      If(
+        reset,
+        then: [flags < 0],
+        orElse: [
+          flags <
+              [
+                ctrl.calFailed ?? Const(0),
+                ctrl.calState.eq(Ddr3Controller.calStateDone) & ctrl.initDone,
+                ctrl.initDone,
+              ].concat(),
+        ],
+      ),
+    ]);
     final failed = Logic(name: 'cal_failed_sticky');
     Sequential(clk, [
       If(
         reset,
         then: [failed < 0],
         orElse: [
-          If(ctrl.calFailed ?? Const(0), then: [failed < 1]),
+          If(flags[2], then: [failed < 1]),
         ],
       ),
     ]);
-    output('init_done') <= ctrl.initDone;
-    output('cal_done') <=
-        ctrl.calState.eq(Ddr3Controller.calStateDone) & ctrl.initDone;
+    output('init_done') <= flags[0];
+    output('cal_done') <= flags[1];
     output('cal_failed') <= failed;
     output('cal_state') <= ctrl.calState;
     output('cal_attempts') <= ctrl.calStarts;
@@ -1232,7 +1247,7 @@ struct DramStore {
       minReadGap: wishbone ? 0 : readGap,
     );
     controller = ctrl;
-    if (sameClock) {
+    if (sameClock && target is! HarborSimTarget) {
       _buildStatusSameClock(clk, reset, ctrl);
     } else {
       _buildStatus(clk, reset, ddrClk, ddrReset, ctrl);

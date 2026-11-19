@@ -12,7 +12,7 @@ export 'port/fabric_kind.dart';
 export 'port/dma_request_adapter.dart';
 export 'port/memory_port.dart';
 export 'port/memory_waist.dart';
-export 'port/port_cdc.dart';
+export 'port/port_cdc.dart' hide harborMarkCrossed;
 export 'port/register_waist.dart';
 export 'port/waist_arbiter.dart';
 

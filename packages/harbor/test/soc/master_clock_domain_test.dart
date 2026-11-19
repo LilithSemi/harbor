@@ -226,6 +226,56 @@ class _OwnClock extends BridgeModule {
   }
 }
 
+/// A slave port crossed through `fabric_clk`, and a master port crossed to
+/// other clock inputs.
+class _Mixed extends BridgeModule with HarborDeviceTreeNodeProvider {
+  _Mixed() : super('MasterDomainMixed', name: 'mixed') {
+    createPort('clk', PortDirection.input);
+    createPort('reset', PortDirection.input);
+    createPort('my_clk', PortDirection.input);
+    createPort('my_reset', PortDirection.input);
+    const kind = HarborFabricKind.wishbone;
+    final m = BusMasterPort.create(
+      module: this,
+      name: 'm',
+      kind: kind,
+      addressWidth: 32,
+      dataWidth: 32,
+      clk: input('clk'),
+      reset: input('reset'),
+      fabricClock: HarborFabricClock(
+        clk: input('my_clk'),
+        reset: input('my_reset'),
+      ),
+    );
+    m.addr <= Const(0, width: 32);
+    m.dataOut <= Const(0, width: 32);
+    m.stb <= Const(0);
+    m.we <= Const(0);
+    m.sel <= Const(0xf, width: 4);
+    final bus = BusSlavePort.create(
+      module: this,
+      name: 'bus',
+      kind: kind,
+      addressWidth: 32,
+      dataWidth: 32,
+      clk: input('clk'),
+      reset: input('reset'),
+      fabricClock: BusSlavePort.fabricClockInputs(this, cross: true),
+    );
+    Sequential(input('clk'), reset: bus.reset, [
+      bus.ack < (bus.stb & ~bus.ack),
+      bus.dataOut < bus.addr,
+    ]);
+  }
+
+  @override
+  HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(
+    compatible: ['test,mixed'],
+    reg: BusAddressRange(0x10005000, 0x1000),
+  );
+}
+
 void main() {
   tearDown(() async => Simulator.reset());
 
@@ -310,6 +360,24 @@ void main() {
           (e) => e.message,
           'message',
           allOf(contains('dual'), contains('port m'), contains('"core"')),
+        ),
+      ),
+    );
+  });
+
+  test('a master port crossed to other clock inputs throws even if the slave '
+      'port of the module uses fabric_clk', () {
+    final soc = _soc(HarborFabricKind.wishbone);
+    final mixed = _Mixed();
+    soc.addMaster(mixed, busInterfaceName: 'm', clockDomainName: 'core');
+    soc.addPeripheral(mixed, clockDomainName: 'core');
+    expect(
+      soc.buildFabric,
+      throwsA(
+        isA<StateError>().having(
+          (e) => e.message,
+          'message',
+          allOf(contains('mixed'), contains('port m'), contains('"core"')),
         ),
       ),
     );

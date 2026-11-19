@@ -21,14 +21,15 @@ class HarborFabricClock {
   bool crossesFrom(Logic deviceClk) => !identical(clk, deviceClk);
 }
 
-final _crossedPorts = Expando<Set<String>>('crossedPorts');
+final _crossedPorts = Expando<Map<String, Logic>>('crossedPorts');
 
-/// Records that the port [port] of [module] crosses to a fabric clock.
-void harborMarkCrossed(Module module, String port) =>
-    (_crossedPorts[module] ??= {}).add(port);
+/// Records that the port [port] of [module] crosses to the fabric clock
+/// [fabricClk].
+void harborMarkCrossed(Module module, String port, Logic fabricClk) =>
+    (_crossedPorts[module] ??= {})[port] = fabricClk;
 
-/// The names of the ports of [module] that cross to a fabric clock.
-Set<String> harborCrossedPorts(Module module) =>
+/// The ports of [module] that cross to a fabric clock, with that clock.
+Map<String, Logic> harborCrossedPorts(Module module) =>
     _crossedPorts[module] ?? const {};
 
 /// The default depth of a memory waist crossing: [outstanding] plus 2,
