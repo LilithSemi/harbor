@@ -769,6 +769,7 @@ class HarborRegisterFile extends BridgeModule {
           writeWidthA: 0,
           readWidthB: 0,
           writeWidthB: 72,
+          writeModeB: 'READ_FIRST',
         );
         addSubModule(bram);
 
@@ -804,8 +805,9 @@ class HarborRegisterFile extends BridgeModule {
       }
 
       final rawBram = _depthSelect(clk, r, rdAddrs[r], depthWords, blockBits);
-      // SDP read/write collisions are implementation-defined at the RAM
-      // outputs. The existing write-first bypass keeps Harbor semantics.
+      // A read of the word that is written in the same cycle is a port
+      // collision. READ_FIRST on the write port returns the old word, so the
+      // bypass replaces only the written bytes.
       final raw = _rdwBypass(clk, r, wrEn, wrAddr, wrData, rdAddrs[r], rawBram);
 
       if (reservedZero) {
@@ -968,7 +970,10 @@ class HarborRegisterFile extends BridgeModule {
               : lo + blockDataWidth;
           final sliceWidth = hi - lo;
 
-          final bram = XilinxRamb36e1(name: 'rf_bram_r${r}_d${d}_w$w');
+          final bram = XilinxRamb36e1(
+            name: 'rf_bram_r${r}_d${d}_w$w',
+            writeModeA: 'READ_FIRST',
+          );
           addSubModule(bram);
 
           // Port A: shared write port (posedge), whole-word write.
@@ -1006,8 +1011,8 @@ class HarborRegisterFile extends BridgeModule {
       final rawBram = _depthSelect(clk, r, rdAddrs[r], depthWords, blockBits);
 
       // A same-cycle write and read of one entry is a RAMB36E1 port
-      // collision, and port B then returns X (UG473). The bypass supplies the
-      // new data.
+      // collision. READ_FIRST on the write port returns the old word, so the
+      // bypass replaces only the written bytes.
       final raw = _rdwBypass(clk, r, wrEn, wrAddr, wrData, rdAddrs[r], rawBram);
 
       // x0 reads as zero (only when entry 0 is reserved), delayed to match the
