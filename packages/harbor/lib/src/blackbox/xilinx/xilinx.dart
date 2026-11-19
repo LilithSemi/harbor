@@ -843,6 +843,7 @@ class XilinxRamb36e1 extends BridgeModule {
     int writeWidthA = 36,
     int readWidthB = 36,
     int writeWidthB = 36,
+    String? writeModeA,
     super.name = 'bram',
   }) : super('RAMB36E1', isSystemVerilogLeaf: true) {
     // Port A
@@ -873,6 +874,7 @@ class XilinxRamb36e1 extends BridgeModule {
     createParameter('WRITE_WIDTH_A', '$writeWidthA');
     createParameter('READ_WIDTH_B', '$readWidthB');
     createParameter('WRITE_WIDTH_B', '$writeWidthB');
+    if (writeModeA != null) createParameter('WRITE_MODE_A', '"$writeModeA"');
   }
 }
 

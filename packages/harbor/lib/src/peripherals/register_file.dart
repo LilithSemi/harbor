@@ -737,6 +737,10 @@ class HarborRegisterFile extends BridgeModule {
         '(got $dataWidth).',
       );
     }
+    if (_useX18) {
+      _buildXilinxX18(clk, rdAddrs, rdDatas, wrEn, wrAddr, wrData);
+      return;
+    }
 
     // A RAMB36E1 in SDP72 mode has 512 words, with the word-address field in
     // ADDR[14:6]. Keep the low six pins zero; the packer ties pin 15 high.
@@ -810,6 +814,108 @@ class HarborRegisterFile extends BridgeModule {
           rdAddrs[r].eq(Const(0, width: addrWidth)),
           readLatency,
           'rfSdp72X0_$r',
+        );
+        rdDatas[r] <= mux(isX0, Const(0, width: dataWidth), raw);
+      } else {
+        rdDatas[r] <= raw;
+      }
+    }
+  }
+
+  /// A x18 RAMB36E1 holds 2048 words of 16 data bits. It replaces the x72
+  /// blocks when it needs no more blocks and fewer depth blocks, because the
+  /// depth blocks cost a read mux in LUTs.
+  bool get _useX18 {
+    final depth72 = _depthBlocks(9);
+    final depth18 = _depthBlocks(11);
+    return depth18 < depth72 && depth18 * ((dataWidth + 15) ~/ 16) <= depth72;
+  }
+
+  /// RAMB36E1 in true dual-port x18 mode. Port A writes with one enable for
+  /// each byte, port B reads. Each block holds 16 data bits of 2048 words, and
+  /// the two parity bits stay unused. A read of the word that is written in the
+  /// same cycle is a port collision. READ_FIRST on the write port makes the
+  /// read return the old word, so the bypass replaces only the written bytes.
+  void _buildXilinxX18(
+    Logic clk,
+    List<Logic> rdAddrs,
+    List<Logic> rdDatas,
+    Logic wrEn,
+    Logic wrAddr,
+    Logic wrData,
+  ) {
+    const blockDataWidth = 16;
+    const blockBits = 11;
+    final widthBlocks = (dataWidth + blockDataWidth - 1) ~/ blockDataWidth;
+    final depthBlocks = _depthBlocks(blockBits);
+    Logic toAd(Logic a) => [
+      Const(0, width: 1),
+      _blockAddr(a, blockBits, blockBits),
+      Const(0, width: 4),
+    ].concat().getRange(0, 16);
+    final wrAd = toAd(wrAddr);
+
+    for (var r = 0; r < rdAddrs.length; r++) {
+      final rdAd = toAd(rdAddrs[r]);
+      final depthWords = <Logic>[];
+      for (var d = 0; d < depthBlocks; d++) {
+        final blockWrite = _depthWrite(wrEn, wrAddr, d, blockBits);
+        final slices = <Logic>[];
+        for (var w = 0; w < widthBlocks; w++) {
+          final lo = w * blockDataWidth;
+          final hi = lo + blockDataWidth > dataWidth
+              ? dataWidth
+              : lo + blockDataWidth;
+          final bram = XilinxRamb36e1(
+            name: 'rf_x18_r${r}_d${d}_w$w',
+            readWidthA: 18,
+            writeWidthA: 18,
+            readWidthB: 18,
+            writeWidthB: 18,
+            writeModeA: 'READ_FIRST',
+          );
+          addSubModule(bram);
+
+          bram.input('CLKARDCLK').srcConnection! <= clk;
+          bram.input('ENARDEN').srcConnection! <= Const(1);
+          bram.input('ADDRARDADDR').srcConnection! <= wrAd;
+          bram.input('DIADI').srcConnection! <=
+              wrData.getRange(lo, hi).zeroExtend(32);
+          bram.input('DIPADIP').srcConnection! <= Const(0, width: 4);
+          bram.input('WEA').srcConnection! <=
+              [
+                Const(0, width: 2),
+                _laneWrite(blockWrite, w * 2 + 1),
+                _laneWrite(blockWrite, w * 2),
+              ].concat();
+          bram.input('REGCEAREGCE').srcConnection! <= Const(0);
+          bram.input('RSTRAMARSTRAM').srcConnection! <= Const(0);
+
+          bram.input('CLKBWRCLK').srcConnection! <= clk;
+          bram.input('ENBWREN').srcConnection! <= Const(1);
+          bram.input('WEBWE').srcConnection! <= Const(0, width: 8);
+          bram.input('ADDRBWRADDR').srcConnection! <= rdAd;
+          bram.input('DIBDI').srcConnection! <= Const(0, width: 32);
+          bram.input('DIPBDIP').srcConnection! <= Const(0, width: 4);
+          bram.input('REGCEB').srcConnection! <= Const(0);
+          bram.input('RSTRAMB').srcConnection! <= Const(0);
+
+          slices.add(bram.output('DOBDO').getRange(0, hi - lo));
+        }
+        depthWords.add(
+          slices.length == 1
+              ? slices.first.zeroExtend(dataWidth)
+              : slices.rconcat().getRange(0, dataWidth),
+        );
+      }
+      final rawBram = _depthSelect(clk, r, rdAddrs[r], depthWords, blockBits);
+      final raw = _rdwBypass(clk, r, wrEn, wrAddr, wrData, rdAddrs[r], rawBram);
+      if (reservedZero) {
+        final isX0 = _registerN(
+          clk,
+          rdAddrs[r].eq(Const(0, width: addrWidth)),
+          readLatency,
+          'rfX18X0_$r',
         );
         rdDatas[r] <= mux(isX0, Const(0, width: dataWidth), raw);
       } else {
