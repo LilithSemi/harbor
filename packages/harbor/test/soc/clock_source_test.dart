@@ -122,6 +122,8 @@ void main() {
       soc.input('clk_n').srcConnection! <= Logic();
       await soc.build();
       // The tree is a black box in sim, so the test drives its outputs.
+      // The lock timer starts at 0 on an FPGA (INIT=0).
+      soc.signals.firstWhere((s) => s.name == 'bus_provLockCnt').put(0);
       tree.locked.put(0);
       final seen = <String, LogicValue>{};
       for (var t = 0; t < 200; t++) {
@@ -134,7 +136,7 @@ void main() {
       }
       Simulator.setMaxSimTime(2000);
       await Simulator.run();
-      expect(seen['before'], isNot(LogicValue.zero));
+      expect(seen['before'], LogicValue.one);
       expect(seen['after'], LogicValue.zero);
     },
   );

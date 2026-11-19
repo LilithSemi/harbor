@@ -190,6 +190,7 @@ class HarborSoC extends BridgeModule {
   /// with CSR slave + bus master). This set keeps the second [addMaster] /
   /// [addPeripheral] from double-adding or double-driving its clk/reset.
   final Set<BridgeModule> _wired = {};
+  final Set<BridgeModule> _fabricWired = {};
 
   /// Adds [module] as a submodule and wires its clk/reset exactly once, even if
   /// it is registered as both a master and a peripheral.
@@ -227,6 +228,20 @@ class HarborSoC extends BridgeModule {
     }
   }
 
+  // Throws when [clockDomainName] is set and names no domain, so a typo does
+  // not fall back to the fabric domain.
+  void _requireDomain(BridgeModule module, String? clockDomainName) {
+    if (clockDomainName == null || _clockDomains.containsKey(clockDomainName)) {
+      return;
+    }
+    throw ArgumentError.value(
+      clockDomainName,
+      'clockDomainName',
+      '${module.name} names a clock domain that does not exist '
+          '(domains: ${_clockDomains.keys.join(', ')})',
+    );
+  }
+
   /// The clock domain a peripheral registered under [clockDomainName] actually
   /// runs on, or null when it rides the raw `clk` input because no domains are
   /// configured.
@@ -241,6 +256,9 @@ class HarborSoC extends BridgeModule {
     if (_clockDomains.isEmpty && fabricClockDomain == null) return null;
     return _fabricDomain;
   }
+
+  /// The clock domain of the fabric, or null when the SoC has no domains.
+  HarborClockDomain? get fabricDomain => _fabricDomain;
 
   /// The domain of the fabric and of every peripheral with no domain name.
   ///
@@ -617,7 +635,8 @@ class HarborSoC extends BridgeModule {
   }) {
     if (hasBuilt || _fabricBuilt) {
       throw StateError(
-        'addClockDomainFromNet("${config.name}") was called after build',
+        'addClockDomainFromNet("${config.name}") was called after '
+        'buildFabric or build',
       );
     }
     if (_clockDomains.containsKey(config.name)) {
@@ -863,6 +882,7 @@ class HarborSoC extends BridgeModule {
       );
     }
 
+    _requireDomain(peripheral, clockDomainName);
     final dt = (peripheral as HarborDeviceTreeNodeProvider).dtNode;
     _peripherals.add(
       _PeripheralEntry(
@@ -879,11 +899,7 @@ class HarborSoC extends BridgeModule {
       }
     }
     _wireOnce(peripheral, clockDomainName);
-    if (peripheral.tryInput(BusSlavePort.fabricClkPort) != null) {
-      final (clk, reset) = defaultClock;
-      peripheral.input(BusSlavePort.fabricClkPort).srcConnection! <= clk;
-      peripheral.input(BusSlavePort.fabricResetPort).srcConnection! <= reset;
-    }
+    _wireFabricClock(peripheral);
 
     // A driver that divides its input clock cannot work without knowing the
     // rate. The peripheral does not know which domain it landed on, the SoC
@@ -992,10 +1008,12 @@ class HarborSoC extends BridgeModule {
     List<BusAddressRange>? targetRanges,
     List<BusAddressRange>? burstRanges,
   }) {
+    _requireDomain(master, clockDomainName);
     _masters.add(
       _MasterEntry(
         module: master,
         busInterfaceName: busInterfaceName,
+        clockDomainName: clockDomainName,
         pipeline: pipeline,
         channel: channel,
         memory: memory,
@@ -1009,6 +1027,7 @@ class HarborSoC extends BridgeModule {
       ),
     );
     _wireOnce(master, clockDomainName);
+    _wireFabricClock(master);
     return master;
   }
 
@@ -1806,6 +1825,16 @@ class HarborSoC extends BridgeModule {
 
   /// Throws when a peripheral runs on a clock other than the fabric clock
   /// and has no crossing to it.
+  // Drives the fabric clock inputs of the ports of [module] once, whether it
+  // is a master, a peripheral or both.
+  void _wireFabricClock(BridgeModule module) {
+    if (module.tryInput(BusSlavePort.fabricClkPort) == null) return;
+    if (!_fabricWired.add(module)) return;
+    final (clk, reset) = defaultClock;
+    module.input(BusSlavePort.fabricClkPort).srcConnection! <= clk;
+    module.input(BusSlavePort.fabricResetPort).srcConnection! <= reset;
+  }
+
   void _checkClockDomains() {
     final (fabricClk, _) = defaultClock;
     for (final e in _peripherals) {
@@ -1816,6 +1845,17 @@ class HarborSoC extends BridgeModule {
           'peripheral ${e.module.name} runs on clock domain '
           '"${e.clockDomainName}", not on the fabric clock. Build it with '
           'crossFabricClock so its port crosses to the fabric clock.',
+        );
+      }
+    }
+    for (final e in _masters) {
+      final domain = domainFor(e.clockDomainName);
+      if (domain == null || identical(domain.clk, fabricClk)) continue;
+      if (e.module.tryInput(BusSlavePort.fabricClkPort) == null) {
+        throw StateError(
+          'master ${e.module.name} runs on clock domain '
+          '"${domain.config.name}", not on the fabric clock. Build its port '
+          'with a fabricClock so it crosses to the fabric clock.',
         );
       }
     }
@@ -2579,6 +2619,9 @@ class _SecondarySlave {
 class _MasterEntry {
   final BridgeModule module;
   final String busInterfaceName;
+
+  /// The clock domain of the master, or null for the fabric domain.
+  final String? clockDomainName;
   final bool pipeline;
 
   /// The fabric channel this master lives on.
@@ -2615,6 +2658,7 @@ class _MasterEntry {
   const _MasterEntry({
     required this.module,
     required this.busInterfaceName,
+    this.clockDomainName,
     this.pipeline = false,
     this.channel = 'primary',
     this.memory,
