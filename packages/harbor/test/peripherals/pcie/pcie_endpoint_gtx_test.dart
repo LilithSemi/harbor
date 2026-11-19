@@ -21,6 +21,7 @@ void main() {
   HarborPcieEndpoint endpoint(
     HarborDeviceTarget target, {
     bool? gen2,
+    int? userClkFreq,
     bool waitRxCdrLock = false,
     HarborGtxPcieTimeouts gtxTimeouts = const HarborGtxPcieTimeouts(),
     Map<String, String> hardBlockOverrides = const {},
@@ -39,6 +40,7 @@ void main() {
     txLast: Logic(),
     txValid: Logic(),
     gen2: gen2,
+    userClkFreq: userClkFreq,
     waitRxCdrLock: waitRxCdrLock,
     gtxTimeouts: gtxTimeouts,
     hardBlockOverrides: hardBlockOverrides,
@@ -181,6 +183,88 @@ void main() {
       () => endpoint(_kintex, hardBlockOverrides: {'PL_FAST_TRAIN': '"TRUE"'}),
       throwsArgumentError,
     );
+  });
+
+  group('user clock option', () {
+    // USER_CLK_FREQ code and MMCM divide of each user clock, with the other
+    // attributes of the endpoint staying as they are.
+    const table = {
+      62500000: (1, '16'),
+      125000000: (2, '8'),
+      250000000: (3, '4'),
+    };
+    for (final gen2 in [false, true]) {
+      for (final MapEntry(key: hz, value: (code, divide)) in table.entries) {
+        test('${gen2 ? '5.0' : '2.5'} GT/s at ${hz / 1e6} MHz', () async {
+          final dut = endpoint(_kintex, gen2: gen2, userClkFreq: hz);
+          await dut.build();
+          final sv = dut.dumpSystemVerilog();
+          expect(dut.userClkHz, hz);
+          expect(param(sv, 'USER_CLK_FREQ'), '$code');
+          expect(param(sv, 'USER_CLK2_DIV2'), '"FALSE"');
+          expect(param(sv, 'CLKOUT2_DIVIDE'), divide);
+          expect(
+            dut
+                .clockRates('e')
+                .entries
+                .firstWhere((e) => e.key.endsWith('.userclk1'))
+                .value,
+            hz / 1e6,
+          );
+          expect(param(sv, 'LINK_CAP_MAX_LINK_WIDTH'), "6'h1");
+        });
+      }
+    }
+
+    test('Gen2 x1 at 62.5 MHz has the 64-bit interface', () async {
+      final dut = endpoint(_kintex, userClkFreq: 62500000);
+      await dut.build();
+      expect(dut.gen2, isTrue);
+      expect(dut.userClkHz, 62500000);
+      expect(dut.rxData.width, 64);
+      expect(dut.rxKeep.width, 8);
+    });
+
+    test('the default stays 125 MHz at Gen2 and 62.5 MHz at Gen1', () {
+      expect(endpoint(_kintex).userClkHz, 125000000);
+      expect(endpoint(_kintex, gen2: false).userClkHz, 62500000);
+      expect(
+        endpoint(_kintex).definitionName,
+        endpoint(_kintex, userClkFreq: 125000000).definitionName,
+      );
+      expect(
+        endpoint(_kintex, userClkFreq: 62500000).definitionName,
+        contains('_Uc62500'),
+      );
+      expect(
+        endpoint(_kintex, gen2: false, userClkFreq: 62500000).definitionName,
+        endpoint(_kintex, gen2: false).definitionName,
+      );
+    });
+
+    test('an illegal user clock is rejected', () {
+      for (final hz in [31250000, 100000000, 500000000, 0]) {
+        expect(
+          () => endpoint(_kintex, userClkFreq: hz),
+          throwsArgumentError,
+          reason: '$hz',
+        );
+      }
+      expect(
+        () => endpoint(_artix, userClkFreq: 125000000),
+        throwsUnsupportedError,
+      );
+      expect(endpoint(_artix, userClkFreq: 62500000).userClkHz, 62500000);
+    });
+
+    test('the user clock is in the definition name', () {
+      final names = {
+        endpoint(_kintex).definitionName,
+        endpoint(_kintex, userClkFreq: 62500000).definitionName,
+        endpoint(_kintex, userClkFreq: 250000000).definitionName,
+      };
+      expect(names, hasLength(3));
+    });
   });
 
   test('the default GTX definition names are fixed', () async {

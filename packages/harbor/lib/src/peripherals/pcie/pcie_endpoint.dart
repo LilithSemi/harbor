@@ -100,8 +100,9 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
   /// The [HarborPcieResetCounters] status, for the DMA reset status input.
   Logic get resetStatus => output('reset_status');
 
-  /// Frequency of [userClk] in Hz, from the PHY. It is 62.5 MHz for a GTP x1
-  /// or a GTX at 2.5 GT/s, and 125 MHz for a GTX at 5 GT/s. It is also the
+  /// Frequency of [userClk] in Hz, from the PHY. It is [userClkFreq] when set.
+  /// Else it is 62.5 MHz for a GTP x1 or a GTX at 2.5 GT/s, and 125 MHz for a
+  /// GTX at 5 GT/s. It is also the
   /// value of the hard block USER_CLK_FREQ parameter.
   int get userClkHz => _phy.userClkHz;
 
@@ -152,6 +153,7 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
     this.timeouts = const HarborGtpPcieTimeouts(),
     this.gtxTimeouts = const HarborGtxPcieTimeouts(),
     bool? gen2,
+    this.userClkFreq,
     this.waitRxCdrLock = false,
     this.debugSkipTxPhaseAlign = false,
     this.debugBuild = false,
@@ -167,6 +169,7 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
            freeClk != null,
            gtx: _isKintex7(target),
            gen2: gen2 ?? _isKintex7(target),
+           userClkRequest: userClkFreq,
            waitRxCdrLock: waitRxCdrLock,
            debugSkip: debugSkipTxPhaseAlign,
            overrides: hardBlockOverrides,
@@ -190,6 +193,12 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
     _checkConfig(config);
     if (this.gen2 && !gtx) {
       throw UnsupportedError('the GTP PHY runs at 2.5 GT/s only');
+    }
+    if (userClkFreq != null) {
+      checkUserClk(gen2: this.gen2, hz: userClkFreq!);
+      if (!gtx && userClkFreq != 62500000) {
+        throw UnsupportedError('the GTP PHY has a 62.5 MHz user clock only');
+      }
     }
     refClkP = addInput('refclk_p', refClkP);
     refClkN = addInput('refclk_n', refClkN);
@@ -229,6 +238,7 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
             rxN: rxN,
             pipe: pipe,
             gen2: this.gen2,
+            userClkRequest: userClkFreq,
             waitRxCdrLock: waitRxCdrLock,
             debugSkipTxPhaseAlign: debugSkipTxPhaseAlign,
             debugBuild: debugBuild,
@@ -566,9 +576,38 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
     };
   }
 
+  /// The user clock in Hz that the caller asked for, or null for the default:
+  /// 62.5 MHz at 2.5 GT/s and 125 MHz at 5 GT/s. The interface is 64 bits
+  /// wide at x1. It sets USER_CLK_FREQ and the user clock divide of the pipe
+  /// clock MMCM. A slower clock gives the user logic more time per cycle.
+  /// 62.5 MHz at 5 GT/s is the recommended clock of PG054 for x1.
+  final int? userClkFreq;
+
+  /// The user clock frequencies in Hz that the x1 64-bit interface allows
+  /// for a link rate, PG054 Table 2-8 and Table 4-3. It is the set that the
+  /// PHY can make, [HarborPipeClock.x1UserClkHz], at 2.5 and at 5.0 GT/s.
+  static const Map<bool, Set<int>> legalUserClkHz = {
+    false: HarborPipeClock.x1UserClkHz,
+    true: HarborPipeClock.x1UserClkHz,
+  };
+
+  /// Throws an [ArgumentError] unless [hz] is a legal user clock for a x1
+  /// link at 5 GT/s with [gen2] and at 2.5 GT/s without it.
+  static void checkUserClk({required bool gen2, required int hz}) {
+    if (!legalUserClkHz[gen2]!.contains(hz)) {
+      throw ArgumentError.value(
+        hz,
+        'userClkFreq',
+        'is not a user clock of a x1 64-bit link at '
+            '${gen2 ? '5.0' : '2.5'} GT/s: ${legalUserClkHz[gen2]!.join(', ')}',
+      );
+    }
+  }
+
   /// Hard block parameters of the endpoint, for a GTX PHY. USER_CLK_FREQ
-  /// comes from the divide of the user clock MMCM output: 1 for 62.5 MHz and
-  /// 2 for 125 MHz. At 5 GT/s the link speed is 2. LINK_STATUS_SLOT_CLOCK_CONFIG
+  /// comes from the divide of the user clock MMCM output: 1 for 62.5 MHz, 2
+  /// for 125 MHz and 3 for 250 MHz. PG054 recommends 62.5 MHz for a x1 link at
+  /// 5 GT/s, and the default is 125 MHz. At 5 GT/s the link speed is 2. LINK_STATUS_SLOT_CLOCK_CONFIG
   /// says that the link uses the reference clock of the slot, as the PHY does.
   Map<String, String> get _gtxParameters => gtx
       ? {
@@ -650,6 +689,12 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
     }
   }
 
+  /// The user clock in Hz when [userClkFreq] is null.
+  static int _defaultUserClkHz(bool gtx, bool gen2) =>
+      HarborPipeClock.userClkHz(
+        gtx ? HarborGtxPciePhy.userClkDivide(gen2: gen2) : 16,
+      );
+
   static String _definitionName(
     HarborPcieEndpointConfig config,
     int pipeStages,
@@ -657,6 +702,7 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
     bool freeClk, {
     required bool gtx,
     required bool gen2,
+    int? userClkRequest,
     required bool waitRxCdrLock,
     required bool debugSkip,
     required Map<String, String> overrides,
@@ -665,6 +711,9 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
     'HarborPcieEndpoint_Xilinx7_X1',
     if (gtx) 'Gtx',
     if (gen2) 'G2',
+    if (userClkRequest != null &&
+        userClkRequest != _defaultUserClkHz(gtx, gen2))
+      'Uc${userClkRequest ~/ 1000}',
     if (gtx && waitRxCdrLock) 'CdrWait',
     if (gtx && gtxTimeouts.definitionTag.isNotEmpty) gtxTimeouts.definitionTag,
     if (debugSkip) 'DebugNoPhAlign',

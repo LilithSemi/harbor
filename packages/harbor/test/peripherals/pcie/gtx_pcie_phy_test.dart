@@ -117,9 +117,14 @@ class _Bench {
     int pipeStages = 1,
     int linkWait = 0,
     int? txSettle,
+    int userClkPeriod = 8,
+    int? userClkHz,
     void Function(Gtxe2StatusModel m)? setup,
   }) async {
     final pclk = SimpleClockGenerator(8).clk;
+    final userClk = userClkPeriod == 8
+        ? pclk
+        : SimpleClockGenerator(userClkPeriod).clk;
     // A valid PERST# before build keeps the async reset of the power-on
     // reset flops away from an X edge at time 0.
     final perstN = Logic(name: 'perst_n')..put(perstEdge ? 0 : 1);
@@ -142,12 +147,13 @@ class _Bench {
       pipe: pipe,
       clocks: HarborPipeClocks(
         pclk: pclk,
-        userClk1: pclk,
-        userClk2: pclk,
+        userClk1: userClk,
+        userClk2: userClk,
         mmcmLock: model.mmcmLock,
         oobClk: pclk,
       ),
       gen2: gen2,
+      userClkHz: userClkHz,
       waitRxCdrLock: waitRxCdrLock,
       debugSkipTxPhaseAlign: skipTxPhaseAlign,
       debugBuild: skipTxPhaseAlign,
@@ -469,6 +475,17 @@ void main() {
       ).definitionName;
       expect({name(), name(cdr: true), name(rx: false)}, hasLength(3));
     });
+
+    test(
+      'the userClkHz option reaches the getter and the sequence is the same',
+      () async {
+        final b = await _Bench.start(userClkPeriod: 16, userClkHz: 62500000);
+        await b.waitFor(_S.idle);
+        expect(b.trace, _goodOrder);
+        expect(b.phy.userClkHz, 62500000);
+        await b.finish();
+      },
+    );
 
     test('USERRDY waits clockSettle cycles after the lock', () async {
       final b = await _Bench.start();

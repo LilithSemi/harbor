@@ -298,6 +298,23 @@ class HarborGtxPciePhy extends Module {
   /// MHz at 2.5 GT/s, which the hard block needs for a x1 link.
   static int userClkDivide({required bool gen2}) => gen2 ? 8 : 16;
 
+  /// Divide value for a user clock of [hz], or the default of [gen2] with
+  /// null. [hz] is 62.5, 125 or 250 MHz.
+  static int userClkDivideFor({required bool gen2, int? hz}) {
+    if (hz == null) return userClkDivide(gen2: gen2);
+    if (!HarborPipeClock.x1UserClkHz.contains(hz)) {
+      throw ArgumentError.value(
+        hz,
+        'userClkHz',
+        'must be 62.5, 125 or 250 MHz',
+      );
+    }
+    return HarborPipeClock.vcoHz ~/ hz;
+  }
+
+  /// The user clock divide of this PHY.
+  final int userClkDivideValue;
+
   /// Run at 5 GT/s when the PIPE rate asks for it.
   final bool gen2;
 
@@ -326,7 +343,7 @@ class HarborGtxPciePhy extends Module {
   final HarborGtxPcieTimeouts timeouts;
 
   /// Frequency of `userclk1` and `userclk2` in Hz.
-  int get userClkHz => HarborPipeClock.userClkHz(userClkDivide(gen2: gen2));
+  int get userClkHz => HarborPipeClock.userClkHz(userClkDivideValue);
 
   /// PIPE clock.
   Logic get pclk => output('pclk');
@@ -404,15 +421,20 @@ class HarborGtxPciePhy extends Module {
     this.debugSkipTxPhaseAlign = false,
     this.debugBuild = false,
     this.gen2 = true,
+    int? userClkHz,
     this.waitRxCdrLock = false,
     this.waitForRxResetStatus = true,
     this.pipeStages = 1,
     this.timeouts = const HarborGtxPcieTimeouts(),
     super.name = 'gtx_pcie_phy',
-  }) : super(
+  }) : userClkDivideValue = userClkDivideFor(gen2: gen2, hz: userClkHz),
+       super(
          definitionName: [
            'HarborGtxPciePhy_X1',
            if (gen2) 'G2',
+           if (userClkHz != null &&
+               userClkHz != HarborPipeClock.vcoHz ~/ userClkDivide(gen2: gen2))
+             'Uc${userClkHz ~/ 1000}',
            if (!registerMmcmLock) 'DirectLock',
            if (debugSkipTxPhaseAlign) 'DebugNoPhAlign',
            if (waitRxCdrLock) 'CdrWait',
@@ -503,7 +525,7 @@ class HarborGtxPciePhy extends Module {
         reset: mmcmReset == null
             ? (~perstN).named('mmcm_rst')
             : (~perstN | addInput('mmcm_reset', mmcmReset)).named('mmcm_rst'),
-        userClkDivide: userClkDivide(gen2: gen2),
+        userClkDivide: userClkDivideValue,
         lockTimerBits: mmcmLockTimerBits,
         registerLock: registerMmcmLock,
         gen2: gen2,

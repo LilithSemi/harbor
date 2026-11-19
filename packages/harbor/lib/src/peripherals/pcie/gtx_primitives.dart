@@ -88,6 +88,7 @@ class HarborKintex7PciePhy extends HarborPciePhy {
     required Logic rxN,
     required HarborPciePipeLane pipe,
     this.gen2 = true,
+    this.userClkRequest,
     this.registerMmcmLock = true,
     this.debugSkipTxPhaseAlign = false,
     this.debugBuild = false,
@@ -100,6 +101,11 @@ class HarborKintex7PciePhy extends HarborPciePhy {
          definitionName: [
            'HarborKintex7PciePhy_X1',
            if (gen2) 'G2',
+           if (userClkRequest != null &&
+               userClkRequest !=
+                   HarborPipeClock.vcoHz ~/
+                       HarborGtxPciePhy.userClkDivide(gen2: gen2))
+             'Uc${userClkRequest ~/ 1000}',
            if (!registerMmcmLock) 'DirectLock',
            if (debugSkipTxPhaseAlign) 'DebugNoPhAlign',
            if (waitRxCdrLock) 'CdrWait',
@@ -140,6 +146,7 @@ class HarborKintex7PciePhy extends HarborPciePhy {
       channel: channelPorts,
       pipe: localPipe,
       gen2: gen2,
+      userClkHz: userClkRequest,
       registerMmcmLock: registerMmcmLock,
       debugSkipTxPhaseAlign: debugSkipTxPhaseAlign,
       debugBuild: debugBuild,
@@ -174,8 +181,12 @@ class HarborKintex7PciePhy extends HarborPciePhy {
   }
 
   @override
-  int get userClkHz =>
-      HarborPipeClock.userClkHz(HarborGtxPciePhy.userClkDivide(gen2: gen2));
+  int get userClkHz => HarborPipeClock.userClkHz(
+    HarborGtxPciePhy.userClkDivideFor(gen2: gen2, hz: userClkRequest),
+  );
+
+  /// The requested user clock in Hz, or null for the default of [gen2].
+  final int? userClkRequest;
 
   /// Run at 5 GT/s when the hard block asks for it.
   final bool gen2;

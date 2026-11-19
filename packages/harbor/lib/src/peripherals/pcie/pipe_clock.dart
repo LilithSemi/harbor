@@ -31,6 +31,11 @@ class HarborPipeClock extends Module {
   static const int vcoHz = 1000000000;
 
   /// Frequency in Hz of `userclk1` and `userclk2` for a divide value.
+  /// The user clock frequencies in Hz of a x1 link with a 64-bit interface,
+  /// PG054 Table 2-8 and Table 4-3. The MMCM makes each with a divide of 16,
+  /// 8 or 4.
+  static const Set<int> x1UserClkHz = {62500000, 125000000, 250000000};
+
   static int userClkHz(int userClkDivide) => vcoHz ~/ userClkDivide;
 
   /// The USER_CLK_FREQ parameter of the PCIe hard block for a divide value:
@@ -95,11 +100,11 @@ class HarborPipeClock extends Module {
     if (gen2 != (pclkSel != null)) {
       throw ArgumentError('pclkSel is given if and only if gen2 is set');
     }
-    if (userClkDivide != 8 && userClkDivide != 16) {
+    if (userClkDivide != 4 && userClkDivide != 8 && userClkDivide != 16) {
       throw ArgumentError.value(
         userClkDivide,
         'userClkDivide',
-        'must be 8 or 16',
+        'must be 4, 8 or 16',
       );
     }
     if (lockTimerBits != null && (lockTimerBits! < 4 || lockTimerBits! > 30)) {
