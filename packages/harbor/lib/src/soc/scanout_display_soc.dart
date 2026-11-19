@@ -8,6 +8,7 @@ import '../clock/clock_domain.dart';
 import '../peripherals/display.dart';
 import '../peripherals/harbor_sdram.dart';
 import '../peripherals/scanout_display.dart';
+import '../video/adv7511_output.dart';
 import 'harbor_soc.dart';
 import 'target.dart';
 
@@ -442,7 +443,7 @@ extension HarborSocScanoutDisplay on HarborSoC {
   HarborScanoutDisplay addFabricScanoutDisplay({
     required BusAddressRange memory,
     required HarborDisplayTiming timing,
-    List<HarborPixelFormat> formats = const [HarborPixelFormat.rgb565],
+    List<HarborPixelFormat>? formats,
     required int baseAddress,
     int? pixelClockHz,
     int pixelClockTolerancePpm = 10000,
@@ -453,6 +454,14 @@ extension HarborSocScanoutDisplay on HarborSoC {
     int burstBeats = 16,
     bool realtime = true,
     String pinName = 'gpdi_dp',
+    HarborDisplayInterface output = HarborDisplayInterface.dvi,
+    int? readChannel,
+    int? memoryBytesPerSecond,
+    double maxBandwidthShare = HarborScanoutBandwidth.defaultMaxShare,
+    String hdmiPinPrefix = 'hdmi',
+    String i2cPinPrefix = 'i2c',
+    String adv7511StatusPin = 'adv7511_status',
+    int? adv7511RepeatCycles,
     String? runningPin,
     String? underrunPin,
     String? updatePendingPin,
@@ -464,10 +473,19 @@ extension HarborSocScanoutDisplay on HarborSoC {
     if (target == null) {
       throw StateError('a scanout display needs a SoC target');
     }
+    final adv7511 = output == HarborDisplayInterface.adv7511;
+    if (!adv7511 && output != HarborDisplayInterface.dvi) {
+      throw ArgumentError.value(output, 'output', 'use dvi or adv7511');
+    }
+    final fmts =
+        formats ??
+        (adv7511
+            ? const [HarborPixelFormat.xrgb8888]
+            : const [HarborPixelFormat.rgb565]);
     final wordBytes = busDataWidth ~/ 8;
     final step = burstBeats * wordBytes;
     final strides = [
-      for (final f in formats)
+      for (final f in fmts)
         (f.lineBytes(0, timing.hActive) + step - 1) ~/ step * step,
     ];
     final frame = strides.reduce(max) * timing.vActive;
@@ -479,6 +497,8 @@ extension HarborSocScanoutDisplay on HarborSoC {
         'give both the $shiftDomain and $pixelDomain domains, or neither',
       );
     }
+    Logic shiftClk, shiftReset, pixelClk, pixelReset;
+    int realPixelHz;
     if (shift == null) {
       final sys = clockDomain('sys');
       final source = sys?.config.sourceFrequency;
@@ -488,25 +508,85 @@ extension HarborSocScanoutDisplay on HarborSoC {
           'domains, so the bus clock stays the sys clock',
         );
       }
-      shift = addClockDomain(
-        HarborScanoutDisplay.clockConfig(
-          pixelClockHz: _reachablePixelClock(
-            target,
-            source,
-            pixelClockHz ?? timing.pixelClock,
-            pixelClockTolerancePpm,
+      final xilinx =
+          target is HarborFpgaTarget &&
+          (target.vendor == HarborFpgaVendor.vivado ||
+              target.vendor == HarborFpgaVendor.openXc7);
+      if (adv7511 && xilinx) {
+        // 25.175 MHz is not reachable with integer dividers, so the 640x480
+        // mode runs at 25.0 MHz, 0.7% below the VESA clock.
+        final want =
+            pixelClockHz ??
+            (timing.pixelClock == 25175000 ? 25000000 : timing.pixelClock);
+        final clocks = addSubModule(
+          HarborAdv7511Clocks(
+            source: sharedOscillatorClock ?? boardClk,
+            sourceBuffered: sharedOscillatorClock != null,
+            reset: sys.reset,
+            sourceHz: source,
+            clk2xHz: 2 * want,
           ),
-          sourceClockHz: source,
-          shiftName: shiftDomain,
-          pixelName: pixelDomain,
-        ),
-      );
-      pixel = clockDomain(pixelDomain)!;
+        );
+        shiftClk = clocks.clk2x;
+        shiftReset = clocks.reset2x;
+        pixelClk = clocks.pixelClk;
+        pixelReset = clocks.pixelReset;
+        realPixelHz = clocks.pixelHz;
+      } else if (adv7511) {
+        final want =
+            pixelClockHz ??
+            (timing.pixelClock == 25175000 ? 25000000 : timing.pixelClock);
+        shift = addClockDomain(
+          HarborClockConfig.fixed(
+            name: shiftDomain,
+            frequency: 2 * want,
+            sourceFrequency: source,
+          ),
+        );
+        pixel = addClockDomain(
+          HarborClockConfig.fixed(
+            name: pixelDomain,
+            frequency: want,
+            sourceFrequency: source,
+          ),
+        );
+        shiftClk = shift.clk;
+        shiftReset = shift.reset;
+        pixelClk = pixel.clk;
+        pixelReset = pixel.reset;
+        realPixelHz = want;
+      } else {
+        shift = addClockDomain(
+          HarborScanoutDisplay.clockConfig(
+            pixelClockHz: _reachablePixelClock(
+              target,
+              source,
+              pixelClockHz ?? timing.pixelClock,
+              pixelClockTolerancePpm,
+            ),
+            sourceClockHz: source,
+            shiftName: shiftDomain,
+            pixelName: pixelDomain,
+          ),
+        );
+        pixel = clockDomain(pixelDomain)!;
+        shiftClk = shift.clk;
+        shiftReset = shift.reset;
+        pixelClk = pixel.clk;
+        pixelReset = pixel.reset;
+        realPixelHz = pixel.config.frequency;
+      }
+    } else {
+      shiftClk = shift.clk;
+      shiftReset = shift.reset;
+      pixelClk = pixel!.clk;
+      pixelReset = pixel.reset;
+      realPixelHz = pixel.config.frequency;
     }
-    final realPixelHz = pixel!.config.frequency;
-    if (shift.config.frequency != 5 * realPixelHz) {
+    final ratio = adv7511 ? 2 : 5;
+    if (shift != null && shift.config.frequency != ratio * realPixelHz) {
       throw StateError(
-        'the $shiftDomain clock must be 5 times the $pixelDomain clock',
+        'the $shiftDomain clock must be $ratio times the $pixelDomain clock',
       );
     }
     final mode = HarborDisplayTiming(
@@ -522,12 +602,28 @@ extension HarborSocScanoutDisplay on HarborSoC {
       hSyncPositive: timing.hSyncPositive,
       vSyncPositive: timing.vSyncPositive,
     );
+    if (memoryBytesPerSecond != null) {
+      for (final f in fmts) {
+        final need =
+            f.lineBytes(0, mode.hActive) * mode.vActive * mode.refreshRate;
+        if (need > memoryBytesPerSecond * maxBandwidthShare) {
+          throw ArgumentError(
+            '${mode.resolution} ${f.name} needs '
+            '${(need / 1e6).toStringAsFixed(1)} MB/s, which is more than '
+            '${(maxBandwidthShare * 100).toStringAsFixed(0)}% of the '
+            '${(memoryBytesPerSecond / 1e6).toStringAsFixed(1)} MB/s of the '
+            'memory port',
+          );
+        }
+      }
+    }
 
+    final busHz = domainFor(null)?.config.frequency;
     final display = addPeripheral(
       HarborScanoutDisplay(
         baseAddress: baseAddress,
         timing: mode,
-        formats: formats,
+        formats: fmts,
         strides: strides,
         framebufferBase: 0,
         placement: HarborFramebufferPlacement.firmware,
@@ -537,33 +633,53 @@ extension HarborSocScanoutDisplay on HarborSoC {
         simpleFramebuffer: false,
         fabricMemory: true,
         burstBeats: burstBeats,
+        outputType: output,
+        busClockHz: busHz,
+        adv7511RepeatCycles: adv7511RepeatCycles,
         fabricKind: fabricKind,
         busAddressWidth: busAddressWidth,
         busDataWidth: busDataWidth,
         name: name,
       ),
     );
-    display.input('pixel_clk').srcConnection! <= pixel.clk;
-    display.input('pixel_reset').srcConnection! <= pixel.reset;
-    display.input('shift_clk').srcConnection! <= shift.clk;
-    display.input('shift_reset').srcConnection! <= shift.reset;
+    display.input('pixel_clk').srcConnection! <= pixelClk;
+    display.input('pixel_reset').srcConnection! <= pixelReset;
+    display.input('shift_clk').srcConnection! <= shiftClk;
+    display.input('shift_reset').srcConnection! <= shiftReset;
     addMaster(
       display,
       busInterfaceName: 'fb',
       memory: true,
       outstanding: fabricKind == HarborFabricKind.wishbone ? 1 : 2,
+      readChannel: readChannel,
       realtime: realtime,
       writeStallFree: true,
       targetRanges: [memory],
       burstRanges: [memory],
     );
-    exposePin(display, 'gpdi', externalName: pinName);
-    if (display.tryOutput('gpdi_n') != null) {
-      exposePin(
-        display,
-        'gpdi_n',
-        externalName: pinName.replaceFirst('dp', 'dn'),
-      );
+    if (adv7511) {
+      for (final (port, pin) in [
+        ('adv_d', '${hdmiPinPrefix}_d'),
+        ('adv_de', '${hdmiPinPrefix}_de'),
+        ('adv_hsync', '${hdmiPinPrefix}_hsync'),
+        ('adv_vsync', '${hdmiPinPrefix}_vsync'),
+        ('adv_clk', '${hdmiPinPrefix}_clk'),
+        ('adv_scl', '${i2cPinPrefix}_scl'),
+        ('adv_sda', '${i2cPinPrefix}_sda'),
+        ('adv_mux_reset_n', '${i2cPinPrefix}_mux_reset_n'),
+        ('adv7511_status', adv7511StatusPin),
+      ]) {
+        exposePin(display, port, externalName: pin);
+      }
+    } else {
+      exposePin(display, 'gpdi', externalName: pinName);
+      if (display.tryOutput('gpdi_n') != null) {
+        exposePin(
+          display,
+          'gpdi_n',
+          externalName: pinName.replaceFirst('dp', 'dn'),
+        );
+      }
     }
     for (final (port, pin) in [
       ('running', runningPin),

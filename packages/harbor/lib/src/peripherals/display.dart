@@ -17,6 +17,11 @@ enum HarborDisplayInterface {
   /// DisplayPort.
   displayPort,
 
+  /// ADV7511 transmitter: 16 bit YCbCr 4:2:2, DE, syncs and a pixel clock,
+  /// with a hardware I2C initializer. The shift clock is twice the pixel
+  /// clock.
+  adv7511,
+
   /// LVDS (for panel displays).
   lvds,
 

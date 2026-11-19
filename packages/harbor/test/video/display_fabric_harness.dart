@@ -122,6 +122,9 @@ class FetchCase {
   final bool hammer;
   final int lineClocks;
 
+  /// Drives the adv7511 output, with a shift clock of twice the pixel clock.
+  final bool adv7511;
+
   const FetchCase({
     required this.kind,
     this.format = HarborPixelFormat.rgb565,
@@ -132,6 +135,7 @@ class FetchCase {
     this.realtime = true,
     this.hammer = false,
     this.lineClocks = 64,
+    this.adv7511 = false,
   });
 
   int get lineBytes => format.lineBytes(0, hActive);
@@ -159,12 +163,35 @@ class FetchRun {
   final Logic pixelClk;
   final List<Map<(int, int), List<int>>> frames = [{}];
 
+  /// For an adv7511 build, the (DE, data) of each pixel on the pins.
+  final List<(int, int)> pins = [];
+
   /// The traffic master of a case with [FetchCase.hammer].
   WaistRequester? hammer;
   final List<String> errors = [];
 
-  FetchRun(this.c, this.soc, this.display, this.bus, this.clk, this.pixelClk) {
+  FetchRun(
+    this.c,
+    this.soc,
+    this.display,
+    this.bus,
+    this.clk,
+    this.pixelClk, [
+    Logic? shiftClk,
+  ]) {
     final d = display.display;
+    if (shiftClk != null) {
+      // The pin clock is high for the 2x clock period that holds a new pixel.
+      shiftClk.negedge.listen((_) {
+        final v = display.output('adv_clk').value;
+        if (v.isValid && v.toBool()) {
+          pins.add((
+            display.output('adv_de').value.toInt(),
+            display.output('adv_d').value.toInt(),
+          ));
+        }
+      });
+    }
     var last = false;
     pixelClk.posedge.listen((_) {
       final de = d.output('de').value;
@@ -282,8 +309,9 @@ Future<FetchRun> startFetch(FetchCase c, {bool writeFrame = true}) async {
       ),
       HarborClockConfig.fixed(
         name: 'shift',
-        frequency: 125000000,
-        sourceFrequency: 50000000,
+        frequency: c.adv7511 ? 50000000 : 125000000,
+        // A domain at the source rate is the source clock and has no port.
+        sourceFrequency: c.adv7511 ? 25000000 : 50000000,
       ),
     ],
   );
@@ -325,6 +353,9 @@ Future<FetchRun> startFetch(FetchCase c, {bool writeFrame = true}) async {
     busDataWidth: 64,
     burstBeats: c.burstBeats,
     realtime: c.realtime,
+    output: c.adv7511
+        ? HarborDisplayInterface.adv7511
+        : HarborDisplayInterface.dvi,
   );
   cpu.pullUp(soc);
   hammer?.pullUp(soc);
@@ -334,7 +365,7 @@ Future<FetchRun> startFetch(FetchCase c, {bool writeFrame = true}) async {
   // that changes against the pixel clock.
   final clk = SimpleClockGenerator(22).clk;
   final pixelClk = SimpleClockGenerator(40).clk;
-  final shift = SimpleClockGenerator(8).clk;
+  final shift = SimpleClockGenerator(c.adv7511 ? 20 : 8).clk;
   final reset = Logic(name: 'reset')..inject(1);
   soc.input('clk').srcConnection! <= clk;
   soc.input('pixel_clk').srcConnection! <= pixelClk;
@@ -347,7 +378,7 @@ Future<FetchRun> startFetch(FetchCase c, {bool writeFrame = true}) async {
   for (final n in soc.inputs.keys.where((n) => n.startsWith('hammer_w_'))) {
     soc.input(n).srcConnection!.put(0);
   }
-  Simulator.setMaxSimTime(200000000);
+  Simulator.setMaxSimTime(c.adv7511 ? 6000000 : 200000000);
   unawaited(Simulator.run());
   for (var i = 0; i < 8; i++) {
     await clk.nextPosedge;
@@ -356,7 +387,15 @@ Future<FetchRun> startFetch(FetchCase c, {bool writeFrame = true}) async {
   for (var i = 0; i < 4; i++) {
     await clk.nextPosedge;
   }
-  final run = FetchRun(c, soc, display, bus, clk, pixelClk);
+  final run = FetchRun(
+    c,
+    soc,
+    display,
+    bus,
+    clk,
+    pixelClk,
+    c.adv7511 ? shift : null,
+  );
   if (c.hammer) {
     final sim = Sim(soc, clk: clk)
       ..attach()

@@ -13,6 +13,7 @@ import 'alpha_blend.dart';
 import 'csc.dart';
 import 'display_output.dart';
 import 'dual_clock_scanout.dart';
+import 'adv7511_output.dart';
 import 'dvi_transmitter.dart';
 import 'hdmi_framer.dart';
 import 'hdmi_packets.dart';
@@ -408,6 +409,7 @@ class HarborDualClockDisplay extends Module {
              (outputType == HarborDisplayInterface.parallelRgb
                  ? '_parallelRgb'
                  : '') +
+             (outputType == HarborDisplayInterface.adv7511 ? '_adv7511' : '') +
              (hdmi
                  ? (audioValid != null
                        ? '_hdmi_audio_p${timing.pixelClock}'
@@ -418,7 +420,8 @@ class HarborDualClockDisplay extends Module {
        ) {
     requireDisplayOutputSupported(outputType);
     if (hdmi) {
-      if (outputType == HarborDisplayInterface.parallelRgb) {
+      if (outputType == HarborDisplayInterface.parallelRgb ||
+          outputType == HarborDisplayInterface.adv7511) {
         throw ArgumentError('hdmi needs a TMDS output');
       }
       if (hdmiEnable == null) {
@@ -467,7 +470,9 @@ class HarborDualClockDisplay extends Module {
     }
     if (outputType != HarborDisplayInterface.parallelRgb &&
         (shiftClk == null || shiftReset == null)) {
-      throw ArgumentError('a TMDS output needs shiftClk and shiftReset');
+      throw ArgumentError(
+        'a TMDS or adv7511 output needs shiftClk and shiftReset',
+      );
     }
     final lineBytes = _lineBytes(timing, this.formats);
     final planar = HarborDualClockScanout.isPlanar(this.formats);
@@ -646,10 +651,18 @@ class HarborDualClockDisplay extends Module {
 
     final hbits = (timing.hTotal - 1).bitLength;
     final vbits = (timing.vTotal - 1).bitLength;
-    final parallelRgb = outputType == HarborDisplayInterface.parallelRgb;
+    final adv7511 = outputType == HarborDisplayInterface.adv7511;
+    final parallelRgb =
+        outputType == HarborDisplayInterface.parallelRgb || adv7511;
     final tmdsComplement =
         !parallelRgb && TmdsSerializer.needsComplement(target);
-    if (parallelRgb) {
+    if (adv7511) {
+      addOutput('adv_d', width: 16);
+      addOutput('adv_de');
+      addOutput('adv_hsync');
+      addOutput('adv_vsync');
+      addOutput('adv_clk');
+    } else if (parallelRgb) {
       addOutput('rgb', width: 24);
       addOutput('pclk');
     } else {
@@ -1182,7 +1195,36 @@ class HarborDualClockDisplay extends Module {
     }
     addOutput('overlay_present') <= Const(overlayPresent ? 1 : 0);
 
-    if (parallelRgb) {
+    if (adv7511) {
+      final conv = HarborYcbcr422Converter(
+        clk: pixelClk,
+        reset: pixelReset,
+        red: r2,
+        green: g2,
+        blue: b2,
+        de: de2,
+        hsync: hsync2,
+        vsync: vsync2,
+        hsyncPositive: hp,
+        vsyncPositive: vp,
+      );
+      final pins = HarborAdv7511PinStage(
+        clk2x: shiftClk!,
+        reset: shiftReset!,
+        tog: conv.tog,
+        d: conv.d,
+        de: conv.de,
+        hsync: conv.hsync,
+        vsync: conv.vsync,
+        hsyncPositive: hp,
+        vsyncPositive: vp,
+      );
+      output('adv_d') <= pins.d;
+      output('adv_de') <= pins.de;
+      output('adv_hsync') <= pins.hsync;
+      output('adv_vsync') <= pins.vsync;
+      output('adv_clk') <= pins.clkOut;
+    } else if (parallelRgb) {
       // No TMDS encoder or serializer, and no shift clock: rgb/hsync/vsync/de
       // are already the registered, pixel-aligned values of the last stage
       // above, and pclk is the pixel clock forwarded through the same edge.

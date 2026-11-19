@@ -240,108 +240,167 @@ class HarborAdv7511Initializer extends Module {
       (data >> (Const(7, width: 4) - bitn).getRange(0, 3))[0],
     );
 
-    Sequential(clk, reset: reset, resetValues: {
-      pc: 0,
-      running: 0,
-      wait: this.repeatCycles,
-      div: 0,
-      q: 0,
-      bitn: 0,
-      rx: 0,
-      for (final r in regs) r: 0,
-      nackNow: 0,
-      sclLow: 0,
-      sdaLow: 0,
-      sdaMeta: 1,
-      sdaSync: 1,
-      statusReg: 0,
-      passReg: 0,
-    }, [
-      sdaMeta < sdaIn,
-      sdaSync < sdaMeta,
-      If(
-        ~running,
-        then: [
-          If(
-            wait.eq(0),
-            then: [
-              running < 1,
-              pc < 0,
-              div < 0,
-              q < 0,
-              bitn < 0,
-              nackNow < 0,
-            ],
-            orElse: [wait < wait - 1],
-          ),
-        ],
-        orElse: [
-          div < mux(tick, Const(quarter - 1, width: divW), div - 1),
-          If(tick, then: [
-            q < q + 1,
-            // START: release SDA, release SCL, pull SDA, pull SCL.
-            // STOP: pull SDA, release SCL, release SDA.
-            If(isStart, then: [
-              Case(q, [
-                CaseItem(Const(0, width: 2), [sdaLow < 0]),
-                CaseItem(Const(1, width: 2), [sclLow < 0]),
-                CaseItem(Const(2, width: 2), [sdaLow < 1]),
-                CaseItem(Const(3, width: 2), [sclLow < 1]),
-              ]),
-            ], orElse: [
-              If(isStop, then: [
-                Case(q, [
-                  CaseItem(Const(0, width: 2), [sdaLow < 1]),
-                  CaseItem(Const(1, width: 2), [sclLow < 0]),
-                  CaseItem(Const(2, width: 2), [sdaLow < 0]),
-                ]),
-              ], orElse: [
-                Case(q, [
-                  CaseItem(Const(0, width: 2), [
-                    // A write byte sends its bit, a read byte and the ACK
-                    // slot release SDA. The master NACKs the last read.
-                    sdaLow < ~mux(isWrite, txBit, Const(1)),
-                  ]),
-                  CaseItem(Const(1, width: 2), [sclLow < 0]),
-                  CaseItem(Const(2, width: 2), [
-                    If(isRead & ~ack, then: [
-                      rx < [rx.getRange(0, 7), sdaSync].concat(),
-                    ]),
-                    If(isWrite & ack & sdaSync, then: [nackNow < 1]),
-                  ]),
-                  CaseItem(Const(3, width: 2), [
-                    sclLow < 1,
-                    If(isRead & ack, then: [
-                      for (var i = 0; i < 4; i++)
-                        If(data.eq(i), then: [regs[i] < rx]),
-                    ]),
-                  ]),
-                ]),
-              ]),
-            ]),
-            If(q.eq(3), then: [
-              If(lastBit, then: [
+    Sequential(
+      clk,
+      reset: reset,
+      resetValues: {
+        pc: 0,
+        running: 0,
+        wait: this.repeatCycles,
+        div: 0,
+        q: 0,
+        bitn: 0,
+        rx: 0,
+        for (final r in regs) r: 0,
+        nackNow: 0,
+        sclLow: 0,
+        sdaLow: 0,
+        sdaMeta: 1,
+        sdaSync: 1,
+        statusReg: 0,
+        passReg: 0,
+      },
+      [
+        sdaMeta < sdaIn,
+        sdaSync < sdaMeta,
+        If(
+          ~running,
+          then: [
+            If(
+              wait.eq(0),
+              then: [
+                running < 1,
+                pc < 0,
+                div < 0,
+                q < 0,
                 bitn < 0,
-                If(lastOp, then: [
-                  running < 0,
-                  wait < this.repeatCycles,
-                  statusReg < statusNext,
-                  passReg < mux(
-                    passReg.eq(0xff),
-                    passReg,
-                    passReg + 1,
-                  ),
-                ], orElse: [pc < pc + 1]),
-              ], orElse: [bitn < bitn + 1]),
-            ]),
-          ]),
-        ],
-      ),
-    ]);
+                nackNow < 0,
+              ],
+              orElse: [wait < wait - 1],
+            ),
+          ],
+          orElse: [
+            div < mux(tick, Const(quarter - 1, width: divW), div - 1),
+            If(
+              tick,
+              then: [
+                q < q + 1,
+                // START: release SDA, release SCL, pull SDA, pull SCL.
+                // STOP: pull SDA, release SCL, release SDA.
+                If(
+                  isStart,
+                  then: [
+                    Case(q, [
+                      CaseItem(Const(0, width: 2), [sdaLow < 0]),
+                      CaseItem(Const(1, width: 2), [sclLow < 0]),
+                      CaseItem(Const(2, width: 2), [sdaLow < 1]),
+                      CaseItem(Const(3, width: 2), [sclLow < 1]),
+                    ]),
+                  ],
+                  orElse: [
+                    If(
+                      isStop,
+                      then: [
+                        Case(q, [
+                          CaseItem(Const(0, width: 2), [sdaLow < 1]),
+                          CaseItem(Const(1, width: 2), [sclLow < 0]),
+                          CaseItem(Const(2, width: 2), [sdaLow < 0]),
+                        ]),
+                      ],
+                      orElse: [
+                        Case(q, [
+                          CaseItem(Const(0, width: 2), [
+                            // A write byte sends its bit, a read byte and the ACK
+                            // slot release SDA. The master NACKs the last read.
+                            sdaLow < ~mux(isWrite, txBit, Const(1)),
+                          ]),
+                          CaseItem(Const(1, width: 2), [sclLow < 0]),
+                          CaseItem(Const(2, width: 2), [
+                            If(
+                              isRead & ~ack,
+                              then: [
+                                rx < [rx.getRange(0, 7), sdaSync].concat(),
+                              ],
+                            ),
+                            If(isWrite & ack & sdaSync, then: [nackNow < 1]),
+                          ]),
+                          CaseItem(Const(3, width: 2), [
+                            sclLow < 1,
+                            If(
+                              isRead & ack,
+                              then: [
+                                for (var i = 0; i < 4; i++)
+                                  If(data.eq(i), then: [regs[i] < rx]),
+                              ],
+                            ),
+                          ]),
+                        ]),
+                      ],
+                    ),
+                  ],
+                ),
+                If(
+                  q.eq(3),
+                  then: [
+                    If(
+                      lastBit,
+                      then: [
+                        bitn < 0,
+                        If(
+                          lastOp,
+                          then: [
+                            running < 0,
+                            wait < this.repeatCycles,
+                            statusReg < statusNext,
+                            passReg <
+                                mux(passReg.eq(0xff), passReg, passReg + 1),
+                          ],
+                          orElse: [pc < pc + 1],
+                        ),
+                      ],
+                      orElse: [bitn < bitn + 1],
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
+      ],
+    );
 
     sclOe <= sclLow;
     sdaOe <= sdaLow;
     status <= statusReg;
     passes <= passReg;
   }
+}
+
+/// Pulls a bidirectional pad low while [oe] is high and releases it
+/// otherwise.
+///
+/// The SystemVerilog is written by hand. A tristate of ROHD on an inout
+/// emits a form that yosys rejects.
+class HarborOpenDrainPad extends Module with SystemVerilog {
+  HarborOpenDrainPad({
+    required Logic oe,
+    required Logic pad,
+    super.name = 'open_drain_pad',
+  }) : super(
+         definitionName: 'HarborOpenDrainPad',
+         reserveDefinitionName: true,
+       ) {
+    addInput('oe', oe);
+    addInOut('pad', pad);
+  }
+
+  @override
+  String? definitionVerilog(String definitionType) =>
+      '''
+module $definitionType (
+  input logic oe,
+  inout wire pad
+);
+  assign pad = oe ? 1'b0 : 1'bz;
+endmodule''';
 }

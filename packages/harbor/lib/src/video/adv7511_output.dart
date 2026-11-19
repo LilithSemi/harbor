@@ -23,7 +23,8 @@ class HarborBt709 {
 
   static int _clip(int sum) => (sum & 0xffff) >> 8;
 
-  static int y(int r, int g, int b) => _clip(yR * r + yG * g + yB * b + yOffset);
+  static int y(int r, int g, int b) =>
+      _clip(yR * r + yG * g + yB * b + yOffset);
   static int cb(int r, int g, int b) =>
       _clip(cbR * r + cbG * g + cbB * b + cOffset);
   static int cr(int r, int g, int b) =>
@@ -82,12 +83,8 @@ class HarborYcbcr422Converter extends Module {
     addOutput('vsync_out');
     addOutput('tog');
 
-    Logic f(Logic v, String n, {int? resetValue}) => flop(
-      clk,
-      v,
-      reset: reset,
-      resetValue: resetValue ?? 0,
-    ).named(n);
+    Logic f(Logic v, String n, {int? resetValue}) =>
+        flop(clk, v, reset: reset, resetValue: resetValue ?? 0).named(n);
 
     Logic mul(Logic c, int k) =>
         (c.zeroExtend(18) * Const(k & 0x3ffff, width: 18));
@@ -97,16 +94,8 @@ class HarborYcbcr422Converter extends Module {
     parity <= flop(clk, ~parity & de, reset: reset);
     final odd1 = f(parity, 'odd1');
     final de1 = f(de, 'de1');
-    final hs1 = f(
-      hsync,
-      'hs1',
-      resetValue: hsyncPositive ? 0 : 1,
-    );
-    final vs1 = f(
-      vsync,
-      'vs1',
-      resetValue: vsyncPositive ? 0 : 1,
-    );
+    final hs1 = f(hsync, 'hs1', resetValue: hsyncPositive ? 0 : 1);
+    final vs1 = f(vsync, 'vs1', resetValue: vsyncPositive ? 0 : 1);
 
     // Stage 1: products.
     final yr = f(mul(red, HarborBt709.yR), 'yr');
@@ -122,18 +111,9 @@ class HarborYcbcr422Converter extends Module {
     // Stage 2: sums.
     Logic sum(Logic a, Logic b, Logic c, int off) =>
         (a + b + c + Const(off, width: 18));
-    final y2 = f(
-      sum(yr, yg, yb, HarborBt709.yOffset).getRange(8, 16),
-      'y2',
-    );
-    final cb2 = f(
-      sum(ur, ug, ub, HarborBt709.cOffset).getRange(8, 16),
-      'cb2',
-    );
-    final cr2 = f(
-      sum(vr, vg, vb, HarborBt709.cOffset).getRange(8, 16),
-      'cr2',
-    );
+    final y2 = f(sum(yr, yg, yb, HarborBt709.yOffset).getRange(8, 16), 'y2');
+    final cb2 = f(sum(ur, ug, ub, HarborBt709.cOffset).getRange(8, 16), 'cb2');
+    final cr2 = f(sum(vr, vg, vb, HarborBt709.cOffset).getRange(8, 16), 'cr2');
     final odd2 = f(odd1, 'odd2');
     final de2 = f(de1, 'de2');
     final hs2 = f(hs1, 'hs2', resetValue: hsyncPositive ? 0 : 1);
@@ -205,13 +185,8 @@ class HarborAdv7511PinStage extends Module {
 
     final seen = flop(clk2x, tog, reset: reset);
     final fresh = (tog ^ seen).named('fresh');
-    Logic take(Logic v, {int resetValue = 0}) => flop(
-      clk2x,
-      v,
-      en: fresh,
-      reset: reset,
-      resetValue: resetValue,
-    );
+    Logic take(Logic v, {int resetValue = 0}) =>
+        flop(clk2x, v, en: fresh, reset: reset, resetValue: resetValue);
     output('pin_d') <= take(d, resetValue: HarborBt709.blank);
     output('pin_de') <= take(de);
     output('pin_hsync') <= take(hsync, resetValue: hsyncPositive ? 0 : 1);
@@ -220,45 +195,141 @@ class HarborAdv7511PinStage extends Module {
   }
 }
 
-/// Makes the pixel clock from the 2x clock on a Xilinx 7-series part.
+/// The 2x clock and the pixel clock of an ADV7511 output on a Xilinx
+/// 7-series part.
 ///
-/// A flop on [clk2x] toggles each clock, and a BUFG puts the result on a
-/// clock net. The pixel clock edge follows a 2x clock edge, so the two
-/// clocks keep a fixed phase. The pixel reset is [reset] taken in the pixel
-/// clock through two flops.
+/// An MMCM makes the 2x clock from [source], which is the shared oscillator
+/// buffer of the SoC when it has one, with the form of the KC705
+/// probe: direct feedback and INTERNAL compensation. A flop on the 2x clock
+/// toggles each clock, and a BUFG puts the result on a clock net as the
+/// pixel clock. The pixel clock edge follows a 2x clock edge, so the two
+/// clocks keep a fixed phase. Each reset holds for a count of the source
+/// clock that is longer than the lock time, then leaves through two flops of
+/// its own clock.
 ///
-/// The module reports the pixel clock net to the SoC clock constraints.
-class HarborAdv7511PixelClock extends BridgeModule with HarborClockRateProvider {
-  /// Rate of the pixel clock in Hz.
-  final double pixelHz;
+/// The module reports both clock nets to the SoC clock constraints.
+class HarborAdv7511Clocks extends BridgeModule with HarborClockRateProvider {
+  /// Rate of the 2x clock in Hz.
+  final int clk2xHz;
 
+  /// True when [source] already comes from a BUFG that other MMCMs share.
+  final bool sourceBuffered;
+
+  /// Rate of the pixel clock in Hz.
+  int get pixelHz => clk2xHz ~/ 2;
+
+  Logic get clk2x => output('clk2x');
+  Logic get reset2x => output('reset2x');
   Logic get pixelClk => output('pixel_clk');
   Logic get pixelReset => output('pixel_reset');
 
-  HarborAdv7511PixelClock({
-    required Logic clk2x,
+  /// The MMCM settings that make [clk2xHz] from [sourceHz] with integer
+  /// dividers. Throws when there are none. The least DIVCLK_DIVIDE that has an
+  /// exact solution wins, and then the VCO nearest to 1100 MHz.
+  static ({int mult, int divclk, int out}) solve(int sourceHz, int clk2xHz) {
+    ({int mult, int divclk, int out})? best;
+    var bestDist = double.infinity;
+    for (var d = 1; d <= 8; d++) {
+      final pfd = sourceHz / d;
+      if (pfd < 10e6 || pfd > 450e6) continue;
+      for (var m = 2; m <= 64; m++) {
+        final vco = sourceHz * m / d;
+        if (vco < 600e6 || vco > 1440e6) continue;
+        final o = vco / clk2xHz;
+        if (o != o.roundToDouble() || o < 1 || o > 128) continue;
+        final dist = (vco - 1100e6).abs();
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = (mult: m, divclk: d, out: o.round());
+        }
+      }
+      if (best != null) break;
+    }
+    if (best == null) {
+      throw ArgumentError(
+        'no MMCM setting makes exactly $clk2xHz Hz from $sourceHz Hz with '
+        'integer dividers',
+      );
+    }
+    return best;
+  }
+
+  HarborAdv7511Clocks({
+    required Logic source,
     required Logic reset,
-    required this.pixelHz,
-    super.name = 'adv7511_pixel_clock',
-  }) : super('HarborAdv7511PixelClock') {
-    clk2x = addInput('clk2x', clk2x);
+    required int sourceHz,
+    required this.clk2xHz,
+    this.sourceBuffered = false,
+    super.name = 'adv7511_clocks',
+  }) : super('HarborAdv7511Clocks') {
+    if (clk2xHz.isOdd) {
+      throw ArgumentError.value(clk2xHz, 'clk2xHz', 'must be even');
+    }
+    final sol = solve(sourceHz, clk2xHz);
+    source = addInput('source', source);
     reset = addInput('reset', reset);
+    addOutput('clk2x');
+    addOutput('reset2x');
     addOutput('pixel_clk');
     addOutput('pixel_reset');
 
+    Logic src = source;
+    if (!sourceBuffered) {
+      final srcBufg = XilinxBufg(name: 'source_bufg');
+      srcBufg.input('I').srcConnection! <= source;
+      src = srcBufg.output('O');
+    }
+
+    final mmcm = XilinxMmcme2Adv(
+      clkfboutMult: sol.mult.toDouble(),
+      clkout0Divide: sol.out.toDouble(),
+      divclkDivide: sol.divclk.toDouble(),
+      clkinPeriod: 1e9 / sourceHz,
+      compensation: 'INTERNAL',
+      name: 'adv7511_mmcm',
+    );
+    addSubModule(mmcm);
+    mmcm.input('CLKIN1').srcConnection! <= src;
+    mmcm.input('CLKIN2').srcConnection! <= Const(0);
+    mmcm.input('CLKINSEL').srcConnection! <= Const(1);
+    mmcm.input('CLKFBIN').srcConnection! <= mmcm.output('CLKFBOUT');
+    mmcm.input('RST').srcConnection! <= Const(0);
+    mmcm.input('PWRDWN').srcConnection! <= Const(0);
+    final bufg = XilinxBufg(name: 'clk2x_bufg');
+    bufg.input('I').srcConnection! <= mmcm.output('CLKOUT0');
+    final clk = bufg.output('O').named('clk2x_net');
+    output('clk2x') <= clk;
+
+    // LOCKED does not reach the fabric on openXC7, so a count of the source
+    // clock holds the reset instead.
+    final hold = Logic(name: 'lock_count', width: 18);
+    Sequential(src, reset: reset, [
+      If(~hold[17], then: [hold < hold + 1]),
+    ]);
+    final assertSrc = (reset | ~hold[17]).named('lock_hold');
+
+    Logic retime(Logic domClk, String n) {
+      final pipe = Logic(name: '${n}_pipe', width: 2);
+      Sequential(domClk, reset: assertSrc, [
+        pipe < [pipe[0], Const(1)].concat(),
+      ]);
+      return (assertSrc | ~pipe[1]).named('${n}_net');
+    }
+
+    output('reset2x') <= retime(clk, 'reset2x');
+
     final phase = Logic(name: 'phase');
-    phase <= flop(clk2x, ~phase, reset: reset);
-    final bufg = XilinxBufg(name: 'pixel_bufg');
-    bufg.input('I').srcConnection! <= phase;
-    final clk = bufg.output('O').named('pixel_clk_net');
-    output('pixel_clk') <= clk;
-    final pipe = Logic(name: 'reset_pipe', width: 2);
-    Sequential(clk, reset: reset, [pipe < [pipe[0], Const(1)].concat()]);
-    output('pixel_reset') <= (reset | ~pipe[1]).named('pixel_reset_net');
+    Sequential(clk, reset: assertSrc, [phase < ~phase]);
+    final pixelBufg = XilinxBufg(name: 'pixel_bufg');
+    pixelBufg.input('I').srcConnection! <= phase;
+    final pixel = pixelBufg.output('O').named('pixel_clk_net');
+    output('pixel_clk') <= pixel;
+    output('pixel_reset') <= retime(pixel, 'pixel_reset');
   }
 
   @override
   Map<String, double> clockRates(String instance) => {
+    '$instance.clk2x_net': clk2xHz / 1e6,
     '$instance.pixel_clk_net': pixelHz / 1e6,
   };
 }

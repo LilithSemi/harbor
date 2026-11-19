@@ -240,6 +240,13 @@ class HarborSoC extends BridgeModule {
   /// The board clock after the input buffer. It is the `clk` port itself for
   /// a single-ended clock. It runs before any MMCM or PLL locks.
   Logic get boardClk => _boardClk;
+
+  Logic? _sharedOscillator;
+
+  /// The oscillator clock after the shared buffer of the DDR3 clock tree,
+  /// or null when the SoC has no tree. A clock generator that adds an MMCM
+  /// takes its input from here, so that every MMCM shares one buffer.
+  Logic? get sharedOscillatorClock => _sharedOscillator;
   final Map<String, HarborClockDomain> _clockDomains = {};
 
   /// The Xilinx DDR3-fast clock tree, built in this SoC's clock generation when
@@ -458,6 +465,7 @@ class HarborSoC extends BridgeModule {
       // Stable aliases keep timing constraints independent of duplicate BUFG
       // port-name disambiguation in the generated RTL (O, O_0, ...).
       final shared = sharedIn.output('O').named('sysosc_clk');
+      _sharedOscillator = shared;
       // Decoupled core PLL off the shared input. The DDR tree no longer emits
       // its CLKOUT5 core clock.
       corePll = buildXilinxCorePll(

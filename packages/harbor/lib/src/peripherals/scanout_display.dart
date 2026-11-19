@@ -13,6 +13,7 @@ import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../soc/target.dart';
+import '../video/adv7511_initializer.dart';
 import '../video/dual_clock_display.dart';
 import 'device_register.dart';
 import 'display.dart';
@@ -261,6 +262,23 @@ class HarborScanoutDisplay extends BridgeModule
   /// The four serialized video lanes, ordered blue, green, red, clock.
   Logic get gpdi => output('gpdi');
 
+  /// The video output of the build. The default is [HarborDisplayInterface.dvi].
+  final HarborDisplayInterface outputType;
+
+  /// Clock of the register port in Hz. An adv7511 build divides it down to
+  /// get the I2C clock.
+  final int? busClockHz;
+
+  /// Clocks between two passes of the ADV7511 initializer, or null for 100 ms
+  /// of [busClockHz].
+  final int? adv7511RepeatCycles;
+
+  /// The ADV7511 initializer, null unless the build has an adv7511 output.
+  late final HarborAdv7511Initializer? initializer;
+
+  /// ADV7511 status, see [HarborAdv7511Initializer.status].
+  Logic get adv7511Status => output('adv7511_status');
+
   HarborScanoutDisplay({
     required this.baseAddress,
     required this.timing,
@@ -276,6 +294,9 @@ class HarborScanoutDisplay extends BridgeModule
     bool? gateOnInitDone,
     this.fabricMemory = false,
     this.burstBeats = 16,
+    this.outputType = HarborDisplayInterface.dvi,
+    this.busClockHz,
+    this.adv7511RepeatCycles,
     HarborFabricKind fabricKind = HarborFabricKind.wishbone,
     this.busAddressWidth = 12,
     this.busDataWidth = 32,
@@ -302,6 +323,8 @@ class HarborScanoutDisplay extends BridgeModule
            if (enableOnReset) 'on',
            if (gateOnInitDone ?? !fabricMemory) 'g',
            if (fabricMemory) 'fm$burstBeats',
+           if (outputType == HarborDisplayInterface.adv7511)
+             'adv${busClockHz}_$adv7511RepeatCycles',
            target is HarborFpgaTarget ? target.vendor.name : 'generic',
          ]),
        ) {
@@ -319,6 +342,17 @@ class HarborScanoutDisplay extends BridgeModule
       );
     }
     final multi = formats.length > 1;
+    final adv7511 = outputType == HarborDisplayInterface.adv7511;
+    if (outputType != HarborDisplayInterface.dvi && !adv7511) {
+      throw ArgumentError.value(
+        outputType,
+        'outputType',
+        'a scanout display drives dvi or adv7511',
+      );
+    }
+    if (adv7511 && busClockHz == null) {
+      throw ArgumentError.notNull('busClockHz');
+    }
 
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -448,7 +482,7 @@ class HarborScanoutDisplay extends BridgeModule
       formats: formats,
       formatSel: multi ? fmtStage : null,
       planePitch: multi ? [stagePitch] : const [],
-      outputType: HarborDisplayInterface.dvi,
+      outputType: outputType,
     );
 
     if (!fabricMemory) {
@@ -456,9 +490,37 @@ class HarborScanoutDisplay extends BridgeModule
       addOutput('rq_addr', width: 32) <= display.rqAddr;
       addOutput('rq_words', width: display.rqWords.width) <= display.rqWords;
     }
-    addOutput('gpdi', width: 4) <= display.gpdi;
-    if (display.tryOutput('gpdi_n') != null) {
-      addOutput('gpdi_n', width: 4) <= display.gpdiN;
+    if (adv7511) {
+      addOutput('adv_d', width: 16) <= display.output('adv_d');
+      addOutput('adv_de') <= display.output('adv_de');
+      addOutput('adv_hsync') <= display.output('adv_hsync');
+      addOutput('adv_vsync') <= display.output('adv_vsync');
+      addOutput('adv_clk') <= display.output('adv_clk');
+      createPort('adv_scl', PortDirection.inOut);
+      createPort('adv_sda', PortDirection.inOut);
+      addOutput('adv_mux_reset_n');
+      addOutput('adv7511_status', width: 8);
+      final scl = inOut('adv_scl');
+      final sda = inOut('adv_sda');
+      final init = HarborAdv7511Initializer(
+        clk: clk,
+        reset: reset,
+        sclIn: scl,
+        sdaIn: sda,
+        clockFrequency: busClockHz!,
+        repeatCycles: adv7511RepeatCycles,
+      );
+      initializer = init;
+      HarborOpenDrainPad(oe: init.sclOe, pad: scl, name: 'scl_pad');
+      HarborOpenDrainPad(oe: init.sdaOe, pad: sda, name: 'sda_pad');
+      output('adv_mux_reset_n') <= init.muxResetN;
+      output('adv7511_status') <= init.status;
+    } else {
+      initializer = null;
+      addOutput('gpdi', width: 4) <= display.gpdi;
+      if (display.tryOutput('gpdi_n') != null) {
+        addOutput('gpdi_n', width: 4) <= display.gpdiN;
+      }
     }
     addOutput('interrupt');
     addOutput('running') <= display.active;
