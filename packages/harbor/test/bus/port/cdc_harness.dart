@@ -231,10 +231,11 @@ class CdcMemDevice extends BridgeModule {
     required bool slave,
     required bool cross,
     int? depth,
+    int recoverTimeout = HarborMemoryWaistCdc.defaultRecoverTimeout,
   }) : super(
          'CdcTestMem${slave ? 'Slave' : 'Master'}_${kind.name}'
          '_a${config.addressWidth}_d${config.dataWidth}_i${config.idWidth}'
-         '_n${config.outstanding}_c${cross}_q$depth',
+         '_n${config.outstanding}_c${cross}_q${depth}_t$recoverTimeout',
          name: slave ? 'memory' : 'requester',
        ) {
     _clockPorts(this);
@@ -263,6 +264,7 @@ class CdcMemDevice extends BridgeModule {
         reset: input('reset'),
         fabricClock: fabric,
         cdcDepth: depth,
+        recoverTimeout: recoverTimeout,
       );
       output('dev_reset') <= port.reset;
       exposeWaist(this, port.waist, 'up', PairRole.consumer);

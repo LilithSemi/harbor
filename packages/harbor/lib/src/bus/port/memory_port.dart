@@ -278,6 +278,9 @@ class HarborMemoryMasterPort {
   /// [HarborMemorySlavePort.create]. AXI4 gives a full AXI4 manager, TileLink a
   /// TL-UH master and Wishbone a master with registered feedback bursts.
   ///
+  /// [recoverTimeout] is the wait limit of the crossing after a device reset
+  /// (see [HarborMemoryWaistCdc.recoverTimeout]).
+  ///
   /// [busAddressWidth] makes the AXI4 address wider than the waist address
   /// in [config]. The bus address is the waist address with zeros above it.
   /// Only AXI4 takes a [busAddressWidth] other than the waist width.
@@ -296,6 +299,7 @@ class HarborMemoryMasterPort {
     required Logic reset,
     HarborFabricClock? fabricClock,
     int? cdcDepth,
+    int recoverTimeout = HarborMemoryWaistCdc.defaultRecoverTimeout,
     int? busAddressWidth,
     bool readOnly = false,
   }) {
@@ -347,6 +351,7 @@ class HarborMemoryMasterPort {
         device: waist,
         slave: false,
         depth: cdcDepth,
+        recoverTimeout: recoverTimeout,
         name: '${name}_cdc',
       );
       return HarborMemoryMasterPort._(
@@ -410,7 +415,7 @@ class HarborMemoryMasterPort {
 
 /// Adds the debug outputs of [cdc] to [module] as plain outputs:
 /// `<prefix>_reads`, `<prefix>_writes`, `<prefix>_recover`, `<prefix>_empty`,
-/// `<prefix>_full` and `<prefix>_dropped`. See [HarborMemoryWaistCdc] for the
+/// `<prefix>_full`, `<prefix>_dropped` and `<prefix>_recover_timeouts`. See [HarborMemoryWaistCdc] for the
 /// fields. Without a crossing, the outputs are 0.
 void harborAddCdcDebug(
   BridgeModule module,
@@ -429,6 +434,8 @@ void harborAddCdcDebug(
   module.addOutput('${prefix}_full', width: 4) <= or0(cdc?.debugFull, 4);
   module.addOutput('${prefix}_dropped', width: 16) <=
       or0(cdc?.debugDropped, 16);
+  module.addOutput('${prefix}_recover_timeouts', width: 8) <=
+      or0(cdc?.debugRecoverTimeouts, 8);
 }
 
 Axi4Interface _axi4(HarborMemoryWaistConfig config, {int? addressWidth}) =>
