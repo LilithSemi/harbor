@@ -260,11 +260,18 @@ class HarborBoard {
     Map<String, String> extraPins = const {},
     bool? ddrDllOn,
     bool useHimbaechel = false,
-    String placer = 'static',
+    HarborPlacer? placer,
     Map<String, String> extraConstraints = const {},
   }) {
     if (useHimbaechel && vendor != HarborFpgaVendor.openXc7) {
       throw ArgumentError('Himbächel is only available for openXC7 boards.');
+    }
+    if (placer == HarborPlacer.static_ && !useHimbaechel) {
+      throw ArgumentError.value(
+        placer,
+        'placer',
+        'the static placer needs useHimbaechel',
+      );
     }
     // "All pins" (pins: null) includes the ambiguous sdram_dqs* entries
     // whenever this board has any, same as naming them explicitly.

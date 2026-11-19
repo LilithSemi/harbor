@@ -9,17 +9,24 @@ void main() {
     expect(makefile, contains('--placer \$(PLACER)'));
   });
 
-  test('the nextpnr-xilinx Makefile places with the static placer', () {
+  test('the nextpnr-xilinx Makefile places with the heap placer', () {
     final target = HarborBoard.get('kc705').fpgaTarget();
     final makefile = target.generateMakefile('soc');
-    expect(makefile, contains('PLACER ?= static\n'));
+    expect(makefile, contains('PLACER ?= heap\n'));
     expect(makefile, contains('--placer \$(PLACER)'));
   });
 
   test('the target sets another default placer', () {
     final target = HarborBoard.get(
       'kc705',
-    ).fpgaTarget(useHimbaechel: true, placer: 'heap');
+    ).fpgaTarget(useHimbaechel: true, placer: HarborPlacer.heap);
     expect(target.generateMakefile('soc'), contains('PLACER ?= heap\n'));
+  });
+
+  test('the static placer without Himbaechel throws', () {
+    expect(
+      () => HarborBoard.get('kc705').fpgaTarget(placer: HarborPlacer.static_),
+      throwsA(isA<ArgumentError>().having((e) => e.name, 'name', 'placer')),
+    );
   });
 }

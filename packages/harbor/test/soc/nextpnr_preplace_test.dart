@@ -224,7 +224,7 @@ void main() {
       expect(mk, contains('PART ?= \$(DEVICE)\$(PACKAGE)-1'));
       expect(mk, contains('SEED ?= 1'));
       expect(mk, contains('THREADS ?= \$(shell nproc)'));
-      expect(mk, contains('PLACER ?= static'));
+      expect(mk, contains('PLACER ?= heap'));
       expect(
         mk,
         contains(
