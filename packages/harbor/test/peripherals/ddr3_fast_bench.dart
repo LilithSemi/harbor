@@ -339,8 +339,10 @@ class CoreCfg {
 class Ddr3FabricBench extends BridgeModule {
   late final HarborDdr3 ddr;
   final bool display;
+  final bool sameClock;
 
   Ddr3FabricBench({
+    this.sameClock = false,
     required List<CoreCfg> cores,
     required int readChannels,
     required int outstanding,
@@ -352,10 +354,14 @@ class Ddr3FabricBench extends BridgeModule {
   }) : super(
          'Ddr3FabricBench_c${readChannels}_n${outstanding}_'
          '${cores.length}${display ? 'd' : ''}'
-         '${cores.any((c) => (c.exclusiveIds ?? 0) != 0) ? 'x' : ''}',
+         '${cores.any((c) => (c.exclusiveIds ?? 0) != 0) ? 'x' : ''}'
+         '${sameClock ? 'sc' : ''}',
          name: 'top',
        ) {
-    for (final p in ['clk', 'reset', 'ddr_clk', 'ddr_reset']) {
+    final ddrPorts = [
+      if (!sameClock) ...['ddr_clk', 'ddr_reset'],
+    ];
+    for (final p in ['clk', 'reset', ...ddrPorts]) {
       createPort(p, PortDirection.input);
     }
     final masters = <HarborFabricMaster>[];
@@ -414,6 +420,7 @@ class Ddr3FabricBench extends BridgeModule {
         readChannels: readChannels,
         outstanding: outstanding,
         fastSim: true,
+        sameClock: sameClock,
         readGap: readGap,
         target: const HarborFpgaTarget.artix7(
           device: 'xc7a200t',
@@ -421,7 +428,7 @@ class Ddr3FabricBench extends BridgeModule {
         ),
       ),
     );
-    for (final p in ['clk', 'reset', 'ddr_clk', 'ddr_reset']) {
+    for (final p in ['clk', 'reset', ...ddrPorts]) {
       ddr.input(p).srcConnection! <= input(p);
     }
     for (final p in [
@@ -491,14 +498,16 @@ class Ddr3FabricRun {
     final fabricClk = SimpleClockGenerator(
       fabricPeriod + (fabricPeriod & 1),
     ).clk;
-    final ddrClk = SimpleClockGenerator(ddrPeriod + (ddrPeriod & 1)).clk;
+    final ddrClk = top.sameClock
+        ? fabricClk
+        : SimpleClockGenerator(ddrPeriod + (ddrPeriod & 1)).clk;
     for (final input in top.inputs.values) {
       if (input.name != 'clk' && input.name != 'ddr_clk') {
         input.srcConnection!.put(0);
       }
     }
     top.input('clk').srcConnection! <= fabricClk;
-    top.input('ddr_clk').srcConnection! <= ddrClk;
+    if (!top.sameClock) top.input('ddr_clk').srcConnection! <= ddrClk;
     await top.build();
     final sim = Sim(top, clk: fabricClk);
     final model = Ddr3PhyWordModel(
@@ -534,13 +543,13 @@ class Ddr3FabricRun {
     sim.attach();
     sim.watchEnd();
     top.input('reset').srcConnection!.put(1);
-    top.input('ddr_reset').srcConnection!.put(1);
+    if (!top.sameClock) top.input('ddr_reset').srcConnection!.put(1);
     Simulator.setMaxSimTime(1 << 50);
     unawaited(Simulator.run());
     for (var i = 0; i < 8; i++) {
       await ddrClk.nextPosedge;
     }
-    top.input('ddr_reset').srcConnection!.inject(0);
+    if (!top.sameClock) top.input('ddr_reset').srcConnection!.inject(0);
     await fabricClk.nextNegedge;
     top.input('reset').srcConnection!.inject(0);
     for (var i = 0; i < 16; i++) {

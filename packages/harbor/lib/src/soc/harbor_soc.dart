@@ -1848,6 +1848,20 @@ class HarborSoC extends BridgeModule {
         );
       }
     }
+    for (final e in _peripherals) {
+      final m = e.module;
+      if (m is! HarborDdr3 || !m.sameClock) continue;
+      final domain = domainFor(e.clockDomainName);
+      if (domain == null ||
+          domain.config.source != HarborClockSource.ddr3Controller ||
+          !identical(domain.clk, fabricClk)) {
+        throw StateError(
+          '${m.name} is built with sameClock, so it must sit on the fabric '
+          'clock domain and that domain must have source ddr3Controller. It '
+          'sits on ${domain == null ? 'no clock domain' : '"${domain.config.name}"'}.',
+        );
+      }
+    }
     for (final e in _masters) {
       final domain = domainFor(e.clockDomainName);
       if (domain == null || identical(domain.clk, fabricClk)) continue;

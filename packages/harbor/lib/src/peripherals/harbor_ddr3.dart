@@ -115,6 +115,12 @@ class HarborDdr3 extends BridgeModule
   /// module only consumes the two clocks.
   final int controllerGearRatio;
 
+  /// When true, the device side runs on `clk` and `reset` on hardware. The
+  /// `ddr_clk` and `ddr_reset` ports do not exist and no clock crossing is
+  /// built. `clk` must be the controller clock of the DDR3 clock tree, and
+  /// `reset` must be synchronous to it. The sim target is unchanged.
+  final bool sameClock;
+
   /// When true, the controller runs in train=runtime: the PHY calibration
   /// knobs are exposed through an extra SoC-facing wishbone slave [trainBus]
   /// (the wb2 knob-ABI window) and the dtNode gains a `training` child. When
@@ -220,6 +226,7 @@ class HarborDdr3 extends BridgeModule
     int? busDataWidth,
     this.ckPeriodPs = 3333,
     this.controllerGearRatio = 1,
+    this.sameClock = false,
     this.runtimeTrainable = false,
     this.memoryFormFactor = HarborMemoryFormFactor.chip,
     this.simExternalMem = false,
@@ -248,6 +255,7 @@ class HarborDdr3 extends BridgeModule
            busDataWidth: busDataWidth ?? 32,
            ckPeriodPs: ckPeriodPs,
            controllerGearRatio: controllerGearRatio,
+           sameClock: sameClock,
            runtimeTrainable: runtimeTrainable,
            simExternalMem: simExternalMem,
            protocol: protocol,
@@ -356,8 +364,18 @@ class HarborDdr3 extends BridgeModule
     }
     final clk = addInput('clk', Logic());
     final reset = addInput('reset', Logic());
-    final ddrClk = addInput('ddr_clk', Logic());
-    final ddrResetIn = addInput('ddr_reset', Logic());
+    // The sim memory runs on `clk`, so only a hardware build crosses.
+    final sim = target is HarborSimTarget;
+    final same = sameClock && !sim;
+    if (same && controllerGearRatio != 1) {
+      throw ArgumentError.value(
+        sameClock,
+        'sameClock',
+        'needs controllerGearRatio 1',
+      );
+    }
+    final ddrClk = same ? clk : addInput('ddr_clk', Logic());
+    final ddrResetIn = same ? reset : addInput('ddr_reset', Logic());
     // CK/8 controller (gearRatio 2): ddr_clk is the CK/8 logic clock and the
     // SERDES/PHY + gearbox run on a separate CK/4 clock. gearRatio 1 keeps a
     // single clock (no new port), so the elaborated RTL is byte-identical.
@@ -374,11 +392,9 @@ class HarborDdr3 extends BridgeModule
 
     final busDW = busDataWidth ?? 32;
     final busAW = busAddressWidth ?? config.size.bitLength;
-    // The sim memory runs on `clk`, so only a hardware build crosses.
-    final sim = target is HarborSimTarget;
     // ddr_reset can come from another clock domain. It asserts at once and
-    // releases on ddr_clk.
-    final ddrReset = sim ? ddrResetIn : _syncReset(ddrClk, ddrResetIn);
+    // releases on ddr_clk. With sameClock the reset is already synchronous.
+    final ddrReset = sim || same ? ddrResetIn : _syncReset(ddrClk, ddrResetIn);
     final devClk = sim ? clk : ddrClk;
     final devReset = sim ? reset : ddrReset;
     final fabric = HarborFabricClock(clk: clk, reset: reset);
@@ -582,6 +598,7 @@ class HarborDdr3 extends BridgeModule
     required int busDataWidth,
     required int ckPeriodPs,
     required int controllerGearRatio,
+    required bool sameClock,
     required bool runtimeTrainable,
     required bool simExternalMem,
     required HarborFabricKind protocol,
@@ -612,6 +629,7 @@ class HarborDdr3 extends BridgeModule
         ? '_b$wishboneBurstBeats'
         : '';
     final cdc = sim ? 0 : harborCdcDepth(outstanding);
+    final sc = sameClock && !sim;
     if (protocol == HarborFabricKind.wishbone) {
       final dm = ecp5 && config.dmRemapping != null
           ? '_dm${config.dmRemapping!.join()}'
@@ -622,7 +640,8 @@ class HarborDdr3 extends BridgeModule
           '${config.readReturnStage ? '_rr' : ''}'
           '_${protocol.name}_i${idWidth}_n${outstanding}_q$cdc$burst'
           '${fastSim ? '_fast' : ''}'
-          '${powerOnCycles != 4095 ? '_p$powerOnCycles' : ''}';
+          '${powerOnCycles != 4095 ? '_p$powerOnCycles' : ''}'
+          '${sc ? '_sc' : ''}';
     }
     final c = config;
     return harborStableDefinitionName(
@@ -644,6 +663,7 @@ class HarborDdr3 extends BridgeModule
         'rg$readGap',
         if (fastSim) 'fast',
         if (powerOnCycles != 4095) 'p$powerOnCycles',
+        if (sc) 'sc',
         ?exclusive?.tag,
       ],
     );
@@ -929,6 +949,26 @@ struct DramStore {
     return stage2;
   }
 
+  // The controller status on the one clock, with no crossing.
+  void _buildStatusSameClock(Logic clk, Logic reset, Ddr3Controller ctrl) {
+    final failed = Logic(name: 'cal_failed_sticky');
+    Sequential(clk, [
+      If(
+        reset,
+        then: [failed < 0],
+        orElse: [
+          If(ctrl.calFailed ?? Const(0), then: [failed < 1]),
+        ],
+      ),
+    ]);
+    output('init_done') <= ctrl.initDone;
+    output('cal_done') <=
+        ctrl.calState.eq(Ddr3Controller.calStateDone) & ctrl.initDone;
+    output('cal_failed') <= failed;
+    output('cal_state') <= ctrl.calState;
+    output('cal_attempts') <= ctrl.calStarts;
+  }
+
   // Crosses the controller status from ddr_clk to clk.
   void _buildStatus(
     Logic clk,
@@ -1192,7 +1232,11 @@ struct DramStore {
       minReadGap: wishbone ? 0 : readGap,
     );
     controller = ctrl;
-    _buildStatus(clk, reset, ddrClk, ddrReset, ctrl);
+    if (sameClock) {
+      _buildStatusSameClock(clk, reset, ctrl);
+    } else {
+      _buildStatus(clk, reset, ddrClk, ddrReset, ctrl);
+    }
     ctrlStall <= ctrl.output('o_wb_stall');
     ctrlAck <= ctrl.output('o_wb_ack');
     ctrlAckAux <= ctrl.output('o_aux');
