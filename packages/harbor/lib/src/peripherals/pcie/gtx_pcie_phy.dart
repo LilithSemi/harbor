@@ -448,8 +448,22 @@ class HarborGtxPciePhy extends Module {
     if (debugSkipTxPhaseAlign && !debugBuild) {
       throw ArgumentError('debugSkipTxPhaseAlign needs debugBuild');
     }
-    for (final t in timeouts.all) {
-      if (t < 4) throw ArgumentError.value(t, 'timeouts', 'below 4 cycles');
+    // The timer compare of each wait needs 11 cycles. The rate compare needs 6.
+    final minimums = {
+      'resetDone': (timeouts.resetDone, 11),
+      'cpllLock': (timeouts.cpllLock, 11),
+      'clockLock': (timeouts.clockLock, 11),
+      'txSync': (timeouts.txSync, 11),
+      'rate': (timeouts.rate, 6),
+    };
+    for (final e in minimums.entries) {
+      if (e.value.$1 < e.value.$2) {
+        throw ArgumentError.value(
+          e.value.$1,
+          e.key,
+          'below ${e.value.$2} cycles',
+        );
+      }
     }
     if (timeouts.resetDone <= HarborGtxPcieTimeouts.cpllResetHold + 4) {
       throw ArgumentError.value(

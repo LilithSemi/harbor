@@ -586,6 +586,58 @@ void main() {
       await b.finish();
     });
 
+    test('a timeout below what its compare needs throws and names it', () {
+      HarborGtxPcieTimeouts with_(String f, int v) => HarborGtxPcieTimeouts(
+        linkWait: 0,
+        resetDone: 100,
+        cpllLock: f == 'cpllLock' ? v : 100,
+        clockLock: f == 'clockLock' ? v : 100,
+        txSync: f == 'txSync' ? v : 100,
+        txSettle: 0,
+        clockSettle: 0,
+        clockSwitch: 3,
+        rate: f == 'rate' ? v : 100,
+      );
+      for (final c in [
+        ('cpllLock', 10),
+        ('clockLock', 10),
+        ('txSync', 10),
+        ('rate', 5),
+        ('rate', 4),
+      ]) {
+        final f = c.$1;
+        expect(
+          () => HarborGtxPciePhy(
+            perstN: Logic(),
+            channel: HarborGtxChannelPorts(),
+            pipe: HarborPciePipeLane(),
+            timeouts: with_(f, c.$2),
+          ),
+          throwsA(isA<ArgumentError>().having((e) => e.name, 'name', f)),
+          reason: '$f ${c.$2}',
+        );
+      }
+      expect(
+        () => HarborGtxPciePhy(
+          perstN: Logic(),
+          channel: HarborGtxChannelPorts(),
+          pipe: HarborPciePipeLane(),
+          timeouts: const HarborGtxPcieTimeouts(
+            linkWait: 0,
+            resetDone: 21,
+            clockLock: 11,
+            cpllLock: 11,
+            txSync: 11,
+            txSettle: 0,
+            clockSettle: 0,
+            clockSwitch: 3,
+            rate: 6,
+          ),
+        ),
+        returnsNormally,
+      );
+    });
+
     test('a txSettle that does not fit the txSync bound throws', () {
       expect(
         () => HarborGtxPciePhy(
