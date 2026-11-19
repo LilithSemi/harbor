@@ -357,7 +357,7 @@ class HarborDdr3 extends BridgeModule
     final clk = addInput('clk', Logic());
     final reset = addInput('reset', Logic());
     final ddrClk = addInput('ddr_clk', Logic());
-    final ddrReset = addInput('ddr_reset', Logic());
+    final ddrResetIn = addInput('ddr_reset', Logic());
     // CK/8 controller (gearRatio 2): ddr_clk is the CK/8 logic clock and the
     // SERDES/PHY + gearbox run on a separate CK/4 clock. gearRatio 1 keeps a
     // single clock (no new port), so the elaborated RTL is byte-identical.
@@ -376,6 +376,9 @@ class HarborDdr3 extends BridgeModule
     final busAW = busAddressWidth ?? config.size.bitLength;
     // The sim memory runs on `clk`, so only a hardware build crosses.
     final sim = target is HarborSimTarget;
+    // ddr_reset can come from another clock domain. It asserts at once and
+    // releases on ddr_clk.
+    final ddrReset = sim ? ddrResetIn : _syncReset(ddrClk, ddrResetIn);
     final devClk = sim ? clk : ddrClk;
     final devReset = sim ? reset : ddrReset;
     final fabric = HarborFabricClock(clk: clk, reset: reset);
@@ -912,6 +915,19 @@ struct DramStore {
   }
 };
 ''';
+
+  Logic _syncReset(Logic clk, Logic reset) {
+    final stage1 = Logic(name: 'ddr_reset_sync1');
+    final stage2 = Logic(name: 'ddr_reset_sync2');
+    Sequential(
+      clk,
+      [stage1 < 0, stage2 < stage1],
+      reset: reset,
+      resetValues: {stage1: 1, stage2: 1},
+      asyncReset: true,
+    );
+    return stage2;
+  }
 
   // Crosses the controller status from ddr_clk to clk.
   void _buildStatus(
