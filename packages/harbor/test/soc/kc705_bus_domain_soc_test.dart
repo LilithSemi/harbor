@@ -303,6 +303,14 @@ void main() {
       );
     });
 
+    // The XDC names only the board clock. nextpnr derives the ddr_clk rate
+    // from the DDR3 MMCM settings, so the fabric on ddr_clk is timed only
+    // while the board clock is constrained and the ddr_clk net stays.
+    test('the board clock is constrained and the ddr_clk net is kept', () {
+      expect(xdcText, matches(RegExp(r'create_clock .*sysclk')));
+      expect(rtl, contains('ddr_clk'));
+    });
+
     test('no clock net is constrained twice, the ddr_clk net at most once', () {
       final nets = _clockNet.allMatches(xdcText).map((m) => m.group(1)!);
       expect(nets.where((n) => n.contains('ddr_clk')).length, lessThan(2));

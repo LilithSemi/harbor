@@ -671,6 +671,16 @@ class HarborSoC extends BridgeModule {
         'a clock domain with this name exists',
       );
     }
+    // On hardware the DDR3 sources bind their tree nets in the constructor.
+    // A net domain with such a label would pass the sameClock check on the
+    // wrong clock.
+    if (config.source != HarborClockSource.pll && target is! HarborSimTarget) {
+      throw ArgumentError.value(
+        config.source,
+        'config.source',
+        'a net clock domain on hardware must have source pll',
+      );
+    }
     return _clockDomains[config.name] = _clockGen.createDomainFromClock(
       config,
       clk,
@@ -1908,7 +1918,9 @@ class HarborSoC extends BridgeModule {
       final domain = domainFor(e.clockDomainName);
       if (domain == null ||
           domain.config.source != HarborClockSource.ddr3Controller ||
-          !identical(domain.clk, fabricClk)) {
+          !identical(domain.clk, fabricClk) ||
+          (xilinxDdr3Clocks != null &&
+              !identical(domain.clk, xilinxDdr3Clocks!.controllerClk))) {
         throw StateError(
           '${m.name} is built with sameClock, so it must sit on the fabric '
           'clock domain and that domain must have source ddr3Controller. It '

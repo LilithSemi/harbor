@@ -141,6 +141,25 @@ void main() {
     },
   );
 
+  test('a net clock domain on hardware must have source pll', () {
+    final soc = HarborSoC(
+      name: 'NetClockHwSoc',
+      compatible: 'test,net-clock-hw',
+      target: HarborBoard.get('kc705').fpgaTarget(useHimbaechel: true),
+    );
+    expect(
+      () => soc.addClockDomainFromNet(
+        const HarborClockConfig(
+          name: 'bus',
+          rate: HarborFixedClockRate(83333333),
+          source: HarborClockSource.ddr3Controller,
+        ),
+        soc.addInput('bus_clk', Logic()),
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
   group('addClockDomainFromNet', () {
     HarborSoC sim() => HarborSoC(
       name: 'NetClockSoc',
