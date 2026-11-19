@@ -336,15 +336,8 @@ class Bench {
     return null;
   }
 
-  /// The response code [x] must get: DECERR when unmapped, SLVERR for a
-  /// narrow access to an AXI4-Lite slave.
-  int respOf(Burst x) {
-    final s = slaveOf(x.addr);
-    if (s == null) return 3;
-    final full = busBytes.bitLength - 1;
-    if (slaveCfgs[s].lite && x.size != full) return 2;
-    return 0;
-  }
+  /// The response code [x] must get: DECERR when unmapped.
+  int respOf(Burst x) => slaveOf(x.addr) == null ? 3 : 0;
 
   /// The memory of each slave after every write that must succeed.
   List<WordMemory> golden() {

@@ -128,36 +128,42 @@ Future<void> _run(HarborFabricTopology t) async {
   );
 
   // A store with strobes in both words gets SLVERR and never reaches the
-  // slave. Neither does a burst of narrow beats.
+  // slave.
   final seen = l.awOrder.length;
-  m
-    ..write(_w(2, lane0, 0, 3, [0x1122334455667788], [0xff]))
-    ..write(_w(3, lane0, 1, 2, [1, 2], [0x0f, 0x0f]))
-    ..read(_r(3, lane0, 1, 2));
+  m.write(_w(2, lane0, 0, 3, [0x1122334455667788], [0xff]));
   await drain();
   must(l.awOrder.length, seen);
-  must(m.bResp.where((x) => x.$1 == 2 || x.$1 == 3).map((x) => x.$2).toList(), [
-    2,
-    2,
-  ]);
-  must(m.rBeats.where((x) => x.$1 == 3).map((x) => x.$3).toList(), [2, 2]);
+  must(m.bResp.where((x) => x.$1 == 2).map((x) => x.$2).toList(), [2]);
 
-  // Every burst is an error, including one of full-size beats.
-  m
-    ..write(_w(2, lane0, 1, 3, [1, 2], [0x0f, 0x0f]))
-    ..read(_r(1, lane0, 3, 3));
+  // A burst of 32-bit beats runs as single beats, one word each.
+  m.write(_w(3, lane0, 1, 2, [1, 2 << 32], [0x0f, 0xf0]));
   await drain();
-  must(l.awOrder.length, seen);
-  must(l.arOrder.length, 2);
-  must(m.bResp.where((x) => x.$1 == 2).map((x) => x.$2).toList(), [2, 2]);
+  m.read(_r(3, lane0, 1, 2));
+  await drain();
+  must(l.awOrder.map((x) => x.addr).toList().skip(seen).toList(), [0x10, 0x14]);
+  must(m.bResp.where((x) => x.$1 == 3).map((x) => x.$2).toList(), [0]);
+  must(m.rBeats.where((x) => x.$1 == 3).map((x) => (x.$2, x.$3)).toList(), [
+    (1, 0),
+    (2 << 32, 0),
+  ]);
+
+  // A burst of full-size beats with one lane of strobes in each beat.
+  m.write(_w(2, lane0, 1, 3, [3, 4], [0x0f, 0x0f]));
+  await drain();
+  m.read(_r(1, lane0, 3, 3));
+  await drain();
+  must(l.awOrder.length, seen + 4);
+  must(l.arOrder.length, 8);
+  must(m.bResp.where((x) => x.$1 == 2).map((x) => x.$2).toList(), [2, 0]);
   must(m.rBeats.where((x) => x.$1 == 1).map((x) => x.$3).toList(), [
     0,
-    2,
-    2,
-    2,
-    2,
+    0,
+    0,
+    0,
+    0,
   ]);
-  must(l.mem.read(0x10), 0xaabbccdd);
+  must(l.mem.read(0x10), 3);
+  must(l.mem.read(0x18), 4);
 
   // The slave still works, and so does the full slave.
   m.write(_w(0, _liteBase + 0x30, 0, 2, [0x55], [0x0f]));

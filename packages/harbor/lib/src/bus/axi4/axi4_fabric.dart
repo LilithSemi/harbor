@@ -203,9 +203,10 @@ class _Tracker {
 ///   ID. Its `outstanding` must be 1. An INCR, WRAP or FIXED burst to it
 ///   runs as one single beat request per beat, in order, and a write burst
 ///   gets one B after the last beat, with the worst response of its beats.
-///   An error response goes back on its own beat. A narrow access, a WRAP
-///   burst that is not 2, 4, 8 or 16 beats, or the reserved burst type gets
-///   SLVERR on every beat.
+///   An error response goes back on its own beat. A narrow access runs as a
+///   full word access, and its write strobes keep only the lanes that SIZE
+///   and the address allow. A WRAP burst that is not 2, 4, 8 or 16 beats, or
+///   the reserved burst type, gets SLVERR on every beat.
 ///
 /// Decode uses the start address of a burst only. A full AXI4 slave must
 /// accept any burst that starts in its region, so a full slave region under
@@ -989,12 +990,6 @@ class HarborAxi4Fabric extends HarborFabricModule {
         innerW: innerW,
         range: slaves[tSlave[t]].range,
         offset: slaves[tSlave[t]].offset,
-        narrow: harborSlaveAdapts(
-          slaves[tSlave[t]],
-          kind: 'AXI4',
-          addrW: addrW,
-          dataW: dataW,
-        ),
       );
       if (x != null) dead.add(x);
     }
@@ -1227,8 +1222,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
   // An AXI4-Lite slave [lite] has 1 request in flight. Its AW and AR share
   // one entry, which stays until the response ends, and its W has one
   // entry. [s] then only carries the handshakes and responses for the
-  // guard. A burst runs as single beats, and a narrow access gets SLVERR on
-  // every beat without the slave.
+  // guard. A burst runs as single beats. A narrow access is a full word
+  // access with the write strobes of its lanes, since the master takes its
+  // bytes by address.
   //
   // The guard keeps a record of each request in flight. When the slave owes
   // something and shows no progress for `timeout` cycles, the guard cuts it
@@ -1257,7 +1253,6 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required int innerW,
     required BusAddressRange range,
     required bool offset,
-    required bool narrow,
   }) {
     final guard = timeout > 0;
     final dead = guard ? Logic(name: '${p}_cut_off') : Const(0);
@@ -1351,7 +1346,6 @@ class HarborAxi4Fabric extends HarborFabricModule {
         k: k,
         restWidths: restWidths,
         slaveAddr: slaveAddr,
-        narrow: narrow,
       );
       arPending = pending.$1;
       wPending = pending.$2;
@@ -1830,17 +1824,22 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required int k,
     required List<int> restWidths,
     required Logic Function(Logic) slaveAddr,
-    required bool narrow,
   }) {
     const lenW = Axi4Interface.lenWidth;
     const protW = Axi4Interface.protWidth;
-    final size = _fullSize(s.dataWidth);
+    const sizeW = Axi4Interface.sizeWidth;
+    final nb = s.dataWidth ~/ 8;
+    final nbLog = nb.bitLength - 1;
+    final full = _fullSize(s.dataWidth);
+    // A SIZE above the bus width counts as the bus width.
+    Logic sizeOf(Logic sz) => mux(sz.gt(full), full, sz);
     final slvErr = _resp(Axi4RespField.slvErr);
     Logic entry(_Req x, Logic sid) {
-      final [addr, len, sz, burst, _, _, prot, _] = harborUnpack(
+      final [addr, len, sz0, burst, _, _, prot, _] = harborUnpack(
         x.rest,
         restWidths,
       );
+      final sz = sizeOf(sz0);
       // A burst reaches the slave as single beats. WRAP takes 2, 4, 8 or
       // 16 beats, and the reserved burst type is an error.
       final isWrap = burst.eq(Const(2, width: 2));
@@ -1850,15 +1849,11 @@ class HarborAxi4Fabric extends HarborFabricModule {
       if (k < 12) {
         // A region under 4 KB has no bits above it to carry into, so a
         // burst that leaves it is an error.
-        final nbLog = (s.dataWidth ~/ 8).bitLength - 1;
         final w = max(k + 1, lenW + nbLog) + 2;
-        final low = addr.getRange(0, k);
-        final aligned = k > nbLog
-            ? [low.getRange(nbLog, k), Const(0, width: nbLog)].concat()
-            : Const(0, width: k);
-        final span = [len, Const(0, width: nbLog)].concat();
-        final end = aligned.zeroExtend(w) + span.zeroExtend(w);
-        final window = (len.zeroExtend(w) + 1) << nbLog;
+        final low = addr.getRange(0, k).zeroExtend(w);
+        final aligned = low & ~((Const(1, width: w) << sz) - 1);
+        final end = aligned + (len.zeroExtend(w) << sz);
+        final window = (len.zeroExtend(w) + 1) << sz;
         final leaves =
             (burst.eq(Const(1, width: 2)) & end.getRange(k, w).neq(0)) |
             (isWrap & window.getRange(k + 1, w).neq(0));
@@ -1868,8 +1863,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
         sid,
         addr.getRange(0, k),
         len,
+        sz,
         burst,
-        (narrow ? len.neq(0) : sz.neq(size)) | badBurst,
+        badBurst,
         prot,
       ]);
     }
@@ -1894,15 +1890,10 @@ class HarborAxi4Fabric extends HarborFabricModule {
     );
     awReady <= req.pushReady | dead;
     arReady <= req.pushReady | dead;
-    final [id, low, len, burst, bad, prot, isW] = harborUnpack(req.popData, [
-      s.idWidth,
-      k,
-      lenW,
-      Axi4Interface.burstWidth,
-      1,
-      protW,
-      1,
-    ]);
+    final [id, low, len, sz, burst, bad, prot, isW] = harborUnpack(
+      req.popData,
+      [s.idWidth, k, lenW, sizeW, Axi4Interface.burstWidth, 1, protW, 1],
+    );
     // A cut off slave never sees a request it was not shown.
     final held = cutValid('${p}_req', c, r, req.popValid, done, dead);
 
@@ -1945,7 +1936,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     l.arProt <= prot;
     l.wValid <= good & isW & ~wSent & wValid;
     l.wData <= wData;
-    l.wStrb <= wStrb;
+    l.wStrb <= wStrb & _laneMask(here, sz, nb);
 
     s.awValid <= held & isW;
     s.arValid <= held & ~isW;
@@ -1979,17 +1970,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
     // Next address: FIXED keeps it, INCR adds one word to the aligned
     // address, and WRAP wraps inside the window of len + 1 words.
-    final nb = s.dataWidth ~/ 8;
-    final nbLog = nb.bitLength - 1;
     Logic next = hereLow;
-    if (kk > nbLog) {
-      final aligned = [
-        hereLow.getRange(nbLog, kk),
-        Const(0, width: nbLog),
-      ].concat();
-      final inc = aligned + Const(nb, width: kk);
-      final win = [len, Const(nb - 1, width: nbLog)].concat();
-      final mask = kk >= win.width ? win.zeroExtend(kk) : win.getRange(0, kk);
+    if (kk > 0) {
+      final sizeMask = (Const(1, width: kk) << sz) - 1;
+      final aligned = hereLow & ~sizeMask;
+      final inc = aligned + (Const(1, width: kk) << sz);
+      final winW = max(kk, lenW + nbLog);
+      final win = (len.zeroExtend(winW) << sz) | sizeMask.zeroExtend(winW);
+      final mask = win.getRange(0, kk);
       final wrap = (aligned & ~mask) | (inc & mask);
       next = mux(
         burst.eq(Const(2, width: 2)),
@@ -2010,6 +1998,26 @@ class HarborAxi4Fabric extends HarborFabricModule {
           ~done.replicate(2) & mux(lBeat & l.bResp.gt(worst), l.bResp, worst),
     ]);
     return (req.popValid & ~isW, wF.popValid);
+  }
+
+  // Byte lanes that an access of 2^[sz] bytes at the byte address [a] covers
+  // on a bus of [nb] bytes. [a] has at least log2([nb]) bits, or fewer when
+  // a region is smaller than a word.
+  static Logic _laneMask(Logic a, Logic sz, int nb) {
+    final nbLog = nb.bitLength - 1;
+    if (nbLog == 0) return Const(1);
+    final addr = a.width < nbLog ? a.zeroExtend(nbLog) : a.getRange(0, nbLog);
+    Logic bySize(int s) => [
+      for (var i = nb - 1; i >= 0; i--)
+        s == nbLog
+            ? Const(1)
+            : addr.getRange(s, nbLog).eq(Const(i >> s, width: nbLog - s)),
+    ].concat();
+    var mask = bySize(nbLog);
+    for (var s = nbLog - 1; s >= 0; s--) {
+      mask = mux(sz.eq(Const(s, width: sz.width)), bySize(s), mask);
+    }
+    return mask;
   }
 
   // Stops the simulation when [bad] is high at a [clk] edge out of reset.

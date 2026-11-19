@@ -142,7 +142,10 @@ class _Bench {
         for (var i = 0; i < n; i++)
           ((addr * 0x9e3779b1 + i * 0x10001 + id) & mask) | 1,
       ],
-      strb: List.filled(n, (1 << bytes) - 1),
+      strb: [
+        for (final a in beatAddrs(addr, len, sz, burst))
+          (((1 << (1 << sz)) - 1) << (a & (bytes - 1) & ~((1 << sz) - 1))),
+      ],
     );
   }
 
@@ -161,16 +164,15 @@ class _Bench {
     bool Function(Burst) bad = _never,
   }) {
     final g = WordMemory(bytes);
-    final full = bytes.bitLength - 1;
     for (final x in writes) {
-      if (x.size != full || bad(x)) continue;
+      if (bad(x)) continue;
       final a = beatAddrs(x.addr, x.len, x.size, x.burst);
       for (var i = 0; i < x.beats; i++) {
         g.write(a[i], x.data[i], x.strb[i]);
       }
     }
     return (x) {
-      if (x.size != full || bad(x)) return (2, null);
+      if (bad(x)) return (2, null);
       return (
         0,
         [for (final a in beatAddrs(x.addr, x.len, x.size, x.burst)) g.read(a)],
@@ -182,12 +184,7 @@ class _Bench {
       [
         ...errors,
         ...checkReads('m', m.arOrder, m.rBeats, want(writes, bad: bad)),
-        ...checkWrites(
-          'm',
-          m.awOrder,
-          m.bResp,
-          (x) => x.size == bytes.bitLength - 1 && !bad(x) ? 0 : 2,
-        ),
+        ...checkWrites('m', m.awOrder, m.bResp, (x) => bad(x) ? 2 : 0),
       ];
 }
 
@@ -279,25 +276,36 @@ Future<void> _middleError(HarborFabricTopology t, int dw) async {
   must(b.l.awOrder.length, 4 + 4 + 4);
 }
 
-// A narrow burst is still an error and never reaches the slave.
+// A narrow burst runs as single beats that advance by SIZE.
 Future<void> _narrow(HarborFabricTopology t, int dw) async {
   final b = await _Bench.start(t, dw);
-  final narrowW = b.wr(0, _liteBase + 0x40, 3, size: 1);
-  final narrowR = b.rd(1, _liteBase + 0x40, 3, size: 1);
-  b.m
-    ..write(narrowW)
-    ..read(narrowR);
+  // Full words first, so a narrow write has known bytes around it.
+  final sizes = [
+    for (final size in [0, 1, 2])
+      if (1 << size <= b.bytes) size,
+  ];
+  final fills = [
+    for (final size in sizes) b.wr(2, _liteBase + 0x40 + size * 0x40, 3),
+  ];
+  final narrow = [
+    for (final size in sizes)
+      b.wr(0, _liteBase + 0x41 + size * 0x40, 3, size: size),
+  ];
+  for (final x in [...fills, ...narrow]) {
+    b.m.write(x);
+  }
+  await b.drain();
+  for (final x in narrow) {
+    b.m.read(b.rd(1, x.addr, 3, size: x.size));
+  }
   await b.drain();
   await b.sim.stop();
   must(b.errors, isEmpty);
-  must(b.m.bResp, [(0, 2)]);
-  must(b.m.rBeats.map((x) => (x.$3, x.$4)).toList(), [
-    (2, 0),
-    (2, 0),
-    (2, 0),
-    (2, 1),
+  must(b.check([...fills, ...narrow]).take(20).toList(), isEmpty);
+  must(b.l.awOrder.map((y) => y.addr).toList(), [
+    for (final x in [...fills, ...narrow])
+      for (final a in beatAddrs(x.addr, x.len, x.size, x.burst)) a,
   ]);
-  must(b.l.awOrder.length + b.l.arOrder.length, 0);
 }
 
 // Bursts and single beats to the lite and the full slave with no drain
@@ -429,7 +437,7 @@ void main() {
           timeout: long,
         );
         test(
-          'a narrow burst is an error',
+          'a narrow burst runs as single beats',
           () => isolated(() => _narrow(t, dw)),
           timeout: long,
         );
