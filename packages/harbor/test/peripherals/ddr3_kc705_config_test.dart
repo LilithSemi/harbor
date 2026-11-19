@@ -13,7 +13,11 @@ void main() {
     expect(c.rowWidth, 14);
     expect(c.colWidth, 10);
     expect(c.size, c.banks * (1 << 14) * (1 << 10) * 4);
-    expect(c.readReturnStage, isTrue);
+    expect(c.readReturnStage, isFalse);
+    expect(
+      const HarborDdrConfig.kc705(readReturnStage: true).readReturnStage,
+      isTrue,
+    );
   });
 
   for (final (hz, ps, controllerMhz) in [

@@ -66,9 +66,12 @@ class HarborDdrConfig with HarborPrettyString {
 
   /// Puts one register on the ISERDES returns of a Xilinx PHY, next to the I/O
   /// column. The controller logic can be far from there, and one cycle is not
-  /// long enough for that route at 83 MHz. The read calibration absorbs the
-  /// extra cycle. Ignored with the CK/8 controller, where the gearbox already
-  /// registers the returns.
+  /// long enough for that route at 83 MHz. Ignored with the CK/8 controller,
+  /// where the gearbox already registers the returns.
+  ///
+  /// The read calibration passes in simulation with this stage, but a KC705
+  /// with the stage does not calibrate. Do not use it on hardware until that
+  /// is fixed.
   final bool readReturnStage;
 
   const HarborDdrConfig({
@@ -155,21 +158,21 @@ class HarborDdrConfig with HarborPrettyString {
   /// slower than the DLL range. Every timing in [DdrTiming] is in ns or in nCK
   /// from [ckHz], so it stays legal at both rates with CL 6 and CWL 5.
   ///
-  /// [readReturnStage] is on, because on this board the controller is placed
-  /// far from the DQ pins.
-  const HarborDdrConfig.kc705({int ckHz = 333333333})
-    : type = HarborDdrType.ddr3,
-      size = 512 * 1024 * 1024,
-      dataWidth = 32,
-      frequency = ckHz,
-      ranks = 1,
-      banks = 8,
-      rowWidth = 14,
-      colWidth = 10,
-      casLatency = 6,
-      density = DdrDensity.gb2,
-      dmRemapping = null,
-      readReturnStage = true;
+  /// [readReturnStage] is off by default. See its doc.
+  const HarborDdrConfig.kc705({
+    int ckHz = 333333333,
+    this.readReturnStage = false,
+  }) : type = HarborDdrType.ddr3,
+       size = 512 * 1024 * 1024,
+       dataWidth = 32,
+       frequency = ckHz,
+       ranks = 1,
+       banks = 8,
+       rowWidth = 14,
+       colWidth = 10,
+       casLatency = 6,
+       density = DdrDensity.gb2,
+       dmRemapping = null;
 
   /// Frequency in MHz.
   double get frequencyMhz => frequency / 1e6;
