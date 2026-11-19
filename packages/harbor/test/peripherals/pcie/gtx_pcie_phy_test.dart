@@ -865,13 +865,14 @@ void main() {
     test('a rate change with no answer restarts the sequence', () async {
       final b = await _Bench.start(setup: (m) => m.rateStuck = true);
       await b.waitFor(_S.idle);
-      final rateState = b.sig('rate_state');
-      final rateFail = b.sig('rate_fail');
+      final rateWait = b.sig('rate_wait');
+      final rateFail = b.sig('fail_rate_k');
       b.pipe.pipeRate.inject(1);
-      // The rate wait is state 2.
-      await b.until(() => rateState.value.toInt() == 2, limit: 100);
+      await b.until(() => b.hi(rateWait), limit: 100);
       final waited = await b.until(() => b.hi(rateFail));
-      expect(waited, _timeouts.rate - 1);
+      // The compare and the failure go through flops, so it is a few cycles
+      // later than the bound.
+      expect(waited, inInclusiveRange(_timeouts.rate - 1, _timeouts.rate + 6));
       await b.waitFor(_S.cpllReset, limit: 200);
       expect(b.failState, _S.rateChange);
       expect(b.flags, 16);

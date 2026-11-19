@@ -613,9 +613,14 @@ class HarborGtxPciePhy extends Module {
     final linkUp = Logic(name: 'link_up');
     final rateQ = Logic(name: 'rate_q');
     final gtRate = Logic(name: 'gt_rate');
-    final rateState = Logic(name: 'rate_state', width: 3);
-    final rateIdle = rateState.eq(_r(_rIdle)).named('rate_idle');
-    final rateDone = rateState.eq(_r(_rDone)).named('rate_done');
+    final rIdle = Logic(name: 'rate_idle');
+    final rSwitch = Logic(name: 'rate_switch');
+    final rWait = Logic(name: 'rate_wait');
+    final rTake = Logic(name: 'rate_take');
+    final rBack = Logic(name: 'rate_back');
+    final rDone = Logic(name: 'rate_done');
+    final rateIdle = rIdle;
+    final rateDone = rDone;
 
     gt.port('CPLLRESET') <= cpllRst;
     gt.port('GTTXRESET') <= gtRst;
@@ -696,46 +701,114 @@ class HarborGtxPciePhy extends Module {
 
     final maxWait = [...timeouts.all, 64].reduce((a, b) => a > b ? a : b);
     final tw = maxWait.bitLength;
-    final state = Logic(name: 'state', width: 4);
-    final next = Logic(name: 'state_next', width: 4);
     final timer = Logic(name: 'timer', width: tw);
-    final stepNext = Logic(name: 'step_next', width: 4);
-    final stepGo = Logic(name: 'step_go');
-    // A wait that ends is registered, and the state changes one cycle later.
-    final goQ = Logic(name: 'step_go_q');
-    final targetQ = Logic(name: 'step_target_q', width: 4);
-    final timedOut = Logic(name: 'timed_out');
-    final rateFail = Logic(name: 'rate_fail');
     final cpllHold = Logic(name: 'cpll_hold');
+    Logic orAll(Iterable<Logic> l) =>
+        l.isEmpty ? Const(0) : l.reduce((a, b) => a | b);
+    Logic andAll(Iterable<Logic> l) =>
+        l.isEmpty ? Const(1) : l.reduce((a, b) => a & b);
 
-    Logic s(HarborGtxResetState v) => Const(v.code, width: 4);
-    // The timer compares are registered: hit_n is high when the timer was
-    // n - 2 in the last cycle. timer_zero is high when the timer was cleared
-    // at the last edge, so the timer did not count up.
-    final timerZero = Logic(name: 'timer_zero');
-    final hits = <int, Logic>{};
-    Logic at(int cycles) {
-      assert(cycles >= 3, 'timer compare needs 3 or more cycles');
-      return hits.putIfAbsent(cycles, () => Logic(name: 'timer_hit_$cycles')) &
-          ~timerZero;
+    // Each decision is a flop and the flop that applies it is later, so no
+    // flop input is behind a chain of compares. A compare of a counter with
+    // a constant is a row of flops that each compare 5 bits.
+    List<Logic> chunkEq(String name, Logic count, int value, Logic mask) {
+      final out = <Logic>[];
+      for (var lo = 0, i = 0; lo < count.width; lo += 5, i++) {
+        final hi = lo + 5 < count.width ? lo + 5 : count.width;
+        final q = Logic(name: '${name}_c$i');
+        final part = Const(
+          (value >> lo) & ((1 << (hi - lo)) - 1),
+          width: hi - lo,
+        );
+        Sequential(pclk, [
+          q < (count.slice(hi - 1, lo).eq(part) & mask),
+        ], reset: rst);
+        out.add(q);
+      }
+      return out;
     }
 
-    Logic isState(List<HarborGtxResetState> l) =>
-        l.map((v) => state.eq(s(v))).reduce((a, b) => a | b);
+    final order = [
+      _S.cfgWait,
+      _S.cpllReset,
+      _S.cpllLock,
+      _S.gtRelease,
+      _S.clockLock,
+      _S.resetDone,
+      _S.txDlySReset,
+      _S.txPhInit,
+      _S.txPhAlign,
+      _S.txDlyEn,
+      _S.idle,
+    ];
+    final st = {for (final v in order) v: Logic(name: 's_${v.name}')};
+    final go = {for (final v in order) v: Logic(name: 'go_${v.name}')};
+    final target = <_S, _S>{
+      _S.cfgWait: _S.cpllReset,
+      _S.cpllReset: _S.cpllLock,
+      _S.cpllLock: _S.gtRelease,
+      _S.gtRelease: _S.clockLock,
+      _S.clockLock: _S.resetDone,
+      _S.resetDone: debugSkipTxPhaseAlign ? _S.idle : _S.txDlySReset,
+      _S.txDlySReset: _S.txPhInit,
+      _S.txPhInit: _S.txPhAlign,
+      _S.txPhAlign: _S.txDlyEn,
+      _S.txDlyEn: _S.idle,
+      _S.idle: _S.txDlySReset,
+    };
+    final sIdle = st[_S.idle]!;
 
-    CaseItem wait(
-      HarborGtxResetState st,
-      Logic done,
-      HarborGtxResetState to,
-      int bound,
-    ) => CaseItem(s(st), [
-      If.block([
-        Iff(done, [stepNext < s(to), stepGo < 1]),
-        ElseIf(at(bound), [timedOut < 1]),
-      ]),
-    ]);
+    // A failure goes through flops: a cause, a failure, then the retry or the
+    // restart that changes the state.
+    final tmoK = {
+      for (final v in [
+        _S.cpllReset,
+        _S.cpllLock,
+        _S.clockLock,
+        _S.resetDone,
+        _S.txDlySReset,
+        _S.txPhInit,
+        _S.txPhAlign,
+        _S.txDlyEn,
+      ])
+        v: Logic(name: 'tmo_k_${v.name}'),
+    };
+    final lostK = Logic(name: 'fail_lost_k');
+    final rateK = Logic(name: 'fail_rate_k');
+    final wdK = Logic(name: 'fail_wd_k');
+    final tmoQ = Logic(name: 'fail_tmo_q');
+    final lostQ = Logic(name: 'fail_lost_q');
+    final rateQf = Logic(name: 'fail_rate_q');
+    final wdQ = Logic(name: 'fail_wd_q');
+    final failQ = Logic(name: 'fail');
+    final wd2Q = Logic(name: 'fail_wd2_q');
+    final retryQ = Logic(name: 'retry_q');
+    final fullQ = Logic(name: 'full_q');
+    final blockQ = Logic(name: 'fail_block_q');
+    final ovr = (retryQ | fullQ).named('fail_apply');
+    final clrPa = Logic(name: 'timer_clr_pa');
+    final clrPb = Logic(name: 'timer_clr_pb');
+    final clrPc = Logic(name: 'timer_clr_pc');
+    final clrQ = Logic(name: 'timer_clr_q');
+    final clrQ2 = Logic(name: 'timer_clr_q2');
 
-    // The lock must stay up for clockSettle cycles in clockLock.
+    // hit is high from `lead` cycles before the timer counts n cycles.
+    final hits = <String, Logic>{};
+    Logic at(int cycles, int lead) {
+      assert(cycles > lead + 2, 'timer compare needs more cycles');
+      return hits.putIfAbsent('${cycles}_$lead', () {
+        final h = Logic(name: 'timer_hit_${cycles}_$lead');
+        final chunks = chunkEq(
+          'timer_eq_${cycles}_$lead',
+          timer,
+          cycles - lead,
+          ~clrQ,
+        );
+        Sequential(pclk, [h < (~clrQ & (h | andAll(chunks)))], reset: rst);
+        return h;
+      });
+    }
+
     final clockOk = (mmcmLocked & (waitRxCdrLock ? cdrLocked : Const(1))).named(
       'clock_ok',
     );
@@ -743,9 +816,17 @@ class HarborGtxPciePhy extends Module {
       name: 'settle_count',
       width: timeouts.clockSettle.bitLength + 1,
     );
+    final settled = Logic(name: 'settled');
+    final settleRun = (st[_S.clockLock]! & clockOk).named('settle_run');
+    final settleChunks = chunkEq(
+      'settle_eq',
+      settleCount,
+      timeouts.clockSettle > 2 ? timeouts.clockSettle - 2 : 0,
+      settleRun,
+    );
     Sequential(pclk, [
       If(
-        state.eq(s(_S.clockLock)) & clockOk,
+        settleRun,
         then: [
           If(
             ~settleCount.eq(
@@ -756,28 +837,24 @@ class HarborGtxPciePhy extends Module {
         ],
         orElse: [settleCount < 0],
       ),
-    ], reset: rst);
-    // The compare is registered, so the wait sees it one cycle late.
-    final settled = Logic(name: 'settled');
-    Sequential(pclk, [
-      settled <
-          (settleCount.eq(
-                Const(timeouts.clockSettle, width: settleCount.width),
-              ) &
-              state.eq(s(_S.clockLock)) &
-              clockOk),
+      settled < (settleRun & (settled | andAll(settleChunks))),
     ], reset: rst);
 
-    final fail = Logic(name: 'fail');
-    // TXDLYSRESET waits txSettle cycles after its state starts, and again
-    // after each failure.
     final txSettleCount = Logic(
       name: 'tx_settle_count',
       width: timeouts.txSettle.bitLength + 1,
     );
+    final txSettled = Logic(name: 'tx_settled');
+    final syncRun = (st[_S.txDlySReset]! & ~failQ & ~retryQ).named('sync_run');
+    final txSettleChunks = chunkEq(
+      'tx_settle_eq',
+      txSettleCount,
+      timeouts.txSettle > 2 ? timeouts.txSettle - 2 : 0,
+      syncRun,
+    );
     Sequential(pclk, [
       If(
-        state.eq(s(_S.txDlySReset)) & ~fail,
+        syncRun,
         then: [
           If(
             ~txSettleCount.eq(
@@ -788,150 +865,193 @@ class HarborGtxPciePhy extends Module {
         ],
         orElse: [txSettleCount < 0],
       ),
-    ], reset: rst);
-    final txSettled = Logic(name: 'tx_settled');
-    Sequential(pclk, [
-      txSettled <
-          (txSettleCount.eq(
-                Const(timeouts.txSettle, width: txSettleCount.width),
-              ) &
-              state.eq(s(_S.txDlySReset)) &
-              ~fail),
+      txSettled < (syncRun & (txSettled | andAll(txSettleChunks))),
     ], reset: rst);
 
-    final afterCpllLock = isState([
-      _S.gtRelease,
-      _S.clockLock,
-      _S.resetDone,
-      _S.txDlySReset,
-      _S.txPhInit,
-      _S.txPhAlign,
-      _S.txDlyEn,
-      _S.idle,
-    ]);
-    final afterMmcmLock = isState([
-      _S.resetDone,
-      _S.txDlySReset,
-      _S.txPhInit,
-      _S.txPhAlign,
-      _S.txDlyEn,
-      _S.idle,
-    ]);
-    final lostLock =
-        (afterCpllLock & ~cpllLocked) | (afterMmcmLock & ~mmcmLocked);
-    final rateTake = rateState.eq(_r(_rTake));
+    // Wait ends, from flops, one cycle old.
+    final done = <_S, Logic>{};
+    Logic doneFlop(_S v, String name, Logic d) {
+      final q = Logic(name: 'done_$name');
+      Sequential(pclk, [q < d], reset: rst);
+      return done[v] = q;
+    }
 
-    Combinational([
-      stepNext < state,
-      stepGo < 0,
-      timedOut < 0,
-      Case(
-        state,
-        [
-          CaseItem(s(_S.cfgWait), [
-            If(at(64), then: [stepNext < s(_S.cpllReset), stepGo < 1]),
-          ]),
-          wait(
-            _S.cpllReset,
-            resetLow & ~cpllLocked & cpllHold,
-            _S.cpllLock,
-            timeouts.resetDone,
-          ),
-          wait(_S.cpllLock, cpllLocked, _S.gtRelease, timeouts.cpllLock),
-          CaseItem(s(_S.gtRelease), [stepNext < s(_S.clockLock), stepGo < 1]),
-          wait(
-            _S.clockLock,
-            clockOk & settled,
-            _S.resetDone,
-            timeouts.clockLock,
-          ),
-          wait(
-            _S.resetDone,
-            resetDoneOk,
-            debugSkipTxPhaseAlign ? _S.idle : _S.txDlySReset,
-            timeouts.resetDone,
-          ),
-          wait(
-            _S.txDlySReset,
-            dlySDoneRise & dlySReset,
-            _S.txPhInit,
-            timeouts.txSync,
-          ),
-          wait(_S.txPhInit, phInitDoneRise, _S.txPhAlign, timeouts.txSync),
-          wait(_S.txPhAlign, phAlignDoneRise, _S.txDlyEn, timeouts.txSync),
-          wait(_S.txDlyEn, phAlignDoneRise, _S.idle, timeouts.txSync),
-          CaseItem(s(_S.idle), [
-            If(
-              rateTake & ~Const(debugSkipTxPhaseAlign ? 1 : 0),
-              then: [stepNext < s(_S.txDlySReset), stepGo < 1],
-            ),
-          ]),
-        ],
-        defaultItem: [timedOut < 1],
-      ),
-    ]);
-    // A failure is registered, so it starts the retry one cycle after the
-    // cause. The cycle after a failure cannot fail again, so a lock loss
-    // counts once.
-    final holdHit = at(HarborGtxPcieTimeouts.cpllResetHold);
-    final failNow = ((timedOut & ~goQ) | lostLock | rateFail).named('fail_now');
-    final failCause = Logic(name: 'fail_cause', width: 4);
-    final causeInSync = Logic(name: 'fail_cause_sync');
-    final failTimeout = Logic(name: 'fail_timeout');
-    // A watchdog restart takes the retry path, but it is not a failure.
-    final restart = timeouts.linkWait == 0 ? null : Logic(name: 'link_restart');
-    final failOrRestart = restart == null ? fail : fail | restart;
-    // A timeout in a TX sync step starts the sync again, up to
-    // [HarborGtxPcieTimeouts.syncRetries] times in a row. A lock loss, a
-    // watchdog restart and any other timeout start the whole sequence.
-    final syncTries = Logic(name: 'sync_tries', width: 8);
+    done[_S.cfgWait] = at(64, 5);
+    doneFlop(_S.cpllReset, 'cpll_reset', resetLow & ~cpllLocked & cpllHold);
+    doneFlop(_S.cpllLock, 'cpll_lock', cpllLocked);
+    done[_S.gtRelease] = Const(1);
+    doneFlop(_S.clockLock, 'clock_lock', clockOk & settled);
+    doneFlop(_S.resetDone, 'reset_done', resetDoneOk);
+    doneFlop(_S.txDlySReset, 'dlysreset', dlySDoneRise & dlySReset);
+    doneFlop(_S.txPhInit, 'phinit', phInitDoneRise);
+    final phAlignDone = doneFlop(_S.txPhAlign, 'phalign', phAlignDoneRise);
+    done[_S.txDlyEn] = phAlignDone;
+    if (debugSkipTxPhaseAlign) {
+      done[_S.idle] = Const(0);
+    } else {
+      doneFlop(_S.idle, 'take', rTake);
+    }
+    final holdCount = Logic(
+      name: 'cpll_hold_count',
+      width: HarborGtxPcieTimeouts.cpllResetHold.bitLength,
+    );
+
+    final bound = <_S, int>{
+      _S.cpllReset: timeouts.resetDone,
+      _S.cpllLock: timeouts.cpllLock,
+      _S.clockLock: timeouts.clockLock,
+      _S.resetDone: timeouts.resetDone,
+      _S.txDlySReset: timeouts.txSync,
+      _S.txPhInit: timeouts.txSync,
+      _S.txPhAlign: timeouts.txSync,
+      _S.txDlyEn: timeouts.txSync,
+    };
+
+    final goD = {
+      for (final v in order)
+        v: (st[v]! & done[v]! & ~go[v]! & ~blockQ).named('go_d_${v.name}'),
+    };
+    final tmoD = {
+      for (final e in bound.entries)
+        e.key:
+            (st[e.key]! &
+                    ~done[e.key]! &
+                    at(e.value, 8) &
+                    ~go[e.key]! &
+                    ~blockQ)
+                .named('tmo_d_${e.key.name}'),
+    };
+    final afterCpllLock = Logic(name: 'after_cpll_lock');
+    final afterMmcmLock = Logic(name: 'after_mmcm_lock');
+    final lostD =
+        (((afterCpllLock & ~cpllLocked) | (afterMmcmLock & ~mmcmLocked)) &
+                ~blockQ)
+            .named('lost_d');
+    final rateHit = Logic(name: 'rate_hit');
+    final rateD = (rWait & rateHit & ~blockQ).named('rate_d');
+    final restartPulse = timeouts.linkWait == 0
+        ? null
+        : Logic(name: 'link_restart');
+
+    final causeSync1 = Logic(name: 'fail_cause_sync_1');
+    final code1 = Logic(name: 'fail_cause_1', width: 4);
+    final flags1 = Logic(name: 'fail_flags_1', width: timeoutFlagBits);
+    final causeSync1b = Logic(name: 'fail_cause_sync_1b');
+    final code1b = Logic(name: 'fail_cause_1b', width: 4);
+    final flags1b = Logic(name: 'fail_flags_1b', width: timeoutFlagBits);
+    final causeSync2 = Logic(name: 'fail_cause_sync');
+    final failTmo2 = Logic(name: 'fail_timeout');
+    final code2 = Logic(name: 'fail_cause', width: 4);
+    final flags2 = Logic(name: 'fail_flags_2', width: timeoutFlagBits);
     final triesLeft = Logic(name: 'sync_tries_left');
-    final syncRetry =
-        (fail &
-                failTimeout &
-                causeInSync &
-                triesLeft &
-                (restart == null ? Const(1) : ~restart))
-            .named('sync_retry');
-    final fullFail = (failOrRestart & ~syncRetry).named('full_fail');
-    next <=
-        mux(
-          syncRetry,
-          s(_S.txDlySReset),
-          mux(fullFail, s(_S.cpllReset), mux(goQ, targetQ, state)),
-        );
-
-    // High when next differs from state, without going through next.
-    final nextChanges =
-        (fail |
-                (restart == null
-                    ? goQ
-                    : mux(restart, ~state.eq(s(_S.cpllReset)), goQ)))
-            .named('next_changes');
-
-    Logic nextIs(List<HarborGtxResetState> l) =>
-        l.map((v) => next.eq(s(v))).reduce((a, b) => a | b);
-
-    final failState = Logic(name: 'fail_state', width: 4);
+    final syncTries = Logic(name: 'sync_tries', width: 8);
     final retries = Logic(name: 'retries', width: 8);
+    final retriesFull = Logic(name: 'retries_full');
+    final failState = Logic(name: 'fail_state', width: 4);
     final flags = Logic(name: 'timeout_flags_q', width: timeoutFlagBits);
-    Logic causeIs(List<HarborGtxResetState> l) =>
-        l.map((v) => failCause.eq(s(v))).reduce((a, b) => a | b);
-    final causeFlags = [
-      causeIs([_S.cpllReset, _S.cpllLock]),
-      causeIs([_S.clockLock]),
-      causeIs([_S.resetDone]),
-      causeIs([_S.txDlySReset, _S.txPhInit, _S.txPhAlign, _S.txDlyEn]),
-      causeIs([_S.rateChange]),
+
+    Logic codeOf(_S v) => Const(v.code, width: 4);
+    final stateCode = List<Logic>.generate(4, (b) {
+      return orAll([
+        for (final v in order)
+          if (((v.code >> b) & 1) == 1) st[v]!,
+      ]);
+    }).rconcat();
+    final syncStates = [
+      st[_S.txDlySReset]!,
+      st[_S.txPhInit]!,
+      st[_S.txPhAlign]!,
+      st[_S.txDlyEn]!,
     ];
+    final tmoAny = orAll(tmoK.values);
+    final retryD = (failQ & failTmo2 & causeSync2 & triesLeft & ~wd2Q).named(
+      'retry_d',
+    );
+    final fullD = ((failQ | wd2Q) & ~retryD).named('full_d');
+    final failD = ((tmoQ | lostQ | rateQf) & ~failQ & ~retryQ & ~fullQ).named(
+      'fail_d',
+    );
+    final wd2D = (wdQ & ~wd2Q).named('wd2_d');
+
+    Sequential(pclk, [
+      for (final v in order) go[v]! < goD[v]!,
+      clrPa < orAll(order.take(6).map((v) => go[v]!)),
+      clrPb < orAll(order.skip(6).map((v) => go[v]!)),
+      clrPc < ovr,
+      clrQ < (clrPa | clrPb | clrPc),
+      clrQ2 < clrQ,
+      blockQ < (failD | wd2D | retryD | fullD),
+      for (final e in tmoK.entries) e.value < tmoD[e.key]!,
+      lostK < lostD,
+      rateK < rateD,
+      wdK <
+          (restartPulse == null
+              ? Const(0)
+              : restartPulse & ~blockQ & ~wdK & ~wdQ),
+      // The cause is taken when the decision is made, and moves on with it.
+      causeSync1 < (~rateD & orAll(syncStates)),
+      code1 < mux(rateD, codeOf(_S.rateChange), stateCode),
+      flags1 <
+          [
+            rateD,
+            ~rateD & orAll(syncStates),
+            ~rateD & st[_S.resetDone]!,
+            ~rateD & st[_S.clockLock]!,
+            ~rateD & (st[_S.cpllReset]! | st[_S.cpllLock]!),
+          ].concat(),
+      causeSync1b < causeSync1,
+      code1b < code1,
+      flags1b < flags1,
+      tmoQ < (tmoAny & ~clrQ & ~clrQ2),
+      lostQ < lostK,
+      rateQf < rateK,
+      wdQ < wdK,
+      failQ < failD,
+      wd2Q < wd2D,
+      causeSync2 < causeSync1b,
+      failTmo2 < (tmoQ | rateQf),
+      code2 < code1b,
+      flags2 < flags1b,
+      retryQ < retryD,
+      fullQ < fullD,
+    ], reset: rst);
+
     Sequential(
       pclk,
       [
-        state < next,
-        goQ < stepGo & ~goQ & ~failOrRestart,
-        targetQ < stepNext,
+        for (final v in order)
+          st[v]! <
+              ((orAll([
+                            for (final p in order)
+                              if (target[p] == v) go[p]!,
+                          ]) |
+                          (st[v]! & ~go[v]!)) &
+                      ~ovr) |
+                  (v == _S.cpllReset
+                      ? fullQ
+                      : v == _S.txDlySReset
+                      ? retryQ
+                      : Const(0)),
+      ],
+      reset: rst,
+      resetValues: {st[_S.cfgWait]!: Const(1)},
+    );
+
+    // Bookkeeping when a failure is applied.
+    Sequential(
+      pclk,
+      [
+        retriesFull < retries.and(),
         If(
-          syncRetry,
+          failQ,
+          then: [
+            failState < code2,
+            If(~retriesFull, then: [retries < retries + 1]),
+            If(failTmo2, then: [flags < (flags2 | flags)]),
+          ],
+        ),
+        If(
+          retryQ,
           then: [
             syncTries < syncTries + 1,
             triesLeft <
@@ -944,7 +1064,7 @@ class HarborGtxPciePhy extends Module {
           ],
           orElse: [
             If(
-              fullFail | nextIs([_S.idle]),
+              fullQ | go[_S.txDlyEn]!,
               then: [
                 syncTries < 0,
                 triesLeft < Const(timeouts.syncRetries > 0 ? 1 : 0),
@@ -952,153 +1072,126 @@ class HarborGtxPciePhy extends Module {
             ),
           ],
         ),
-        fail < failNow & ~fail,
-        failTimeout < (timedOut | rateFail),
-        failCause < mux(rateFail, s(_S.rateChange), state),
-        causeInSync <
-            ~rateFail &
-                [
-                  _S.txDlySReset,
-                  _S.txPhInit,
-                  _S.txPhAlign,
-                  _S.txDlyEn,
-                ].map((v) => state.eq(s(v))).reduce((a, b) => a | b),
-        timerZero < nextChanges,
-        for (final MapEntry(key: n, value: hit) in hits.entries)
-          hit < timer.eq(Const(n - 2, width: tw)),
-        If(
-          nextChanges,
-          then: [timer < 0],
-          orElse: [
-            If(~state.eq(s(_S.idle)), then: [timer < timer + 1]),
-          ],
-        ),
-        cpllHold < (state.eq(s(_S.cpllReset)) & (cpllHold | holdHit)),
-        If(
-          fail,
-          then: [
-            failState < failCause,
-            If(~retries.and(), then: [retries < retries + 1]),
-            If(
-              failTimeout,
-              then: [
-                flags <
-                    [for (final f in causeFlags.reversed) f].concat() | flags,
-              ],
-            ),
-          ],
-        ),
-        cpllRst < nextIs([_S.cpllReset]),
-        gtRst < nextIs([_S.cpllReset, _S.cpllLock]),
-        userRdy <
-            nextIs([
-              _S.resetDone,
-              _S.txDlySReset,
-              _S.txPhInit,
-              _S.txPhAlign,
-              _S.txDlyEn,
-              _S.idle,
-            ]),
-        dlySReset < nextIs([_S.txDlySReset]) & txSettled,
-        phInit < nextIs([_S.txPhInit]),
-        phAlign < nextIs([_S.txPhAlign]),
-        dlyEn <
-            nextIs(
-              debugSkipTxPhaseAlign ? [_S.txDlyEn] : [_S.txDlyEn, _S.idle],
-            ),
       ],
       reset: rst,
       resetValues: {
-        state: s(_S.cfgWait),
-        failState: s(_S.none),
-        timerZero: Const(1),
+        failState: codeOf(_S.none),
         triesLeft: Const(timeouts.syncRetries > 0 ? 1 : 0),
       },
     );
 
+    // The timer clears in the first cycle of a state, so it counts the cycles
+    // after that.
+    Sequential(pclk, [
+      If(
+        clrQ,
+        then: [timer < 0],
+        orElse: [
+          If(~sIdle, then: [timer < timer + 1]),
+        ],
+      ),
+      If(
+        st[_S.cpllReset]! & ~holdCount[holdCount.width - 1],
+        then: [holdCount < holdCount + 1],
+        orElse: [
+          If(~st[_S.cpllReset]!, then: [holdCount < 0]),
+        ],
+      ),
+      cpllHold < (st[_S.cpllReset]! & holdCount[holdCount.width - 1]),
+    ], reset: rst);
+
+    // Outputs to the GT.
+    cpllRst <= st[_S.cpllReset]!;
+    Sequential(pclk, [
+      gtRst < (fullQ | go[_S.cfgWait]! | (gtRst & ~go[_S.cpllLock]!)),
+      afterCpllLock < ((afterCpllLock & ~fullQ) | go[_S.cpllLock]!),
+      afterMmcmLock < ((afterMmcmLock & ~fullQ) | go[_S.clockLock]!),
+      dlySReset <
+          (st[_S.txDlySReset]! &
+              txSettled &
+              ~failQ &
+              ~retryQ &
+              ~go[_S.txDlySReset]!),
+      dlyEn <
+          (go[_S.txPhAlign]! |
+              (dlyEn &
+                  ~(debugSkipTxPhaseAlign ? go[_S.txDlyEn]! : go[_S.idle]!) &
+                  ~ovr)),
+      linkUp <
+          ((orAll([
+                    for (final p in order)
+                      if (target[p] == _S.idle) go[p]!,
+                  ]) |
+                  (sIdle & ~go[_S.idle]!) |
+                  ~rIdle) &
+              ~blockQ),
+    ], reset: rst);
+    userRdy <= afterMmcmLock;
+    phInit <= st[_S.txPhInit]!;
+    phAlign <= st[_S.txPhAlign]!;
+
     // Rate change. The hard block drives one rate. The `pclk` select changes
     // first, then TXRATE and RXRATE.
-    final rateTimer = Logic(name: 'rate_timer', width: timeouts.rate.bitLength);
+    final rw = timeouts.rate.bitLength;
+    final rateTimer = Logic(name: 'rate_timer', width: rw);
     final txRateSeen = Logic(name: 'tx_rate_seen');
     final rxRateSeen = Logic(name: 'rx_rate_seen');
     final phySeen = Logic(name: 'phy_seen');
-    final rateChange = (rateQ ^ gtRate).named('rate_change');
-    final idleNow = state.eq(s(_S.idle));
-    // rate_hit is high when the timer was rate - 2 in wait in the last
-    // cycle. In wait the timer counts up on each cycle.
-    final rateHit = Logic(name: 'rate_hit');
-    final rateWait = rateState.eq(_r(_rWait));
+    final seenAll = Logic(name: 'rate_seen_all');
+    final rateChg = Logic(name: 'rate_change_q');
     final switchHit = Logic(name: 'switch_hit');
-    rateFail <= rateWait & rateHit;
-    final rw = timeouts.rate.bitLength;
-    Sequential(pclk, [
-      rateQ < _pipeDelay(pclk, p.pipeRate, pipeStages, 'rate'),
-      rateHit < rateWait & rateTimer.eq(Const(timeouts.rate - 2, width: rw)),
-      switchHit <
-          rateState.eq(_r(_rSwitch)) &
-              rateTimer.eq(Const(timeouts.clockSwitch - 2, width: rw)),
-      If(
-        fullFail,
-        then: [rateState < _r(_rIdle), rateTimer < 0, gtRate < 0, pclkSelQ < 0],
-        orElse: [
-          Case(
-            rateState,
-            [
-              CaseItem(_r(_rIdle), [
-                If(
-                  rateChange & idleNow,
-                  then: [
-                    rateState < _r(_rSwitch),
-                    rateTimer < 0,
-                    pclkSelQ < rateQ,
-                  ],
-                ),
-              ]),
-              CaseItem(_r(_rSwitch), [
-                rateTimer < rateTimer + 1,
-                If(
-                  switchHit,
-                  then: [
-                    gtRate < rateQ,
-                    rateState < _r(_rWait),
-                    rateTimer < 0,
-                    txRateSeen < 0,
-                    rxRateSeen < 0,
-                    phySeen < 0,
-                  ],
-                ),
-              ]),
-              CaseItem(_r(_rWait), [
-                rateTimer < rateTimer + 1,
-                If(txRateDoneS, then: [txRateSeen < 1]),
-                If(rxRateDoneS, then: [rxRateSeen < 1]),
-                If(gtPhyStatus, then: [phySeen < 1]),
-                If(
-                  txRateSeen & rxRateSeen & phySeen,
-                  then: [rateState < _r(_rTake)],
-                ),
-              ]),
-              CaseItem(_r(_rTake), [
-                If(
-                  ~idleNow | Const(debugSkipTxPhaseAlign ? 1 : 0),
-                  then: [rateState < _r(_rBack)],
-                ),
-              ]),
-              CaseItem(_r(_rBack), [
-                If(idleNow, then: [rateState < _r(_rDone)]),
-              ]),
-              CaseItem(_r(_rDone), [rateState < _r(_rIdle)]),
-            ],
-            defaultItem: [rateState < _r(_rIdle)],
-          ),
-        ],
-      ),
-      linkUp <
-          (nextIs([_S.idle]) | ~rateState.eq(_r(_rIdle))) &
-              ~fullFail &
-              ~failNow,
-    ], reset: rst);
+    final takeGo = debugSkipTxPhaseAlign ? Const(1) : ~sIdle;
+    final rateChunks = chunkEq(
+      'rate_eq',
+      rateTimer,
+      timeouts.rate > 5 ? timeouts.rate - 3 : 0,
+      rWait,
+    );
+    final switchChunks = chunkEq(
+      'switch_eq',
+      rateTimer,
+      timeouts.clockSwitch - 3,
+      rSwitch,
+    );
+    Sequential(
+      pclk,
+      [
+        rateQ < _pipeDelay(pclk, p.pipeRate, pipeStages, 'rate'),
+        rateChg < (rateQ ^ gtRate),
+        rateHit < (rWait & (rateHit | andAll(rateChunks))),
+        switchHit < (rSwitch & andAll(switchChunks)),
+        txRateSeen < (rWait & (txRateSeen | txRateDoneS)),
+        rxRateSeen < (rWait & (rxRateSeen | rxRateDoneS)),
+        phySeen < (rWait & (phySeen | gtPhyStatus)),
+        seenAll < (txRateSeen & rxRateSeen & phySeen),
+        rIdle < (fullQ | rDone | (rIdle & ~(rateChg & sIdle))),
+        rSwitch <
+            (~fullQ & ((rIdle & rateChg & sIdle) | (rSwitch & ~switchHit))),
+        rWait < (~fullQ & ((rSwitch & switchHit) | (rWait & ~seenAll))),
+        rTake < (~fullQ & ((rWait & seenAll) | (rTake & ~takeGo))),
+        rBack < (~fullQ & ((rTake & takeGo) | (rBack & ~sIdle))),
+        rDone < (~fullQ & rBack & sIdle),
+        If(
+          fullQ | rIdle | (rSwitch & switchHit),
+          then: [rateTimer < 0],
+          orElse: [
+            If(rSwitch | rWait, then: [rateTimer < rateTimer + 1]),
+          ],
+        ),
+        If(
+          fullQ,
+          then: [gtRate < 0, pclkSelQ < 0],
+          orElse: [
+            If(rSwitch & switchHit, then: [gtRate < rateQ]),
+            If(rIdle & rateChg & sIdle, then: [pclkSelQ < rateQ]),
+          ],
+        ),
+      ],
+      reset: rst,
+      resetValues: {rIdle: Const(1)},
+    );
 
+    final state = stateCode;
     addOutput('reset_state', width: 4) <= state;
     addOutput('reset_fail_state', width: 4) <= failState;
     addOutput('reset_retries', width: 8) <= retries;
@@ -1122,7 +1215,7 @@ class HarborGtxPciePhy extends Module {
     final kSeen = (p.rxDataK.or() & rxValidOut);
     Sequential(pclk, [
       If(
-        ~state.eq(s(_S.idle)),
+        ~sIdle,
         then: [rxIdleSeen < 0],
         orElse: [
           rxIdleSeen <
@@ -1150,7 +1243,7 @@ class HarborGtxPciePhy extends Module {
     addOutput('rx_reset_done') <= rxResetDoneS;
     addOutput('timeout_flags', width: timeoutFlagBits) <= flags;
 
-    if (restart == null) return;
+    if (restartPulse == null) return;
     final hardUp = sync(
       addInput('hard_link_up', hardLinkUp!),
       'hard_link_up_s',
@@ -1173,9 +1266,13 @@ class HarborGtxPciePhy extends Module {
       inDetect < ltssmS.eq(ltssmQ) & ltssmS.getRange(2).eq(0),
     ], reset: rst);
 
-    final dlDown = (linkUp & ~hardUp).named('dl_down');
+    // The watchdog reads its own copy of `link_up`, so the logic near the hard
+    // block pins does not load the `link_up` flop.
+    final linkUpWd = Logic(name: 'link_up_wd');
+    Sequential(pclk, [linkUpWd < linkUp], reset: rst);
+    final dlDown = (linkUpWd & ~hardUp).named('dl_down');
     final training = (dlDown & ~phyUp).named('link_training');
-    final detectRestart = _watch(
+    final detect = _watch(
       pclk,
       rst,
       'detect',
@@ -1184,7 +1281,7 @@ class HarborGtxPciePhy extends Module {
       clear: ~training,
     );
     final l0 = (dlDown & phyUp).named('link_l0_dl_down');
-    final l0Restart = _watch(
+    final l0Watch = _watch(
       pclk,
       rst,
       'l0',
@@ -1192,21 +1289,21 @@ class HarborGtxPciePhy extends Module {
       run: l0,
       clear: ~l0,
     );
-    restart <= detectRestart | l0Restart;
+    restartPulse <= (detect.hit & detect.run) | (l0Watch.hit & l0Watch.run);
     final linkRetrains = Logic(name: 'link_retrains', width: 8);
+    final retrainsFull = Logic(name: 'link_retrains_full');
     Sequential(pclk, [
-      If(
-        restart & ~linkRetrains.and(),
-        then: [linkRetrains < linkRetrains + 1],
-      ),
+      retrainsFull < linkRetrains.and(),
+      If(wdQ & ~retrainsFull, then: [linkRetrains < linkRetrains + 1]),
     ], reset: rst);
     addOutput('link_retrains', width: 8) <= linkRetrains;
   }
 
   /// A timer that counts while [run] is high, holds while [run] and [clear]
-  /// are low, and goes to 0 while [clear] is high. The result is high on the
-  /// first cycle with [run] high after [bound] counted cycles.
-  static Logic _watch(
+  /// are low, and goes to 0 while [clear] is high. `hit` goes high a few
+  /// cycles after [bound] counted cycles and stays high until [clear]. The
+  /// inputs and the compare are flops. `run` is the registered copy of [run].
+  static ({Logic hit, Logic run}) _watch(
     Logic clk,
     Logic reset,
     String name,
@@ -1217,32 +1314,36 @@ class HarborGtxPciePhy extends Module {
     final w = bound.bitLength;
     final timer = Logic(name: '${name}_timer', width: w);
     final hit = Logic(name: '${name}_hit');
+    final eq = Logic(name: '${name}_eq');
+    final runQ = Logic(name: '${name}_run_q');
+    final clearQ = Logic(name: '${name}_clear_q');
+    final chunks = <Logic>[];
+    final value = bound > 3 ? bound - 3 : 0;
+    for (var lo = 0, i = 0; lo < w; lo += 5, i++) {
+      final hi = lo + 5 < w ? lo + 5 : w;
+      final q = Logic(name: '${name}_c$i');
+      final part = Const(
+        (value >> lo) & ((1 << (hi - lo)) - 1),
+        width: hi - lo,
+      );
+      Sequential(clk, [q < timer.slice(hi - 1, lo).eq(part)], reset: reset);
+      chunks.add(q);
+    }
     Sequential(clk, [
+      runQ < run,
+      clearQ < clear,
+      eq < chunks.reduce((a, b) => a & b),
       If(
-        clear,
+        clearQ,
         then: [timer < 0, hit < 0],
         orElse: [
-          If(
-            run & ~hit,
-            then: [
-              timer < timer + 1,
-              hit < timer.eq(Const(bound - 1, width: w)),
-            ],
-          ),
+          If(runQ & ~hit, then: [timer < timer + 1]),
+          If(runQ & eq, then: [hit < 1]),
         ],
       ),
     ], reset: reset);
-    return (hit & run).named('${name}_restart');
+    return (hit: hit, run: runQ);
   }
-
-  static const _rIdle = 0;
-  static const _rSwitch = 1;
-  static const _rWait = 2;
-  static const _rTake = 3;
-  static const _rBack = 4;
-  static const _rDone = 5;
-
-  static Logic _r(int v) => Const(v, width: 3);
 }
 
 /// Puts [stages] registers on [d], with no reset.
