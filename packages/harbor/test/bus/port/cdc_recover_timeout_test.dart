@@ -369,6 +369,51 @@ Future<void> _aliasAfterSecondReset() async {
   await b.end();
 }
 
+/// The write side of the same case. The B of write A is owed when the first
+/// give up comes. A second reset hits while write B is owed and write C
+/// waits. The crossing must not give up again. The late B of A and the B of
+/// B are dropped, and C is answered once. A write after that works.
+Future<void> _aliasWrite() async {
+  final b = await _Bench.start(_timeout);
+  b.set('bus_WREADY', 1);
+  final w1 = b.wdata(0x11);
+  await b.req(1, 1, 0x180);
+  await w1;
+  await b.until(() => b.aw.isNotEmpty);
+  await b.reset();
+  final w2 = b.wdata(0xcafe);
+  await b.req(2, 1, 0x300);
+  await w2;
+  await b.until(() => b.aw.length == 2);
+  must(b.aw.length, 2, reason: 'write after the first give up');
+  must(b.timeouts, 1);
+  await b.reset();
+  final w3 = b.wdata(0x77);
+  await b.req(3, 1, 0x400);
+  await w3;
+  await b.fall(_timeout * 4);
+  must(b.aw.length, 2, reason: 'no second give up while the old B is owed');
+  must(b.timeouts, 1);
+  await b.bResp(b.aw[0].id, err: 2);
+  await b.bResp(b.aw[1].id, err: 2);
+  await b.until(() => b.aw.length == 3);
+  must(b.aw.length, 3, reason: 'recover ends after the owed responses');
+  must(b.aw[2].addr, 0x400);
+  await b.bResp(b.aw[2].id);
+  await b.fall(20);
+  must(b.bGot, [(id: 3, err: 0)]);
+  must(b.timeouts, 1);
+  // The B path is not stuck: another write works.
+  final w4 = b.wdata(0x44);
+  await b.req(0, 1, 0x500);
+  await w4;
+  await b.until(() => b.aw.length == 4);
+  await b.bResp(b.aw[3].id);
+  await b.fall(20);
+  must(b.bGot, [(id: 3, err: 0), (id: 0, err: 0)]);
+  await b.end();
+}
+
 /// With no wait limit the crossing waits for the response for ever, and
 /// goes on when it comes.
 Future<void> _noLimit() async {
@@ -405,6 +450,10 @@ void main() {
   test(
     'no second give up while old responses are owed',
     () => isolated(_aliasAfterSecondReset),
+  );
+  test(
+    'no second give up while an old write response is owed',
+    () => isolated(_aliasWrite),
   );
   test('recoverTimeout 0 never gives up', () => isolated(_noLimit));
 
