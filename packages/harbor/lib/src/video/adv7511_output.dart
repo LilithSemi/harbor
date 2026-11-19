@@ -200,10 +200,10 @@ class HarborAdv7511PinStage extends Module {
 ///
 /// An MMCM makes the 2x clock from [source], which is the shared oscillator
 /// buffer of the SoC when it has one, with the form of the KC705
-/// probe: direct feedback and INTERNAL compensation. A flop on the 2x clock
-/// toggles each clock, and a BUFG puts the result on a clock net as the
-/// pixel clock. The pixel clock edge follows a 2x clock edge, so the two
-/// clocks keep a fixed phase. Each reset holds for a count of the source
+/// probe: direct feedback and INTERNAL compensation. CLKOUT0 is the 2x
+/// clock and CLKOUT1 is the pixel clock at twice the CLKOUT0 divide. Each
+/// goes through its own BUFG, so the two clocks come from one VCO with
+/// matched insertion delays. Each reset holds for a count of the source
 /// clock that is longer than the lock time, then leaves through two flops of
 /// its own clock.
 ///
@@ -211,6 +211,10 @@ class HarborAdv7511PinStage extends Module {
 class HarborAdv7511Clocks extends BridgeModule with HarborClockRateProvider {
   /// Rate of the 2x clock in Hz.
   final int clk2xHz;
+
+  /// Bits of the lock count that holds the resets, 2^(lockBits-1) clocks of
+  /// the source clock. The default holds 131072 clocks.
+  final int lockBits;
 
   /// True when [source] already comes from a BUFG that other MMCMs share.
   final bool sourceBuffered;
@@ -236,7 +240,7 @@ class HarborAdv7511Clocks extends BridgeModule with HarborClockRateProvider {
         final vco = sourceHz * m / d;
         if (vco < 600e6 || vco > 1440e6) continue;
         final o = vco / clk2xHz;
-        if (o != o.roundToDouble() || o < 1 || o > 128) continue;
+        if (o != o.roundToDouble() || o < 1 || o > 64) continue;
         final dist = (vco - 1100e6).abs();
         if (dist < bestDist) {
           bestDist = dist;
@@ -260,8 +264,18 @@ class HarborAdv7511Clocks extends BridgeModule with HarborClockRateProvider {
     required int sourceHz,
     required this.clk2xHz,
     this.sourceBuffered = false,
+    this.lockBits = 18,
+    Logic? simClk2x,
+    Logic? simPixelClk,
     super.name = 'adv7511_clocks',
-  }) : super('HarborAdv7511Clocks') {
+  }) : super(
+         'HarborAdv7511Clocks_${clk2xHz}_${sourceHz}_'
+         '${sourceBuffered ? 'b' : 'r'}_$lockBits'
+         '${simClk2x == null ? '' : '_sim'}',
+       ) {
+    if ((simClk2x == null) != (simPixelClk == null)) {
+      throw ArgumentError('give simClk2x and simPixelClk together');
+    }
     if (clk2xHz.isOdd) {
       throw ArgumentError.value(clk2xHz, 'clk2xHz', 'must be even');
     }
@@ -280,33 +294,48 @@ class HarborAdv7511Clocks extends BridgeModule with HarborClockRateProvider {
       src = srcBufg.output('O');
     }
 
-    final mmcm = XilinxMmcme2Adv(
-      clkfboutMult: sol.mult.toDouble(),
-      clkout0Divide: sol.out.toDouble(),
-      divclkDivide: sol.divclk.toDouble(),
-      clkinPeriod: 1e9 / sourceHz,
-      compensation: 'INTERNAL',
-      name: 'adv7511_mmcm',
-    );
-    addSubModule(mmcm);
-    mmcm.input('CLKIN1').srcConnection! <= src;
-    mmcm.input('CLKIN2').srcConnection! <= Const(0);
-    mmcm.input('CLKINSEL').srcConnection! <= Const(1);
-    mmcm.input('CLKFBIN').srcConnection! <= mmcm.output('CLKFBOUT');
-    mmcm.input('RST').srcConnection! <= Const(0);
-    mmcm.input('PWRDWN').srcConnection! <= Const(0);
-    final bufg = XilinxBufg(name: 'clk2x_bufg');
-    bufg.input('I').srcConnection! <= mmcm.output('CLKOUT0');
-    final clk = bufg.output('O').named('clk2x_net');
+    // CLKOUT1 divides the same VCO by twice the CLKOUT0 divide. Both outputs
+    // go through a BUFG of their own, so they keep matched insertion delays
+    // and the pixel edge falls on a 2x edge.
+    Logic clk;
+    Logic pixel;
+    if (simClk2x != null) {
+      clk = addInput('sim_clk2x', simClk2x).named('clk2x_net');
+      pixel = addInput('sim_pixel_clk', simPixelClk!).named('pixel_clk_net');
+    } else {
+      final mmcm = XilinxMmcme2Adv(
+        clkfboutMult: sol.mult.toDouble(),
+        clkout0Divide: sol.out.toDouble(),
+        clkout1Divide: 2 * sol.out,
+        divclkDivide: sol.divclk.toDouble(),
+        clkinPeriod: 1e9 / sourceHz,
+        compensation: 'INTERNAL',
+        name: 'adv7511_mmcm',
+      );
+      addSubModule(mmcm);
+      mmcm.input('CLKIN1').srcConnection! <= src;
+      mmcm.input('CLKIN2').srcConnection! <= Const(0);
+      mmcm.input('CLKINSEL').srcConnection! <= Const(1);
+      mmcm.input('CLKFBIN').srcConnection! <= mmcm.output('CLKFBOUT');
+      mmcm.input('RST').srcConnection! <= Const(0);
+      mmcm.input('PWRDWN').srcConnection! <= Const(0);
+      final bufg = XilinxBufg(name: 'clk2x_bufg');
+      bufg.input('I').srcConnection! <= mmcm.output('CLKOUT0');
+      clk = bufg.output('O').named('clk2x_net');
+      final pixelBufg = XilinxBufg(name: 'pixel_bufg');
+      pixelBufg.input('I').srcConnection! <= mmcm.output('CLKOUT1');
+      pixel = pixelBufg.output('O').named('pixel_clk_net');
+    }
     output('clk2x') <= clk;
+    output('pixel_clk') <= pixel;
 
     // LOCKED does not reach the fabric on openXC7, so a count of the source
     // clock holds the reset instead.
-    final hold = Logic(name: 'lock_count', width: 18);
+    final hold = Logic(name: 'lock_count', width: lockBits);
     Sequential(src, reset: reset, [
-      If(~hold[17], then: [hold < hold + 1]),
+      If(~hold[lockBits - 1], then: [hold < hold + 1]),
     ]);
-    final assertSrc = (reset | ~hold[17]).named('lock_hold');
+    final assertSrc = (reset | ~hold[lockBits - 1]).named('lock_hold');
 
     Logic retime(Logic domClk, String n) {
       final pipe = Logic(name: '${n}_pipe', width: 2);
@@ -318,12 +347,6 @@ class HarborAdv7511Clocks extends BridgeModule with HarborClockRateProvider {
 
     output('reset2x') <= retime(clk, 'reset2x');
 
-    final phase = Logic(name: 'phase');
-    Sequential(clk, reset: assertSrc, [phase < ~phase]);
-    final pixelBufg = XilinxBufg(name: 'pixel_bufg');
-    pixelBufg.input('I').srcConnection! <= phase;
-    final pixel = pixelBufg.output('O').named('pixel_clk_net');
-    output('pixel_clk') <= pixel;
     output('pixel_reset') <= retime(pixel, 'pixel_reset');
   }
 
