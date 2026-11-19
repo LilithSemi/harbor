@@ -44,6 +44,9 @@ HarborSoC _soc(List<HarborClockConfig> clocks, {String? fabric}) => HarborSoC(
   fabricClockDomain: fabric,
 );
 
+HarborUart _uart() =>
+    HarborUart(baseAddress: 0x10000000, busAddressWidth: 32, busDataWidth: 32);
+
 void main() {
   tearDown(() async => Simulator.reset());
 
@@ -55,13 +58,7 @@ void main() {
       ], fabric: 'bus');
       final bus = soc.clockDomain('bus')!;
       final cpu = soc.addMaster(_Cpu());
-      final uart = soc.addPeripheral(
-        HarborUart(
-          baseAddress: 0x10000000,
-          busAddressWidth: 32,
-          busDataWidth: 32,
-        ),
-      );
+      final uart = soc.addPeripheral(_uart());
       cpu.pullUp(soc);
       soc.buildFabric();
       expect(identical(soc.defaultClock.$1, bus.clk), isTrue);
@@ -73,7 +70,10 @@ void main() {
       );
       expect(soc.inputClockHzFor(null), 25000000);
       expect(soc.simClockOf(uart, 50000000), (port: 'bus_clk', hz: 25000000));
-      expect(soc.generateDts(), contains('clock-frequency = <25000000>'));
+      expect(
+        soc.generateDts(),
+        matches(RegExp(r'@10000000 \{[^}]*clock-frequency = <25000000>')),
+      );
     });
 
     test('a missing name throws at buildFabric and names it', () {
@@ -85,6 +85,53 @@ void main() {
             (e) => e.message,
             'message',
             contains('bus'),
+          ),
+        ),
+      );
+    });
+
+    test('a peripheral with no domain before the domain exists throws', () {
+      final soc = _soc([], fabric: 'bus');
+      expect(
+        () => soc.addPeripheral(_uart()),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('"bus"'),
+              contains('FabricDomainSoc'),
+              contains('before addPeripheral'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('a master with no domain follows the named domain', () {
+      final soc = _soc([
+        _clk('sys', 50000000),
+        _clk('bus', 25000000),
+      ], fabric: 'bus');
+      final cpu = soc.addMaster(_Cpu());
+      expect(
+        cpu.input('clk').srcConnection!.srcConnections,
+        contains(soc.clockDomain('bus')!.clk),
+      );
+    });
+
+    test('a net domain has no sim clock to report', () {
+      final soc = _soc([_clk('sys', 50000000)], fabric: 'bus');
+      final ext = soc.addInput('ext_clk', Logic());
+      soc.addClockDomainFromNet(_clk('bus', 25000000), ext);
+      final uart = soc.addPeripheral(_uart());
+      expect(
+        () => soc.simClockOf(uart, 50000000),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('"bus"'),
           ),
         ),
       );
@@ -103,13 +150,7 @@ void main() {
     test('sys wins over the first domain', () {
       final soc = _soc([_clk('first', 25000000), _clk('sys', 40000000)]);
       final sys = soc.clockDomain('sys')!;
-      final uart = soc.addPeripheral(
-        HarborUart(
-          baseAddress: 0x10000000,
-          busAddressWidth: 32,
-          busDataWidth: 32,
-        ),
-      );
+      final uart = soc.addPeripheral(_uart());
       expect(soc.domainFor(null), same(sys));
       expect(identical(soc.defaultClock.$1, sys.clk), isTrue);
       expect(soc.simClockOf(uart, 1).hz, 40000000);
@@ -118,13 +159,7 @@ void main() {
     test('the first domain wins when there is no sys', () {
       final soc = _soc([_clk('a', 25000000), _clk('b', 12500000)]);
       final a = soc.clockDomain('a')!;
-      final uart = soc.addPeripheral(
-        HarborUart(
-          baseAddress: 0x10000000,
-          busAddressWidth: 32,
-          busDataWidth: 32,
-        ),
-      );
+      final uart = soc.addPeripheral(_uart());
       expect(soc.domainFor(null), same(a));
       expect(identical(soc.defaultClock.$1, a.clk), isTrue);
       expect(soc.simClockOf(uart, 1).hz, 25000000);
@@ -150,17 +185,36 @@ void main() {
         ],
       );
       final sys = soc.clockDomain('sys')!;
-      final uart = soc.addPeripheral(
-        HarborUart(
-          baseAddress: 0x10000000,
-          busAddressWidth: 32,
-          busDataWidth: 32,
-        ),
-      );
+      final uart = soc.addPeripheral(_uart());
       expect(soc.domainFor(null), same(sys));
       expect(identical(soc.defaultClock.$1, sys.clk), isTrue);
-      // A hardware target has no sim port, so the model samples clk.
-      expect(soc.simClockOf(uart, 25000000).hz, 25000000);
+      expect(() => soc.simClockOf(uart, 25000000), throwsStateError);
+    });
+
+    test('a coClkos pair can name either output as the fabric', () {
+      HarborSoC pair(String fabric) => HarborSoC(
+        name: 'PairSoc',
+        compatible: 'test,pair',
+        target: HarborBoard.get('ulx3s-85f').fpgaTarget(pins: ['clk']),
+        fabricClockDomain: fabric,
+        clocks: [
+          const HarborClockConfig(
+            name: 'fast',
+            rate: HarborFixedClockRate(125000000),
+            sourceFrequency: 25000000,
+            coClkosSecondary: (
+              name: 'sys',
+              frequency: 62500000,
+              tolerancePpm: 0,
+            ),
+          ),
+        ],
+      );
+      final secondary = pair('sys');
+      expect(secondary.domainFor(null), same(secondary.clockDomain('sys')));
+      final primary = pair('fast');
+      expect(primary.domainFor(null), same(primary.clockDomain('fast')));
+      expect(primary.inputClockHzFor(null), 125000000);
     });
   });
 }

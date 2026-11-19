@@ -238,7 +238,7 @@ class HarborSoC extends BridgeModule {
     if (clockDomainName != null && _clockDomains.containsKey(clockDomainName)) {
       return _clockDomains[clockDomainName];
     }
-    if (_clockDomains.isEmpty) return null;
+    if (_clockDomains.isEmpty && fabricClockDomain == null) return null;
     return _fabricDomain;
   }
 
@@ -249,12 +249,14 @@ class HarborSoC extends BridgeModule {
   /// primary domain: when sys is a CLKOS secondary, those are different
   /// clocks. It is null when no domains exist.
   HarborClockDomain? get _fabricDomain {
-    final name = fabricClockDomain;
-    if (name != null) {
-      return _clockDomains[name] ??
+    final fabricName = fabricClockDomain;
+    if (fabricName != null) {
+      return _clockDomains[fabricName] ??
           (throw StateError(
-            '$name: fabricClockDomain "$name" is not a clock domain '
-            '(domains: ${_clockDomains.keys.join(', ')})',
+            'SoC "$name": the fabric clock domain "$fabricName" does not '
+            'exist (domains: ${_clockDomains.keys.join(', ')}). Add it with '
+            'addClockDomainFromNet or the clocks list before addPeripheral '
+            'or addMaster with no domain name, and before buildFabric.',
           ));
     }
     return _clockDomains['sys'] ?? _clockDomains.values.firstOrNull;
@@ -390,8 +392,11 @@ class HarborSoC extends BridgeModule {
 
   /// The name of the clock domain of the fabric, or null for the default.
   ///
-  /// The default is the sys domain, else the first domain. A name with no
-  /// domain throws at [buildFabric].
+  /// The default is the sys domain, else the first domain. The named domain
+  /// must exist before the first [addPeripheral] or [addMaster] with no domain
+  /// name, and before [buildFabric]. Otherwise they throw. Do not name one
+  /// output of a coClkos pair as the fabric while masters run on the other
+  /// output: phase-locked outputs break the async crossing.
   final String? fabricClockDomain;
 
   bool _fabricBuilt = false;
@@ -1128,14 +1133,25 @@ class HarborSoC extends BridgeModule {
     // A peripheral with no explicit domain is wired to [defaultClock], not the
     // primary input clock. [domainFor] gives the clock its bus runs on, which
     // is what a sim model must sample.
+    if (target is! HarborSimTarget) {
+      throw StateError('simClockOf is for a HarborSimTarget SoC only');
+    }
     final domain = domainFor(domainName);
     if (domain == null || domain.config.isPrimary) {
       return (port: 'clk', hz: primaryHz);
     }
-    // A domain with no port of its own IS the input clock (it runs at the
-    // source rate), so a model on it samples `clk`.
+    // A domain with no port of its own that runs on the input clock samples
+    // `clk`. A domain made from a net has no sim port to sample.
     final port = domain.simPort;
-    if (port == null) return (port: 'clk', hz: primaryHz);
+    if (port == null) {
+      if (!identical(domain.clk, _boardClk)) {
+        throw StateError(
+          'clock domain "${domain.config.name}" has no sim clock port: it '
+          'comes from a net, and a sim model cannot sample it',
+        );
+      }
+      return (port: 'clk', hz: primaryHz);
+    }
     return (port: port, hz: domain.config.frequency);
   }
 
