@@ -351,10 +351,12 @@ Future<void> _aliasAfterSecondReset() async {
   await b.fall(_timeout * 4);
   must(b.ar.length, 2, reason: 'no second give up while A is owed');
   must(b.timeouts, 1);
+  must(b.cdc.output('debug_giveup_held').value.toInt(), 1);
   await b.rResp(b.ar[0].id, 0xdead);
   await b.rResp(b.ar[1].id, 0xbad);
   await b.until(() => b.ar.length == 3);
   must(b.ar.length, 3, reason: 'recover ends after the owed responses');
+  must(b.cdc.output('debug_giveup_held').value.toInt(), 0);
   must(b.ar[2].addr, 0x300);
   await b.rResp(b.ar[2].id, 0xbeef);
   await b.fall(20);

@@ -422,7 +422,7 @@ class HarborMemoryMasterPort {
 
 /// Adds the debug outputs of [cdc] to [module] as plain outputs:
 /// `<prefix>_reads`, `<prefix>_writes`, `<prefix>_recover`, `<prefix>_empty`,
-/// `<prefix>_full`, `<prefix>_dropped` and `<prefix>_recover_timeouts`. See [HarborMemoryWaistCdc] for the
+/// `<prefix>_full`, `<prefix>_dropped`, `<prefix>_recover_timeouts` and `<prefix>_giveup_held`. See [HarborMemoryWaistCdc] for the
 /// fields. Without a crossing, the outputs are 0.
 void harborAddCdcDebug(
   BridgeModule module,
@@ -443,6 +443,7 @@ void harborAddCdcDebug(
       or0(cdc?.debugDropped, 16);
   module.addOutput('${prefix}_recover_timeouts', width: 8) <=
       or0(cdc?.debugRecoverTimeouts, 8);
+  module.addOutput('${prefix}_giveup_held') <= or0(cdc?.debugGiveupHeld, 1);
 }
 
 Axi4Interface _axi4(HarborMemoryWaistConfig config, {int? addressWidth}) =>

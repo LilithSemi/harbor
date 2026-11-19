@@ -109,6 +109,11 @@ class HarborMemoryWaistCdc extends Module {
   /// [slave] set.
   Logic get debugRecoverTimeouts => output('debug_recover_timeouts');
 
+  /// High while responses from before the last give up are still owed. The
+  /// fabric side does not give up again until they arrive. It is 0 with
+  /// [slave] set.
+  Logic get debugGiveupHeld => output('debug_giveup_held');
+
   HarborMemoryWaistCdc({
     required Logic fabricClk,
     required Logic fabricReset,
@@ -300,6 +305,7 @@ class HarborMemoryWaistCdc extends Module {
       addOutput('debug_recover') <= mode;
       addOutput('debug_dropped', width: 16) <= Const(0, width: 16);
       addOutput('debug_recover_timeouts', width: 8) <= Const(0, width: 8);
+      addOutput('debug_giveup_held') <= Const(0);
 
       up.reqReady <= ~reqF.wrFull & ~mode & rdQ.pushReady & wrQ.pushReady;
       reqFire <= up.reqValid & up.reqReady;
@@ -561,6 +567,7 @@ class HarborMemoryWaistCdc extends Module {
     // match the epoch after two flips.
     final goneR = Logic(name: 'gone_reads', width: cntW);
     final goneW = Logic(name: 'gone_writes', width: cntW);
+    addOutput('debug_giveup_held') <= nonZero(goneR) | nonZero(goneW);
     addOutput('debug_reads', width: cntW) <= outR;
     addOutput('debug_writes', width: cntW) <= outW;
     addOutput('debug_recover') <= mode;
