@@ -21,6 +21,16 @@ class HarborFabricClock {
   bool crossesFrom(Logic deviceClk) => !identical(clk, deviceClk);
 }
 
+final _crossedPorts = Expando<Set<String>>('crossedPorts');
+
+/// Records that the port [port] of [module] crosses to a fabric clock.
+void harborMarkCrossed(Module module, String port) =>
+    (_crossedPorts[module] ??= {}).add(port);
+
+/// The names of the ports of [module] that cross to a fabric clock.
+Set<String> harborCrossedPorts(Module module) =>
+    _crossedPorts[module] ?? const {};
+
 /// The default depth of a memory waist crossing: [outstanding] plus 2,
 /// rounded up to a power of two.
 int harborCdcDepth(int outstanding) {

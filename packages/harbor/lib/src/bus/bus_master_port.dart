@@ -122,6 +122,7 @@ class BusMasterPort {
     HarborFabricClock? fabricClock,
   }) {
     final crossed = fabricClock != null && fabricClock.crossesFrom(clk);
+    if (crossed) harborMarkCrossed(module, name);
     if (exclusive && kind != HarborFabricKind.axi4) {
       throw ArgumentError('$name: a ${kind.name} port has no exclusive access');
     }

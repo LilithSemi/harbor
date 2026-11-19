@@ -122,6 +122,7 @@ class HarborMemorySlavePort {
     }
     final waist = HarborMemoryWaist(config);
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
+      harborMarkCrossed(module, name);
       final inner = create(
         module: module,
         name: name,
@@ -333,6 +334,7 @@ class HarborMemoryMasterPort {
       });
     }
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
+      harborMarkCrossed(module, name);
       // The native port has one more ID bit, for the epoch of the crossing.
       final inner = create(
         module: module,
