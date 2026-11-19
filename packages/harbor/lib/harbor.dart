@@ -77,6 +77,8 @@ export 'src/soc/svd.dart';
 export 'src/soc/target.dart';
 
 // Video
+export 'src/video/adv7511_initializer.dart';
+export 'src/video/adv7511_output.dart';
 export 'src/video/alpha_blend.dart';
 export 'src/video/csc.dart';
 export 'src/video/display_output.dart';
