@@ -80,6 +80,17 @@ module RAMB36E1 #(
   wire [31:0] di_hi = DIBDI;
   localparam int LANES = X18 ? 2 : X36 ? 4 : 8;
 
+  // UG473 says to tie the address pins that a width does not use, and pin 15,
+  // to High.
+  localparam int LOW = X18 ? 4 : X36 ? 5 : 6;
+  localparam logic [15:0] UNUSED = 16'h8000 | ((16'h1 << LOW) - 1);
+  always @(posedge CLKARDCLK)
+    if ((ADDRARDADDR & UNUSED) !== UNUSED)
+      $fatal(1, "unused ADDRARDADDR pins must be High: %h", ADDRARDADDR);
+  always @(posedge CLKBWRCLK)
+    if ((ADDRBWRADDR & UNUSED) !== UNUSED)
+      $fatal(1, "unused ADDRBWRADDR pins must be High: %h", ADDRBWRADDR);
+
   always @(posedge wclk) begin
     if (RSTRAMARSTRAM || RSTRAMB) $fatal(1, "RSTRAM is not modelled");
     if (!S72 && WEBWE != 0) $fatal(1, "port B must not write");

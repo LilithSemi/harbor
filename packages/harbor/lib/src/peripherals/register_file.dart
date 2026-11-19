@@ -743,13 +743,13 @@ class HarborRegisterFile extends BridgeModule {
     }
 
     // A RAMB36E1 in SDP72 mode has 512 words, with the word-address field in
-    // ADDR[14:6]. Keep the low six pins zero; the packer ties pin 15 high.
+    // ADDR[14:6]. Tie the unused pins high.
     const blockBits = 9;
     final depthBlocks = _depthBlocks(blockBits);
     Logic toAd(Logic a) => [
-      Const(0, width: 1),
+      Const(1, width: 1),
       _blockAddr(a, blockBits, blockBits),
-      Const(0, width: 6),
+      Const(63, width: 6),
     ].concat().getRange(0, 16);
 
     final wrAd = toAd(wrAddr);
@@ -851,9 +851,9 @@ class HarborRegisterFile extends BridgeModule {
     final widthBlocks = (dataWidth + blockDataWidth - 1) ~/ blockDataWidth;
     final depthBlocks = _depthBlocks(blockBits);
     Logic toAd(Logic a) => [
-      Const(0, width: 1),
+      Const(1, width: 1),
       _blockAddr(a, blockBits, blockBits),
-      Const(0, width: 4),
+      Const(15, width: 4),
     ].concat().getRange(0, 16);
     final wrAd = toAd(wrAddr);
 
@@ -950,9 +950,9 @@ class HarborRegisterFile extends BridgeModule {
     const blockBits = 10;
     final depthBlocks = _depthBlocks(blockBits);
     Logic toAd(Logic a) => [
-      Const(0, width: 1),
+      Const(1, width: 1),
       _blockAddr(a, blockBits, blockBits),
-      Const(0, width: 5),
+      Const(31, width: 5),
     ].concat().getRange(0, 16);
     final wrAd = toAd(wrAddr);
 
