@@ -397,8 +397,10 @@ Future<void> _smallRegion(HarborFabricTopology t, int dw) async {
     b.wr(2, _liteBase + 3 * w, 7, burst: 2),
     b.wr(3, _liteBase, 7),
     b.wr(0, _liteBase + 2 * w, 3, burst: 2),
+    b.wr(1, _liteBase + 2 * w + 2, 3, size: 1),
   ];
   final bad = [
+    b.wr(3, _liteBase + size - 2, 3, size: 1),
     b.wr(1, _liteBase + 6 * w, 3),
     b.wr(2, _liteBase + 8 * w - w, 1),
     b.wr(3, _liteBase + 4 * w, 15, burst: 2),
@@ -421,6 +423,28 @@ Future<void> _smallRegion(HarborFabricTopology t, int dw) async {
   must(b.l.arOrder.length, good.fold<int>(0, (n, x) => n + x.beats));
 }
 
+// A WRAP burst of 2-byte beats wraps inside its 8 byte window.
+Future<void> _narrowWrap(HarborFabricTopology t, int dw) async {
+  final b = await _Bench.start(t, dw);
+  final fill = b.wr(2, _liteBase, 3);
+  final wrap = b.wr(0, _liteBase + 0xc, 3, burst: 2, size: 1);
+  b.m.write(fill);
+  await b.drain();
+  b.m.write(wrap);
+  await b.drain();
+  b.m.read(b.rd(1, _liteBase + 0xc, 3, burst: 2, size: 1));
+  await b.drain();
+  await b.sim.stop();
+  must(b.errors, isEmpty);
+  must(b.check([fill, wrap]).take(20).toList(), isEmpty);
+  must(b.l.awOrder.map((x) => x.addr).skip(4).toList(), [
+    _liteBase + 0xc,
+    _liteBase + 0xe,
+    _liteBase + 0x8,
+    _liteBase + 0xa,
+  ]);
+}
+
 void main() {
   const long = Timeout(Duration(minutes: 5));
   for (final t in HarborFabricTopology.values) {
@@ -439,6 +463,11 @@ void main() {
         test(
           'a narrow burst runs as single beats',
           () => isolated(() => _narrow(t, dw)),
+          timeout: long,
+        );
+        test(
+          'a narrow WRAP burst wraps by SIZE',
+          () => isolated(() => _narrowWrap(t, dw)),
           timeout: long,
         );
         test(

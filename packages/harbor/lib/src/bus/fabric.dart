@@ -567,6 +567,8 @@ abstract final class HarborFabric {
   /// - A region of 4 KB or more starts and ends on a 4 KB boundary, so an
   ///   AXI4 burst never leaves it. A smaller region is a power of two in
   ///   size and starts on a multiple of its size.
+  /// - On AXI4, a region holds at least one data word, so a write strobe
+  ///   never falls outside the bits of the slave address.
   /// - On Wishbone, a memory slave region holds at least one burst block of
   ///   [wishboneBurstBeats] beats and starts on a block boundary, so the pad
   ///   beats of a burst never leave the region.
@@ -587,6 +589,12 @@ abstract final class HarborFabric {
       }
       if (BigInt.from(r.start) + BigInt.from(r.size) > top) {
         errors.add('${s.name}: $r is outside $addressWidth address bits');
+      }
+      if (kind == HarborFabricKind.axi4 && r.size < dataWidth ~/ 8) {
+        errors.add(
+          '${s.name}: $r is smaller than the ${dataWidth ~/ 8} byte AXI4 '
+          'data word',
+        );
       }
       if (r.size >= 0x1000) {
         if (r.start % 0x1000 != 0 || r.size % 0x1000 != 0) {

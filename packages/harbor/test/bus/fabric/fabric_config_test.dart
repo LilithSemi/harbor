@@ -296,6 +296,26 @@ void main() {
   });
 
   group('build', () {
+    test('rejects an AXI4 region smaller than the data word', () {
+      final small = [_slave('a', 0x1000, 2)];
+      expect(
+        () => _build(slaves: small),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.message.toString(),
+            'message',
+            allOf(contains('a:'), contains('smaller than the 4 byte')),
+          ),
+        ),
+      );
+      expect(
+        _check([
+          _slave('a', 0x1000, 2, memory: false),
+        ], kind: HarborFabricKind.wishbone),
+        isEmpty,
+      );
+    });
+
     test('rejects a bad map', () {
       expect(
         () => _build(

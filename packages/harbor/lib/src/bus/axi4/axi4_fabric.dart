@@ -206,7 +206,9 @@ class _Tracker {
 ///   An error response goes back on its own beat. A narrow access runs as a
 ///   full word access, and its write strobes keep only the lanes that SIZE
 ///   and the address allow. A WRAP burst that is not 2, 4, 8 or 16 beats, or
-///   the reserved burst type, gets SLVERR on every beat.
+///   the reserved burst type, gets SLVERR on every beat. A narrow burst reads
+///   the slave word once per beat, so a FIFO register pops once per beat. A
+///   native AXI4-Lite slave must ignore the address bits below the bus width.
 ///
 /// Decode uses the start address of a burst only. A full AXI4 slave must
 /// accept any burst that starts in its region, so a full slave region under
