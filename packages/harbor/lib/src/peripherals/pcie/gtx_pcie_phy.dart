@@ -899,8 +899,12 @@ class HarborGtxPciePhy extends Module {
     doneFlop(_S.clockLock, 'clock_lock', clockOk & settled);
     doneFlop(_S.resetDone, 'reset_done', resetDoneOk);
     doneFlop(_S.txDlySReset, 'dlysreset', dlySDoneRise & dlySReset);
-    doneFlop(_S.txPhInit, 'phinit', phInitDoneRise);
-    final phAlignDone = doneFlop(_S.txPhAlign, 'phalign', phAlignDoneRise);
+    doneFlop(_S.txPhInit, 'phinit', phInitDoneRise & st[_S.txPhInit]!);
+    final phAlignDone = doneFlop(
+      _S.txPhAlign,
+      'phalign',
+      phAlignDoneRise & (st[_S.txPhAlign]! | st[_S.txDlyEn]!),
+    );
     done[_S.txDlyEn] = phAlignDone;
     if (debugSkipTxPhaseAlign) {
       done[_S.idle] = Const(0);
