@@ -4,7 +4,9 @@
 // configurations: commit 655ca67 for the fabric shells with the grant cap
 // off, and commit 122c86f for the SoCs, which have the default grant cap.
 // The Wishbone SoC hash moved when the grant cap learned to take the grant
-// from an idle owner, which is not a real-time change.
+// from an idle owner, which is not a real-time change. All hashes moved
+// when the fabric started to count the slaves that a bus timeout cut off,
+// which is not a real-time change.
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
@@ -153,15 +155,15 @@ Future<String> _soc(HarborFabricKind kind) async {
 
 void main() {
   const golden = <String, (int, int)>{
-    'axi4_crossbar': (-1289824076368411166, 778927),
-    'axi4_shared': (-7900584569341212455, 759468),
-    'soc_axi4': (6451994755986780406, 719575),
-    'soc_tilelink': (-20490596120018683, 671334),
-    'soc_wishbone': (4450380808038980455, 535597),
-    'tl_crossbar': (-6055400673713627179, 149394),
-    'tl_shared': (3339608990310352046, 307715),
-    'wb_crossbar': (8735552845619675350, 32986),
-    'wb_shared': (7679619553882137748, 32948),
+    'axi4_crossbar': (3280062545294442785, 779215),
+    'axi4_shared': (-8631706365240976922, 759756),
+    'soc_axi4': (-759004141521954637, 723493),
+    'soc_tilelink': (-4122436125043858959, 671414),
+    'soc_wishbone': (4689187175172827120, 535823),
+    'tl_crossbar': (-5608642720268730264, 149685),
+    'tl_shared': (171527483369796812, 308006),
+    'wb_crossbar': (-3765011429854336056, 33613),
+    'wb_shared': (-1007195441028053844, 33574),
   };
   for (final t in HarborFabricTopology.values) {
     test('axi4 ${t.name}: SV equals the SV before real-time QoS', () async {
