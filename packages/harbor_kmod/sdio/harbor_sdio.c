@@ -19,10 +19,12 @@
  * engine gates the SD clock while a word waits, so it is the only correct path
  * for a block transfer.
  *
- * Commands are polled. The controller holds STATUS.BUSY from the command until
- * the end of the data phase, so one wait covers the whole request. The MMC core
- * calls ->request from a context that may sleep (the block queue sets
- * BLK_MQ_F_BLOCKING), so the poll sleeps rather than spins.
+ * The controller holds STATUS.BUSY from the command until the end of the data
+ * phase, so one wait covers the whole request. The MMC core calls ->request
+ * from a context that may sleep (the block queue sets BLK_MQ_F_BLOCKING). With
+ * an interrupt, ->request sleeps until the interrupt of the last event, then
+ * reads STATUS.BUSY. Without one, it polls STATUS.BUSY with a sleep between
+ * reads.
  */
 
 #include <linux/module.h>
@@ -32,6 +34,10 @@
 #include <linux/mmc/mmc.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/interrupt.h>
+#include <linux/completion.h>
+#include <linux/spinlock.h>
+#include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/of.h>
 #include <linux/clk.h>
@@ -106,6 +112,19 @@
 #define HARBOR_SD_INT_ALL	  GENMASK(11, 0)
 
 /*
+ * The interrupts that end the wait. A data CRC error or a data timeout is
+ * always followed by data done or an ADMA error, so they do not wake the wait.
+ * The end of the busy of an R1b response sets no bit, so cmd-done is followed
+ * by a poll of STATUS.BUSY.
+ */
+#define HARBOR_SD_WAKE_CMD                                                     \
+	(HARBOR_SD_INT_CMD_DONE | HARBOR_SD_INT_CMD_TIMEOUT |                  \
+	 HARBOR_SD_INT_RESP_ERR)
+#define HARBOR_SD_WAKE_DATA                                                    \
+	(HARBOR_SD_INT_DATA_DONE | HARBOR_SD_INT_ADMA_ERR |                    \
+	 HARBOR_SD_INT_CMD_TIMEOUT | HARBOR_SD_INT_RESP_ERR)
+
+/*
  * ADMA descriptor: two 32-bit words, [buffer address], [byte length in [15:0],
  * end flag in [31]]. The engine walks the table until it retires a descriptor
  * with the end flag set. It moves whole 32-bit words, so both the address and
@@ -130,6 +149,11 @@ struct harbor_sd_desc {
 #define HARBOR_SD_DATA_TIMEOUT_US 5000000
 /* No data transfer or busy wait is allowed to hold the host for longer. */
 #define HARBOR_SD_MAX_WAIT_US	  60000000
+/*
+ * A command without data ends in about 250 SD clocks, 10 us at 25 MHz. That is
+ * less than an interrupt costs, so spin for it first.
+ */
+#define HARBOR_SD_CMD_SPIN_US	  20
 
 /* CLK_DIV counts full SD periods, so the divider is freq/(2*rate) - 1. */
 #define HARBOR_SD_CLK_DIV_MAX 65535
@@ -144,6 +168,11 @@ struct harbor_sd {
 	struct harbor_sd_desc *desc; /* descriptor table (coherent) */
 	dma_addr_t desc_dma;
 	struct dentry *dbg;
+	int irq;		/* 0 when the driver polls */
+	spinlock_t lock;	/* protects ist and wake */
+	u32 ist;		/* INT_STATUS bits that the handler cleared */
+	u32 wake;		/* the INT_ENABLE value in force */
+	struct completion done;
 };
 
 static void harbor_sd_write_ctrl(struct harbor_sd *hs, u32 ctrl)
@@ -298,12 +327,79 @@ static int harbor_sd_dat_reset(struct harbor_sd *hs)
 	return ret;
 }
 
+static irqreturn_t harbor_sd_irq(int irq, void *dev_id)
+{
+	struct harbor_sd *hs = dev_id;
+	u32 ist;
+
+	spin_lock(&hs->lock);
+	ist = readl(hs->base + HARBOR_SD_INT_STATUS);
+	if (!(ist & hs->wake)) {
+		spin_unlock(&hs->lock);
+		return IRQ_NONE;
+	}
+	writel(ist, hs->base + HARBOR_SD_INT_STATUS);
+	hs->ist |= ist;
+	spin_unlock(&hs->lock);
+
+	complete(&hs->done);
+	return IRQ_HANDLED;
+}
+
+static void harbor_sd_set_wake(struct harbor_sd *hs, u32 wake)
+{
+	spin_lock_irq(&hs->lock);
+	hs->wake = wake;
+	writel(wake, hs->base + HARBOR_SD_INT_ENABLE);
+	spin_unlock_irq(&hs->lock);
+}
+
+/*
+ * Wait for STATUS.BUSY to clear. The interrupt is enabled only for the sleep,
+ * so a command that the spin sees end takes no interrupt. The interrupt is a
+ * level, so a bit that sets before INT_ENABLE is written still raises it.
+ */
+static int harbor_sd_wait(struct harbor_sd *hs, u32 wake, u64 timeout_us)
+{
+	ktime_t deadline = ktime_add_us(ktime_get(), timeout_us);
+	s64 left;
+	u32 sts;
+
+	if (!hs->irq)
+		return readl_poll_timeout(hs->base + HARBOR_SD_STATUS, sts,
+					  !(sts & HARBOR_SD_ST_BUSY), 10,
+					  timeout_us);
+
+	if (wake == HARBOR_SD_WAKE_CMD &&
+	    !readl_poll_timeout_atomic(hs->base + HARBOR_SD_STATUS, sts,
+				       !(sts & HARBOR_SD_ST_BUSY), 1,
+				       HARBOR_SD_CMD_SPIN_US))
+		return 0;
+
+	harbor_sd_set_wake(hs, wake);
+	wait_for_completion_timeout(&hs->done, usecs_to_jiffies(timeout_us));
+	harbor_sd_set_wake(hs, 0);
+
+	/*
+	 * After the interrupt, BUSY can stay set for the busy of an R1b, for
+	 * the rest of a transfer that had an ADMA error, or for an ADMA access
+	 * still in flight.
+	 */
+	left = ktime_us_delta(deadline, ktime_get());
+	if (left <= 0)
+		return (readl(hs->base + HARBOR_SD_STATUS) & HARBOR_SD_ST_BUSY) ?
+			       -ETIMEDOUT :
+			       0;
+	return readl_poll_timeout(hs->base + HARBOR_SD_STATUS, sts,
+				  !(sts & HARBOR_SD_ST_BUSY), 10, left);
+}
+
 /* Issue one command, and its data phase when it has one. */
 static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 			      struct mmc_data *data)
 {
 	u64 timeout_us;
-	u32 val, ist, sts;
+	u32 val, ist;
 	int ret;
 
 	val = (cmd->opcode & HARBOR_SD_CMD_INDEX) |
@@ -347,13 +443,18 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 	 * Clear the latched status first. Without this the timeout and error
 	 * checks below would report a previous command's result.
 	 */
+	spin_lock_irq(&hs->lock);
+	hs->ist = 0;
 	writel(HARBOR_SD_INT_ALL, hs->base + HARBOR_SD_INT_STATUS);
+	spin_unlock_irq(&hs->lock);
+	reinit_completion(&hs->done);
+
 	writel(cmd->arg, hs->base + HARBOR_SD_CMD_ARG);
 	writel(val, hs->base + HARBOR_SD_CMD);
 
 	/* BUSY covers the command and, when present, the whole data phase. */
-	ret = readl_poll_timeout(hs->base + HARBOR_SD_STATUS, sts,
-				 !(sts & HARBOR_SD_ST_BUSY), 10, timeout_us);
+	ret = harbor_sd_wait(hs, data ? HARBOR_SD_WAKE_DATA : HARBOR_SD_WAKE_CMD,
+			     timeout_us);
 	if (ret) {
 		cmd->error = -ETIMEDOUT;
 		if (data)
@@ -362,8 +463,11 @@ static void harbor_sd_run_cmd(struct harbor_sd *hs, struct mmc_command *cmd,
 		return;
 	}
 
-	ist = readl(hs->base + HARBOR_SD_INT_STATUS);
+	spin_lock_irq(&hs->lock);
+	ist = readl(hs->base + HARBOR_SD_INT_STATUS) | hs->ist;
 	writel(HARBOR_SD_INT_ALL, hs->base + HARBOR_SD_INT_STATUS);
+	hs->ist = 0;
+	spin_unlock_irq(&hs->lock);
 
 	if (ist & HARBOR_SD_INT_CMD_TIMEOUT) {
 		cmd->error = -ETIMEDOUT;
@@ -642,22 +746,43 @@ static int harbor_sd_probe(struct platform_device *pdev)
 	    (unsigned int)HARBOR_SD_MAX_SEGS *HARBOR_SD_DESC_MAX_LEN,
 	    (unsigned int)HARBOR_SD_MAX_BLK_SIZE *HARBOR_SD_MAX_BLK_COUNT);
 
-	/* Poll the transfer, so leave the interrupt line masked. */
+	/* A request enables the interrupt only while it sleeps. */
 	writel(0, hs->base + HARBOR_SD_INT_ENABLE);
 	writel(HARBOR_SD_INT_ALL, hs->base + HARBOR_SD_INT_STATUS);
 	harbor_sd_write_ctrl(hs, HARBOR_SD_CTRL_ENABLE);
+
+	spin_lock_init(&hs->lock);
+	init_completion(&hs->done);
+
+	/* Without an interrupt the driver polls. */
+	hs->irq = platform_get_irq_optional(pdev, 0);
+	if (hs->irq == -ENXIO) {
+		hs->irq = 0;
+	} else if (hs->irq < 0) {
+		ret = hs->irq;
+		goto err_free_dma;
+	} else {
+		ret = request_irq(hs->irq, harbor_sd_irq, 0, dev_name(dev), hs);
+		if (ret) {
+			dev_err(dev, "cannot request irq %d: %d\n", hs->irq, ret);
+			goto err_free_dma;
+		}
+	}
 
 	platform_set_drvdata(pdev, hs);
 
 	ret = mmc_add_host(mmc);
 	if (ret)
-		goto err_free_dma;
+		goto err_free_irq;
 
 	hs->dbg = debugfs_create_dir(dev_name(dev), harbor_sd_debugfs);
 	debugfs_create_file("regs", 0444, hs->dbg, hs, &harbor_sd_regs_fops);
 
 	return 0;
 
+err_free_irq:
+	if (hs->irq)
+		free_irq(hs->irq, hs);
 err_free_dma:
 	dma_free_coherent(dev, HARBOR_SD_MAX_SEGS * sizeof(*hs->desc), hs->desc,
 			  hs->desc_dma);
@@ -672,6 +797,8 @@ static void harbor_sd_remove(struct platform_device *pdev)
 
 	debugfs_remove_recursive(hs->dbg);
 	mmc_remove_host(hs->mmc);
+	if (hs->irq)
+		free_irq(hs->irq, hs);
 	harbor_sd_write_ctrl(hs, 0);
 	dma_free_coherent(hs->dev, HARBOR_SD_MAX_SEGS * sizeof(*hs->desc),
 			  hs->desc, hs->desc_dma);
