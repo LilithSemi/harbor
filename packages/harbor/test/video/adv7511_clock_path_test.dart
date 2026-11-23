@@ -56,7 +56,7 @@ void main() {
   tearDown(() async => Simulator.reset());
 
   test(
-    'resets release, the pin clock has a 50% duty, data changes at its rise',
+    'resets release, data settles before each rising pin-clock edge',
     () async {
       final top = _Top(SimpleClockGenerator(4).clk);
       await top.build();
@@ -103,21 +103,21 @@ void main() {
       expect(rstPix.sublist(relPix).every((v) => v == 0), isTrue);
 
       // After the release the pin clock toggles on every 2x clock.
-      final start = clk.indexOf(1, relPix);
+      final start = clk.indexOf(1, relPix + 10);
       expect(start, isNot(-1));
       for (var i = start; i < clk.length - 1; i++) {
         expect(clk[i + 1], 1 - clk[i], reason: 'pin_clk at $i');
       }
 
-      // The bus changes only in a 2x cycle where the pin clock rose, and each
-      // rise has at most one change, because a change needs a new pixel.
+      // Data launches on the falling pin-clock edge. The next 2x edge raises
+      // the pin clock, leaving half a pixel period for ADV7511 setup time.
       var changes = 0;
       for (var i = start + 1; i < clk.length; i++) {
         expect(bus[i], isNot(-1), reason: 'bus at $i');
         if (bus[i] != bus[i - 1]) {
           changes++;
-          expect(clk[i], 1, reason: 'change at $i');
-          expect(clk[i - 1], 0, reason: 'change at $i');
+          expect(clk[i], 0, reason: 'change at $i');
+          expect(clk[i - 1], 1, reason: 'change at $i');
         }
       }
       expect(changes, greaterThan(50));
@@ -130,6 +130,9 @@ void main() {
       expect(rises.length, greaterThan(100));
       for (var i = 1; i < rises.length; i++) {
         expect(rises[i] - rises[i - 1], 2);
+      }
+      for (final rise in rises) {
+        expect(bus[rise], bus[rise - 1], reason: 'setup before rise $rise');
       }
     },
   );

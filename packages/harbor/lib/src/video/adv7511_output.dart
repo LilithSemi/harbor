@@ -145,8 +145,9 @@ class HarborYcbcr422Converter extends Module {
 ///
 /// It reads [tog] of the converter to find the first 2x clock after each
 /// pixel clock edge. At that clock the pins take the new pixel and [clkOut]
-/// goes high. The next clock sets it low. The pin clock has the pixel rate,
-/// and each data change lines up with its rising edge.
+/// goes low. The next clock sets it high. The ADV7511 captures on the rising
+/// edge, so the data has half a pixel period of setup time. The pin clock has
+/// the pixel rate.
 class HarborAdv7511PinStage extends Module {
   Logic get d => output('pin_d');
   Logic get de => output('pin_de');
@@ -191,7 +192,7 @@ class HarborAdv7511PinStage extends Module {
     output('pin_de') <= take(de);
     output('pin_hsync') <= take(hsync, resetValue: hsyncPositive ? 0 : 1);
     output('pin_vsync') <= take(vsync, resetValue: vsyncPositive ? 0 : 1);
-    output('pin_clk') <= flop(clk2x, fresh, reset: reset);
+    output('pin_clk') <= flop(clk2x, ~fresh, reset: reset);
   }
 }
 
