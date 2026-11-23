@@ -312,13 +312,16 @@ class HarborSoC extends BridgeModule {
   // to it.
   late final Logic _hardReset;
 
-  // The reset pin or the power-on reset, before a reset request.
-  late final Logic _boardReset;
+  late final Logic _hardResetSync;
 
-  /// The reset pin or the power-on reset, without the reset request and the
-  /// soft reset. A module that makes the reset request takes this reset, so
-  /// that its request does not clear itself.
-  Logic get hardReset => _boardReset;
+  /// The reset pin or the power-on reset on [boardClk], without the reset
+  /// request and the soft reset. It asserts at once and releases after two
+  /// board clocks.
+  Logic get hardReset => _hardResetSync;
+
+  /// The minimum number of [boardClk] cycles that a reset request holds the
+  /// SoC in reset.
+  static const int resetRequestHoldCycles = 1024;
 
   // The reset of everything on the SoC, with the soft reset request.
   late final Logic _systemReset;
@@ -466,8 +469,11 @@ class HarborSoC extends BridgeModule {
   /// Accepts an optional list of [clocks] to generate PLL-derived
   /// clock domains. If empty, the external `clk` input is used directly.
   ///
-  /// A high [resetRequest] resets the full SoC, as the reset pin does. Drive
-  /// it from a module that takes [hardReset] as its reset.
+  /// A high [resetRequest] resets the logic of every clock domain, as the
+  /// reset pin does. The SoC samples it on [boardClk], so it must be high at
+  /// a board clock edge. The reset then holds for at least
+  /// [resetRequestHoldCycles] board clocks after it goes low. The PLLs and
+  /// MMCMs keep running.
   HarborSoC({
     required String name,
     required this.compatible,
@@ -550,10 +556,40 @@ class HarborSoC extends BridgeModule {
     } else {
       resetSignal = input('reset');
     }
-    _boardReset = resetSignal;
-    // A module in the SoC can reset the full SoC, clock generator included.
+    final boardReset = resetSignal;
+    final hardSync = [
+      Logic(name: 'hardResetSync1'),
+      Logic(name: 'hardResetSync2'),
+    ];
+    Sequential(
+      _boardClk,
+      [hardSync[0] < 0, hardSync[1] < hardSync[0]],
+      reset: boardReset,
+      resetValues: {hardSync[0]: 1, hardSync[1]: 1},
+      asyncReset: true,
+    );
+    _hardResetSync = hardSync[1].named('hardReset');
+    // A module in the SoC can reset the logic of every domain. The request
+    // is stretched here, and only the pin or the power-on reset clears the
+    // stretch, so a request that its own reset clears still holds.
     if (resetRequest != null) {
-      resetSignal = (resetSignal | resetRequest).named('systemResetRequest');
+      final requestQ = Logic(name: 'resetRequestQ');
+      final hold = Logic(name: 'resetRequestHold');
+      final left = Logic(
+        name: 'resetRequestLeft',
+        width: (resetRequestHoldCycles - 1).bitLength,
+      );
+      Sequential(_boardClk, reset: _hardResetSync, [
+        requestQ < resetRequest,
+        If(
+          requestQ,
+          then: [left < resetRequestHoldCycles - 1, hold < 1],
+          orElse: [
+            If(left.neq(0), then: [left < left - 1], orElse: [hold < 0]),
+          ],
+        ),
+      ]);
+      resetSignal = (resetSignal | hold).named('systemResetRequest');
     }
     _hardReset = resetSignal;
     if (softReset) {
