@@ -1920,8 +1920,11 @@ class Ddr3Controller extends Module {
                         dqsStartIndexRepeat + 1,
                         Const(0, width: 1),
                       ),
+                  // The counter holds the earlier matches only. The current
+                  // start index must also match before calibration continues.
                   If(
-                    dqsStartIndexRepeat.eq(_repeatDqsAnalyze),
+                    dqsStartIndex.eq(dqsStartIndexStored) &
+                        dqsStartIndexRepeat.eq(_repeatDqsAnalyze),
                     then: [
                       initialDqs < Const(0),
                       dqsStartIndexRepeat < Const(0),
