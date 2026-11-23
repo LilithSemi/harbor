@@ -32,6 +32,11 @@ class HarborPcieEndpointConfig {
   /// Number of MSI vectors the endpoint asks for: 1, 2, 4 or 8.
   final int msiVectors;
 
+  /// The minimum time in nanoseconds from one accepted MSI to the next. 0
+  /// sets no minimum. Causes that come during the gap stay pending and go
+  /// out in the next MSI, so a held cause cannot flood the host.
+  final int minMsiIntervalNs;
+
   const HarborPcieEndpointConfig({
     this.vendorId = 0x10ee,
     this.deviceId = 0x7203,
@@ -45,7 +50,31 @@ class HarborPcieEndpointConfig {
     this.packetMemoryEntries = 2048,
     this.bar2Bytes = 0,
     this.msiVectors = 1,
+    this.minMsiIntervalNs = 1000000,
   });
+
+  /// [minMsiIntervalNs] in cycles of a [userClkHz] clock, rounded up.
+  /// Throws an [ArgumentError] when it is negative or does not fit the gap
+  /// counter of [HarborPcieInterrupt].
+  int minMsiCycles(int userClkHz) {
+    if (minMsiIntervalNs < 0) {
+      throw ArgumentError.value(
+        minMsiIntervalNs,
+        'minMsiIntervalNs',
+        'must not be negative',
+      );
+    }
+    final cycles = (minMsiIntervalNs * userClkHz + 999999999) ~/ 1000000000;
+    if (cycles > HarborPcieInterrupt.maxMinMsiCycles) {
+      throw ArgumentError.value(
+        minMsiIntervalNs,
+        'minMsiIntervalNs',
+        'is $cycles cycles at $userClkHz Hz, more than the '
+            '${HarborPcieInterrupt.maxMinMsiCycles} the gap counter holds',
+      );
+    }
+    return cycles;
+  }
 }
 
 /// PCIe physical endpoint with 64-bit AXI transmit and receive streams.
@@ -400,9 +429,7 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
       busMasterEnable: hardBlock.output('CFGCOMMANDBUSMASTERENABLE'),
       interruptDisable: hardBlock.output('CFGCOMMANDINTERRUPTDISABLE'),
       interruptRdyN: hardBlock.output('CFGINTERRUPTRDYN'),
-      // Send at most one MSI each millisecond, so that a held cause cannot
-      // flood the host.
-      minMsiCycles: (phy.userClkHz + 999) ~/ 1000,
+      minMsiCycles: config.minMsiCycles(phy.userClkHz),
     );
     interruptN <= interrupt.interruptN;
     interruptDi <= interrupt.interruptDi;

@@ -8,6 +8,9 @@ import 'package:rohd/rohd.dart';
 /// [minMsiCycles] sets the minimum gap after each accepted MSI. Edges during
 /// the gap stay pending, with repeated edges of one vector combined.
 class HarborPcieInterrupt extends Module {
+  /// The largest [minMsiCycles] the gap counter holds.
+  static const int maxMinMsiCycles = (1 << 24) - 1;
+
   Logic get interruptN => output('interrupt_n');
   Logic get interruptDi => output('interrupt_di');
   Logic get interruptAssertN => output('interrupt_assert_n');
@@ -25,8 +28,12 @@ class HarborPcieInterrupt extends Module {
     int minMsiCycles = 0,
     super.name = 'pcie_interrupt',
   }) : super(definitionName: 'HarborPcieInterrupt') {
-    if (minMsiCycles < 0) {
-      throw ArgumentError.value(minMsiCycles, 'minMsiCycles');
+    if (minMsiCycles < 0 || minMsiCycles > maxMinMsiCycles) {
+      throw ArgumentError.value(
+        minMsiCycles,
+        'minMsiCycles',
+        'must be 0 to $maxMinMsiCycles',
+      );
     }
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
