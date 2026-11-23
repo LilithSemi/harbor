@@ -458,22 +458,70 @@ void main() {
       await Simulator.endSimulation();
     });
 
-    test('a DAT reset in the middle of a frame releases CMD for good', () async {
+    test(
+      'a DAT reset in the middle of a frame releases CMD for good',
+      () async {
+        await setUpDut();
+        await busWrite(_clkDiv, 6);
+        await busWrite(_cmdArg, 0);
+        await busWrite(_cmd, 13 | (1 << 6));
+        // The power-up clocks come first, then the frame starts.
+        for (var i = 0; i < 6000 && cmdOe.value.toInt() != 1; i++) {
+          await clk.nextPosedge;
+        }
+        for (var i = 0; i < 200; i++) {
+          await clk.nextPosedge;
+        }
+        expect(sig('cmd_state').value.toInt(), equals(1));
+        expect(cmdOe.value.toInt(), equals(1));
+        await busWrite(_ctrl, 0x201);
+        await expectReleased(600, 'after a DAT reset in a frame');
+        await Simulator.endSimulation();
+      },
+    );
+
+    test('a command after a cut frame waits for eight idle clocks', () async {
       await setUpDut();
-      await busWrite(_clkDiv, 6);
+      await busWrite(_clkDiv, 1);
       await busWrite(_cmdArg, 0);
       await busWrite(_cmd, 13 | (1 << 6));
-      // The power-up clocks come first, then the frame starts.
       for (var i = 0; i < 6000 && cmdOe.value.toInt() != 1; i++) {
         await clk.nextPosedge;
       }
-      for (var i = 0; i < 200; i++) {
+      for (var i = 0; i < 100; i++) {
         await clk.nextPosedge;
       }
       expect(sig('cmd_state').value.toInt(), equals(1));
-      expect(cmdOe.value.toInt(), equals(1));
+      // Count the SD rising edges with CMD high from the release up to the
+      // rising edge that samples the new start bit.
+      var high = 0;
+      var released = false;
+      var done = false;
+      unawaited(() async {
+        var prev = sdClk.value.toInt();
+        while (!done) {
+          await clk.nextPosedge;
+          final c = sdClk.value.toInt();
+          if (cmdOe.value.toInt() == 0) released = true;
+          if (released && prev == 0 && c == 1) {
+            final wire = cmdOe.value.toInt() == 1 ? cmdOut.value.toInt() : 1;
+            if (wire == 0) {
+              done = true;
+            } else {
+              high++;
+            }
+          }
+          prev = c;
+        }
+      }());
       await busWrite(_ctrl, 0x201);
-      await expectReleased(600, 'after a DAT reset in a frame');
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 13 | (1 << 6));
+      for (var i = 0; i < 6000 && !done; i++) {
+        await clk.nextPosedge;
+      }
+      expect(done, isTrue);
+      expect(high, greaterThanOrEqualTo(8));
       await Simulator.endSimulation();
     });
 

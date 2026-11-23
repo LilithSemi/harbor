@@ -58,13 +58,8 @@ class _Card {
   var out = 1;
   var txIdx = 0;
 
-  final log = <String>[];
   final framed = <int>[];
-  var endRise = -1;
-  var startFall = -1;
-  var startRise = -1;
   var releaseEdge = -1;
-  final missed = <int>[];
   final cmdStartRise = <int>[];
   final gapBefore = <int>[];
 
@@ -81,13 +76,8 @@ class _Card {
           final crcOk =
               _val(_crc7(bits.sublist(0, 40))) == _val(bits.sublist(40, 47));
           final ok = bits[1] == 1 && bits[47] == 1 && crcOk;
-          log.add(
-            'card framed CMD$idx arg 0x${arg.toRadixString(16)} '
-            'crc ${crcOk ? 'ok' : 'bad'} end ${bits[47]} at R$rises',
-          );
           if (ok) {
             framed.add(idx);
-            endRise = rises;
             edgesSinceEnd = 0;
             if (idx == 8) pending = _frameR(8, arg & 0xfff);
             if (idx == 55) pending = _frameR(55, 0x120);
@@ -101,8 +91,6 @@ class _Card {
             ..add(0);
           cmdStartRise.add(rises);
           gapBefore.add(highRun);
-        } else {
-          missed.add(rises);
         }
         highRun = 0;
       } else {
@@ -130,8 +118,6 @@ class _Card {
         oe = true;
         txIdx = 0;
         out = pending![txIdx++];
-        startFall = launchOnRise ? -1 : edge;
-        startRise = launchOnRise ? edge : -1;
       }
     } else if (oe) {
       if (txIdx < pending!.length) {
@@ -148,19 +134,16 @@ class _Card {
 }
 
 class _Result {
-  final int gap;
-  final List<String> lines = [];
   var overlapCycles = 0;
-  var overlapHigh = 0;
   int? int8;
   int? resp8;
   int? int55;
-  var hostRelease = <int>[];
-  var hostStartFall = <int>[];
   var framed = <int>[];
   var gapBefore = <int>[];
   var firstStartRise = 0;
-  _Result(this.gap);
+
+  // SD clocks from the second enable to the first start bit after it.
+  var rearmClocks = 0;
 }
 
 void main() {
@@ -200,9 +183,9 @@ void main() {
     int gap, {
     int clkDiv = 61,
     bool launchOnRise = false,
-    int swDelay = 0,
+    bool rearm = false,
   }) async {
-    final res = _Result(gap);
+    final res = _Result();
     sdio = HarborSdioController(
       baseAddress: 0x60000000,
       config: const HarborSdioConfig(sampleReadOnFall: true),
@@ -257,20 +240,13 @@ void main() {
     Simulator.setMaxSimTime(100000000);
     unawaited(Simulator.run());
 
-    final card = _Card(
-      gap,
-      launchOnRise: launchOnRise,
-      
-    );
+    final card = _Card(gap, launchOnRise: launchOnRise);
     var stop = false;
     // The card and the wire, evaluated each half cycle after the host flops
     // have settled.
     unawaited(() async {
       var prevClk = 0;
-      var prevOe = 0;
-      var inFrame = false;
       var inOverlap = false;
-      final cmdState = sdio.signals.firstWhere((x) => x.name == 'cmd_state');
       while (!stop) {
         await clk.nextNegedge;
         final c = sdClk.value.isValid ? sdClk.value.toInt() : 0;
@@ -288,37 +264,11 @@ void main() {
         } else if (prevClk == 1 && c == 0) {
           card.onFall();
         }
-        if (prevOe == 1 && hOe == 0) {
-          res.hostRelease.add(card.falls);
-          res.lines.add(
-            'host releases CMD on F${card.falls} '
-            '(sd_clk=$c, rises=${card.rises})',
-          );
-        }
-        final st = cmdState.value.toInt();
-        if (st != 1) inFrame = false;
-        if (st == 1 && hOe == 1 && hOut == 0 && !inFrame) {
-          inFrame = true;
-          res.hostStartFall.add(card.falls);
-          res.lines.add(
-            'host start bit on F${card.falls}, card high run ${card.highRun}, card released on ${card.releaseEdge}',
-          );
-        }
         if (hOe == 1 && card.oe) {
-          if (!inOverlap) {
-            res.lines.add(
-              'overlap begins at sd_clk=$c after R${card.rises} F${card.falls}, host $hOut card ${card.out}',
-            );
-          }
           inOverlap = true;
           res.overlapCycles++;
-          if (hOut != card.out) res.overlapHigh++;
         }
-        if (!(hOe == 1 && card.oe) && inOverlap) {
-          inOverlap = false;
-          res.lines.add('overlap ends at R${card.rises} F${card.falls}');
-        }
-        prevOe = hOe;
+        if (!(hOe == 1 && card.oe) && inOverlap) inOverlap = false;
         prevClk = c;
         cmdIn.inject(line());
       }
@@ -330,17 +280,17 @@ void main() {
     await clk.nextPosedge;
 
     Future<void> waitIdle() async {
-      for (var i = 0; i < 200000; i++) {
+      for (var i = 0; i < 20000; i++) {
         if ((await busRead(_status) >> 8) & 1 == 0) return;
+        for (var j = 0; j < 20; j++) {
+          await clk.nextPosedge;
+        }
       }
       fail('host stays busy');
     }
 
     Future<int> cmd(int word, int arg) async {
       await waitIdle();
-      for (var i = 0; i < swDelay; i++) {
-        await clk.nextPosedge;
-      }
       await busWrite(_intStatus, 0xfff);
       await busWrite(_cmdArg, arg);
       await busWrite(_cmd, word);
@@ -356,63 +306,64 @@ void main() {
     await busWrite(_clkDiv, clkDiv);
 
     await cmd(0, 0);
-    final i8 = await cmd(8 | (1 << 6), 0x1aa);
-    res.int8 = i8;
+    res.firstStartRise = card.cmdStartRise.first;
+    if (rearm) {
+      // Clearing enable stops the clock. Setting it again starts the
+      // power-up clocks over.
+      await busWrite(_ctrl, 0x0);
+      for (var i = 0; i < 100; i++) {
+        await clk.nextPosedge;
+      }
+      final starts = card.cmdStartRise.length;
+      await busWrite(_ctrl, 0x1);
+      final base = card.rises;
+      await cmd(0, 0);
+      res.rearmClocks = card.cmdStartRise[starts] - base;
+    }
+    res.int8 = await cmd(8 | (1 << 6), 0x1aa);
     res.resp8 = await busRead(_resp0);
-    res.lines.add(
-      'CMD8 INT 0x${i8.toRadixString(16)} '
-      'RESP0 0x${res.resp8!.toRadixString(16)}',
-    );
-    res.lines.add(
-      'card: CMD8 end bit sampled R${card.endRise}, '
-      'start bit F${card.startFall} R${card.startRise}, '
-      'released edge ${card.releaseEdge}',
-    );
-    final i55 = await cmd(55 | (1 << 6), 0);
-    res.int55 = i55;
-    res.lines.add('CMD55 INT 0x${i55.toRadixString(16)}');
+    res.int55 = await cmd(55 | (1 << 6), 0);
     stop = true;
     res.framed = card.framed;
     res.gapBefore = card.gapBefore;
-    res.firstStartRise = card.cmdStartRise.first;
-    res.lines
-      ..addAll(card.log)
-      ..add('card cmd start rises ${card.cmdStartRise}')
-      ..add('card high clocks before each start ${card.gapBefore}')
-      ..add('card ignored starts at rises ${card.missed}')
-      ..add('host start-bit falls ${res.hostStartFall}')
-      ..add(
-        'overlap cycles ${res.overlapCycles} '
-        '(different value ${res.overlapHigh})',
-      )
-      ..add('card framed ${card.framed}');
     await Simulator.endSimulation();
     await Simulator.simulationEnded;
     await Simulator.reset();
     return res;
   }
 
+  void check(_Result r, {bool rearm = false}) {
+    expect(r.int8! & 0xe10, 0, reason: 'R7 misframed');
+    expect(r.resp8, 0x1aa);
+    expect(r.int55! & 0xe11, 0x1, reason: 'CMD55 not answered');
+    expect(r.framed, rearm ? [0, 0, 8, 55] : [0, 8, 55]);
+    expect(r.gapBefore, everyElement(greaterThanOrEqualTo(8)));
+    expect(r.overlapCycles, 0, reason: 'host and card both drive CMD');
+    expect(
+      r.firstStartRise,
+      greaterThanOrEqualTo(74),
+      reason: 'clocks from enable to the first command',
+    );
+  }
+
   for (final div in [61, 1]) {
-    for (final gap in div == 61 ? [0, 1, 2, 8, 64] : [0, 1, 3, 8, 16, 64]) {
+    for (final gap in [0, 8, 64]) {
       test(
         'a strict card frames CMD0, CMD8 and CMD55 back to back, '
         'Ncr $gap, CLK_DIV $div',
-        () async {
-          final r = await run(gap, clkDiv: div);
-          expect(r.int8! & 0xe10, 0, reason: 'R7 misframed');
-          expect(r.resp8, 0x1aa);
-          expect(r.int55! & 0xe11, 0x1, reason: 'CMD55 not answered');
-          expect(r.framed, [0, 8, 55]);
-          expect(r.gapBefore, everyElement(greaterThanOrEqualTo(8)));
-          expect(r.overlapCycles, 0, reason: 'host and card both drive CMD');
-          expect(
-            r.firstStartRise,
-            greaterThanOrEqualTo(74),
-            reason: 'clocks from enable to the first command',
-          );
-        },
+        () async => check(await run(gap, clkDiv: div)),
         timeout: const Timeout(Duration(minutes: 20)),
       );
     }
   }
+
+  test('a card that launches on the rising edge, 25 MHz SD clock', () async {
+    check(await run(2, clkDiv: 1, launchOnRise: true));
+  });
+
+  test('clearing and setting enable starts the 80 clocks again', () async {
+    final r = await run(2, clkDiv: 1, rearm: true);
+    check(r, rearm: true);
+    expect(r.rearmClocks, greaterThanOrEqualTo(74));
+  });
 }

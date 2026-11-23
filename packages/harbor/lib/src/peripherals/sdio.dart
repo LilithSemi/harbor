@@ -2577,6 +2577,13 @@ class HarborSdioController extends BridgeModule
                                   cmdHold < Const(cmdQuietClocks, width: 8),
                                 ],
                               ),
+                              // A frame that is cut off keeps the card busy,
+                              // so the next command waits for idle clocks.
+                              If(
+                                state.eq(Const(sSend, width: 3)) |
+                                    state.eq(Const(sEnd, width: 3)),
+                                then: [cmdGap < Const(cmdGapClocks, width: 4)],
+                              ),
                               state < Const(sIdle, width: 3),
                               cmdOe < Const(0),
                               cmdOut < Const(1),
