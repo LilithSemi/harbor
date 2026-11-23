@@ -32,9 +32,13 @@ class HarborPcieEndpointConfig {
   /// Number of MSI vectors the endpoint asks for: 1, 2, 4 or 8.
   final int msiVectors;
 
-  /// The minimum time in nanoseconds from one accepted MSI to the next. 0
-  /// sets no minimum. Causes that come during the gap stay pending and go
-  /// out in the next MSI, so a held cause cannot flood the host.
+  /// The minimum time in nanoseconds from one accepted MSI to the next.
+  ///
+  /// The default 0 sets no minimum. A held cause sends a new MSI only after
+  /// the driver clears it, so the host already sets the MSI rate, and a gap
+  /// adds delay to each interrupt. Set a gap on a board with causes that can
+  /// change faster than the host can take interrupts. Causes that come
+  /// during the gap stay pending and go out in the next MSI.
   final int minMsiIntervalNs;
 
   const HarborPcieEndpointConfig({
@@ -50,7 +54,7 @@ class HarborPcieEndpointConfig {
     this.packetMemoryEntries = 2048,
     this.bar2Bytes = 0,
     this.msiVectors = 1,
-    this.minMsiIntervalNs = 1000000,
+    this.minMsiIntervalNs = 0,
   });
 
   /// [minMsiIntervalNs] in cycles of a [userClkHz] clock, rounded up.

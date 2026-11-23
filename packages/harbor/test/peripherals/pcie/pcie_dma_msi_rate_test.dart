@@ -52,6 +52,8 @@ void main() {
       }
       await b.cycles(1024);
       if (interval > 0) {
+        // The cause stays high through all acks, so a later MSI must come.
+        expect(times.length, greaterThan(1));
         for (var i = 1; i < times.length; i++) {
           expect(times[i] - times[i - 1], greaterThanOrEqualTo(interval * 10));
         }

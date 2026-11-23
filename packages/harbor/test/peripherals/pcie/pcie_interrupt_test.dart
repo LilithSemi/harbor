@@ -202,7 +202,13 @@ void main() {
 
   test('the MSI gap comes from minMsiIntervalNs and the user clock', () {
     const userClkHz = 62500000;
-    expect(const HarborPcieEndpointConfig().minMsiCycles(userClkHz), 62500);
+    expect(const HarborPcieEndpointConfig().minMsiCycles(userClkHz), 0);
+    expect(
+      const HarborPcieEndpointConfig(
+        minMsiIntervalNs: 1000000,
+      ).minMsiCycles(userClkHz),
+      62500,
+    );
     expect(
       const HarborPcieEndpointConfig(
         minMsiIntervalNs: 10000,
@@ -248,8 +254,11 @@ void main() {
 
   for (final (label, ns) in [
     ('10 us', 10000),
-    ('no gap', 0),
-    ('the 1 ms default', const HarborPcieEndpointConfig().minMsiIntervalNs),
+    (
+      'the default of no gap',
+      const HarborPcieEndpointConfig().minMsiIntervalNs,
+    ),
+    ('1 ms', 1000000),
   ]) {
     test('causes during the gap merge into later MSIs at $label', () async {
       final gap = HarborPcieEndpointConfig(
