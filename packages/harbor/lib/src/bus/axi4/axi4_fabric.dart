@@ -670,7 +670,11 @@ class HarborAxi4Fabric extends HarborFabricModule {
     }
 
     // Outstanding limit per target, reads and writes together. When one
-    // slot is left and both directions want it, they take turns.
+    // slot is left, a registered direction owns it. On a target that a
+    // real-time master reaches, a request in one direction takes the slot
+    // when the other direction does not want it. On other targets a request
+    // in the other direction waits one cycle for its turn, so no path goes
+    // from the AW request to the AR grant.
     final outOk = <List<Logic>>[];
     final tFire = [
       for (var t = 0; t < nt; t++) [Logic(), Logic()],
@@ -684,10 +688,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
       final lastOne = cnt.eq(Const(n - 1, width: cw));
       final awWant = anyOf([for (var m = 0; m < nm; m++) req[m][0][t]]);
       final arWant = anyOf([for (var m = 0; m < nm; m++) req[m][1][t]]);
+      final rtTarget =
+          t < nst &&
+          masters.any((m) => m.realtime && m.reaches(slaves[tSlave[t]].name));
       // A real-time request in one direction takes the last slot from a
       // request in the other direction.
       var prefer = preferRead;
-      if (hasRt) {
+      if (rtTarget) {
         final awRt = anyOf([
           for (var m = 0; m < nm; m++)
             if (rt[m]) req[m][0][t],
@@ -703,8 +710,8 @@ class HarborAxi4Fabric extends HarborFabricModule {
         );
       }
       outOk.add([
-        ~full & ~(lastOne & arWant & prefer),
-        ~full & ~(lastOne & awWant & ~prefer),
+        ~full & ~(lastOne & prefer & (rtTarget ? arWant : Const(1))),
+        ~full & ~(lastOne & ~prefer & (rtTarget ? awWant : Const(1))),
       ]);
       Sequential(c, reset: r, [
         cnt <
@@ -713,7 +720,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
                 tFire[t][1].zeroExtend(cw) -
                 bDone[t].zeroExtend(cw) -
                 rDone[t].zeroExtend(cw),
-        preferRead < preferRead ^ (lastOne & awWant & arWant),
+        // The direction turns when the other direction wants the slot. A
+        // stream in one direction keeps it and does not wait.
+        preferRead <
+            preferRead ^
+                (lastOne &
+                    (rtTarget
+                        ? awWant & arWant
+                        : mux(preferRead, awWant, arWant))),
       ]);
     }
 
