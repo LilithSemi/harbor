@@ -24,6 +24,9 @@ class PcieFabricMemory {
   /// Write beats answered.
   int writeBeats = 0;
 
+  /// Base addresses of the answered write beats with a strobe bit set.
+  final List<int> dataBeats = [];
+
   /// Read beats answered.
   int readBeats = 0;
   final Logic _ack = Logic(name: 'tb_ack');
@@ -87,6 +90,7 @@ class PcieFabricMemory {
       // Lanes with no strobe can hold X.
       final data = top.output('t_wdata').value;
       final sel = top.output('t_sel').value.toInt();
+      if (sel != 0 && !fail) dataBeats.add(base);
       for (var b = 0; b < busBytes && !fail; b++) {
         if ((sel >> b) & 1 == 1) {
           bytes[base + b] = data.getRange(8 * b, 8 * b + 8).toInt();

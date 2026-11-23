@@ -66,9 +66,10 @@ void main() {
             35,
           );
           final r = Random(35);
+          final payload = randomBytes(r, 128);
           bench.memory.writeLimit = 0;
           await bench.driver.send(
-            PcieTlp.memWrite(address: 0xc0000200, data: randomBytes(r, 128)),
+            PcieTlp.memWrite(address: 0xc0000200, data: payload),
             user: HarborPcieStream.userBar2,
           );
           await bench.idle(limit * 3);
@@ -79,6 +80,7 @@ void main() {
           await bench.idle(limit * 8);
           expect(bench.wedged, 0);
           expect(bench.timeoutErrors, 1);
+          final taken = bench.memory.dataBeats.length;
           final good = PcieTlp.memWrite(
             address: 0xc0000400,
             data: randomBytes(r, 64),
@@ -88,17 +90,17 @@ void main() {
           final want = await bench.read(flush);
           await bench.checkReads([(flush, want)], rcb: 64, maxPayload: 256);
           expect(bench.timeoutErrors, 1);
-          // The port holds a few beats the completer already sent, and the
-          // stalled beat lands. No drain beat after them writes a byte.
-          final landed = switch (kind) {
-            HarborFabricKind.wishbone => 12,
-            HarborFabricKind.axi4 => 20,
-            HarborFabricKind.tilelink => 36,
-          };
-          final first = bench.fabric(0xc0000200) + landed;
-          bench.checkMemory(
-            bench.span(0xc0000200, 128).where((a) => a >= first),
-          );
+          // The beats the memory took are the first beats of the payload.
+          // Every drain beat after them has no strobe.
+          final base = bench.fabric(0xc0000200);
+          expect(taken, greaterThan(0));
+          expect(bench.memory.dataBeats.take(taken).toList(), [
+            for (var i = 0; i < taken; i++) base + 4 * i,
+          ]);
+          for (var i = 0; i < 128; i++) {
+            final want = i < taken * 4 ? payload[i] : completerFill(base + i);
+            expect(bench.memory.byte(base + i), want, reason: 'byte $i');
+          }
           await bench.finish();
         },
       );
