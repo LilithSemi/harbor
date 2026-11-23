@@ -238,6 +238,24 @@ class HarborBoard {
     );
   }
 
+  /// Adds the vendor pull-up to an SD CMD or DAT pin that names no pull.
+  ///
+  /// The host releases these lines at rest, so a pull-up must hold them high.
+  /// An explicit PULLMODE or PULLTYPE attribute, including NONE, stays as is.
+  String _withSdPull(String signal, String value) {
+    if (!RegExp(r'(^|_)sd_(cmd|dat\d)$').hasMatch(signal)) return value;
+    final attrs = value.trim().split(RegExp(r'\s+'));
+    if (attrs.any(
+      (a) => a.startsWith('PULLMODE=') || a.startsWith('PULLTYPE='),
+    )) {
+      return value;
+    }
+    final pull = vendor == HarborFpgaVendor.ecp5
+        ? 'PULLMODE=UP'
+        : 'PULLTYPE=PULLUP';
+    return '${attrs.join(' ')} $pull';
+  }
+
   /// Builds a [HarborFpgaTarget] for this board.
   ///
   /// [pins] selects which catalog signals to constrain (defaults to all of
@@ -310,6 +328,7 @@ class HarborBoard {
       pinMap[signal] = site;
     }
     pinMap.addAll(extraPins);
+    pinMap.updateAll(_withSdPull);
     for (final e in {...this.pins, ...extraPins}.entries) {
       _checkPerstPull(e.key, e.value);
     }

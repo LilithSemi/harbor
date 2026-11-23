@@ -1229,33 +1229,28 @@ void main() {
       await Simulator.endSimulation();
     });
 
-    test(
-      'DAT3 is held high and DAT0..2 are released outside a write',
-      () async {
-        await setUpDut();
-        await busWrite(_intEnable, 0x11);
-        for (var i = 0; i < 20; i++) {
-          await clk.nextPosedge;
-          expect(datOe.value.toInt(), equals(0x8));
-          expect(datOut.value.toInt() & 0x8, equals(0x8));
-        }
-        final diag = await busRead(_diag);
-        expect((diag >> 16) & 0xF, equals(0x8));
-        expect(diag & 0x2, equals(0x2));
-        expect(top.output('sd_diag').value.toInt() & 0xF0000, equals(0x80000));
-        // CMD0 keeps the same drive through the whole command.
-        await busWrite(_cmdArg, 0);
-        await busWrite(_cmd, 0);
-        for (var i = 0; i < 600; i++) {
-          await clk.nextPosedge;
-          expect(datOe.value.toInt(), equals(0x8));
-          expect(datOut.value.toInt() & 0x8, equals(0x8));
-        }
-        await Simulator.endSimulation();
-      },
-    );
+    test('every DAT line is released outside a write, DAT3 included', () async {
+      await setUpDut();
+      await busWrite(_intEnable, 0x11);
+      for (var i = 0; i < 20; i++) {
+        await clk.nextPosedge;
+        expect(datOe.value.toInt(), equals(0));
+      }
+      final diag = await busRead(_diag);
+      expect((diag >> 16) & 0xF, equals(0));
+      expect(diag & 0x2, equals(0), reason: 'CMD is released at rest');
+      expect(top.output('sd_diag').value.toInt() & 0xF0000, equals(0));
+      // CMD0 leaves the DAT lines released through the whole command.
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 0);
+      for (var i = 0; i < 600; i++) {
+        await clk.nextPosedge;
+        expect(datOe.value.toInt(), equals(0));
+      }
+      await Simulator.endSimulation();
+    });
 
-    test('DAT3 is released in reset and held high once enabled', () async {
+    test('the DAT lines stay released in reset and once enabled', () async {
       await setUpDut();
       reset.inject(1);
       await clk.nextPosedge;
@@ -1265,8 +1260,7 @@ void main() {
       await clk.nextPosedge;
       expect(datOe.value.toInt(), equals(0));
       await busWrite(_ctrl, 0x1);
-      expect(datOe.value.toInt(), equals(0x8));
-      expect(datOut.value.toInt() & 0x8, equals(0x8));
+      expect(datOe.value.toInt(), equals(0));
       await busWrite(_ctrl, 0x0);
       expect(datOe.value.toInt(), equals(0));
       await Simulator.endSimulation();
@@ -1297,21 +1291,22 @@ void main() {
       fail('the write never drove DAT0');
     }
 
-    test('a 1-bit write keeps DAT3 high and DAT1, DAT2 released', () async {
-      await setUpDut();
-      await startWrite1Bit();
-      var driven = 0;
-      for (var i = 0; i < 400; i++) {
-        await clk.nextPosedge;
-        final oe = datOe.value.toInt();
-        expect(oe & 0x6, equals(0), reason: 'DAT1 and DAT2 stay released');
-        expect(oe & 0x8, equals(0x8), reason: 'DAT3 stays driven');
-        expect(datOut.value.toInt() & 0x8, equals(0x8));
-        if (oe & 1 == 1) driven++;
-      }
-      expect(driven, greaterThan(40));
-      await Simulator.endSimulation();
-    });
+    test(
+      'a 1-bit write drives DAT0 only and keeps DAT1 to DAT3 released',
+      () async {
+        await setUpDut();
+        await startWrite1Bit();
+        var driven = 0;
+        for (var i = 0; i < 400; i++) {
+          await clk.nextPosedge;
+          final oe = datOe.value.toInt();
+          expect(oe & 0xE, equals(0), reason: 'DAT1 to DAT3 stay released');
+          if (oe & 1 == 1) driven++;
+        }
+        expect(driven, greaterThan(40));
+        await Simulator.endSimulation();
+      },
+    );
 
     test('clearing enable in a write releases the DAT pads', () async {
       await setUpDut();
@@ -1320,6 +1315,7 @@ void main() {
       for (var i = 0; i < 20; i++) {
         await clk.nextPosedge;
         expect(datOe.value.toInt() & 0x7, equals(0));
+        expect(cmdOe.value.toInt(), equals(0), reason: 'CMD at rest');
       }
       final status = await busRead(_intStatus);
       expect(status & 0x22, equals(0x22)); // write error and data-done
@@ -1333,8 +1329,8 @@ void main() {
       await busWrite(_ctrl, 0x201);
       for (var i = 0; i < 20; i++) {
         await clk.nextPosedge;
-        expect(datOe.value.toInt(), equals(0x8));
-        expect(datOut.value.toInt() & 0x7, equals(0));
+        expect(datOe.value.toInt(), equals(0));
+        expect(cmdOe.value.toInt(), equals(0), reason: 'CMD at rest');
       }
       await Simulator.endSimulation();
     });
@@ -1386,6 +1382,10 @@ void main() {
         expect(si, equals(statusBusy.length));
         final status = await busRead(_intStatus);
         expect(status & 0x20, equals(0x20)); // write error flagged
+        for (var i = 0; i < 100; i++) {
+          await clk.nextPosedge;
+          expect(cmdOe.value.toInt(), equals(0), reason: 'CMD at rest');
+        }
         await Simulator.endSimulation();
       },
     );

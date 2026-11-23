@@ -1150,33 +1150,18 @@ class HarborSdioController extends BridgeModule
     mw.wrespReady <= writesBusy | (reqValid & reqWrite);
 
     output('sd_clk') <= sdClkReg & ctrlEnable;
-    // Per-lane drive. The host drives the active lanes while it writes. In
-    // 1-bit mode an enabled host also holds DAT3 high, so a card does not read
-    // the line as an SPI mode select, and it releases DAT1 and DAT2. A disabled
-    // host drives nothing, so a card with switched power can be cycled.
-    final datOeLane = <Logic>[];
-    final datOutLane = <Logic>[];
-    for (var l = 0; l < maxW; l++) {
-      if (l == 3) {
-        datOeLane.add((datOeReg & laneMask[l]) | (wSel1 & ctrlEnable));
-        datOutLane.add(mux(wSel1, Const(1), datOutReg[l]));
-      } else {
-        datOeLane.add(datOeReg & laneMask[l]);
-        datOutLane.add(datOutReg[l]);
-      }
-    }
-    final datOePins = datOeLane.rconcat().named('dat_oe_pins');
-    final datOutPins = datOutLane.rconcat().named('dat_out_pins');
-    // An enabled host holds CMD high when no command is on the bus, so the
-    // line cannot float low on a board without a pull-up. It stays released
-    // for [cmdQuietClocks] after a failed or stopped response.
-    final cmdIdleHigh =
-        (ctrlEnable &
-                (state.eq(Const(sIdle, width: 3)) |
-                    state.eq(Const(sBusy, width: 3))) &
-                cmdHold.eq(Const(0, width: 8)))
-            .named('cmd_idle_high');
-    final cmdPadOe = (cmdOe | cmdIdleHigh).named('cmd_pad_oe');
+    // Per-lane drive. The host drives a lane only while it writes on it. DAT3
+    // is released in 1-bit mode too. The card pull-up holds it high, so the
+    // card does not read an SPI mode select. The pad or board must also pull
+    // each DAT line up.
+    final datOePins = [
+      for (var l = 0; l < maxW; l++) datOeReg & laneMask[l],
+    ].rconcat().named('dat_oe_pins');
+    final datOutPins = datOutReg;
+    // The host drives CMD only while it sends a command. At rest CMD is
+    // released and relies on the pad or board pull-up. A board without one
+    // must add a pull-up in its pin constraints.
+    final cmdPadOe = cmdOe;
     if (ownPads) {
       // One IOBUF per bidirectional line: drive when the FSM asserts its output
       // enable, otherwise release and read the pad back in.

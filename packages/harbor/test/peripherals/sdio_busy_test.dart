@@ -554,12 +554,11 @@ void main() {
       return busRead(_intStatus);
     }
 
-    test('CMD is driven high while an R1b waits for busy end', () async {
+    test('CMD is released while an R1b waits for busy end', () async {
       await r1bStuck(
         during: () async {
           expect(sig('cmd_state').value.toInt(), equals(5));
-          expect(cmdOe.value.toInt(), equals(1));
-          expect(cmdOut.value.toInt(), equals(1));
+          expect(cmdOe.value.toInt(), equals(0));
         },
       );
       await Simulator.endSimulation();

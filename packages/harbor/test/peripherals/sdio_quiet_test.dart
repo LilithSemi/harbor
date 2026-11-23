@@ -289,15 +289,14 @@ void main() {
       },
     );
 
-    test('CMD is driven high again after the quiet time', () async {
-      final (oe, out, _) = await lateCard(
+    test('CMD stays released after the quiet time', () async {
+      final (oe, _, _) = await lateCard(
         r1Frame(13, crcXor: 1),
         lateAfter: 20,
         lateLow: 16,
         settle: 240,
       );
-      expect(oe, equals(1));
-      expect(out, equals(1));
+      expect(oe, equals(0));
       await Simulator.endSimulation();
     });
 
@@ -328,6 +327,8 @@ void main() {
           expect((await busRead(_status) >> 8) & 1, equals(0));
           expect((await busRead(_intStatus)) & 0x10, equals(0x10));
           await busWrite(_ctrl, 0x11);
+          await busWrite(_cmdArg, 0);
+          await busWrite(_cmd, 13 | (1 << 6));
           var rises = 0;
           var prev = sdClk.value.toInt();
           var firstOe = -1;
@@ -344,13 +345,12 @@ void main() {
       );
     }
 
-    test('CMD is driven high when idle and released while waiting', () async {
+    test('CMD is released at rest and while waiting', () async {
       await setUpDut();
       strictResponse = true;
       await busWrite(_intEnable, 0xE11);
       final frame = r1Frame(13);
-      expect(cmdOe.value.toInt(), equals(1));
-      expect(cmdOut.value.toInt(), equals(1));
+      expect(cmdOe.value.toInt(), equals(0));
       await busWrite(_cmdArg, 0);
       await busWrite(_cmd, 13 | (1 << 6));
       var sawDrive = false;
@@ -368,17 +368,132 @@ void main() {
         }
         final st = sig('cmd_state').value.toInt();
         states.add(st);
-        if (st == 2 || st == 3) {
+        if (st == 0 || st == 2 || st == 3) {
           expect(cmdOe.value.toInt(), equals(0), reason: 'state $st');
-        }
-        if (st == 0) {
-          expect(cmdOe.value.toInt(), equals(1));
-          expect(cmdOut.value.toInt(), equals(1));
         }
         if (irq.value.toInt() == 1) break;
       }
       expect(states, containsAll([0, 1, 2, 3]));
       await Simulator.endSimulation();
     });
+
+    Future<void> expectReleased(int cycles, String when) async {
+      for (var i = 0; i < cycles; i++) {
+        await clk.nextPosedge;
+        expect(cmdOe.value.toInt(), equals(0), reason: when);
+      }
+    }
+
+    test('CMD is released after reset and while reset is held', () async {
+      await setUpDut();
+      await expectReleased(100, 'after reset');
+      reset.inject(1);
+      await expectReleased(5, 'in reset');
+      reset.inject(0);
+      await expectReleased(50, 'after reset again');
+      await Simulator.endSimulation();
+    });
+
+    test('CMD is released after a good response', () async {
+      await setUpDut();
+      await busWrite(_intEnable, 0xE11);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 13 | (1 << 6));
+      final frame = r1Frame(13);
+      var sawDrive = false;
+      var k = 0;
+      for (var i = 0; i < 3000 && irq.value.toInt() == 0; i++) {
+        await clk.nextPosedge;
+        final sending = cmdProbe.sending(cmdOe, cmdOut);
+        if (sending) sawDrive = true;
+        if (sawDrive &&
+            !sending &&
+            sdClk.value.toInt() == 0 &&
+            k < frame.length) {
+          cmdIn.inject(frame[k++]);
+        }
+      }
+      expect(irq.value.toInt(), equals(1));
+      cmdIn.inject(1);
+      await expectReleased(300, 'after a good response');
+      await Simulator.endSimulation();
+    });
+
+    test('CMD is released after a response error', () async {
+      final (oe, _, _) = await lateCard(
+        r1Frame(13, crcXor: 1),
+        lateAfter: 2,
+        lateLow: 2,
+        settle: 2,
+      );
+      expect(oe, equals(0));
+      await expectReleased(300, 'after a response error');
+      await Simulator.endSimulation();
+    });
+
+    test('CMD is released after a timeout', () async {
+      await setUpDut();
+      await busWrite(_intEnable, 0xE11);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 13 | (1 << 6));
+      for (var i = 0; i < 60000 && irq.value.toInt() == 0; i++) {
+        await clk.nextPosedge;
+      }
+      expect(irq.value.toInt(), equals(1));
+      expect((await busRead(_intStatus)) & 0x10, equals(0x10));
+      await expectReleased(300, 'after a timeout');
+      await Simulator.endSimulation();
+    });
+
+    test('CMD is released after a clock stop', () async {
+      await setUpDut();
+      await busWrite(_intEnable, 0xE11);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 13 | (1 << 6));
+      for (var i = 0; i < 4000 && sig('cmd_state').value.toInt() != 1; i++) {
+        await clk.nextPosedge;
+      }
+      await busWrite(_ctrl, 0x10);
+      await expectReleased(300, 'after a clock stop');
+      await Simulator.endSimulation();
+    });
+
+    test('CMD is driven only from the start bit to the end-bit hold', () async {
+      await setUpDut();
+      await busWrite(_intEnable, 0xE11);
+      await expectReleased(20, 'before the command');
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 13 | (1 << 6));
+      var prevOe = 0;
+      var pulses = 0;
+      var prevClk = sdClk.value.toInt();
+      var risesWhileOe = 0;
+      for (var i = 0; i < 3000 && irq.value.toInt() == 0; i++) {
+        await clk.nextPosedge;
+        final oe = cmdOe.value.toInt();
+        if (oe == 1 && prevOe == 0) pulses++;
+        final c = sdClk.value.toInt();
+        if (oe == 1 && prevClk == 0 && c == 1) risesWhileOe++;
+        prevOe = oe;
+        prevClk = c;
+      }
+      expect(pulses, equals(1));
+      expect(risesWhileOe, inInclusiveRange(48, 50));
+      await Simulator.endSimulation();
+    });
+
+    test(
+      'a card that holds CMD low at rest never meets a host drive',
+      () async {
+        await setUpDut();
+        cmdIn.inject(0);
+        await expectReleased(300, 'card low, idle');
+        reset.inject(1);
+        await expectReleased(5, 'card low, reset');
+        reset.inject(0);
+        await expectReleased(100, 'card low, after reset');
+        await Simulator.endSimulation();
+      },
+    );
   });
 }

@@ -111,6 +111,49 @@ void main() {
       expect(pins['sd_dat3'], equals('M1 LVCMOS33 PULLMODE=UP'));
     });
 
+    group('SD CMD and DAT pins carry a pull-up in the constraint file', () {
+      final lines = <String, List<String>>{};
+      for (final preset in HarborBoard.byName.keys) {
+        test(preset, () {
+          final board = HarborBoard.get(preset);
+          final ecp5 = board.vendor == HarborFpgaVendor.ecp5;
+          // An extra pin with only a site, the way a build passes it.
+          final names = [
+            'sdio_sd_cmd',
+            for (var i = 0; i < 4; i++) 'sdio_sd_dat$i',
+          ];
+          final target = board.fpgaTarget(
+            pins: ['clk'],
+            extraPins: {
+              for (var i = 0; i < names.length; i++)
+                names[i]: ecp5 ? 'A${i + 1}' : 'U${i + 1}',
+            },
+          );
+          lines[preset] = target.generateConstraints().split('\n');
+          for (final n in names) {
+            final line = lines[preset]!.singleWhere(
+              (l) => l.contains(ecp5 ? 'IOBUF PORT "$n"' : 'get_ports $n]'),
+            );
+            expect(
+              line,
+              contains(ecp5 ? 'PULLMODE=UP' : 'PULLTYPE PULLUP'),
+              reason: '$preset $n',
+            );
+          }
+        });
+      }
+
+      test('an explicit pull attribute on an SD pin is kept', () {
+        final target = HarborBoard.get('arty-s7-50').fpgaTarget(
+          pins: ['clk'],
+          extraPins: {'sdio_sd_cmd': 'U12 LVCMOS33 PULLTYPE=NONE'},
+        );
+        final text = target.generateConstraints();
+        expect(text, contains('PULLTYPE NONE'));
+        expect(text, isNot(contains('PULLUP')));
+      });
+    });
+
     test('the orangecrab SD clock ball is NOT clock capable', () {
       final board = HarborBoard.get('orangecrab-25f');
       // K1 is a general I/O, so a design that clocks logic from sd_clk must
