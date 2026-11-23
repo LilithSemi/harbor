@@ -364,6 +364,14 @@ class HarborSdioController extends BridgeModule
   /// delay (64). A card that is still answering finds the line free.
   static const cmdQuietClocks = 200;
 
+  /// High SD clocks the host keeps on CMD between the end of one frame and
+  /// the start bit of the next command (NCC and NRC, 8 at minimum).
+  static const cmdGapClocks = 8;
+
+  /// SD clocks the host runs after enable before it sends the first command.
+  /// The physical layer specification asks for 74 at minimum.
+  static const initClocks = 80;
+
   /// The reset value of DATA_TIMEOUT: 4194304 SD clocks. A 25 MHz system clock
   /// gives at most a 12.5 MHz SD clock, so this is at least 335 ms.
   static const defaultDataTimeout = 1 << 22;
@@ -564,6 +572,14 @@ class HarborSdioController extends BridgeModule
     final respCrc = Logic(name: 'resp_crc', width: 7);
     final respTxBad = Logic(name: 'resp_tx_bad');
     final cmdHold = Logic(name: 'cmd_hold', width: 8);
+    final cmdGap = Logic(name: 'cmd_gap', width: 4);
+    final initCnt = Logic(name: 'init_cnt', width: 8);
+    // A command may start when no hold, gap or power-up time is left.
+    final cmdFree =
+        (cmdHold.eq(Const(0, width: 8)) &
+                cmdGap.eq(Const(0, width: 4)) &
+                initCnt.eq(Const(0, width: 8)))
+            .named('cmd_free');
     final resp = [
       mux(respLong, respRaw.getRange(0, 32), respRaw.getRange(8, 40)),
       for (var i = 1; i < 4; i++)
@@ -1313,6 +1329,8 @@ class HarborSdioController extends BridgeModule
           respCrc < Const(0, width: 7),
           respTxBad < Const(0),
           cmdHold < Const(0, width: 8),
+          cmdGap < Const(0, width: 4),
+          initCnt < Const(initClocks, width: 8),
           blkSize < Const(512, width: 12),
           blkCount < Const(1, width: 16),
           dataTimeout < Const(defaultDataTimeout, width: 24),
@@ -1428,6 +1446,22 @@ class HarborSdioController extends BridgeModule
             sdRise & cmdHold.neq(Const(0, width: 8)),
             then: [cmdHold < (cmdHold - Const(1, width: 8))],
           ),
+          If(
+            sdFall & cmdGap.neq(Const(0, width: 4)),
+            then: [cmdGap < (cmdGap - Const(1, width: 4))],
+          ),
+          // The power-up clocks count from enable, and a cleared enable
+          // starts them again.
+          If(
+            ~ctrlEnable,
+            then: [initCnt < Const(initClocks, width: 8)],
+            orElse: [
+              If(
+                sdFall & initCnt.neq(Const(0, width: 8)),
+                then: [initCnt < (initCnt - Const(1, width: 8))],
+              ),
+            ],
+          ),
 
           // CMD engine.
           Case(state, [
@@ -1436,7 +1470,7 @@ class HarborSdioController extends BridgeModule
               // A command written while the quiet time runs waits for it. CMD
               // stays released until then, and STATUS shows busy meanwhile.
               If(
-                ~cmdOe & cmdHold.eq(Const(0, width: 8)),
+                ~cmdOe & cmdFree,
                 then: [cmdOe < Const(1)],
               ),
               If(
@@ -1477,6 +1511,7 @@ class HarborSdioController extends BridgeModule
                     cmdRespType.eq(Const(0, width: 2)),
                     // No response expected: the command is done.
                     then: [
+                      cmdGap < Const(cmdGapClocks, width: 4),
                       state < Const(sIdle, width: 3),
                       busy < Const(0),
                       ...setInt(intCmdDone),
@@ -1590,6 +1625,9 @@ class HarborSdioController extends BridgeModule
                     respCnt.eq(Const(1, width: 8)) & ~respErrNow,
                     then: [
                       state < Const(sIdle, width: 3),
+                      // The card drives the end bit until the next falling
+                      // edge, and that edge does not count as a high clock.
+                      cmdGap < Const(cmdGapClocks + 1, width: 4),
                       ...setInt(intCmdDone),
                       // Hand off to the data engine when the command carries a
                       // data phase, otherwise the command is done.
@@ -2580,7 +2618,7 @@ class HarborSdioController extends BridgeModule
                           cmdCrc < Const(0, width: 7),
                           cmdCnt < Const(48, width: 7),
                           cmdOut < Const(1),
-                          cmdOe < cmdHold.eq(Const(0, width: 8)),
+                          cmdOe < cmdFree,
                           busy < Const(1),
                           state < Const(sSend, width: 3),
                           // Start every data phase with an empty RX FIFO, so

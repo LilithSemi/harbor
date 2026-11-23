@@ -458,6 +458,25 @@ void main() {
       await Simulator.endSimulation();
     });
 
+    test('a DAT reset in the middle of a frame releases CMD for good', () async {
+      await setUpDut();
+      await busWrite(_clkDiv, 6);
+      await busWrite(_cmdArg, 0);
+      await busWrite(_cmd, 13 | (1 << 6));
+      // The power-up clocks come first, then the frame starts.
+      for (var i = 0; i < 6000 && cmdOe.value.toInt() != 1; i++) {
+        await clk.nextPosedge;
+      }
+      for (var i = 0; i < 200; i++) {
+        await clk.nextPosedge;
+      }
+      expect(sig('cmd_state').value.toInt(), equals(1));
+      expect(cmdOe.value.toInt(), equals(1));
+      await busWrite(_ctrl, 0x201);
+      await expectReleased(600, 'after a DAT reset in a frame');
+      await Simulator.endSimulation();
+    });
+
     test('CMD is driven only from the start bit to the end-bit hold', () async {
       await setUpDut();
       await busWrite(_intEnable, 0xE11);

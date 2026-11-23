@@ -242,9 +242,22 @@ class HarborBoard {
   ///
   /// The host releases these lines at rest, so a pull-up must hold them high.
   /// An explicit PULLMODE or PULLTYPE attribute, including NONE, stays as is.
+  /// An iCE40 target throws unless the pin states NONE.
   String _withSdPull(String signal, String value) {
     if (!RegExp(r'(^|_)sd_(cmd|dat\d)$').hasMatch(signal)) return value;
     final attrs = value.trim().split(RegExp(r'\s+'));
+    if (vendor == HarborFpgaVendor.ice40) {
+      // The PCF writer keeps only the site, so a pull-up would be lost.
+      if (attrs.contains('PULLTYPE=NONE') || attrs.contains('PULLMODE=NONE')) {
+        return value;
+      }
+      throw ArgumentError.value(
+        value,
+        signal,
+        'An iCE40 PCF has no pull attribute, so the SD pull-up would be '
+        'dropped. Add an external pull-up and write PULLTYPE=NONE.',
+      );
+    }
     if (attrs.any(
       (a) => a.startsWith('PULLMODE=') || a.startsWith('PULLTYPE='),
     )) {

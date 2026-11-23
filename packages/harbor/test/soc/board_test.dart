@@ -143,6 +143,19 @@ void main() {
         });
       }
 
+      test('an iCE40 target with an SD pin and no NONE throws', () {
+        HarborBoard ice(String value) => HarborBoard(
+          name: 'ice',
+          vendor: HarborFpgaVendor.ice40,
+          device: 'up5k',
+          package: 'sg48',
+          oscillatorHz: 12000000,
+          pins: {'clk': '35', 'sd_cmd': value},
+        );
+        expect(ice('10').fpgaTarget, throwsArgumentError);
+        expect(ice('10 PULLTYPE=NONE').fpgaTarget, returnsNormally);
+      });
+
       test('an explicit pull attribute on an SD pin is kept', () {
         final target = HarborBoard.get('arty-s7-50').fpgaTarget(
           pins: ['clk'],
