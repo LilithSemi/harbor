@@ -18,6 +18,7 @@ HarborPcieDma _dma({
   int irqLines = 0,
   int timeoutCycles = 6250000,
   int maxReadRequestBytes = 512,
+  int memoryOutstanding = 1,
   List<int> infoWords = const [],
   HarborPcieEndpointConfig endpointConfig = const HarborPcieEndpointConfig(
     msiVectors: 8,
@@ -42,6 +43,7 @@ HarborPcieDma _dma({
   irqLines: irqLines,
   timeoutCycles: timeoutCycles,
   maxReadRequestBytes: maxReadRequestBytes,
+  memoryOutstanding: memoryOutstanding,
   infoWords: infoWords,
   endpointConfig: endpointConfig,
 );
@@ -153,6 +155,66 @@ void main() {
     expect(b.host.violations, isEmpty);
     await b.finish();
   });
+
+  test('local write bursts overlap outstanding fabric responses', () async {
+    final config = const DmaConfig(memoryOutstanding: 8, axiGate: true);
+    final b = await DmaBench.create(config, seed: 37);
+    b.seedHost(0x80040000, 0x2000);
+    await b.start();
+    await b.setupRing(dmaCplBase, 4);
+    b.hold('b');
+    await b.enable();
+    await b.push(
+      hostAddress: 0x80040000,
+      localAddress: 0x20000,
+      length: 0x2000,
+      deviceToHost: false,
+      cookie: 0xbeef,
+    );
+
+    // The Wishbone-backed test target serializes B responses, so it does not
+    // model the full depth of the memory controller. It should still prove
+    // the engine can advance to more than one write burst before B returns.
+    await b.cycles(3000);
+    expect(b.reads.length, greaterThan(8));
+    expect(b.memory.writeBeats, greaterThan(64));
+    b.hold('b', held: false);
+    await b.waitRecordWrites(0, 1);
+    b.checkLocal(0x80040000, 0x20000, 0x2000);
+    final r = b.record(0);
+    expect(r.cookie, 0xbeef);
+    expect(r.code, 0);
+    expect(r.bytes, 0x2000);
+    expect(b.host.violations, isEmpty);
+    await b.finish();
+  });
+
+  test(
+    'with overlapped writes a write error counts the tags before it',
+    () async {
+      final b = await DmaBench.create(
+        const DmaConfig(memoryOutstanding: 8, axiGate: true),
+      );
+      b.seedHost(0x80000000, 0x800);
+      await b.start();
+      await b.setupRing(dmaCplBase, 4);
+      await b.enable();
+      b.memory.errorBeats.add(0x2000 + 0x250);
+      await b.push(
+        hostAddress: 0x80000000,
+        localAddress: 0x2000,
+        length: 0x800,
+        deviceToHost: false,
+        cookie: 8,
+      );
+      await b.waitRecordWrites(0, 1);
+      final r = b.record(0);
+      expect(r.code, HarborPcieDma.errorFabric);
+      expect(r.bytes, 0x200);
+      b.checkLocal(0x80000000, 0x2000, 0x200);
+      await b.finish();
+    },
+  );
 
   test('read size follows max read request and the build limit', () async {
     final b = await DmaBench.create(
@@ -1155,6 +1217,7 @@ void main() {
   for (final config in [
     const DmaConfig(),
     const DmaConfig(width: 128, kind: HarborFabricKind.wishbone),
+    const DmaConfig(memoryOutstanding: 8),
   ]) {
     test('engine reset waits for a local write burst, $config', () async {
       final b = await DmaBench.create(config, seed: 91);

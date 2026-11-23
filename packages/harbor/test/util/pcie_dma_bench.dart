@@ -28,6 +28,7 @@ class DmaConfig {
   final List<int> infoWords;
   final int timeoutCycles;
   final int maxReadRequestBytes;
+  final int memoryOutstanding;
   final bool fifoSource;
   final bool ringSource;
   final int addressWidth;
@@ -56,6 +57,7 @@ class DmaConfig {
     this.infoWords = const [],
     this.timeoutCycles = 6250000,
     this.maxReadRequestBytes = 512,
+    this.memoryOutstanding = 1,
     this.fifoSource = true,
     this.ringSource = false,
     this.addressWidth = dmaAddressWidth,
@@ -66,7 +68,9 @@ class DmaConfig {
   });
 
   @override
-  String toString() => 'W$width D$dataWidth ${kind.name}';
+  String toString() =>
+      'W$width D$dataWidth ${kind.name}'
+      '${memoryOutstanding == 1 ? '' : ' N$memoryOutstanding'}';
 }
 
 class DmaRecord {
@@ -192,6 +196,7 @@ class DmaBench {
       infoWords: config.infoWords,
       timeoutCycles: config.timeoutCycles,
       maxReadRequestBytes: config.maxReadRequestBytes,
+      memoryOutstanding: config.memoryOutstanding,
       fifoSource: config.fifoSource,
       ringSource: config.ringSource,
       resetStatus: config.resetStatus ? Logic(width: 64) : null,
@@ -204,6 +209,10 @@ class DmaBench {
       config: HarborMemoryWaistConfig(
         addressWidth: config.addressWidth,
         dataWidth: config.dataWidth,
+        idWidth: config.memoryOutstanding.bitLength - 1 == 0
+            ? 1
+            : config.memoryOutstanding.bitLength - 1,
+        outstanding: config.memoryOutstanding,
       ),
       withErr: true,
       axiGate: config.axiGate,
