@@ -108,4 +108,76 @@ void main() {
     txLast.inject(1);
     await Simulator.endSimulation();
   });
+  test(
+    'finishes the current packet before granting a configuration request',
+    () async {
+      final clock = SimpleClockGenerator(10).clk;
+      final reset = Logic()..inject(1);
+      final txValid = Logic()..inject(0);
+      final txLast = Logic()..inject(0);
+      final cfgReq = Logic()..inject(0);
+      final dut = HarborPcieTrnAxi(
+        clk: clock,
+        reset: reset,
+        linkUp: Logic()..inject(1),
+        rxReady: Logic()..inject(1),
+        txData: Logic(width: 64)..inject(0x1122334455667788),
+        txKeep: Logic(width: 8)..inject(0xff),
+        txLast: txLast,
+        txValid: txValid,
+        trnRxData: Logic(width: 128)..inject(0),
+        trnRxRem: Logic(width: 2)..inject(0),
+        trnRxSof: Logic()..inject(0),
+        trnRxEof: Logic()..inject(0),
+        trnRxSrcReady: Logic()..inject(0),
+        trnRxSrcDsc: Logic()..inject(0),
+        trnRxErrFwd: Logic()..inject(0),
+        trnRxBarHit: Logic(width: 8)..inject(0),
+        trnRxEcrcErr: Logic()..inject(0),
+        trnTxDstReady: Logic(width: 4)..inject(1),
+        trnTxCfgReq: cfgReq,
+      );
+      await dut.build();
+      unawaited(Simulator.run());
+      await clock.nextPosedge;
+      reset.inject(0);
+      txValid.inject(1);
+      await clock.nextPosedge;
+      await clock.nextNegedge;
+      expect(dut.trnTxSrcReady.value.toBool(), isTrue);
+      expect(dut.trnTxSof.value.toBool(), isTrue);
+      expect(dut.trnTxData.value.toInt(), 0x5566778811223344);
+      expect(dut.trnTxRem.value.toInt(), 1);
+
+      cfgReq.inject(1);
+      await clock.nextPosedge;
+      await clock.nextNegedge;
+      expect(
+        dut.txReady.value.toBool(),
+        isTrue,
+        reason: 'the packet must drain while the hard block waits for grant',
+      );
+      expect(dut.trnTxCfgGrant.value.toBool(), isFalse);
+      txLast.inject(1);
+      await clock.nextPosedge;
+      await clock.nextNegedge;
+      expect(dut.trnTxEof.value.toBool(), isTrue);
+      expect(
+        dut.txReady.value.toBool(),
+        isFalse,
+        reason: 'the next packet must wait for the configuration request',
+      );
+      await clock.nextPosedge;
+      await clock.nextNegedge;
+      expect(dut.trnTxCfgGrant.value.toBool(), isTrue);
+      expect(dut.trnTxSrcReady.value.toBool(), isFalse);
+      expect(dut.txReady.value.toBool(), isFalse);
+      cfgReq.inject(0);
+      await clock.nextPosedge;
+      await clock.nextNegedge;
+      expect(dut.trnTxSrcReady.value.toBool(), isTrue);
+      expect(dut.trnTxSof.value.toBool(), isTrue);
+      await Simulator.endSimulation();
+    },
+  );
 }

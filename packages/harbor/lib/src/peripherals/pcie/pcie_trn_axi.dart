@@ -154,12 +154,19 @@ class HarborPcieTrnAxi extends Module {
     final trnAccept = (trnTxDstReady[0] & linkUp).named('trn_accept');
     final acceptTx = (~txValidReg | trnAccept).named('accept_tx');
     final txTransfer = (txValidReg & trnAccept).named('tx_transfer');
+    // Finish the active packet before granting the configuration request.
+    // Blocking its remaining data would prevent the grant.
+    final packetNeedsData =
+        (txInPacket | txValidReg) & ~(txValidReg & txLastReg);
+    final acceptPacket = (~trnTxCfgReq | packetNeedsData).named(
+      'accept_packet',
+    );
     final swappedTx = [
       txDataReg.slice(31, 0),
       txDataReg.slice(63, 32),
     ].concat();
 
-    addOutput('tx_ready') <= acceptTx & linkUp & ~trnTxCfgReq;
+    addOutput('tx_ready') <= acceptTx & linkUp & acceptPacket;
     addOutput('tx_idle') <= ~txValidReg & ~txInPacket;
     addOutput('trn_tx_data', width: 128) <= swappedTx.zeroExtend(128);
     addOutput('trn_tx_rem', width: 2) <= txKeepReg[7].zeroExtend(2);
@@ -180,9 +187,9 @@ class HarborPcieTrnAxi extends Module {
           If(
             acceptTx,
             then: [
-              txValidReg < txValid & ~trnTxCfgReq,
+              txValidReg < txValid & acceptPacket,
               If(
-                txValid & ~trnTxCfgReq,
+                txValid & acceptPacket,
                 then: [
                   txDataReg < txData,
                   txKeepReg < txKeep,
