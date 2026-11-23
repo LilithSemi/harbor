@@ -21,6 +21,12 @@ import 'pcie_stream.dart';
 ///   block waits for each write response before it continues. A write that
 ///   gets a fabric error, a poisoned write and a write longer than
 ///   [maxPayloadBytes] are dropped and counted in `write_errors`.
+/// - Each wait for the memory has a limit of [timeoutCycles] cycles with no
+///   progress. On a timeout a write is dropped and counted in `write_errors`
+///   and `timeout_errors`. A read gets one completion with status CA for
+///   the rest of the request and is counted in `timeout_errors`. A late
+///   response of an abandoned request is read and discarded. A slave that
+///   stops taking write data in the middle of a burst is not recoverable.
 /// - A memory read is answered by completions. The first ends at the read
 ///   completion boundary, the next ones have the maximum payload size, and
 ///   the last ends at the end of the request. The block reads one
@@ -60,8 +66,15 @@ class HarborPcieMemoryCompleter extends BridgeModule {
   /// The memory master port.
   late final HarborMemoryMasterPort memory;
 
+  /// Cycles without progress that a wait for the memory can last. A value of
+  /// 8192 is 65 us at 125 MHz.
+  final int timeoutCycles;
+
   /// Count of dropped writes. It stops at 0xffff.
   Logic get writeErrors => output('write_errors');
+
+  /// Count of timeouts. It stops at 0xffff.
+  Logic get timeoutErrors => output('timeout_errors');
 
   HarborPcieMemoryCompleter({
     required Logic clk,
@@ -79,6 +92,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     this.memoryOffset = 0,
     int? barHitBit,
     this.maxPayloadBytes = 256,
+    this.timeoutCycles = 8192,
     String? name,
   }) : width = rx.width,
        barBytes = _barSize(endpointConfig, barBytes),
@@ -88,7 +102,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
          '_${fabricKind.name}'
          '_S${_barSize(endpointConfig, barBytes).toRadixString(16)}'
          '_O${memoryOffset.toRadixString(16)}'
-         '_B${_hitBit(endpointConfig, barHitBit)}_P$maxPayloadBytes',
+         '_B${_hitBit(endpointConfig, barHitBit)}_P${maxPayloadBytes}_T$timeoutCycles',
          name: name ?? 'pcie_memory_completer',
        ) {
     _validate(tx);
@@ -199,6 +213,9 @@ class HarborPcieMemoryCompleter extends BridgeModule {
         BigInt.one << addressWidth) {
       throw ArgumentError('the BAR does not fit in $addressWidth bits');
     }
+    if (timeoutCycles < 16) {
+      throw ArgumentError.value(timeoutCycles, 'timeoutCycles', 'at least 16');
+    }
     if (barHitBit < 2 || barHitBit > 8) {
       throw RangeError.range(barHitBit, 2, 8, 'barHitBit');
     }
@@ -289,6 +306,13 @@ class HarborPcieMemoryCompleter extends BridgeModule {
 
     final errCount = Logic(name: 'err_count', width: 16);
     addOutput('write_errors', width: 16) <= errCount;
+    final tmoCount = Logic(name: 'tmo_count', width: 16);
+    addOutput('timeout_errors', width: 16) <= tmoCount;
+    // Abandoned bursts whose responses have not come. Responses of one
+    // ID are in order, so the oldest responses belong to these.
+    final orphanB = Logic(name: 'orphan_b', width: 4);
+    final orphanR = Logic(name: 'orphan_r', width: 4);
+    final tmoWait = Logic(name: 'tmo_wait', width: _log2(timeoutCycles) + 1);
 
     Logic laneOf(Logic addr) => dpb == 1
         ? Const(0, width: 2)
@@ -438,10 +462,16 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     mem.wdataStrb <= strb;
     mem.wdataLast <= burstLeft.eq(1);
     final wFire = mem.wdataValid & mem.wdataReady;
-    mem.wrespReady <= inState(sWresp);
-    final bFire = mem.wrespValid & mem.wrespReady;
-    mem.rdataReady <= inState(sRdata);
-    final rFire = mem.rdataValid & mem.rdataReady;
+    final drainB = orphanB.neq(0);
+    final drainR = orphanR.neq(0);
+    mem.wrespReady <= inState(sWresp) | drainB;
+    mem.rdataReady <= inState(sRdata) | drainR;
+    final bFire = mem.wrespValid & inState(sWresp) & ~drainB;
+    final rFire = mem.rdataValid & inState(sRdata) & ~drainR;
+    final waiting =
+        inState(sReq) | inState(sWdata) | inState(sWresp) | inState(sRdata);
+    final progress = reqFire | wFire | bFire | rFire;
+    final timeout = waiting & ~progress & tmoWait.eq(timeoutCycles - 1);
 
     // TX side.
     final cplData = cplStatus.eq(0);
@@ -566,10 +596,34 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       ];
     }
 
+    List<Conditional> orphanUpdate(Logic count, Logic add, Logic drained) => [
+      If(
+        add & ~drained,
+        then: [
+          If(~count.and(), then: [count < count + 1]),
+        ],
+        orElse: [
+          If(drained & ~add, then: [count < count - 1]),
+        ],
+      ),
+    ];
+
+    List<Conditional> readAbort() => [
+      cplStatus < statusCa,
+      txT < 0,
+      totalDw < 3,
+      txBase < lane0.zeroExtend(idxW) - 3,
+      state < sTx,
+    ];
+
     Sequential(clk, [
       If(
         reset,
         then: [
+          orphanB < 0,
+          orphanR < 0,
+          tmoWait < 0,
+          tmoCount < 0,
           state < sRx,
           pastHeader < 0,
           rxBase < 0,
@@ -580,6 +634,30 @@ class HarborPcieMemoryCompleter extends BridgeModule {
           totalDw < 3,
         ],
         orElse: [
+          If(
+            ~waiting | progress,
+            then: [tmoWait < 0],
+            orElse: [tmoWait < tmoWait + 1],
+          ),
+          ...orphanUpdate(
+            orphanB,
+            timeout & inState(sWresp),
+            mem.wrespValid & mem.wrespReady & drainB,
+          ),
+          ...orphanUpdate(
+            orphanR,
+            timeout & inState(sRdata),
+            mem.rdataValid & mem.rdataReady & drainR & mem.rdataLast,
+          ),
+          If(
+            timeout,
+            then: [
+              tmoWait < 0,
+              If(~tmoCount.and(), then: [tmoCount < tmoCount + 1]),
+              If(opWrite, then: [...countError(), state < sRx]),
+              If(~opWrite, then: [...readAbort()]),
+            ],
+          ),
           Case(state, [
             CaseItem(Const(sRx, width: 3), [
               If(

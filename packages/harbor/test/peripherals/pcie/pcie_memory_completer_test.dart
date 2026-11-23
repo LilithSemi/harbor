@@ -69,6 +69,7 @@ class _Bench {
     int seed = 1,
     double gapChance = 0.3,
     double readyChance = 0.6,
+    int timeoutCycles = 8192,
   }) async {
     final clk = SimpleClockGenerator(10).clk;
     final reset = Logic(name: 'reset');
@@ -89,6 +90,7 @@ class _Bench {
       barBytes: _barBytes,
       memoryOffset: config.memoryOffset,
       maxPayloadBytes: config.maxPayloadBytes,
+      timeoutCycles: timeoutCycles,
     );
     final top = MasterTop(
       dut,
@@ -149,6 +151,14 @@ class _Bench {
   };
 
   int get writeErrors => top.output('write_errors').value.toInt();
+
+  int get timeoutErrors => top.output('timeout_errors').value.toInt();
+
+  Future<void> idle(int cycles) async {
+    for (var i = 0; i < cycles; i++) {
+      await clk.nextPosedge;
+    }
+  }
 
   int fabric(int hostAddress) =>
       config.memoryOffset + (hostAddress & (_barBytes - 1));
@@ -604,6 +614,108 @@ void main() {
       for (var i = 0; i < 32; i++) bench.fabric(0xc0000300 + i),
     ]);
     await bench.finish();
+  });
+
+  group('memory timeout', () {
+    const config = _Config(width: 64, dataWidth: 64);
+    const limit = 64;
+
+    test('a silent slave drops a write and the block recovers', () async {
+      final bench = await _Bench.create(config, seed: 31, timeoutCycles: limit);
+      await bench.start();
+      final r = Random(31);
+      bench.memory.writeLimit = 0;
+      await bench.driver.send(
+        PcieTlp.memWrite(address: 0xc0000200, data: _bytes(r, 32)),
+        user: HarborPcieStream.userBar2,
+      );
+      await bench.idle(limit * 3);
+      expect(bench.timeoutErrors, 1);
+      expect(bench.writeErrors, 1);
+      bench.memory.writeLimit = null;
+      await bench.write(
+        PcieTlp.memWrite(address: 0xc0000300, data: _bytes(r, 32)),
+      );
+      final flush = PcieTlp.memRead(address: 0xc0000300, lengthDw: 8);
+      final want = await bench.read(flush);
+      await bench.checkReads([(flush, want)], rcb: 64, maxPayload: 256);
+      expect(bench.timeoutErrors, 1);
+      await bench.finish();
+    });
+
+    test('a silent slave gives a CA completion on a read', () async {
+      final bench = await _Bench.create(config, seed: 32, timeoutCycles: limit);
+      await bench.start();
+      bench.memory.readLimit = 0;
+      final tlp = PcieTlp.memRead(address: 0xc0000100, lengthDw: 8, tag: 5);
+      final want = await bench.read(tlp);
+      await bench.checkReads(
+        [(tlp, want)],
+        rcb: 64,
+        maxPayload: 256,
+        aborted: {0},
+      );
+      expect(bench.sink.received.single.tag, 5);
+      expect(bench.timeoutErrors, 1);
+      expect(bench.writeErrors, 0);
+      bench.memory.readLimit = null;
+      await bench.idle(limit);
+      final again = PcieTlp.memRead(address: 0xc0000140, lengthDw: 8, tag: 6);
+      final wantAgain = await bench.read(again);
+      await bench.checkReads(
+        [(tlp, want), (again, wantAgain)],
+        rcb: 64,
+        maxPayload: 256,
+        aborted: {0},
+      );
+      await bench.finish();
+    });
+
+    test('a late write response is not taken for a later write', () async {
+      final bench = await _Bench.create(config, seed: 33, timeoutCycles: limit);
+      await bench.start();
+      final r = Random(33);
+      bench.memory.writeLimit = 0;
+      await bench.driver.send(
+        PcieTlp.memWrite(address: 0xc0000200, data: _bytes(r, 8)),
+        user: HarborPcieStream.userBar2,
+      );
+      await bench.idle(limit * 3);
+      expect(bench.timeoutErrors, 1);
+      bench.memory.writeLimit = 0;
+      // The slave answers the first write late while the next write waits.
+      await bench.write(
+        PcieTlp.memWrite(address: 0xc0000400, data: _bytes(r, 8)),
+      );
+      bench.memory.writeLimit = null;
+      await bench.idle(limit * 3);
+      expect(bench.timeoutErrors, 1);
+      final flush = PcieTlp.memRead(address: 0xc0000400, lengthDw: 2);
+      final want = await bench.read(flush);
+      await bench.checkReads([(flush, want)], rcb: 64, maxPayload: 256);
+      await bench.finish();
+    });
+
+    test('late read data is not taken for a later read', () async {
+      final bench = await _Bench.create(config, seed: 34, timeoutCycles: limit);
+      await bench.start();
+      bench.memory.readLimit = 0;
+      final first = PcieTlp.memRead(address: 0xc0000100, lengthDw: 16, tag: 1);
+      final wantFirst = await bench.read(first);
+      await bench.idle(limit * 3);
+      expect(bench.timeoutErrors, 1);
+      bench.memory.readLimit = null;
+      final second = PcieTlp.memRead(address: 0xc0000800, lengthDw: 16, tag: 2);
+      final wantSecond = await bench.read(second);
+      await bench.checkReads(
+        [(first, wantFirst), (second, wantSecond)],
+        rcb: 64,
+        maxPayload: 256,
+        aborted: {0},
+      );
+      expect(bench.timeoutErrors, 1);
+      await bench.finish();
+    });
   });
 
   for (final width in [64, 128]) {
