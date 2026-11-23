@@ -37,6 +37,10 @@ class MasterCfg {
 
   /// The master declares that it never stalls write data inside a burst.
   final bool writeStallFree;
+
+  /// The slaves this master reaches, or null for all (see
+  /// [HarborFabricMaster.reach]).
+  final Set<String>? reach;
   const MasterCfg(
     this.name,
     this.idWidth,
@@ -46,6 +50,7 @@ class MasterCfg {
     this.realtime = false,
     this.exclusiveIds,
     this.writeStallFree = false,
+    this.reach,
   });
 }
 
@@ -151,6 +156,7 @@ class FabricShell extends BridgeModule {
           realtime: m.realtime,
           exclusiveIds: m.exclusiveIds,
           writeStallFree: m.writeStallFree,
+          reach: m.reach,
         ),
       );
     }
