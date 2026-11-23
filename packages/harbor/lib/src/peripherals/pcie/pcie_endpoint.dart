@@ -400,6 +400,9 @@ class HarborPcieEndpoint extends Module with HarborClockRateProvider {
       busMasterEnable: hardBlock.output('CFGCOMMANDBUSMASTERENABLE'),
       interruptDisable: hardBlock.output('CFGCOMMANDINTERRUPTDISABLE'),
       interruptRdyN: hardBlock.output('CFGINTERRUPTRDYN'),
+      // Send at most one MSI each millisecond, so that a held cause cannot
+      // flood the host.
+      minMsiCycles: (phy.userClkHz + 999) ~/ 1000,
     );
     interruptN <= interrupt.interruptN;
     interruptDi <= interrupt.interruptDi;

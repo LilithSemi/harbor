@@ -100,6 +100,7 @@ class _Bench {
     int mm = 3,
     bool bme = true,
     int seed = 1,
+    int minMsiCycles = 0,
   }) async {
     dut = HarborPcieInterrupt(
       clk: clk,
@@ -111,6 +112,7 @@ class _Bench {
       busMasterEnable: busMaster,
       interruptDisable: intDisable,
       interruptRdyN: rdyN,
+      minMsiCycles: minMsiCycles,
     );
     await dut.build();
     reset.inject(1);
@@ -151,6 +153,51 @@ class _Bench {
 
 void main() {
   tearDown(Simulator.reset);
+
+  test('bounds repeated MSI edges and retains pending vectors', () async {
+    const interval = 64;
+    final bench = _Bench();
+    await bench.start(minMsiCycles: interval);
+    for (var i = 0; i < 128; i++) {
+      await bench.set(bench.irq, i.isEven ? 0xff : 0);
+      await bench.idle(2);
+    }
+    await bench.set(bench.irq, 0);
+    await bench.idle(interval * 10);
+    final times = bench.stub.msiTimes;
+    expect(times, isNotEmpty);
+    for (var i = 1; i < times.length; i++) {
+      expect(times[i] - times[i - 1], greaterThanOrEqualTo(interval * 10));
+    }
+    expect(bench.stub.msis.toSet(), {0, 1, 2, 3, 4, 5, 6, 7});
+    final count = times.length;
+    await bench.idle(interval * 2);
+    expect(times.length, count);
+    await bench.finish();
+  });
+
+  test(
+    'retains a completion during MSI cooldown and transmit backpressure',
+    () async {
+      final bench = _Bench();
+      await bench.start(mm: 0, minMsiCycles: 64);
+      await bench.set(bench.irq, 1);
+      await bench.idle(20);
+      expect(bench.stub.msis, [0]);
+      await bench.set(bench.txBusy, 1);
+      await bench.set(bench.irq, 0);
+      await bench.set(bench.irq, 1);
+      await bench.set(bench.irq, 0);
+      await bench.idle(100);
+      expect(bench.stub.msis, [0]);
+      await bench.set(bench.txBusy, 0);
+      await bench.idle(20);
+      expect(bench.stub.msis, [0, 0]);
+      await bench.idle(100);
+      expect(bench.stub.msis, [0, 0]);
+      await bench.finish();
+    },
+  );
 
   test('sends the lowest pending vector first with 8 granted', () async {
     final bench = _Bench();

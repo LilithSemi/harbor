@@ -5,6 +5,8 @@ import 'package:rohd/rohd.dart';
 /// With MSI on, each rising edge of a pending bit sends one MSI. A bit at or
 /// above the granted vector count goes out as vector 0. With MSI off, INTA
 /// stays asserted while any bit is set.
+/// [minMsiCycles] sets the minimum gap after each accepted MSI. Edges during
+/// the gap stay pending, with repeated edges of one vector combined.
 class HarborPcieInterrupt extends Module {
   Logic get interruptN => output('interrupt_n');
   Logic get interruptDi => output('interrupt_di');
@@ -20,8 +22,12 @@ class HarborPcieInterrupt extends Module {
     required Logic busMasterEnable,
     required Logic interruptDisable,
     required Logic interruptRdyN,
+    int minMsiCycles = 0,
     super.name = 'pcie_interrupt',
   }) : super(definitionName: 'HarborPcieInterrupt') {
+    if (minMsiCycles < 0) {
+      throw ArgumentError.value(minMsiCycles, 'minMsiCycles');
+    }
     clk = addInput('clk', clk);
     reset = addInput('reset', reset);
     irqPending = addInput('irq_pending', irqPending, width: 8);
@@ -39,6 +45,9 @@ class HarborPcieInterrupt extends Module {
     final vector = Logic(name: 'vector', width: 8);
     final assertMessage = Logic(name: 'assert_message');
     final intxAsserted = Logic(name: 'intx_asserted');
+    final cooldown = minMsiCycles > 0
+        ? Logic(name: 'msi_cooldown', width: minMsiCycles.bitLength)
+        : null;
 
     final grantedMask = mux(
       mmEnable.eq(0),
@@ -76,9 +85,13 @@ class HarborPcieInterrupt extends Module {
     final accepted = (active & ~interruptRdyN).named('accepted');
     final level = irqPending.or().named('level');
     final startMsi =
-        (~active & msiEnable & busMasterEnable & ~txBusy & latched.or()).named(
-          'start_msi',
-        );
+        (~active &
+                msiEnable &
+                busMasterEnable &
+                ~txBusy &
+                latched.or() &
+                (cooldown?.eq(0) ?? Const(1)))
+            .named('start_msi');
     final startAssert =
         (~active &
                 ~msiEnable &
@@ -106,8 +119,17 @@ class HarborPcieInterrupt extends Module {
           vector < 0,
           assertMessage < 0,
           intxAsserted < 0,
+          if (cooldown != null) cooldown < 0,
         ],
         orElse: [
+          if (cooldown != null)
+            If(
+              accepted & activeMsi,
+              then: [cooldown < minMsiCycles - 1],
+              orElse: [
+                If(cooldown.neq(0), then: [cooldown < cooldown - 1]),
+              ],
+            ),
           If(
             msiEnable,
             then: [previous < irqPending, latched < (taken | edges)],
