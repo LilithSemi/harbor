@@ -308,8 +308,17 @@ class HarborSoC extends BridgeModule {
   late final HarborClockGenerator _clockGen;
 
   // The reset that is not the soft reset: the reset pin or the power-on
-  // reset. The SoC reset adds the soft reset request to it.
+  // reset, and the reset request. The SoC reset adds the soft reset request
+  // to it.
   late final Logic _hardReset;
+
+  // The reset pin or the power-on reset, before a reset request.
+  late final Logic _boardReset;
+
+  /// The reset pin or the power-on reset, without the reset request and the
+  /// soft reset. A module that makes the reset request takes this reset, so
+  /// that its request does not clear itself.
+  Logic get hardReset => _boardReset;
 
   // The reset of everything on the SoC, with the soft reset request.
   late final Logic _systemReset;
@@ -456,6 +465,9 @@ class HarborSoC extends BridgeModule {
   ///
   /// Accepts an optional list of [clocks] to generate PLL-derived
   /// clock domains. If empty, the external `clk` input is used directly.
+  ///
+  /// A high [resetRequest] resets the full SoC, as the reset pin does. Drive
+  /// it from a module that takes [hardReset] as its reset.
   HarborSoC({
     required String name,
     required this.compatible,
@@ -473,6 +485,7 @@ class HarborSoC extends BridgeModule {
     this.interruptContexts = const [],
     this.externalReset = false,
     this.softReset = false,
+    Logic? resetRequest,
     this.cpus = const [],
     this.target,
     this.exclusiveSlotBudget = HarborExclusive.defaultSlotBudget,
@@ -536,6 +549,11 @@ class HarborSoC extends BridgeModule {
           : por;
     } else {
       resetSignal = input('reset');
+    }
+    _boardReset = resetSignal;
+    // A module in the SoC can reset the full SoC, clock generator included.
+    if (resetRequest != null) {
+      resetSignal = (resetSignal | resetRequest).named('systemResetRequest');
     }
     _hardReset = resetSignal;
     if (softReset) {
