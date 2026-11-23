@@ -119,7 +119,7 @@ class HarborPcieTrnAxi extends Module {
                   rxDataReg < swappedRx,
                   rxKeepReg <
                       mux<Logic>(
-                        trnRxRem[0],
+                        ~trnRxEof | trnRxRem[0],
                         Const(0xff, width: 8),
                         Const(0x0f, width: 8),
                       ),

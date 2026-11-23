@@ -13,7 +13,7 @@ void main() {
     final linkUp = Logic()..inject(1);
     final rxReady = Logic()..inject(0);
     final trnData = Logic(width: 128)..inject(0x1122334455667788);
-    final trnRem = Logic(width: 2)..inject(1);
+    final trnRem = Logic(width: 2)..inject(0);
     final trnSof = Logic()..inject(1);
     final trnEof = Logic()..inject(0);
     final trnValid = Logic()..inject(1);
@@ -54,6 +54,13 @@ void main() {
     await clock.nextNegedge;
     expect(dut.rxData.value.toInt(), 0x5566778811223344);
     expect(dut.trnRxReady.value.toBool(), isFalse);
+
+    rxReady.inject(1);
+    trnEof.inject(1);
+    await clock.nextPosedge;
+    await clock.nextNegedge;
+    expect(dut.rxKeep.value.toInt(), 0x0f);
+    expect(dut.rxLast.value.toBool(), isTrue);
     await Simulator.endSimulation();
   });
 
