@@ -688,9 +688,11 @@ class HarborAxi4Fabric extends HarborFabricModule {
       final lastOne = cnt.eq(Const(n - 1, width: cw));
       final awWant = anyOf([for (var m = 0; m < nm; m++) req[m][0][t]]);
       final arWant = anyOf([for (var m = 0; m < nm; m++) req[m][1][t]]);
-      final rtTarget =
-          t < nst &&
-          masters.any((m) => m.realtime && m.reaches(slaves[tSlave[t]].name));
+      // The error target counts as real-time in a fabric with a real-time
+      // master, as any master can decode to it.
+      final rtTarget = t < nst
+          ? masters.any((m) => m.realtime && m.reaches(slaves[tSlave[t]].name))
+          : hasRt;
       // A real-time request in one direction takes the last slot from a
       // request in the other direction.
       var prefer = preferRead;
@@ -709,10 +711,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
           mux(awRt & ~arRt, Const(0), preferRead),
         );
       }
-      outOk.add([
-        ~full & ~(lastOne & prefer & (rtTarget ? arWant : Const(1))),
-        ~full & ~(lastOne & ~prefer & (rtTarget ? awWant : Const(1))),
-      ]);
+      outOk.add(
+        rtTarget
+            ? [
+                ~full & ~(lastOne & arWant & prefer),
+                ~full & ~(lastOne & awWant & ~prefer),
+              ]
+            : [~full & ~(lastOne & prefer), ~full & ~(lastOne & ~prefer)],
+      );
       Sequential(c, reset: r, [
         cnt <
             cnt +
@@ -720,14 +726,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
                 tFire[t][1].zeroExtend(cw) -
                 bDone[t].zeroExtend(cw) -
                 rDone[t].zeroExtend(cw),
-        // The direction turns when the other direction wants the slot. A
-        // stream in one direction keeps it and does not wait.
-        preferRead <
-            preferRead ^
-                (lastOne &
-                    (rtTarget
-                        ? awWant & arWant
-                        : mux(preferRead, awWant, arWant))),
+        // On a target that is not real-time, the direction turns when the
+        // other direction wants the slot. A stream in one direction keeps it
+        // and does not wait.
+        if (rtTarget)
+          preferRead < preferRead ^ (lastOne & awWant & arWant)
+        else
+          preferRead < preferRead ^ (lastOne & mux(preferRead, awWant, arWant)),
       ]);
     }
 
