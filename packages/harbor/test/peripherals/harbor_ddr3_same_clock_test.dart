@@ -11,18 +11,23 @@ import 'ddr3_fast_bench.dart';
 const _artix = HarborFpgaTarget.artix7(device: 'xc7a200t', package: 'fbg484');
 const _kc705Pins = ['clk', 'clk_n', 'uart_tx', 'uart_rx'];
 
-HarborDdr3 _ddr({bool sameClock = false, HarborDeviceTarget? target}) =>
-    HarborDdr3(
-      config: const HarborDdrConfig.ax7203(),
-      baseAddress: 0x80000000,
-      clockHz: 83333333,
-      busAddressWidth: 32,
-      busDataWidth: 32,
-      ckPeriodPs: 3000,
-      protocol: HarborFabricKind.axi4,
-      sameClock: sameClock,
-      target: target ?? _artix,
-    );
+HarborDdr3 _ddr({
+  bool sameClock = false,
+  bool performanceMonitor = false,
+  HarborFabricKind protocol = HarborFabricKind.axi4,
+  HarborDeviceTarget? target,
+}) => HarborDdr3(
+  config: const HarborDdrConfig.ax7203(),
+  baseAddress: 0x80000000,
+  clockHz: 83333333,
+  busAddressWidth: 32,
+  busDataWidth: 32,
+  ckPeriodPs: 3000,
+  protocol: protocol,
+  sameClock: sameClock,
+  performanceMonitor: performanceMonitor,
+  target: target ?? _artix,
+);
 
 class _Cpu extends BridgeModule {
   _Cpu() : super('SameClockCpu', name: 'cpu') {
@@ -88,18 +93,13 @@ void main() {
       expect(ddr.inputs.keys, isNot(contains('ddr_clk')));
       expect(ddr.inputs.keys, isNot(contains('ddr_reset')));
       expect(ddr.inputs.keys, contains('ddr_ck_fast'));
-      // The performance events are on the fabric clock, so they are ports.
-      expect(ddr.performanceClock, isNotNull);
-      expect(
-        ddr.performanceEvents.keys,
-        containsAll(['controller_accept', 'ch0_read_wait', 'ch0_latency_ge64']),
-      );
-      for (final name in ddr.performanceEvents.keys) {
-        expect(ddr.outputs.keys, contains('perf_$name'));
-      }
+      expect(ddr.performanceEvents, isEmpty);
+      expect(ddr.outputs.keys.where((n) => n.startsWith('perf_')), isEmpty);
       await ddr.build();
       final sv = ddr.dumpSystemVerilog();
       for (final name in [
+        'Ddr3PerformanceMonitor',
+        'ddr_performance_monitor',
         'HarborMemoryWaistCdc',
         'HarborCdcSync',
         'HarborCdcHandshake',
@@ -126,6 +126,48 @@ void main() {
         expect(sv, contains(name), reason: name);
       }
     });
+
+    test('the performance monitor adds the perf ports', () async {
+      final ddr = _ddr(sameClock: true, performanceMonitor: true);
+      expect(ddr.definitionName, isNot(_ddr(sameClock: true).definitionName));
+      expect(ddr.performanceClock, isNotNull);
+      expect(
+        ddr.performanceEvents.keys,
+        containsAll([
+          'controller_accept',
+          'ch0_read_wait',
+          'ch0_latency_ge64',
+          'ch0_latency_invalid_cycles',
+        ]),
+      );
+      for (final name in ddr.performanceEvents.keys) {
+        expect(ddr.outputs.keys, contains('perf_$name'));
+      }
+      await ddr.build();
+      expect(ddr.dumpSystemVerilog(), contains('Ddr3PerformanceMonitor'));
+    });
+
+    for (final (why, sameClock, protocol) in [
+      ('without sameClock', false, HarborFabricKind.axi4),
+      ('on a Wishbone port', true, HarborFabricKind.wishbone),
+    ]) {
+      test('the performance monitor is refused $why', () {
+        expect(
+          () => _ddr(
+            sameClock: sameClock,
+            performanceMonitor: true,
+            protocol: protocol,
+          ),
+          throwsA(
+            isA<ArgumentError>().having(
+              (e) => e.name,
+              'name',
+              'performanceMonitor',
+            ),
+          ),
+        );
+      });
+    }
 
     test('the flag changes the definition name', () {
       expect(

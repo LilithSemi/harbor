@@ -3,13 +3,16 @@ import 'package:rohd/rohd.dart';
 import '../bus/port/memory_waist.dart';
 import 'ddr3_command_latency.dart';
 
-/// Event pulses for performance counters of a DDR3 memory port.
+/// Event signals for performance counters of a DDR3 memory port.
 ///
 /// Each event is high for one cycle per occurrence: controller commands,
 /// stalls and returns, and per waist the requests, beats, stalls and read
 /// waits. With [readLatency], each read channel also has a histogram of
-/// controller read latency in four bins. The monitor only observes, and no
-/// output goes back to flow control.
+/// controller read latency in four bins. `ch<i>_latency_invalid_cycles` is
+/// a level, not a pulse: it stays high after a timestamp overflow or an
+/// unmatched return until reset, so a counter of it counts the cycles with
+/// no valid histogram. The monitor only observes, and no output goes back
+/// to flow control.
 class Ddr3PerformanceMonitor extends Module {
   /// The event outputs, by name.
   final Map<String, Logic> events = {};
@@ -52,7 +55,11 @@ class Ddr3PerformanceMonitor extends Module {
           wrReady = observe('wr_ready', w.wrespReady);
       final accepted = reqValid & reqReady, readRequest = accepted & ~write;
       final readBeat = rdValid & rdReady, readDone = readBeat & rdLast;
-      final pending = Logic(name: 'ch${i}_pending', width: 32);
+      // A waist has at most `outstanding` reads in flight.
+      final pending = Logic(
+        name: 'ch${i}_pending',
+        width: w.config.outstanding.bitLength,
+      );
       Sequential(clk, reset: reset | clear, [
         If(readRequest & ~readDone, then: [pending < pending + 1]),
         If(readDone & ~readRequest, then: [pending < pending - 1]),

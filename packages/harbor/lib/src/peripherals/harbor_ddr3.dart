@@ -122,6 +122,12 @@ class HarborDdr3 extends BridgeModule
   /// `reset` must be synchronous to it. The sim target is unchanged.
   final bool sameClock;
 
+  /// When true, a [Ddr3PerformanceMonitor] watches the memory ports and the
+  /// controller, and its events go out on [performanceEvents]. It needs
+  /// [sameClock], so the events are on the fabric clock, and an AXI4 or
+  /// TileLink port.
+  final bool performanceMonitor;
+
   /// When true, the controller runs in train=runtime: the PHY calibration
   /// knobs are exposed through an extra SoC-facing wishbone slave [trainBus]
   /// (the wb2 knob-ABI window) and the dtNode gains a `training` child. When
@@ -210,9 +216,9 @@ class HarborDdr3 extends BridgeModule
   /// The wrapped controller, exposed for simulation tests.
   Ddr3Controller? controller;
 
-  /// One-cycle event pulses of the [Ddr3PerformanceMonitor], by event name.
-  /// Each is also the output `perf_<name>`. Only a [sameClock] build with a
-  /// memory port front end has them, so the events are on the fabric clock.
+  /// The event signals of the [Ddr3PerformanceMonitor], by event name.
+  /// Each is also the output `perf_<name>`. Only a build with
+  /// [performanceMonitor] has them.
   final Map<String, Logic> performanceEvents = {};
 
   /// The clock of [performanceEvents], or null when there are no events.
@@ -239,6 +245,7 @@ class HarborDdr3 extends BridgeModule
     this.ckPeriodPs = 3333,
     this.controllerGearRatio = 1,
     this.sameClock = false,
+    this.performanceMonitor = false,
     this.runtimeTrainable = false,
     this.memoryFormFactor = HarborMemoryFormFactor.chip,
     this.simExternalMem = false,
@@ -270,6 +277,7 @@ class HarborDdr3 extends BridgeModule
            ckPeriodPs: ckPeriodPs,
            controllerGearRatio: controllerGearRatio,
            sameClock: sameClock,
+           performanceMonitor: performanceMonitor,
            runtimeTrainable: runtimeTrainable,
            simExternalMem: simExternalMem,
            protocol: protocol,
@@ -295,6 +303,13 @@ class HarborDdr3 extends BridgeModule
         this.outstanding,
         'outstanding',
         'a Wishbone port holds 1 request',
+      );
+    }
+    if (performanceMonitor && (wishbone || !sameClock)) {
+      throw ArgumentError.value(
+        performanceMonitor,
+        'performanceMonitor',
+        'needs sameClock and an AXI4 or TileLink port',
       );
     }
     if (writeCombine && !wishbone) {
@@ -619,6 +634,7 @@ class HarborDdr3 extends BridgeModule
     required int ckPeriodPs,
     required int controllerGearRatio,
     required bool sameClock,
+    required bool performanceMonitor,
     required bool runtimeTrainable,
     required bool simExternalMem,
     required HarborFabricKind protocol,
@@ -684,6 +700,7 @@ class HarborDdr3 extends BridgeModule
         if (fastSim) 'fast',
         if (powerOnCycles != 4095) 'p$powerOnCycles',
         if (sc) 'sc',
+        if (performanceMonitor) 'pm',
         ?exclusive?.tag,
       ],
     );
@@ -1193,7 +1210,7 @@ struct DramStore {
         readWords: readWords,
       );
     }
-    if (!wishbone && sameClock) {
+    if (performanceMonitor) {
       performanceClock = addOutput('perf_clk')..gets(ddrClk);
       performanceReset = addOutput('perf_reset')..gets(ddrReset);
       final monitor = Ddr3PerformanceMonitor(
