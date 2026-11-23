@@ -317,8 +317,9 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     addOutput('timeout_errors', width: 16) <= tmoCount;
     // Abandoned bursts whose responses have not come. Responses of one
     // ID are in order, so the oldest responses belong to these.
-    final orphanB = Logic(name: 'orphan_b', width: 4);
-    final orphanR = Logic(name: 'orphan_r', width: 4);
+    // A timeout drains the bus before new work starts, so each count is 0 or 1.
+    final orphanB = Logic(name: 'orphan_b');
+    final orphanR = Logic(name: 'orphan_r');
     final owed = Logic(name: 'owed', width: 9);
     final tmoWait = Logic(name: 'tmo_wait', width: _log2(timeoutCycles) + 1);
 
@@ -463,16 +464,22 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     // Bytes with no strobe are driven 0.
     final strb = strobes.rconcat();
     final raw = [for (var l = dpb - 1; l >= 0; l--) window[l]].concat();
+    final liveData = [
+      for (var b = beatBytes - 1; b >= 0; b--)
+        mux(strb[b], raw.slice(8 * b + 7, 8 * b), Const(0, width: 8)),
+    ].concat();
+    // The beat offered at a timeout stays unchanged until the bus takes it.
+    final heldData = Logic(name: 'held_data', width: 8 * beatBytes);
+    final heldStrb = Logic(name: 'held_strb', width: beatBytes);
+    final heldBeat = Logic(name: 'held_beat');
     mem.wdataData <=
-        [
-          for (var b = beatBytes - 1; b >= 0; b--)
-            mux(
-              strb[b] & ~drainW,
-              raw.slice(8 * b + 7, 8 * b),
-              Const(0, width: 8),
-            ),
-        ].concat();
-    mem.wdataStrb <= mux(drainW, Const(0, width: beatBytes), strb);
+        mux(
+          drainW,
+          mux(heldBeat, heldData, Const(0, width: 8 * beatBytes)),
+          liveData,
+        );
+    mem.wdataStrb <=
+        mux(drainW, mux(heldBeat, heldStrb, Const(0, width: beatBytes)), strb);
     mem.wdataLast <= mux(drainW, owed.eq(1), burstLeft.eq(1));
     final wFire = mem.wdataValid & mem.wdataReady & ~drainW;
     final owedFire = mem.wdataValid & mem.wdataReady & drainW;
@@ -615,11 +622,9 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     List<Conditional> orphanUpdate(Logic count, Logic add, Logic drained) => [
       If(
         add & ~drained,
-        then: [
-          If(~count.and(), then: [count < count + 1]),
-        ],
+        then: [count < 1],
         orElse: [
-          If(drained & ~add, then: [count < count - 1]),
+          If(drained & ~add, then: [count < 0]),
         ],
       ),
     ];
@@ -639,6 +644,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
           orphanB < 0,
           orphanR < 0,
           owed < 0,
+          heldBeat < 0,
           tmoWait < 0,
           tmoCount < 0,
           state < sRx,
@@ -663,9 +669,14 @@ class HarborPcieMemoryCompleter extends BridgeModule {
           ),
           If(
             timeout & inState(sWdata),
-            then: [owed < burstLeft],
+            then: [
+              owed < burstLeft,
+              heldBeat < 1,
+              heldData < liveData,
+              heldStrb < strb,
+            ],
             orElse: [
-              If(owedFire, then: [owed < owed - 1]),
+              If(owedFire, then: [owed < owed - 1, heldBeat < 0]),
             ],
           ),
           ...orphanUpdate(

@@ -88,10 +88,62 @@ void main() {
           final want = await bench.read(flush);
           await bench.checkReads([(flush, want)], rcb: 64, maxPayload: 256);
           expect(bench.timeoutErrors, 1);
+          // The port holds a few beats the completer already sent, and the
+          // stalled beat lands. No drain beat after them writes a byte.
+          final landed = switch (kind) {
+            HarborFabricKind.wishbone => 12,
+            HarborFabricKind.axi4 => 20,
+            HarborFabricKind.tilelink => 36,
+          };
+          final first = bench.fabric(0xc0000200) + landed;
+          bench.checkMemory(
+            bench.span(0xc0000200, 128).where((a) => a >= first),
+          );
           await bench.finish();
         },
       );
     }
+
+    test('a stalled write beat holds its data across a timeout', () async {
+      final bench = await start(
+        CompleterConfig(dataWidth: 32, kind: HarborFabricKind.wishbone),
+        39,
+      );
+      final r = Random(39);
+      final dut = bench.top.subModules.firstWhere(
+        (m) => m.name == 'pcie_memory_completer',
+      );
+      String? prev;
+      var pending = false;
+      var broken = 0;
+      bench.clk.negedge.listen((_) {
+        final stb = dut.output('memory_STB').value;
+        if (!stb.isValid) return;
+        final now =
+            '${dut.output('memory_SEL').value} '
+            '${dut.output('memory_DAT_MOSI').value}';
+        if (pending && (!stb.toBool() || now != prev)) broken++;
+        pending = stb.toBool() && !dut.input('memory_ACK').value.toBool();
+        prev = now;
+      });
+      bench.memory.writeLimit = 1;
+      await bench.driver.send(
+        PcieTlp.memWrite(address: 0xc0000200, data: randomBytes(r, 128)),
+        user: HarborPcieStream.userBar2,
+      );
+      await bench.idle(limit * 2 + 8);
+      expect(bench.timeoutErrors, 1);
+      await bench.driver.send(
+        PcieTlp.memWrite(address: 0xc0000300, data: randomBytes(r, 64)),
+        user: HarborPcieStream.userBar2,
+      );
+      await bench.idle(limit);
+      bench.memory.writeLimit = null;
+      await bench.idle(limit * 8);
+      expect(broken, 0);
+      expect(bench.wedged, 0);
+      await bench.finish();
+    });
 
     test('a request while the memory stays dead is answered at once', () async {
       final bench = await start(config, 36);
