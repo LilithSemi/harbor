@@ -147,9 +147,10 @@ void main() {
       expect(ddr.dumpSystemVerilog(), contains('Ddr3PerformanceMonitor'));
     });
 
-    for (final (why, sameClock, protocol) in [
-      ('without sameClock', false, HarborFabricKind.axi4),
-      ('on a Wishbone port', true, HarborFabricKind.wishbone),
+    for (final (why, sameClock, protocol, target) in [
+      ('without sameClock', false, HarborFabricKind.axi4, null),
+      ('on a Wishbone port', true, HarborFabricKind.wishbone, null),
+      ('on a sim target', true, HarborFabricKind.axi4, const HarborSimTarget()),
     ]) {
       test('the performance monitor is refused $why', () {
         expect(
@@ -157,6 +158,7 @@ void main() {
             sameClock: sameClock,
             performanceMonitor: true,
             protocol: protocol,
+            target: target,
           ),
           throwsA(
             isA<ArgumentError>().having(

@@ -305,11 +305,12 @@ class HarborDdr3 extends BridgeModule
         'a Wishbone port holds 1 request',
       );
     }
-    if (performanceMonitor && (wishbone || !sameClock)) {
+    if (performanceMonitor &&
+        (wishbone || !sameClock || target is HarborSimTarget)) {
       throw ArgumentError.value(
         performanceMonitor,
         'performanceMonitor',
-        'needs sameClock and an AXI4 or TileLink port',
+        'needs sameClock, an AXI4 or TileLink port and a hardware target',
       );
     }
     if (writeCombine && !wishbone) {
