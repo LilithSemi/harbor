@@ -106,6 +106,81 @@ class AxiStallGate extends BridgeModule {
   }
 }
 
+/// An AXI4 pass-through that keeps up to 16 write responses and gives the
+/// newest one first, so responses leave out of order. A single kept response
+/// goes out after 256 cycles with no new one. While `pass_b` is low, no
+/// response goes out.
+class AxiBStack extends BridgeModule {
+  static const depth = 16;
+
+  AxiBStack(HarborMemoryWaistConfig config)
+    : super(
+        'AxiBStack_a${config.addressWidth}_d${config.dataWidth}'
+        '_i${config.idWidth}',
+        name: 'b_stack',
+      ) {
+    final clk = createPort('clk', PortDirection.input).port;
+    final reset = createPort('reset', PortDirection.input).port;
+    final pass = createPort('pass_b', PortDirection.input).port;
+    Axi4Interface axi() => Axi4Interface(
+      addressWidth: config.addressWidth,
+      dataWidth: config.dataWidth,
+      idWidth: config.idWidth,
+    );
+    final up = addInterface(
+      axi(),
+      name: 'up',
+      role: PairRole.consumer,
+    ).internalInterface!;
+    final dn = addInterface(
+      axi(),
+      name: 'dn',
+      role: PairRole.provider,
+    ).internalInterface!;
+    const b = {'BVALID', 'BREADY', 'BID', 'BRESP'};
+    for (final n in up.getPorts([PairDirection.fromProvider]).keys) {
+      if (!b.contains(n)) dn.port(n) <= up.port(n);
+    }
+    for (final n in up.getPorts([PairDirection.fromConsumer]).keys) {
+      if (!b.contains(n)) up.port(n) <= dn.port(n);
+    }
+    final w = config.idWidth + 2;
+    final entries = [
+      for (var i = 0; i < depth; i++) Logic(name: 'e_$i', width: w),
+    ];
+    final count = Logic(name: 'count', width: 5);
+    final wait = Logic(name: 'wait', width: 9);
+    final top = (count - 1).slice(3, 0);
+    final out = top.selectFrom(entries);
+    final give = (pass & (count.gte(2) | count.eq(1) & wait[8])).named('give');
+    final gone = give & up.port('BREADY');
+    // A response on the output stays until it is taken.
+    final take = dn.port('BVALID') & count.lt(depth) & ~(give & ~gone);
+    dn.port('BREADY') <= count.lt(depth) & ~(give & ~gone);
+    up.port('BVALID') <= give;
+    up.port('BID') <= out.getRange(2);
+    up.port('BRESP') <= out.slice(1, 0);
+    final inBeat = [dn.port('BID'), dn.port('BRESP')].concat();
+    // With a take and a gone in one cycle, the input replaces the top.
+    final slot = mux(gone, top, count.slice(3, 0));
+    Sequential(clk, reset: reset, [
+      If(
+        take | gone,
+        then: [wait < 0],
+        orElse: [
+          If(~wait[8], then: [wait < wait + 1]),
+        ],
+      ),
+      for (var i = 0; i < depth; i++)
+        If(take & slot.eq(i), then: [entries[i] < inBeat]),
+      If.block([
+        Iff(take & ~gone, [count < count + 1]),
+        ElseIf(gone & ~take, [count < count - 1]),
+      ]),
+    ]);
+  }
+}
+
 /// A memory slave port on `device_clk` joined to a memory master port that
 /// crosses to `clk`, as a device puts its memory port on a fabric with
 /// another clock. Both ports reset on `device_reset`. The crossing debug
@@ -169,6 +244,7 @@ class MasterTop extends BridgeModule {
     int burstBeats = 8,
     bool withErr = false,
     bool axiGate = false,
+    bool bReorder = false,
     bool fabricCrossing = false,
     String? memoryReset,
   }) : super('MasterTop_${dut.definitionName}', name: 'top') {
@@ -225,6 +301,13 @@ class MasterTop extends BridgeModule {
     }
     if (fabricCrossing) {
       // The crossing above carries the port.
+    } else if (bReorder) {
+      final gate = addSubModule(AxiBStack(config));
+      gate.input('clk').srcConnection! <= input('clk');
+      gate.input('reset').srcConnection! <= input('reset');
+      connectInterfaces(dut.interface(iface), gate.interface('up'));
+      connectInterfaces(gate.interface('dn'), target.interface('bus'));
+      pullUpPort(gate.port('pass_b'), newPortName: 'pass_b');
     } else if (axiGate) {
       final gate = addSubModule(AxiStallGate(config));
       connectInterfaces(dut.interface(iface), gate.interface('up'));
