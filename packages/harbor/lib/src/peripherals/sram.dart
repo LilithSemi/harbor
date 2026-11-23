@@ -342,19 +342,19 @@ class HarborSram extends BridgeModule
       bankOutputs.add(bankData);
     }
 
-    if (depthBlocks == 1) {
-      datOut <= bankOutputs.first;
-    } else {
-      Logic readMux = bankOutputs.first;
-      for (var d = 1; d < depthBlocks; d++) {
-        readMux = mux(
-          bankSelect!.eq(Const(d, width: depthAddrBits)),
-          bankOutputs[d],
-          readMux,
-        );
-      }
-      datOut <= readMux;
+    // Select the bank one address bit at a time, so the read path depth is
+    // the log of the bank count. An index with no bank selects bank 0.
+    var readLevel = [
+      for (var d = 0; d < (1 << depthAddrBits); d++)
+        d < depthBlocks ? bankOutputs[d] : bankOutputs.first,
+    ];
+    for (var bit = 0; bit < depthAddrBits; bit++) {
+      readLevel = [
+        for (var d = 0; d < readLevel.length; d += 2)
+          mux(bankSelect![bit], readLevel[d + 1], readLevel[d]),
+      ];
     }
+    datOut <= readLevel.single;
 
     _ackOnce(clk, stb, ack);
   }
