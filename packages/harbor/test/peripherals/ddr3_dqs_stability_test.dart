@@ -124,4 +124,13 @@ void main() {
     expect(passes.first.repeat, 0);
     expect(passes.map((x) => x.next), [2, _calibrateDqs]);
   });
+
+  // The newest index 9 differs from the stored 0, so the controller goes
+  // back to MPR_READ and does not calibrate.
+  test('DQS stability rejects index 9 after a first pass at 0', () async {
+    final passes = await _analyze((c) => c == 0 ? 0 : 9);
+    expect(passes.first.index, 0);
+    expect(passes[1].index, 9);
+    expect(passes[1].next, 2);
+  });
 }
