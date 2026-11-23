@@ -155,16 +155,23 @@ class _Tracker {
     final ok =
         mux(hasMatch, pick(match, tgts).eq(target), anyOf(free)) &
         total.lt(Const(outstanding, width: cw));
+    // The completion credit returns one cycle after the response select. The
+    // slot stays live for that cycle, so no extra request can issue, and the
+    // path from the response mux to the counters gets a flop.
+    final completed = Logic(name: '${name}_completed');
+    final completedId = Logic(name: '${name}_completed_id', width: id.width);
     final doneMatch = [
-      for (var i = 0; i < k; i++) valid[i] & ids[i].eq(doneId),
+      for (var i = 0; i < k; i++) valid[i] & ids[i].eq(completedId),
     ];
     Sequential(clk, reset: reset, [
-      total < total + issue.zeroExtend(cw) - done.zeroExtend(cw),
+      completed < done,
+      completedId < doneId,
+      total < total + issue.zeroExtend(cw) - completed.zeroExtend(cw),
       for (var i = 0; i < k; i++) ...[
         cnt[i] <
             cnt[i] +
                 (issue & mux(hasMatch, match[i], free[i])).zeroExtend(cw) -
-                (done & doneMatch[i]).zeroExtend(cw),
+                (completed & doneMatch[i]).zeroExtend(cw),
         ids[i] < harborLoad(ids[i], issue & ~hasMatch & free[i], id),
         tgts[i] < harborLoad(tgts[i], issue & ~hasMatch & free[i], target),
       ],
