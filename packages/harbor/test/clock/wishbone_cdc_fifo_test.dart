@@ -31,6 +31,7 @@ void main() {
     required int sPeriod,
     required int mPeriod,
     bool registerMaster = false,
+    bool checkMasterClock = false,
   }) async {
     const aw = 32;
     const dw = 32;
@@ -62,6 +63,21 @@ void main() {
     dut.input('s_sel').srcConnection! <= sSel;
     dut.input('m_clk').srcConnection! <= mClk;
     dut.input('m_reset').srcConnection! <= mReset;
+
+    var checking = false;
+    var lastMasterEdge = -1;
+    final offClockChanges = <String>[];
+    final monitors = <StreamSubscription>[];
+    monitors.add(mClk.posedge.listen((_) => lastMasterEdge = Simulator.time));
+    for (final port in ['m_adr', 'm_dat_w', 'm_we', 'm_sel']) {
+      monitors.add(
+        dut.output(port).changed.listen((_) {
+          if (checking && Simulator.time != lastMasterEdge) {
+            offClockChanges.add('$port at ${Simulator.time}');
+          }
+        }),
+      );
+    }
 
     // Fast-side model: a single 32-bit register, one-cycle combinational ACK.
     final mem = Logic(name: 'mem', width: dw);
@@ -114,13 +130,28 @@ void main() {
       return rd;
     }
 
+    checking = checkMasterClock;
     const magic = 0xC0DE1234;
     await doXfer(we: true, adr: 0x40, data: magic);
     final rd = await doXfer(we: false, adr: 0x40);
     expect(rd, equals(magic), reason: 'read-back must match the written value');
 
+    checking = false;
+    for (final monitor in monitors) {
+      await monitor.cancel();
+    }
     await Simulator.endSimulation();
+    expect(
+      offClockChanges,
+      isEmpty,
+      reason:
+          'Master payload must stay in the master clock domain even while idle',
+    );
   }
+
+  test('idle master payload never follows asynchronous FIFO writes', () async {
+    await runXfer(sPeriod: 10, mPeriod: 26, checkMasterClock: true);
+  });
 
   test('write then read crosses domains (FIFO bridge)', () async {
     await runXfer(sPeriod: 40, mPeriod: 12); // creek-like 25:83

@@ -323,6 +323,10 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
       // The head stays in the FIFO until completion, so a copy taken at the
       // start of service stays correct and cuts the path from the read port.
       final headWe = Logic(name: 'head_we');
+      // The FIFO read port can change on the slave clock while the FIFO is
+      // empty. The bus outputs come from this copy, so they change only on
+      // the master clock.
+      final head = Logic(name: 'master_head', width: reqW);
       // A posted write was already ACKed on the slave side. Pushing a response
       // for it would desynchronize the response FIFO from the pending read.
       final respPush = postedWrites
@@ -331,8 +335,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
 
       reqFifo.input('rd_clk').srcConnection! <= mClk;
       reqFifo.input('rd_reset').srcConnection! <= reqRdReset;
-      // Keep the head in the FIFO while serving (drives m_adr etc. directly).
-      // Pop it only on completion.
+      // Keep the head in the FIFO while serving. Pop it only on completion.
       reqFifo.input('rd_en').srcConnection! <= complete;
 
       respFifo.input('wr_clk').srcConnection! <= mClk;
@@ -346,7 +349,12 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
       Sequential(mClk, [
         If(
           mReset,
-          then: [serving < Const(0), mCycReg < Const(0), headWe < Const(0)],
+          then: [
+            serving < Const(0),
+            mCycReg < Const(0),
+            headWe < Const(0),
+            head < Const(0, width: reqW),
+          ],
           orElse: [
             If(
               startServe,
@@ -354,6 +362,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
                 serving < Const(1),
                 mCycReg < Const(1),
                 headWe < reqFifo.output('rd_data').slice(reqW - 1, reqW - 1),
+                head < reqFifo.output('rd_data'),
               ],
               orElse: [
                 If(complete, then: [serving < Const(0), mCycReg < Const(0)]),
@@ -363,10 +372,7 @@ class HarborWishboneCdcFifoBridge extends BridgeModule {
         ),
       ]);
 
-      // Unpack the FIFO head { we, adr, dat_w, sel } onto the master bus.
-      // Stable while serving because the head is not popped until
-      // completion.
-      final head = reqFifo.output('rd_data');
+      // Unpack the captured request { we, adr, dat_w, sel }.
       output('m_cyc') <= mCycReg;
       output('m_stb') <= mCycReg;
       output('m_we') <= head.slice(reqW - 1, reqW - 1);
