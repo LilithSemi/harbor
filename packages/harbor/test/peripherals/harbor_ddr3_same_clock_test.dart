@@ -88,6 +88,15 @@ void main() {
       expect(ddr.inputs.keys, isNot(contains('ddr_clk')));
       expect(ddr.inputs.keys, isNot(contains('ddr_reset')));
       expect(ddr.inputs.keys, contains('ddr_ck_fast'));
+      // The performance events are on the fabric clock, so they are ports.
+      expect(ddr.performanceClock, isNotNull);
+      expect(
+        ddr.performanceEvents.keys,
+        containsAll(['controller_accept', 'ch0_read_wait', 'ch0_latency_ge64']),
+      );
+      for (final name in ddr.performanceEvents.keys) {
+        expect(ddr.outputs.keys, contains('perf_$name'));
+      }
       await ddr.build();
       final sv = ddr.dumpSystemVerilog();
       for (final name in [
@@ -106,6 +115,7 @@ void main() {
       final ddr = _ddr();
       expect(ddr.sameClock, isFalse);
       expect(ddr.inputs.keys, containsAll(['ddr_clk', 'ddr_reset']));
+      expect(ddr.performanceEvents, isEmpty);
       await ddr.build();
       final sv = ddr.dumpSystemVerilog();
       for (final name in [

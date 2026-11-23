@@ -22,6 +22,7 @@ import 'ddr3_burst_adapter.dart';
 import 'ddr3_controller.dart';
 import 'ddr3_gearbox.dart';
 import 'ddr3_memory_port.dart';
+import 'ddr3_performance_monitor.dart';
 import 'ddr3_params.dart';
 import 'ddr3_phy.dart';
 import 'ddr3_phy_base.dart';
@@ -208,6 +209,17 @@ class HarborDdr3 extends BridgeModule
 
   /// The wrapped controller, exposed for simulation tests.
   Ddr3Controller? controller;
+
+  /// One-cycle event pulses of the [Ddr3PerformanceMonitor], by event name.
+  /// Each is also the output `perf_<name>`. Only a [sameClock] build with a
+  /// memory port front end has them, so the events are on the fabric clock.
+  final Map<String, Logic> performanceEvents = {};
+
+  /// The clock of [performanceEvents], or null when there are no events.
+  Logic? performanceClock;
+
+  /// The reset of [performanceEvents], or null when there are no events.
+  Logic? performanceReset;
 
   /// True when [target] is a Lattice ECP5, which builds [Ddr3PhyEcp5].
   bool get isEcp5 => switch (target) {
@@ -1181,6 +1193,29 @@ struct DramStore {
         readWords: readWords,
       );
     }
+    if (!wishbone && sameClock) {
+      performanceClock = addOutput('perf_clk')..gets(ddrClk);
+      performanceReset = addOutput('perf_reset')..gets(ddrReset);
+      final monitor = Ddr3PerformanceMonitor(
+        clk: ddrClk,
+        reset: ddrReset,
+        clear: _clear,
+        waists: [bus.waist, for (final b in readBuses) b.waist],
+        command: front.output('m_cyc') & front.output('m_stb'),
+        stalled: ctrlStall,
+        returned: ctrlAck,
+        readLatency: (
+          commandTag: front.output('m_aux'),
+          returnTag: ctrlAckAux,
+          depth: readWords,
+        ),
+      );
+      for (final entry in monitor.events.entries) {
+        performanceEvents[entry.key] = addOutput('perf_${entry.key}')
+          ..gets(entry.value);
+      }
+    }
+
     String m(String adapter, String port) => wishbone ? adapter : port;
 
     // --- wb2 knob-ABI window: train port (crossed to ddr clk) -> wb2 ---
