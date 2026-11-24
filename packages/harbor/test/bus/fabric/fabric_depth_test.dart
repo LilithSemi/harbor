@@ -65,15 +65,18 @@ final _kc705Masters = [
       cdc: i == 5,
     ),
 ];
+// s2 has 2 slave ID bits for 8 requests, so its ID remap has fewer slots
+// than requests, and s16 is an AXI4-Lite slave with a 1 KB region, so the
+// bursts to it check the region end.
 final _kc705Slaves = [
   const SlaveCfg('s0', 4, 8, 0x00000, 0x10000, readChannels: 2),
   for (var i = 1; i < 17; i++)
     SlaveCfg(
       's$i',
-      i.isEven ? 1 : 8,
-      i > 12 ? 1 : 2,
+      i == 2 ? 2 : (i.isEven ? 1 : 8),
+      i > 12 ? 1 : (i == 2 ? 8 : 2),
       0x10000 + i * 0x4000,
-      0x4000,
+      i == 16 ? 0x400 : 0x4000,
       lite: i > 12,
     ),
 ];
@@ -96,7 +99,7 @@ const _compact = {
 // responses, which are not yet registered, and must not grow.
 const _balanced = {
   ('kc705', HarborFabricTopology.shared): 16,
-  ('kc705', HarborFabricTopology.crossbar): 16,
+  ('kc705', HarborFabricTopology.crossbar): 15,
   ('2x3', HarborFabricTopology.shared): 16,
   ('2x3', HarborFabricTopology.crossbar): 15,
 };
@@ -127,12 +130,26 @@ final _requestCell = RegExp(
   r'remap_.*|grant_(wr|rd|count|ram))$|_prefer_read$|_inflight$',
 );
 
-// The cells of the slave side, the responses and W.
+// The cells of the slave side, the responses and W, by target (s<i>,
+// s<i>_r<k>, err) or master (m<i>) prefix. A FIFO counts by its internal
+// names only.
+const _fifo = r'(wr|rd|count|ram|e\d+)';
+const _target = r'(s\d+(_r\d+)?|err)';
 final _otherCell = RegExp(
-  r'_(aw|ar|w|b|r|req)_(wr|rd|count|ram|pop_data|e\d+)$|'
-  r'_(aw|ar|w)_shown$|_(b|r)_(pieces|worst)$|_(b|r)_resp_rr$|_lite_|'
-  r'_timer$|_cut_off$|_rec\d+_|_r_beat$|_w_done$|'
-  r'_w_(aw_held|count|pieces|order_.*|route_.*|source_.*)$|^bus_w_',
+  '^${_target}_(aw|ar|w|req)_$_fifo\$|'
+  '^${_target}_(aw|ar|w|req)_shown\$|'
+  '^${_target}_lite_.*\$|^${_target}_req_(valid|entry)\$|'
+  '^${_target}_(timer|cut_off)\$|^${_target}_rec\\d+_.*\$|'
+  '^${_target}_w_(aw_held|source_$_fifo|order_$_fifo)\$|'
+  '^err_(r_beat|w_done)\$|'
+  '^m\\d+_(b|r|w)_$_fifo\$|^m\\d+_(b|r)_(pieces|worst|resp_rr)\$|'
+  '^m\\d+_w_(count|pieces|route_$_fifo)\$|'
+  '^bus_(b|r)_resp_rr\$|^bus_w_(count|order_$_fifo)\$',
+);
+
+// The cells of the AXI4-Lite slave paths of the kc705 config.
+final _liteCell = RegExp(
+  r'^s1[3-6]_(lite_.*|req_(valid|entry|shown)|w_(wr|rd|count|ram|e\d+))$',
 );
 
 List<String> _cellNames(Module cell) => cell is HarborFifoRam
@@ -389,6 +406,25 @@ void main() {
           };
           must(open, isEmpty);
         });
+
+        if (config == 'kc705') {
+          for (final level in [
+            HarborFabricPipeline.balanced,
+            HarborFabricPipeline.fast,
+          ]) {
+            test('${level.name} AXI4-Lite slave paths fit '
+                '$_requestBudget levels', () async {
+              final f = await _fabric(config, t, level);
+              final p = harborWorstDepth(
+                f,
+                cut: f.requestCut,
+                endIn: (c) => _cellNames(c).any(_liteCell.hasMatch),
+              );
+              printOnFailure('$p');
+              expect(p.levels, lessThanOrEqualTo(_requestBudget));
+            });
+          }
+        }
 
         test('balanced keeps its recorded depth', () async {
           final p = await _fabricDepth(

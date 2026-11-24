@@ -35,6 +35,13 @@ const rtTwoSlaves = [
   SlaveCfg('s1', 1, 2, 0x10000, 0x10000),
 ];
 
+// s1 has 1 slave ID bit for 4 requests, so its ID remap has fewer slots than
+// requests.
+const rtFewIdSlaves = [
+  SlaveCfg('s0', 5, 4, 0x00000, 0x10000),
+  SlaveCfg('s1', 1, 4, 0x10000, 0x10000),
+];
+
 Burst rtRead(int id, int addr, int len, {int burst = 1}) =>
     Burst(id: id, write: false, addr: addr, len: len, size: 2, burst: burst);
 

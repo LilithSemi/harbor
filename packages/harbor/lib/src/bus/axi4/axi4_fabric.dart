@@ -353,9 +353,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
   /// The register stages of this fabric.
   final HarborFabricPipeline pipeline;
 
-  /// The signals from the response and slave side that the request side
-  /// reads, at the balanced and fast levels. A depth check of the request
-  /// path counts them as constants.
+  /// The signals from the response, W and slave side that the request side
+  /// and the AXI4-Lite slave paths read, at the balanced and fast levels. A
+  /// depth check of those parts counts them as constants.
   @visibleForTesting
   final Set<Logic> requestCut = {};
 
@@ -1527,6 +1527,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
             Sequential(c, reset: r, [
               slotElig[t][dir] < _fits(ru, [charged[t][dir], mayTake], k, 1),
             ]);
+            harborSimWatch(
+              c,
+              r,
+              () => simInt(ru) > k + 1
+                  ? '$tn $d: remap slot credits ${simInt(ru)} over ${k + 1}'
+                  : null,
+            );
           }
           Sequential(c, reset: r, [elig[t][dir] < ok]);
         }
@@ -1783,6 +1790,17 @@ class HarborAxi4Fabric extends HarborFabricModule {
     for (var t = 0; t < nt; t++) {
       wLastBeat[t] <= tBeat[t].valid & tBeat[t].last;
     }
+    if (headOn) {
+      requestCut.addAll([
+        for (var t = 0; t < nt; t++) ...[
+          bResp[t].ready,
+          rResp[t].ready,
+          tBeat[t].valid,
+          tBeat[t].data,
+          tBeat[t].last,
+        ],
+      ]);
+    }
 
     // Slave paths and the error slave.
     final dead = <Logic>[];
@@ -1809,6 +1827,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
         innerW: innerW,
         range: slaves[tSlave[t]].range,
         offset: slaves[tSlave[t]].offset,
+        liteStaged: headOn,
       );
       if (x != null) dead.add(x);
     }
@@ -2177,6 +2196,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required int innerW,
     required BusAddressRange range,
     required bool offset,
+    bool liteStaged = false,
   }) {
     final guard = timeout > 0;
     final dead = guard ? Logic(name: '${p}_cut_off') : Const(0);
@@ -2252,7 +2272,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
       wReady <= wF.pushReady | dead;
       wPending = wF.popValid;
     } else {
-      final pending = _litePath(
+      final pending = (liteStaged ? _litePathStaged : _litePath)(
         c,
         r,
         p: p,
@@ -2922,6 +2942,270 @@ class HarborAxi4Fabric extends HarborFabricModule {
           ~done.replicate(2) & mux(lBeat & l.bResp.gt(worst), l.bResp, worst),
     ]);
     return (req.popValid & ~isW, wF.popValid);
+  }
+
+  // [_litePath] at the balanced and fast levels. The request waits in a one
+  // entry register, its burst checks and address steps go to registers in
+  // the two cycles after it arrives, and B and R leave through 2 entry
+  // FIFOs. So the response arbiter does not reach the beat counter, and the
+  // next address comes from registers only.
+  static (Logic, Logic) _litePathStaged(
+    Logic c,
+    Logic r, {
+    required String p,
+    required Axi4Interface s,
+    required Axi4LiteInterface l,
+    required _Req aw,
+    required Logic awSid,
+    required _Req ar,
+    required Logic arSid,
+    required _WBeat w,
+    required Logic awReady,
+    required Logic arReady,
+    required Logic wReady,
+    required Logic dead,
+    required int k,
+    required List<int> restWidths,
+    required Logic Function(Logic) slaveAddr,
+  }) {
+    const lenW = Axi4Interface.lenWidth;
+    const protW = Axi4Interface.protWidth;
+    const sizeW = Axi4Interface.sizeWidth;
+    const burstW = Axi4Interface.burstWidth;
+    final nb = s.dataWidth ~/ 8;
+    final nbLog = nb.bitLength - 1;
+    final slvErr = _resp(Axi4RespField.slvErr);
+    final kk = min(k, 12);
+    Logic fields(_Req x, Logic sid) {
+      final [addr, len, sz, burst, _, _, prot, _] = harborUnpack(
+        x.rest,
+        restWidths,
+      );
+      return harborPack([sid, addr.getRange(0, k), len, sz, burst, prot]);
+    }
+
+    _checkInSim(c, r, aw.valid & ar.valid, '$p: AW and AR in one cycle');
+    final entryW = s.idWidth + k + lenW + sizeW + burstW + protW + 1;
+    final valid = Logic(name: '${p}_req_valid');
+    final entry = Logic(name: '${p}_req_entry', width: entryW);
+    final done = Logic(name: '${p}_lite_done');
+    final push = (aw.valid | ar.valid) & ~dead;
+    awReady <= ~valid | dead;
+    arReady <= ~valid | dead;
+    Sequential(c, reset: r, [
+      valid < push | (valid & ~done),
+      entry <
+          harborLoad(
+            entry,
+            push,
+            harborPack([
+              mux(aw.valid, fields(aw, awSid), fields(ar, arSid)),
+              aw.valid,
+            ]),
+          ),
+    ]);
+    final [id, low, len, sz0, burst, prot, isW] = harborUnpack(entry, [
+      s.idWidth,
+      k,
+      lenW,
+      sizeW,
+      burstW,
+      protW,
+      1,
+    ]);
+    final held = cutValid('${p}_req', c, r, valid, done, dead);
+
+    // Two cycles of checks after the request arrives. A SIZE above the bus
+    // width counts as the bus width.
+    final staged = Logic(name: '${p}_lite_staged', width: 2);
+    final ready = staged[1];
+    final w0 = max(kk + 1, lenW + nbLog) + 2;
+    final full = _fullSize(s.dataWidth);
+    final szc = mux(sz0.gt(full), full, sz0);
+    final low0 = [
+      for (var b = 0; b < w0; b++)
+        b < nbLog ? sz0.gt(Const(b, width: sizeW)) : Const(0),
+    ];
+    final szMask = Logic(name: '${p}_lite_size_mask', width: low0.length);
+    final szStep = Logic(name: '${p}_lite_size_step', width: low0.length);
+    final sz = Logic(name: '${p}_lite_size', width: sizeW);
+    final wrapOk = Logic(name: '${p}_lite_wrap_ok');
+    final winMask = Logic(name: '${p}_lite_win', width: max(kk, 1));
+    final bad = Logic(name: '${p}_lite_bad');
+    final isWrap = burst.eq(Const(2, width: burstW));
+    final isIncr = burst.eq(Const(1, width: burstW));
+    Logic shifted(Logic x) => (x.zeroExtend(w0) << sz).getRange(0, w0);
+    final aligned = low.getRange(0, min(k, w0)).zeroExtend(w0) & ~szMask;
+    final end = aligned + shifted(len);
+    final window = shifted(len.zeroExtend(lenW + 1) + 1);
+    var badB = burst.eq(Const(3, width: burstW)) | (isWrap & ~wrapOk);
+    if (k < 12) {
+      // A region under 4 KB has no bits above it to carry into, so a burst
+      // that leaves it is an error.
+      final leaves =
+          (isIncr & end.getRange(k, w0).neq(0)) |
+          (isWrap & window.getRange(k + 1, w0).neq(0));
+      badB = badB | (len.neq(0) & leaves);
+    }
+    Sequential(c, reset: r, [
+      staged <
+          mux(
+            valid & ~done,
+            [Const(1), staged[0]].rconcat(),
+            Const(0, width: 2),
+          ),
+      sz < szc,
+      szMask < low0.rconcat(),
+      szStep <
+          [
+            for (var b = 0; b < w0; b++)
+              b <= nbLog
+                  ? (sz0.eq(Const(b, width: sizeW)) |
+                        (b == nbLog ? sz0.gt(full) : Const(0)))
+                  : Const(0),
+          ].rconcat(),
+      wrapOk < len[0] & (len & (len + 1)).eq(0) & len.getRange(4, lenW).eq(0),
+      winMask <
+          (kk > 0
+              ? ((len.zeroExtend(w0) << szc).getRange(0, kk) |
+                    low0.rconcat().getRange(0, kk))
+              : Const(0)),
+      bad < badB,
+    ]);
+
+    final wValid = Logic(name: '${p}_w_pop');
+    final wF = HarborRegFifo(
+      name: '${p}_w',
+      clk: c,
+      reset: r,
+      depth: 1,
+      pushValid: w.valid & ~dead,
+      pushData: w.data,
+      popReady: s.wReady & wValid,
+      resetEntries: true,
+    );
+    wValid <= cutValid('${p}_w', c, r, wF.popValid, s.wReady, dead);
+    final [wData, wStrb, wLast] = harborUnpack(wF.popData, [
+      s.dataWidth,
+      s.dataWidth ~/ 8,
+      1,
+    ]);
+    wReady <= wF.pushReady | dead;
+
+    final aSent = Logic(name: '${p}_lite_a_sent');
+    final wSent = Logic(name: '${p}_lite_w_sent');
+    final beat = Logic(name: '${p}_lite_beat', width: lenW);
+    final cur = Logic(name: '${p}_lite_cur', width: max(kk, 1));
+    final worst = Logic(name: '${p}_lite_worst', width: 2);
+    final lastBeat = beat.eq(len);
+    final hereLow = kk > 0 ? cur : low.getRange(0, 0);
+    final here = k > kk ? [low.getRange(kk, k), hereLow].concat() : hereLow;
+    final live = held & ready;
+    final good = live & ~bad;
+    final addr = slaveAddr(here);
+    l.awValid <= good & isW & ~aSent;
+    l.awAddr <= addr;
+    l.awProt <= prot;
+    l.arValid <= good & ~isW & ~aSent;
+    l.arAddr <= addr;
+    l.arProt <= prot;
+    l.wValid <= good & isW & ~wSent & wValid;
+    l.wData <= wData;
+    l.wStrb <= wStrb & _laneMask(here, sz, nb);
+
+    s.awValid <= held & isW;
+    s.arValid <= held & ~isW;
+    s.wValid <= wValid;
+    s.wLast <= wLast;
+    s.wReady <= live & isW & ~wSent & (bad | l.wReady);
+
+    final bF = HarborRegFifo(
+      name: '${p}_lite_b',
+      clk: c,
+      reset: r,
+      depth: 2,
+      pushValid: live & isW & mux(bad, wSent, l.bValid & lastBeat),
+      pushData: harborPack([
+        id,
+        mux(bad, slvErr, mux(worst.gt(l.bResp), worst, l.bResp)),
+      ]),
+      popReady: s.bReady,
+      resetEntries: true,
+    );
+    final [bId, bResp] = harborUnpack(bF.popData, [
+      s.idWidth,
+      Axi4Interface.respWidth,
+    ]);
+    s.bValid <= bF.popValid;
+    s.bId <= bId;
+    s.bResp <= bResp;
+    l.bReady <= good & isW & (bF.pushReady | ~lastBeat);
+    final rF = HarborRegFifo(
+      name: '${p}_lite_r',
+      clk: c,
+      reset: r,
+      depth: 2,
+      pushValid: live & ~isW & (bad | l.rValid),
+      pushData: harborPack([
+        id,
+        mux(bad, Const(0, width: s.dataWidth), l.rData),
+        mux(bad, slvErr, l.rResp),
+        lastBeat,
+      ]),
+      popReady: s.rReady,
+      resetEntries: true,
+    );
+    final [rId, rData, rResp, rLast] = harborUnpack(rF.popData, [
+      s.idWidth,
+      s.dataWidth,
+      Axi4Interface.respWidth,
+      1,
+    ]);
+    s.rValid <= rF.popValid;
+    s.rId <= rId;
+    s.rData <= rData;
+    s.rResp <= rResp;
+    s.rLast <= rLast;
+    l.rReady <= good & ~isW & rF.pushReady;
+    final bFire = bF.pushFire;
+    final rFire = rF.pushFire;
+    done <= bFire | (rFire & lastBeat);
+    // The entry leaves when its response is queued, so the guard sees the
+    // AW or AR handshake then.
+    s.awReady <= bFire;
+    s.arReady <= rFire & lastBeat;
+
+    final lBeat = good & isW & l.bValid & l.bReady;
+    final step = rFire | lBeat;
+    final clear = done | step;
+    final wFire = s.wValid & s.wReady;
+
+    // Next address: FIXED keeps it, INCR adds one word to the aligned
+    // address, and WRAP wraps inside the window of len + 1 words.
+    Logic next = hereLow;
+    if (kk > 0) {
+      final al = cur & ~szMask.getRange(0, kk);
+      final inc = al + szStep.getRange(0, kk);
+      final wrap = (al & ~winMask) | (inc & winMask);
+      next = harborLoad(harborLoad(cur, isIncr, inc), isWrap, wrap);
+    }
+
+    Sequential(c, reset: r, [
+      aSent <
+          ~clear & (aSent | (l.awValid & l.awReady) | (l.arValid & l.arReady)),
+      wSent < ~clear & (wSent | mux(bad, wFire & s.wLast, l.wValid & l.wReady)),
+      beat < (beat + step.zeroExtend(lenW)) & ~done.replicate(lenW),
+      if (kk > 0)
+        cur <
+            harborLoad(
+              harborLoad(cur, step, next),
+              ~staged[0],
+              low.getRange(0, kk),
+            ),
+      worst <
+          ~done.replicate(2) & mux(lBeat & l.bResp.gt(worst), l.bResp, worst),
+    ]);
+    return (valid & ~isW, wF.popValid);
   }
 
   // Byte lanes that an access of 2^[sz] bytes at the byte address [a] covers

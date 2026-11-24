@@ -130,10 +130,28 @@ void main() {
           );
           var cycle = 0;
           final seen = <int>[];
+          // The master IDs in flight on each slave ID. One slave ID carries
+          // one master ID at a time, and at most k = 2 slave IDs are live.
+          final live = <int, List<int>>{};
+          final wrong = <String>[];
           b.sim.onRise(() {
             cycle++;
+            if (b.sim.pre('s0_RVALID') == 1 &&
+                b.sim.pre('s0_RREADY') == 1 &&
+                b.sim.pre('s0_RLAST') == 1) {
+              live[b.sim.pre('s0_RID')]!.removeAt(0);
+            }
             if (b.sim.pre('s0_ARVALID') == 1 && b.sim.pre('s0_ARREADY') == 1) {
+              final sid = b.sim.pre('s0_ARID');
+              (live[sid] ??= []).add(reads[seen.length].id);
               seen.add(cycle);
+            }
+            final ids = [
+              for (final q in live.values)
+                if (q.isNotEmpty) q,
+            ];
+            if (ids.length > 2 || ids.any((q) => q.toSet().length > 1)) {
+              wrong.add('cycle $cycle: $live');
             }
           });
           final m = b.managers['m0']!;
@@ -143,6 +161,7 @@ void main() {
           await b.drain(limit: 20000);
           await b.sim.stop();
           must(b.errors, isEmpty);
+          must(wrong.take(5).toList(), isEmpty);
           must(
             checkReads('m0', m.arOrder, m.rBeats, (_) => (0, null)),
             isEmpty,

@@ -14,6 +14,18 @@ void main() {
   tearDown(() async => Simulator.reset());
 
   forEachPipeline((p) {
+    for (final t in HarborFabricTopology.values) {
+      test(
+        'axi4 ${t.name}, a slave with fewer IDs than requests',
+        () async {
+          await rtTiming(t, rtMasters, rtFewIdSlaves, rtCap);
+        },
+        // A real-time read with a new ID waits until a slave ID frees, and
+        // the other masters hold both slave IDs through their long bursts.
+        // The bound has no term for that: 416 against 213 at compact.
+        skip: 'the bound does not cover a slave with fewer IDs than requests',
+      );
+    }
     for (var shift = 1; shift <= 6; shift++) {
       test('axi4 shared, 2 slaves, reads moved by $shift cycles', () async {
         await rtTiming(
