@@ -826,9 +826,66 @@ class HarborAxi4Fabric extends HarborFabricModule {
       }
     }
 
+    // The grant goes through a register stage into each target, so no path
+    // goes from a master queue to a slave request queue in one cycle. The
+    // order check and the outstanding count stay at the grant.
+    final slaveTake = [
+      for (var t = 0; t < nt; t++) [Logic(), Logic()],
+    ];
+    final grantQ = [
+      for (var t = 0; t < nt; t++)
+        [
+          for (var dir = 0; dir < 2; dir++)
+            HarborRegFifo(
+              name: '${tName[t]}_${dir == 0 ? 'aw' : 'ar'}_grant',
+              clk: c,
+              reset: r,
+              depth: 2,
+              pushValid: tReq[t][dir].valid,
+              pushData: harborPack([tSid[t][dir], tReq[t][dir].rest]),
+              popReady: slaveTake[t][dir],
+            ),
+        ],
+    ];
+    final gSid = [
+      for (var t = 0; t < nt; t++)
+        [
+          for (var dir = 0; dir < 2; dir++)
+            harborUnpack(grantQ[t][dir].popData, [tIdW[t], restW]),
+        ],
+    ];
+    // A request leaves the stage when the slave side queue takes it.
+    final gReq = [
+      for (var t = 0; t < nt; t++)
+        [
+          for (var dir = 0; dir < 2; dir++)
+            _Req(grantQ[t][dir].popFire, gSid[t][dir][0], gSid[t][dir][1]),
+        ],
+    ];
+    for (var t = 0; t < nt; t++) {
+      for (var dir = 0; dir < 2; dir++) {
+        inReady[t][dir] <= grantQ[t][dir].pushReady;
+      }
+    }
+
     // Write data. A master's beats go to the targets of its AWs in order,
-    // and a target takes beats from the masters of its AWs in order.
-    final wReady = [for (var t = 0; t < nt; t++) Logic()];
+    // and a target takes beats from the masters of its AWs in order. A beat
+    // for a target waits until the AW of its burst is in the slave side
+    // queue.
+    final wSlaveReady = [for (var t = 0; t < nt; t++) Logic()];
+    final wLastBeat = [for (var t = 0; t < nt; t++) Logic()];
+    final wReady = <Logic>[];
+    for (var t = 0; t < nt; t++) {
+      final cw = widthOf(tN[t] + 2);
+      final held = Logic(name: '${tName[t]}_w_aw_held', width: cw);
+      Sequential(c, reset: r, [
+        held <
+            held +
+                grantQ[t][0].popFire.zeroExtend(cw) -
+                wLastBeat[t].zeroExtend(cw),
+      ]);
+      wReady.add(wSlaveReady[t] & held.neq(0));
+    }
     final wPop = [for (var m = 0; m < nm; m++) Logic()];
     final wHead = [
       for (var m = 0; m < nm; m++)
@@ -993,6 +1050,10 @@ class HarborAxi4Fabric extends HarborFabricModule {
       }
     }
 
+    for (var t = 0; t < nt; t++) {
+      wLastBeat[t] <= tBeat[t].valid & tBeat[t].last;
+    }
+
     // Slave paths and the error slave.
     final dead = <Logic>[];
     for (var t = 0; t < nst; t++) {
@@ -1004,14 +1065,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
         lite: sLite[t],
         outstanding: tN[t],
         timeout: slaves[tSlave[t]].timeout,
-        aw: tReq[t][0],
-        awSid: tSid[t][0],
-        ar: tReq[t][1],
-        arSid: tSid[t][1],
+        aw: gReq[t][0],
+        awSid: gReq[t][0].id,
+        ar: gReq[t][1],
+        arSid: gReq[t][1].id,
         w: tBeat[t],
-        awReady: inReady[t][0],
-        arReady: inReady[t][1],
-        wReady: wReady[t],
+        awReady: slaveTake[t][0],
+        arReady: slaveTake[t][1],
+        wReady: wSlaveReady[t],
         b: bResp[t],
         rd: rResp[t],
         addrW: addrW,
@@ -1024,14 +1085,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
     _errorSlave(
       c,
       r,
-      aw: tReq[nst][0],
-      awSid: tSid[nst][0],
-      ar: tReq[nst][1],
-      arSid: tSid[nst][1],
+      aw: gReq[nst][0],
+      awSid: gReq[nst][0].id,
+      ar: gReq[nst][1],
+      arSid: gReq[nst][1].id,
       w: tBeat[nst],
-      awReady: inReady[nst][0],
-      arReady: inReady[nst][1],
-      wReady: wReady[nst],
+      awReady: slaveTake[nst][0],
+      arReady: slaveTake[nst][1],
+      wReady: wSlaveReady[nst],
       b: bResp[nst],
       rd: rResp[nst],
       innerW: innerW,
