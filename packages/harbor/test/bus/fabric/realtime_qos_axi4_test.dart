@@ -430,6 +430,14 @@ ReadWant Function(Burst) _wantFrom(Bench b, List<Burst> writes) {
 void main() {
   tearDown(() async => Simulator.reset());
 
+  test('the path of an access counts the registered grant of AXI4', () {
+    int path(HarborFabricKind k) =>
+        HarborFabric.pathCyclesOf(kind: k, fabrics: 2, memoryPorts: 0);
+    must(path(HarborFabricKind.wishbone), 4);
+    must(path(HarborFabricKind.axi4), 10);
+    must(path(HarborFabricKind.tilelink), 8);
+  });
+
   test(
     'axi4: a 256 beat stream with the cap on and no real-time traffic',
     () async {

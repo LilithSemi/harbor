@@ -462,8 +462,9 @@ abstract final class HarborFabric {
   /// - [fabrics] is the number of fabrics the access crosses: 1, or 2 through
   ///   a channel fabric and a converge fabric.
   /// - A fabric has 2 stages on Wishbone (the grant register and the
-  ///   response), and 4 on AXI4 and TileLink (the request FIFOs of the master
-  ///   and the slave side, the response FIFO, and the response arbitration).
+  ///   response), 4 on TileLink (the request FIFOs of the master and the
+  ///   slave side, the response FIFO, and the response arbitration), and 5 on
+  ///   AXI4 (those 4 and the grant register of the target).
   /// - [memoryPorts] is the number of memory master and slave port pairs. A
   ///   pair has 8 stages: the request, data and response FIFOs of both ports.
   /// - [registerStages] is the number of `WishboneRegisterStage` slices on
@@ -478,7 +479,12 @@ abstract final class HarborFabric {
     int registerStages = 0,
     int cdcCycles = 0,
   }) =>
-      fabrics * (kind == HarborFabricKind.wishbone ? 2 : 4) +
+      fabrics *
+          switch (kind) {
+            HarborFabricKind.wishbone => 2,
+            HarborFabricKind.axi4 => 5,
+            HarborFabricKind.tilelink => 4,
+          } +
       memoryPorts * 8 +
       registerStages * 2 +
       cdcCycles;
