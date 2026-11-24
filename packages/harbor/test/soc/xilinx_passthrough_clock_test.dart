@@ -61,8 +61,15 @@ String _sv(Directory dir) => _read(dir, 'rtl/PassSoc.sv');
 int _pinBufgs(String sv) =>
     RegExp(r'BUFG\s+\w+\(\.I\(clk\)').allMatches(sv).length;
 
+/// Every instance port wired to the clock pin. Only the one BUFG may be.
+List<String> _padLoads(String sv) => RegExp(
+  r'^.*\.\w+\(clk\).*$',
+  multiLine: true,
+).allMatches(sv).map((m) => m.group(0)!).toList();
+
 void _expectOnBuffer(String sv) {
   expect(_pinBufgs(sv), 1);
+  expect(_padLoads(sv), hasLength(1), reason: _padLoads(sv).join('\n'));
   expect(sv, contains('(* keep = 1 *) logic sysosc_clk;'));
   expect(sv, contains('uart(.clk(sysosc_clk)'));
   expect(sv, contains('always_ff @(posedge sysosc_clk)'));
@@ -197,6 +204,136 @@ void main() {
     final sv = _sv(dir);
     expect(sv, isNot(contains('sysosc')));
     expect(sv, contains('.CLKIN1(clk)'));
+  });
+
+  test('a late same-rate domain after a pad PLL is refused', () {
+    final soc = HarborSoC(
+      name: 'PassLate',
+      compatible: 'test,pass-late',
+      target: HarborBoard.get('arty-s7-50').fpgaTarget(pins: ['clk']),
+      clocks: const [
+        HarborClockConfig(
+          name: 'pix',
+          rate: HarborFixedClockRate(50000000),
+          sourceFrequency: 100000000,
+        ),
+      ],
+    );
+    expect(
+      () => soc.addClockDomain(_sd),
+      throwsA(
+        isA<StateError>().having(
+          (e) => e.message,
+          'message',
+          allOf(contains('"sd"'), contains('constructor')),
+        ),
+      ),
+    );
+  });
+
+  test('a late same-rate domain with no PLL gets the BUFG', () async {
+    final soc = HarborSoC(
+      name: 'PassLate2',
+      compatible: 'test,pass-late2',
+      target: HarborBoard.get('arty-s7-50').fpgaTarget(pins: ['clk']),
+      clocks: const [],
+    );
+    final d = soc.addClockDomain(_sd);
+    expect(identical(d.clk, soc.sharedOscillatorClock), isTrue);
+  });
+
+  test('a rate that differs from the target clock is refused', () {
+    expect(
+      () => HarborSoC(
+        name: 'PassRate',
+        compatible: 'test,pass-rate',
+        target: HarborBoard.get('arty-s7-50').fpgaTarget(pins: ['clk']),
+        clocks: const [
+          HarborClockConfig(
+            name: 'sd',
+            rate: HarborFixedClockRate(50000000),
+            sourceFrequency: 50000000,
+          ),
+        ],
+      ),
+      throwsStateError,
+    );
+  });
+
+  test('a Vivado target buffers the clock and keeps the port clock', () async {
+    final soc = HarborSoC(
+      name: 'PassSoc',
+      compatible: 'test,pass-vivado',
+      target: const HarborFpgaTarget.artix7(
+        device: 'xc7a35t',
+        package: 'cpg236',
+        frequency: 100000000,
+        pinMap: {'clk': 'E3 LVCMOS33'},
+      ),
+      clocks: const [_sd],
+      fabricClockDomain: 'sd',
+    );
+    soc.addPeripheral(HarborUart(baseAddress: 0x10000000));
+    final dir = Directory.systemTemp.createTempSync('harbor_pass_vivado_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await soc.generateAll(dir);
+    final sv = _sv(dir);
+    expect(_pinBufgs(sv), 1);
+    expect(_padLoads(sv), hasLength(1));
+    expect(sv, contains('uart(.clk(sysosc_clk)'));
+    final xdc = _read(dir, 'PassSoc.xdc');
+    expect(xdc, contains('create_clock -period 10.000 [get_ports clk]'));
+  });
+
+  test('the ADV7511 clocks share the buffer of a same-rate domain', () async {
+    final soc = HarborSoC(
+      name: 'PassSoc',
+      compatible: 'test,pass-adv',
+      target: HarborBoard.get('arty-s7-50').fpgaTarget(pins: ['clk']),
+      clocks: const [_sd],
+      fabricClockDomain: 'sd',
+    );
+    expect(soc.sharedOscillatorClock, isNotNull);
+    soc.addSubModule(
+      HarborAdv7511Clocks(
+        source: soc.sharedOscillatorClock ?? soc.boardClk,
+        sourceBuffered: soc.sharedOscillatorClock != null,
+        reset: soc.clockDomain('sd')!.reset,
+        sourceHz: 100000000,
+        clk2xHz: 50000000,
+      ),
+    );
+    final dir = Directory.systemTemp.createTempSync('harbor_pass_adv_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await soc.generateAll(dir);
+    final sv = _sv(dir);
+    expect(_pinBufgs(sv), 1);
+    expect(_padLoads(sv), hasLength(1));
+    final all = Directory(
+      '${dir.path}/rtl',
+    ).listSync().whereType<File>().map((f) => f.readAsStringSync()).join('\n');
+    expect(RegExp(r'BUFG\s+source_bufg').hasMatch(all), isFalse);
+  });
+
+  test('a CLKOS secondary domain does not take the input buffer', () {
+    final soc = HarborSoC(
+      name: 'PassSec',
+      compatible: 'test,pass-sec',
+      target: HarborBoard.get('arty-s7-50').fpgaTarget(pins: ['clk']),
+      clocks: const [],
+    );
+    expect(soc.sharedOscillatorClock, isNull);
+    final d = soc.addClockDomain(
+      const HarborClockConfig(
+        name: 'a',
+        rate: HarborFixedClockRate(100000000),
+        sourceFrequency: 100000000,
+        isPrimary: true,
+        coClkosSecondary: (name: 'b', frequency: 50000000, tolerancePpm: 0),
+      ),
+    );
+    expect(d.clk, isNot(same(soc.boardClk)));
+    expect(soc.sharedOscillatorClock, isNull);
   });
 
   test('an ECP5 primary domain gets the LPF frequency line', () async {

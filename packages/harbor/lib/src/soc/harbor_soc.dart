@@ -365,6 +365,9 @@ class HarborSoC extends BridgeModule {
   /// it, or null when no domain does.
   double? _xilinxPassthroughMhz;
 
+  // True once a Xilinx PLL domain is wired to the clock pin.
+  bool _xilinxPadPlls = false;
+
   final String acpiOemId;
   final String acpiOemTableId;
 
@@ -747,10 +750,26 @@ class HarborSoC extends BridgeModule {
   }
 
   void _addPllClock(HarborClockConfig clkConfig) {
-    if (_isXilinxFpga &&
-        _isPassthrough(clkConfig) &&
-        _clockGen.bufferedInputClk == null) {
-      _clockGen.bufferedInputClk = _buildSharedInputBufg();
+    final passthrough = _isXilinxFpga && _isPassthrough(clkConfig);
+    if (passthrough) {
+      final t = target as HarborFpgaTarget;
+      if (t.frequency > 0 && t.frequency != clkConfig.frequency) {
+        throw StateError(
+          'clock "${clkConfig.name}" runs on the input clock at '
+          '${clkConfig.frequency / 1e6} MHz, but the target clock is '
+          '${t.frequency / 1e6} MHz.',
+        );
+      }
+      if (_clockGen.bufferedInputClk == null) {
+        if (_xilinxPadPlls) {
+          throw StateError(
+            'clock "${clkConfig.name}" runs on the input clock and was added '
+            'after a PLL domain took the clock pin. Put it in the clocks '
+            'list of the constructor.',
+          );
+        }
+        _clockGen.bufferedInputClk = _buildSharedInputBufg();
+      }
     }
     final sec = clkConfig.coClkosSecondary;
     if (sec != null) {
@@ -778,6 +797,7 @@ class HarborSoC extends BridgeModule {
             t.vendor == HarborFpgaVendor.openXc7,
       );
       _clockDomains[clkConfig.name] = domain;
+      if (_isXilinxFpga && !passthrough) _xilinxPadPlls = true;
       if (_sharedOscillator != null &&
           identical(domain.clk, _sharedOscillator)) {
         final mhz = clkConfig.frequency / 1e6;
