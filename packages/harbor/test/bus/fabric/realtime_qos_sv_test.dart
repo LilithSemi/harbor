@@ -153,19 +153,19 @@ Future<String> _soc(HarborFabricKind kind) async {
 
 void main() {
   const golden = <String, (int, int)>{
-    'axi4_crossbar': (-1289824076368411166, 778927),
-    'axi4_shared': (-7900584569341212455, 759468),
-    'axi4_balanced_crossbar': (0, 0),
-    'axi4_balanced_shared': (0, 0),
-    'axi4_fast_crossbar': (0, 0),
-    'axi4_fast_shared': (0, 0),
-    'soc_axi4': (6451994755986780406, 719575),
-    'soc_tilelink': (-20490596120018683, 671334),
-    'soc_wishbone': (4450380808038980455, 535597),
-    'tl_crossbar': (-6055400673713627179, 149394),
-    'tl_shared': (3339608990310352046, 307715),
-    'wb_crossbar': (8735552845619675350, 32986),
-    'wb_shared': (7679619553882137748, 32948),
+    'axi4_crossbar': (-1806727016848880604, 725461),
+    'axi4_shared': (-4758848597611908600, 703895),
+    'axi4_balanced_crossbar': (-1047644616298858352, 1042985),
+    'axi4_balanced_shared': (5997735925694472600, 993859),
+    'axi4_fast_crossbar': (-7056526555121309953, 1042985),
+    'axi4_fast_shared': (1738350219222816629, 993859),
+    'soc_axi4': (-719853137350859623, 757532),
+    'soc_tilelink': (3980852489748109613, 671753),
+    'soc_wishbone': (2951180329469432230, 536162),
+    'tl_crossbar': (-5608642720268730264, 149685),
+    'tl_shared': (171527483369796812, 308006),
+    'wb_crossbar': (-3765011429854336056, 33613),
+    'wb_shared': (-1007195441028053844, 33574),
   };
   for (final t in HarborFabricTopology.values) {
     for (final p in HarborFabricPipeline.values) {
