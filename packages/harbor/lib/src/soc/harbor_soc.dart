@@ -2145,7 +2145,8 @@ class HarborSoC extends BridgeModule {
     _fabricErrorFlags.add(reg.output('bus_error'));
     final (clk, reset) = defaultClock;
     reg.input('clk').srcConnection! <= clk;
-    reg.input('reset').srcConnection! <= reset;
+    reg.input('reset').srcConnection! <=
+        _localReset(_fabricDomain, reset, '${reg.name}_reset_branch');
     connectInterfaces(port, reg.interface('up'));
     return reg.interface('down');
   }

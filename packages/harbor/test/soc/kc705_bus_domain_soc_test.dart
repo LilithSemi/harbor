@@ -108,7 +108,10 @@ HarborUart _uart() => HarborUart(
   fabricKind: HarborFabricKind.axi4,
 );
 
-HarborSoC _kc705Soc(HarborFpgaTarget target) {
+HarborSoC _kc705Soc(
+  HarborFpgaTarget target, {
+  Set<String> localReset = const {},
+}) {
   final soc = HarborSoC(
     name: 'Kc705BusDomain',
     compatible: 'test,kc705-bus-domain',
@@ -117,6 +120,7 @@ HarborSoC _kc705Soc(HarborFpgaTarget target) {
     fabricClockDomain: 'bus',
     clocks: const [_coreClock, _busClock],
     xilinxDdr3Tree: const XilinxDdr3TreeSpec.kc705(coreClkHz: 50000000),
+    localResetDomains: localReset,
   );
   final tree = soc.xilinxDdr3Clocks!;
   final cpu = soc.addMaster(
@@ -317,6 +321,42 @@ void main() {
       expect(nets.toSet(), hasLength(nets.length), reason: '$nets');
     });
   });
+
+  test(
+    'a local reset bus domain has no reader of the bus reset sync',
+    () async {
+      final target = HarborBoard.get(
+        'kc705',
+      ).fpgaTarget(useHimbaechel: true, extraPins: _ddrExtra);
+      final soc = _kc705Soc(target, localReset: {'bus'});
+      final dir = Directory.systemTemp.createTempSync(
+        'harbor_kc705_local_rst_',
+      );
+      addTearDown(() => dir.deleteSync(recursive: true));
+      await soc.generateAll(dir);
+      final top = File('${dir.path}/rtl/Kc705BusDomain.sv').readAsStringSync();
+      for (final name in ['ddr3_reset_branch', 'uart_reset_branch']) {
+        expect(
+          top,
+          contains('HarborRegisteredResetBranch  $name('),
+          reason: name,
+        );
+      }
+      // The sync output and the domain reset have no reader but their assign.
+      expect(RegExp(r'busRstSync\[1\]').allMatches(top), hasLength(1));
+      expect(RegExp(r'\bbusReset\b').allMatches(top), hasLength(2));
+      // Each release flop takes the stage before the sync output.
+      final branches = RegExp(
+        r'HarborRegisteredResetBranch\s+\w+\(([^;]*)\);',
+      ).allMatches(top).map((m) => m.group(1)!).toList();
+      expect(branches.length, greaterThanOrEqualTo(3));
+      for (final b in branches) {
+        expect(b, contains('.reset_assert(bus_provResetHold)'));
+        expect(b, contains('.release_in(release_in)'));
+      }
+      expect(top, contains('assign release_in = busRstSync[0];'));
+    },
+  );
 
   test('the CPU writes and reads DRAM and a UART register in sim', () async {
     final sim = _Sim();
