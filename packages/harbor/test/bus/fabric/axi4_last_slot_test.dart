@@ -78,146 +78,202 @@ String _sv(Module m) => [
 // The SV of fabrics where every target is real-time, built with the
 // registered grant.
 const _realtimeGolden = {
-  HarborFabricTopology.shared: (-5402545984370467316, 726513),
-  HarborFabricTopology.crossbar: (-2930259836543658950, 741959),
+  (HarborFabricPipeline.compact, HarborFabricTopology.shared): (
+    -5402545984370467316,
+    726513,
+  ),
+  (HarborFabricPipeline.compact, HarborFabricTopology.crossbar): (
+    -2930259836543658950,
+    741959,
+  ),
+  (HarborFabricPipeline.balanced, HarborFabricTopology.shared): (
+    -5792061948357707147,
+    931561,
+  ),
+  (HarborFabricPipeline.balanced, HarborFabricTopology.crossbar): (
+    -3386948133231821030,
+    957739,
+  ),
+  (HarborFabricPipeline.fast, HarborFabricTopology.shared): (
+    7872232207992025901,
+    931561,
+  ),
+  (HarborFabricPipeline.fast, HarborFabricTopology.crossbar): (
+    -6305941106286881074,
+    957739,
+  ),
 };
 
 void main() {
-  tearDown(endAndReset);
+  forEachPipeline((p) {
+    tearDown(endAndReset);
 
-  for (final t in HarborFabricTopology.values) {
-    group(t.name, () {
-      test('a flood of AW and AR takes turns at the last slot', () async {
-        final b = await Bench.start(
-          t,
-          stall: 0,
-          masters: const [MasterCfg('ma', 2, 8), MasterCfg('mb', 2, 8)],
-          slaves: const [SlaveCfg('s0', 4, 2, 0x00000, 0x10000)],
-        );
-        final inflight = _internal(b.sim.dut, 's0_inflight');
-        final fires = <String>[];
-        final waits = {'aw': 0, 'ar': 0};
-        var longest = 0;
-        var contested = 0;
-        b.sim.onRise(() {
-          if (inflight.previousValue!.toInt() != 1) return;
-          final want = {
-            'aw': b.sim.pre('ma_AWVALID') == 1,
-            'ar': b.sim.pre('mb_ARVALID') == 1,
-          };
-          final fire = {
-            'aw': want['aw']! && b.sim.pre('ma_AWREADY') == 1,
-            'ar': want['ar']! && b.sim.pre('mb_ARREADY') == 1,
-          };
-          if (want['aw']! && want['ar']!) {
-            contested++;
-            for (final d in ['aw', 'ar']) {
-              if (fire[d]!) fires.add(d);
+    for (final t in HarborFabricTopology.values) {
+      group(t.name, () {
+        test('a flood of AW and AR takes turns at the last slot', () async {
+          final b = await Bench.start(
+            t,
+            stall: 0,
+            masters: const [MasterCfg('ma', 2, 8), MasterCfg('mb', 2, 8)],
+            slaves: const [SlaveCfg('s0', 4, 2, 0x00000, 0x10000)],
+          );
+          final inflight = _internal(b.sim.dut, 's0_inflight');
+          final fires = <String>[];
+          final slaveFires = <(int, String)>[];
+          var cycle = 0;
+          b.sim.onRise(() {
+            cycle++;
+            for (final d in ['AW', 'AR']) {
+              if (b.sim.pre('s0_${d}VALID') == 1 &&
+                  b.sim.pre('s0_${d}READY') == 1) {
+                slaveFires.add((cycle, d));
+              }
             }
-          }
-          for (final d in ['aw', 'ar']) {
-            waits[d] = fire[d]! || !want[d]! ? 0 : waits[d]! + 1;
-            longest = longest > waits[d]! ? longest : waits[d]!;
-          }
-        });
-        for (var i = 0; i < 200; i++) {
-          b.managers['ma']!.write(_wr(i * 4));
-          b.managers['mb']!.read(_rd(0x800 + i * 4));
-        }
-        await b.drain(limit: 20000);
-        await b.sim.stop();
-        must(b.errors, isEmpty);
-        must(contested, greaterThan(50));
-        for (var i = 1; i < fires.length; i++) {
-          must(fires[i], isNot(fires[i - 1]), reason: 'fire $i');
-        }
-        must(longest, lessThanOrEqualTo(2));
-      });
-
-      test('a lone AW after an AR waits 1 cycle, a stream waits 0', () async {
-        final b = await Bench.start(
-          t,
-          stall: 0,
-          masters: const [MasterCfg('m0', 2, 8)],
-          slaves: const [SlaveCfg('s0', 4, 1, 0x00000, 0x10000)],
-        );
-        final m = b.managers['m0']!;
-        final awWaits = <int>[];
-        var waiting = 0;
-        b.sim.onRise(() {
-          if (b.sim.pre('m0_AWVALID') != 1) return;
-          if (b.sim.pre('m0_AWREADY') == 1) {
-            awWaits.add(waiting);
-            waiting = 0;
-          } else {
-            waiting++;
-          }
-        });
-        m.read(_rd(0x100));
-        await waitUntil(b.sim, () => m.rBeats.length == 1);
-        for (var i = 0; i < 4; i++) {
-          m.write(_wr(i * 4));
-          await waitUntil(b.sim, () => m.bResp.length == i + 1);
-        }
-        await b.sim.stop();
-        must(b.errors, isEmpty);
-        must(awWaits, [1, 0, 0, 0]);
-      });
-
-      test('no path from one direction to the other without a real-time '
-          'master', () async {
-        final shell = FabricShell(
-          t,
-          masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
-        );
-        await shell.build();
-        for (final s in slaves3) {
-          for (final (from, to) in [('AW', 'ar'), ('AR', 'aw')]) {
-            final targets = {_push(shell.fabric, s.name, to)};
-            for (final m in ['m0', 'm1']) {
-              must(
-                _combPath(shell.input('${m}_${from}VALID'), targets),
-                isFalse,
-                reason: '${m}_${from}VALID to ${s.name} $to',
-              );
-            }
-          }
-        }
-      });
-
-      // In the shared topology one AR arbiter serves every target, so a
-      // path into the real-time target s0 or the error target goes on to
-      // the AR grant of every target. The crossbar keeps it on s0.
-      test('the path stays on a real-time target only', () async {
-        final shell = FabricShell(
-          t,
-          masters: const [
-            MasterCfg('rt', 2, 4, realtime: true, reach: {'s0'}),
-            MasterCfg('m1', 3, 8),
-          ],
-        );
-        await shell.build();
-        for (final s in slaves3) {
-          final path = _combPath(shell.input('m1_AWVALID'), {
-            _push(shell.fabric, s.name, 'ar'),
           });
-          if (s.name == 's0' || t == HarborFabricTopology.crossbar) {
-            must(path, s.name == 's0', reason: s.name);
+          final waits = {'aw': 0, 'ar': 0};
+          var longest = 0;
+          var contested = 0;
+          b.sim.onRise(() {
+            if (inflight.previousValue!.toInt() != 1) return;
+            final want = {
+              'aw': b.sim.pre('ma_AWVALID') == 1,
+              'ar': b.sim.pre('mb_ARVALID') == 1,
+            };
+            final fire = {
+              'aw': want['aw']! && b.sim.pre('ma_AWREADY') == 1,
+              'ar': want['ar']! && b.sim.pre('mb_ARREADY') == 1,
+            };
+            if (want['aw']! && want['ar']!) {
+              contested++;
+              for (final d in ['aw', 'ar']) {
+                if (fire[d]!) fires.add(d);
+              }
+            }
+            for (final d in ['aw', 'ar']) {
+              waits[d] = fire[d]! || !want[d]! ? 0 : waits[d]! + 1;
+              longest = longest > waits[d]! ? longest : waits[d]!;
+            }
+          });
+          for (var i = 0; i < 200; i++) {
+            b.managers['ma']!.write(_wr(i * 4));
+            b.managers['mb']!.read(_rd(0x800 + i * 4));
           }
-        }
-      });
+          await b.drain(limit: 20000);
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          must(contested, greaterThan(50));
+          for (var i = 1; i < fires.length; i++) {
+            must(fires[i], isNot(fires[i - 1]), reason: 'fire $i');
+          }
+          if (p == HarborFabricPipeline.compact) {
+            must(longest, lessThanOrEqualTo(2));
+          } else {
+            // The inflight count includes the slots of granted requests on
+            // their way to the slave, so the slave shows the turns: no
+            // direction takes two slots in a row.
+            for (var i = 1; i < slaveFires.length; i++) {
+              final (c0, d0) = slaveFires[i - 1];
+              final (c1, d1) = slaveFires[i];
+              if (c0 == c1) continue;
+              must(d1, isNot(d0), reason: 'slave fire $i at $c1');
+            }
+          }
+        });
 
-      test('a real-time target has the SV from before', () async {
-        final shell = FabricShell(
-          t,
-          masters: const [
-            MasterCfg('m0', 2, 4, realtime: true),
-            MasterCfg('m1', 3, 8),
-          ],
-        );
-        await shell.build();
-        must(_hash(_sv(shell)), _realtimeGolden[t]);
+        test('a lone AW after an AR waits 1 cycle, a stream waits 0', () async {
+          final b = await Bench.start(
+            t,
+            stall: 0,
+            masters: const [MasterCfg('m0', 2, 8)],
+            slaves: const [SlaveCfg('s0', 4, 1, 0x00000, 0x10000)],
+          );
+          final m = b.managers['m0']!;
+          final awWaits = <int>[];
+          var waiting = 0;
+          b.sim.onRise(() {
+            if (b.sim.pre('m0_AWVALID') != 1) return;
+            if (b.sim.pre('m0_AWREADY') == 1) {
+              awWaits.add(waiting);
+              waiting = 0;
+            } else {
+              waiting++;
+            }
+          });
+          m.read(_rd(0x100));
+          await waitUntil(b.sim, () => m.rBeats.length == 1);
+          for (var i = 0; i < 4; i++) {
+            m.write(_wr(i * 4));
+            await waitUntil(b.sim, () => m.bResp.length == i + 1);
+          }
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          // With registered wants, a direction that wants the last slot
+          // alone owns it at once.
+          must(
+            awWaits,
+            p == HarborFabricPipeline.compact ? [1, 0, 0, 0] : [0, 0, 0, 0],
+          );
+        });
+
+        test('no path from one direction to the other without a real-time '
+            'master', () async {
+          final shell = FabricShell(
+            t,
+            masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
+          );
+          await shell.build();
+          for (final s in slaves3) {
+            for (final (from, to) in [('AW', 'ar'), ('AR', 'aw')]) {
+              final targets = {_push(shell.fabric, s.name, to)};
+              for (final m in ['m0', 'm1']) {
+                must(
+                  _combPath(shell.input('${m}_${from}VALID'), targets),
+                  isFalse,
+                  reason: '${m}_${from}VALID to ${s.name} $to',
+                );
+              }
+            }
+          }
+        });
+
+        // In the shared topology one AR arbiter serves every target, so a
+        // path into the real-time target s0 or the error target goes on to
+        // the AR grant of every target. The crossbar keeps it on s0.
+        test('the path stays on a real-time target only', () async {
+          final shell = FabricShell(
+            t,
+            masters: const [
+              MasterCfg('rt', 2, 4, realtime: true, reach: {'s0'}),
+              MasterCfg('m1', 3, 8),
+            ],
+          );
+          await shell.build();
+          for (final s in slaves3) {
+            final path = _combPath(shell.input('m1_AWVALID'), {
+              _push(shell.fabric, s.name, 'ar'),
+            });
+            // The balanced and fast levels arbitrate on flops, so no
+            // request reaches a grant in its own cycle.
+            if (p != HarborFabricPipeline.compact) {
+              must(path, isFalse, reason: s.name);
+            } else if (s.name == 's0' || t == HarborFabricTopology.crossbar) {
+              must(path, s.name == 's0', reason: s.name);
+            }
+          }
+        });
+
+        test('a real-time target has the SV from before', () async {
+          final shell = FabricShell(
+            t,
+            masters: const [
+              MasterCfg('m0', 2, 4, realtime: true),
+              MasterCfg('m1', 3, 8),
+            ],
+          );
+          await shell.build();
+          must(_hash(_sv(shell)), _realtimeGolden[(p, t)]);
+        });
       });
-    });
-  }
+    }
+  });
 }

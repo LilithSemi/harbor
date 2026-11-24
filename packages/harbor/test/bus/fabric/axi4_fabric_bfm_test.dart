@@ -279,10 +279,12 @@ Future<void> _bfm(HarborFabricTopology topology) async {
 }
 
 void main() {
-  for (final t in HarborFabricTopology.values) {
-    test(
-      '${t.name} fabric under the rohd_hcl manager BFM',
-      () => isolated(() => _bfm(t)),
-    );
-  }
+  forEachPipeline((p) {
+    for (final t in HarborFabricTopology.values) {
+      test(
+        '${t.name} fabric under the rohd_hcl manager BFM',
+        () => isolated(() => _bfm(t)),
+      );
+    }
+  });
 }

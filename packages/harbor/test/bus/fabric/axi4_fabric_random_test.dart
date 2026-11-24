@@ -36,10 +36,12 @@ Future<void> _random(
   List<SlaveCfg> slaves = slaves3,
   int phase1 = 70,
   int phase2 = 35,
+  HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
 }) async {
   final b = await Bench.start(
     topology,
     seed: seed,
+    pipeline: pipeline,
     masters: masters,
     slaves: slaves,
   );
@@ -131,33 +133,47 @@ const _oneLiteSlave = [
 ];
 
 void main() {
-  for (final topology in HarborFabricTopology.values) {
-    for (final (name, masters, slaves) in [
-      ('one slave', masters3, _oneSlave),
-      ('one slave with a timeout', masters3, _oneSlaveTimeout),
-      ('one AXI4-Lite slave', _mastersLite, _oneLiteSlave),
-    ]) {
+  for (final pipeline in HarborFabricPipeline.values) {
+    for (final topology in HarborFabricTopology.values) {
+      for (final (name, masters, slaves) in [
+        ('one slave', masters3, _oneSlave),
+        ('one slave with a timeout', masters3, _oneSlaveTimeout),
+        ('one AXI4-Lite slave', _mastersLite, _oneLiteSlave),
+      ]) {
+        test(
+          '${pipeline.name} ${topology.name} random traffic, $name',
+          () => isolated(
+            () => _random(
+              topology,
+              4,
+              pipeline: pipeline,
+              masters: masters,
+              slaves: slaves,
+            ),
+          ),
+          timeout: const Timeout(Duration(minutes: 10)),
+        );
+      }
+      for (final seed in [1, 2]) {
+        test(
+          '${pipeline.name} ${topology.name} random traffic, seed $seed',
+          () => isolated(() => _random(topology, seed, pipeline: pipeline)),
+          timeout: const Timeout(Duration(minutes: 10)),
+        );
+      }
       test(
-        '${topology.name} random traffic, $name',
+        '${pipeline.name} ${topology.name} random traffic with AXI4-Lite ports',
         () => isolated(
-          () => _random(topology, 4, masters: masters, slaves: slaves),
+          () => _random(
+            topology,
+            3,
+            pipeline: pipeline,
+            masters: _mastersLite,
+            slaves: _slavesLite,
+          ),
         ),
         timeout: const Timeout(Duration(minutes: 10)),
       );
     }
-    for (final seed in [1, 2]) {
-      test(
-        '${topology.name} random traffic, seed $seed',
-        () => isolated(() => _random(topology, seed)),
-        timeout: const Timeout(Duration(minutes: 10)),
-      );
-    }
-    test(
-      '${topology.name} random traffic with AXI4-Lite ports',
-      () => isolated(
-        () => _random(topology, 3, masters: _mastersLite, slaves: _slavesLite),
-      ),
-      timeout: const Timeout(Duration(minutes: 10)),
-    );
   }
 }

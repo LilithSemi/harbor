@@ -84,12 +84,34 @@ const _compact = {
   ('2x3', HarborFabricTopology.crossbar): 15,
 };
 
-const _budget = {
-  HarborFabricPipeline.balanced: 10,
-  HarborFabricPipeline.fast: 6,
+// The worst depth of the whole fabric at the balanced level. It is on the
+// responses, which are not yet registered, and must not grow.
+const _balanced = {
+  ('kc705', HarborFabricTopology.shared): 16,
+  ('kc705', HarborFabricTopology.crossbar): 16,
+  ('2x3', HarborFabricTopology.shared): 16,
+  ('2x3', HarborFabricTopology.crossbar): 15,
 };
 
-Future<HarborDepthPath> _fabricDepth(
+// The request path budget: from the master FIFO and head register through
+// the arbiter, the credits and the grant register into the grant FIFO.
+const _requestBudget = 6;
+
+// The cells of the request path, by the names of the flops they drive.
+final _requestCell = RegExp(
+  r'^m\d+_(aw|ar)_(wr|rd|has|full|ram)$|'
+  r'_(aw|ar)_(head_.*|issued_.*|pop_q|fire_q|non_final_q|split_.*|order_.*|'
+  r'rr|grant_reg|elig|want_q|rt_want_q|grant_used|remap_used|grant_pop_q|'
+  r'remap_.*|grant_(wr|rd|count|ram))$|_prefer_read$|_inflight$',
+);
+
+bool _inRequest(Module cell) => [
+  if (cell is HarborFifoRam) cell.name,
+  for (final o in cell.outputs.values)
+    for (final d in o.dstConnections) d.name,
+].any(_requestCell.hasMatch);
+
+Future<HarborAxi4Fabric> _fabric(
   String config,
   HarborFabricTopology t,
   HarborFabricPipeline p,
@@ -97,8 +119,14 @@ Future<HarborDepthPath> _fabricDepth(
   final (masters, slaves) = _configs[config]!;
   final shell = FabricShell(t, masters: masters, slaves: slaves, pipeline: p);
   await shell.build();
-  return harborWorstDepth(shell.fabric);
+  return shell.fabric as HarborAxi4Fabric;
 }
+
+Future<HarborDepthPath> _fabricDepth(
+  String config,
+  HarborFabricTopology t,
+  HarborFabricPipeline p,
+) async => harborWorstDepth(await _fabric(config, t, p));
 
 void main() {
   group('cost model', () {
@@ -271,13 +299,40 @@ void main() {
           expect(p.levels, _compact[(config, t)]);
         });
 
-        for (final MapEntry(key: level, value: budget) in _budget.entries) {
-          test('${level.name} fits $budget levels', () async {
-            final p = await _fabricDepth(config, t, level);
-            printOnFailure('$p');
-            expect(p.levels, lessThanOrEqualTo(budget));
-          }, skip: 'level not built yet');
+        for (final level in [
+          HarborFabricPipeline.balanced,
+          HarborFabricPipeline.fast,
+        ]) {
+          test(
+            '${level.name} request path fits $_requestBudget levels',
+            () async {
+              final f = await _fabric(config, t, level);
+              final p = harborWorstDepth(
+                f,
+                cut: f.requestCut,
+                endIn: _inRequest,
+              );
+              printOnFailure('$p');
+              expect(p.levels, lessThanOrEqualTo(_requestBudget));
+            },
+          );
         }
+
+        test('balanced keeps its recorded depth', () async {
+          final p = await _fabricDepth(
+            config,
+            t,
+            HarborFabricPipeline.balanced,
+          );
+          printOnFailure('$p');
+          expect(p.levels, _balanced[(config, t)]);
+        });
+
+        test('fast fits 6 levels', () async {
+          final p = await _fabricDepth(config, t, HarborFabricPipeline.fast);
+          printOnFailure('$p');
+          expect(p.levels, lessThanOrEqualTo(6));
+        }, skip: 'responses and W are not registered yet');
       });
     }
   }
@@ -293,7 +348,12 @@ void main() {
     expect(p.levels, greaterThanOrEqualTo(14));
   });
 
-  test('pathCyclesOf counts 5 AXI4 stages at each level', () {
+  test('pathCyclesOf counts the AXI4 stages of each level', () {
+    const stages = {
+      HarborFabricPipeline.compact: 5,
+      HarborFabricPipeline.balanced: 7,
+      HarborFabricPipeline.fast: 7,
+    };
     for (final p in HarborFabricPipeline.values) {
       expect(
         HarborFabric.pathCyclesOf(
@@ -301,7 +361,7 @@ void main() {
           pipeline: p,
           memoryPorts: 0,
         ),
-        5,
+        stages[p],
       );
     }
   });

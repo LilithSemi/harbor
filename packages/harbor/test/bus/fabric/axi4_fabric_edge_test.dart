@@ -145,24 +145,26 @@ Future<void> _liteSameCycle(HarborFabricTopology t) async {
 }
 
 void main() {
-  const long = Timeout(Duration(minutes: 5));
-  for (final t in HarborFabricTopology.values) {
-    group(t.name, () {
-      test(
-        'slaves see the full address or offset at region edges',
-        () => isolated(() => _addressRebuild(t)),
-        timeout: long,
-      );
-      test(
-        'AW and AR to one AXI4-Lite slave in the same cycle',
-        () => isolated(() => _liteSameCycle(t)),
-        timeout: long,
-      );
-      test(
-        'timeout cuts off an AXI4-Lite slave',
-        () => isolated(() => _liteTimeout(t)),
-        timeout: long,
-      );
-    });
-  }
+  forEachPipeline((p) {
+    const long = Timeout(Duration(minutes: 5));
+    for (final t in HarborFabricTopology.values) {
+      group(t.name, () {
+        test(
+          'slaves see the full address or offset at region edges',
+          () => isolated(() => _addressRebuild(t)),
+          timeout: long,
+        );
+        test(
+          'AW and AR to one AXI4-Lite slave in the same cycle',
+          () => isolated(() => _liteSameCycle(t)),
+          timeout: long,
+        );
+        test(
+          'timeout cuts off an AXI4-Lite slave',
+          () => isolated(() => _liteTimeout(t)),
+          timeout: long,
+        );
+      });
+    }
+  });
 }

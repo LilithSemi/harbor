@@ -175,10 +175,11 @@ typedef _In = (_Arrival, Logic);
 
 class _Walker {
   final Module root;
+  final Set<Logic> cut;
   final Map<Logic, List<_Arrival>> _memo = {};
   final Set<Logic> _open = {};
 
-  _Walker(this.root);
+  _Walker(this.root, this.cut);
 
   // The arrival of each bit of [s], low bit first.
   List<_Arrival> bits(Logic s) {
@@ -206,7 +207,9 @@ class _Walker {
 
   List<_Arrival> _compute(Logic s) {
     final w = s.width;
-    if (s is Const) return List.filled(w, _Arrival.constant);
+    if (s is Const || cut.contains(s)) {
+      return List.filled(w, _Arrival.constant);
+    }
     final m = s.parentModule;
     if (s.isInput && m == root) return List.filled(w, _Arrival.source);
     if (s is LogicStructure && s.elements.isNotEmpty) {
@@ -413,11 +416,13 @@ class _Walker {
 }
 
 /// The ends of paths inside [root]: the inputs of Sequential, FlipFlop and
-/// RAM write ports, and the outputs of [root].
-List<Logic> _endPoints(Module root) {
-  final ends = <Logic>[...root.outputs.values];
+/// RAM write ports, and the outputs of [root]. With [endIn], only the cells
+/// it accepts, and no output of [root].
+List<Logic> _endPoints(Module root, bool Function(Module cell)? endIn) {
+  final ends = <Logic>[if (endIn == null) ...root.outputs.values];
   void visit(Module m) {
     if (m.subModules.isEmpty) {
+      if (endIn != null && !endIn(m)) return;
       if (m is Sequential || m is FlipFlop) {
         ends.addAll(m.inputs.values);
       } else if (_isRam(m)) {
@@ -442,12 +447,19 @@ List<Logic> _endPoints(Module root) {
 /// [harborGateLevels] gives, except that AND, OR, XOR, NOT and equality
 /// cells pack into shared LUT6 levels, and a tree of Add and Subtract cells
 /// counts as one adder of all its operands. [root] must be built.
-HarborDepthPath harborWorstDepth(Module root) {
-  final w = _Walker(root);
+///
+/// To measure one part of a design, [cut] lists signals that count as
+/// constants, and [endIn] keeps only the end cells it accepts.
+HarborDepthPath harborWorstDepth(
+  Module root, {
+  Set<Logic> cut = const {},
+  bool Function(Module cell)? endIn,
+}) {
+  final w = _Walker(root, cut);
   Logic? worst;
   var bit = 0;
   var levels = -1;
-  for (final end in _endPoints(root)) {
+  for (final end in _endPoints(root, endIn)) {
     final b = w.bits(end);
     for (var i = 0; i < b.length; i++) {
       if (b[i].level > levels) {

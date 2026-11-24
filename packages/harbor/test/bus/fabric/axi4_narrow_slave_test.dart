@@ -11,7 +11,8 @@ import 'package:test/test.dart';
 
 import '../port/memory_harness.dart';
 import '../port/port_harness.dart';
-import 'axi4_fabric_harness.dart' show exposeInterface, must;
+import 'axi4_fabric_harness.dart'
+    show exposeInterface, forEachPipeline, harnessPipeline, must;
 
 const _liteBase = 0x10000;
 
@@ -28,6 +29,7 @@ class _Shell extends BridgeModule {
     exposeInterface(this, l, 'l', PairDirection.fromConsumer);
     final fabric = HarborFabric.build(
       kind: HarborFabricKind.axi4,
+      pipeline: harnessPipeline,
       topology: t,
       clk: input('clk'),
       reset: input('reset'),
@@ -179,14 +181,16 @@ Future<void> _run(HarborFabricTopology t) async {
 }
 
 void main() {
-  tearDown(() async => Simulator.reset());
-  for (final t in HarborFabricTopology.values) {
-    test(
-      '${t.name}: a 32-bit lite slave on a 64-bit AXI4 fabric',
-      () async {
-        await _run(t);
-      },
-      timeout: const Timeout(Duration(minutes: 5)),
-    );
-  }
+  forEachPipeline((p) {
+    tearDown(() async => Simulator.reset());
+    for (final t in HarborFabricTopology.values) {
+      test(
+        '${t.name}: a 32-bit lite slave on a 64-bit AXI4 fabric',
+        () async {
+          await _run(t);
+        },
+        timeout: const Timeout(Duration(minutes: 5)),
+      );
+    }
+  });
 }

@@ -4,11 +4,27 @@ import 'dart:math';
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
+import 'package:test/test.dart';
 
 import '../port/memory_harness.dart';
 import '../port/port_harness.dart';
 
 export '../port/cdc_harness.dart' show isolated, must;
+
+/// The level a test builds when it names none. [forEachPipeline] sets it.
+HarborFabricPipeline harnessPipeline = HarborFabricPipeline.balanced;
+
+/// Runs [body] in one group per pipeline level, with [harnessPipeline] set
+/// to that level in each test.
+void forEachPipeline(void Function(HarborFabricPipeline p) body) {
+  for (final p in HarborFabricPipeline.values) {
+    group(p.name, () {
+      setUp(() => harnessPipeline = p);
+      tearDown(() => harnessPipeline = HarborFabricPipeline.balanced);
+      body(p);
+    });
+  }
+}
 
 const addrW = 20;
 const dataW = 32;
@@ -139,7 +155,7 @@ class FabricShell extends BridgeModule {
     List<MasterCfg> masters = masters3,
     List<SlaveCfg> slaves = slaves3,
     int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
-    HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
+    HarborFabricPipeline? pipeline,
   }) : super('FabricTestShell_${topology.name}', name: 'shell') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -198,7 +214,7 @@ class FabricShell extends BridgeModule {
       masters: ms,
       slaves: ss,
       realtimeBurstCap: realtimeBurstCap,
-      pipeline: pipeline,
+      pipeline: pipeline ?? harnessPipeline,
     );
     createPort('bus_error', PortDirection.output);
     output('bus_error') <= fabric.busError;
@@ -233,12 +249,14 @@ class Bench {
     double stall = 0.3,
     int maxTime = 4000000,
     int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
+    HarborFabricPipeline? pipeline,
   }) async {
     final shell = FabricShell(
       topology,
       masters: masters,
       slaves: slaves,
       realtimeBurstCap: realtimeBurstCap,
+      pipeline: pipeline,
     );
     final sim = Sim(shell);
     final rng = Random(seed);

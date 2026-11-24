@@ -1,5 +1,6 @@
 import 'dart:math';
 
+import 'package:meta/meta.dart' show visibleForTesting;
 import 'package:rohd/rohd.dart';
 import 'package:rohd_hcl/rohd_hcl.dart' show Axi4RespField;
 
@@ -53,12 +54,13 @@ class _Resp {
 // while it has requests in flight, so the slave still sees one ID for it and
 // keeps their order.
 class _Remap {
+  final String name;
   final List<Logic> fid;
   final List<Logic> cnt;
   final int slotWidth;
   final int slaveIdWidth;
 
-  _Remap(String name, int fullIdWidth, this.slaveIdWidth, int outstanding)
+  _Remap(this.name, int fullIdWidth, this.slaveIdWidth, int outstanding)
     : fid = [],
       cnt = [],
       slotWidth = indexWidth(min(1 << min(slaveIdWidth, 16), outstanding)) {
@@ -111,19 +113,84 @@ class _Remap {
       ],
     ]);
   }
+
+  /// The slave ID of [f] for a request that [issue] marks, as [update]
+  /// does, with the table update one cycle later. The lookup sees the
+  /// request of the cycle before as if it were in the table. [giveBack] is
+  /// high one cycle after a request found its ID, and [release] in the
+  /// cycle after a slot became free.
+  ({Logic sid, Logic giveBack, Logic release}) lookup(
+    Logic clk,
+    Logic reset, {
+    required Logic issue,
+    required Logic f,
+    required Logic done,
+    required Logic doneSid,
+  }) {
+    final k = fid.length;
+    final issueQ = Logic(name: '${name}_issue_q');
+    final slotQ = Logic(name: '${name}_slot_q', width: k);
+    final allocQ = Logic(name: '${name}_alloc_q');
+    final fQ = Logic(name: '${name}_f_q', width: f.width);
+    final liveQ = Logic(name: '${name}_live_q', width: k);
+    final pend = [for (var i = 0; i < k; i++) issueQ & slotQ[i]];
+    final live = [for (var i = 0; i < k; i++) cnt[i].neq(0) | pend[i]];
+    final load = [for (var i = 0; i < k; i++) allocQ & pend[i]];
+    final match = [
+      for (var i = 0; i < k; i++)
+        live[i] & harborLoad(fid[i], load[i], fQ).eq(f),
+    ];
+    final hasMatch = anyOf(match);
+    final free = lowestOf([for (final v in live) ~v]);
+    final slot = [
+      for (var i = 0; i < k; i++) (hasMatch & match[i]) | (~hasMatch & free[i]),
+    ];
+    final doneSlot = decodeIndex(doneSid.getRange(0, slotWidth), k);
+    final w = cnt.first.width;
+    Sequential(clk, reset: reset, [
+      issueQ < issue,
+      slotQ < slot.rconcat(),
+      allocQ < ~hasMatch,
+      fQ < f,
+      liveQ < live.rconcat(),
+      for (var i = 0; i < k; i++) ...[
+        cnt[i] <
+            cnt[i] + pend[i].zeroExtend(w) - (done & doneSlot[i]).zeroExtend(w),
+        fid[i] < harborLoad(fid[i], load[i], fQ),
+      ],
+    ]);
+    return (
+      sid: indexOf(slot, slotWidth).zeroExtend(slaveIdWidth),
+      giveBack: issueQ & ~allocQ,
+      release: anyOf([for (var i = 0; i < k; i++) liveQ[i] & ~live[i]]),
+    );
+  }
 }
 
 // Requests a master has in flight in one direction, grouped by ID. Each
 // group keeps the target its requests went to.
 class _Tracker {
-  final Logic ok;
+  final Logic? ok;
   final Logic _total;
+  final int outstanding;
+  final Logic Function(Logic id, Logic target)? _okFor;
 
-  _Tracker._(this.ok, this._total);
+  _Tracker._(this.ok, this._total, this.outstanding, this._okFor);
 
   /// High when the master has no request in flight.
   Logic get idle => _total.eq(0);
 
+  /// High when the ID order lets a request with [id] go to [target]. The
+  /// caller checks the count with [below].
+  Logic okFor(Logic id, Logic target) => _okFor!(id, target);
+
+  /// High when fewer than [outstanding] less [x] requests are in flight.
+  Logic below(int x) => outstanding > x
+      ? _total.lt(Const(outstanding - x, width: _total.width))
+      : Const(0);
+
+  /// [id] and [target] are of the request that issues. With [head], [ok] is
+  /// null and [okFor] checks any request.
   factory _Tracker(
     String name,
     Logic clk,
@@ -134,6 +201,7 @@ class _Tracker {
     required Logic issue,
     required Logic done,
     required Logic doneId,
+    bool head = false,
   }) {
     final k = min(1 << min(id.width, 16), outstanding);
     final cw = widthOf(outstanding);
@@ -152,9 +220,10 @@ class _Tracker {
     final match = [for (var i = 0; i < k; i++) valid[i] & ids[i].eq(id)];
     final hasMatch = anyOf(match);
     final free = lowestOf([for (final v in valid) ~v]);
-    final ok =
-        mux(hasMatch, pick(match, tgts).eq(target), anyOf(free)) &
-        total.lt(Const(outstanding, width: cw));
+    final ok = head
+        ? null
+        : mux(hasMatch, pick(match, tgts).eq(target), anyOf(free)) &
+              total.lt(Const(outstanding, width: cw));
     // The completion credit returns one cycle after the response select. The
     // slot stays live for that cycle, so no extra request can issue, and the
     // path from the response mux to the counters gets a flop.
@@ -170,13 +239,29 @@ class _Tracker {
       for (var i = 0; i < k; i++) ...[
         cnt[i] <
             cnt[i] +
-                (issue & mux(hasMatch, match[i], free[i])).zeroExtend(cw) -
+                (head
+                        ? issue &
+                              ((hasMatch & match[i]) | (~hasMatch & free[i]))
+                        : issue & mux(hasMatch, match[i], free[i]))
+                    .zeroExtend(cw) -
                 (completed & doneMatch[i]).zeroExtend(cw),
         ids[i] < harborLoad(ids[i], issue & ~hasMatch & free[i], id),
         tgts[i] < harborLoad(tgts[i], issue & ~hasMatch & free[i], target),
       ],
     ]);
-    return _Tracker._(ok.named('${name}_ok'), total);
+    // Each slot is free or holds an ID, and a full tracker has its total at
+    // the limit. So a request with no slot of its own finds a free one.
+    Logic okFor(Logic f, Logic t) {
+      final m = [for (var i = 0; i < k; i++) valid[i] & ids[i].eq(f)];
+      return mux(anyOf(m), pick(m, tgts).eq(t), Const(1));
+    }
+
+    return _Tracker._(
+      ok?.named('${name}_ok'),
+      total,
+      outstanding,
+      head ? okFor : null,
+    );
   }
 }
 
@@ -253,6 +338,12 @@ class HarborAxi4Fabric extends HarborFabricModule {
   /// The register stages of this fabric.
   final HarborFabricPipeline pipeline;
 
+  /// The signals from the response and slave side that the request side
+  /// reads, at the balanced and fast levels. A depth check of the request
+  /// path counts them as constants.
+  @visibleForTesting
+  final Set<Logic> requestCut = {};
+
   HarborAxi4Fabric({
     required this.topology,
     required Logic clk,
@@ -268,6 +359,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
            masters,
            slaves,
            realtimeBurstCap,
+           pipeline,
          ),
        ) {
     final (addrW, dataW, _) = _shape(masters.first.interface);
@@ -351,6 +443,11 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final mW = indexWidth(nm);
     // With one slave, the slave FIFOs are the only request stage.
     final pass = ns == 1;
+    final headOn = pipeline != HarborFabricPipeline.compact;
+    // A grant FIFO slot comes back four cycles after its grant: the grant
+    // register, the push, the pop and the registered pop. With one more
+    // slot for the grant in each cycle, one request per cycle goes on.
+    const grantDepth = 5;
 
     // The read channel each master uses at each slave, by master index.
     final chanOf = [
@@ -503,330 +600,842 @@ class HarborAxi4Fabric extends HarborFabricModule {
       mNonFinal[m][dir] <= fire & mMore[m][dir];
     }
 
-    final mIdle = [
-      for (var m = 0; m < nm; m++) <Logic?>[null, null],
-    ];
-    final mFull = <List<Logic>>[];
-    final mRest = <List<Logic>>[];
-    final mTgt = <List<List<Logic>>>[];
     final mTgtIdx = <List<Logic>>[];
-    final req = <List<List<Logic>>>[];
-    for (var m = 0; m < nm; m++) {
-      final a = ma[m];
-      final mn = masters[m].name;
-      mFull.add([]);
-      mRest.add([]);
-      mTgt.add([]);
-      mTgtIdx.add([]);
-      req.add([]);
-      for (var dir = 0; dir < 2; dir++) {
-        final d = dir == 0 ? 'AW' : 'AR';
-        // Decode comes before the FIFO, so the FIFO holds the target and
-        // the low address bits in place of the full address.
-        final addr = a.port('${d}ADDR');
-        final hits = [
-          for (final s in slaves)
-            masters[m].reaches(s.name) ? inRange(addr, s.range) : Const(0),
-        ];
-        // AW always targets channel 0. AR targets this master's assigned
-        // channel at the slave it hits.
-        final tgtIn = <Logic>[];
-        for (var s = 0; s < ns; s++) {
-          final chan = dir == 0 ? 0 : max(0, chanOf[s][m]);
-          for (var k = 0; k < chCount[s]; k++) {
-            tgtIn.add(k == chan ? hits[s] : Const(0));
-          }
-        }
-        tgtIn.add(~anyOf(hits));
-        final f = _stage(
-          pass,
-          name: '${mn}_${d.toLowerCase()}',
-          clk: c,
-          reset: r,
-          valid: a.port('${d}VALID'),
-          data: harborPack([
-            a.port('${d}ID'),
-            indexOf(tgtIn, tW),
-            addr.getRange(0, innerW),
-            for (final x in _restFields.skip(1)) a.port('$d$x'),
-          ]),
-          ready: a.port('${d}READY'),
-          pop: mPop[m][dir],
-        );
-        final [hid, tgtIdx, rest] = harborUnpack(f.data, [
-          a.idWidth,
-          tW,
-          restW,
-        ]);
-        final tgt = decodeIndex(tgtIdx, nt);
-        var pieceRest = rest;
-        Logic? splitOk;
-        if (splitM[m]) {
-          // The piece the master offers now: at most the cap beats of what
-          // is left of the burst, from the address the earlier pieces ended
-          // at.
-          final [addr, len, size, burst, lock, cache, prot, qos] = harborUnpack(
-            rest,
-            restWidths,
-          );
-          const lw = lenW + 1;
-          final p = '${mn}_${d.toLowerCase()}_split';
-          final done = Logic(name: '${p}_done', width: lw);
-          final busy = Logic(name: '${p}_busy');
-          final remain = (len.zeroExtend(lw) + 1) - done;
-          final eligible = anyOf([
-            for (var t = 0; t < nt; t++)
-              if (splitT[t]) tgt[t],
-          ]);
-          final incr = burst.eq(Const(1, width: Axi4Interface.burstWidth));
-          // A legal exclusive burst (16 beats or fewer) goes whole, or the
-          // monitor would see pieces. An exclusive burst above 16 beats is
-          // illegal and splits like any other.
-          final more =
-              (eligible &
-                      incr &
-                      (~lock | len.gt(Const(15, width: lenW))) &
-                      remain.gt(Const(cap, width: lw)))
-                  .named('${p}_more');
-          mMore[m][dir] <= more;
-          final pieceLen = mux(
-            more,
-            Const(cap - 1, width: lenW),
-            (remain - 1).getRange(0, lenW),
-          );
-          mPieceLen[m][dir] <= pieceLen;
-          final w = innerW + lw + 8;
-          final aligned = (addr.zeroExtend(w) >> size) << size;
-          final offset = done.zeroExtend(w) << size;
-          final pieceAddr = mux(
-            done.eq(0),
-            addr,
-            (aligned + offset).getRange(0, innerW),
-          );
-          pieceRest = harborPack([
-            pieceAddr,
-            pieceLen,
-            size,
-            burst,
-            lock,
-            cache,
-            prot,
-            qos,
-          ]);
-          Sequential(c, reset: r, [
-            If(
-              mFire[m][dir],
-              then: [
-                If(more, then: [done < done + Const(cap, width: lw)]),
-                If(~more, then: [done < 0]),
-              ],
-            ),
-            busy < (busy | mNonFinal[m][dir]) & ~mDone[m][dir],
-          ]);
-          // A burst that splits starts when the master has nothing else in
-          // flight, and any other request waits until it ends. So each
-          // response of the master belongs to the burst that splits.
-          mIdle[m][dir] = Logic(name: '${p}_idle');
-          splitOk = done.neq(0) | (~busy & (~more | mIdle[m][dir]!));
-          if (dir == 0) {
-            // Pieces of one burst overlap, as far as the master and the
-            // fabric hold their write routes.
-            final room = wPieces[m].lt(
-              Const(
-                min(15, masters[m].outstandingOn(HarborFabricKind.axi4)),
-                width: 4,
-              ),
-            );
-            splitOk = splitOk & room;
-          }
-        } else if (hasRt) {
-          mPieceLen[m][dir] <= rest.getRange(innerW, innerW + lenW);
-        }
-        final full = pW > 0
-            ? [Const(m, width: pW), hid.zeroExtend(maxId)].concat()
-            : hid.zeroExtend(maxId);
-        final tracker = _Tracker(
-          '${mn}_${d.toLowerCase()}_order',
-          c,
-          r,
-          outstanding: masters[m].outstandingOn(HarborFabricKind.axi4),
-          id: hid,
-          target: tgtIdx,
-          issue: mPop[m][dir],
-          done: mDone[m][dir],
-          doneId: mDoneId[m][dir],
-        );
-        final ok = splitOk == null ? tracker.ok : tracker.ok & splitOk;
-        if (splitOk != null) mIdle[m][dir]! <= tracker.idle;
-        mFull[m].add(full);
-        mRest[m].add(pieceRest);
-        mTgt[m].add(tgt);
-        mTgtIdx[m].add(tgtIdx);
-        req[m].add([
-          for (var t = 0; t < nt; t++)
-            f.valid &
-                ok &
-                tgt[t] &
-                inReady[t][dir] &
-                (tRemap[t] ? remap[t]![dir].ok(full) : Const(1)),
-        ]);
-      }
-    }
-
-    // Outstanding limit per target, reads and writes together. When one
-    // slot is left, a registered direction owns it. On a target that a
-    // real-time master reaches, a request in one direction takes the slot
-    // when the other direction does not want it. On other targets a request
-    // in the other direction waits one cycle for its turn, so no path goes
-    // from the AW request to the AR grant.
-    final outOk = <List<Logic>>[];
-    final tFire = [
-      for (var t = 0; t < nt; t++) [Logic(), Logic()],
-    ];
-    for (var t = 0; t < nt; t++) {
-      final n = tN[t];
-      final cw = widthOf(n);
-      final cnt = Logic(name: '${tName[t]}_inflight', width: cw);
-      final preferRead = Logic(name: '${tName[t]}_prefer_read');
-      final full = cnt.eq(Const(n, width: cw));
-      final lastOne = cnt.eq(Const(n - 1, width: cw));
-      final awWant = anyOf([for (var m = 0; m < nm; m++) req[m][0][t]]);
-      final arWant = anyOf([for (var m = 0; m < nm; m++) req[m][1][t]]);
-      // The error target counts as real-time in a fabric with a real-time
-      // master, as any master can decode to it.
-      final rtTarget = t < nst
-          ? masters.any((m) => m.realtime && m.reaches(slaves[tSlave[t]].name))
-          : hasRt;
-      // A real-time request in one direction takes the last slot from a
-      // request in the other direction.
-      var prefer = preferRead;
-      if (rtTarget) {
-        final awRt = anyOf([
-          for (var m = 0; m < nm; m++)
-            if (rt[m]) req[m][0][t],
-        ]);
-        final arRt = anyOf([
-          for (var m = 0; m < nm; m++)
-            if (rt[m]) req[m][1][t],
-        ]);
-        prefer = mux(
-          arRt & ~awRt,
-          Const(1),
-          mux(awRt & ~arRt, Const(0), preferRead),
-        );
-      }
-      outOk.add(
-        rtTarget
-            ? [
-                ~full & ~(lastOne & arWant & prefer),
-                ~full & ~(lastOne & awWant & ~prefer),
-              ]
-            : [~full & ~(lastOne & prefer), ~full & ~(lastOne & ~prefer)],
-      );
-      Sequential(c, reset: r, [
-        cnt <
-            cnt +
-                tFire[t][0].zeroExtend(cw) +
-                tFire[t][1].zeroExtend(cw) -
-                bDone[t].zeroExtend(cw) -
-                rDone[t].zeroExtend(cw),
-        // On a target that is not real-time, the direction turns when the
-        // other direction wants the slot. A stream in one direction keeps it
-        // and does not wait.
-        if (rtTarget)
-          preferRead < preferRead ^ (lastOne & awWant & arWant)
-        else
-          preferRead < preferRead ^ (lastOne & mux(preferRead, awWant, arWant)),
-      ]);
-    }
-
-    // Arbitration. Each target gets a request with its full ID and the
-    // master it came from.
-    final tReq = [for (var t = 0; t < nt; t++) <_Req>[]];
-    final tMaster = [for (var t = 0; t < nt; t++) <Logic>[]];
-    final awBusTarget = <Logic>[];
-    final awBusMaster = <Logic>[];
-    final awBusLen = <Logic>[];
-    for (var dir = 0; dir < 2; dir++) {
-      final d = dir == 0 ? 'aw' : 'ar';
-      final gated = [
-        for (var m = 0; m < nm; m++)
-          [for (var t = 0; t < nt; t++) req[m][dir][t] & outOk[t][dir]],
+    final List<List<Logic>> tFire;
+    final List<List<_Req>> tReq;
+    final List<List<Logic>> tMaster;
+    final List<Logic> awBusTarget;
+    final List<Logic> awBusMaster;
+    final List<Logic> awBusLen;
+    final List<List<Logic>> tSid;
+    final grantPopQ = <List<Logic>>[];
+    if (!headOn) {
+      final mIdle = [
+        for (var m = 0; m < nm; m++) <Logic?>[null, null],
       ];
-      final full = [for (var m = 0; m < nm; m++) mFull[m][dir]];
-      final rest = [for (var m = 0; m < nm; m++) mRest[m][dir]];
-      if (topology == HarborFabricTopology.crossbar) {
-        final grants = <List<Logic>>[];
-        for (var t = 0; t < nt; t++) {
-          final g = roundRobin(
-            '${tName[t]}_$d',
+      final mFull = <List<Logic>>[];
+      final mRest = <List<Logic>>[];
+      final mTgt = <List<List<Logic>>>[];
+      final req = <List<List<Logic>>>[];
+      for (var m = 0; m < nm; m++) {
+        final a = ma[m];
+        final mn = masters[m].name;
+        mFull.add([]);
+        mRest.add([]);
+        mTgt.add([]);
+        mTgtIdx.add([]);
+        req.add([]);
+        for (var dir = 0; dir < 2; dir++) {
+          final d = dir == 0 ? 'AW' : 'AR';
+          // Decode comes before the FIFO, so the FIFO holds the target and
+          // the low address bits in place of the full address.
+          final addr = a.port('${d}ADDR');
+          final hits = [
+            for (final s in slaves)
+              masters[m].reaches(s.name) ? inRange(addr, s.range) : Const(0),
+          ];
+          // AW always targets channel 0. AR targets this master's assigned
+          // channel at the slave it hits.
+          final tgtIn = <Logic>[];
+          for (var s = 0; s < ns; s++) {
+            final chan = dir == 0 ? 0 : max(0, chanOf[s][m]);
+            for (var k = 0; k < chCount[s]; k++) {
+              tgtIn.add(k == chan ? hits[s] : Const(0));
+            }
+          }
+          tgtIn.add(~anyOf(hits));
+          final f = _stage(
+            pass,
+            name: '${mn}_${d.toLowerCase()}',
+            clk: c,
+            reset: r,
+            valid: a.port('${d}VALID'),
+            data: harborPack([
+              a.port('${d}ID'),
+              indexOf(tgtIn, tW),
+              addr.getRange(0, innerW),
+              for (final x in _restFields.skip(1)) a.port('$d$x'),
+            ]),
+            ready: a.port('${d}READY'),
+            pop: mPop[m][dir],
+          );
+          final [hid, tgtIdx, rest] = harborUnpack(f.data, [
+            a.idWidth,
+            tW,
+            restW,
+          ]);
+          final tgt = decodeIndex(tgtIdx, nt);
+          var pieceRest = rest;
+          Logic? splitOk;
+          if (splitM[m]) {
+            // The piece the master offers now: at most the cap beats of what
+            // is left of the burst, from the address the earlier pieces ended
+            // at.
+            final [addr, len, size, burst, lock, cache, prot, qos] =
+                harborUnpack(rest, restWidths);
+            const lw = lenW + 1;
+            final p = '${mn}_${d.toLowerCase()}_split';
+            final done = Logic(name: '${p}_done', width: lw);
+            final busy = Logic(name: '${p}_busy');
+            final remain = (len.zeroExtend(lw) + 1) - done;
+            final eligible = anyOf([
+              for (var t = 0; t < nt; t++)
+                if (splitT[t]) tgt[t],
+            ]);
+            final incr = burst.eq(Const(1, width: Axi4Interface.burstWidth));
+            // A legal exclusive burst (16 beats or fewer) goes whole, or the
+            // monitor would see pieces. An exclusive burst above 16 beats is
+            // illegal and splits like any other.
+            final more =
+                (eligible &
+                        incr &
+                        (~lock | len.gt(Const(15, width: lenW))) &
+                        remain.gt(Const(cap, width: lw)))
+                    .named('${p}_more');
+            mMore[m][dir] <= more;
+            final pieceLen = mux(
+              more,
+              Const(cap - 1, width: lenW),
+              (remain - 1).getRange(0, lenW),
+            );
+            mPieceLen[m][dir] <= pieceLen;
+            final w = innerW + lw + 8;
+            final aligned = (addr.zeroExtend(w) >> size) << size;
+            final offset = done.zeroExtend(w) << size;
+            final pieceAddr = mux(
+              done.eq(0),
+              addr,
+              (aligned + offset).getRange(0, innerW),
+            );
+            pieceRest = harborPack([
+              pieceAddr,
+              pieceLen,
+              size,
+              burst,
+              lock,
+              cache,
+              prot,
+              qos,
+            ]);
+            Sequential(c, reset: r, [
+              If(
+                mFire[m][dir],
+                then: [
+                  If(more, then: [done < done + Const(cap, width: lw)]),
+                  If(~more, then: [done < 0]),
+                ],
+              ),
+              busy < (busy | mNonFinal[m][dir]) & ~mDone[m][dir],
+            ]);
+            // A burst that splits starts when the master has nothing else in
+            // flight, and any other request waits until it ends. So each
+            // response of the master belongs to the burst that splits.
+            mIdle[m][dir] = Logic(name: '${p}_idle');
+            splitOk = done.neq(0) | (~busy & (~more | mIdle[m][dir]!));
+            if (dir == 0) {
+              // Pieces of one burst overlap, as far as the master and the
+              // fabric hold their write routes.
+              final room = wPieces[m].lt(
+                Const(
+                  min(15, masters[m].outstandingOn(HarborFabricKind.axi4)),
+                  width: 4,
+                ),
+              );
+              splitOk = splitOk & room;
+            }
+          } else if (hasRt) {
+            mPieceLen[m][dir] <= rest.getRange(innerW, innerW + lenW);
+          }
+          final full = pW > 0
+              ? [Const(m, width: pW), hid.zeroExtend(maxId)].concat()
+              : hid.zeroExtend(maxId);
+          final tracker = _Tracker(
+            '${mn}_${d.toLowerCase()}_order',
             c,
             r,
-            realtimeFirst([for (var m = 0; m < nm; m++) gated[m][t]], rt),
+            outstanding: masters[m].outstandingOn(HarborFabricKind.axi4),
+            id: hid,
+            target: tgtIdx,
+            issue: mPop[m][dir],
+            done: mDone[m][dir],
+            doneId: mDoneId[m][dir],
           );
-          grants.add(g);
-          tFire[t][dir] <= anyOf(g);
-          tReq[t].add(_Req(tFire[t][dir], pick(g, full), pick(g, rest)));
-          tMaster[t].add(indexOf(g, mW));
+          final ok = splitOk == null ? tracker.ok! : tracker.ok! & splitOk;
+          if (splitOk != null) mIdle[m][dir]! <= tracker.idle;
+          mFull[m].add(full);
+          mRest[m].add(pieceRest);
+          mTgt[m].add(tgt);
+          mTgtIdx[m].add(tgtIdx);
+          req[m].add([
+            for (var t = 0; t < nt; t++)
+              f.valid &
+                  ok &
+                  tgt[t] &
+                  inReady[t][dir] &
+                  (tRemap[t] ? remap[t]![dir].ok(full) : Const(1)),
+          ]);
         }
-        for (var m = 0; m < nm; m++) {
-          grantTo(m, dir, anyOf([for (var t = 0; t < nt; t++) grants[t][m]]));
+      }
+
+      // Outstanding limit per target, reads and writes together. When one
+      // slot is left, a registered direction owns it. On a target that a
+      // real-time master reaches, a request in one direction takes the slot
+      // when the other direction does not want it. On other targets a request
+      // in the other direction waits one cycle for its turn, so no path goes
+      // from the AW request to the AR grant.
+      final outOk = <List<Logic>>[];
+      tFire = [
+        for (var t = 0; t < nt; t++) [Logic(), Logic()],
+      ];
+      for (var t = 0; t < nt; t++) {
+        final n = tN[t];
+        final cw = widthOf(n);
+        final cnt = Logic(name: '${tName[t]}_inflight', width: cw);
+        final preferRead = Logic(name: '${tName[t]}_prefer_read');
+        final full = cnt.eq(Const(n, width: cw));
+        final lastOne = cnt.eq(Const(n - 1, width: cw));
+        final awWant = anyOf([for (var m = 0; m < nm; m++) req[m][0][t]]);
+        final arWant = anyOf([for (var m = 0; m < nm; m++) req[m][1][t]]);
+        // The error target counts as real-time in a fabric with a real-time
+        // master, as any master can decode to it.
+        final rtTarget = t < nst
+            ? masters.any(
+                (m) => m.realtime && m.reaches(slaves[tSlave[t]].name),
+              )
+            : hasRt;
+        // A real-time request in one direction takes the last slot from a
+        // request in the other direction.
+        var prefer = preferRead;
+        if (rtTarget) {
+          final awRt = anyOf([
+            for (var m = 0; m < nm; m++)
+              if (rt[m]) req[m][0][t],
+          ]);
+          final arRt = anyOf([
+            for (var m = 0; m < nm; m++)
+              if (rt[m]) req[m][1][t],
+          ]);
+          prefer = mux(
+            arRt & ~awRt,
+            Const(1),
+            mux(awRt & ~arRt, Const(0), preferRead),
+          );
         }
-      } else {
-        final g = roundRobin(
-          'bus_$d',
-          c,
-          r,
-          realtimeFirst([for (var m = 0; m < nm; m++) anyOf(gated[m])], rt),
+        outOk.add(
+          rtTarget
+              ? [
+                  ~full & ~(lastOne & arWant & prefer),
+                  ~full & ~(lastOne & awWant & ~prefer),
+                ]
+              : [~full & ~(lastOne & prefer), ~full & ~(lastOne & ~prefer)],
         );
-        final busFull = pick(g, full);
-        final busRest = pick(g, rest);
-        final busMaster = indexOf(g, mW);
-        for (var t = 0; t < nt; t++) {
-          tFire[t][dir] <=
-              anyOf([for (var m = 0; m < nm; m++) g[m] & mTgt[m][dir][t]]);
-          tReq[t].add(_Req(tFire[t][dir], busFull, busRest));
-          tMaster[t].add(busMaster);
-        }
-        for (var m = 0; m < nm; m++) {
-          grantTo(m, dir, g[m]);
-        }
-        if (dir == 0) {
-          awBusTarget.add(
-            pick(g, [for (var m = 0; m < nm; m++) mTgtIdx[m][0]]),
-          );
-          awBusMaster.add(busMaster);
-          if (hasRt) {
-            awBusLen.add(
-              pick(g, [for (var m = 0; m < nm; m++) mPieceLen[m][0]]),
+        Sequential(c, reset: r, [
+          cnt <
+              cnt +
+                  tFire[t][0].zeroExtend(cw) +
+                  tFire[t][1].zeroExtend(cw) -
+                  bDone[t].zeroExtend(cw) -
+                  rDone[t].zeroExtend(cw),
+          // On a target that is not real-time, the direction turns when the
+          // other direction wants the slot. A stream in one direction keeps it
+          // and does not wait.
+          if (rtTarget)
+            preferRead < preferRead ^ (lastOne & awWant & arWant)
+          else
+            preferRead <
+                preferRead ^ (lastOne & mux(preferRead, awWant, arWant)),
+        ]);
+      }
+
+      // Arbitration. Each target gets a request with its full ID and the
+      // master it came from.
+      tReq = [for (var t = 0; t < nt; t++) <_Req>[]];
+      tMaster = [for (var t = 0; t < nt; t++) <Logic>[]];
+      awBusTarget = <Logic>[];
+      awBusMaster = <Logic>[];
+      awBusLen = <Logic>[];
+      for (var dir = 0; dir < 2; dir++) {
+        final d = dir == 0 ? 'aw' : 'ar';
+        final gated = [
+          for (var m = 0; m < nm; m++)
+            [for (var t = 0; t < nt; t++) req[m][dir][t] & outOk[t][dir]],
+        ];
+        final full = [for (var m = 0; m < nm; m++) mFull[m][dir]];
+        final rest = [for (var m = 0; m < nm; m++) mRest[m][dir]];
+        if (topology == HarborFabricTopology.crossbar) {
+          final grants = <List<Logic>>[];
+          for (var t = 0; t < nt; t++) {
+            final g = roundRobin(
+              '${tName[t]}_$d',
+              c,
+              r,
+              realtimeFirst([for (var m = 0; m < nm; m++) gated[m][t]], rt),
             );
+            grants.add(g);
+            tFire[t][dir] <= anyOf(g);
+            tReq[t].add(_Req(tFire[t][dir], pick(g, full), pick(g, rest)));
+            tMaster[t].add(indexOf(g, mW));
+          }
+          for (var m = 0; m < nm; m++) {
+            grantTo(m, dir, anyOf([for (var t = 0; t < nt; t++) grants[t][m]]));
+          }
+        } else {
+          final g = roundRobin(
+            'bus_$d',
+            c,
+            r,
+            realtimeFirst([for (var m = 0; m < nm; m++) anyOf(gated[m])], rt),
+          );
+          final busFull = pick(g, full);
+          final busRest = pick(g, rest);
+          final busMaster = indexOf(g, mW);
+          for (var t = 0; t < nt; t++) {
+            tFire[t][dir] <=
+                anyOf([for (var m = 0; m < nm; m++) g[m] & mTgt[m][dir][t]]);
+            tReq[t].add(_Req(tFire[t][dir], busFull, busRest));
+            tMaster[t].add(busMaster);
+          }
+          for (var m = 0; m < nm; m++) {
+            grantTo(m, dir, g[m]);
+          }
+          if (dir == 0) {
+            awBusTarget.add(
+              pick(g, [for (var m = 0; m < nm; m++) mTgtIdx[m][0]]),
+            );
+            awBusMaster.add(busMaster);
+            if (hasRt) {
+              awBusLen.add(
+                pick(g, [for (var m = 0; m < nm; m++) mPieceLen[m][0]]),
+              );
+            }
           }
         }
       }
-    }
 
-    // ID remap at each target.
-    final tSid = [
-      for (var t = 0; t < nt; t++)
-        [
-          for (var dir = 0; dir < 2; dir++)
-            tRemap[t]
-                ? remap[t]![dir].slaveId(tReq[t][dir].id)
-                : tReq[t][dir].id.zeroExtend(tIdW[t]),
-        ],
-    ];
-    for (var t = 0; t < nt; t++) {
-      if (!tRemap[t]) continue;
+      // ID remap at each target.
+      tSid = [
+        for (var t = 0; t < nt; t++)
+          [
+            for (var dir = 0; dir < 2; dir++)
+              tRemap[t]
+                  ? remap[t]![dir].slaveId(tReq[t][dir].id)
+                  : tReq[t][dir].id.zeroExtend(tIdW[t]),
+          ],
+      ];
+      for (var t = 0; t < nt; t++) {
+        if (!tRemap[t]) continue;
+        for (var dir = 0; dir < 2; dir++) {
+          final resp = dir == 0 ? bResp[t] : rResp[t];
+          remap[t]![dir].update(
+            c,
+            r,
+            issue: tFire[t][dir],
+            f: tReq[t][dir].id,
+            done: dir == 0 ? bDone[t] : rDone[t],
+            doneSid: resp.id,
+          );
+        }
+      }
+    } else {
+      // The flop-only arbitration. Each master head is a register, each
+      // target and direction has an eligibility flop from local credits,
+      // and the arbiter reads only flops. The granted fields, the ID remap,
+      // the grant FIFO push and the tracker issue follow one cycle later
+      // from the grant register.
+      final elig = [
+        for (var t = 0; t < nt; t++)
+          [
+            for (final d in ['aw', 'ar']) Logic(name: '${tName[t]}_${d}_elig'),
+          ],
+      ];
+      final hValid = [
+        for (var m = 0; m < nm; m++) [Logic(), Logic()],
+      ];
+      final hOk = [
+        for (var m = 0; m < nm; m++) [Logic(), Logic()],
+      ];
+      final hTgt = [
+        for (var m = 0; m < nm; m++) <List<Logic>>[[], []],
+      ];
+      final gFire = [
+        for (var m = 0; m < nm; m++) [Logic(), Logic()],
+      ];
+      final iFull = [for (var m = 0; m < nm; m++) <Logic>[]];
+      final iRest = [for (var m = 0; m < nm; m++) <Logic>[]];
+      final iTgt = [for (var m = 0; m < nm; m++) <Logic>[]];
+      for (var m = 0; m < nm; m++) {
+        final a = ma[m];
+        final mn = masters[m].name;
+        mTgtIdx.add([]);
+        final n = masters[m].outstandingOn(HarborFabricKind.axi4);
+        for (var dir = 0; dir < 2; dir++) {
+          final d = dir == 0 ? 'AW' : 'AR';
+          final p = '${mn}_${d.toLowerCase()}';
+          final addr = a.port('${d}ADDR');
+          final hits = [
+            for (final s in slaves)
+              masters[m].reaches(s.name) ? inRange(addr, s.range) : Const(0),
+          ];
+          final tgtIn = <Logic>[];
+          for (var s = 0; s < ns; s++) {
+            final chan = dir == 0 ? 0 : max(0, chanOf[s][m]);
+            for (var k = 0; k < chCount[s]; k++) {
+              tgtIn.add(k == chan ? hits[s] : Const(0));
+            }
+          }
+          tgtIn.add(~anyOf(hits));
+          final advance = Logic(name: '${p}_advance');
+          final f = _inStage(
+            pass,
+            name: p,
+            clk: c,
+            reset: r,
+            valid: a.port('${d}VALID'),
+            data: harborPack([
+              a.port('${d}ID'),
+              indexOf(tgtIn, tW),
+              addr.getRange(0, innerW),
+              for (final x in _restFields.skip(1)) a.port('$d$x'),
+            ]),
+            ready: a.port('${d}READY'),
+            pop: advance,
+          );
+          final [eid, eIdx, eRest] = harborUnpack(f.data, [
+            a.idWidth,
+            tW,
+            restW,
+          ]);
+          final eTgt = decodeIndex(eIdx, nt);
+
+          // The head register. It takes the next entry when it is empty or
+          // its request issues, so one request can issue each cycle.
+          final hp = '${p}_head';
+          final hv = Logic(name: '${hp}_valid');
+          final hid = Logic(name: '${hp}_id', width: a.idWidth);
+          final rest = Logic(name: '${hp}_rest', width: restW);
+          final ht = Logic(name: '${hp}_tgt', width: nt);
+          final fire = gFire[m][dir];
+          final more = splitM[m] ? Logic(name: '${p}_split_more') : Const(0);
+          final pop = splitM[m] ? fire & ~more : fire;
+          advance <= ~hv | pop;
+          Sequential(c, reset: r, [hv < harborLoad(hv, advance, f.valid)]);
+          Sequential(c, [
+            hid < harborLoad(hid, advance, eid),
+            rest < harborLoad(rest, advance, eRest),
+            ht < harborLoad(ht, advance, eTgt.rconcat()),
+          ]);
+          final tgt = [for (var t = 0; t < nt; t++) ht[t]];
+          final tgtIdx = indexOf(tgt, tW);
+          hValid[m][dir] <= hv;
+          hTgt[m][dir] = tgt;
+
+          // The request that issued last cycle, for the grant register.
+          final iid = Logic(name: '${p}_issued_id', width: a.idWidth);
+          final irest = Logic(name: '${p}_issued_rest', width: restW);
+          final itgt = Logic(name: '${p}_issued_tgt', width: tW);
+          final popQ = Logic(name: '${p}_pop_q');
+          final fireQ = Logic(name: '${p}_fire_q');
+
+          var pieceRest = rest;
+          Logic? splitD;
+          final idleNow = Logic();
+          if (splitM[m]) {
+            // The piece the head offers, kept in registers: its address,
+            // the beats left of the burst and the piece length. A piece
+            // that is not the last moves them on by the cap.
+            final [addr, len, size, burst, lock, cache, prot, qos] =
+                harborUnpack(rest, restWidths);
+            final [eAddr, eLen, _, eBurst, eLock, ...] = harborUnpack(
+              eRest,
+              restWidths,
+            );
+            const lw = lenW + 1;
+            final sp = '${p}_split';
+            final pAddr = Logic(name: '${sp}_addr', width: innerW);
+            final remain = Logic(name: '${sp}_remain', width: lw);
+            final pLen = Logic(name: '${sp}_len', width: lenW);
+            final mid = Logic(name: '${sp}_mid');
+            final busy = Logic(name: '${sp}_busy');
+            Logic base(List<Logic> tg, Logic b, Logic l, Logic ln) =>
+                anyOf([
+                  for (var t = 0; t < nt; t++)
+                    if (splitT[t]) tg[t],
+                ]) &
+                b.eq(Const(1, width: Axi4Interface.burstWidth)) &
+                (~l | ln.gt(Const(15, width: lenW)));
+            final eMore =
+                base(eTgt, eBurst, eLock, eLen) &
+                eLen.gt(Const(cap - 1, width: lenW));
+            final sMore =
+                base(tgt, burst, lock, len) &
+                remain.gt(Const(2 * cap, width: lw));
+            final sLen = mux(
+              sMore,
+              Const(cap - 1, width: lenW),
+              (remain - (cap + 1)).getRange(0, lenW),
+            );
+            final low = [
+              for (var b = 0; b < innerW; b++)
+                b < 7
+                    ? size.gt(Const(b, width: Axi4Interface.sizeWidth))
+                    : Const(0),
+            ];
+            final step = Const(cap, width: innerW) << size;
+            final sAddr = (pAddr & ~low.rconcat()) + step;
+            final isStep = fire & more;
+            Sequential(c, reset: r, [
+              more <
+                  harborLoad(harborLoad(more, isStep, sMore), advance, eMore),
+              mid < (mid | isStep) & ~advance,
+              busy < (busy | isStep) & ~mDone[m][dir],
+            ]);
+            Sequential(c, [
+              pAddr <
+                  harborLoad(harborLoad(pAddr, isStep, sAddr), advance, eAddr),
+              remain <
+                  harborLoad(
+                    harborLoad(remain, isStep, remain - cap),
+                    advance,
+                    eLen.zeroExtend(lw) + 1,
+                  ),
+              pLen <
+                  harborLoad(
+                    harborLoad(pLen, isStep, sLen),
+                    advance,
+                    mux(eMore, Const(cap - 1, width: lenW), eLen),
+                  ),
+            ]);
+            pieceRest = harborPack([
+              pAddr,
+              pLen,
+              size,
+              burst,
+              lock,
+              cache,
+              prot,
+              qos,
+            ]);
+            // The write pieces in flight count the piece of last cycle and
+            // the one that fires now.
+            Logic roomFor(int x) {
+              if (dir == 1) return Const(1);
+              final limit = min(15, n);
+              Logic below(int y) => limit - y > 0
+                  ? wPieces[m].lt(Const(limit - y, width: 4))
+                  : Const(0);
+              return mux(fireQ, below(x + 1), below(x));
+            }
+
+            final roomHeld = roomFor(0);
+            final roomFire = roomFor(1);
+            final heldOk = (mid | (~busy & (~more | idleNow))) & roomHeld;
+            final entryOk =
+                ~busy &
+                (~eMore | (idleNow & ~pop)) &
+                harborLoad(roomHeld, fire, roomFire);
+            splitD = harborLoad(
+              harborLoad(heldOk, isStep, roomFire),
+              advance,
+              entryOk,
+            );
+          }
+          Sequential(c, [
+            iid < harborLoad(iid, fire, hid),
+            irest < harborLoad(irest, fire, pieceRest),
+            itgt < harborLoad(itgt, fire, tgtIdx),
+          ]);
+          Sequential(c, reset: r, [popQ < pop, fireQ < fire]);
+          mPop[m][dir] <= popQ;
+          mFire[m][dir] <= fireQ;
+          if (splitM[m]) {
+            final nf = Logic(name: '${p}_non_final_q');
+            Sequential(c, reset: r, [nf < fire & more]);
+            mNonFinal[m][dir] <= nf;
+          }
+          if (hasRt) {
+            mPieceLen[m][dir] <= irest.getRange(innerW, innerW + lenW);
+          }
+          iFull[m].add(
+            pW > 0
+                ? [Const(m, width: pW), iid.zeroExtend(maxId)].concat()
+                : iid.zeroExtend(maxId),
+          );
+          iRest[m].add(irest);
+          iTgt[m].add(itgt);
+          mTgtIdx[m].add(itgt);
+
+          // The order check of the head, one cycle ahead. The tracker takes
+          // an issue one cycle after the grant, so the check also looks at
+          // the request in the grant register and at the one that issues
+          // now.
+          final tracker = _Tracker(
+            '${p}_order',
+            c,
+            r,
+            outstanding: n,
+            id: iid,
+            target: itgt,
+            issue: popQ,
+            done: mDone[m][dir],
+            doneId: mDoneId[m][dir],
+            head: true,
+          );
+          idleNow <= tracker.idle & ~popQ;
+          Logic clash(Logic id, Logic t, Logic withId, Logic withT) =>
+              withId.eq(id) & withT.neq(t);
+          Logic room(int x) =>
+              mux(popQ, tracker.below(x + 1), tracker.below(x));
+          final heldTrk =
+              tracker.okFor(hid, tgtIdx) &
+              ~(popQ & clash(hid, tgtIdx, iid, itgt)) &
+              room(0);
+          final eBase =
+              tracker.okFor(eid, eIdx) & ~(popQ & clash(eid, eIdx, iid, itgt));
+          final entryTrk = harborLoad(
+            eBase & room(0),
+            pop,
+            eBase & ~clash(eid, eIdx, hid, tgtIdx) & room(1),
+          );
+          final trkOk = Logic(name: '${hp}_trk_ok');
+          Sequential(c, reset: r, [
+            trkOk < harborLoad(heldTrk, advance, entryTrk),
+          ]);
+          if (splitD != null) {
+            final splitOk = Logic(name: '${hp}_split_ok');
+            Sequential(c, reset: r, [splitOk < splitD]);
+            hOk[m][dir] <= trkOk & splitOk;
+          } else {
+            hOk[m][dir] <= trkOk;
+          }
+        }
+      }
+
+      // Wants of each target, registered, for the last slot rules.
+      Logic wantOf(int t, int dir, bool rtOnly) => anyOf([
+        for (var m = 0; m < nm; m++)
+          if (!rtOnly || rt[m]) hValid[m][dir] & hOk[m][dir] & hTgt[m][dir][t],
+      ]);
+
+      // The arbiters and the grant registers.
+      tReq = [for (var t = 0; t < nt; t++) <_Req>[]];
+      tMaster = [for (var t = 0; t < nt; t++) <Logic>[]];
+      tFire = [
+        for (var t = 0; t < nt; t++) [Logic(), Logic()],
+      ];
+      awBusTarget = [];
+      awBusMaster = [];
+      awBusLen = [];
       for (var dir = 0; dir < 2; dir++) {
-        final resp = dir == 0 ? bResp[t] : rResp[t];
-        remap[t]![dir].update(
-          c,
-          r,
-          issue: tFire[t][dir],
-          f: tReq[t][dir].id,
-          done: dir == 0 ? bDone[t] : rDone[t],
-          doneSid: resp.id,
+        final d = dir == 0 ? 'aw' : 'ar';
+        final full = [for (var m = 0; m < nm; m++) iFull[m][dir]];
+        final rest = [for (var m = 0; m < nm; m++) iRest[m][dir]];
+        if (topology == HarborFabricTopology.crossbar) {
+          final grants = <List<Logic>>[];
+          for (var t = 0; t < nt; t++) {
+            final g = _roundRobin(
+              '${tName[t]}_$d',
+              c,
+              r,
+              realtimeFirst([
+                for (var m = 0; m < nm; m++)
+                  hValid[m][dir] & hOk[m][dir] & hTgt[m][dir][t] & elig[t][dir],
+              ], rt),
+            );
+            grants.add(g);
+            final reg = Logic(name: '${tName[t]}_${d}_grant_reg', width: nm);
+            Sequential(c, reset: r, [reg < g.rconcat()]);
+            final oh = [for (var m = 0; m < nm; m++) reg[m]];
+            tFire[t][dir] <= anyOf(oh);
+            tReq[t].add(_Req(tFire[t][dir], pick(oh, full), pick(oh, rest)));
+            tMaster[t].add(indexOf(oh, mW));
+          }
+          for (var m = 0; m < nm; m++) {
+            gFire[m][dir] <= anyOf([for (var t = 0; t < nt; t++) grants[t][m]]);
+          }
+        } else {
+          final g = _roundRobin(
+            'bus_$d',
+            c,
+            r,
+            realtimeFirst([
+              for (var m = 0; m < nm; m++)
+                hValid[m][dir] &
+                    hOk[m][dir] &
+                    anyOf([
+                      for (var t = 0; t < nt; t++)
+                        hTgt[m][dir][t] & elig[t][dir],
+                    ]),
+            ], rt),
+          );
+          for (var m = 0; m < nm; m++) {
+            gFire[m][dir] <= g[m];
+          }
+          final reg = Logic(name: 'bus_${d}_grant_reg', width: nm + nt);
+          Sequential(c, reset: r, [
+            reg <
+                [
+                  ...g,
+                  for (var t = 0; t < nt; t++)
+                    anyOf([
+                      for (var m = 0; m < nm; m++) g[m] & hTgt[m][dir][t],
+                    ]),
+                ].rconcat(),
+          ]);
+          final oh = [for (var m = 0; m < nm; m++) reg[m]];
+          final busFull = pick(oh, full);
+          final busRest = pick(oh, rest);
+          final busMaster = indexOf(oh, mW);
+          for (var t = 0; t < nt; t++) {
+            tFire[t][dir] <= reg[nm + t];
+            tReq[t].add(_Req(tFire[t][dir], busFull, busRest));
+            tMaster[t].add(busMaster);
+          }
+          if (dir == 0) {
+            awBusTarget.add(
+              pick(oh, [for (var m = 0; m < nm; m++) iTgt[m][0]]),
+            );
+            awBusMaster.add(busMaster);
+            if (hasRt) {
+              awBusLen.add(
+                pick(oh, [for (var m = 0; m < nm; m++) mPieceLen[m][0]]),
+              );
+            }
+          }
+        }
+      }
+
+      // ID remap at each target, from the grant register.
+      final remapFree = [
+        for (var t = 0; t < nt; t++) <(Logic, Logic)?>[null, null],
+      ];
+      tSid = [
+        for (var t = 0; t < nt; t++)
+          [
+            for (var dir = 0; dir < 2; dir++)
+              if (tRemap[t])
+                () {
+                  final resp = dir == 0 ? bResp[t] : rResp[t];
+                  final x = remap[t]![dir].lookup(
+                    c,
+                    r,
+                    issue: tFire[t][dir],
+                    f: tReq[t][dir].id,
+                    done: dir == 0 ? bDone[t] : rDone[t],
+                    doneSid: resp.id,
+                  );
+                  remapFree[t][dir] = (x.giveBack, x.release);
+                  return x.sid;
+                }()
+              else
+                tReq[t][dir].id.zeroExtend(tIdW[t]),
+          ],
+      ];
+
+      // Credits and eligibility per target and direction. A credit goes
+      // down when the grant register holds the target. An outstanding slot
+      // comes back with its B or last R, a grant FIFO slot one cycle after
+      // its pop. A grant in the next cycle needs room for the requests in
+      // the grant register, the grants now and itself.
+      for (var t = 0; t < nt; t++) {
+        final n = tN[t];
+        final tn = tName[t];
+        final held = [tFire[t][0], tFire[t][1]];
+        final inflight = Logic(name: '${tn}_inflight', width: widthOf(n));
+        final w = inflight.width;
+        Sequential(c, reset: r, [
+          inflight <
+              inflight +
+                  held[0].zeroExtend(w) +
+                  held[1].zeroExtend(w) -
+                  bDone[t].zeroExtend(w) -
+                  rDone[t].zeroExtend(w),
+        ]);
+        // A grant can come now only where the target is eligible and a head
+        // wants it.
+        final now = [
+          for (var dir = 0; dir < 2; dir++)
+            (elig[t][dir] & wantOf(t, dir, false)).named(
+              '${tn}_${dir == 0 ? 'aw' : 'ar'}_may_grant',
+            ),
+        ];
+        final pend = [held[0], held[1], now[0], now[1]];
+        final two = _fits(inflight, pend, n, 2);
+        final one = _fits(inflight, pend, n, 1) & ~two;
+        final rtTarget = t < nst
+            ? masters.any(
+                (m) => m.realtime && m.reaches(slaves[tSlave[t]].name),
+              )
+            : hasRt;
+        final preferRead = Logic(name: '${tn}_prefer_read');
+        final wantQ = [
+          for (final d in ['aw', 'ar']) Logic(name: '${tn}_${d}_want_q'),
+        ];
+        Sequential(c, reset: r, [
+          for (var dir = 0; dir < 2; dir++) wantQ[dir] < wantOf(t, dir, false),
+        ]);
+        // When one slot is left, one direction owns it: the direction that
+        // wants it alone, else on a real-time target the direction with a
+        // real-time request alone, else the registered direction, which
+        // turns at each use while both directions want the slot.
+        var prefer = preferRead;
+        if (rtTarget) {
+          final rtQ = [
+            for (final d in ['aw', 'ar']) Logic(name: '${tn}_${d}_rt_want_q'),
+          ];
+          Sequential(c, reset: r, [
+            for (var dir = 0; dir < 2; dir++) rtQ[dir] < wantOf(t, dir, true),
+          ]);
+          prefer = mux(
+            rtQ[1] & ~rtQ[0],
+            Const(1),
+            mux(rtQ[0] & ~rtQ[1], Const(0), preferRead),
+          );
+        }
+        final ownerRead = mux(
+          wantQ[1] & ~wantQ[0],
+          Const(1),
+          mux(wantQ[0] & ~wantQ[1], Const(0), prefer),
         );
+        Sequential(c, reset: r, [
+          preferRead < preferRead ^ (one & wantQ[0] & wantQ[1]),
+        ]);
+        final outOk = [two | (one & ~ownerRead), two | (one & ownerRead)];
+        final gPopQ = [
+          for (final d in ['aw', 'ar']) Logic(name: '${tn}_${d}_grant_pop_q'),
+        ];
+        for (var dir = 0; dir < 2; dir++) {
+          final d = dir == 0 ? 'aw' : 'ar';
+          final used = Logic(
+            name: '${tn}_${d}_grant_used',
+            width: widthOf(grantDepth),
+          );
+          Sequential(c, reset: r, [
+            used <
+                used +
+                    held[dir].zeroExtend(used.width) -
+                    gPopQ[dir].zeroExtend(used.width),
+          ]);
+          var ok =
+              outOk[dir] & _fits(used, [held[dir], now[dir]], grantDepth, 1);
+          final free = remapFree[t][dir];
+          final k = tRemap[t] ? remap[t]![dir].fid.length : 0;
+          if (free != null && k < n) {
+            // Fewer remap slots than requests in flight: each grant takes
+            // a slot credit, and a request that finds its ID gives it back.
+            final ru = Logic(name: '${tn}_${d}_remap_used', width: widthOf(k));
+            final rw = ru.width;
+            Sequential(c, reset: r, [
+              ru <
+                  ru +
+                      held[dir].zeroExtend(rw) -
+                      free.$1.zeroExtend(rw) -
+                      free.$2.zeroExtend(rw),
+            ]);
+            ok = ok & _fits(ru, [held[dir], now[dir]], k, 1);
+          }
+          Sequential(c, reset: r, [elig[t][dir] < ok]);
+        }
+        grantPopQ.add(gPopQ);
       }
     }
 
@@ -836,6 +1445,15 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final slaveTake = [
       for (var t = 0; t < nt; t++) [Logic(), Logic()],
     ];
+    if (headOn) {
+      requestCut.addAll([
+        for (var m = 0; m < nm; m++) ...[...mDone[m], ...mDoneId[m]],
+        ...bDone,
+        ...rDone,
+        for (var t = 0; t < nt; t++) ...[bResp[t].id, rResp[t].id],
+        for (final x in slaveTake) ...x,
+      ]);
+    }
     final grantQ = [
       for (var t = 0; t < nt; t++)
         [
@@ -844,7 +1462,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
               name: '${tName[t]}_${dir == 0 ? 'aw' : 'ar'}_grant',
               clk: c,
               reset: r,
-              depth: 2,
+              depth: headOn ? grantDepth : 2,
               pushValid: tReq[t][dir].valid,
               pushData: harborPack([tSid[t][dir], tReq[t][dir].rest]),
               popReady: slaveTake[t][dir],
@@ -874,6 +1492,13 @@ class HarborAxi4Fabric extends HarborFabricModule {
       for (var dir = 0; dir < 2; dir++) {
         inReady[t][dir] <= grantQ[t][dir].pushReady;
       }
+    }
+    if (headOn) {
+      Sequential(c, reset: r, [
+        for (var t = 0; t < nt; t++)
+          for (var dir = 0; dir < 2; dir++)
+            grantPopQ[t][dir] < grantQ[t][dir].popFire,
+      ]);
     }
 
     // Write data. A master's beats go to the targets of its AWs in order,
@@ -1282,6 +1907,111 @@ class HarborAxi4Fabric extends HarborFabricModule {
       }
     }
   }
+
+  // The request stage of a master channel at the balanced and fast levels:
+  // a 2 entry FIFO whose pointers and flags take no adder, or with [pass]
+  // the port itself, whose READY is then [pop].
+  static ({Logic valid, Logic data}) _inStage(
+    bool pass, {
+    required String name,
+    required Logic clk,
+    required Logic reset,
+    required Logic valid,
+    required Logic data,
+    required Logic ready,
+    required Logic pop,
+  }) {
+    if (pass) {
+      ready <= pop;
+      return (valid: valid, data: data);
+    }
+    final wr = Logic(name: '${name}_wr');
+    final rd = Logic(name: '${name}_rd');
+    final has = Logic(name: '${name}_has');
+    final full = Logic(name: '${name}_full');
+    final push = valid & ~full;
+    final take = pop & has;
+    final ram = HarborFifoRam(
+      name: '${name}_ram',
+      clk: clk,
+      wrEn: push,
+      wrAddr: wr,
+      wrData: data,
+      rdAddr: rd,
+      depth: 2,
+      zeroInit: false,
+    );
+    Sequential(clk, reset: reset, [
+      wr < wr ^ push,
+      rd < rd ^ take,
+      has < push | full | (has & ~take),
+      full < (full & ~take) | (has & ~full & push & ~take),
+    ]);
+    ready <= ~full;
+    return (valid: has, data: ram.rdData);
+  }
+
+  // Round robin over [req] in AND and OR terms of the requests and the
+  // one-hot pointer, with no adder. The order is that of [roundRobin].
+  static List<Logic> _roundRobin(
+    String name,
+    Logic clk,
+    Logic reset,
+    List<Logic> req,
+  ) {
+    final n = req.length;
+    if (n == 1) return req;
+    final last = Logic(name: '${name}_rr', width: n);
+    Logic none(Iterable<int> js) => _allOf([for (final j in js) ~req[j]]);
+    final fresh = ~anyOf([for (var i = 0; i < n; i++) last[i]]);
+    final g = [
+      for (var i = 0; i < n; i++)
+        req[i] &
+            ((fresh & none([for (var j = 0; j < i; j++) j])) |
+                anyOf([
+                  for (var p = 0; p < n; p++)
+                    last[p] &
+                        none([
+                          for (var q = 1; q < n && (p + q) % n != i; q++)
+                            (p + q) % n,
+                        ]),
+                ])),
+    ];
+    final grant = g.rconcat().named('${name}_grant');
+    Sequential(clk, reset: reset, [last < harborLoad(last, anyOf(req), grant)]);
+    return [for (var i = 0; i < n; i++) grant[i]];
+  }
+
+  static Logic _allOf(List<Logic> xs) =>
+      xs.isEmpty ? Const(1) : xs.reduce((a, b) => a & b);
+
+  // High when [used] plus the number of high bits in [pend] plus [x] is at
+  // most [cap]. It is AND and OR terms of equalities, with no adder.
+  static Logic _fits(Logic used, List<Logic> pend, int cap, int x) {
+    final terms = <Logic>[];
+    for (var v = 0; v <= pend.length; v++) {
+      final top = min(cap - v - x, (1 << used.width) - 1);
+      if (top < 0) continue;
+      final exactly = anyOf([
+        for (var s = 0; s < 1 << pend.length; s++)
+          if (_ones(s) == v)
+            _allOf([
+              for (var i = 0; i < pend.length; i++)
+                (s >> i) & 1 == 1 ? pend[i] : ~pend[i],
+            ]),
+      ]);
+      terms.add(
+        exactly &
+            anyOf([
+              for (var u = 0; u <= top; u++)
+                used.eq(Const(u, width: used.width)),
+            ]),
+      );
+    }
+    return anyOf(terms);
+  }
+
+  static int _ones(int s) => s == 0 ? 0 : (s & 1) + _ones(s >> 1);
 
   // The request stage of a master channel: a 2 entry FIFO, or with [pass]
   // the port itself, whose READY is then [pop].
@@ -2202,6 +2932,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     List<HarborFabricMaster> masters,
     List<HarborFabricSlave> slaves,
     int realtimeBurstCap,
+    HarborFabricPipeline pipeline,
   ) {
     if (masters.isEmpty) {
       throw ArgumentError.value(masters, 'masters', 'must not be empty');
@@ -2213,6 +2944,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     };
     return harborStableDefinitionName('HarborAxi4Fabric', [
       topology.name,
+      if (pipeline != HarborFabricPipeline.compact) pipeline.name,
       'a$addrW',
       'd$dataW',
       if (masters.any((m) => m.realtime)) 'q$realtimeBurstCap',

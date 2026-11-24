@@ -8,7 +8,15 @@ import 'package:test/test.dart';
 import '../port/memory_harness.dart';
 import '../port/port_harness.dart';
 import 'axi4_fabric_harness.dart'
-    show ReadWant, checkReads, checkWrites, exposeInterface, isolated, must;
+    show
+        ReadWant,
+        checkReads,
+        checkWrites,
+        exposeInterface,
+        forEachPipeline,
+        harnessPipeline,
+        isolated,
+        must;
 
 const _liteBase = 0x10000;
 const _fullBase = 0x00000;
@@ -37,6 +45,7 @@ class _Shell extends BridgeModule {
     exposeInterface(this, l, 'l', PairDirection.fromConsumer);
     fabric = HarborFabric.build(
       kind: HarborFabricKind.axi4,
+      pipeline: harnessPipeline,
       topology: t,
       clk: input('clk'),
       reset: input('reset'),
@@ -446,56 +455,58 @@ Future<void> _narrowWrap(HarborFabricTopology t, int dw) async {
 }
 
 void main() {
-  const long = Timeout(Duration(minutes: 5));
-  for (final t in HarborFabricTopology.values) {
-    for (final dw in [32, 64]) {
-      group('${t.name} $dw-bit', () {
-        test(
-          'INCR, WRAP and FIXED bursts to an AXI4-Lite slave',
-          () => isolated(() => _bursts(t, dw)),
-          timeout: long,
-        );
-        test(
-          'an error on a middle beat',
-          () => isolated(() => _middleError(t, dw)),
-          timeout: long,
-        );
-        test(
-          'a narrow burst runs as single beats',
-          () => isolated(() => _narrow(t, dw)),
-          timeout: long,
-        );
-        test(
-          'a narrow WRAP burst wraps by SIZE',
-          () => isolated(() => _narrowWrap(t, dw)),
-          timeout: long,
-        );
-        test(
-          'bursts with a guard timeout',
-          () => isolated(() => _bursts(t, dw, timeout: 64)),
-          timeout: long,
-        );
-        test(
-          'bursts to a slave that sees an offset',
-          () => isolated(() => _bursts(t, dw, offset: true)),
-          timeout: long,
-        );
-        test(
-          'forbidden bursts are an error',
-          () => isolated(() => _badBursts(t, dw)),
-          timeout: long,
-        );
-        test(
-          'a burst out of a region under 4 KB is an error',
-          () => isolated(() => _smallRegion(t, dw)),
-          timeout: long,
-        );
-        test(
-          'back to back bursts and single beats',
-          () => isolated(() => _backToBack(t, dw)),
-          timeout: long,
-        );
-      });
+  forEachPipeline((p) {
+    const long = Timeout(Duration(minutes: 5));
+    for (final t in HarborFabricTopology.values) {
+      for (final dw in [32, 64]) {
+        group('${t.name} $dw-bit', () {
+          test(
+            'INCR, WRAP and FIXED bursts to an AXI4-Lite slave',
+            () => isolated(() => _bursts(t, dw)),
+            timeout: long,
+          );
+          test(
+            'an error on a middle beat',
+            () => isolated(() => _middleError(t, dw)),
+            timeout: long,
+          );
+          test(
+            'a narrow burst runs as single beats',
+            () => isolated(() => _narrow(t, dw)),
+            timeout: long,
+          );
+          test(
+            'a narrow WRAP burst wraps by SIZE',
+            () => isolated(() => _narrowWrap(t, dw)),
+            timeout: long,
+          );
+          test(
+            'bursts with a guard timeout',
+            () => isolated(() => _bursts(t, dw, timeout: 64)),
+            timeout: long,
+          );
+          test(
+            'bursts to a slave that sees an offset',
+            () => isolated(() => _bursts(t, dw, offset: true)),
+            timeout: long,
+          );
+          test(
+            'forbidden bursts are an error',
+            () => isolated(() => _badBursts(t, dw)),
+            timeout: long,
+          );
+          test(
+            'a burst out of a region under 4 KB is an error',
+            () => isolated(() => _smallRegion(t, dw)),
+            timeout: long,
+          );
+          test(
+            'back to back bursts and single beats',
+            () => isolated(() => _backToBack(t, dw)),
+            timeout: long,
+          );
+        });
+      }
     }
-  }
+  });
 }

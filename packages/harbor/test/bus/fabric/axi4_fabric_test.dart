@@ -68,8 +68,8 @@ void checkAll(Bench b, {List<Burst> writes = const []}) {
 
 // A master that issues one ID to two slaves gets the responses in issue
 // order: the second request waits until the first one ends.
-Future<void> _sameId(HarborFabricTopology t) async {
-  final b = await Bench.start(t, stall: 0.2);
+Future<void> _sameId(HarborFabricTopology t, HarborFabricPipeline p) async {
+  final b = await Bench.start(t, pipeline: p, stall: 0.2);
   final m0 = b.managers['m0']!;
   final s0 = b.memories['s0']!;
   final s1 = b.memories['s1']!;
@@ -100,8 +100,8 @@ Future<void> _sameId(HarborFabricTopology t) async {
 
 // Unmapped requests get DECERR with every read beat and one B after the
 // last W beat.
-Future<void> _errorSlave(HarborFabricTopology t) async {
-  final b = await Bench.start(t, stall: 0.2);
+Future<void> _errorSlave(HarborFabricTopology t, HarborFabricPipeline p) async {
+  final b = await Bench.start(t, pipeline: p, stall: 0.2);
   final m0 = b.managers['m0']!;
   final m1 = b.managers['m1']!;
   m0
@@ -130,8 +130,8 @@ Future<void> _errorSlave(HarborFabricTopology t) async {
 }
 
 // Write data may come before its AW, to any slave.
-Future<void> _wBeforeAw(HarborFabricTopology t) async {
-  final b = await Bench.start(t, stall: 0.2);
+Future<void> _wBeforeAw(HarborFabricTopology t, HarborFabricPipeline p) async {
+  final b = await Bench.start(t, pipeline: p, stall: 0.2);
   final m0 = b.managers['m0']!;
   final m2 = b.managers['m2']!;
   final writes = [
@@ -166,9 +166,10 @@ Future<void> _wBeforeAw(HarborFabricTopology t) async {
 
 // A slave with fewer ID bits sees one slave ID per full ID in flight, and a
 // new full ID waits for a free one.
-Future<void> _remap(HarborFabricTopology t) async {
+Future<void> _remap(HarborFabricTopology t, HarborFabricPipeline p) async {
   final b = await Bench.start(
     t,
+    pipeline: p,
     stall: 0.2,
     slaves: const [
       SlaveCfg('s0', 5, 8, 0x00000, 0x10000),
@@ -197,9 +198,13 @@ Future<void> _remap(HarborFabricTopology t) async {
 }
 
 // Each slave stops at its own outstanding limit, reads and writes together.
-Future<void> _outstanding(HarborFabricTopology t) async {
+Future<void> _outstanding(
+  HarborFabricTopology t,
+  HarborFabricPipeline p,
+) async {
   final b = await Bench.start(
     t,
+    pipeline: p,
     stall: 0.1,
     slaves: const [
       SlaveCfg('s0', 5, 8, 0x00000, 0x10000),
@@ -235,9 +240,10 @@ Future<void> _outstanding(HarborFabricTopology t) async {
 // A slave that stops answering is cut off: the requests in flight end with
 // SLVERR, bus_error stays high, its late responses are dropped and later
 // requests to it get SLVERR.
-Future<void> _timeout(HarborFabricTopology t) async {
+Future<void> _timeout(HarborFabricTopology t, HarborFabricPipeline p) async {
   final b = await Bench.start(
     t,
+    pipeline: p,
     stall: 0.2,
     masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
     slaves: const [
@@ -299,9 +305,10 @@ Future<void> _timeout(HarborFabricTopology t) async {
 
 // A slave that never takes AR is cut off. The read gets SLVERR on every
 // beat, bus_error sticks, and the read the slave takes later goes nowhere.
-Future<void> _arHang(HarborFabricTopology t) async {
+Future<void> _arHang(HarborFabricTopology t, HarborFabricPipeline p) async {
   final b = await Bench.start(
     t,
+    pipeline: p,
     stall: 0.2,
     masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
     slaves: const [
@@ -343,9 +350,10 @@ Future<void> _arHang(HarborFabricTopology t) async {
 
 // Two silent slaves are both cut off. The count is 2, and the slave that
 // answers still works.
-Future<void> _twoCutOff(HarborFabricTopology t) async {
+Future<void> _twoCutOff(HarborFabricTopology t, HarborFabricPipeline p) async {
   final b = await Bench.start(
     t,
+    pipeline: p,
     stall: 0.2,
     masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
     slaves: const [
@@ -373,9 +381,10 @@ Future<void> _twoCutOff(HarborFabricTopology t) async {
 
 // A slave that takes AW but never takes W is cut off. The write gets SLVERR,
 // and writes to the other slave, queued behind it, still finish.
-Future<void> _wHang(HarborFabricTopology t) async {
+Future<void> _wHang(HarborFabricTopology t, HarborFabricPipeline p) async {
   final b = await Bench.start(
     t,
+    pipeline: p,
     stall: 0.2,
     masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
     slaves: const [
@@ -410,9 +419,13 @@ Future<void> _wHang(HarborFabricTopology t) async {
 // A slave may hold AWREADY until WVALID. W that comes long after its AW,
 // or waits behind another write's W, must not trip the timeout. A slave
 // that takes neither AW nor W still times out.
-Future<void> _awWaitsForW(HarborFabricTopology t) async {
+Future<void> _awWaitsForW(
+  HarborFabricTopology t,
+  HarborFabricPipeline p,
+) async {
   final b = await Bench.start(
     t,
+    pipeline: p,
     stall: 0.2,
     masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 3, 8)],
     slaves: const [
@@ -466,9 +479,10 @@ Future<void> _awWaitsForW(HarborFabricTopology t) async {
 // A Lite master reaches a full slave and a full master reaches a Lite
 // slave. A burst to the Lite slave runs as single beats, a narrow access
 // runs as a full word access, and a write gets one B after all its W beats.
-Future<void> _lite(HarborFabricTopology t) async {
+Future<void> _lite(HarborFabricTopology t, HarborFabricPipeline p) async {
   final b = await Bench.start(
     t,
+    pipeline: p,
     stall: 0.2,
     masters: const [MasterCfg('m0', 2, 4), MasterCfg('mL', 1, 2, lite: true)],
     slaves: const [
@@ -542,63 +556,65 @@ Future<void> _lite(HarborFabricTopology t) async {
 
 void main() {
   const long = Timeout(Duration(minutes: 5));
-  for (final t in HarborFabricTopology.values) {
-    group(t.name, () {
-      test(
-        'same ID to two slaves keeps issue order',
-        () => isolated(() => _sameId(t)),
-        timeout: long,
-      );
-      test(
-        'error slave answers whole bursts with DECERR',
-        () => isolated(() => _errorSlave(t)),
-        timeout: long,
-      );
-      test(
-        'write data before AW',
-        () => isolated(() => _wBeforeAw(t)),
-        timeout: long,
-      );
-      test(
-        'ID remap holds one slave ID per full ID',
-        () => isolated(() => _remap(t)),
-        timeout: long,
-      );
-      test(
-        'outstanding limit per slave',
-        () => isolated(() => _outstanding(t)),
-        timeout: long,
-      );
-      test(
-        'timeout cuts a slave off and drops late responses',
-        () => isolated(() => _timeout(t)),
-        timeout: long,
-      );
-      test(
-        'a slave that never takes AR is cut off',
-        () => isolated(() => _arHang(t)),
-        timeout: long,
-      );
-      test(
-        'two silent slaves count 2',
-        () => isolated(() => _twoCutOff(t)),
-        timeout: long,
-      );
-      test(
-        'a slave that never takes W is cut off and other writes finish',
-        () => isolated(() => _wHang(t)),
-        timeout: long,
-      );
-      test(
-        'a slave that waits for W before AWREADY is not cut off',
-        () => isolated(() => _awWaitsForW(t)),
-        timeout: long,
-      );
-      test(
-        'AXI4-Lite masters and slaves',
-        () => isolated(() => _lite(t)),
-        timeout: long,
-      );
-    });
+  for (final p in HarborFabricPipeline.values) {
+    for (final t in HarborFabricTopology.values) {
+      group('${p.name} ${t.name}', () {
+        test(
+          'same ID to two slaves keeps issue order',
+          () => isolated(() => _sameId(t, p)),
+          timeout: long,
+        );
+        test(
+          'error slave answers whole bursts with DECERR',
+          () => isolated(() => _errorSlave(t, p)),
+          timeout: long,
+        );
+        test(
+          'write data before AW',
+          () => isolated(() => _wBeforeAw(t, p)),
+          timeout: long,
+        );
+        test(
+          'ID remap holds one slave ID per full ID',
+          () => isolated(() => _remap(t, p)),
+          timeout: long,
+        );
+        test(
+          'outstanding limit per slave',
+          () => isolated(() => _outstanding(t, p)),
+          timeout: long,
+        );
+        test(
+          'timeout cuts a slave off and drops late responses',
+          () => isolated(() => _timeout(t, p)),
+          timeout: long,
+        );
+        test(
+          'a slave that never takes AR is cut off',
+          () => isolated(() => _arHang(t, p)),
+          timeout: long,
+        );
+        test(
+          'two silent slaves count 2',
+          () => isolated(() => _twoCutOff(t, p)),
+          timeout: long,
+        );
+        test(
+          'a slave that never takes W is cut off and other writes finish',
+          () => isolated(() => _wHang(t, p)),
+          timeout: long,
+        );
+        test(
+          'a slave that waits for W before AWREADY is not cut off',
+          () => isolated(() => _awWaitsForW(t, p)),
+          timeout: long,
+        );
+        test(
+          'AXI4-Lite masters and slaves',
+          () => isolated(() => _lite(t, p)),
+          timeout: long,
+        );
+      });
+    }
   }
 }

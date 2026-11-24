@@ -151,13 +151,15 @@ Future<void> _timing(
   HarborFabricTopology t,
   List<MasterCfg> masters,
   List<SlaveCfg> slaves,
-  int cap,
-) async {
+  int cap, {
+  HarborFabricPipeline? pipeline,
+}) async {
   final shell = FabricShell(
     t,
     masters: masters,
     slaves: slaves,
     realtimeBurstCap: cap,
+    pipeline: pipeline,
   );
   final sim = Sim(shell);
   final rng = Random(3);
@@ -226,7 +228,7 @@ Future<void> _timing(
   final worst = waits.values.map((w) => w.waits.reduce(max)).reduce(max);
   // ignore: avoid_print
   print(
-    'axi4 ${t.name} ${slaves.length} slaves ${rtNames.length} rt: worst wait '
+    'axi4 ${harnessPipeline.name} ${t.name} ${slaves.length} slaves ${rtNames.length} rt: worst wait '
     '$worst, bound $bound',
   );
   for (final w in waits.values) {
@@ -431,46 +433,58 @@ void main() {
   tearDown(() async => Simulator.reset());
 
   test('the path of an access counts the registered grant of AXI4', () {
-    int path(HarborFabricKind k) =>
-        HarborFabric.pathCyclesOf(kind: k, fabrics: 2, memoryPorts: 0);
+    int path(HarborFabricKind k, [HarborFabricPipeline? p]) =>
+        HarborFabric.pathCyclesOf(
+          kind: k,
+          pipeline: p ?? HarborFabricPipeline.balanced,
+          fabrics: 2,
+          memoryPorts: 0,
+        );
     must(path(HarborFabricKind.wishbone), 4);
-    must(path(HarborFabricKind.axi4), 10);
+    must(path(HarborFabricKind.axi4, HarborFabricPipeline.compact), 10);
+    must(path(HarborFabricKind.axi4, HarborFabricPipeline.balanced), 14);
+    must(path(HarborFabricKind.axi4, HarborFabricPipeline.fast), 14);
     must(path(HarborFabricKind.tilelink), 8);
   });
 
-  test(
-    'axi4: a 256 beat stream with the cap on and no real-time traffic',
-    () async {
-      final off = await _stream(false);
-      final on = await _stream(true);
-      // ignore: avoid_print
-      print('axi4 stream cycles, reads/writes: realtime off $off, on $on');
-    },
-  );
+  forEachPipeline((p) {
+    test(
+      'axi4: a 256 beat stream with the cap on and no real-time traffic',
+      () async {
+        final off = await _stream(false);
+        final on = await _stream(true);
+        // ignore: avoid_print
+        print('axi4 stream cycles, reads/writes: realtime off $off, on $on');
+      },
+    );
 
-  for (final t in HarborFabricTopology.values) {
-    test('axi4 ${t.name}: exclusive bursts stay whole and a split write '
-        'keeps its worst code', () async {
-      await _exclusiveAndMerge(t);
-    });
-    for (final slaves in [_n1Slave, _twoSlaves]) {
-      test(
-        'axi4 ${t.name}, ${slaves.length} slave(s): two real-time masters stay '
-        'under the bound',
-        () async {
-          await _timing(t, _masters2, slaves, _cap);
-        },
-      );
-    }
-    for (final slaves in [_oneSlave, _twoSlaves]) {
-      final n = '${t.name}, ${slaves.length} slave(s)';
-      test('axi4 $n: the real-time read wait stays under the bound', () async {
-        await _timing(t, _masters, slaves, _cap);
+    for (final t in HarborFabricTopology.values) {
+      test('axi4 ${t.name}: exclusive bursts stay whole and a split write '
+          'keeps its worst code', () async {
+        await _exclusiveAndMerge(t);
       });
-      test('axi4 $n: split bursts keep the data and the bursts of the '
-          'other masters stay under the cap', () async {
-        await _data(t, slaves);
-      });
+      for (final slaves in [_n1Slave, _twoSlaves]) {
+        test(
+          'axi4 ${t.name}, ${slaves.length} slave(s): two real-time masters stay '
+          'under the bound',
+          () async {
+            await _timing(t, _masters2, slaves, _cap);
+          },
+        );
+      }
+      for (final slaves in [_oneSlave, _twoSlaves]) {
+        final n = '${t.name}, ${slaves.length} slave(s)';
+        test(
+          'axi4 $n: the real-time read wait stays under the bound',
+          () async {
+            await _timing(t, _masters, slaves, _cap);
+          },
+        );
+        test('axi4 $n: split bursts keep the data and the bursts of the '
+            'other masters stay under the cap', () async {
+          await _data(t, slaves);
+        });
+      }
     }
-  }
+  });
 }

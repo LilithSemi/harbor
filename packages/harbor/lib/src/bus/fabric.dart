@@ -484,7 +484,9 @@ abstract final class HarborFabric {
   /// - A fabric has 2 stages on Wishbone (the grant register and the
   ///   response), 4 on TileLink (the request FIFOs of the master and the
   ///   slave side, the response FIFO, and the response arbitration), and 5 on
-  ///   AXI4 (those 4 and the grant register of the target).
+  ///   AXI4 (those 4 and the grant register of the target). The `balanced`
+  ///   and `fast` AXI4 levels add 2: the head register of each master and
+  ///   the register of the arbiter grant.
   /// - [memoryPorts] is the number of memory master and slave port pairs. A
   ///   pair has 8 stages: the request, data and response FIFOs of both ports.
   /// - [registerStages] is the number of `WishboneRegisterStage` slices on
@@ -504,7 +506,8 @@ abstract final class HarborFabric {
       fabrics *
           switch (kind) {
             HarborFabricKind.wishbone => 2,
-            HarborFabricKind.axi4 => 5,
+            HarborFabricKind.axi4 =>
+              pipeline == HarborFabricPipeline.compact ? 5 : 7,
             HarborFabricKind.tilelink => 4,
           } +
       memoryPorts * 8 +
