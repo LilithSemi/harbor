@@ -35,6 +35,12 @@ const rtTwoSlaves = [
   SlaveCfg('s1', 1, 2, 0x10000, 0x10000),
 ];
 
+// s1 is an AXI4-Lite slave that only the real-time master reads.
+const rtLiteSlaves = [
+  SlaveCfg('s0', 5, 4, 0x00000, 0x10000),
+  SlaveCfg('s1', 0, 1, 0x10000, 0x10000, lite: true),
+];
+
 // s1 has 1 slave ID bit for 4 requests, so its ID remap has fewer slots than
 // requests.
 const rtFewIdSlaves = [
@@ -179,7 +185,23 @@ Future<void> rtTiming(
         stall: 0,
       ),
   };
-  final mems = {for (final s in slaves) s.name: DetMem(sim, s.name, rng)};
+  final mems = {
+    for (final s in slaves)
+      if (!s.lite) s.name: DetMem(sim, s.name, rng),
+  };
+  final liteErrors = <String>[];
+  for (final s in slaves.where((s) => s.lite)) {
+    AxiMemory(
+      sim,
+      s.name,
+      rng,
+      busBytes: busBytes,
+      outstanding: 1,
+      errors: liteErrors,
+      stall: 0,
+      lite: true,
+    );
+  }
   final rtNames = [
     for (final m in masters)
       if (m.realtime) m.name,
@@ -192,10 +214,11 @@ Future<void> rtTiming(
   await sim.start();
   Simulator.setMaxSimTime(8000000);
 
-  // The other masters hammer every slave with 256 beat reads.
+  // The other masters hammer every full slave with 256 beat reads.
   for (var i = 0; i < 12; i++) {
     for (final n in others) {
       for (var si = 0; si < slaves.length; si++) {
+        if (slaves[si].lite) continue;
         final base = slaves[si].base + (n == others.first ? 0 : 0x4000);
         mgr[n]!.read(rtRead(i % 8, base + (i % 3) * 0x800, 255));
       }
@@ -221,6 +244,7 @@ Future<void> rtTiming(
   );
   await sim.stop();
 
+  final lite = slaves.any((s) => s.lite);
   final bound = HarborFabric.realtimeWaitBound(
     kind: HarborFabricKind.axi4,
     masters: [for (final m in masters) rtFabricMaster(m)],
@@ -231,9 +255,11 @@ Future<void> rtTiming(
     pathCycles: HarborFabric.pathCyclesOf(
       kind: HarborFabricKind.axi4,
       pipeline: harnessPipeline,
+      liteSlave: lite,
       memoryPorts: 0,
     ),
     pipeline: harnessPipeline,
+    liteSlave: lite,
   );
   final worst = waits.values.map((w) => w.waits.reduce(max)).reduce(max);
   // ignore: avoid_print
@@ -244,6 +270,7 @@ Future<void> rtTiming(
   for (final w in waits.values) {
     must(w.waits.length, reads);
   }
+  must(liteErrors, isEmpty);
   expect(worst, lessThanOrEqualTo(bound));
   for (final m in mems.values) {
     for (final (x, _) in m.reads) {

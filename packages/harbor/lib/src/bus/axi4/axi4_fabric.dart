@@ -2163,8 +2163,8 @@ class HarborAxi4Fabric extends HarborFabricModule {
   // The slave sees the full address, or its offset in the region.
   //
   // An AXI4-Lite slave [lite] has 1 request in flight. Its AW and AR share
-  // one entry, which stays until the response ends, and its W has one
-  // entry. [s] then only carries the handshakes and responses for the
+  // one entry, which stays until the response ends (with [liteStaged],
+  // until the response is queued), and its W has one entry. [s] then only carries the handshakes and responses for the
   // guard. A burst runs as single beats. A narrow access is a full word
   // access with the write strobes of its lanes, since the master takes its
   // bytes by address.
@@ -2946,8 +2946,8 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
   // [_litePath] at the balanced and fast levels. The request waits in a one
   // entry register, its burst checks and address steps go to registers in
-  // the two cycles after it arrives, and B and R leave through 2 entry
-  // FIFOs. So the response arbiter does not reach the beat counter, and the
+  // the two cycles after it arrives, and B leaves through a one entry
+  // register and R through a 2 entry FIFO. So the response arbiter does not reach the beat counter, and the
   // next address comes from registers only.
   static (Logic, Logic) _litePathStaged(
     Logic c,
@@ -2990,6 +2990,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     final entry = Logic(name: '${p}_req_entry', width: entryW);
     final done = Logic(name: '${p}_lite_done');
     final push = (aw.valid | ar.valid) & ~dead;
+    _checkInSim(c, r, push & valid, '$p: a request while one is held');
     awReady <= ~valid | dead;
     arReady <= ~valid | dead;
     Sequential(c, reset: r, [
@@ -3119,27 +3120,34 @@ class HarborAxi4Fabric extends HarborFabricModule {
     s.wLast <= wLast;
     s.wReady <= live & isW & ~wSent & (bad | l.wReady);
 
-    final bF = HarborRegFifo(
-      name: '${p}_lite_b',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: live & isW & mux(bad, wSent, l.bValid & lastBeat),
-      pushData: harborPack([
-        id,
-        mux(bad, slvErr, mux(worst.gt(l.bResp), worst, l.bResp)),
-      ]),
-      popReady: s.bReady,
-      resetEntries: true,
+    // B: one entry, as the slave has one request in flight.
+    final bHeld = Logic(name: '${p}_lite_b_valid');
+    final bData = Logic(
+      name: '${p}_lite_b_data',
+      width: s.idWidth + Axi4Interface.respWidth,
     );
-    final [bId, bResp] = harborUnpack(bF.popData, [
+    final bPush = (live & isW & mux(bad, wSent, l.bValid & lastBeat) & ~bHeld)
+        .named('${p}_lite_b_push');
+    Sequential(c, reset: r, [
+      bHeld < bPush | (bHeld & ~s.bReady),
+      bData <
+          harborLoad(
+            bData,
+            bPush,
+            harborPack([
+              id,
+              mux(bad, slvErr, mux(worst.gt(l.bResp), worst, l.bResp)),
+            ]),
+          ),
+    ]);
+    final [bId, bResp] = harborUnpack(bData, [
       s.idWidth,
       Axi4Interface.respWidth,
     ]);
-    s.bValid <= bF.popValid;
+    s.bValid <= bHeld;
     s.bId <= bId;
     s.bResp <= bResp;
-    l.bReady <= good & isW & (bF.pushReady | ~lastBeat);
+    l.bReady <= good & isW & (~bHeld | ~lastBeat);
     final rF = HarborRegFifo(
       name: '${p}_lite_r',
       clk: c,
@@ -3167,7 +3175,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     s.rResp <= rResp;
     s.rLast <= rLast;
     l.rReady <= good & ~isW & rF.pushReady;
-    final bFire = bF.pushFire;
+    final bFire = bPush;
     final rFire = rF.pushFire;
     done <= bFire | (rFire & lastBeat);
     // The entry leaves when its response is queued, so the guard sees the

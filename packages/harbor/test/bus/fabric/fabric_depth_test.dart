@@ -147,10 +147,9 @@ final _otherCell = RegExp(
   '^bus_(b|r)_resp_rr\$|^bus_w_(count|order_$_fifo)\$',
 );
 
-// The cells of the AXI4-Lite slave paths of the kc705 config.
-final _liteCell = RegExp(
-  r'^s1[3-6]_(lite_.*|req_(valid|entry|shown)|w_(wr|rd|count|ram|e\d+))$',
-);
+// The cells of the slave paths: the slave queues, the grant FIFOs, the
+// AXI4-Lite entries and checks, and the W stages of each target.
+final _slaveCell = RegExp(r'^s\d+(_r\d+)?_(aw|ar|w|req|lite)_');
 
 List<String> _cellNames(Module cell) => cell is HarborFifoRam
     ? [cell.name]
@@ -412,13 +411,13 @@ void main() {
             HarborFabricPipeline.balanced,
             HarborFabricPipeline.fast,
           ]) {
-            test('${level.name} AXI4-Lite slave paths fit '
+            test('${level.name} slave paths fit '
                 '$_requestBudget levels', () async {
               final f = await _fabric(config, t, level);
               final p = harborWorstDepth(
                 f,
                 cut: f.requestCut,
-                endIn: (c) => _cellNames(c).any(_liteCell.hasMatch),
+                endIn: (c) => _cellNames(c).any(_slaveCell.hasMatch),
               );
               printOnFailure('$p');
               expect(p.levels, lessThanOrEqualTo(_requestBudget));

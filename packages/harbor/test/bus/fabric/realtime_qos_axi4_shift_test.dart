@@ -16,6 +16,14 @@ void main() {
   forEachPipeline((p) {
     for (final t in HarborFabricTopology.values) {
       test(
+        'axi4 ${t.name}, a real-time master reads an AXI4-Lite slave',
+        () async {
+          await rtTiming(t, rtMasters, rtLiteSlaves, rtCap);
+        },
+      );
+    }
+    for (final t in HarborFabricTopology.values) {
+      test(
         'axi4 ${t.name}, a slave with fewer IDs than requests',
         () async {
           await rtTiming(t, rtMasters, rtFewIdSlaves, rtCap);
@@ -23,7 +31,9 @@ void main() {
         // A real-time read with a new ID waits until a slave ID frees, and
         // the other masters hold both slave IDs through their long bursts.
         // The bound has no term for that: 416 against 213 at compact.
-        skip: 'the bound does not cover a slave with fewer IDs than requests',
+        skip:
+            'the bound has no ID remap term; Ross decides the fix: a remap '
+            'term in the bound or a reserved real-time slave ID',
       );
     }
     for (var shift = 1; shift <= 6; shift++) {

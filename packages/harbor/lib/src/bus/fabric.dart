@@ -392,7 +392,9 @@ abstract final class HarborFabric {
   ///   as a freed slot reaches the next grant through the grant register and
   ///   the eligibility flop, and 3 to `e`: the head register, the grant
   ///   register, and one cycle for the last slot, which a real-time request
-  ///   takes from registered wants.
+  ///   takes from registered wants. With [liteSlave] at those levels, `g`
+  ///   and `e` grow by 3 more: the 2 cycles of checks of each AXI4-Lite
+  ///   request and the cycle of its response FIFO.
   /// - TileLink: `(shared * outstanding + r) * (max(maxMessage, rt) * bc +
   ///   ac) + ac + 8`. A message cannot be cut, so the cap does not apply.
   ///
@@ -418,6 +420,7 @@ abstract final class HarborFabric {
     int? wishboneGrantCap,
     bool allowUnproven = false,
     HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
+    bool liteSlave = false,
   }) {
     if (cap < 1) {
       throw ArgumentError.value(cap, 'cap', 'must be >= 1');
@@ -467,11 +470,13 @@ abstract final class HarborFabric {
       case HarborFabricKind.axi4:
         final int piece = max<int>(max<int>(cap, 16), rt);
         final compact = pipeline == HarborFabricPipeline.compact;
+        final lite = liteSlave && !compact ? 3 : 0;
         return sharedSlaves *
                 (slaveOutstanding + r - 1) *
-                (piece * beatCycles + ac + (compact ? 4 : 6)) +
+                (piece * beatCycles + ac + (compact ? 4 : 6) + lite) +
             ac +
-            (compact ? 8 : 11);
+            (compact ? 8 : 11) +
+            lite;
       case HarborFabricKind.tilelink:
         final int message =
             maxMessageBeats ?? _tileLinkMaxMessageBeats(masters);
@@ -502,9 +507,13 @@ abstract final class HarborFabric {
   /// - [cdcCycles] is the latency of each clock crossing on the path, from
   ///   its own documentation.
   /// - [pipeline] is the [HarborFabricPipeline] of an AXI4 fabric.
+  /// - [liteSlave] is set when the slave is AXI4-Lite. At the `balanced`
+  ///   and `fast` levels its requests take 2 more cycles for their checks
+  ///   and its responses 1 more for their FIFO.
   static int pathCyclesOf({
     required HarborFabricKind kind,
     HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
+    bool liteSlave = false,
     int fabrics = 1,
     int memoryPorts = 1,
     int registerStages = 0,
@@ -517,6 +526,11 @@ abstract final class HarborFabric {
               pipeline == HarborFabricPipeline.compact ? 5 : 7,
             HarborFabricKind.tilelink => 4,
           } +
+      (kind == HarborFabricKind.axi4 &&
+              liteSlave &&
+              pipeline != HarborFabricPipeline.compact
+          ? 3
+          : 0) +
       memoryPorts * 8 +
       registerStages * 2 +
       cdcCycles;
@@ -554,6 +568,7 @@ abstract final class HarborFabric {
     int? wishboneGrantCap,
     bool allowUnproven = false,
     HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
+    bool liteSlave = false,
   }) =>
       realtimeWaitBound(
         kind: kind,
@@ -586,6 +601,7 @@ abstract final class HarborFabric {
         wishboneGrantCap: wishboneGrantCap,
         allowUnproven: allowUnproven,
         pipeline: pipeline,
+        liteSlave: liteSlave,
       ) -
       (accessCycles + pathCycles);
 
