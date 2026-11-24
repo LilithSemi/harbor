@@ -5,6 +5,7 @@ import 'package:harbor/src/peripherals/ddr3_params.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+const _mprRead = 2;
 const _collectDqs = 3;
 const _analyzeDqs = 4;
 const _calibrateDqs = 5;
@@ -58,8 +59,12 @@ Future<List<_Pass>> _analyze(int Function(int collection) indexOf) async {
     await clk.nextNegedge;
     final now = state();
     if (now == _collectDqs && previous != _collectDqs) collection++;
-    if (now == _collectDqs) {
-      final count = sig('dqs_count_repeat').value.toInt();
+    // The controller registers the lane DQS byte, so the sample for the
+    // next cycle is driven.
+    if (now == _mprRead || now == _collectDqs) {
+      final captured =
+          now == _collectDqs && sig('delay_before_read_data').value.toInt() == 0;
+      final count = sig('dqs_count_repeat').value.toInt() + (captured ? 1 : 0);
       final sample = ((0x154 << indexOf(collection)) >> (count * 8)) & 255;
       dqs.inject(
         BigInt.from(sample) *

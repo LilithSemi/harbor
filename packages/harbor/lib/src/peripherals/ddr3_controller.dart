@@ -1599,15 +1599,22 @@ class Ddr3Controller extends Module {
       conditionalType: ConditionalType.unique,
     );
 
-    final dqsRefByte = laneSlice(bitslipReference, 8);
-    final dqsByte = laneSlice(iserdesDqs, 8);
+    // The lane-selected samples are registered. The ISERDES samples sit far
+    // from the controller, so the calibration decisions read the flops.
+    final dqsRefByte = Logic(name: 'dqs_ref_byte', width: 8);
+    final dqsByte = Logic(name: 'dqs_byte', width: 8);
+    Sequential(clk, [
+      dqsRefByte < laneSlice(bitslipReference, 8),
+      dqsByte < laneSlice(iserdesDqs, 8),
+    ]);
     final dqsTargetIndexValue = mux(
       dqsStartIndexStored[0],
       dqsStartIndexStored + 2,
       dqsStartIndexStored + 1,
     );
-    // MPR-read data latency: READ_DELAY(1) + issue/ISERDES pipeline (1310-1319).
-    const readCalDelay = 4;
+    // MPR-read data latency: READ_DELAY(1) + issue/ISERDES pipeline (1310-1319)
+    // + the dqsByte register.
+    const readCalDelay = 5;
     // dqs_store[dqs_start_index +: 10]: a variable 10-bit window (zero-extended
     // so a scan near the top pads with 0, matching Verilog +:).
     final dqsWindow =
@@ -1836,6 +1843,7 @@ class Ddr3Controller extends Module {
                               width: 6,
                             ),
                         laneReg < Const(0, width: laneW),
+                        trainDelay < Const(1, width: 4),
                         for (var l = 0; l < lanes; l++) ...[
                           oOdelayDataLd[l] < Const(1),
                           oOdelayDqsLd[l] < Const(1),
@@ -1869,7 +1877,7 @@ class Ddr3Controller extends Module {
                     orElse: [
                       for (var l = 0; l < lanes; l++)
                         If(laneReg.eq(l), then: [oBitslip[l] < Const(1)]),
-                      trainDelay < Const(3, width: 4),
+                      trainDelay < Const(4, width: 4),
                     ],
                   ),
                 ],
@@ -1982,6 +1990,7 @@ class Ddr3Controller extends Module {
                                 dqTargetIndex[l].getRange(0, 3)),
                       ],
                     ),
+                  trainDelay < Const(1, width: 4),
                   state < Const(_stBitslipTrain2, width: 6),
                 ],
                 orElse: [
@@ -2018,6 +2027,7 @@ class Ddr3Controller extends Module {
                           ],
                           orElse: [
                             laneReg < laneReg + 1,
+                            trainDelay < Const(1, width: 4),
                             state < Const(_stBitslipTrain1, width: 6),
                           ],
                         )
@@ -2043,7 +2053,7 @@ class Ddr3Controller extends Module {
                     orElse: [
                       for (var l = 0; l < lanes; l++)
                         If(laneReg.eq(l), then: [oBitslip[l] < Const(1)]),
-                      trainDelay < Const(3, width: 4),
+                      trainDelay < Const(4, width: 4),
                     ],
                   ),
                 ],
