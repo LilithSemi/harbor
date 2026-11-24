@@ -920,14 +920,10 @@ class HarborSoC extends BridgeModule {
       _clockDomains[clkConfig.name] = shared.primary;
     } else {
       final t = target;
-      // A design with the DDR3 clock tree has its own clock script, so its
-      // generated RTL stays as it was.
       final domain = _clockGen.createDomain(
         clkConfig,
         namePllClock:
-            !_hasDdr3ClockTree &&
-            t is HarborFpgaTarget &&
-            t.vendor == HarborFpgaVendor.openXc7,
+            t is HarborFpgaTarget && t.vendor == HarborFpgaVendor.openXc7,
       );
       _clockDomains[clkConfig.name] = domain;
       if (_isXilinxFpga && !passthrough) _xilinxPadPlls = true;
@@ -2409,7 +2405,7 @@ class HarborSoC extends BridgeModule {
           );
         }
       }
-      if (fileContents.name == name && !_hasDdr3ClockTree) {
+      if (fileContents.name == name) {
         for (final clockNet in [
           if (_xilinxPassthroughMhz != null) 'sysosc_clk',
           ..._xilinxPllClockMhz.keys,
@@ -2716,31 +2712,31 @@ class HarborSoC extends BridgeModule {
                     sourceClockNet: 'sysosc_clk',
                     sourceClkMhz: sourceMhz,
                     ddrCtrlMhz: ddrCtrlMhz,
-                    extraClocks: providedClocks,
+                    extraClocks: pllClocks,
                   ),
                 );
               }
             }
             if (_hasDdr3ClockTree &&
                 !t.useHimbaechel &&
-                providedClocks.isNotEmpty &&
+                pllClocks.isNotEmpty &&
                 !clocksPyWritten) {
               throw StateError(
-                'The clock rates of ${providedClocks.keys.join(', ')} need '
+                'The clock rates of ${pllClocks.keys.join(', ')} need '
                 'support/nextpnr/clocks.py, and a design with a DDR3 clock '
                 'tree writes it only with a DDR3 controller and the rates of '
                 'its clocks. Use Himbächel or add the controller.',
               );
             }
             // Himbächel can lack Python hooks, so the XDC carries the rates.
-            // With a DDR3 clock tree the PLL nets are not timed here.
-            final xdcClocks = _hasDdr3ClockTree
-                ? {
-                    if (_xilinxPassthroughMhz != null && !clocksPyWritten)
-                      'sysosc_clk': _xilinxPassthroughMhz!,
-                    ...providedClocks,
-                  }
-                : pllClocks;
+            // An independent PLL beside a DDR3 clock tree is timed here too.
+            final xdcClocks = {
+              if (_hasDdr3ClockTree &&
+                  _xilinxPassthroughMhz != null &&
+                  !clocksPyWritten)
+                'sysosc_clk': _xilinxPassthroughMhz!,
+              ...pllClocks,
+            };
             if (t.useHimbaechel && xdcClocks.isNotEmpty) {
               final xdc = File('$path/$name.${t.constraintExtension}');
               final lines = StringBuffer(xdc.readAsStringSync());

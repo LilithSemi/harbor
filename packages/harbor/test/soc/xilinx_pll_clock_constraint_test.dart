@@ -106,8 +106,9 @@ void main() {
       },
     );
 
-    test('a DDR3 clock tree build keeps its output, himb=$himb', () async {
-      final dir = await _generate(
+    test('a DDR3 clock tree build times an independent PLL clock, '
+        'himb=$himb', () async {
+      final generated = _generate(
         useHimbaechel: himb,
         clocks: const [
           HarborClockConfig(
@@ -128,13 +129,33 @@ void main() {
           coreClkHz: 100000000,
         ),
       );
+      if (!himb) {
+        // The legacy flow writes the DDR3 clocks.py only with a DDR3
+        // controller, so it has no script for aux_clk.
+        await expectLater(
+          generated,
+          throwsA(
+            isA<StateError>().having(
+              (e) => e.message,
+              'message',
+              contains('aux_clk'),
+            ),
+          ),
+        );
+        return;
+      }
+      final dir = await generated;
       addTearDown(() => dir.deleteSync(recursive: true));
       expect(_exists(dir, 'support/nextpnr/pll_clocks.py'), isFalse);
       expect(_read(dir, 'Makefile'), isNot(contains('pll_clocks')));
-      expect(_netClocks(dir), isEmpty);
-      final sv = _read(dir, 'rtl/PllSoc.sv');
-      expect(sv, isNot(contains('aux_clk')));
-      expect(sv, isNot(contains('keep = 1 *) logic aux')));
+      expect(
+        _netClocks(dir),
+        contains('create_clock -period 20.000 [get_nets aux_clk]'),
+      );
+      expect(
+        _read(dir, 'rtl/PllSoc.sv'),
+        contains('(* keep = 1 *) logic aux_clk;'),
+      );
     });
   }
 }
