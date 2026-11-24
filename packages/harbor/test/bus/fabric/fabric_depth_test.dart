@@ -52,10 +52,18 @@ Future<int> _depth(
 }
 
 // Seven masters and seventeen targets as on the KC705: s0 has a second read
-// channel, the even targets remap IDs, m6 is real-time, so bursts split.
+// channel, the even targets remap IDs, m6 is real-time, so bursts split, and
+// m5 is a memory master behind a clock crossing, as PCIe DMA is.
 final _kc705Masters = [
   for (var i = 0; i < 7; i++)
-    MasterCfg('m$i', 4, 4, realtime: i == 6, readChannel: i < 2 ? 1 : null),
+    MasterCfg(
+      'm$i',
+      4,
+      4,
+      realtime: i == 6,
+      readChannel: i < 2 ? 1 : null,
+      cdc: i == 5,
+    ),
 ];
 final _kc705Slaves = [
   const SlaveCfg('s0', 4, 8, 0x00000, 0x10000, readChannels: 2),
@@ -93,6 +101,19 @@ const _balanced = {
   ('2x3', HarborFabricTopology.crossbar): 15,
 };
 
+// The worst depth of the crossing and memory master in front of m5.
+const _crossing = 7;
+
+Iterable<Module> _leaves(Module m) sync* {
+  if (m.subModules.isEmpty) {
+    yield m;
+    return;
+  }
+  for (final s in m.subModules) {
+    yield* _leaves(s);
+  }
+}
+
 // The request path budget: from the master FIFO and head register through
 // the arbiter, the credits and the grant register into the grant FIFO.
 const _requestBudget = 6;
@@ -101,15 +122,56 @@ const _requestBudget = 6;
 final _requestCell = RegExp(
   r'^m\d+_(aw|ar)_(wr|rd|has|full|ram)$|'
   r'_(aw|ar)_(head_.*|issued_.*|pop_q|fire_q|non_final_q|split_.*|order_.*|'
-  r'rr|grant_reg|elig|want_q|rt_want_q|grant_used|remap_used|grant_pop_q|'
+  r'rr|grant_reg|elig|slot_elig|want_q|rt_want_q|grant_used|remap_used|'
+  r'grant_pop_q|'
   r'remap_.*|grant_(wr|rd|count|ram))$|_prefer_read$|_inflight$',
 );
 
-bool _inRequest(Module cell) => [
-  if (cell is HarborFifoRam) cell.name,
-  for (final o in cell.outputs.values)
-    for (final d in o.dstConnections) d.name,
-].any(_requestCell.hasMatch);
+// The cells of the slave side, the responses and W.
+final _otherCell = RegExp(
+  r'_(aw|ar|w|b|r|req)_(wr|rd|count|ram|pop_data|e\d+)$|'
+  r'_(aw|ar|w)_shown$|_(b|r)_(pieces|worst)$|_(b|r)_resp_rr$|_lite_|'
+  r'_timer$|_cut_off$|_rec\d+_|_r_beat$|_w_done$|'
+  r'_w_(aw_held|count|pieces|order_.*|route_.*|source_.*)$|^bus_w_',
+);
+
+List<String> _cellNames(Module cell) => cell is HarborFifoRam
+    ? [cell.name]
+    : [
+        for (final o in cell.outputs.values)
+          for (final d in o.dstConnections) d.name,
+      ];
+
+bool _inRequest(Module cell) => _cellNames(cell).any(_requestCell.hasMatch);
+
+Iterable<Module> _cells(Module m) sync* {
+  if (m.subModules.isEmpty) {
+    if (m is Sequential || m is FlipFlop || m is HarborFifoRam) yield m;
+    return;
+  }
+  for (final s in m.subModules) {
+    yield* _cells(s);
+  }
+}
+
+// True when [to] is in the combinational fan out of [from]. A flop ends a
+// path.
+bool _combPath(Logic from, Set<Logic> to) {
+  final seen = <Logic>{};
+  final todo = [from];
+  while (todo.isNotEmpty) {
+    final s = todo.removeLast();
+    if (!seen.add(s)) continue;
+    if (to.contains(s)) return true;
+    todo.addAll(s.dstConnections);
+    final m = s.parentModule;
+    if (s.isInput && m != null && m.subModules.isEmpty) {
+      if (m is Sequential || m is FlipFlop) continue;
+      todo.addAll(m.outputs.values);
+    }
+  }
+  return false;
+}
 
 Future<HarborAxi4Fabric> _fabric(
   String config,
@@ -318,6 +380,16 @@ void main() {
           );
         }
 
+        test('every flop of the balanced fabric has a part', () async {
+          final f = await _fabric(config, t, HarborFabricPipeline.balanced);
+          final open = {
+            for (final cell in _cells(f))
+              for (final n in _cellNames(cell))
+                if (!_requestCell.hasMatch(n) && !_otherCell.hasMatch(n)) n,
+          };
+          must(open, isEmpty);
+        });
+
         test('balanced keeps its recorded depth', () async {
           final p = await _fabricDepth(
             config,
@@ -335,6 +407,53 @@ void main() {
         }, skip: 'responses and W are not registered yet');
       });
     }
+  }
+
+  for (final t in HarborFabricTopology.values) {
+    test(
+      'kc705 ${t.name}: no path from a CDC RAM read into the fabric',
+      () async {
+        final (masters, slaves) = _configs['kc705']!;
+        final shell = FabricShell(
+          t,
+          masters: masters,
+          slaves: slaves,
+          pipeline: HarborFabricPipeline.balanced,
+        );
+        await shell.build();
+        final into = shell.fabric.inputs.values.toSet();
+        final reads = [
+          for (final c in _leaves(shell))
+            if (c.definitionName.startsWith('HarborWaistCdcRam_'))
+              c.output('rd_data'),
+        ];
+        must(reads, isNotEmpty);
+        for (final x in reads) {
+          must(_combPath(x, into), isFalse, reason: x.parentModule!.name);
+        }
+      },
+    );
+
+    test(
+      'kc705 ${t.name}: the crossing side keeps its recorded depth',
+      () async {
+        final (masters, slaves) = _configs['kc705']!;
+        final shell = FabricShell(
+          t,
+          masters: masters,
+          slaves: slaves,
+          pipeline: HarborFabricPipeline.balanced,
+        );
+        await shell.build();
+        final fabric = shell.fabric;
+        final p = harborWorstDepth(
+          shell,
+          endIn: (c) => !c.hierarchy().contains(fabric),
+        );
+        printOnFailure('$p');
+        expect(p.levels, _crossing);
+      },
+    );
   }
 
   // Glacier routed 14 to 20 LUT levels on the compact KC705 fabric.

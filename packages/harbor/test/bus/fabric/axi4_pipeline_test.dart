@@ -119,6 +119,58 @@ void main() {
           must(seen.first, _firstArTwoSlaves[p]);
         });
 
+        // Slave ID 1 bit, outstanding 8: two slave IDs for eight requests.
+        Future<List<int>> fewIds(List<Burst> reads) async {
+          final b = await Bench.start(
+            t,
+            pipeline: p,
+            stall: 0,
+            masters: const [MasterCfg('m0', 2, 16)],
+            slaves: const [SlaveCfg('s0', 1, 8, 0x00000, 0x10000)],
+          );
+          var cycle = 0;
+          final seen = <int>[];
+          b.sim.onRise(() {
+            cycle++;
+            if (b.sim.pre('s0_ARVALID') == 1 && b.sim.pre('s0_ARREADY') == 1) {
+              seen.add(cycle);
+            }
+          });
+          final m = b.managers['m0']!;
+          for (final x in reads) {
+            m.read(x);
+          }
+          await b.drain(limit: 20000);
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          must(
+            checkReads('m0', m.arOrder, m.rBeats, (_) => (0, null)),
+            isEmpty,
+          );
+          return seen;
+        }
+
+        test('one ID streams to a slave with few IDs', () async {
+          final seen = await fewIds([
+            for (var i = 0; i < 16; i++) _rd(1, i * 4),
+          ]);
+          must(seen.length, 16);
+          _consecutive(seen.sublist(4), 12);
+        });
+
+        test(
+          'two live IDs stream and a third waits for a free slave ID',
+          () async {
+            final seen = await fewIds([
+              for (var i = 0; i < 16; i++) _rd(i & 1, i * 4),
+              _rd(2, 0x400),
+              for (var i = 0; i < 8; i++) _rd(i & 1, 0x800 + i * 4),
+            ]);
+            must(seen.length, 25);
+            _consecutive(seen.sublist(4, 16), 12);
+          },
+        );
+
         test('outstanding 1 with reads and writes from two masters', () async {
           final b = await Bench.start(
             t,

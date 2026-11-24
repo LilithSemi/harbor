@@ -57,6 +57,11 @@ class MasterCfg {
   /// The slaves this master reaches, or null for all (see
   /// [HarborFabricMaster.reach]).
   final Set<String>? reach;
+
+  /// The master is a memory master port behind a clock crossing from
+  /// `dev_clk`, with its device waist on `<name>_w_*`. The native port has
+  /// [idWidth] bits, the device one less.
+  final bool cdc;
   const MasterCfg(
     this.name,
     this.idWidth,
@@ -67,6 +72,7 @@ class MasterCfg {
     this.exclusiveIds,
     this.writeStallFree = false,
     this.reach,
+    this.cdc = false,
   });
 }
 
@@ -161,8 +167,13 @@ class FabricShell extends BridgeModule {
     createPort('reset', PortDirection.input);
     final ms = <HarborFabricMaster>[];
     for (final m in masters) {
-      final intf = _intf(m.idWidth, m.lite);
-      exposeInterface(this, intf, m.name, PairDirection.fromProvider);
+      final PairInterface intf;
+      if (m.cdc) {
+        intf = _cdcMaster(m);
+      } else {
+        intf = _intf(m.idWidth, m.lite);
+        exposeInterface(this, intf, m.name, PairDirection.fromProvider);
+      }
       ms.add(
         HarborFabricMaster(
           name: m.name,
@@ -220,6 +231,56 @@ class FabricShell extends BridgeModule {
     output('bus_error') <= fabric.busError;
     createPort('timeout_count', PortDirection.output, width: 8);
     output('timeout_count') <= fabric.timeoutCount.zeroExtend(8);
+  }
+}
+
+extension on FabricShell {
+  // The AXI4 port of a memory master behind a clock crossing.
+  Axi4Interface _cdcMaster(MasterCfg m) {
+    if (tryInput('dev_clk') == null) {
+      createPort('dev_clk', PortDirection.input);
+      createPort('dev_reset', PortDirection.input);
+    }
+    final device = HarborMemoryWaist(
+      HarborMemoryWaistConfig(
+        addressWidth: addrW,
+        dataWidth: dataW,
+        idWidth: m.idWidth - 1,
+        outstanding: m.outstanding,
+      ),
+    );
+    exposeWaist(this, device, '${m.name}_w', PairRole.consumer);
+    final fabric = HarborMemoryWaist(
+      HarborMemoryWaistConfig(
+        addressWidth: addrW,
+        dataWidth: dataW,
+        idWidth: m.idWidth,
+        outstanding: m.outstanding,
+      ),
+    );
+    HarborMemoryWaistCdc(
+      fabricClk: input('clk'),
+      fabricReset: input('reset'),
+      deviceClk: input('dev_clk'),
+      deviceReset: input('dev_reset'),
+      fabric: fabric,
+      device: device,
+      slave: false,
+      name: '${m.name}_cdc',
+    );
+    final axi = Axi4Interface(
+      addressWidth: addrW,
+      dataWidth: dataW,
+      idWidth: m.idWidth,
+    );
+    HarborAxi4MemoryMaster(
+      clk: input('clk'),
+      reset: input('reset'),
+      waist: fabric,
+      axi: axi,
+      name: '${m.name}_axi4',
+    );
+    return axi;
   }
 }
 

@@ -383,11 +383,16 @@ abstract final class HarborFabric {
   ///   wait for the write response of the last write transfer is part of
   ///   `ac`.
   /// - AXI4: `shared * (outstanding + r - 1) * (max(max(cap, 16), rt) * bc +
-  ///   ac + 4) + ac + 8`. The slave has up to `outstanding` requests ahead and
+  ///   ac + g) + ac + e`. The slave has up to `outstanding` requests ahead and
   ///   each other real-time master adds one request ahead. A request is a
   ///   burst of at most the cap (a FIXED or WRAP burst has up to 16 beats),
   ///   and the response channel is shared with the other slaves. A request
-  ///   crosses the fabric stages in a few cycles.
+  ///   crosses the fabric stages in a few cycles. With [pipeline] `compact`,
+  ///   `g` is 4 and `e` is 8. The `balanced` and `fast` levels add 2 to `g`,
+  ///   as a freed slot reaches the next grant through the grant register and
+  ///   the eligibility flop, and 3 to `e`: the head register, the grant
+  ///   register, and one cycle for the last slot, which a real-time request
+  ///   takes from registered wants.
   /// - TileLink: `(shared * outstanding + r) * (max(maxMessage, rt) * bc +
   ///   ac) + ac + 8`. A message cannot be cut, so the cap does not apply.
   ///
@@ -412,6 +417,7 @@ abstract final class HarborFabric {
     int wishboneBurstBeats = 8,
     int? wishboneGrantCap,
     bool allowUnproven = false,
+    HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
   }) {
     if (cap < 1) {
       throw ArgumentError.value(cap, 'cap', 'must be >= 1');
@@ -460,11 +466,12 @@ abstract final class HarborFabric {
             3;
       case HarborFabricKind.axi4:
         final int piece = max<int>(max<int>(cap, 16), rt);
+        final compact = pipeline == HarborFabricPipeline.compact;
         return sharedSlaves *
                 (slaveOutstanding + r - 1) *
-                (piece * beatCycles + ac + 4) +
+                (piece * beatCycles + ac + (compact ? 4 : 6)) +
             ac +
-            8;
+            (compact ? 8 : 11);
       case HarborFabricKind.tilelink:
         final int message =
             maxMessageBeats ?? _tileLinkMaxMessageBeats(masters);
@@ -546,6 +553,7 @@ abstract final class HarborFabric {
     int wishboneBurstBeats = 8,
     int? wishboneGrantCap,
     bool allowUnproven = false,
+    HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
   }) =>
       realtimeWaitBound(
         kind: kind,
@@ -561,6 +569,7 @@ abstract final class HarborFabric {
         wishboneBurstBeats: wishboneBurstBeats,
         wishboneGrantCap: wishboneGrantCap,
         allowUnproven: allowUnproven,
+        pipeline: pipeline,
       ) +
       realtimeWaitBound(
         kind: kind,
@@ -576,6 +585,7 @@ abstract final class HarborFabric {
         wishboneBurstBeats: wishboneBurstBeats,
         wishboneGrantCap: wishboneGrantCap,
         allowUnproven: allowUnproven,
+        pipeline: pipeline,
       ) -
       (accessCycles + pathCycles);
 

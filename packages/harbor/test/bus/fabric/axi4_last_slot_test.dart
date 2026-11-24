@@ -87,21 +87,30 @@ const _realtimeGolden = {
     741959,
   ),
   (HarborFabricPipeline.balanced, HarborFabricTopology.shared): (
-    -5792061948357707147,
-    931561,
+    7378622264927147043,
+    931398,
   ),
   (HarborFabricPipeline.balanced, HarborFabricTopology.crossbar): (
-    -3386948133231821030,
-    957739,
+    7375273245388810228,
+    957818,
   ),
   (HarborFabricPipeline.fast, HarborFabricTopology.shared): (
-    7872232207992025901,
-    931561,
+    -4223802904182233805,
+    931398,
   ),
   (HarborFabricPipeline.fast, HarborFabricTopology.crossbar): (
-    -6305941106286881074,
-    957739,
+    5398571752657003120,
+    957818,
   ),
+};
+
+// The longest wait at the slave of one direction between its slots in the
+// flood test. The balanced and fast levels add the grant register and the
+// bubble of a freed slot.
+const _floodGap = {
+  HarborFabricPipeline.compact: 21,
+  HarborFabricPipeline.balanced: 23,
+  HarborFabricPipeline.fast: 23,
 };
 
 void main() {
@@ -177,6 +186,17 @@ void main() {
               if (c0 == c1) continue;
               must(d1, isNot(d0), reason: 'slave fire $i at $c1');
             }
+          }
+          for (final d in ['AW', 'AR']) {
+            final at = [
+              for (final (c, x) in slaveFires)
+                if (x == d) c,
+            ];
+            var gap = 0;
+            for (var i = 1; i < at.length; i++) {
+              gap = gap > at[i] - at[i - 1] ? gap : at[i] - at[i - 1];
+            }
+            must(gap, lessThanOrEqualTo(_floodGap[p]!), reason: d);
           }
         });
 

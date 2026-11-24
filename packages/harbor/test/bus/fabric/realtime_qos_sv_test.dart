@@ -4,7 +4,9 @@
 // configurations: commit 655ca67 for the fabric shells with the grant cap
 // off, and commit 122c86f for the SoCs, which have the default grant cap.
 // The Wishbone SoC hash moved when the grant cap learned to take the grant
-// from an idle owner, which is not a real-time change.
+// from an idle owner, which is not a real-time change. All hashes moved
+// when the fabric started to count the slaves that a bus timeout cut off,
+// which is not a real-time change.
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
@@ -119,7 +121,10 @@ class _Cpu extends BridgeModule {
   }
 }
 
-Future<String> _soc(HarborFabricKind kind) async {
+Future<String> _soc(
+  HarborFabricKind kind, {
+  HarborFabricPipeline axi4Pipeline = HarborFabricPipeline.balanced,
+}) async {
   final soc = HarborSoC(
     name: 'masters_${kind.name}',
     compatible: 'test,masters',
@@ -144,7 +149,7 @@ Future<String> _soc(HarborFabricKind kind) async {
     ),
   );
   cpu.pullUp(soc);
-  soc.buildFabric();
+  soc.buildFabric(axi4Pipeline: axi4Pipeline);
   soc.input('clk').srcConnection! <= Logic(name: 'clk');
   soc.input('reset').srcConnection! <= Logic(name: 'reset');
   await soc.build();
@@ -155,13 +160,14 @@ void main() {
   const golden = <String, (int, int)>{
     'axi4_crossbar': (-1806727016848880604, 725461),
     'axi4_shared': (-4758848597611908600, 703895),
-    'axi4_balanced_crossbar': (-1047644616298858352, 1042985),
-    'axi4_balanced_shared': (5997735925694472600, 993859),
-    'axi4_fast_crossbar': (-7056526555121309953, 1042985),
-    'axi4_fast_shared': (1738350219222816629, 993859),
-    'soc_axi4': (-719853137350859623, 757532),
-    'soc_tilelink': (3980852489748109613, 671753),
-    'soc_wishbone': (2951180329469432230, 536162),
+    'axi4_balanced_crossbar': (173297470315991894, 1043312),
+    'axi4_balanced_shared': (-3919233163272566078, 993695),
+    'axi4_fast_crossbar': (-177625609682684969, 1043312),
+    'axi4_fast_shared': (-8551066521692636977, 993695),
+    'soc_axi4': (-1469753368518890654, 758537),
+    'soc_axi4_compact': (4023386663348030894, 717740),
+    'soc_tilelink': (-4122436125043858959, 671414),
+    'soc_wishbone': (4689187175172827120, 535823),
     'tl_crossbar': (-5608642720268730264, 149685),
     'tl_shared': (171527483369796812, 308006),
     'wb_crossbar': (-3765011429854336056, 33613),
@@ -199,6 +205,17 @@ void main() {
       expect(_hash(_sv(shell)), golden['tl_${t.name}']);
     });
   }
+  test('axi4 SoC at compact: SV equals the SV before the levels', () async {
+    expect(
+      _hash(
+        await _soc(
+          HarborFabricKind.axi4,
+          axi4Pipeline: HarborFabricPipeline.compact,
+        ),
+      ),
+      golden['soc_axi4_compact'],
+    );
+  });
   for (final kind in HarborFabricKind.values) {
     test('${kind.name} SoC: SV equals the SV before real-time QoS', () async {
       expect(_hash(await _soc(kind)), golden['soc_${kind.name}']);

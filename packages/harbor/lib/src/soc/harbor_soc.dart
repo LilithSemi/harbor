@@ -1621,6 +1621,8 @@ class HarborSoC extends BridgeModule {
   /// [realtimeBurstCap] is the most beats of a burst another master sends
   /// to a slave in one grant while a real-time master waits (see
   /// [HarborFabric.build]). It has no effect without a real-time master.
+  /// [axi4Pipeline] sets the register stages of each AXI4 fabric (see
+  /// [HarborFabricPipeline]). Wishbone and TileLink fabrics ignore it.
   void buildFabric({
     bool pipeline = false,
     Map<String, Set<String>>? channelSlaves,
@@ -1628,6 +1630,7 @@ class HarborSoC extends BridgeModule {
     int? busTimeoutCycles,
     int? maxGrantCycles = harborDefaultWishboneGrantCap,
     int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
+    HarborFabricPipeline axi4Pipeline = HarborFabricPipeline.balanced,
   }) {
     _fabricBuilt = true;
     _fabricDomain; // throws when fabricClockDomain names no domain
@@ -1906,6 +1909,7 @@ class HarborSoC extends BridgeModule {
         wishboneBurstBeats: burstBeats,
         maxGrantCycles: maxGrantCycles,
         realtimeBurstCap: realtimeBurstCap,
+        pipeline: axi4Pipeline,
         name: name,
       );
       fabrics.add(f);

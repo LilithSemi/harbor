@@ -86,6 +86,9 @@ class _Remap {
 
   Logic ok(Logic f) => anyOf(_match(f)) | anyOf([for (final v in _valid) ~v]);
 
+  /// High when [f] holds a slot.
+  Logic has(Logic f) => anyOf(_match(f));
+
   Logic slaveId(Logic f) =>
       indexOf(_slot(f), slotWidth).zeroExtend(slaveIdWidth);
 
@@ -116,13 +119,17 @@ class _Remap {
 
   /// The slave ID of [f] for a request that [issue] marks, as [update]
   /// does, with the table update one cycle later. The lookup sees the
-  /// request of the cycle before as if it were in the table. [giveBack] is
-  /// high one cycle after a request found its ID, and [release] in the
-  /// cycle after a slot became free.
-  ({Logic sid, Logic giveBack, Logic release}) lookup(
+  /// request of the cycle before as if it were in the table. [charged] marks
+  /// a request that took a slot credit. One cycle later [giveBack] is high
+  /// when a charged request found its ID, and [charge] when a request that
+  /// was not charged took a free slot. [release] is high three cycles after
+  /// a slot became free, so it never comes before the [charge] of a request
+  /// that saw that slot live.
+  ({Logic sid, Logic giveBack, Logic charge, Logic release}) lookup(
     Logic clk,
     Logic reset, {
     required Logic issue,
+    required Logic charged,
     required Logic f,
     required Logic done,
     required Logic doneSid,
@@ -133,6 +140,10 @@ class _Remap {
     final allocQ = Logic(name: '${name}_alloc_q');
     final fQ = Logic(name: '${name}_f_q', width: f.width);
     final liveQ = Logic(name: '${name}_live_q', width: k);
+    final chargedQ = Logic(name: '${name}_charged_q');
+    final rel = [
+      for (var i = 0; i < 2; i++) Logic(name: '${name}_release_q$i'),
+    ];
     final pend = [for (var i = 0; i < k; i++) issueQ & slotQ[i]];
     final live = [for (var i = 0; i < k; i++) cnt[i].neq(0) | pend[i]];
     final load = [for (var i = 0; i < k; i++) allocQ & pend[i]];
@@ -153,6 +164,9 @@ class _Remap {
       allocQ < ~hasMatch,
       fQ < f,
       liveQ < live.rconcat(),
+      chargedQ < charged,
+      rel[0] < anyOf([for (var i = 0; i < k; i++) liveQ[i] & ~live[i]]),
+      rel[1] < rel[0],
       for (var i = 0; i < k; i++) ...[
         cnt[i] <
             cnt[i] + pend[i].zeroExtend(w) - (done & doneSlot[i]).zeroExtend(w),
@@ -161,8 +175,9 @@ class _Remap {
     ]);
     return (
       sid: indexOf(slot, slotWidth).zeroExtend(slaveIdWidth),
-      giveBack: issueQ & ~allocQ,
-      release: anyOf([for (var i = 0; i < k; i++) liveQ[i] & ~live[i]]),
+      giveBack: issueQ & chargedQ & ~allocQ,
+      charge: issueQ & ~chargedQ & allocQ,
+      release: rel[1],
     );
   }
 }
@@ -963,6 +978,21 @@ class HarborAxi4Fabric extends HarborFabricModule {
       final iFull = [for (var m = 0; m < nm; m++) <Logic>[]];
       final iRest = [for (var m = 0; m < nm; m++) <Logic>[]];
       final iTgt = [for (var m = 0; m < nm; m++) <Logic>[]];
+      // Remap targets with fewer slave IDs than requests in flight. A
+      // request there takes a slot credit unless its ID holds a slot.
+      final few = [
+        for (var t = 0; t < nt; t++)
+          [
+            for (var dir = 0; dir < 2; dir++)
+              tRemap[t] && remap[t]![dir].fid.length < tN[t],
+          ],
+      ];
+      final hFound = [
+        for (var m = 0; m < nm; m++) <Logic>[Const(0), Const(0)],
+      ];
+      final iFound = [
+        for (var m = 0; m < nm; m++) <Logic>[Const(0), Const(0)],
+      ];
       for (var m = 0; m < nm; m++) {
         final a = ma[m];
         final mn = masters[m].name;
@@ -1200,6 +1230,27 @@ class HarborAxi4Fabric extends HarborFabricModule {
           Sequential(c, reset: r, [
             trkOk < harborLoad(heldTrk, advance, entryTrk),
           ]);
+          if ([for (var t = 0; t < nt; t++) few[t][dir]].contains(true)) {
+            // The ID holds a slot at its target, from the table one cycle
+            // ahead. Only a slot that frees can make it wrong, and the
+            // lookup then charges the slot it takes.
+            Logic full(Logic id) => pW > 0
+                ? [Const(m, width: pW), id.zeroExtend(maxId)].concat()
+                : id.zeroExtend(maxId);
+            Logic foundOf(Logic id, List<Logic> tg) => anyOf([
+              for (var t = 0; t < nt; t++)
+                if (few[t][dir]) tg[t] & remap[t]![dir].has(full(id)),
+            ]);
+            final found = Logic(name: '${hp}_remap_found');
+            final ifound = Logic(name: '${p}_issued_found');
+            Sequential(c, reset: r, [
+              found <
+                  harborLoad(foundOf(hid, tgt), advance, foundOf(eid, eTgt)),
+              ifound < harborLoad(ifound, fire, found),
+            ]);
+            hFound[m][dir] = found;
+            iFound[m][dir] = ifound;
+          }
           if (splitD != null) {
             final splitOk = Logic(name: '${hp}_split_ok');
             Sequential(c, reset: r, [splitOk < splitD]);
@@ -1215,6 +1266,30 @@ class HarborAxi4Fabric extends HarborFabricModule {
         for (var m = 0; m < nm; m++)
           if (!rtOnly || rt[m]) hValid[m][dir] & hOk[m][dir] & hTgt[m][dir][t],
       ]);
+      Logic wantSlot(int t, int dir) => anyOf([
+        for (var m = 0; m < nm; m++)
+          hValid[m][dir] & hOk[m][dir] & hTgt[m][dir][t] & ~hFound[m][dir],
+      ]);
+      // The remap slot credit of a target with few slave IDs.
+      final slotElig = [
+        for (var t = 0; t < nt; t++)
+          [
+            for (var dir = 0; dir < 2; dir++)
+              few[t][dir]
+                  ? Logic(
+                      name: '${tName[t]}_${dir == 0 ? 'aw' : 'ar'}_slot_elig',
+                    )
+                  : Const(1),
+          ],
+      ];
+      // A head may take target [t] when the target is eligible and, on a
+      // target with few slave IDs, its ID holds a slot or a slot is free.
+      Logic open(int m, int dir, int t) => few[t][dir]
+          ? elig[t][dir] & (hFound[m][dir] | slotElig[t][dir])
+          : elig[t][dir];
+      final charged = [
+        for (var t = 0; t < nt; t++) [Logic(), Logic()],
+      ];
 
       // The arbiters and the grant registers.
       tReq = [for (var t = 0; t < nt; t++) <_Req>[]];
@@ -1238,7 +1313,10 @@ class HarborAxi4Fabric extends HarborFabricModule {
               r,
               realtimeFirst([
                 for (var m = 0; m < nm; m++)
-                  hValid[m][dir] & hOk[m][dir] & hTgt[m][dir][t] & elig[t][dir],
+                  hValid[m][dir] &
+                      hOk[m][dir] &
+                      hTgt[m][dir][t] &
+                      open(m, dir, t),
               ], rt),
             );
             grants.add(g);
@@ -1246,6 +1324,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
             Sequential(c, reset: r, [reg < g.rconcat()]);
             final oh = [for (var m = 0; m < nm; m++) reg[m]];
             tFire[t][dir] <= anyOf(oh);
+            charged[t][dir] <=
+                tFire[t][dir] &
+                    ~pick(oh, [for (var m = 0; m < nm; m++) iFound[m][dir]]);
             tReq[t].add(_Req(tFire[t][dir], pick(oh, full), pick(oh, rest)));
             tMaster[t].add(indexOf(oh, mW));
           }
@@ -1263,7 +1344,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
                     hOk[m][dir] &
                     anyOf([
                       for (var t = 0; t < nt; t++)
-                        hTgt[m][dir][t] & elig[t][dir],
+                        hTgt[m][dir][t] & open(m, dir, t),
                     ]),
             ], rt),
           );
@@ -1285,8 +1366,12 @@ class HarborAxi4Fabric extends HarborFabricModule {
           final busFull = pick(oh, full);
           final busRest = pick(oh, rest);
           final busMaster = indexOf(oh, mW);
+          final busFound = pick(oh, [
+            for (var m = 0; m < nm; m++) iFound[m][dir],
+          ]);
           for (var t = 0; t < nt; t++) {
             tFire[t][dir] <= reg[nm + t];
+            charged[t][dir] <= tFire[t][dir] & ~busFound;
             tReq[t].add(_Req(tFire[t][dir], busFull, busRest));
             tMaster[t].add(busMaster);
           }
@@ -1306,7 +1391,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
 
       // ID remap at each target, from the grant register.
       final remapFree = [
-        for (var t = 0; t < nt; t++) <(Logic, Logic)?>[null, null],
+        for (var t = 0; t < nt; t++) <(Logic, Logic, Logic)?>[null, null],
       ];
       tSid = [
         for (var t = 0; t < nt; t++)
@@ -1319,11 +1404,12 @@ class HarborAxi4Fabric extends HarborFabricModule {
                     c,
                     r,
                     issue: tFire[t][dir],
+                    charged: charged[t][dir],
                     f: tReq[t][dir].id,
                     done: dir == 0 ? bDone[t] : rDone[t],
                     doneSid: resp.id,
                   );
-                  remapFree[t][dir] = (x.giveBack, x.release);
+                  remapFree[t][dir] = (x.giveBack, x.charge, x.release);
                   return x.sid;
                 }()
               else
@@ -1418,20 +1504,29 @@ class HarborAxi4Fabric extends HarborFabricModule {
           var ok =
               outOk[dir] & _fits(used, [held[dir], now[dir]], grantDepth, 1);
           final free = remapFree[t][dir];
-          final k = tRemap[t] ? remap[t]![dir].fid.length : 0;
-          if (free != null && k < n) {
-            // Fewer remap slots than requests in flight: each grant takes
-            // a slot credit, and a request that finds its ID gives it back.
-            final ru = Logic(name: '${tn}_${d}_remap_used', width: widthOf(k));
+          if (few[t][dir]) {
+            // Slot credits: a grant whose ID held no slot takes one; the
+            // lookup gives it back when the ID was there, or charges one
+            // when an ID lost its slot on the way.
+            final k = remap[t]![dir].fid.length;
+            final ru = Logic(
+              name: '${tn}_${d}_remap_used',
+              width: widthOf(k + 1),
+            );
             final rw = ru.width;
             Sequential(c, reset: r, [
               ru <
                   ru +
-                      held[dir].zeroExtend(rw) -
+                      charged[t][dir].zeroExtend(rw) +
+                      free!.$2.zeroExtend(rw) -
                       free.$1.zeroExtend(rw) -
-                      free.$2.zeroExtend(rw),
+                      free.$3.zeroExtend(rw),
             ]);
-            ok = ok & _fits(ru, [held[dir], now[dir]], k, 1);
+            final mayTake = (elig[t][dir] & slotElig[t][dir] & wantSlot(t, dir))
+                .named('${tn}_${d}_may_take_slot');
+            Sequential(c, reset: r, [
+              slotElig[t][dir] < _fits(ru, [charged[t][dir], mayTake], k, 1),
+            ]);
           }
           Sequential(c, reset: r, [elig[t][dir] < ok]);
         }
