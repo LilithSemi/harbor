@@ -107,6 +107,45 @@ void main() {
     );
   });
 
+  test('a register stage and the fabric take their own release flop', () async {
+    final soc = _soc(_ecp5, {'sys'});
+    final cpu = soc.addMaster(_Cpu(), pipeline: true);
+    soc.addPeripheral(
+      HarborUart(
+        baseAddress: 0x10000000,
+        busAddressWidth: 32,
+        busDataWidth: 32,
+      ),
+    );
+    cpu.pullUp(soc);
+    soc.buildFabric(pipeline: true);
+    await soc.build();
+    final names = soc.subModules
+        .whereType<HarborRegisteredResetBranch>()
+        .map((b) => b.name)
+        .toList();
+    // A master with both pipeline flags gets two stages, each with its own.
+    expect(
+      names,
+      unorderedEquals([
+        'cpu_reset_branch',
+        'uart_reset_branch',
+        'fabric_reset_branch',
+        'wishbone_reg_0_reset_branch',
+        'wishbone_reg_1_reset_branch',
+      ]),
+    );
+    expect(names.toSet(), hasLength(names.length));
+    final sys = soc.clockDomain('sys')!;
+    final readers = [
+      for (final m in soc.subModules)
+        if (m is! HarborRegisteredResetBranch)
+          for (final i in m.inputs.values)
+            if (identical(i.srcConnections.firstOrNull, sys.reset)) m.name,
+    ];
+    expect(readers, isEmpty);
+  });
+
   test('an unknown local reset domain throws at buildFabric', () {
     final soc = _soc(_ecp5, {'sys', 'nope'});
     soc.addMaster(_Cpu()).pullUp(soc);

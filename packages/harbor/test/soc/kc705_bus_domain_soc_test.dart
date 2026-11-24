@@ -349,7 +349,17 @@ void main() {
       final branches = RegExp(
         r'HarborRegisteredResetBranch\s+\w+\(([^;]*)\);',
       ).allMatches(top).map((m) => m.group(1)!).toList();
-      expect(branches.length, greaterThanOrEqualTo(3));
+      expect(branches, hasLength(3));
+      expect(
+        RegExp(
+          r'HarborRegisteredResetBranch\s+(\w+)\(',
+        ).allMatches(top).map((m) => m.group(1)),
+        unorderedEquals([
+          'cpu_fabric_reset_branch',
+          'ddr3_reset_branch',
+          'uart_reset_branch',
+        ]),
+      );
       for (final b in branches) {
         expect(b, contains('.reset_assert(bus_provResetHold)'));
         expect(b, contains('.release_in(release_in)'));

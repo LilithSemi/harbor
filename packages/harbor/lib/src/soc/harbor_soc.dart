@@ -2140,6 +2140,8 @@ class HarborSoC extends BridgeModule {
 
   // Puts a register stage in front of a master port and returns the stage's
   // fabric side.
+  int _registerStages = 0;
+
   InterfaceReference _registerStage(InterfaceReference port) {
     final cfg = (port.interface as WishboneInterface).config;
     final reg = WishboneRegisterStage(config: cfg);
@@ -2148,7 +2150,11 @@ class HarborSoC extends BridgeModule {
     final (clk, reset) = defaultClock;
     reg.input('clk').srcConnection! <= clk;
     reg.input('reset').srcConnection! <=
-        _localReset(_fabricDomain, reset, '${reg.name}_reset_branch');
+        _localReset(
+          _fabricDomain,
+          reset,
+          '${reg.name}_${_registerStages++}_reset_branch',
+        );
     connectInterfaces(port, reg.interface('up'));
     return reg.interface('down');
   }
