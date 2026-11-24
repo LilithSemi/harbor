@@ -54,9 +54,9 @@ bool _combPath(Logic from, Set<Logic> to) {
   return false;
 }
 
-/// The push of the request FIFO of [slave] in direction [d].
+/// The push of the grant register of [slave] in direction [d].
 Logic _push(Module fabric, String slave, String d) =>
-    _internal(fabric, '${slave}_${d}_push_fire');
+    _internal(fabric, '${slave}_${d}_grant_push_fire');
 
 String _sv(Module m) => [
   for (final f in SynthBuilder(
@@ -75,11 +75,11 @@ String _sv(Module m) => [
   return (h, s.length);
 }
 
-// The SV of fabrics where every target is real-time, built by the tree before
-// the registered last slot direction (commit 9707fd9c).
+// The SV of fabrics where every target is real-time, built with the
+// registered grant.
 const _realtimeGolden = {
-  HarborFabricTopology.shared: (-6565777653522790195, 710099),
-  HarborFabricTopology.crossbar: (-9161587348457697530, 728450),
+  HarborFabricTopology.shared: (-5402545984370467316, 726513),
+  HarborFabricTopology.crossbar: (-2930259836543658950, 741959),
 };
 
 void main() {
