@@ -112,41 +112,83 @@ void main() {
         }
       });
 
-      test('the AW is at the slave before the first W beat', () async {
-        final b = await Bench.start(
-          t,
-          stall: 0,
-          masters: const [MasterCfg('m0', 2, 4)],
-          slaves: const [SlaveCfg('s0', 4, 4, 0x00000, 0x10000)],
-        );
-        final m = b.managers['m0']!;
-        var cycle = 0;
-        int? awAt;
-        int? wAt;
-        b.sim.onRise(() {
-          cycle++;
-          if (awAt == null && b.sim.pre('s0_AWVALID') == 1) awAt = cycle;
-          if (wAt == null && b.sim.pre('s0_WVALID') == 1) wAt = cycle;
+      // Slow slaves keep AWs in the stage while the W beats are ready.
+      for (final (label, slave, addr, len) in [
+        ('a slave', SlaveCfg('s0', 4, 4, 0x00000, 0x10000), 0x40, 3),
+        (
+          // The early W check cannot trigger here: the error slave takes W at
+          // any time and drops it.
+          'the error target',
+          SlaveCfg('s0', 4, 4, 0x00000, 0x10000),
+          unmapped,
+          3,
+        ),
+        (
+          'an AXI4-Lite slave',
+          SlaveCfg('s0', 4, 1, 0x00000, 0x10000, lite: true),
+          0x40,
+          0,
+        ),
+      ]) {
+        test('no W beat reaches $label before its AW', () async {
+          final b = await Bench.start(
+            t,
+            stall: 0.8,
+            masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 2, 4)],
+            slaves: [slave],
+          );
+          final fab = b.sim.dut;
+          final err = addr == unmapped;
+          final p = err ? 'err' : 's0';
+          final held = _internal(fab, '${p}_w_aw_held');
+          final awFire = _internal(
+            fab,
+            err
+                ? 'err_aw_push_fire'
+                : slave.lite
+                ? 's0_req_push_fire'
+                : 's0_aw_push_fire',
+          );
+          final lastBeat = _internal(fab, '${p}_w_last_beat');
+          final wFire = err ? null : _internal(fab, 's0_w_push_fire');
+          var awPushed = 0;
+          var bursts = 0;
+          var early = 0;
+          b.sim.onRise(() {
+            if (wFire != null &&
+                wFire.previousValue!.toInt() == 1 &&
+                held.previousValue!.toInt() == 0) {
+              early++;
+            }
+            if (lastBeat.previousValue!.toInt() == 1) {
+              bursts++;
+              if (bursts > awPushed) early++;
+            }
+            if (awFire.previousValue!.toInt() == 1) awPushed++;
+          });
+          for (var i = 0; i < 4; i++) {
+            for (final m in ['m0', 'm1']) {
+              b.managers[m]!.write(
+                Burst(
+                  id: 0,
+                  write: true,
+                  addr: addr + i * 0x40,
+                  len: len,
+                  size: 2,
+                  burst: 1,
+                  data: [for (var k = 0; k <= len; k++) k + i],
+                  strb: [for (var k = 0; k <= len; k++) 0xf],
+                ),
+              );
+            }
+          }
+          await b.drain(limit: 40000);
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          must(bursts, 8);
+          must(early, 0);
         });
-        m.write(
-          Burst(
-            id: 0,
-            write: true,
-            addr: 0x40,
-            len: 3,
-            size: 2,
-            burst: 1,
-            data: [1, 2, 3, 4],
-            strb: [0xf, 0xf, 0xf, 0xf],
-          ),
-        );
-        await b.drain(limit: 20000);
-        await b.sim.stop();
-        must(b.errors, isEmpty);
-        must(awAt, isNotNull);
-        must(wAt, isNotNull);
-        must(awAt! <= wAt!, isTrue, reason: 'AW at $awAt, W at $wAt');
-      });
+      }
     });
   }
 }

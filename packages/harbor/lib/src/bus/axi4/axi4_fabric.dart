@@ -847,7 +847,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
             ),
         ],
     ];
-    final gSid = [
+    final gFields = [
       for (var t = 0; t < nt; t++)
         [
           for (var dir = 0; dir < 2; dir++)
@@ -859,7 +859,11 @@ class HarborAxi4Fabric extends HarborFabricModule {
       for (var t = 0; t < nt; t++)
         [
           for (var dir = 0; dir < 2; dir++)
-            _Req(grantQ[t][dir].popFire, gSid[t][dir][0], gSid[t][dir][1]),
+            _Req(
+              grantQ[t][dir].popFire,
+              gFields[t][dir][0],
+              gFields[t][dir][1],
+            ),
         ],
     ];
     for (var t = 0; t < nt; t++) {
@@ -873,7 +877,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
     // for a target waits until the AW of its burst is in the slave side
     // queue.
     final wSlaveReady = [for (var t = 0; t < nt; t++) Logic()];
-    final wLastBeat = [for (var t = 0; t < nt; t++) Logic()];
+    final wLastBeat = [
+      for (var t = 0; t < nt; t++) Logic(name: '${tName[t]}_w_last_beat'),
+    ];
     final wReady = <Logic>[];
     for (var t = 0; t < nt; t++) {
       final cw = widthOf(tN[t] + 2);
