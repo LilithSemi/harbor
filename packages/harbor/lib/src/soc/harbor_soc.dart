@@ -226,7 +226,8 @@ class HarborSoC extends BridgeModule {
           Const(_resetWatchdog == null ? 0 : 1);
       module.input('debug_reset').srcConnection! <= (_resetDebug ?? Const(0));
     } else {
-      module.input('reset').srcConnection! <= reset;
+      module.input('reset').srcConnection! <=
+          _localReset(domain, reset, '${module.name}_reset_branch');
     }
   }
 
@@ -462,6 +463,31 @@ class HarborSoC extends BridgeModule {
   /// output: phase-locked outputs break the async crossing.
   final String? fabricClockDomain;
 
+  /// Names of the domains where each module reset gets its own copy of the
+  /// final release flop, on ECP5 and openXC7. Synthesis keeps each copy, so
+  /// the reset fanout splits per module. A simulation target ignores them.
+  /// Another target throws, and [buildFabric] throws for a name with no
+  /// domain.
+  final Set<String> localResetDomains;
+
+  Logic _localReset(HarborClockDomain? domain, Logic fallback, String name) {
+    final t = target;
+    if (domain == null ||
+        !localResetDomains.contains(domain.config.name) ||
+        t is! HarborFpgaTarget ||
+        (t.vendor != HarborFpgaVendor.ecp5 &&
+            t.vendor != HarborFpgaVendor.openXc7)) {
+      return fallback;
+    }
+    final taps = _clockGen.resetBranchSource(domain);
+    if (taps == null) return fallback;
+    final branch = addSubModule(HarborRegisteredResetBranch(name: name));
+    branch.input('clk').srcConnection! <= domain.clk;
+    branch.input('reset_assert').srcConnection! <= taps.hold;
+    branch.input('release_in').srcConnection! <= taps.release;
+    return branch.output('reset_out');
+  }
+
   bool _fabricBuilt = false;
 
   /// Creates a new SoC.
@@ -499,9 +525,23 @@ class HarborSoC extends BridgeModule {
     List<HarborClockConfig> clocks = const [],
     XilinxDdr3TreeSpec? xilinxDdr3Tree,
     this.fabricClockDomain,
+    this.localResetDomains = const {},
   }) : model = model ?? name,
        _explicitModel = model,
        super(name, name: name) {
+    final t = target;
+    if (localResetDomains.isNotEmpty &&
+        t != null &&
+        t is! HarborSimTarget &&
+        !(t is HarborFpgaTarget &&
+            (t.vendor == HarborFpgaVendor.ecp5 ||
+                t.vendor == HarborFpgaVendor.openXc7))) {
+      throw ArgumentError.value(
+        localResetDomains,
+        'localResetDomains',
+        'local reset flops are for ECP5 and openXC7 targets, not ${t.name}',
+      );
+    }
     if (exclusiveSlotBudget < 1) {
       throw ArgumentError.value(
         exclusiveSlotBudget,
@@ -981,6 +1021,13 @@ class HarborSoC extends BridgeModule {
   /// Returns null if no domain with that name exists. Falls back to
   /// the raw `clk`/`reset` inputs if no domains were configured.
   HarborClockDomain? clockDomain(String name) => _clockDomains[name];
+
+  /// The inputs of a [HarborRegisteredResetBranch] for the domain [name], or
+  /// null when there is no such domain.
+  ({Logic hold, Logic release})? resetBranchSource(String name) {
+    final domain = _clockDomains[name];
+    return domain == null ? null : _clockGen.resetBranchSource(domain);
+  }
 
   /// The default clock and reset signals.
   ///
@@ -1500,6 +1547,15 @@ class HarborSoC extends BridgeModule {
   }) {
     _fabricBuilt = true;
     _fabricDomain; // throws when fabricClockDomain names no domain
+    final unknown = localResetDomains.where(
+      (n) => !_clockDomains.containsKey(n),
+    );
+    if (unknown.isNotEmpty) {
+      throw StateError(
+        'localResetDomains names ${unknown.join(', ')}, but $name has no '
+        'clock domain with that name.',
+      );
+    }
     final errors = validate();
     if (errors.isNotEmpty) {
       throw StateError('Validation errors in $name:\n${errors.join("\n")}');
@@ -1760,7 +1816,7 @@ class HarborSoC extends BridgeModule {
         kind: fabricKind,
         topology: topology,
         clk: clk,
-        reset: reset,
+        reset: _localReset(_fabricDomain, reset, '${name}_reset_branch'),
         masters: ms,
         slaves: ss,
         wishboneBurstBeats: burstBeats,
@@ -2000,7 +2056,8 @@ class HarborSoC extends BridgeModule {
     if (!_fabricWired.add(module)) return;
     final (clk, reset) = defaultClock;
     module.input(BusSlavePort.fabricClkPort).srcConnection! <= clk;
-    module.input(BusSlavePort.fabricResetPort).srcConnection! <= reset;
+    module.input(BusSlavePort.fabricResetPort).srcConnection! <=
+        _localReset(_fabricDomain, reset, '${module.name}_fabric_reset_branch');
   }
 
   // True when [fabricClk], the fabric clock a port crosses to, is the

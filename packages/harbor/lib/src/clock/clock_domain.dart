@@ -330,6 +330,12 @@ class HarborClockGenerator {
 
   final List<HarborClockDomain> _domains = [];
   final Map<Logic, Logic> _hardResets = {};
+  final Map<Logic, ({Logic hold, Logic release})> _resetBranchSources = {};
+
+  /// The inputs of a [HarborRegisteredResetBranch] for [domain]: the
+  /// immediate reset source and the stage before the final release flop.
+  ({Logic hold, Logic release})? resetBranchSource(HarborClockDomain domain) =>
+      _resetBranchSources[domain.reset];
 
   HarborClockGenerator({
     required this.parent,
@@ -371,7 +377,9 @@ class HarborClockGenerator {
     Sequential(domClk, reset: assertSrc, [
       pipe < [pipe[0], Const(1)].concat(),
     ]);
-    return (assertSrc | ~pipe[1]).named('${name}Reset');
+    final result = (assertSrc | ~pipe[1]).named('${name}Reset');
+    _resetBranchSources[result] = (hold: assertSrc, release: pipe[0]);
+    return result;
   }
 
   /// Creates a clock domain.
@@ -1599,4 +1607,22 @@ Ecp5Ddr3Clocks buildEcp5Ddr3ClockTree(
     controllerClkMhz: sol.fout / 1.0e6 / 4,
     vcoMhz: sol.vco / 1.0e6,
   );
+}
+
+/// A local copy of the final release flop of a domain reset. The reset
+/// asserts immediately. The stage before it is shared, so all copies
+/// release on the same clock edge.
+class HarborRegisteredResetBranch extends BridgeModule
+    implements HarborPreserveRegisters {
+  HarborRegisteredResetBranch({required super.name})
+    : super('HarborRegisteredResetBranch') {
+    createPort('clk', PortDirection.input);
+    createPort('reset_assert', PortDirection.input);
+    createPort('release_in', PortDirection.input);
+    final released = Logic(name: 'released');
+    Sequential(input('clk'), reset: input('reset_assert'), [
+      released < input('release_in'),
+    ]);
+    addOutput('reset_out') <= input('reset_assert') | ~released;
+  }
 }
