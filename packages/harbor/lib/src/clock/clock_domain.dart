@@ -323,6 +323,11 @@ class HarborClockGenerator {
   /// request is not in [hardResetOf].
   final Logic? softReset;
 
+  /// The global-buffered copy of [inputClk], or null for none. A domain that
+  /// passes the input clock through runs on this net when it is set. The Xilinx
+  /// SoC sets it, since a clock from a pad needs a BUFG there.
+  Logic? bufferedInputClk;
+
   final List<HarborClockDomain> _domains = [];
   final Map<Logic, Logic> _hardResets = {};
 
@@ -428,11 +433,12 @@ class HarborClockGenerator {
     HarborClockConfig config, {
     bool namePllClock = false,
   }) {
+    final passClk = bufferedInputClk ?? inputClk;
     if (config.isPrimary) {
       final domain = HarborClockDomain(
         config: config,
-        clk: inputClk,
-        reset: _domainReset(inputClk, inputReset, config.name),
+        clk: passClk,
+        reset: _domainReset(passClk, inputReset, config.name),
       );
       _domains.add(domain);
       return domain;
@@ -453,8 +459,8 @@ class HarborClockGenerator {
     if (config.frequency == sourceFreq && !config.forcePll) {
       final domain = HarborClockDomain(
         config: config,
-        clk: inputClk,
-        reset: _domainReset(inputClk, inputReset, config.name),
+        clk: passClk,
+        reset: _domainReset(passClk, inputReset, config.name),
       );
       _domains.add(domain);
       return domain;
