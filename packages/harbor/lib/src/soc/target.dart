@@ -5,6 +5,23 @@ import '../pdk/klayout.dart';
 import '../pdk/pdk_provider.dart';
 import '../pdk/standard_cell_library.dart';
 
+/// Marks a module whose registers must stay separate after flattening.
+///
+/// The module must reserve its definition name, so that the name in the
+/// output is the name the script uses. The FPGA synthesis script keeps its
+/// flops. The module stays portable ROHD.
+abstract interface class HarborPreserveRegisters {}
+
+/// A memory whose read register can go into target block RAM.
+///
+/// The register can be in the consumer. The module must reserve its
+/// definition name, so that the name in the output is the name the script
+/// uses, and contain only memories that accept a synchronous read.
+/// This is a synthesis preference. It does not change the simulated timing.
+abstract interface class HarborPreferBlockRam {
+  bool get preferBlockRam;
+}
+
 /// Build target describing whether the SoC targets an FPGA or ASIC,
 /// and which vendor/PDK to use.
 ///
@@ -533,7 +550,15 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   ///
   /// Produces a JSON netlist for nextpnr (iCE40/ECP5) or a
   /// Verilog netlist for Vivado/openXC7.
-  String generateYosysTcl(String topCell, {List<String> svFiles = const []}) {
+  ///
+  /// [blockRamModules] and [preserveRegisterModules] are definition names of
+  /// [HarborPreferBlockRam] and [HarborPreserveRegisters] modules.
+  String generateYosysTcl(
+    String topCell, {
+    List<String> svFiles = const [],
+    List<String> preserveRegisterModules = const [],
+    List<String> blockRamModules = const [],
+  }) {
     final buf = StringBuffer();
     buf.writeln('# Auto-generated Yosys synthesis for $name');
     buf.writeln('# Target: ${_yosysSynthTarget} ($device)');
@@ -546,6 +571,27 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       buf.writeln('read_verilog -sv rtl/*.sv');
     }
     buf.writeln('hierarchy -top $topCell');
+
+    // Set the attributes before flatten removes the module names. Yosys
+    // then moves the read register into the block RAM.
+    final ident = RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$');
+    for (final module in blockRamModules.toSet()) {
+      if (!ident.hasMatch(module)) {
+        throw ArgumentError.value(module, 'blockRamModules');
+      }
+      buf.writeln('select -assert-any $module/m:*');
+      buf.writeln('setattr -set ram_style "block" $module/m:*');
+    }
+    for (final module in preserveRegisterModules.toSet()) {
+      if (!ident.hasMatch(module)) {
+        throw ArgumentError.value(module, 'preserveRegisterModules');
+      }
+      // opt_merge reads the keep flag of the cell, not of its output wire.
+      buf.writeln('select -assert-any $module');
+      buf.writeln('proc $module');
+      buf.writeln('select -assert-any $module/t:\$*ff*');
+      buf.writeln('setattr -set keep 1 $module/t:\$*ff*');
+    }
 
     switch (vendor) {
       case HarborFpgaVendor.ice40:

@@ -2531,9 +2531,15 @@ class HarborSoC extends BridgeModule {
                     .toList()
                   ..sort())
               : <String>[];
-          File(
-            '$path/synth.tcl',
-          ).writeAsStringSync(t.generateYosysTcl(name, svFiles: svFiles));
+          final marks = harborSynthesisMarks(this);
+          File('$path/synth.tcl').writeAsStringSync(
+            t.generateYosysTcl(
+              name,
+              svFiles: svFiles,
+              blockRamModules: marks.blockRam,
+              preserveRegisterModules: marks.preserve,
+            ),
+          );
           final providedClocks = _peripheralClockMhz();
           final pllClocks = {
             if (_xilinxPassthroughMhz != null && !_hasDdr3ClockTree)
@@ -2906,4 +2912,33 @@ class _MasterEntry {
     this.targetRanges,
     this.burstRanges,
   });
+}
+
+/// The definition names of the [HarborPreferBlockRam] modules that prefer
+/// block RAM and of the [HarborPreserveRegisters] modules under the built
+/// module [top]. The synthesis script finds a module by this name, so a
+/// marked module must reserve its definition name. Otherwise this throws.
+({List<String> blockRam, List<String> preserve}) harborSynthesisMarks(
+  Module top,
+) {
+  final blockRam = <String>{};
+  final preserve = <String>{};
+  void walk(Module m) {
+    final ram = m is HarborPreferBlockRam;
+    final keep = m is HarborPreserveRegisters;
+    if ((ram || keep) && !m.reserveDefinitionName) {
+      throw StateError(
+        '${m.name} is marked for synthesis but does not reserve its '
+        'definition name ${m.definitionName}, so the script cannot find it.',
+      );
+    }
+    if (ram && (m as HarborPreferBlockRam).preferBlockRam) {
+      blockRam.add(m.definitionName);
+    }
+    if (keep) preserve.add(m.definitionName);
+    m.subModules.forEach(walk);
+  }
+
+  walk(top);
+  return (blockRam: blockRam.toList(), preserve: preserve.toList());
 }

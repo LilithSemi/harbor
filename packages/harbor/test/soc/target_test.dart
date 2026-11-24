@@ -1,4 +1,5 @@
 import 'package:harbor/harbor.dart';
+import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -106,6 +107,42 @@ void main() {
 
     test('hasEfuse is true', () {
       expect(target.hasEfuse, isTrue);
+    });
+
+    test('generateYosysTcl marks modules before synthesis', () {
+      final lines = target
+          .generateYosysTcl(
+            'Top',
+            blockRamModules: ['Ram', 'Ram'],
+            preserveRegisterModules: ['Keep'],
+          )
+          .split('\n');
+      final marks = [
+        'select -assert-any Ram/m:*',
+        'setattr -set ram_style "block" Ram/m:*',
+        'select -assert-any Keep',
+        'proc Keep',
+        r'select -assert-any Keep/t:$*ff*',
+        r'setattr -set keep 1 Keep/t:$*ff*',
+      ];
+      final at = lines.indexOf('hierarchy -top Top');
+      expect(lines.sublist(at + 1, at + 1 + marks.length), equals(marks));
+      expect(lines.where((l) => l.startsWith('synth_')).single, isNotNull);
+      expect(
+        lines.indexWhere((l) => l.startsWith('synth_')),
+        greaterThan(at + marks.length),
+      );
+    });
+
+    test('generateYosysTcl refuses a module name that is not plain', () {
+      expect(
+        () => target.generateYosysTcl('Top', blockRamModules: ['a b']),
+        throwsArgumentError,
+      );
+      expect(
+        () => target.generateYosysTcl('Top', preserveRegisterModules: ['a;b']),
+        throwsArgumentError,
+      );
     });
   });
 
@@ -1013,6 +1050,85 @@ void main() {
       expect(HarborFpgaVendor.values, contains(HarborFpgaVendor.openXc7));
     });
   });
+
+  group('harborSynthesisMarks', () {
+    tearDown(Simulator.reset);
+
+    test('gives the reserved names of marked modules', () async {
+      final top = _Top([
+        (c) => _Keep(c, 'KeepA', reserve: true),
+        (c) => _Keep(c, 'KeepA', reserve: true),
+        (c) => _Ram(c, 'RamA', prefer: true),
+        (c) => _Ram(c, 'RamB', prefer: false),
+      ]);
+      await top.build();
+      final marks = harborSynthesisMarks(top);
+      expect(marks.preserve, ['KeepA']);
+      expect(marks.blockRam, ['RamA']);
+    });
+
+    test('a marked module that does not reserve its name throws', () async {
+      final top = _Top([(c) => _Keep(c, 'KeepB', reserve: false)]);
+      await top.build();
+      expect(
+        () => harborSynthesisMarks(top),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('KeepB'),
+          ),
+        ),
+      );
+    });
+
+    test('two different marked modules cannot share a name', () async {
+      final top = _Top([
+        (c) => _Keep(c, 'KeepC', reserve: true),
+        (c) => _Keep(c, 'KeepC', reserve: true, width: 2),
+      ]);
+      await top.build();
+      expect(
+        () => SynthBuilder(top, SystemVerilogSynthesizer()),
+        throwsA(predicate((e) => e.toString().contains('KeepC'))),
+      );
+    });
+  });
+}
+
+class _Keep extends Module implements HarborPreserveRegisters {
+  _Keep(
+    Logic clk,
+    String definitionName, {
+    required bool reserve,
+    int width = 1,
+  }) : super(definitionName: definitionName, reserveDefinitionName: reserve) {
+    final d = addInput('d', clk.replicate(width), width: width);
+    clk = addInput('clk', clk);
+    final q = addOutput('q', width: width);
+    Sequential(clk, [q < d]);
+  }
+}
+
+class _Ram extends Module implements HarborPreferBlockRam {
+  @override
+  final bool preferBlockRam;
+
+  _Ram(Logic clk, String definitionName, {required bool prefer})
+    : preferBlockRam = prefer,
+      super(definitionName: definitionName, reserveDefinitionName: true) {
+    addOutput('q') <= ~addInput('d', clk);
+  }
+}
+
+class _Top extends Module {
+  _Top(List<Module Function(Logic)> parts) : super(definitionName: 'Top') {
+    final clk = addInput('clk', Logic());
+    for (final (i, part) in parts.indexed) {
+      final m = part(clk);
+      addOutput('o$i', width: m.output('q').width) <= m.output('q');
+    }
+  }
 }
 
 class _BareCellProvider extends PdkProvider {
