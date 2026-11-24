@@ -250,6 +250,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
   /// Unused when no master is real-time.
   final int realtimeBurstCap;
 
+  /// The register stages of this fabric.
+  final HarborFabricPipeline pipeline;
+
   HarborAxi4Fabric({
     required this.topology,
     required Logic clk,
@@ -257,6 +260,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required this.masters,
     required this.slaves,
     this.realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
+    this.pipeline = HarborFabricPipeline.balanced,
     super.name = 'fabric',
   }) : super(
          definitionName: _definitionName(

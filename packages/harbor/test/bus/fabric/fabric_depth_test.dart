@@ -1,0 +1,308 @@
+import 'package:harbor/harbor.dart';
+import 'package:harbor/src/bus/port/reg_fifo.dart' show HarborFifoRam;
+import 'package:rohd/rohd.dart';
+import 'package:test/test.dart';
+
+import 'axi4_fabric_harness.dart';
+
+// Flops in front of and behind [body], so the walk sees one path.
+class _Tiny extends Module {
+  _Tiny(int width, int count, Logic Function(Logic clk, List<Logic>) body)
+    : super(name: 'tiny') {
+    final clk = addInput('clk', Logic());
+    final ins = [
+      for (var i = 0; i < count; i++)
+        flop(clk, addInput('i$i', Logic(width: width), width: width)),
+    ];
+    final out = body(clk, ins);
+    addOutput('o', width: out.width) <= flop(clk, out);
+  }
+}
+
+class _Inner extends Module {
+  Logic get out => output('out');
+
+  _Inner(Logic c, Logic a, Logic b) : super(name: 'inner') {
+    c = addInput('c', c);
+    a = addInput('a', a);
+    b = addInput('b', b);
+    addOutput('out') <= mux(c, a, b);
+  }
+}
+
+HarborFifoRam _ram(Logic clk, Logic wrData, Logic rdAddr) => HarborFifoRam(
+  name: 'ram',
+  clk: clk,
+  wrEn: Logic()..put(1),
+  wrAddr: Const(0, width: rdAddr.width),
+  wrData: wrData,
+  rdAddr: rdAddr,
+  depth: 1 << rdAddr.width,
+  zeroInit: true,
+);
+
+Future<int> _depth(
+  int width,
+  int count,
+  Logic Function(Logic clk, List<Logic>) body,
+) async {
+  final m = _Tiny(width, count, body);
+  await m.build();
+  return harborWorstDepth(m).levels;
+}
+
+// Seven masters and seventeen targets as on the KC705: s0 has a second read
+// channel, the even targets remap IDs, m6 is real-time, so bursts split.
+final _kc705Masters = [
+  for (var i = 0; i < 7; i++)
+    MasterCfg('m$i', 4, 4, realtime: i == 6, readChannel: i < 2 ? 1 : null),
+];
+final _kc705Slaves = [
+  const SlaveCfg('s0', 4, 8, 0x00000, 0x10000, readChannels: 2),
+  for (var i = 1; i < 17; i++)
+    SlaveCfg(
+      's$i',
+      i.isEven ? 1 : 8,
+      i > 12 ? 1 : 2,
+      0x10000 + i * 0x4000,
+      0x4000,
+      lite: i > 12,
+    ),
+];
+
+final _configs = {
+  'kc705': (_kc705Masters, _kc705Slaves),
+  '2x3': (masters3.sublist(0, 2), slaves3),
+};
+
+// The compact worst depth per config and topology. A change in the fabric
+// or the model must update it.
+const _compact = {
+  ('kc705', HarborFabricTopology.shared): 23,
+  ('kc705', HarborFabricTopology.crossbar): 21,
+  ('2x3', HarborFabricTopology.shared): 16,
+  ('2x3', HarborFabricTopology.crossbar): 15,
+};
+
+const _budget = {
+  HarborFabricPipeline.balanced: 10,
+  HarborFabricPipeline.fast: 6,
+};
+
+Future<HarborDepthPath> _fabricDepth(
+  String config,
+  HarborFabricTopology t,
+  HarborFabricPipeline p,
+) async {
+  final (masters, slaves) = _configs[config]!;
+  final shell = FabricShell(t, masters: masters, slaves: slaves, pipeline: p);
+  await shell.build();
+  return harborWorstDepth(shell.fabric);
+}
+
+void main() {
+  group('cost model', () {
+    test('a 7-input AND is 2', () async {
+      expect(await _depth(1, 7, (_, i) => i.reduce((a, b) => a & b)), 2);
+      expect(await _depth(1, 7, (_, i) => i.concat().and()), 2);
+    });
+
+    test('a flop to flop wire is 0', () async {
+      expect(await _depth(8, 1, (_, i) => i.first), 0);
+    });
+
+    test('a 32-bit adder is 3', () async {
+      expect(await _depth(32, 2, (_, i) => i[0] + i[1]), 3);
+    });
+
+    test('a counter with four 1-bit steps is one 5-operand adder', () async {
+      expect(
+        await _depth(
+          4,
+          5,
+          (_, i) =>
+              i[0] +
+              i[1].getRange(0, 1).zeroExtend(4) +
+              i[2].getRange(0, 1).zeroExtend(4) -
+              i[3].getRange(0, 1).zeroExtend(4) -
+              i[4].getRange(0, 1).zeroExtend(4),
+        ),
+        3,
+      );
+    });
+
+    test('an add result used twice is not collapsed', () async {
+      expect(
+        await _depth(4, 3, (_, i) {
+          final ab = i[0] + i[1];
+          return (ab + i[2]) ^ ab;
+        }),
+        5,
+      );
+    });
+
+    test('two chained 2:1 muxes are 2', () async {
+      expect(
+        await _depth(1, 5, (_, i) => mux(i[0], mux(i[1], i[2], i[3]), i[4])),
+        2,
+      );
+    });
+
+    test('a 17-bit equality is 2', () async {
+      expect(await _depth(17, 2, (_, i) => i[0].eq(i[1])), 2);
+    });
+
+    test('a path through a flop stops', () async {
+      expect(await _depth(1, 3, (clk, i) => flop(clk, i[0] & i[1]) & i[2]), 1);
+    });
+
+    test('a slice of the shallow field of a bus stays shallow', () async {
+      expect(
+        await _depth(
+          8,
+          3,
+          (_, i) => [i[0] + i[1], i[2]].concat().getRange(0, 8),
+        ),
+        0,
+      );
+      expect(
+        await _depth(8, 3, (_, i) => [i[0] + i[1], i[2]].concat().getRange(8)),
+        2,
+      );
+    });
+
+    test('a RAM read goes from its address to its data', () async {
+      expect(
+        await _depth(4, 3, (clk, i) {
+          final ram = _ram(clk, i[0], i[1]);
+          return ram.rdData & i[2];
+        }),
+        2,
+      );
+    });
+
+    test('a RAM write ends a path', () async {
+      final m = _Tiny(32, 3, (clk, i) {
+        final ram = _ram(clk, i[0] + i[1], i[2].getRange(0, 4));
+        return ram.rdData;
+      });
+      await m.build();
+      final p = harborWorstDepth(m);
+      expect(p.levels, 3);
+      expect(p.signals.last.parentModule, isA<HarborFifoRam>());
+    });
+
+    test('a path crosses a submodule boundary', () async {
+      expect(
+        await _depth(
+          1,
+          5,
+          (_, i) => mux(i[3], _Inner(i[0], i[1], i[2]).out, i[4]),
+        ),
+        2,
+      );
+    });
+
+    test('an If and else Combinational is a 2:1 mux', () async {
+      expect(
+        await _depth(1, 5, (_, i) {
+          final o = Logic();
+          Combinational([
+            If(i[0], then: [o < i[1]], orElse: [o < i[2]]),
+          ]);
+          return mux(i[3], o, i[4]);
+        }),
+        2,
+      );
+    });
+
+    test('another Combinational shape throws', () async {
+      expect(
+        () => _depth(1, 3, (_, i) {
+          final o = Logic();
+          Combinational([
+            o < i[2],
+            If(i[0], then: [o < i[1]]),
+          ]);
+          return o;
+        }),
+        throwsA(
+          isA<UnsupportedError>().having(
+            (e) => e.message,
+            'message',
+            contains('Combinational'),
+          ),
+        ),
+      );
+    });
+
+    test('a NOT costs 0', () async {
+      expect(await _depth(1, 2, (_, i) => ~(~i[0] & i[1])), 1);
+    });
+
+    test('an unknown leaf throws with its type', () async {
+      expect(
+        () => _depth(8, 2, (_, i) => i[0] * i[1]),
+        throwsA(
+          isA<UnsupportedError>().having(
+            (e) => e.message,
+            'message',
+            contains('Multiply'),
+          ),
+        ),
+      );
+    });
+
+    test('the path names its signals from start to end', () async {
+      final m = _Tiny(1, 3, (_, i) => (i[0] & i[1]).named('both') | i[2]);
+      await m.build();
+      final p = harborWorstDepth(m);
+      expect(p.levels, 1);
+      expect(p.signals.last.parentModule, isA<Sequential>());
+    });
+  });
+
+  for (final config in _configs.keys) {
+    for (final t in HarborFabricTopology.values) {
+      group('$config ${t.name}', () {
+        test('compact keeps its recorded depth', () async {
+          final p = await _fabricDepth(config, t, HarborFabricPipeline.compact);
+          printOnFailure('$p');
+          expect(p.levels, _compact[(config, t)]);
+        });
+
+        for (final MapEntry(key: level, value: budget) in _budget.entries) {
+          test('${level.name} fits $budget levels', () async {
+            final p = await _fabricDepth(config, t, level);
+            printOnFailure('$p');
+            expect(p.levels, lessThanOrEqualTo(budget));
+          }, skip: 'level not built yet');
+        }
+      });
+    }
+  }
+
+  // Glacier routed 14 to 20 LUT levels on the compact KC705 fabric.
+  test('the model gives the KC705 compact fabric 14 levels or more', () async {
+    final p = await _fabricDepth(
+      'kc705',
+      HarborFabricTopology.shared,
+      HarborFabricPipeline.compact,
+    );
+    printOnFailure('$p');
+    expect(p.levels, greaterThanOrEqualTo(14));
+  });
+
+  test('pathCyclesOf counts 5 AXI4 stages at each level', () {
+    for (final p in HarborFabricPipeline.values) {
+      expect(
+        HarborFabric.pathCyclesOf(
+          kind: HarborFabricKind.axi4,
+          pipeline: p,
+          memoryPorts: 0,
+        ),
+        5,
+      );
+    }
+  });
+}

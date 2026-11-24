@@ -139,6 +139,7 @@ class FabricShell extends BridgeModule {
     List<MasterCfg> masters = masters3,
     List<SlaveCfg> slaves = slaves3,
     int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
+    HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
   }) : super('FabricTestShell_${topology.name}', name: 'shell') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
@@ -197,6 +198,7 @@ class FabricShell extends BridgeModule {
       masters: ms,
       slaves: ss,
       realtimeBurstCap: realtimeBurstCap,
+      pipeline: pipeline,
     );
     createPort('bus_error', PortDirection.output);
     output('bus_error') <= fabric.busError;

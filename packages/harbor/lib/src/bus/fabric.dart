@@ -24,6 +24,21 @@ enum HarborFabricTopology {
   crossbar,
 }
 
+/// The register stages of an AXI4 fabric. More stages give a shorter
+/// combinational path and a higher bus clock, for more latency and area.
+/// Wishbone and TileLink fabrics ignore it. At this time, each level builds
+/// the [compact] fabric.
+enum HarborFabricPipeline {
+  /// The fewest stages, for a small device.
+  compact,
+
+  /// A register at each master head, and at the read port of each CDC FIFO.
+  balanced,
+
+  /// Arbitration, responses and write data from registers only.
+  fast,
+}
+
 /// A master on a fabric. [interface] is the native port of the master
 /// device, for example an `Axi4Interface` on an AXI4 fabric.
 ///
@@ -240,6 +255,9 @@ abstract final class HarborFabric {
   /// - TileLink: a message cannot be cut, so the cap does not apply. A
   ///   real-time message waits for the message that holds the target. The
   ///   largest message of the other masters sets the bound.
+  ///
+  /// [pipeline] sets the register stages of an AXI4 fabric. Wishbone and
+  /// TileLink fabrics ignore it.
   static HarborFabricModule build({
     required HarborFabricKind kind,
     required HarborFabricTopology topology,
@@ -250,6 +268,7 @@ abstract final class HarborFabric {
     int wishboneBurstBeats = 8,
     int? maxGrantCycles = harborDefaultWishboneGrantCap,
     int realtimeBurstCap = defaultRealtimeBurstCap,
+    HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
     String name = 'fabric',
   }) {
     if (realtimeBurstCap < 1) {
@@ -284,6 +303,7 @@ abstract final class HarborFabric {
           masters: masters,
           slaves: slaves,
           realtimeBurstCap: realtimeBurstCap,
+          pipeline: pipeline,
           name: name,
         );
       case HarborFabricKind.tilelink:
@@ -472,8 +492,10 @@ abstract final class HarborFabric {
   ///   `pipeline`). Each costs 2 cycles.
   /// - [cdcCycles] is the latency of each clock crossing on the path, from
   ///   its own documentation.
+  /// - [pipeline] is the [HarborFabricPipeline] of an AXI4 fabric.
   static int pathCyclesOf({
     required HarborFabricKind kind,
+    HarborFabricPipeline pipeline = HarborFabricPipeline.balanced,
     int fabrics = 1,
     int memoryPorts = 1,
     int registerStages = 0,

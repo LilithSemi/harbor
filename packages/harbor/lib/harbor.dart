@@ -38,6 +38,7 @@ export 'src/pipeline/stage.dart';
 // Bus
 export 'src/bus/bus_exports.dart';
 export 'src/bus/fabric.dart';
+export 'src/bus/fabric_depth.dart';
 
 // Cache
 export 'src/cache/cache_config.dart';
