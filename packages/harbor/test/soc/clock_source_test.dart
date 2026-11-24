@@ -158,20 +158,32 @@ void main() {
       soc.input('clk').srcConnection! <= clk;
       soc.input('clk_n').srcConnection! <= Logic();
       await soc.build();
-      // The tree is a black box in sim, so the test drives its outputs.
-      // The lock timer starts at 0 on an FPGA (INIT=0).
-      soc.signals.firstWhere((s) => s.name == 'bus_provLockCnt').put(0);
+      // The tree and the board clock pad are black boxes in sim, so the test
+      // drives them. The lock timer and the power-on counter start at 0 on an
+      // FPGA (INIT=0).
+      final pad = soc.subModules
+          .firstWhere((m) => m.name == 'sysclk_ibufds')
+          .output('O');
+      final initial = soc.signals.where(
+        (s) => s.name == 'bus_provLockCnt' || s.name == 'porCount',
+      );
       tree.locked.put(0);
       final seen = <String, LogicValue>{};
-      for (var t = 0; t < 200; t++) {
+      for (var t = 0; t < 400; t++) {
         Simulator.registerAction(t * 6, () {
+          if (t == 2) {
+            for (final s in initial) {
+              s.put(0);
+            }
+          }
+          pad.put(t > 4 && t.isOdd ? 1 : 0);
           tree.controllerClk.put(t.isEven ? 1 : 0);
-          if (t == 100) tree.locked.put(1);
-          if (t == 90) seen['before'] = d.reset.value;
-          if (t == 150) seen['after'] = d.reset.value;
+          if (t == 300) tree.locked.put(1);
+          if (t == 290) seen['before'] = d.reset.value;
+          if (t == 350) seen['after'] = d.reset.value;
         });
       }
-      Simulator.setMaxSimTime(2000);
+      Simulator.setMaxSimTime(4000);
       await Simulator.run();
       expect(seen['before'], LogicValue.one);
       expect(seen['after'], LogicValue.zero);

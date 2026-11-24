@@ -737,6 +737,7 @@ class HarborSoC extends BridgeModule {
           clkConfig,
           coreClk,
           locked: combinedLocked,
+          hardReset: _hardReset,
         );
         continue;
       }
@@ -824,6 +825,7 @@ class HarborSoC extends BridgeModule {
       config,
       tree.controllerClk,
       locked: tree.locked,
+      hardReset: _hardReset,
     );
   }
 
