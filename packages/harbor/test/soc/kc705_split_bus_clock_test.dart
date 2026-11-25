@@ -51,11 +51,14 @@ const _busClock = HarborClockConfig(
 Future<Directory> _generate({
   required bool useHimbaechel,
   required bool ddr,
+  bool netDomain = false,
+  Map<String, String> extraConstraints = const {},
 }) async {
   final target = HarborBoard.get('kc705').fpgaTarget(
     pins: ddr ? null : ['clk', 'clk_n', 'uart_tx', 'uart_rx'],
     useHimbaechel: useHimbaechel,
     extraPins: ddr ? _ddrExtra : const {},
+    extraConstraints: extraConstraints,
   );
   final soc = HarborSoC(
     name: 'SplitBus',
@@ -66,6 +69,18 @@ Future<Directory> _generate({
     clocks: const [_coreClock, _busClock],
     xilinxDdr3Tree: const XilinxDdr3TreeSpec.kc705(coreClkHz: 50000000),
   );
+  if (netDomain) {
+    final buf = soc.addSubModule(XilinxBufg(name: 'ext_bufg'));
+    buf.input('I').srcConnection! <= soc.boardClk;
+    soc.addClockDomainFromNet(
+      HarborClockConfig.fixed(
+        name: 'ext',
+        frequency: 200000000,
+        sourceFrequency: 200000000,
+      ),
+      buf.output('O').named('ext_clk'),
+    );
+  }
   if (ddr) {
     final tree = soc.xilinxDdr3Clocks!;
     final shape = soc.memoryBusShape();
@@ -118,18 +133,24 @@ void main() {
       final dir = await _generate(useHimbaechel: true, ddr: ddr);
       addTearDown(() => dir.deleteSync(recursive: true));
       final xdc = _read(dir, 'SplitBus.xdc');
-      expect(xdc, contains('create_clock -period 12.000 [get_nets bus_clk]'));
+      final py = ddr ? _read(dir, 'support/nextpnr/clocks.py') : '';
       expect(xdc, isNot(contains('dst_clk')));
       expect(
         _read(dir, 'rtl/SplitBus.sv'),
         contains('(* keep = 1 *) logic bus_clk;'),
       );
+      // One constraint for the net, from clocks.py when it is written.
+      final inXdc = RegExp(r'create_clock .*\[get_nets bus_clk\]');
+      final inPy = RegExp(r"\('bus_clk', [0-9.]+\)");
+      expect(
+        inXdc.allMatches(xdc).length + inPy.allMatches(py).length,
+        1,
+        reason: '$xdc\n$py',
+      );
       if (ddr) {
-        expect(
-          _read(dir, 'support/nextpnr/clocks.py'),
-          contains("('bus_clk', 83.33)"),
-        );
+        expect(py, contains("('bus_clk', 83.33)"));
       } else {
+        expect(xdc, contains('create_clock -period 12.000 [get_nets bus_clk]'));
         expect(
           xdc,
           contains('create_clock -period 20.000 [get_nets core_clk]'),
@@ -151,6 +172,46 @@ void main() {
     );
   });
 
+  test('himbaechel refuses a net clock domain with no constraint', () {
+    expect(
+      _generate(useHimbaechel: true, ddr: false, netDomain: true),
+      throwsA(
+        isA<StateError>().having(
+          (e) => e.message,
+          'message',
+          allOf(contains('"ext"'), contains('ext_clk')),
+        ),
+      ),
+    );
+  });
+
+  test('himbaechel takes a net clock domain the caller constrains', () async {
+    final dir = await _generate(
+      useHimbaechel: true,
+      ddr: false,
+      netDomain: true,
+      extraConstraints: const {
+        'ext_clk': 'create_clock -period 5.000 [get_nets ext_clk]',
+      },
+    );
+    addTearDown(() => dir.deleteSync(recursive: true));
+    expect(
+      _read(dir, 'SplitBus.xdc'),
+      contains('create_clock -period 5.000 [get_nets ext_clk]'),
+    );
+  });
+
+  test('the XDC clock nets come from its create_clock lines', () {
+    expect(
+      harborXdcClockNets(
+        'create_clock -period 5.000 [get_ports clk]\n'
+        'set_property -dict {PACKAGE_PIN A1} [get_ports x]\n'
+        'create_clock -name p -period 8.000 [get_nets a.b.pclk]\n',
+      ),
+      {'clk', 'a.b.pclk'},
+    );
+  });
+
   test('a clock net with no constraint stops the build', () {
     expect(
       () => harborCheckClockNets(
@@ -166,5 +227,6 @@ void main() {
       ),
     );
     harborCheckClockNets({'bus': 'bus_clk'}, {'bus_clk'});
+    harborCheckClockNets({'pipe': 'pclk'}, {'pcie.phy.pclk'});
   });
 }

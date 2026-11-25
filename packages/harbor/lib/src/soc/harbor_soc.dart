@@ -40,16 +40,31 @@ import 'graph.dart';
 import 'svd.dart';
 import 'target.dart';
 
+/// The nets and ports that the `create_clock` lines of [xdc] constrain.
+@visibleForTesting
+Set<String> harborXdcClockNets(String xdc) => {
+  for (final m in RegExp(
+    r'^\s*create_clock\b[^\[\n]*\[get_(?:nets|ports)\s+\{?([^\]\}\s]+)',
+    multiLine: true,
+  ).allMatches(xdc))
+    m.group(1)!,
+};
+
 /// Throws when a clock net in [netByDomain], keyed by domain name, is not in
-/// [constrained]. nextpnr gives such a net a 12 MHz default target and does
-/// not fail.
+/// [constrained]. A hierarchical name in [constrained] also matches its last
+/// part. nextpnr gives a net with no constraint a 12 MHz default target and
+/// does not fail.
 @visibleForTesting
 void harborCheckClockNets(
   Map<String, String> netByDomain,
   Set<String> constrained,
 ) {
+  final names = {
+    ...constrained,
+    for (final c in constrained) c.split(RegExp('[./]')).last,
+  };
   for (final MapEntry(key: domain, value: net) in netByDomain.entries) {
-    if (constrained.contains(net)) continue;
+    if (names.contains(net)) continue;
     throw StateError(
       'Clock domain "$domain" runs on net $net, which has no clock '
       'constraint. nextpnr would time it at its 12 MHz default.',
@@ -403,11 +418,6 @@ class HarborSoC extends BridgeModule {
 
   /// Domain name to clock net for each domain on a Harbor PLL or MMCM.
   final Map<String, String> _domainClockNet = {};
-
-  /// Names of the domains from [addClockDomainFromNet]. Their caller
-  /// constrains the net.
-  final Set<String> _netClockDomains = {};
-
   final String acpiOemId;
   final String acpiOemTableId;
 
@@ -821,6 +831,7 @@ class HarborSoC extends BridgeModule {
   /// The rate of [config] must be the real rate of [clk], since the device
   /// tree reads it. This adds no timing constraint: the caller must constrain
   /// the net, or the module that makes it must be a [HarborClockRateProvider].
+  /// A Himbächel build refuses a net that has no constraint.
   /// The reset of the domain holds while the SoC hard reset or the soft reset
   /// is high, and until [locked] is high or the lock timer ends. Call it before
   /// [buildFabric] and [build], and not for a name that already has a domain.
@@ -852,7 +863,6 @@ class HarborSoC extends BridgeModule {
         'a net clock domain on hardware must have source pll',
       );
     }
-    _netClockDomains.add(config.name);
     return _clockDomains[config.name] = _clockGen.createDomainFromClock(
       config,
       clk,
@@ -1396,12 +1406,11 @@ class HarborSoC extends BridgeModule {
   }
 
   /// Throws when a clock domain runs on a net that is not in [constrained].
-  /// A domain on the board clock has the pad constraint. A domain from
-  /// [addClockDomainFromNet] is constrained by its caller.
+  /// A domain on the board clock has the pad constraint.
   void _checkClockDomainConstraints(Set<String> constrained) {
     harborCheckClockNets({
       for (final MapEntry(key: domain, value: d) in _clockDomains.entries)
-        if (!identical(d.clk, _boardClk) && !_netClockDomains.contains(domain))
+        if (!identical(d.clk, _boardClk))
           domain: _domainClockNet[domain] ?? d.clk.name,
     }, constrained);
   }
@@ -2778,23 +2787,17 @@ class HarborSoC extends BridgeModule {
                 'its clocks. Use Himbächel or add the controller.',
               );
             }
-            // Himbächel can lack Python hooks, so the XDC carries the rates.
-            // An independent PLL beside a DDR3 clock tree is timed here too,
-            // and so is the tree when no clocks.py times it.
-            final xdcClocks = {
-              if (_hasDdr3ClockTree &&
-                  _xilinxPassthroughMhz != null &&
-                  !clocksPyWritten)
-                'sysosc_clk': _xilinxPassthroughMhz!,
-              if (!clocksPyWritten) ..._ddr3TreeClockMhz,
-              ...pllClocks,
-            };
-            if (t.useHimbaechel) {
-              _checkClockDomainConstraints({
-                ...xdcClocks.keys,
-                if (clocksPyWritten) ...['sysosc_clk', 'core_clk', 'ddr_clk'],
-              });
-            }
+            // The Makefile gives clocks.py to Himbächel too, so when it is
+            // written it times each PLL clock and the XDC does not. Else the
+            // XDC times the PLL clocks and the DDR3 tree.
+            final xdcClocks = clocksPyWritten
+                ? const <String, double>{}
+                : {
+                    if (_hasDdr3ClockTree && _xilinxPassthroughMhz != null)
+                      'sysosc_clk': _xilinxPassthroughMhz!,
+                    ..._ddr3TreeClockMhz,
+                    ...pllClocks,
+                  };
             if (t.useHimbaechel && xdcClocks.isNotEmpty) {
               final xdc = File('$path/$name.${t.constraintExtension}');
               final lines = StringBuffer(xdc.readAsStringSync());
@@ -2813,6 +2816,19 @@ class HarborSoC extends BridgeModule {
               File(
                 '$path/support/nextpnr/pll_clocks.py',
               ).writeAsStringSync(t.generatePllClockConstraintPy(pllClocks));
+            }
+            if (t.useHimbaechel) {
+              final xdc = File('$path/$name.${t.constraintExtension}');
+              _checkClockDomainConstraints({
+                if (xdc.existsSync())
+                  ...harborXdcClockNets(xdc.readAsStringSync()),
+                if (clocksPyWritten) ...[
+                  'sysosc_clk',
+                  'core_clk',
+                  'ddr_clk',
+                  ...pllClocks.keys,
+                ],
+              });
             }
           } else if (t.vendor == HarborFpgaVendor.vivado &&
               providedClocks.isNotEmpty) {

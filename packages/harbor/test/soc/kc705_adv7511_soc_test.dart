@@ -183,19 +183,22 @@ void main() {
     }
   });
 
-  test('the XDC constrains the 2x clock and the pixel clock', () {
-    final clocks = RegExp(r'create_clock -period (\S+) \[get_nets (\S+)\]')
-        .allMatches(xdcText)
-        .map((m) => (double.parse(m.group(1)!), m.group(2)!))
+  test('clocks.py alone constrains the 2x clock and the pixel clock', () {
+    final py = File('${dir.path}/support/nextpnr/clocks.py').readAsStringSync();
+    final clocks = RegExp(r"\('(\S+)', ([0-9.]+)\)")
+        .allMatches(py)
+        .map((m) => (double.parse(m.group(2)!), m.group(1)!))
         .toList();
     expect(
-      clocks.where((c) => c.$2.endsWith('clk2x_net') && c.$1 == 7.692),
+      clocks.where((c) => c.$2.endsWith('clk2x_net') && c.$1 == 130.0),
       hasLength(1),
     );
     expect(
-      clocks.where((c) => c.$2.endsWith('pixel_clk_net') && c.$1 == 15.385),
+      clocks.where((c) => c.$2.endsWith('pixel_clk_net') && c.$1 == 65.0),
       hasLength(1),
     );
+    expect(xdcText, isNot(contains('clk2x_net')));
+    expect(xdcText, isNot(contains('pixel_clk_net')));
   });
 
   test('the MMCM takes the shared oscillator buffer', () {
