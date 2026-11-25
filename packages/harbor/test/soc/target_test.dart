@@ -821,6 +821,45 @@ void main() {
       expect(top.indexOf('cut_rows'), lessThan(top.indexOf('tapcell')));
     });
 
+    test('generateOpenroadTcl takes the core margin from the env', () {
+      final auto = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(auto, isNot(contains('set _m 200')));
+      final env = auto.indexOf('if {[info exists ::env(CORE_MARGIN_UM)]} {');
+      expect(env, isNonNegative);
+      expect(env, lessThan(auto.indexOf('initialize_floorplan')));
+      expect(auto, contains(r'set _m $::env(CORE_MARGIN_UM)'));
+      expect(auto, contains('getInsts'));
+      expect(
+        auto,
+        contains(
+          r'set _side [expr {max(80.0, sqrt($_cells / $::env(UTILIZATION) '
+          r'+ $_macros))}]',
+        ),
+      );
+      expect(auto, contains(r'-core_area "$_cx0 $_cy0 $_cx1 $_cy1"'));
+      expect(auto, contains('if {![info exists _m]} { set _m 10 }'));
+
+      final fixed = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+        dieMarginUm: 40,
+      ).generateOpenroadTcl();
+      final head = fixed.substring(0, fixed.indexOf('initialize_floorplan'));
+      expect(
+        head,
+        contains(
+          'if {[info exists ::env(CORE_MARGIN_UM)]} {\n'
+          '    set _m \$::env(CORE_MARGIN_UM)\n'
+          '} else {\n'
+          '    set _m 40\n'
+          '}',
+        ),
+      );
+    });
+
     test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
       final tcl = HarborAsicTarget(
         provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),

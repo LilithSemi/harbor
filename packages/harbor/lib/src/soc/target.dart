@@ -1601,8 +1601,16 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// Empty list = flat flow (no hierarchical hardening).
   final List<HarborAsicMacro> macros;
 
-  /// Margin around the die edge in um.
-  final double dieMarginUm;
+  /// Space from the PnR die edge to the core (um).
+  ///
+  /// The `CORE_MARGIN_UM` env var overrides it. With neither and a
+  /// `DIE_AREA`, the core is a square in the middle of the die, sized from
+  /// the cell area and `UTILIZATION`. With neither and no `DIE_AREA`, the
+  /// space is [defaultCoreSpaceUm].
+  final double? dieMarginUm;
+
+  /// Core space for a floorplan from `UTILIZATION` with no margin set (um).
+  static const double defaultCoreSpaceUm = 10;
 
   /// Minimum metal layer for top-level routing (skip lower layers
   /// used internally by macros to avoid DRC violations).
@@ -1623,7 +1631,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     this.frequency = 0,
     this.utilization = 0.5,
     this.macros = const [],
-    this.dieMarginUm = 200.0,
+    this.dieMarginUm,
     this.topRoutingMinLayer = 2,
     this.ioRing,
     this.klayoutDrc,
@@ -1847,6 +1855,32 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('place_pins -hor_layers $hor -ver_layers $ver');
   }
 
+  /// Tcl that sets `_cx0 _cy0 _cx1 _cy1` to a square core in the middle of
+  /// the die. The core holds the cell area at `UTILIZATION`, plus each macro
+  /// with its `MACRO_HALO`, and has a side of at least 80 um.
+  static const _autoCoreTcl = [
+    r'set _block [ord::get_db_block]',
+    r'set _dbu [$_block getDbUnitsPerMicron]',
+    r'set _halo [expr {[info exists ::env(MACRO_HALO)] ? $::env(MACRO_HALO) : 0}]',
+    r'set _cells 0.0',
+    r'set _macros 0.0',
+    r'foreach _inst [$_block getInsts] {',
+    r'    set _master [$_inst getMaster]',
+    r'    set _w [expr {double([$_master getWidth]) / $_dbu}]',
+    r'    set _h [expr {double([$_master getHeight]) / $_dbu}]',
+    r'    if {[$_master isBlock]} {',
+    r'        set _macros [expr {$_macros + ($_w + 2 * $_halo) * ($_h + 2 * $_halo)}]',
+    r'    } else {',
+    r'        set _cells [expr {$_cells + $_w * $_h}]',
+    r'    }',
+    r'}',
+    r'set _side [expr {max(80.0, sqrt($_cells / $::env(UTILIZATION) + $_macros))}]',
+    r'set _cx0 [expr {int(($_dx0 + $_dx1 - $_side) / 2)}]',
+    r'set _cy0 [expr {int(($_dy0 + $_dy1 - $_side) / 2)}]',
+    r'set _cx1 [expr {$_cx0 + ceil($_side)}]',
+    r'set _cy1 [expr {$_cy0 + ceil($_side)}]',
+  ];
+
   static String _um(double v) =>
       v == v.roundToDouble() ? v.toInt().toString() : v.toString();
 
@@ -1999,8 +2033,9 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('# floorplan knobs come from the env: LIB_FILE/TECH_LEF/');
     buf.writeln('# CELL_LEF_DIR/SYNTH_V/SDC_FILE/SITE_NAME/UTILIZATION/');
     buf.writeln(
-      '# MACRO_HALO/PLACEMENT_DENSITY/DROUTE_END_ITER (+optional DIE_AREA).',
+      '# MACRO_HALO/PLACEMENT_DENSITY/DROUTE_END_ITER (+optional DIE_AREA,',
     );
+    buf.writeln('# CORE_MARGIN_UM).');
     if (isHierarchical) {
       buf.writeln(
         '# Mode: hierarchical assembly '
@@ -2044,21 +2079,37 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln();
 
     // Floorplan: a fixed DIE_AREA (fab-slot tapeouts) takes precedence over a
-    // utilization-driven auto floorplan. The core is inset from the die by the
-    // die margin on every side.
+    // utilization-driven auto floorplan.
+    buf.writeln('if {[info exists ::env(CORE_MARGIN_UM)]} {');
+    buf.writeln('    set _m \$::env(CORE_MARGIN_UM)');
+    if (dieMarginUm != null) {
+      buf.writeln('} else {');
+      buf.writeln('    set _m ${_um(dieMarginUm!)}');
+    }
+    buf.writeln('}');
     buf.writeln('if {[info exists ::env(DIE_AREA)]} {');
     buf.writeln('    lassign \$::env(DIE_AREA) _dx0 _dy0 _dx1 _dy1');
-    buf.writeln('    set _m ${dieMarginUm.toStringAsFixed(0)}');
+    buf.writeln('    if {[info exists _m]} {');
+    buf.writeln('        set _cx0 [expr {\$_dx0 + \$_m}]');
+    buf.writeln('        set _cy0 [expr {\$_dy0 + \$_m}]');
+    buf.writeln('        set _cx1 [expr {\$_dx1 - \$_m}]');
+    buf.writeln('        set _cy1 [expr {\$_dy1 - \$_m}]');
+    buf.writeln('    } else {');
+    for (final line in _autoCoreTcl) {
+      buf.writeln('        $line');
+    }
+    buf.writeln('    }');
     buf.writeln('    initialize_floorplan \\');
     buf.writeln('        -die_area "\$_dx0 \$_dy0 \$_dx1 \$_dy1" \\');
-    buf.writeln(
-      '        -core_area "[expr {\$_dx0 + \$_m}] [expr {\$_dy0 + \$_m}] [expr {\$_dx1 - \$_m}] [expr {\$_dy1 - \$_m}]" \\',
-    );
+    buf.writeln('        -core_area "\$_cx0 \$_cy0 \$_cx1 \$_cy1" \\');
     buf.writeln('        -site \$::env(SITE_NAME)');
     buf.writeln('} else {');
+    buf.writeln(
+      '    if {![info exists _m]} { set _m ${_um(defaultCoreSpaceUm)} }',
+    );
     buf.writeln('    initialize_floorplan \\');
     buf.writeln('        -utilization \$::env(UTILIZATION) \\');
-    buf.writeln('        -core_space ${dieMarginUm.toStringAsFixed(0)} \\');
+    buf.writeln('        -core_space \$_m \\');
     buf.writeln('        -site \$::env(SITE_NAME)');
     buf.writeln('}');
     buf.writeln('make_tracks');
