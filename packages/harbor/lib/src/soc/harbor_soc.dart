@@ -615,6 +615,16 @@ class HarborSoC extends BridgeModule {
             'xilinxDdr3Tree/coreClkHz was supplied to build its core clock.',
           );
         }
+        final coreHz = (corePll.coreMhz * 1e6).round();
+        if ((clkConfig.frequency - coreHz).abs() >
+            coreHz * clkConfig.tolerancePpm / 1e6) {
+          throw StateError(
+            'clock "${clkConfig.name}" is '
+            '${clkConfig.frequencyMhz.toStringAsFixed(3)} MHz but the core '
+            'clock of the DDR3 tree is ${corePll.coreMhz.toStringAsFixed(3)} '
+            'MHz. Use HarborClockSource.pll for a different rate.',
+          );
+        }
         // Hold reset until BOTH the core PLL and the DDR3 clock-tree PLL have
         // locked (the belt-and-suspenders timer in createDomainFromClock still
         // releases if a LOCKED never reaches the fabric). Gating only on the

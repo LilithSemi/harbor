@@ -61,6 +61,43 @@ void main() {
     expect(d.clk.name, 'core_clk');
   });
 
+  test('ddr3Core with a rate the core pll does not make throws', () {
+    expect(
+      () => _kc705(
+        clocks: [
+          const HarborClockConfig(
+            name: 'bus',
+            rate: HarborFixedClockRate(83333333),
+            sourceFrequency: 200000000,
+            source: HarborClockSource.ddr3Core,
+          ),
+        ],
+      ),
+      throwsA(
+        isA<StateError>().having(
+          (e) => e.message,
+          'message',
+          allOf(contains('bus'), contains('83.333'), contains('50.000')),
+        ),
+      ),
+    );
+  });
+
+  test('two ddr3Core domains at the core rate share one net', () {
+    final soc = _kc705(
+      clocks: [
+        _core(),
+        const HarborClockConfig(
+          name: 'core2',
+          rate: HarborFixedClockRate(50000000),
+          sourceFrequency: 200000000,
+          source: HarborClockSource.ddr3Core,
+        ),
+      ],
+    );
+    expect(soc.clockDomain('core2')!.clk.name, 'core_clk');
+  });
+
   test('ddr3Controller binds the controller clock of the tree', () {
     final soc = _kc705(clocks: [_core(), _bus(83333333)]);
     final d = soc.clockDomain('bus')!;
