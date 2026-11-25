@@ -1799,11 +1799,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
 
     if (macro.pinOnAllEdges) _writePlacePins(buf, lib);
 
-    // Power
-    buf.writeln('add_global_connection -net VDD -pin_pattern VDD -power');
-    buf.writeln('add_global_connection -net VSS -pin_pattern VSS -ground');
-    buf.writeln('global_connect');
-    buf.writeln();
+    _writePower(buf, lib, tile: true);
 
     // Placement
     buf.writeln('global_placement -density \$::env(TILE_UTIL)');
@@ -1849,6 +1845,92 @@ class HarborAsicTarget extends HarborDeviceTarget {
     final ver = lib.pinVerticalLayer;
     if (hor == null || ver == null) return;
     buf.writeln('place_pins -hor_layers $hor -ver_layers $ver');
+  }
+
+  static String _um(double v) =>
+      v == v.roundToDouble() ? v.toInt().toString() : v.toString();
+
+  /// Writes the power connections, the tap and endcap cells, and the PDN.
+  ///
+  /// A [tile] grid stops one stripe layer below the top, so that the top
+  /// level stripes can cross the tile. The top level connects to the tile
+  /// pins of each cell in [macroCells].
+  static void _writePower(
+    StringBuffer buf,
+    StandardCellLibrary lib, {
+    bool tile = false,
+    List<String> macroCells = const [],
+  }) {
+    for (final pin in lib.powerPins) {
+      buf.writeln(
+        'add_global_connection -net VDD -pin_pattern {^$pin\$} -power',
+      );
+    }
+    for (final pin in lib.groundPins) {
+      buf.writeln(
+        'add_global_connection -net VSS -pin_pattern {^$pin\$} -ground',
+      );
+    }
+    buf.writeln('global_connect');
+    buf.writeln();
+
+    final tap = lib.tapCell;
+    if (tap != null) {
+      if (macroCells.isNotEmpty) {
+        buf.writeln(
+          'cut_rows -halo_width_x \$::env(MACRO_HALO) '
+          '-halo_width_y \$::env(MACRO_HALO)',
+        );
+      }
+      final endcap = lib.endcapCell;
+      buf.writeln('tapcell -distance ${_um(lib.tapDistanceUm)} \\');
+      buf.writeln('    -tapcell_master $tap${endcap == null ? '' : ' \\'}');
+      if (endcap != null) buf.writeln('    -endcap_master $endcap');
+      buf.writeln('global_connect');
+      buf.writeln();
+    }
+
+    final pdn = lib.pdn;
+    if (pdn == null) return;
+    var stripes = pdn.stripes;
+    if (tile && stripes.length > 1) {
+      stripes = stripes.sublist(0, stripes.length - 1);
+    }
+    buf.writeln('set_voltage_domain -name CORE -power VDD -ground VSS');
+    buf.writeln(
+      'define_pdn_grid -name stdcell -voltage_domains CORE '
+      '-pins {${stripes.map((s) => s.layer).join(' ')}}',
+    );
+    buf.writeln(
+      'add_pdn_stripe -grid stdcell -layer ${pdn.railLayer} '
+      '-width ${_um(pdn.railWidthUm)} -followpins',
+    );
+    for (final s in stripes) {
+      buf.writeln(
+        'add_pdn_stripe -grid stdcell -layer ${s.layer} '
+        '-width ${_um(s.widthUm)} -pitch ${_um(s.pitchUm)} '
+        '-offset ${_um(s.offsetUm)} -spacing ${_um(s.spacingUm)} '
+        '-starts_with POWER',
+      );
+    }
+    var below = pdn.railLayer;
+    for (final s in stripes) {
+      buf.writeln('add_pdn_connect -grid stdcell -layers {$below ${s.layer}}');
+      below = s.layer;
+    }
+    if (macroCells.isNotEmpty && stripes.length > 1) {
+      final n = stripes.length;
+      buf.writeln(
+        'define_pdn_grid -name macros -macro -cells {${macroCells.join(' ')}} '
+        '-voltage_domains CORE -grid_over_boundary',
+      );
+      buf.writeln(
+        'add_pdn_connect -grid macros '
+        '-layers {${stripes[n - 2].layer} ${stripes[n - 1].layer}}',
+      );
+    }
+    buf.writeln('pdngen');
+    buf.writeln();
   }
 
   /// Writes antenna repair around detailed routing.
@@ -1996,11 +2078,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
       buf.writeln();
     }
 
-    // Power
-    buf.writeln('add_global_connection -net VDD -pin_pattern VDD -power');
-    buf.writeln('add_global_connection -net VSS -pin_pattern VSS -ground');
-    buf.writeln('global_connect');
-    buf.writeln();
+    _writePower(buf, lib, macroCells: [for (final m in macros) m.moduleName]);
 
     // Placement (density supplied by asix as PLACEMENT_DENSITY). With pin
     // layers, a first pass without the pins lets place_pins put each pin near

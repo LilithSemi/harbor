@@ -50,6 +50,24 @@ class StandardCellLibrary with HarborPrettyString {
   /// Vertical routing layer for top-level pins (`place_pins -ver_layers`).
   final String? pinVerticalLayer;
 
+  /// Cell pin names that connect to the power net.
+  final List<String> powerPins;
+
+  /// Cell pin names that connect to the ground net.
+  final List<String> groundPins;
+
+  /// Well tap cell for `tapcell`. Without it, the flow writes no `tapcell`.
+  final String? tapCell;
+
+  /// Endcap cell for `tapcell`.
+  final String? endcapCell;
+
+  /// Maximum distance between tap cells in a row (um).
+  final double tapDistanceUm;
+
+  /// Power grid for the standard cells. Without it, the flow writes no PDN.
+  final HarborPdnGrid? pdn;
+
   const StandardCellLibrary({
     required this.name,
     required this.libertyPath,
@@ -66,6 +84,12 @@ class StandardCellLibrary with HarborPrettyString {
     this.antennaCell,
     this.pinHorizontalLayer,
     this.pinVerticalLayer,
+    this.powerPins = const ['VDD'],
+    this.groundPins = const ['VSS'],
+    this.tapCell,
+    this.endcapCell,
+    this.tapDistanceUm = 20,
+    this.pdn,
   });
 
   @override
@@ -99,7 +123,57 @@ class StandardCellLibrary with HarborPrettyString {
     if (pinHorizontalLayer != null && pinVerticalLayer != null) {
       buf.writeln('${c}pins: $pinHorizontalLayer/$pinVerticalLayer,');
     }
+    if (tapCell != null) buf.writeln('${c}tap: $tapCell,');
+    if (endcapCell != null) buf.writeln('${c}endcap: $endcapCell,');
     buf.write('$p)');
     return buf.toString();
   }
+}
+
+/// One set of power and ground stripes in a [HarborPdnGrid].
+class HarborPdnStripe {
+  /// Metal layer name.
+  final String layer;
+
+  /// Stripe width (um).
+  final double widthUm;
+
+  /// Distance between two stripe pairs (um).
+  final double pitchUm;
+
+  /// Distance from the core edge to the first stripe (um).
+  final double offsetUm;
+
+  /// Gap between the power stripe and the ground stripe of a pair (um).
+  final double spacingUm;
+
+  const HarborPdnStripe({
+    required this.layer,
+    required this.widthUm,
+    required this.pitchUm,
+    required this.offsetUm,
+    required this.spacingUm,
+  });
+}
+
+/// Standard cell power grid for OpenROAD `pdngen`.
+///
+/// The rails follow the cell rows on [railLayer]. Each stripe in [stripes]
+/// connects to the layer before it, the first one to the rails. The stripe
+/// layers are also the grid pin layers.
+class HarborPdnGrid {
+  /// Layer of the rails on the cell rows.
+  final String railLayer;
+
+  /// Rail width (um).
+  final double railWidthUm;
+
+  /// Stripes from the lowest layer to the highest.
+  final List<HarborPdnStripe> stripes;
+
+  const HarborPdnGrid({
+    required this.railLayer,
+    required this.railWidthUm,
+    required this.stripes,
+  });
 }

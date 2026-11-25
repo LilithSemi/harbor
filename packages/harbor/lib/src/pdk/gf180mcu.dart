@@ -66,6 +66,31 @@ class Gf180mcuProvider extends PdkProvider {
     antennaCell: '${_libName}__antenna',
     pinHorizontalLayer: 'Metal3',
     pinVerticalLayer: 'Metal2',
+    powerPins: const ['VDD', 'VNW'],
+    groundPins: const ['VSS', 'VPW'],
+    tapCell: '${_libName}__filltie',
+    endcapCell: '${_libName}__endcap',
+    tapDistanceUm: 20,
+    pdn: const HarborPdnGrid(
+      railLayer: 'Metal1',
+      railWidthUm: 0.6,
+      stripes: [
+        HarborPdnStripe(
+          layer: 'Metal4',
+          widthUm: 1.6,
+          pitchUm: 40,
+          offsetUm: 10,
+          spacingUm: 1.7,
+        ),
+        HarborPdnStripe(
+          layer: 'Metal5',
+          widthUm: 1.6,
+          pitchUm: 153.18,
+          offsetUm: 16.65,
+          spacingUm: 1.7,
+        ),
+      ],
+    ),
   );
 
   @override

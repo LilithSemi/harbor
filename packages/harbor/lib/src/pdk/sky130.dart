@@ -69,7 +69,38 @@ class Sky130Provider extends PdkProvider {
     antennaCell: '${_libName}__diode_2',
     pinHorizontalLayer: 'met3',
     pinVerticalLayer: 'met2',
+    // Only the hd library is checked against the PDK. The other variants
+    // keep the default pins and get no tap cells or PDN.
+    powerPins: _isHd ? const ['VPWR', 'VPB'] : const ['VDD'],
+    groundPins: _isHd ? const ['VGND', 'VNB'] : const ['VSS'],
+    tapCell: _isHd ? '${_libName}__tapvpwrvgnd_1' : null,
+    endcapCell: _isHd ? '${_libName}__decap_3' : null,
+    tapDistanceUm: 13,
+    pdn: _isHd
+        ? const HarborPdnGrid(
+            railLayer: 'met1',
+            railWidthUm: 0.48,
+            stripes: [
+              HarborPdnStripe(
+                layer: 'met4',
+                widthUm: 1.6,
+                pitchUm: 153.6,
+                offsetUm: 16.32,
+                spacingUm: 1.7,
+              ),
+              HarborPdnStripe(
+                layer: 'met5',
+                widthUm: 1.6,
+                pitchUm: 153.18,
+                offsetUm: 16.65,
+                spacingUm: 1.7,
+              ),
+            ],
+          )
+        : null,
   );
+
+  bool get _isHd => variant == Sky130Variant.hd;
 
   @override
   AnalogBlock ioCell({required int index}) => AnalogBlock(

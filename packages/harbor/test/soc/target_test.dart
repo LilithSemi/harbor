@@ -739,6 +739,88 @@ void main() {
       );
     });
 
+    test('generateOpenroadTcl writes gf180 tap cells and a PDN', () {
+      final tcl = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      const prefix = 'gf180mcu_fd_sc_mcu7t5v0';
+      for (final line in [
+        r'add_global_connection -net VDD -pin_pattern {^VNW$} -power',
+        r'add_global_connection -net VSS -pin_pattern {^VPW$} -ground',
+        'tapcell -distance 20 \\\n'
+            '    -tapcell_master ${prefix}__filltie \\\n'
+            '    -endcap_master ${prefix}__endcap',
+        'define_pdn_grid -name stdcell -voltage_domains CORE '
+            '-pins {Metal4 Metal5}',
+        'add_pdn_stripe -grid stdcell -layer Metal1 -width 0.6 -followpins',
+        'add_pdn_stripe -grid stdcell -layer Metal4 -width 1.6 -pitch 40 '
+            '-offset 10 -spacing 1.7 -starts_with POWER',
+        'add_pdn_stripe -grid stdcell -layer Metal5 -width 1.6 '
+            '-pitch 153.18 -offset 16.65 -spacing 1.7 -starts_with POWER',
+        'add_pdn_connect -grid stdcell -layers {Metal1 Metal4}',
+        'add_pdn_connect -grid stdcell -layers {Metal4 Metal5}',
+      ]) {
+        expect(tcl, contains(line));
+      }
+      final order = [
+        tcl.indexOf('make_tracks'),
+        tcl.indexOf('tapcell'),
+        tcl.indexOf('pdngen'),
+        tcl.indexOf('global_placement'),
+      ];
+      expect(order, everyElement(isNonNegative));
+      expect(order, orderedEquals([...order]..sort()));
+    });
+
+    test('generateOpenroadTcl writes a PDN only for checked libraries', () {
+      final hd = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(hd, contains('-tapcell_master sky130_fd_sc_hd__tapvpwrvgnd_1'));
+      expect(hd, contains('add_pdn_connect -grid stdcell -layers {met4 met5}'));
+      expect(hd, contains(r'-pin_pattern {^VPWR$} -power'));
+
+      for (final provider in [
+        Sky130Provider(pdkRoot: '/pdk/sky130A', variant: Sky130Variant.hs),
+        _BareCellProvider(),
+      ]) {
+        final tcl = HarborAsicTarget(
+          provider: provider,
+          topCell: 'MySoC',
+        ).generateOpenroadTcl();
+        expect(tcl, isNot(contains('tapcell')));
+        expect(tcl, isNot(contains('pdngen')));
+        expect(tcl, contains(r'-pin_pattern {^VDD$} -power'));
+      }
+    });
+
+    test('hierarchical flow connects the top PDN to the tile PDN', () {
+      final target = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+        macros: const [HarborAsicMacro(moduleName: 'Core')],
+      );
+      final tile = target.generateMacroOpenroadTcl(target.macros.first);
+      expect(tile, contains('-pins {Metal4}'));
+      expect(tile, isNot(contains('-layer Metal5')));
+      expect(tile, contains('tapcell'));
+      final top = target.generateOpenroadTcl();
+      expect(
+        top,
+        contains(
+          'define_pdn_grid -name macros -macro -cells {Core} '
+          '-voltage_domains CORE -grid_over_boundary',
+        ),
+      );
+      expect(
+        top,
+        contains('add_pdn_connect -grid macros -layers {Metal4 Metal5}'),
+      );
+      expect(top.indexOf('cut_rows'), lessThan(top.indexOf('tapcell')));
+    });
+
     test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
       final tcl = HarborAsicTarget(
         provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
