@@ -218,4 +218,99 @@ void main() {
       await Simulator.endSimulation();
     },
   );
+
+  test('every copy sets at once and releases on the same edge', () async {
+    final clk = SimpleClockGenerator(10).clk;
+    final hold = Logic()..inject(1);
+    final release = Logic()..inject(0);
+    final branch = HarborRegisteredResetBranch(name: 'branch', copies: 3);
+    branch.input('clk').srcConnection! <= clk;
+    branch.input('reset_assert').srcConnection! <= hold;
+    branch.input('release_in').srcConnection! <= release;
+    await branch.build();
+    final outs = branch.resetOuts;
+    expect(outs, hasLength(3));
+    List<bool> values() => [for (final o in outs) o.value.toBool()];
+
+    unawaited(Simulator.run());
+    await clk.nextPosedge;
+    expect(values(), [true, true, true]);
+    hold.inject(0);
+    await clk.nextPosedge;
+    release.inject(1);
+    await clk.nextNegedge;
+    expect(values(), [true, true, true]);
+    await clk.nextPosedge;
+    await clk.nextNegedge;
+    expect(values(), [false, false, false]);
+    // Assertion does not wait for an edge.
+    final t = Simulator.time;
+    List<bool>? between;
+    Simulator.registerAction(t + 1, () => hold.put(1));
+    Simulator.registerAction(t + 2, () => between = values());
+    await clk.nextPosedge;
+    expect(between, [true, true, true]);
+    await Simulator.endSimulation();
+  });
+
+  test('each copy is its own flop in the SV and kept in synthesis', () async {
+    final branch = HarborRegisteredResetBranch(name: 'branch', copies: 4);
+    branch.input('clk').srcConnection! <= Logic();
+    branch.input('reset_assert').srcConnection! <= Logic();
+    branch.input('release_in').srcConnection! <= Logic();
+    await branch.build();
+    final sv = SynthBuilder(
+      branch,
+      SystemVerilogSynthesizer(),
+    ).getSynthFileContents().map((f) => f.contents).join();
+    final flops = RegExp(
+      r'^\s*(reset_q(?:_\d+)?) <= \(~release_in\);',
+      multiLine: true,
+    ).allMatches(sv).map((m) => m.group(1)).toSet();
+    expect(flops, {'reset_q', 'reset_q_1', 'reset_q_2', 'reset_q_3'});
+    expect(sv, contains('posedge reset_assert'));
+    for (var i = 0; i < 4; i++) {
+      final name = HarborRegisteredResetBranch.outputName(i);
+      expect(sv, contains('assign $name = reset_q${i == 0 ? '' : '_$i'};'));
+    }
+
+    final marks = harborSynthesisMarks(branch).preserve;
+    expect(marks, ['HarborRegisteredResetBranch_x4']);
+    final tcl = _ecp5.generateYosysTcl('Top', preserveRegisterModules: marks);
+    expect(
+      tcl,
+      contains(r'setattr -set keep 1 HarborRegisteredResetBranch_x4/t:$*ff*'),
+    );
+    expect(
+      () => HarborRegisteredResetBranch(name: 'none', copies: 0),
+      throwsArgumentError,
+    );
+  });
+
+  test('resetCopies gives kept copies in a local reset domain', () async {
+    final soc = _soc(_ecp5, {'sys'});
+    soc.addMaster(_Cpu()).pullUp(soc);
+    soc.buildFabric();
+    final copies = soc.resetCopies('sys', 'user_reset_branch', copies: 3);
+    expect(copies.toSet(), hasLength(3));
+    for (final (i, c) in copies.indexed) {
+      soc.addOutput('user_reset_$i') <= c;
+    }
+    await soc.build();
+    final branch = soc.subModules
+        .whereType<HarborRegisteredResetBranch>()
+        .singleWhere((b) => b.name == 'user_reset_branch');
+    expect(branch.copies, 3);
+    expect(branch.resetOuts, copies);
+    expect(() => soc.resetCopies('none', 'x'), throwsArgumentError);
+  });
+
+  test('resetCopies gives the domain reset with no local reset', () {
+    final soc = _soc(_ecp5, {});
+    final sys = soc.clockDomain('sys')!;
+    expect(soc.resetCopies('sys', 'user_reset_branch', copies: 2), [
+      sys.reset,
+      sys.reset,
+    ]);
+  });
 }

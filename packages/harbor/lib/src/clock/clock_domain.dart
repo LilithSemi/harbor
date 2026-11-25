@@ -1609,20 +1609,50 @@ Ecp5Ddr3Clocks buildEcp5Ddr3ClockTree(
   );
 }
 
-/// A local copy of the final release flop of a domain reset. The reset
-/// asserts immediately. The stage before it is shared, so all copies
-/// release on the same clock edge.
+/// Local copies of the final release flop of a domain reset. Each of the
+/// [copies] outputs comes from its own flop, and synthesis keeps each flop,
+/// so each copy drives its own part of the reset fanout. A copy sets at once
+/// on `reset_assert` and clears on the edge after `release_in` goes high.
+/// The stage before the copies is shared, so all copies release on the same
+/// clock edge.
 class HarborRegisteredResetBranch extends BridgeModule
     implements HarborPreserveRegisters {
-  HarborRegisteredResetBranch({required super.name})
-    : super('HarborRegisteredResetBranch') {
+  /// The number of outputs.
+  final int copies;
+
+  HarborRegisteredResetBranch({required super.name, this.copies = 1})
+    : super(
+        copies == 1
+            ? 'HarborRegisteredResetBranch'
+            : 'HarborRegisteredResetBranch_x$copies',
+      ) {
+    if (copies < 1) {
+      throw ArgumentError.value(copies, 'copies', 'must be at least 1');
+    }
     createPort('clk', PortDirection.input);
     createPort('reset_assert', PortDirection.input);
     createPort('release_in', PortDirection.input);
-    final released = Logic(name: 'released');
-    Sequential(input('clk'), reset: input('reset_assert'), [
-      released < input('release_in'),
-    ]);
-    addOutput('reset_out') <= input('reset_assert') | ~released;
+    final flops = [
+      for (var i = 0; i < copies; i++)
+        Logic(name: i == 0 ? 'reset_q' : 'reset_q_$i'),
+    ];
+    Sequential(
+      input('clk'),
+      [for (final q in flops) q < ~input('release_in')],
+      reset: input('reset_assert'),
+      asyncReset: true,
+      resetValues: {for (final q in flops) q: Const(1)},
+    );
+    for (var i = 0; i < copies; i++) {
+      addOutput(outputName(i)) <= flops[i];
+    }
   }
+
+  /// The output port name of copy [i].
+  static String outputName(int i) => i == 0 ? 'reset_out' : 'reset_out_$i';
+
+  /// The outputs, one for each copy.
+  List<Logic> get resetOuts => [
+    for (var i = 0; i < copies; i++) output(outputName(i)),
+  ];
 }

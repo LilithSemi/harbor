@@ -470,22 +470,49 @@ class HarborSoC extends BridgeModule {
   /// domain.
   final Set<String> localResetDomains;
 
-  Logic _localReset(HarborClockDomain? domain, Logic fallback, String name) {
+  Logic _localReset(HarborClockDomain? domain, Logic fallback, String name) =>
+      _localResets(domain, fallback, name, 1).single;
+
+  List<Logic> _localResets(
+    HarborClockDomain? domain,
+    Logic fallback,
+    String name,
+    int copies,
+  ) {
     final t = target;
+    final taps = domain == null ? null : _clockGen.resetBranchSource(domain);
     if (domain == null ||
+        taps == null ||
         !localResetDomains.contains(domain.config.name) ||
         t is! HarborFpgaTarget ||
         (t.vendor != HarborFpgaVendor.ecp5 &&
             t.vendor != HarborFpgaVendor.openXc7)) {
-      return fallback;
+      return List.filled(copies, fallback);
     }
-    final taps = _clockGen.resetBranchSource(domain);
-    if (taps == null) return fallback;
-    final branch = addSubModule(HarborRegisteredResetBranch(name: name));
+    final branch = addSubModule(
+      HarborRegisteredResetBranch(name: name, copies: copies),
+    );
     branch.input('clk').srcConnection! <= domain.clk;
     branch.input('reset_assert').srcConnection! <= taps.hold;
     branch.input('release_in').srcConnection! <= taps.release;
-    return branch.output('reset_out');
+    return branch.resetOuts;
+  }
+
+  /// [copies] copies of the reset of the clock domain [domainName], for logic
+  /// that the SoC does not wire, from a branch with the instance name [name].
+  /// In a domain of [localResetDomains], each copy is its own kept release
+  /// flop and releases on the same edge as the module resets of the domain.
+  /// Otherwise each copy is the domain reset. Throws when there is no such
+  /// domain.
+  List<Logic> resetCopies(String domainName, String name, {int copies = 1}) {
+    final domain = _clockDomains[domainName];
+    if (domain == null) {
+      throw ArgumentError.value(domainName, 'domainName', 'no such domain');
+    }
+    if (copies < 1) {
+      throw ArgumentError.value(copies, 'copies', 'must be at least 1');
+    }
+    return _localResets(domain, domain.reset, name, copies);
   }
 
   bool _fabricBuilt = false;
