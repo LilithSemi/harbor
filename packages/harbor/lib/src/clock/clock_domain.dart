@@ -1157,6 +1157,7 @@ class HarborClockGenerator {
     required int secondaryFrequency,
     String? secondaryName,
     int secondaryTolerancePpm = 0,
+    bool namePllClock = false,
   }) {
     final secName = secondaryName ?? '${config.name}_s';
     final secConfig = HarborClockConfig.fixed(
@@ -1197,10 +1198,15 @@ class HarborClockGenerator {
       if (config.sourceFrequency == null) {
         throw ArgumentError('Clock "${config.name}" requires sourceFrequency');
       }
-      final primaryX = _createXilinxPll(config, config.sourceFrequency!);
+      final primaryX = _createXilinxPll(
+        config,
+        config.sourceFrequency!,
+        namePllClock: namePllClock,
+      );
       final secondaryX = _createXilinxPll(
         secConfig,
         secConfig.sourceFrequency!,
+        namePllClock: namePllClock,
       );
       return (primary: primaryX, secondary: secondaryX);
     }
