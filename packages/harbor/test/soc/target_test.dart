@@ -877,6 +877,20 @@ void main() {
       );
     });
 
+    test('generateOpenroadTcl writes the area report with tee', () {
+      final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
+      expect(
+        target.generateOpenroadTcl(),
+        contains('tee -file area.rpt {report_design_area}'),
+      );
+      expect(
+        target.generateMacroOpenroadTcl(
+          const HarborAsicMacro(moduleName: 'Core'),
+        ),
+        contains('tee -file Core_area.rpt {report_design_area}'),
+      );
+    });
+
     test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
       final tcl = HarborAsicTarget(
         provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),

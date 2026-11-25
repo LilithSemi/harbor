@@ -1841,7 +1841,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('write_timing_model ${m}.lib');
     buf.writeln();
     buf.writeln('report_checks -path_delay min_max > ${m}_timing.rpt');
-    buf.writeln('report_design_area > ${m}_area.rpt');
+    buf.writeln('tee -file ${m}_area.rpt {report_design_area}');
 
     return buf.toString();
   }
@@ -2194,7 +2194,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
 
     // Reports & outputs
     buf.writeln('report_checks -path_delay min_max > timing.rpt');
-    buf.writeln('report_design_area > area.rpt');
+    buf.writeln('tee -file area.rpt {report_design_area}');
     buf.writeln('report_power > power.rpt');
     buf.writeln('write_def ${topCell}_final.def');
     buf.writeln('write_verilog ${topCell}_final.v');
