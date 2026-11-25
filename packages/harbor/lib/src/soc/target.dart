@@ -1803,6 +1803,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('    -core_space 2 \\');
     buf.writeln('    -site \$::env(SITE_NAME)');
     buf.writeln('make_tracks');
+    _writeLayerAdjustments(buf);
     buf.writeln();
 
     if (macro.pinOnAllEdges) _writePlacePins(buf, lib);
@@ -1880,6 +1881,17 @@ class HarborAsicTarget extends HarborDeviceTarget {
     r'set _cx1 [expr {$_cx0 + ceil($_side)}]',
     r'set _cy1 [expr {$_cy0 + ceil($_side)}]',
   ];
+
+  /// Writes a global routing adjustment for each `LAYER_ADJ_<layer>` env var
+  /// that asix exports from the PDK.
+  static void _writeLayerAdjustments(StringBuffer buf) {
+    buf.writeln('foreach _name [array names ::env LAYER_ADJ_*] {');
+    buf.writeln(
+      '    set_global_routing_layer_adjustment '
+      '[string range \$_name 10 end] \$::env(\$_name)',
+    );
+    buf.writeln('}');
+  }
 
   static String _um(double v) =>
       v == v.roundToDouble() ? v.toInt().toString() : v.toString();
@@ -2035,7 +2047,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln(
       '# MACRO_HALO/PLACEMENT_DENSITY/DROUTE_END_ITER (+optional DIE_AREA,',
     );
-    buf.writeln('# CORE_MARGIN_UM).');
+    buf.writeln('# CORE_MARGIN_UM, LAYER_ADJ_*).');
     if (isHierarchical) {
       buf.writeln(
         '# Mode: hierarchical assembly '
@@ -2121,6 +2133,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('        -site \$::env(SITE_NAME)');
     buf.writeln('}');
     buf.writeln('make_tracks');
+    _writeLayerAdjustments(buf);
     buf.writeln();
 
     // Macro placement with halos (halo width supplied by asix as MACRO_HALO)

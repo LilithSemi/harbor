@@ -891,6 +891,24 @@ void main() {
       );
     });
 
+    test('generateOpenroadTcl applies the LAYER_ADJ env vars', () {
+      final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
+      const loop =
+          'foreach _name [array names ::env LAYER_ADJ_*] {\n'
+          '    set_global_routing_layer_adjustment '
+          '[string range \$_name 10 end] \$::env(\$_name)\n'
+          '}';
+      final tcl = target.generateOpenroadTcl();
+      expect(tcl.indexOf(loop), greaterThan(tcl.indexOf('make_tracks')));
+      expect(tcl.indexOf(loop), lessThan(tcl.indexOf('global_route')));
+      expect(
+        target.generateMacroOpenroadTcl(
+          const HarborAsicMacro(moduleName: 'Core'),
+        ),
+        contains(loop),
+      );
+    });
+
     test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
       final tcl = HarborAsicTarget(
         provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
