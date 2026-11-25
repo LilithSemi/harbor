@@ -242,10 +242,12 @@ class HarborDdr3 extends BridgeModule
     this.writeCombine = false,
     int? readGap,
     super.name = 'ddr3',
-  }) : outstanding = outstanding ?? defaultOutstanding(protocol),
+  }) : outstanding = outstanding ?? _defaultOutstanding(target, protocol),
        readWords =
            readWords ??
-           defaultReadWords(outstanding ?? defaultOutstanding(protocol)),
+           defaultReadWords(
+             outstanding ?? _defaultOutstanding(target, protocol),
+           ),
        readGap = readGap ?? defaultReadGap(protocol),
        super(
          _definitionName(
@@ -262,10 +264,12 @@ class HarborDdr3 extends BridgeModule
            idWidth: idWidth,
            wishboneBurstBeats: wishboneBurstBeats,
            readChannels: readChannels,
-           outstanding: outstanding ?? defaultOutstanding(protocol),
+           outstanding: outstanding ?? _defaultOutstanding(target, protocol),
            readWords:
                readWords ??
-               defaultReadWords(outstanding ?? defaultOutstanding(protocol)),
+               defaultReadWords(
+                 outstanding ?? _defaultOutstanding(target, protocol),
+               ),
            fastSim: fastSim,
            powerOnCycles: powerOnCycles,
            writeCombine: writeCombine,
@@ -581,9 +585,13 @@ class HarborDdr3 extends BridgeModule
   /// The default [readWords]: 2 with one request in flight, else 4.
   static int defaultReadWords(int outstanding) => outstanding == 1 ? 2 : 4;
 
-  /// The default [outstanding] for a port of [protocol].
-  static int defaultOutstanding(HarborFabricKind protocol) =>
-      protocol == HarborFabricKind.wishbone ? 1 : 8;
+  /// The default [outstanding] for a port of [protocol] on [target].
+  static int _defaultOutstanding(
+    HarborDeviceTarget? target,
+    HarborFabricKind protocol,
+  ) => target == null
+      ? (protocol == HarborFabricKind.wishbone ? 1 : 8)
+      : target.defaultOutstanding(protocol);
 
   /// The default [readGap] for a port of [protocol]. Wishbone ignores
   /// [readGap] (it always runs the controller gap at 0), so its default is

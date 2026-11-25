@@ -260,14 +260,14 @@ class HarborSdram extends BridgeModule
          maxPulledInRefresh,
        ),
        busAddressWidth = busAddressWidth ?? config.sizeBytes.bitLength,
-       outstanding = _outstanding(protocol, outstanding),
+       outstanding = _outstanding(target, protocol, outstanding),
        cdcDepth = _cdcDepth(
          target,
          protocol,
          busClockSync,
          postedWrites,
          cdcDepth,
-         _outstanding(protocol, outstanding),
+         _outstanding(target, protocol, outstanding),
        ),
        super(
          _definitionName(
@@ -295,7 +295,7 @@ class HarborSdram extends BridgeModule
            busDataWidth: busDataWidth,
            protocol: protocol,
            idWidth: idWidth,
-           outstanding: _outstanding(protocol, outstanding),
+           outstanding: _outstanding(target, protocol, outstanding),
            wishboneBurstBeats: wishboneBurstBeats,
            cdcDepth: _cdcDepth(
              target,
@@ -303,7 +303,7 @@ class HarborSdram extends BridgeModule
              busClockSync,
              postedWrites,
              cdcDepth,
-             _outstanding(protocol, outstanding),
+             _outstanding(target, protocol, outstanding),
            ),
            scanoutPorts: scanoutPorts,
            scanoutMaxInFlight: scanoutMaxInFlight,
@@ -556,8 +556,14 @@ class HarborSdram extends BridgeModule
     );
   }
 
-  static int _outstanding(HarborFabricKind kind, int? n) =>
-      n ?? (kind == HarborFabricKind.wishbone ? 1 : 8);
+  static int _outstanding(
+    HarborDeviceTarget? target,
+    HarborFabricKind kind,
+    int? n,
+  ) =>
+      n ??
+      (target?.defaultOutstanding(kind) ??
+          (kind == HarborFabricKind.wishbone ? 1 : 8));
 
   static int _cdcDepth(
     HarborDeviceTarget? target,

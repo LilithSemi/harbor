@@ -2,6 +2,47 @@ import 'package:harbor/harbor.dart';
 import 'package:test/test.dart';
 
 void main() {
+  group('defaultOutstanding', () {
+    const axi = HarborFabricKind.axi4;
+    const wb = HarborFabricKind.wishbone;
+    test('small parts get 2', () {
+      for (final t in const [
+        HarborFpgaTarget.spartan7(device: 'xc7s50', package: 'csga324'),
+        HarborFpgaTarget.ecp5(device: 'LFE5U-85F', package: 'CABGA381'),
+        HarborFpgaTarget.ice40(device: 'up5k', package: 'sg48'),
+      ]) {
+        expect(t.defaultOutstanding(axi), 2, reason: t.name);
+        expect(t.defaultOutstanding(HarborFabricKind.tilelink), 2);
+        expect(t.defaultOutstanding(wb), 1);
+      }
+    });
+    test('big parts get 8', () {
+      for (final t in const [
+        HarborFpgaTarget.artix7(device: 'xc7a200t', package: 'fbg484'),
+        HarborFpgaTarget.kintex7(device: 'xc7k325t', package: 'ffg900'),
+        HarborSimTarget(),
+      ]) {
+        expect(t.defaultOutstanding(axi), 8, reason: t.name);
+        expect(t.defaultOutstanding(wb), 1);
+      }
+    });
+    test('an explicit value wins', () {
+      final s = HarborSdram(
+        config: const HarborSdramConfig.as4c16m16sb6(),
+        baseAddress: 0x80000000,
+        clockHz: 25000000,
+        busClockSync: true,
+        protocol: HarborFabricKind.axi4,
+        outstanding: 4,
+        target: const HarborFpgaTarget.ecp5(
+          device: 'LFE5U-85F',
+          package: 'CABGA381',
+        ),
+      );
+      expect(s.outstanding, 4);
+    });
+  });
+
   group('HarborFpgaTarget.ice40', () {
     late HarborFpgaTarget target;
 

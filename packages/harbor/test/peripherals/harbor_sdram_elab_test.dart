@@ -160,8 +160,8 @@ void main() {
           idWidth: 3,
         );
         await sdram.build();
-        final q = harborCdcDepth(8);
-        expect(sdram.outstanding, 8);
+        final q = harborCdcDepth(2);
+        expect(sdram.outstanding, 2);
         expect(sdram.cdcDepth, q);
         expect(sdram.bus!.cdcDepth, q);
         final mods = tree(sdram).toList();
@@ -199,7 +199,7 @@ void main() {
         );
         expect(
           sdram.definitionName,
-          startsWith('HarborSdram_ecp5_${kind.name}_i3_n8_q$q'),
+          startsWith('HarborSdram_ecp5_${kind.name}_i3_n2_q$q'),
         );
       },
     );

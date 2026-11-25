@@ -1,3 +1,4 @@
+import '../bus/port/fabric_kind.dart' show HarborFabricKind;
 import '../debug/jtag_remote.dart' show JtagRemote;
 import '../pdk/io_ring.dart';
 import '../pdk/klayout.dart';
@@ -21,6 +22,15 @@ sealed class HarborDeviceTarget {
   /// A null answer means the block must build the array from flops instead.
   /// Every target answers, so a new family only has to add its own case.
   HarborBlockRam? get blockRam => null;
+
+  /// The default outstanding limit of a memory port on a fabric of [kind].
+  /// Wishbone is 1. AXI4 and TileLink are 2 on a small part (Spartan-7, ECP5,
+  /// iCE40) and 8 on every other target. An explicit `outstanding:` wins.
+  int defaultOutstanding(HarborFabricKind kind) =>
+      kind == HarborFabricKind.wishbone ? 1 : (smallPart ? 2 : 8);
+
+  /// True for a part where the area of a deep outstanding queue does not fit.
+  bool get smallPart => false;
 
   const HarborDeviceTarget();
 }
@@ -259,6 +269,12 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// Set by the constructor, not derived from [vendor] or [name], so a new
   /// Xilinx family only has to set this field.
   final _XilinxFamily? _xilinxFamily;
+
+  @override
+  bool get smallPart =>
+      vendor == HarborFpgaVendor.ecp5 ||
+      vendor == HarborFpgaVendor.ice40 ||
+      _xilinxFamily == _XilinxFamily.spartan7;
 
   /// Runs the full `synth_ecp5`, including its `autoname` pass. Other
   /// vendors ignore it.

@@ -81,7 +81,7 @@ void main() {
         final sv = ddr.dumpSystemVerilog();
         expect(sv, contains('sdram_dq'));
         expect(ddr.bus.kind, kind);
-        final n = HarborDdr3.defaultOutstanding(kind);
+        final n = kind == HarborFabricKind.wishbone ? 1 : 2;
         expect(ddr.outstanding, n);
         expect(ddr.bus.cdcDepth, harborCdcDepth(n));
         expect(ddr.definitionName, contains('_${kind.name}_'));
