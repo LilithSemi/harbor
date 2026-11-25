@@ -501,7 +501,7 @@ class HarborSoC extends BridgeModule {
   /// [copies] copies of the reset of the clock domain [domainName], for logic
   /// that the SoC does not wire, from a branch with the instance name [name].
   /// In a domain of [localResetDomains], each copy is its own kept release
-  /// flop and releases on the same edge as the module resets of the domain.
+  /// flop and releases on the same edge as the domain reset.
   /// Otherwise each copy is the domain reset. Throws when there is no such
   /// domain.
   List<Logic> resetCopies(String domainName, String name, {int copies = 1}) {

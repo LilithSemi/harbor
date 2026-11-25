@@ -6,6 +6,7 @@ import '../blackbox/ice40/ice40.dart';
 import '../blackbox/ecp5/ecp5.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../util/pretty_string.dart';
+import 'cdc.dart' show harborSimPowerUp;
 
 /// Configuration for a clock domain.
 ///
@@ -359,8 +360,10 @@ class HarborClockGenerator {
   /// deassertion is re-timed through a two-flop synchronizer clocked in the
   /// domain. This avoids recovery/removal hazards when the source (input
   /// reset, power-on reset, or PLL lock) releases asynchronously to [domClk].
-  /// The pipe resets to zero while [assertSrc] is high and shifts in ones
-  /// after it falls, so reset releases two clean domain edges later. FPGA
+  /// The pipe clears at once while [assertSrc] is high, also with no clock
+  /// edge, and shifts in ones after it falls, so reset releases two clean
+  /// domain edges later. Thus a [HarborRegisteredResetBranch] on the pipe
+  /// sees each pulse that the domain reset sees. FPGA
   /// flops power up to zero (reset asserted), and on ASIC the externally
   /// held reset clears the pipe within two edges regardless of power-up
   /// state.
@@ -374,9 +377,14 @@ class HarborClockGenerator {
 
   Logic _retimed(Logic domClk, Logic assertSrc, String name) {
     final pipe = Logic(name: '${name}RstSync', width: 2);
-    Sequential(domClk, reset: assertSrc, [
-      pipe < [pipe[0], Const(1)].concat(),
-    ]);
+    Sequential(
+      domClk,
+      [
+        pipe < [pipe[0], Const(1)].concat(),
+      ],
+      reset: assertSrc,
+      asyncReset: true,
+    );
     final result = (assertSrc | ~pipe[1]).named('${name}Reset');
     _resetBranchSources[result] = (hold: assertSrc, release: pipe[0]);
     return result;
@@ -1613,8 +1621,9 @@ Ecp5Ddr3Clocks buildEcp5Ddr3ClockTree(
 /// [copies] outputs comes from its own flop, and synthesis keeps each flop,
 /// so each copy drives its own part of the reset fanout. A copy sets at once
 /// on `reset_assert` and clears on the edge after `release_in` goes high.
-/// The stage before the copies is shared, so all copies release on the same
-/// clock edge.
+/// All copies share the stage before them, so they release on the same edge.
+/// On the domain reset pipe of [HarborClockGenerator], this is also the edge
+/// where the domain reset releases.
 class HarborRegisteredResetBranch extends BridgeModule
     implements HarborPreserveRegisters {
   /// The number of outputs.
@@ -1643,6 +1652,8 @@ class HarborRegisteredResetBranch extends BridgeModule
       asyncReset: true,
       resetValues: {for (final q in flops) q: Const(1)},
     );
+    // A ROHD flop does not see a reset that is high from time 0.
+    harborSimPowerUp(input('clk'), flops, value: 1);
     for (var i = 0; i < copies; i++) {
       addOutput(outputName(i)) <= flops[i];
     }

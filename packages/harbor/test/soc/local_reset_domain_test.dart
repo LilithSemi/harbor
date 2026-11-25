@@ -313,4 +313,69 @@ void main() {
       sys.reset,
     ]);
   });
+
+  test(
+    'the copies and the domain reset agree on every edge and pulse',
+    () async {
+      final clk = Logic(name: 'clk')..put(0);
+      final hold = Logic(name: 'hold')..put(1);
+      final gen = HarborClockGenerator(
+        parent: BridgeModule('GenParent'),
+        inputClk: clk,
+        inputReset: hold,
+      );
+      final domain = gen.createDomain(
+        HarborClockConfig.fixed(name: 'sys', frequency: 1, isPrimary: true),
+      );
+      final taps = gen.resetBranchSource(domain)!;
+      final branch = HarborRegisteredResetBranch(name: 'branch', copies: 2);
+      branch.input('clk').srcConnection! <= clk;
+      branch.input('reset_assert').srcConnection! <= taps.hold;
+      branch.input('release_in').srcConnection! <= taps.release;
+      await branch.build();
+
+      var samples = 0;
+      void at(int time, void Function() action) =>
+          Simulator.registerAction(time, action);
+      void sample(int time, int expected) => at(time, () {
+        expect(domain.reset.value.toInt(), expected, reason: 'domain at $time');
+        for (final o in branch.resetOuts) {
+          expect(o.value.toInt(), expected, reason: '${o.name} at $time');
+        }
+        samples++;
+      });
+      void edge(int time) {
+        at(time, () => clk.put(1));
+        at(time + 2, () => clk.put(0));
+      }
+
+      sample(1, 1);
+      edge(5);
+      at(8, () => hold.put(0));
+      edge(10);
+      sample(11, 1);
+      edge(15);
+      sample(16, 0);
+      // A pulse with no clock edge resets the domain and the copies.
+      at(20, () => hold.put(1));
+      sample(21, 1);
+      at(23, () => hold.put(0));
+      sample(24, 1);
+      edge(30);
+      sample(31, 1);
+      edge(35);
+      sample(36, 0);
+      // A pulse over one edge.
+      at(40, () => hold.put(1));
+      edge(45);
+      at(48, () => hold.put(0));
+      sample(49, 1);
+      edge(50);
+      sample(51, 1);
+      edge(55);
+      sample(56, 0);
+      await Simulator.run();
+      expect(samples, 10);
+    },
+  );
 }

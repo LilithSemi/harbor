@@ -1100,8 +1100,8 @@ class HarborGtxPciePhy extends Module {
       wdPend < ((wdPend | wdK) & (restartPulse ?? Const(0))),
       // The cause is taken when the decision is made, and moves on with it.
       causeSync1 < (~rateD & orAll(syncStates)),
-      // An AND-OR and not a mux, so synthesis does not merge rateD into
-      // the flop reset.
+      // An AND-OR and not a mux. The intent is that synthesis does not
+      // merge rateD into the flop reset.
       code1 <
           ((codeOf(_S.rateChange) & rateD.replicate(4)) |
               (stateCode & (~rateD).replicate(4))),
