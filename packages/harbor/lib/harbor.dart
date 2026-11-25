@@ -108,6 +108,7 @@ export 'src/pdk/analog_block.dart';
 export 'src/pdk/gf180mcu.dart';
 export 'src/pdk/io_ring.dart';
 export 'src/pdk/klayout.dart';
+export 'src/pdk/chip_top.dart';
 export 'src/pdk/pad_library.dart';
 export 'src/pdk/pad_plan.dart';
 export 'src/pdk/pdk_provider.dart';
