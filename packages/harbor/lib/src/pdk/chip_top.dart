@@ -17,6 +17,22 @@ String harborChipTopVerilog({
   required List<HarborPadPort> corePorts,
   String topName = 'chip_top',
 }) {
+  final known = {for (final p in corePorts) p.name};
+  for (final pad in plan.all) {
+    final port = pad.port;
+    if (port != null && !known.contains(port.name)) {
+      throw ArgumentError(
+        'Pad ${pad.inst} uses port ${port.name} that is not a core port',
+      );
+    }
+  }
+  final padded = {for (final pad in plan.all) pad.port?.name};
+  for (final p in corePorts) {
+    if (!padded.contains(p.name)) {
+      throw ArgumentError('Core port ${p.name} has no pad in the pad plan');
+    }
+  }
+
   final pins = <String>[];
   final conns = <String>[];
   final wires = <String>[];

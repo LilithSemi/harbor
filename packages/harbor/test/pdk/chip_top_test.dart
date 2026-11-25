@@ -87,4 +87,59 @@ void main() {
       expect(uses(n), 1, reason: n);
     }
   });
+
+  test('each pad takes its own bit', () {
+    expect(padLine('btn_pad_1'), contains('.Y(btn[1])'));
+    expect(padLine('btn_pad_1'), contains('.PAD(btn_PAD[1])'));
+    expect(padLine('led_pad_0'), contains('.A(led[0])'));
+  });
+
+  test('wire, inout and core connections', () {
+    expect(v, contains('  wire [1:0] btn;'));
+    expect(v, contains('  wire [2:0] led;'));
+    expect(v, contains('  wire [1:0] sd_oe;'));
+    expect(v, contains('  wire clk;'));
+    expect(v, contains('  inout [2:0] led_PAD'));
+    expect(v, contains('  inout [1:0] sd_PAD'));
+    expect(v, contains('  inout clk_PAD'));
+    for (final n in ['clk', 'btn', 'led', 'sd_out', 'sd_oe', 'sd_in']) {
+      expect(v, contains('.$n($n)'));
+    }
+  });
+
+  test('analog pad has no tie-offs', () {
+    expect(
+      padLine('vref_pad_0').contains(RegExp(r'\.(PU|PD|OE|IE)\(')),
+      isFalse,
+    );
+  });
+
+  test('a pad port missing from the core ports throws', () {
+    expect(
+      () => harborChipTopVerilog(
+        plan: plan,
+        library: _lib,
+        coreModule: 'soc',
+        corePorts: _ports.where((p) => p.name != 'led').toList(),
+      ),
+      throwsA(isA<ArgumentError>().having((e) => '$e', 'msg', contains('led'))),
+    );
+  });
+
+  test('a core port without a pad throws', () {
+    expect(
+      () => harborChipTopVerilog(
+        plan: plan,
+        library: _lib,
+        coreModule: 'soc',
+        corePorts: [
+          ..._ports,
+          HarborPadPort(name: 'extra', width: 1, kind: HarborPadKind.input),
+        ],
+      ),
+      throwsA(
+        isA<ArgumentError>().having((e) => '$e', 'msg', contains('extra')),
+      ),
+    );
+  });
 }
