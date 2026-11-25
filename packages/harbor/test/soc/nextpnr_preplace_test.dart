@@ -261,11 +261,12 @@ void main() {
         contains(
           '\tnextpnr-himbaechel --device \$(PART) -o xdc=\$(TOP).xdc '
           '--json \$(TOP).json --write \$(TOP)_routed.json '
-          '-o fasm=\$(TOP).fasm \$(PREPACK) --placer \$(PLACER) '
+          '-o fasm=\$(TOP).fasm --placer \$(PLACER) '
           '--router \$(ROUTER) --threads \$(THREADS) --seed \$(SEED)',
         ),
       );
       expect(mk, isNot(contains('nextpnr-xilinx')));
+      expect(mk, isNot(contains('PREPACK')));
       expect(mk, isNot(contains('PREPLACE')));
       expect(mk, isNot(contains('PREROUTE')));
       expect(mk, isNot(contains('CHIPDB')));

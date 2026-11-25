@@ -2730,9 +2730,9 @@ class HarborSoC extends BridgeModule {
           final preplacePy = <String>[];
 
           // openXC7 DDR3 nextpnr helper scripts. Legacy nextpnr-xilinx needs
-          // the train SERDES pinned off the dead _SING tile through pre-place.
-          // Himbächel pairs the SERDES during packing, so it only uses the
-          // clock constraint script below.
+          // the train SERDES pinned off the dead _SING tile through pre-place
+          // and the clocks.py script below. Himbächel has no Python, so it
+          // pairs the SERDES during packing and reads the clocks from the XDC.
           var clocksPyWritten = false;
           if (t.vendor == HarborFpgaVendor.openXc7) {
             final ddr = peripherals.whereType<HarborDdr3>().firstOrNull;
@@ -2761,7 +2761,10 @@ class HarborSoC extends BridgeModule {
               // CK/4). At gearRatio 1 the two are equal, so this is byte-
               // identical for the legacy path.
               final ddrCtrlMhz = xilinxDdr3Clocks?.controllerClkMhz;
-              if (coreMhz != null && sourceMhz != null && ddrCtrlMhz != null) {
+              if (!t.useHimbaechel &&
+                  coreMhz != null &&
+                  sourceMhz != null &&
+                  ddrCtrlMhz != null) {
                 clocksPyWritten = true;
                 Directory('$path/support/nextpnr').createSync(recursive: true);
                 File('$path/support/nextpnr/clocks.py').writeAsStringSync(
@@ -2787,21 +2790,22 @@ class HarborSoC extends BridgeModule {
                 'its clocks. Use Himbächel or add the controller.',
               );
             }
-            // The Makefile gives clocks.py to Himbächel too, so when it is
-            // written it times each PLL clock and the XDC does not. Else the
-            // XDC times the PLL clocks and the DDR3 tree.
-            final xdcClocks = clocksPyWritten
-                ? const <String, double>{}
-                : {
-                    if (_hasDdr3ClockTree && _xilinxPassthroughMhz != null)
-                      'sysosc_clk': _xilinxPassthroughMhz!,
-                    ..._ddr3TreeClockMhz,
-                    ...pllClocks,
-                  };
-            if (t.useHimbaechel && xdcClocks.isNotEmpty) {
+            if (t.useHimbaechel) {
+              // One create_clock for each clock net. A net that the board
+              // constraints already time is not timed again.
+              final ddrClkMhz = xilinxDdr3Clocks?.controllerClkMhz;
               final xdc = File('$path/$name.${t.constraintExtension}');
-              final lines = StringBuffer(xdc.readAsStringSync());
-              for (final e in xdcClocks.entries) {
+              final text = xdc.readAsStringSync();
+              final timed = harborXdcClockNets(text);
+              final lines = StringBuffer(text);
+              for (final e in {
+                if (_hasDdr3ClockTree && _xilinxPassthroughMhz != null)
+                  'sysosc_clk': _xilinxPassthroughMhz!,
+                ..._ddr3TreeClockMhz,
+                if (ddr != null && ddrClkMhz != null) 'ddr_clk': ddrClkMhz,
+                ...pllClocks,
+              }.entries) {
+                if (!timed.add(e.key)) continue;
                 lines.writeln(
                   'create_clock -period '
                   '${(1000 / e.value).toStringAsFixed(3)} '
@@ -2809,26 +2813,12 @@ class HarborSoC extends BridgeModule {
                 );
               }
               xdc.writeAsStringSync(lines.toString());
-            } else if (!t.useHimbaechel &&
-                !_hasDdr3ClockTree &&
-                pllClocks.isNotEmpty) {
+              _checkClockDomainConstraints(timed);
+            } else if (!_hasDdr3ClockTree && pllClocks.isNotEmpty) {
               Directory('$path/support/nextpnr').createSync(recursive: true);
               File(
                 '$path/support/nextpnr/pll_clocks.py',
               ).writeAsStringSync(t.generatePllClockConstraintPy(pllClocks));
-            }
-            if (t.useHimbaechel) {
-              final xdc = File('$path/$name.${t.constraintExtension}');
-              _checkClockDomainConstraints({
-                if (xdc.existsSync())
-                  ...harborXdcClockNets(xdc.readAsStringSync()),
-                if (clocksPyWritten) ...[
-                  'sysosc_clk',
-                  'core_clk',
-                  'ddr_clk',
-                  ...pllClocks.keys,
-                ],
-              });
             }
           } else if (t.vendor == HarborFpgaVendor.vivado &&
               providedClocks.isNotEmpty) {

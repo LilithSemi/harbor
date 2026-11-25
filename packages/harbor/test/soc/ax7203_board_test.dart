@@ -373,11 +373,13 @@ void main() {
     final target = board.fpgaTarget(useHimbaechel: true);
     await _soc(target, withEth: false).generateAll(dir);
 
-    final clocks = File(
-      '${dir.path}/support/nextpnr/clocks.py',
-    ).readAsStringSync();
-    expect(clocks, contains("('sysosc_clk', 200.00)"));
-    expect(clocks, contains("('core_clk', 140.00)"));
+    expect(File('${dir.path}/support/nextpnr/clocks.py').existsSync(), isFalse);
+    final xdc = File('${dir.path}/Ax7203Soc.xdc').readAsStringSync();
+    expect(xdc, contains('create_clock -period 10.000 [get_nets core_clk]'));
+    expect(
+      RegExp(r'create_clock .*\[get_nets ddr_clk\]').allMatches(xdc),
+      hasLength(1),
+    );
     final generatedRtl = Directory('${dir.path}/rtl')
         .listSync(recursive: true)
         .whereType<File>()
@@ -437,10 +439,10 @@ void main() {
       generatedRtl,
       matches(RegExp(r'ddr3clk_ctrl_bufg\s*\([^;]*\.O\(ddr_ck4_clk\)')),
     );
-    final clocks = File(
-      '${dir.path}/support/nextpnr/clocks.py',
-    ).readAsStringSync();
-    expect(clocks, contains("('ddr_clk', 62.50)"));
+    expect(
+      File('${dir.path}/Ax7203Soc.xdc').readAsStringSync(),
+      contains('create_clock -period 20.000 [get_nets ddr_clk]'),
+    );
   });
 
   test('one leg of the differential clock binds both', () {

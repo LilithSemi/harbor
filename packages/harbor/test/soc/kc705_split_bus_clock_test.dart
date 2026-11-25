@@ -133,29 +133,26 @@ void main() {
       final dir = await _generate(useHimbaechel: true, ddr: ddr);
       addTearDown(() => dir.deleteSync(recursive: true));
       final xdc = _read(dir, 'SplitBus.xdc');
-      final py = ddr ? _read(dir, 'support/nextpnr/clocks.py') : '';
       expect(xdc, isNot(contains('dst_clk')));
       expect(
         _read(dir, 'rtl/SplitBus.sv'),
         contains('(* keep = 1 *) logic bus_clk;'),
       );
-      // One constraint for the net, from clocks.py when it is written.
-      final inXdc = RegExp(r'create_clock .*\[get_nets bus_clk\]');
-      final inPy = RegExp(r"\('bus_clk', [0-9.]+\)");
+      // Himbächel has no Python, so the XDC alone times the clocks.
       expect(
-        inXdc.allMatches(xdc).length + inPy.allMatches(py).length,
-        1,
-        reason: '$xdc\n$py',
+        File('${dir.path}/support/nextpnr/clocks.py').existsSync(),
+        isFalse,
       );
-      if (ddr) {
-        expect(py, contains("('bus_clk', 83.33)"));
-      } else {
-        expect(xdc, contains('create_clock -period 12.000 [get_nets bus_clk]'));
+      expect(_read(dir, 'Makefile'), isNot(contains('PREPACK')));
+      for (final net in ['bus_clk', 'core_clk', if (ddr) 'ddr_clk']) {
         expect(
-          xdc,
-          contains('create_clock -period 20.000 [get_nets core_clk]'),
+          RegExp('create_clock .*\\[get_nets $net\\]').allMatches(xdc),
+          hasLength(1),
+          reason: net,
         );
       }
+      expect(xdc, contains('create_clock -period 12.000 [get_nets bus_clk]'));
+      expect(xdc, contains('create_clock -period 20.000 [get_nets core_clk]'));
     });
   }
 

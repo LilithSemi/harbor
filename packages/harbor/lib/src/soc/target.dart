@@ -1202,20 +1202,23 @@ def require_net(net):
           '--pre-route support/nextpnr/show_bels.py,)',
         );
       }
-      buf.writeln(
-        '# --pre-pack over-constrains the PLL/BUFG-derived clocks (which',
-      );
-      buf.writeln(
-        '# nextpnr leaves unconstrained); --timing-allow-fail still writes a',
-      );
-      buf.writeln('# bitstream when the aggressive target is not met.');
-      buf.writeln(
-        pllClockScript
-            ? 'PREPACK := \$(if \$(wildcard support/nextpnr/pll_clocks.py),'
-                  '--pre-pack support/nextpnr/pll_clocks.py,)'
-            : 'PREPACK := \$(if \$(wildcard support/nextpnr/clocks.py),'
-                  '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
-      );
+      // Himbächel has no Python, so the XDC carries its clocks.
+      if (!useHimbaechel) {
+        buf.writeln(
+          '# --pre-pack over-constrains the PLL/BUFG-derived clocks (which',
+        );
+        buf.writeln(
+          '# nextpnr leaves unconstrained); --timing-allow-fail still writes a',
+        );
+        buf.writeln('# bitstream when the aggressive target is not met.');
+        buf.writeln(
+          pllClockScript
+              ? 'PREPACK := \$(if \$(wildcard support/nextpnr/pll_clocks.py),'
+                    '--pre-pack support/nextpnr/pll_clocks.py,)'
+              : 'PREPACK := \$(if \$(wildcard support/nextpnr/clocks.py),'
+                    '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
+        );
+      }
       buf.writeln();
       final patches = [
         for (final p in bitstreamPatches)
@@ -1234,7 +1237,7 @@ def require_net(net):
           '\tnextpnr-himbaechel --device \$(PART) '
           '-o xdc=\$(TOP).$constraintExtension '
           '--json \$(TOP).json --write \$(TOP)_routed.json '
-          '-o fasm=\$(TOP).fasm \$(PREPACK) --placer \$(PLACER) '
+          '-o fasm=\$(TOP).fasm --placer \$(PLACER) '
           '--router \$(ROUTER) --threads \$(THREADS) --seed \$(SEED) '
           '-l \$(TOP)_pnr.log \$(PNRFLAGS)',
         );
