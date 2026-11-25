@@ -66,6 +66,7 @@ class Gf180mcuProvider extends PdkProvider {
     antennaCell: '${_libName}__antenna',
     pinHorizontalLayer: 'Metal3',
     pinVerticalLayer: 'Metal2',
+    wireRcLayer: 'Metal2',
     powerPins: const ['VDD', 'VNW'],
     groundPins: const ['VSS', 'VPW'],
     tapCell: '${_libName}__filltie',

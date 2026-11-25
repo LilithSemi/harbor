@@ -69,6 +69,7 @@ class Sky130Provider extends PdkProvider {
     antennaCell: '${_libName}__diode_2',
     pinHorizontalLayer: 'met3',
     pinVerticalLayer: 'met2',
+    wireRcLayer: 'met2',
     // Only the hd library is checked against the PDK. The other variants
     // keep the default pins and get no tap cells or PDN.
     powerPins: _isHd ? const ['VPWR', 'VPB'] : const ['VDD'],

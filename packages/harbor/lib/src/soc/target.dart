@@ -2076,6 +2076,14 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('read_verilog \$::env(SYNTH_V)');
     buf.writeln('link_design $topCell');
     buf.writeln('read_sdc \$::env(SDC_FILE)');
+    final rcLayer = lib.wireRcLayer;
+    if (rcLayer != null) {
+      buf.writeln('if {[info exists ::env(RC_TCL)]} {');
+      buf.writeln('    source \$::env(RC_TCL)');
+      buf.writeln('} else {');
+      buf.writeln('    set_wire_rc -layer $rcLayer');
+      buf.writeln('}');
+    }
     buf.writeln();
 
     // Floorplan: a fixed DIE_AREA (fab-slot tapeouts) takes precedence over a
@@ -2151,9 +2159,14 @@ class HarborAsicTarget extends HarborDeviceTarget {
         'clock_tree_synthesis -buf_list '
         '{${lib.clockBufferCells.join(" ")}}',
       );
+      buf.writeln('set_propagated_clock [all_clocks]');
       buf.writeln('detailed_placement');
       buf.writeln();
     }
+    buf.writeln('estimate_parasitics -placement');
+    buf.writeln('repair_timing -hold');
+    buf.writeln('detailed_placement');
+    buf.writeln();
 
     // Routing: skip lower metal layers in hierarchical mode
     if (isHierarchical && topRoutingMinLayer > 1) {

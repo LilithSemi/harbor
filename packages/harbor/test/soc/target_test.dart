@@ -860,6 +860,23 @@ void main() {
       );
     });
 
+    test('generateOpenroadTcl repairs hold after CTS', () {
+      final tcl = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(tcl, contains('set_wire_rc -layer Metal2'));
+      final cts = tcl.indexOf('clock_tree_synthesis');
+      final hold = tcl.indexOf('repair_timing -hold');
+      expect(cts, isNonNegative);
+      expect(tcl.indexOf('set_propagated_clock', cts), lessThan(hold));
+      expect(hold, lessThan(tcl.indexOf('global_route')));
+      expect(
+        tcl.indexOf('detailed_placement', hold),
+        lessThan(tcl.indexOf('global_route')),
+      );
+    });
+
     test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
       final tcl = HarborAsicTarget(
         provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),

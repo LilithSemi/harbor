@@ -50,6 +50,9 @@ class StandardCellLibrary with HarborPrettyString {
   /// Vertical routing layer for top-level pins (`place_pins -ver_layers`).
   final String? pinVerticalLayer;
 
+  /// Layer for `set_wire_rc` when the flow has no `RC_TCL`.
+  final String? wireRcLayer;
+
   /// Cell pin names that connect to the power net.
   final List<String> powerPins;
 
@@ -84,6 +87,7 @@ class StandardCellLibrary with HarborPrettyString {
     this.antennaCell,
     this.pinHorizontalLayer,
     this.pinVerticalLayer,
+    this.wireRcLayer,
     this.powerPins = const ['VDD'],
     this.groundPins = const ['VSS'],
     this.tapCell,
