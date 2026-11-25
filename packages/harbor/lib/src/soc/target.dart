@@ -1657,7 +1657,9 @@ class HarborAsicTarget extends HarborDeviceTarget {
   ///
   /// In hierarchical mode, macro modules are replaced with blackbox
   /// stubs so only the glue logic is synthesized at the top level.
-  String generateYosysTcl() {
+  ///
+  /// Set [hasBlackboxes] when `blackboxes.v` exists next to the script.
+  String generateYosysTcl({bool hasBlackboxes = false}) {
     final lib = provider.standardCellLibrary;
     final buf = StringBuffer();
     buf.writeln('# Auto-generated Yosys synthesis for $topCell');
@@ -1678,8 +1680,9 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('set ipdir [file dirname [info script]]');
     buf.writeln('read_verilog -sv \$ipdir/rtl/*.sv');
 
-    // Read blackbox stubs for hard macros (SRAM, etc.)
-    buf.writeln('read_verilog -lib \$ipdir/blackboxes.v');
+    if (hasBlackboxes) {
+      buf.writeln('read_verilog -lib \$ipdir/blackboxes.v');
+    }
 
     // In hierarchical mode, replace macros with blackbox stubs
     if (isHierarchical) {

@@ -613,6 +613,21 @@ void main() {
       expect(tcl, contains('synth'));
     });
 
+    test('generateYosysTcl reads blackboxes.v only when told it exists', () {
+      final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
+      expect(target.generateYosysTcl(), isNot(contains('blackboxes.v')));
+      expect(
+        target.generateYosysTcl(hasBlackboxes: true),
+        contains('read_verilog -lib \$ipdir/blackboxes.v'),
+      );
+      final hier = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+        macros: const [HarborAsicMacro(moduleName: 'Core')],
+      );
+      expect(hier.generateYosysTcl(), isNot(contains('blackboxes.v')));
+    });
+
     test('generateOpenroadTcl contains read_liberty', () {
       final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
       final tcl = target.generateOpenroadTcl();
