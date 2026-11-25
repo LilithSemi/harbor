@@ -1,4 +1,5 @@
 import 'analog_block.dart';
+import 'pad_library.dart';
 import 'pdk_provider.dart';
 import 'standard_cell_library.dart';
 
@@ -33,6 +34,46 @@ class Gf180mcuProvider extends PdkProvider {
     Gf180mcuVoltage.v3_3 => 3.3,
     Gf180mcuVoltage.v5_0 => 5.0,
   };
+
+  @override
+  HarborPadLibrary get padLibrary => const HarborPadLibrary(
+    libName: 'gf180mcu_fd_io',
+    master: {
+      HarborPadKind.input: 'in_c',
+      HarborPadKind.clockInput: 'in_s',
+      HarborPadKind.output: 'bi_24t',
+      HarborPadKind.bidir: 'bi_24t',
+      HarborPadKind.analog: 'asig_5p0',
+      HarborPadKind.ioPower: 'dvdd',
+      HarborPadKind.ioGround: 'dvss',
+      HarborPadKind.corePower: 'dvdd',
+      HarborPadKind.coreGround: 'dvss',
+    },
+    tieOffs: {
+      HarborPadKind.input: {'PU': "1'b0", 'PD': "1'b0"},
+      HarborPadKind.clockInput: {'PU': "1'b0", 'PD': "1'b0"},
+      HarborPadKind.output: {
+        'OE': "1'b1",
+        'IE': "1'b0",
+        'CS': "1'b0",
+        'SL': "1'b0",
+        'PU': "1'b0",
+        'PD': "1'b0",
+      },
+      HarborPadKind.bidir: {
+        'IE': "1'b1",
+        'CS': "1'b0",
+        'SL': "1'b0",
+        'PU': "1'b0",
+        'PD': "1'b0",
+      },
+    },
+    padPin: 'PAD',
+    inPin: 'Y',
+    outPin: 'A',
+    oePin: 'OE',
+    analogPin: 'ASIG5V',
+  );
 
   String get _libName => switch (voltage) {
     Gf180mcuVoltage.v3_3 => 'gf180mcu_fd_sc_mcu7t5v0',

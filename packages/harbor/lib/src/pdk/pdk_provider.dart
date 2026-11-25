@@ -1,4 +1,5 @@
 import 'analog_block.dart';
+import 'pad_library.dart';
 import 'standard_cell_library.dart';
 
 /// Abstract interface for PDK-specific configuration.
@@ -40,6 +41,10 @@ abstract class PdkProvider {
 
   /// Returns a power pad cell descriptor.
   AnalogBlock? powerPad({required String net}) => null;
+
+  /// Pad cells for a generated pad ring. Null when the PDK has no
+  /// verified pad cells.
+  HarborPadLibrary? get padLibrary => null;
 
   /// Returns an eFuse macro descriptor for OTP storage.
   ///
