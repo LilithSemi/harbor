@@ -1662,6 +1662,8 @@ class HarborAsicTarget extends HarborDeviceTarget {
   String generateYosysTcl({bool hasBlackboxes = false}) {
     final lib = provider.standardCellLibrary;
     final buf = StringBuffer();
+    // asix runs `yosys -c`, a Tcl shell, so the Yosys commands must be imported.
+    buf.writeln('yosys -import');
     buf.writeln('# Auto-generated Yosys synthesis for $topCell');
     buf.writeln('# PDK: ${provider.name}');
     buf.writeln(
@@ -1696,7 +1698,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     }
 
     buf.writeln('hierarchy -top $topCell -keep_portwidths');
-    buf.writeln('synth -top $topCell');
+    buf.writeln('synth -top $topCell -flatten');
     buf.writeln('dfflibmap -liberty \$::env(LIB_FILE)');
     buf.writeln('abc -liberty \$::env(LIB_FILE)');
     buf.writeln(
@@ -1715,6 +1717,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
   String generateMacroYosysTcl(HarborAsicMacro macro) {
     final lib = provider.standardCellLibrary;
     final buf = StringBuffer();
+    buf.writeln('yosys -import');
     buf.writeln(
       '# Auto-generated Yosys synthesis for macro: ${macro.moduleName}',
     );

@@ -613,6 +613,20 @@ void main() {
       expect(tcl, contains('synth'));
     });
 
+    test('generateYosysTcl imports yosys commands and flattens', () {
+      final target = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+        macros: const [HarborAsicMacro(moduleName: 'Core')],
+      );
+      final tcl = target.generateYosysTcl();
+      expect(tcl.split('\n').first, equals('yosys -import'));
+      expect(tcl, contains('synth -top MySoC -flatten'));
+      final macro = target.generateMacroYosysTcl(target.macros.first);
+      expect(macro.split('\n').first, equals('yosys -import'));
+      expect(macro, contains('synth -top Core -flatten'));
+    });
+
     test('generateYosysTcl reads blackboxes.v only when told it exists', () {
       final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
       expect(target.generateYosysTcl(), isNot(contains('blackboxes.v')));
