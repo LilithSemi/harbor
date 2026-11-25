@@ -2,6 +2,7 @@ import '../debug/jtag_remote.dart' show JtagRemote;
 import '../pdk/io_ring.dart';
 import '../pdk/klayout.dart';
 import '../pdk/pdk_provider.dart';
+import '../pdk/standard_cell_library.dart';
 
 /// Build target describing whether the SoC targets an FPGA or ASIC,
 /// and which vendor/PDK to use.
@@ -1820,14 +1821,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
 
     // Routing
     buf.writeln('global_route -allow_congestion');
-    buf.writeln('detailed_route');
+    _writeDetailedRoute(buf, lib, '    detailed_route', '    detailed_route');
     buf.writeln();
 
-    // Fill
-    if (lib.fillCells.isNotEmpty) {
-      buf.writeln('filler_placement ${lib.fillCells.join(" ")}');
-      buf.writeln();
-    }
+    _writeFill(buf, lib);
 
     // Output macro artifacts
     buf.writeln('# Macro outputs');
@@ -1839,6 +1836,58 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('report_design_area > ${m}_area.rpt');
 
     return buf.toString();
+  }
+
+  /// Writes antenna repair around detailed routing.
+  ///
+  /// [withEnv] runs when [guardEnv] is set, [without] runs otherwise. With no
+  /// guard, [without] runs.
+  static void _writeDetailedRoute(
+    StringBuffer buf,
+    StandardCellLibrary lib,
+    String withEnv,
+    String without, {
+    String? guardEnv,
+  }) {
+    final diode = lib.antennaCell;
+    if (diode != null) {
+      buf.writeln('set _diode $diode');
+      buf.writeln(
+        'repair_antennas \$_diode -iterations 3 -ratio_margin 10 '
+        '-allow_congestion',
+      );
+    }
+    void route() {
+      if (guardEnv == null) {
+        buf.writeln(without.trim());
+        return;
+      }
+      buf.writeln('if {[info exists ::env($guardEnv)]} {');
+      buf.writeln(withEnv);
+      buf.writeln('} else {');
+      buf.writeln(without);
+      buf.writeln('}');
+    }
+
+    route();
+    if (diode != null) {
+      buf.writeln('for {set _i 0} {\$_i < 3 && [check_antennas]} {incr _i} {');
+      buf.writeln(
+        '    if {![repair_antennas \$_diode -ratio_margin 10 '
+        '-allow_congestion]} { break }',
+      );
+      route();
+      buf.writeln('}');
+      buf.writeln('check_antennas');
+    }
+  }
+
+  /// Writes decap cell fill, then plain cell fill. Metal fill is left to asix.
+  static void _writeFill(StringBuffer buf, StandardCellLibrary lib) {
+    final cells = [...lib.decapCells, ...lib.fillCells];
+    if (cells.isEmpty) return;
+    buf.writeln('filler_placement {${cells.join(" ")}}');
+    buf.writeln();
   }
 
   /// Generates an OpenROAD place-and-route TCL script for the top level.
@@ -1967,18 +2016,16 @@ class HarborAsicTarget extends HarborDeviceTarget {
       );
     }
     buf.writeln('global_route -allow_congestion');
-    buf.writeln('if {[info exists ::env(DROUTE_END_ITER)]} {');
-    buf.writeln('    detailed_route -droute_end_iter \$::env(DROUTE_END_ITER)');
-    buf.writeln('} else {');
-    buf.writeln('    detailed_route');
-    buf.writeln('}');
+    _writeDetailedRoute(
+      buf,
+      lib,
+      '    detailed_route -droute_end_iter \$::env(DROUTE_END_ITER)',
+      '    detailed_route',
+      guardEnv: 'DROUTE_END_ITER',
+    );
     buf.writeln();
 
-    // Fill
-    if (lib.fillCells.isNotEmpty) {
-      buf.writeln('filler_placement ${lib.fillCells.join(" ")}');
-      buf.writeln();
-    }
+    _writeFill(buf, lib);
 
     // Reports & outputs
     buf.writeln('report_checks -path_delay min_max > timing.rpt');

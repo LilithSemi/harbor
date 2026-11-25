@@ -62,6 +62,8 @@ class Gf180mcuProvider extends PdkProvider {
       '${_libName}__fill_2',
       '${_libName}__fill_4',
     ],
+    decapCells: ['${_libName}__fillcap_*'],
+    antennaCell: '${_libName}__antenna',
   );
 
   @override

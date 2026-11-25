@@ -38,6 +38,12 @@ class StandardCellLibrary with HarborPrettyString {
   /// Fill cell names for density fill.
   final List<String> fillCells;
 
+  /// Decap cell names or glob patterns, placed before [fillCells].
+  final List<String> decapCells;
+
+  /// Antenna diode cell name for `repair_antennas`.
+  final String? antennaCell;
+
   const StandardCellLibrary({
     required this.name,
     required this.libertyPath,
@@ -50,6 +56,8 @@ class StandardCellLibrary with HarborPrettyString {
     required this.tieLowCell,
     this.clockBufferCells = const [],
     this.fillCells = const [],
+    this.decapCells = const [],
+    this.antennaCell,
   });
 
   @override
@@ -76,6 +84,10 @@ class StandardCellLibrary with HarborPrettyString {
     if (fillCells.isNotEmpty) {
       buf.writeln('${c}fills: [${fillCells.join(", ")}],');
     }
+    if (decapCells.isNotEmpty) {
+      buf.writeln('${c}decaps: [${decapCells.join(", ")}],');
+    }
+    if (antennaCell != null) buf.writeln('${c}antenna: $antennaCell,');
     buf.write('$p)');
     return buf.toString();
   }

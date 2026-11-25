@@ -618,6 +618,71 @@ void main() {
       final tcl = target.generateOpenroadTcl();
       expect(tcl, contains('read_liberty'));
     });
+
+    test('generateOpenroadTcl repairs antennas and fills decap first', () {
+      final gf = Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD');
+      final tcl = HarborAsicTarget(
+        provider: gf,
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      const prefix = 'gf180mcu_fd_sc_mcu7t5v0';
+      expect(tcl, contains('set _diode ${prefix}__antenna'));
+      expect(tcl, contains('${prefix}__fillcap_*'));
+      final repair = tcl.indexOf('repair_antennas \$_diode -iterations 3');
+      final order = [
+        tcl.indexOf('global_route'),
+        repair,
+        tcl.indexOf('detailed_route', repair),
+        tcl.indexOf('check_antennas'),
+        tcl.indexOf('filler_placement'),
+      ];
+      expect(order, everyElement(isNonNegative));
+      expect(order, orderedEquals([...order]..sort()));
+      final fill = tcl.substring(tcl.indexOf('filler_placement'));
+      expect(fill.indexOf('__fillcap_'), lessThan(fill.indexOf('__fill_1')));
+      expect(tcl, isNot(contains('metal_fill')));
+    });
+
+    test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
+      final tcl = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      final loop = tcl.substring(tcl.indexOf('for {set _i 0}'));
+      expect(loop, contains('if {[info exists ::env(DROUTE_END_ITER)]}'));
+      expect(loop, contains('detailed_route -droute_end_iter'));
+    });
+
+    test('generateMacroOpenroadTcl orders antenna and fill steps', () {
+      final gf = Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD');
+      final tcl = HarborAsicTarget(
+        provider: gf,
+        topCell: 'MySoC',
+      ).generateMacroOpenroadTcl(const HarborAsicMacro(moduleName: 'Core'));
+      expect(
+        tcl.indexOf('global_route'),
+        lessThan(tcl.indexOf('repair_antennas')),
+      );
+      expect(
+        tcl.indexOf('repair_antennas'),
+        lessThan(tcl.indexOf('detailed_route')),
+      );
+      expect(
+        tcl.indexOf('check_antennas'),
+        lessThan(tcl.indexOf('filler_placement')),
+      );
+    });
+
+    test('generateOpenroadTcl omits antenna and decap steps when unset', () {
+      final tcl = HarborAsicTarget(
+        provider: _BareCellProvider(),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(tcl, isNot(contains('repair_antennas')));
+      expect(tcl, isNot(contains('check_antennas')));
+      expect(tcl, isNot(contains('filler_placement')));
+      expect(tcl, contains('detailed_route'));
+    });
   });
 
   group('HarborAsicMacro', () {
@@ -641,4 +706,29 @@ void main() {
       expect(HarborFpgaVendor.values, contains(HarborFpgaVendor.openXc7));
     });
   });
+}
+
+class _BareCellProvider extends PdkProvider {
+  @override
+  String get name => 'bare';
+  @override
+  String get node => '0nm';
+  @override
+  int get metalLayers => 5;
+  @override
+  double get supplyVoltage => 1.0;
+  @override
+  StandardCellLibrary get standardCellLibrary => const StandardCellLibrary(
+    name: 'bare',
+    libertyPath: 'a.lib',
+    lefPath: 'a.lef',
+    cellPrefix: 'bare__',
+    siteName: 'site',
+    tieHighCell: 'bare__tieh',
+    tieLowCell: 'bare__tiel',
+  );
+  @override
+  AnalogBlock ioCell({required int index}) => throw UnimplementedError();
+  @override
+  AnalogBlock pll({required int index}) => throw UnimplementedError();
 }
