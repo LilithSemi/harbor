@@ -2092,6 +2092,14 @@ class HarborAxi4Fabric extends HarborFabricModule {
           Sequential(c, reset: r, [
             elig[m] < _fits(outs[m].count, [raw, elig[m]], respDepth, 1),
           ]);
+          final mn = masters[m].name;
+          harborSimWatch(
+            c,
+            r,
+            () => simHigh(push[m]) && !simHigh(outs[m].pushReady)
+                ? '$mn $d: a response push into a full FIFO'
+                : null,
+          );
         }
       } else if (topology == HarborFabricTopology.crossbar) {
         final grants = <List<Logic>>[];

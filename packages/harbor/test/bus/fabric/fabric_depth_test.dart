@@ -151,7 +151,7 @@ final _otherCell = RegExp(
 // of each target, the grant registers and the credits of each master FIFO.
 const _responseStage =
     '^${_target}_(b|r)_rhead_(v0|v1|e0|e1)\$|'
-    '^(m\\d+|bus)_(b|r)_resp_grant_reg\$|^m\\d+_(b|r)_resp_(elig|used)\$';
+    '^(m\\d+|bus)_(b|r)_resp_grant_reg\$|^m\\d+_(b|r)_resp_elig\$';
 
 // The cells of the response path at the fast level: the response stages,
 // the arbiters, the grant registers and the master FIFOs, and the
