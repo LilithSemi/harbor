@@ -218,7 +218,7 @@ void main() {
     must(path(HarborFabricKind.wishbone), 4);
     must(path(HarborFabricKind.axi4, HarborFabricPipeline.compact), 10);
     must(path(HarborFabricKind.axi4, HarborFabricPipeline.balanced), 14);
-    must(path(HarborFabricKind.axi4, HarborFabricPipeline.fast), 14);
+    must(path(HarborFabricKind.axi4, HarborFabricPipeline.fast), 18);
     must(path(HarborFabricKind.tilelink), 8);
   });
 

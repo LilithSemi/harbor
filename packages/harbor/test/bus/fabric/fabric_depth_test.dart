@@ -139,12 +139,27 @@ final _otherCell = RegExp(
   '^${_target}_(aw|ar|w|req)_$_fifo\$|'
   '^${_target}_(aw|ar|w|req)_shown\$|'
   '^${_target}_lite_.*\$|^${_target}_req_(valid|entry)\$|'
-  '^${_target}_(timer|cut_off)\$|^${_target}_rec\\d+_.*\$|'
+  '^${_target}_(timer|cut_off|cut_(b|r)_(v|sel|fields))\$|^${_target}_rec\\d+_.*\$|'
   '^${_target}_w_(aw_held|source_$_fifo|order_$_fifo)\$|'
   '^err_(r_beat|w_done)\$|'
   '^m\\d+_(b|r|w)_$_fifo\$|^m\\d+_(b|r)_(pieces|worst|resp_rr)\$|'
   '^m\\d+_w_(count|pieces|route_$_fifo)\$|'
-  '^bus_(b|r)_resp_rr\$|^bus_w_(count|order_$_fifo)\$',
+  '^bus_(b|r)_resp_rr\$|^bus_w_(count|order_$_fifo)\$|$_responseStage',
+);
+
+// The cells that the fast level adds to the responses: the response stage
+// of each target, the grant registers and the credits of each master FIFO.
+const _responseStage =
+    '^${_target}_(b|r)_rhead_(v0|v1|e0|e1)\$|'
+    '^(m\\d+|bus)_(b|r)_resp_grant_reg\$|^m\\d+_(b|r)_resp_(elig|used)\$';
+
+// The cells of the response path at the fast level: the response stages,
+// the arbiters, the grant registers and the master FIFOs, and the
+// completions that go back to the order trackers and the split state.
+final _responseCell = RegExp(
+  '$_responseStage|^m\\d+_(b|r)_($_fifo|pieces|worst|resp_rr)\$|'
+  '^bus_(b|r)_resp_rr\$|'
+  '_(aw|ar)_(order_completed|order_completed_id|split_busy)\$',
 );
 
 // The cells of the slave paths: the slave queues, the grant FIFOs, the
@@ -396,14 +411,29 @@ void main() {
           );
         }
 
-        test('every flop of the balanced fabric has a part', () async {
-          final f = await _fabric(config, t, HarborFabricPipeline.balanced);
-          final open = {
-            for (final cell in _cells(f))
-              for (final n in _cellNames(cell))
-                if (!_requestCell.hasMatch(n) && !_otherCell.hasMatch(n)) n,
-          };
-          must(open, isEmpty);
+        for (final level in [
+          HarborFabricPipeline.balanced,
+          HarborFabricPipeline.fast,
+        ]) {
+          test('every flop of the ${level.name} fabric has a part', () async {
+            final f = await _fabric(config, t, level);
+            final open = {
+              for (final cell in _cells(f))
+                for (final n in _cellNames(cell))
+                  if (!_requestCell.hasMatch(n) && !_otherCell.hasMatch(n)) n,
+            };
+            must(open, isEmpty);
+          });
+        }
+
+        test('fast response path fits $_requestBudget levels', () async {
+          final f = await _fabric(config, t, HarborFabricPipeline.fast);
+          final p = harborWorstDepth(
+            f,
+            endIn: (c) => _cellNames(c).any(_responseCell.hasMatch),
+          );
+          printOnFailure('$p');
+          expect(p.levels, lessThanOrEqualTo(_requestBudget));
         });
 
         if (config == 'kc705') {
@@ -506,7 +536,7 @@ void main() {
     const stages = {
       HarborFabricPipeline.compact: 5,
       HarborFabricPipeline.balanced: 7,
-      HarborFabricPipeline.fast: 7,
+      HarborFabricPipeline.fast: 9,
     };
     for (final p in HarborFabricPipeline.values) {
       expect(

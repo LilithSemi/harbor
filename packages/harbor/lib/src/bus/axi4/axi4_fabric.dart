@@ -285,7 +285,9 @@ class _Tracker {
 /// - Each master port takes AW, AR and W into 2 entry FIFOs, and each full
 ///   AXI4 slave port drives AW, AR and W from 2 entry FIFOs. An AXI4-Lite
 ///   slave port drives AW or AR from one shared entry and W from one entry.
-///   B and R reach a master through 2 entry FIFOs.
+///   B and R reach a master through 2 entry FIFOs. At the fast level each
+///   target has a 2 entry response stage, and the master FIFOs have 4
+///   entries.
 /// - A fabric with one slave has no master FIFOs. The slave FIFOs are its
 ///   one request stage, so AWREADY, ARREADY and WREADY to a master follow
 ///   its VALID in the same cycle.
@@ -459,6 +461,11 @@ class HarborAxi4Fabric extends HarborFabricModule {
     // With one slave, the slave FIFOs are the only request stage.
     final pass = ns == 1;
     final headOn = pipeline != HarborFabricPipeline.compact;
+    final fast = pipeline == HarborFabricPipeline.fast;
+    // At the fast level an entry of a master response FIFO comes back four
+    // cycles after its grant: the grant register, the push, the pop and the
+    // count. So four entries pass one response per cycle.
+    const respDepth = 4;
     // A grant FIFO slot comes back four cycles after its grant: the grant
     // register, the push, the pop and the registered pop. With one more
     // slot for the grant in each cycle, one request per cycle goes on.
@@ -1828,6 +1835,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
         range: slaves[tSlave[t]].range,
         offset: slaves[tSlave[t]].offset,
         liteStaged: headOn,
+        cutStaged: fast,
       );
       if (x != null) dead.add(x);
     }
@@ -1861,6 +1869,30 @@ class HarborAxi4Fabric extends HarborFabricModule {
         mids.add(full.getRange(0, maxId));
         dest.add(nm > 1 ? decodeIndex(full.getRange(maxId), nm) : [Const(1)]);
       }
+      // The fields the master FIFOs take: from the slave side, or at the
+      // fast level from the front entry of each response stage.
+      var iMid = mids;
+      var iPay = [for (final x in resp) x.payload];
+      var iLast = [for (final x in resp) x.last];
+      final stage = fast
+          ? [
+              for (var t = 0; t < nt; t++)
+                _respStage(
+                  c,
+                  r,
+                  name: '${tName[t]}_${d}_rhead',
+                  resp: resp[t],
+                  mid: mids[t],
+                  dest: dest[t],
+                  withLast: dir == 1,
+                ),
+            ]
+          : null;
+      if (stage != null) {
+        iMid = [for (final x in stage) x.mid];
+        iPay = [for (final x in stage) x.payload];
+        iLast = [for (final x in stage) x.last];
+      }
       final push = [for (var m = 0; m < nm; m++) Logic()];
       final pushData = <Logic>[];
       final outs = <HarborRegFifo>[];
@@ -1888,16 +1920,18 @@ class HarborAxi4Fabric extends HarborFabricModule {
         items.add([
           for (var t = 0; t < nt; t++)
             harborPack([
-              mids[t].getRange(0, a.idWidth),
-              if (worst[m] != null)
+              iMid[t].getRange(0, a.idWidth),
+              if (worst[m] != null && fast)
+                _worse(worst[m]!, iPay[t])
+              else if (worst[m] != null)
                 mux(
-                  _respKey(worst[m]!).gt(_respKey(resp[t].payload)),
+                  _respKey(worst[m]!).gt(_respKey(iPay[t])),
                   worst[m]!,
-                  resp[t].payload,
+                  iPay[t],
                 )
               else
-                resp[t].payload,
-              if (dir == 1) more != null ? resp[t].last & ~more : resp[t].last,
+                iPay[t],
+              if (dir == 1) more != null ? iLast[t] & ~more : iLast[t],
             ]),
         ]);
         final data = Logic(width: items[m].first.width);
@@ -1907,7 +1941,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
           name: '${masters[m].name}_$d',
           clk: c,
           reset: r,
-          depth: 2,
+          depth: fast ? respDepth : 2,
           pushValid: push[m],
           pushData: data,
           popReady: ready,
@@ -1945,8 +1979,9 @@ class HarborAxi4Fabric extends HarborFabricModule {
         int m,
         Logic raw,
         Logic Function() last,
-        Logic Function() payload,
-      ) {
+        Logic Function() payload, {
+        Logic Function()? merged,
+      }) {
         final n = pieces[m];
         if (n == null) {
           push[m] <= raw;
@@ -1969,7 +2004,10 @@ class HarborAxi4Fabric extends HarborFabricModule {
           If(
             swallow,
             then: [
-              If(_respKey(payload()).gt(_respKey(w)), then: [w < payload()]),
+              if (merged != null)
+                w < merged()
+              else
+                If(_respKey(payload()).gt(_respKey(w)), then: [w < payload()]),
             ],
             orElse: [
               If(raw, then: [w < 0]),
@@ -1978,7 +2016,70 @@ class HarborAxi4Fabric extends HarborFabricModule {
         ]);
       }
 
-      if (topology == HarborFabricTopology.crossbar) {
+      if (stage != null) {
+        // The arbiters see only flops: the front of each response stage and
+        // the credit flag of each master FIFO. The grant register pops the
+        // stage and selects its entry into the master FIFO one cycle later.
+        final elig = [
+          for (final mc in masters) Logic(name: '${mc.name}_${d}_resp_elig'),
+        ];
+        final sel = <List<Logic>>[];
+        if (topology == HarborFabricTopology.crossbar) {
+          for (var m = 0; m < nm; m++) {
+            final g = _roundRobin('${masters[m].name}_${d}_resp', c, r, [
+              for (var t = 0; t < nt; t++)
+                stage[t].valid & stage[t].dest[m] & elig[m],
+            ]);
+            final reg = Logic(
+              name: '${masters[m].name}_${d}_resp_grant_reg',
+              width: nt,
+            );
+            Sequential(c, reset: r, [reg < g.rconcat()]);
+            sel.add([for (var t = 0; t < nt; t++) reg[t]]);
+          }
+          for (var t = 0; t < nt; t++) {
+            stage[t].pop <= anyOf([for (var m = 0; m < nm; m++) sel[m][t]]);
+          }
+        } else {
+          final g = _roundRobin('bus_${d}_resp', c, r, [
+            for (var t = 0; t < nt; t++)
+              stage[t].valid &
+                  anyOf([
+                    for (var m = 0; m < nm; m++) stage[t].dest[m] & elig[m],
+                  ]),
+          ]);
+          final reg = Logic(name: 'bus_${d}_resp_grant_reg', width: nt);
+          Sequential(c, reset: r, [reg < g.rconcat()]);
+          for (var t = 0; t < nt; t++) {
+            stage[t].pop <= reg[t];
+          }
+          for (var m = 0; m < nm; m++) {
+            sel.add([
+              for (var t = 0; t < nt; t++) reg[t] & stage[t].popDest[m],
+            ]);
+          }
+        }
+        for (var m = 0; m < nm; m++) {
+          final raw = anyOf(sel[m]);
+          pushTo(
+            m,
+            raw,
+            () => pick(sel[m], iLast),
+            () => pick(sel[m], iPay),
+            merged: worst[m] == null
+                ? null
+                : () => pick(sel[m], [
+                    for (final x in iPay) _worse(worst[m]!, x),
+                  ]),
+          );
+          pushData[m] <= pick(sel[m], items[m]);
+          // A grant needs a free FIFO entry after the entries in the FIFO,
+          // the grant in the register and a grant now.
+          Sequential(c, reset: r, [
+            elig[m] < _fits(outs[m].count, [raw, elig[m]], respDepth, 1),
+          ]);
+        }
+      } else if (topology == HarborFabricTopology.crossbar) {
         final grants = <List<Logic>>[];
         for (var m = 0; m < nm; m++) {
           final g = roundRobin('${masters[m].name}_${d}_resp', c, r, [
@@ -2063,6 +2164,112 @@ class HarborAxi4Fabric extends HarborFabricModule {
     ]);
     ready <= ~full;
     return (valid: has, data: ram.rdData);
+  }
+
+  // The response stage of a target at the fast level: two entries, each with
+  // the master side ID, the payload, the last flag and the destination
+  // master one-hot. [pop] is the grant register, which takes the front
+  // entry. [valid] and [dest] are of the entry after it, which the arbiter
+  // sees, and [mid], [payload], [last] and [popDest] are of the front entry.
+  static ({
+    Logic valid,
+    List<Logic> dest,
+    Logic pop,
+    Logic mid,
+    Logic payload,
+    Logic last,
+    List<Logic> popDest,
+  })
+  _respStage(
+    Logic clk,
+    Logic reset, {
+    required String name,
+    required _Resp resp,
+    required Logic mid,
+    required List<Logic> dest,
+    required bool withLast,
+  }) {
+    final widths = [
+      mid.width,
+      resp.payload.width,
+      if (withLast) 1,
+      dest.length,
+    ];
+    final data = harborPack([
+      mid,
+      resp.payload,
+      if (withLast) resp.last,
+      dest.rconcat(),
+    ]);
+    final v0 = Logic(name: '${name}_v0');
+    final v1 = Logic(name: '${name}_v1');
+    final e0 = Logic(name: '${name}_e0', width: data.width);
+    final e1 = Logic(name: '${name}_e1', width: data.width);
+    final pop = Logic();
+    final valid = (pop & v1) | (~pop & v0);
+    final front = harborLoad(e0, pop, e1);
+    final push = resp.valid & (~v1 | pop);
+    resp.ready <= ~v1 | pop;
+    Sequential(clk, reset: reset, [
+      v0 < valid | push,
+      v1 < (~pop & v1) | (push & valid),
+    ]);
+    Sequential(clk, [
+      e0 < harborLoad(front, ~valid, data),
+      e1 < harborLoad(e1, push & valid, data),
+    ]);
+    final f = harborUnpack(e0, widths);
+    final next = harborUnpack(front, widths).last;
+    return (
+      valid: valid,
+      dest: [for (var i = 0; i < dest.length; i++) valid & next[i]],
+      pop: pop,
+      mid: f[0],
+      payload: f[1],
+      last: withLast ? f[2] : Const(1),
+      popDest: [for (var i = 0; i < dest.length; i++) f.last[i]],
+    );
+  }
+
+  // A register for the made-up responses of a cut off slave. It loads
+  // [valid], [sel] and [fields] while [dead] and empty, and empties when
+  // [ready] takes it.
+  static ({Logic valid, List<Logic> sel, List<Logic> fields}) _cutStage(
+    Logic clk,
+    Logic reset,
+    String name,
+    Logic dead,
+    Logic ready,
+    Logic valid,
+    List<Logic> sel,
+    List<Logic> fields,
+  ) {
+    final v = Logic(name: '${name}_v');
+    final selQ = Logic(name: '${name}_sel', width: sel.length);
+    final f = harborPack(fields);
+    final fQ = Logic(name: '${name}_fields', width: f.width);
+    final load = dead & ~v;
+    Sequential(clk, reset: reset, [
+      v < (load & valid) | (v & ~ready),
+      selQ < harborLoad(selQ, load, sel.rconcat()),
+      fQ < harborLoad(fQ, load, f),
+    ]);
+    return (
+      valid: v,
+      sel: [for (var i = 0; i < sel.length; i++) selQ[i]],
+      fields: harborUnpack(fQ, [for (final x in fields) x.width]),
+    );
+  }
+
+  // The worse of the response codes [a] and [b], as [_respKey] orders them,
+  // in AND and OR terms.
+  static Logic _worse(Logic a, Logic b) {
+    final ka1 = a[1];
+    final ka0 = ~(a[1] ^ a[0]);
+    final kb1 = b[1];
+    final kb0 = ~(b[1] ^ b[0]);
+    final aWorse = (ka1 & ~kb1) | (~(ka1 ^ kb1) & ka0 & ~kb0);
+    return harborLoad(b, aWorse, a);
   }
 
   // Round robin over [req] in AND and OR terms of the requests and the
@@ -2197,6 +2404,7 @@ class HarborAxi4Fabric extends HarborFabricModule {
     required BusAddressRange range,
     required bool offset,
     bool liteStaged = false,
+    bool cutStaged = false,
   }) {
     final guard = timeout > 0;
     final dead = guard ? Logic(name: '${p}_cut_off') : Const(0);
@@ -2345,13 +2553,22 @@ class HarborAxi4Fabric extends HarborFabricModule {
       for (var i = 0; i < n; i++) ev[i] & isW[i] & wdone[i] & first[i],
     ];
     final bPick = lowestOf(bCand);
-    b.valid <= mux(dead, anyOf(bCand), s.bValid);
-    b.id <= mux(dead, pick(bPick, gid), s.bId);
+    // With [cutStaged], a made-up response comes from a register that loads
+    // when it is empty. So the response stage sees only flops, for one
+    // response each 2 cycles.
+    final bCut = cutStaged
+        ? _cutStage(c, r, '${p}_cut_b', dead, b.ready, anyOf(bCand), bPick, [
+            pick(bPick, gid),
+          ])
+        : null;
+    b.valid <= mux(dead, bCut?.valid ?? anyOf(bCand), s.bValid);
+    b.id <= mux(dead, bCut?.fields[0] ?? pick(bPick, gid), s.bId);
     b.payload <= mux(dead, slvErr, s.bResp);
     b.last <= Const(1);
     s.bReady <= dead | b.ready;
     final bDoneOh = [
-      for (var i = 0; i < n; i++) b.fire & mux(dead, bPick[i], bMatch[i]),
+      for (var i = 0; i < n; i++)
+        b.fire & mux(dead, bCut?.sel[i] ?? bPick[i], bMatch[i]),
     ];
 
     // R: passed through, or made up once cut off. A burst already started
@@ -2368,16 +2585,30 @@ class HarborAxi4Fabric extends HarborFabricModule {
       for (var i = 0; i < n; i++)
         mux(anyStarted, rFirstStarted[i], rFirstCand[i]),
     ];
-    final rSel = [for (var i = 0; i < n; i++) mux(dead, rPick[i], rMatch[i])];
-    rd.valid <= mux(dead, anyOf(rCand), s.rValid);
-    rd.id <= mux(dead, pick(rPick, gid), s.rId);
+    final rCut = cutStaged
+        ? _cutStage(c, r, '${p}_cut_r', dead, rd.ready, anyOf(rCand), rPick, [
+            pick(rPick, gid),
+            pick(rPick, gbeat).eq(pick(rPick, glen)),
+          ])
+        : null;
+    final rSel = [
+      for (var i = 0; i < n; i++)
+        mux(dead, rCut?.sel[i] ?? rPick[i], rMatch[i]),
+    ];
+    rd.valid <= mux(dead, rCut?.valid ?? anyOf(rCand), s.rValid);
+    rd.id <= mux(dead, rCut?.fields[0] ?? pick(rPick, gid), s.rId);
     rd.payload <=
         mux(
           dead,
           harborPack([Const(0, width: s.dataWidth), slvErr]),
           harborPack([s.rData, s.rResp]),
         );
-    rd.last <= mux(dead, pick(rPick, gbeat).eq(pick(rPick, glen)), s.rLast);
+    rd.last <=
+        mux(
+          dead,
+          rCut?.fields[1] ?? pick(rPick, gbeat).eq(pick(rPick, glen)),
+          s.rLast,
+        );
     s.rReady <= dead | rd.ready;
     final rBeatOh = [for (var i = 0; i < n; i++) rd.fire & rSel[i]];
     final rDoneOh = [for (var i = 0; i < n; i++) rBeatOh[i] & rd.last];

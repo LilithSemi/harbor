@@ -26,8 +26,7 @@ enum HarborFabricTopology {
 
 /// The register stages of an AXI4 fabric. More stages give a shorter
 /// combinational path and a higher bus clock, for more latency and area.
-/// Wishbone and TileLink fabrics ignore it. At this time, each level builds
-/// the [compact] fabric.
+/// Wishbone and TileLink fabrics ignore it.
 enum HarborFabricPipeline {
   /// The fewest stages, for a small device.
   compact,
@@ -35,7 +34,8 @@ enum HarborFabricPipeline {
   /// A register at each master head, and at the read port of each CDC FIFO.
   balanced,
 
-  /// Arbitration, responses and write data from registers only.
+  /// The [balanced] stages, and a response stage at each target with a
+  /// response arbiter that sees only registers.
   fast,
 }
 
@@ -498,7 +498,9 @@ abstract final class HarborFabric {
   ///   slave side, the response FIFO, and the response arbitration), and 5 on
   ///   AXI4 (those 4 and the grant register of the target). The `balanced`
   ///   and `fast` AXI4 levels add 2: the head register of each master and
-  ///   the register of the arbiter grant.
+  ///   the register of the arbiter grant. The `fast` level adds 2 more: the
+  ///   response stage of each target and the register of the response
+  ///   grant.
   /// - [memoryPorts] is the number of memory master and slave port pairs. A
   ///   pair has 8 stages: the request, data and response FIFOs of both ports.
   /// - [registerStages] is the number of `WishboneRegisterStage` slices on
@@ -522,8 +524,11 @@ abstract final class HarborFabric {
       fabrics *
           switch (kind) {
             HarborFabricKind.wishbone => 2,
-            HarborFabricKind.axi4 =>
-              pipeline == HarborFabricPipeline.compact ? 5 : 7,
+            HarborFabricKind.axi4 => switch (pipeline) {
+              HarborFabricPipeline.compact => 5,
+              HarborFabricPipeline.balanced => 7,
+              HarborFabricPipeline.fast => 9,
+            },
             HarborFabricKind.tilelink => 4,
           } +
       (kind == HarborFabricKind.axi4 &&

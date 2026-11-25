@@ -95,12 +95,12 @@ const _realtimeGolden = {
     957818,
   ),
   (HarborFabricPipeline.fast, HarborFabricTopology.shared): (
-    -4223802904182233805,
-    931398,
+    7212164165149453307,
+    1015948,
   ),
   (HarborFabricPipeline.fast, HarborFabricTopology.crossbar): (
-    5398571752657003120,
-    957818,
+    4522619541237310717,
+    1062438,
   ),
 };
 

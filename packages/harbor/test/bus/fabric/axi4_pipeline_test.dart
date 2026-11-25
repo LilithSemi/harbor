@@ -72,11 +72,75 @@ Burst _wr(int id, int addr) => Burst(
 // Cycles from the R beat that frees a slot of outstanding 2 at the master
 // to the next AR at the slave, with reads always waiting. The balanced
 // level adds the grant register and the bubble of the eligibility flop.
+// The slot frees at the slave, and at the fast level the R beat reaches
+// the master 2 cycles after that.
 const _slotReuse = {
   HarborFabricPipeline.compact: 2,
   HarborFabricPipeline.balanced: 4,
-  HarborFabricPipeline.fast: 4,
+  HarborFabricPipeline.fast: 2,
 };
+
+// Cycles from an R beat at the slave to the same beat at the master. The
+// fast level adds the response stage and the response grant register.
+const _rLatency = {
+  HarborFabricPipeline.compact: 1,
+  HarborFabricPipeline.balanced: 1,
+  HarborFabricPipeline.fast: 3,
+};
+
+Burst _rdLen(int id, int addr, int len) =>
+    Burst(id: id, write: false, addr: addr, len: len, size: 2, burst: 1);
+
+Burst _wrLen(int id, int addr, int len) => Burst(
+  id: id,
+  write: true,
+  addr: addr,
+  len: len,
+  size: 2,
+  burst: 1,
+  data: [for (var i = 0; i <= len; i++) addr * 7 + i],
+  strb: List.filled(len + 1, 0xf),
+);
+
+// Reads and writes of two masters to two slaves, with the same IDs on both
+// slaves and bursts of 1 to 8 beats. Every response must come back in
+// order per ID.
+Future<void> _mixed(
+  HarborFabricTopology t,
+  HarborFabricPipeline p, {
+  double stall = 0.3,
+  void Function(Bench b)? setUp,
+}) async {
+  final b = await Bench.start(
+    t,
+    pipeline: p,
+    stall: stall,
+    seed: 5,
+    masters: const [MasterCfg('m0', 2, 8), MasterCfg('m1', 2, 8)],
+    slaves: const [
+      SlaveCfg('s0', 4, 8, 0x00000, 0x10000),
+      SlaveCfg('s1', 2, 4, 0x10000, 0x10000),
+    ],
+  );
+  setUp?.call(b);
+  for (final (k, name) in ['m0', 'm1'].indexed) {
+    final m = b.managers[name]!;
+    for (var i = 0; i < 24; i++) {
+      final slave = (i >> 1) & 1;
+      final addr = slave * 0x10000 + k * 0x4000 + i * 0x40;
+      m.write(_wrLen(i & 3, addr, i % 8));
+      m.read(_rdLen(i & 3, addr, (i * 3) % 8));
+    }
+  }
+  await b.drain(limit: 40000);
+  await b.sim.stop();
+  must(b.errors, isEmpty);
+  for (final name in ['m0', 'm1']) {
+    final m = b.managers[name]!;
+    must(checkWrites(name, m.awOrder, m.bResp, (_) => 0), isEmpty);
+    must(checkReads(name, m.arOrder, m.rBeats, (x) => (0, null)), isEmpty);
+  }
+}
 
 void _consecutive(List<int> seen, int n) {
   must(seen.length, n);
@@ -240,6 +304,56 @@ void main() {
             );
           },
         );
+
+        test('16 R beats of one burst reach the master on 16 cycles', () async {
+          final b = await Bench.start(
+            t,
+            pipeline: p,
+            stall: 0,
+            masters: const [MasterCfg('m0', 2, 16)],
+            slaves: const [SlaveCfg('s0', 4, 8, 0x00000, 0x10000)],
+          );
+          var cycle = 0;
+          final atSlave = <int>[];
+          final atMaster = <int>[];
+          b.sim.onRise(() {
+            cycle++;
+            if (b.sim.pre('s0_RVALID') == 1 && b.sim.pre('s0_RREADY') == 1) {
+              atSlave.add(cycle);
+            }
+            if (b.sim.pre('m0_RVALID') == 1 && b.sim.pre('m0_RREADY') == 1) {
+              atMaster.add(cycle);
+            }
+          });
+          b.managers['m0']!.read(_rdLen(1, 0x100, 15));
+          await b.drain(limit: 20000);
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          _consecutive(atSlave, 16);
+          _consecutive(atMaster, 16);
+          must(atMaster.first - atSlave.first, _rLatency[p]);
+        });
+
+        test('responses keep their order per ID across two slaves', () async {
+          await _mixed(t, p);
+        });
+
+        test('a master that takes no response for 20 cycles loses '
+            'nothing', () async {
+          await _mixed(
+            t,
+            p,
+            stall: 0,
+            setUp: (b) {
+              var cycle = 0;
+              b.sim.onRise(() => cycle++);
+              for (final m in b.managers.values) {
+                m.r.gate = () => cycle >= 20 && (cycle < 60 || cycle >= 80);
+                m.b.gate = () => cycle >= 20 && (cycle < 60 || cycle >= 80);
+              }
+            },
+          );
+        });
 
         test('a freed slot of outstanding 2 is used again', () async {
           final b = await Bench.start(

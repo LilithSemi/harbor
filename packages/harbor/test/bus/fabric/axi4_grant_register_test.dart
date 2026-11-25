@@ -160,7 +160,11 @@ void main() {
               err
                   ? 'err_aw_push_fire'
                   : slave.lite
-                  ? 's0_req_push_fire'
+                  // The staged AXI4-Lite entry takes the AW as it leaves the
+                  // grant FIFO.
+                  ? (harnessPipeline == HarborFabricPipeline.compact
+                        ? 's0_req_push_fire'
+                        : 's0_aw_grant_pop_fire')
                   : 's0_aw_push_fire',
             );
             final lastBeat = _internal(fab, '${p}_w_last_beat');
