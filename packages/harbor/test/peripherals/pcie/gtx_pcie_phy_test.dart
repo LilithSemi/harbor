@@ -1327,4 +1327,114 @@ void main() {
       expect(seen, [1, 0]);
     });
   });
+
+  group('HarborGtxPciePhy reset fanout', () {
+    test('each flop group takes its own kept copy of perst_rst', () async {
+      final phy = HarborGtxPciePhy(
+        perstN: Logic(name: 'perst_n'),
+        hardLinkUp: Logic(name: 'link'),
+        phyLinkUpN: Logic(name: 'phy_link_n'),
+        ltssmState: Logic(name: 'ltssm', width: 6),
+        channel: HarborGtxChannelPorts(),
+        pipe: HarborPciePipeLane(),
+      );
+      await phy.build();
+      final branch = phy.subModules
+          .whereType<HarborRegisteredResetBranch>()
+          .single;
+      expect(branch.copies, 8);
+      expect(
+        harborSynthesisMarks(phy).preserve,
+        contains('HarborRegisteredResetBranch_x8'),
+      );
+      final sv = phy.dumpSystemVerilog();
+      final top = sv.substring(sv.indexOf('module ${phy.definitionName}'));
+      // perst_rst goes only to the copies.
+      final readers = top
+          .split('\n')
+          .where((l) => RegExp(r'\bperst_rst\b').hasMatch(l))
+          .where(
+            (l) => !RegExp(
+              r'^\s*(logic perst_rst;|assign perst_rst =)',
+            ).hasMatch(l),
+          )
+          .toList();
+      expect(readers, hasLength(1), reason: '$readers');
+      expect(top, contains('.release_in((~perst_rst))'));
+      for (final g in [
+        'sync',
+        'state',
+        'timer',
+        'fail',
+        'book',
+        'rate',
+        'gt',
+        'link',
+      ]) {
+        expect(top, contains('perst_rst_$g'), reason: g);
+      }
+      // No flop reset comes from a select: the cause is an AND-OR.
+      final cause = RegExp(
+        r'fail_cause_1 <= ([^;]*);',
+      ).firstMatch(top)!.group(1)!;
+      expect(cause, isNot(contains('?')));
+      // The data counters are in flops with no reset.
+      for (final name in ['cpll_hold_count', 'detect_timer', 'l0_timer']) {
+        final block = RegExp(
+          'always_ff @\\(([^)]*)\\) begin((?:(?!always_ff).)*?)'
+          '\\b$name <=',
+          dotAll: true,
+        ).allMatches(top).map((m) => (m.group(1)!, m.group(2)!)).toList();
+        expect(block, isNotEmpty, reason: name);
+        for (final (edge, body) in block) {
+          expect(edge, 'posedge pclk', reason: name);
+          expect(body, isNot(contains('perst_rst')), reason: name);
+        }
+      }
+    });
+
+    test('the counters with no reset are 0 before they count', () async {
+      final b = await _Bench.start(linkWait: 400);
+      final hold = b.sig('cpll_hold_count');
+      final watches = {
+        for (final n in ['detect', 'l0'])
+          b.sig('${n}_run_q'): b.sig('${n}_timer'),
+      };
+      final runs = {for (final r in watches.keys) r: 0};
+      var holds = 0;
+      var inCpllReset = false;
+      void check() {
+        final now = b.phy.resetState.value.isValid && b.state == _S.cpllReset;
+        if (now && !inCpllReset) {
+          expect(hold.value.toInt(), 0, reason: 'cpll_hold_count');
+          holds++;
+        }
+        inCpllReset = now;
+        for (final e in watches.entries) {
+          if (!b.hi(e.key)) continue;
+          expect(e.value.value.isValid, isTrue, reason: e.value.name);
+          runs[e.key] = runs[e.key]! + 1;
+        }
+      }
+
+      Future<void> run(int n) async {
+        for (var i = 0; i < n; i++) {
+          await b.pclk.nextNegedge;
+          check();
+        }
+      }
+
+      // No link partner: the Detect timer restarts the link.
+      b.link(_detectQuiet);
+      await run(1500);
+      expect(b.phy.linkRetrains!.value.toInt(), greaterThanOrEqualTo(2));
+      // A physical link with no data link: the L0 timer counts.
+      await b.waitFor(_S.idle);
+      b.link(_l0, phy: true);
+      await run(1500);
+      expect(holds, greaterThan(0));
+      expect(runs.values, everyElement(greaterThan(0)));
+      await b.finish();
+    });
+  });
 }

@@ -1,6 +1,7 @@
 import 'package:rohd/rohd.dart';
 
 import '../../clock/cdc.dart';
+import '../../clock/clock_domain.dart' show HarborRegisteredResetBranch;
 import 'gtp_pcie_phy.dart' show harborCheckPipeStages;
 import 'pcie_pipe.dart';
 import 'pipe_clock.dart';
@@ -593,12 +594,35 @@ class HarborGtxPciePhy extends Module {
     );
     final por = (~porCount[6]).named('por_reset');
     final rst = harborCdcJoinReset(pclk, ~perstN, por, name: 'perst_rst');
+    // Each group of flops takes its own kept copy of the reset, so no one
+    // reset net spans the PHY. The copies release one edge after `rst`.
+    final groups = [
+      'sync',
+      'state',
+      'timer',
+      'fail',
+      'book',
+      'rate',
+      'gt',
+      if (timeouts.linkWait != 0) 'link',
+    ];
+    final branch = HarborRegisteredResetBranch(
+      name: 'perst_rst_branch',
+      copies: groups.length,
+    );
+    branch.input('clk').srcConnection! <= pclk;
+    branch.input('reset_assert').srcConnection! <= ~perstN | por;
+    branch.input('release_in').srcConnection! <= ~rst;
+    final rsts = {
+      for (var i = 0; i < groups.length; i++)
+        groups[i]: branch.resetOuts[i].named('perst_rst_${groups[i]}'),
+    };
 
     Logic sync(Logic d, String name) {
       final s = HarborCdcSync(name: '${name}_sync');
       s.input('async_in').srcConnection! <= d;
       s.input('dst_clk').srcConnection! <= pclk;
-      s.input('dst_reset').srcConnection! <= rst;
+      s.input('dst_reset').srcConnection! <= rsts['sync']!;
       return s.syncOut.named(name);
     }
 
@@ -685,7 +709,7 @@ class HarborGtxPciePhy extends Module {
         ],
         orElse: [validCount < 0],
       ),
-    ], reset: rst);
+    ], reset: rsts['gt']!);
     p.rxValid <= stage(linkUp & validCount[4] & gtValid, 'rxvalid');
 
     // PHYSTATUS is high while the link is down. During a rate change only the
@@ -705,7 +729,7 @@ class HarborGtxPciePhy extends Module {
 
     Logic rise(Logic s, String name) {
       final q = Logic(name: '${name}_q');
-      Sequential(pclk, [q < s], reset: rst);
+      Sequential(pclk, [q < s], reset: rsts['state']!);
       return (s & ~q).named('${name}_rise');
     }
 
@@ -725,7 +749,13 @@ class HarborGtxPciePhy extends Module {
     // Each decision is a flop and the flop that applies it is later, so no
     // flop input is behind a chain of compares. A compare of a counter with
     // a constant is a row of flops that each compare 5 bits.
-    List<Logic> chunkEq(String name, Logic count, int value, Logic mask) {
+    List<Logic> chunkEq(
+      String name,
+      Logic count,
+      int value,
+      Logic mask, {
+      required Logic reset,
+    }) {
       final out = <Logic>[];
       for (var lo = 0, i = 0; lo < count.width; lo += 5, i++) {
         final hi = lo + 5 < count.width ? lo + 5 : count.width;
@@ -736,7 +766,7 @@ class HarborGtxPciePhy extends Module {
         );
         Sequential(pclk, [
           q < (count.slice(hi - 1, lo).eq(part) & mask),
-        ], reset: rst);
+        ], reset: reset);
         out.add(q);
       }
       return out;
@@ -819,8 +849,11 @@ class HarborGtxPciePhy extends Module {
           timer,
           cycles - lead,
           ~clrQ,
+          reset: rsts['timer']!,
         );
-        Sequential(pclk, [h < (~clrQ & (h | andAll(chunks)))], reset: rst);
+        Sequential(pclk, [
+          h < (~clrQ & (h | andAll(chunks))),
+        ], reset: rsts['timer']!);
         return h;
       });
     }
@@ -839,6 +872,7 @@ class HarborGtxPciePhy extends Module {
       settleCount,
       timeouts.clockSettle > 2 ? timeouts.clockSettle - 2 : 0,
       settleRun,
+      reset: rsts['timer']!,
     );
     Sequential(pclk, [
       If(
@@ -854,7 +888,7 @@ class HarborGtxPciePhy extends Module {
         orElse: [settleCount < 0],
       ),
       settled < (settleRun & (settled | andAll(settleChunks))),
-    ], reset: rst);
+    ], reset: rsts['timer']!);
 
     final txSettleCount = Logic(
       name: 'tx_settle_count',
@@ -867,6 +901,7 @@ class HarborGtxPciePhy extends Module {
       txSettleCount,
       timeouts.txSettle > 2 ? timeouts.txSettle - 2 : 0,
       syncRun,
+      reset: rsts['timer']!,
     );
     Sequential(pclk, [
       If(
@@ -882,13 +917,13 @@ class HarborGtxPciePhy extends Module {
         orElse: [txSettleCount < 0],
       ),
       txSettled < (syncRun & (txSettled | andAll(txSettleChunks))),
-    ], reset: rst);
+    ], reset: rsts['timer']!);
 
     // Wait ends, from flops, one cycle old.
     final done = <_S, Logic>{};
     Logic doneFlop(_S v, String name, Logic d) {
       final q = Logic(name: 'done_$name');
-      Sequential(pclk, [q < d], reset: rst);
+      Sequential(pclk, [q < d], reset: rsts['state']!);
       return done[v] = q;
     }
 
@@ -1008,7 +1043,7 @@ class HarborGtxPciePhy extends Module {
             a < (i == 0 ? orAll(g) | blockQ : orAll(g) & ~blockQ),
             m < (orAll(pairs) & ~blockQ),
           ],
-          reset: rst,
+          reset: rsts['book']!,
           resetValues: {if (i == 0) a: Const(1)},
         );
         anys.add(a);
@@ -1021,7 +1056,7 @@ class HarborGtxPciePhy extends Module {
       final bad = Logic(name: '${name}_bad');
       Sequential(pclk, [
         bad < (~orAll(anys) | orAll(multis) | orAll(cross)),
-      ], reset: rst);
+      ], reset: rsts['book']!);
       return bad;
     }
 
@@ -1034,7 +1069,9 @@ class HarborGtxPciePhy extends Module {
       rBack,
       rDone,
     ]);
-    Sequential(pclk, [badQ < ((badSt | badRate) & ~blockQ)], reset: rst);
+    Sequential(pclk, [
+      badQ < ((badSt | badRate) & ~blockQ),
+    ], reset: rsts['book']!);
     final retryD = (failQ & failTmo2 & causeSync2 & triesLeft & ~wd2Q).named(
       'retry_d',
     );
@@ -1063,7 +1100,11 @@ class HarborGtxPciePhy extends Module {
       wdPend < ((wdPend | wdK) & (restartPulse ?? Const(0))),
       // The cause is taken when the decision is made, and moves on with it.
       causeSync1 < (~rateD & orAll(syncStates)),
-      code1 < mux(rateD, codeOf(_S.rateChange), stateCode),
+      // An AND-OR and not a mux, so synthesis does not merge rateD into
+      // the flop reset.
+      code1 <
+          ((codeOf(_S.rateChange) & rateD.replicate(4)) |
+              (stateCode & (~rateD).replicate(4))),
       flags1 <
           [
             rateD,
@@ -1087,7 +1128,7 @@ class HarborGtxPciePhy extends Module {
       flags2 < flags1b,
       retryQ < retryD,
       fullQ < fullD,
-    ], reset: rst);
+    ], reset: rsts['fail']!);
 
     Sequential(
       pclk,
@@ -1106,7 +1147,7 @@ class HarborGtxPciePhy extends Module {
                       ? retryQ
                       : Const(0)),
       ],
-      reset: rst,
+      reset: rsts['state']!,
       resetValues: {st[_S.cfgWait]!: Const(1)},
     );
 
@@ -1146,7 +1187,7 @@ class HarborGtxPciePhy extends Module {
           ],
         ),
       ],
-      reset: rst,
+      reset: rsts['book']!,
       resetValues: {
         failState: codeOf(_S.none),
         triesLeft: Const(timeouts.syncRetries > 0 ? 1 : 0),
@@ -1163,6 +1204,11 @@ class HarborGtxPciePhy extends Module {
           If(~sIdle, then: [timer < timer + 1]),
         ],
       ),
+      cpllHold < (st[_S.cpllReset]! & holdCount[holdCount.width - 1]),
+    ], reset: rsts['timer']!);
+    // No reset: the state resets to cfgWait, which clears the count before
+    // cpllReset can start.
+    Sequential(pclk, [
       If(
         st[_S.cpllReset]! & ~holdCount[holdCount.width - 1],
         then: [holdCount < holdCount + 1],
@@ -1170,8 +1216,7 @@ class HarborGtxPciePhy extends Module {
           If(~st[_S.cpllReset]!, then: [holdCount < 0]),
         ],
       ),
-      cpllHold < (st[_S.cpllReset]! & holdCount[holdCount.width - 1]),
-    ], reset: rst);
+    ]);
 
     // Outputs to the GT.
     cpllRst <= st[_S.cpllReset]!;
@@ -1198,7 +1243,7 @@ class HarborGtxPciePhy extends Module {
                   (sIdle & ~go[_S.idle]!) |
                   ~rIdle) &
               ~blockQ),
-    ], reset: rst);
+    ], reset: rsts['gt']!);
     userRdy <= afterMmcmLock;
     phInit <= st[_S.txPhInit]!;
     phAlign <= st[_S.txPhAlign]!;
@@ -1219,12 +1264,14 @@ class HarborGtxPciePhy extends Module {
       rateTimer,
       timeouts.rate > 5 ? timeouts.rate - 3 : 0,
       rWait,
+      reset: rsts['rate']!,
     );
     final switchChunks = chunkEq(
       'switch_eq',
       rateTimer,
       timeouts.clockSwitch - 3,
       rSwitch,
+      reset: rsts['rate']!,
     );
     Sequential(
       pclk,
@@ -1260,7 +1307,7 @@ class HarborGtxPciePhy extends Module {
           ],
         ),
       ],
-      reset: rst,
+      reset: rsts['rate']!,
       resetValues: {rIdle: Const(1)},
     );
 
@@ -1277,7 +1324,7 @@ class HarborGtxPciePhy extends Module {
         phAlignDoneRise & ~alignCount.and(),
         then: [alignCount < alignCount + 1],
       ),
-    ], reset: rst);
+    ], reset: rsts['gt']!);
     addOutput('tx_sync', width: 4) <=
         [gtPhyStatus, phAlignDoneS, phInitDoneS, dlySDoneS].concat();
     addOutput('tx_sync_seen', width: 3) <= seen;
@@ -1296,7 +1343,7 @@ class HarborGtxPciePhy extends Module {
                   [kSeen, byteAligned, rxValidOut, ~p.rxElecIdle].concat()),
         ],
       ),
-    ], reset: rst);
+    ], reset: rsts['gt']!);
     addOutput('rx_debug', width: rxDebugBits) <=
         [
           p.pipeRate,
@@ -1329,7 +1376,7 @@ class HarborGtxPciePhy extends Module {
     ltssm.input('async_in').srcConnection! <=
         addInput('ltssm_state', ltssmState!, width: 6);
     ltssm.input('dst_clk').srcConnection! <= pclk;
-    ltssm.input('dst_reset').srcConnection! <= rst;
+    ltssm.input('dst_reset').srcConnection! <= rsts['sync']!;
     final ltssmS = ltssm.syncOut.named('ltssm_state_s');
     final ltssmQ = Logic(name: 'ltssm_state_q', width: 6);
     final inDetect = Logic(name: 'ltssm_detect');
@@ -1337,17 +1384,17 @@ class HarborGtxPciePhy extends Module {
     Sequential(pclk, [
       ltssmQ < ltssmS,
       inDetect < ltssmS.eq(ltssmQ) & ltssmS.getRange(2).eq(0),
-    ], reset: rst);
+    ], reset: rsts['link']!);
 
     // The watchdog reads its own copy of `link_up`, so the logic near the hard
     // block pins does not load the `link_up` flop.
     final linkUpWd = Logic(name: 'link_up_wd');
-    Sequential(pclk, [linkUpWd < linkUp], reset: rst);
+    Sequential(pclk, [linkUpWd < linkUp], reset: rsts['link']!);
     final dlDown = (linkUpWd & ~hardUp).named('dl_down');
     final training = (dlDown & ~phyUp).named('link_training');
     final detect = _watch(
       pclk,
-      rst,
+      rsts['link']!,
       'detect',
       timeouts.linkWait,
       run: training & inDetect,
@@ -1356,7 +1403,7 @@ class HarborGtxPciePhy extends Module {
     final l0 = (dlDown & phyUp).named('link_l0_dl_down');
     final l0Watch = _watch(
       pclk,
-      rst,
+      rsts['link']!,
       'l0',
       timeouts.dataLinkWait,
       run: l0,
@@ -1368,7 +1415,7 @@ class HarborGtxPciePhy extends Module {
     Sequential(pclk, [
       retrainsFull < linkRetrains.and(),
       If(wdQ & ~retrainsFull, then: [linkRetrains < linkRetrains + 1]),
-    ], reset: rst);
+    ], reset: rsts['link']!);
     addOutput('link_retrains', width: 8) <= linkRetrains;
   }
 
@@ -1406,15 +1453,19 @@ class HarborGtxPciePhy extends Module {
       runQ < run,
       clearQ < clear,
       eq < chunks.reduce((a, b) => a & b),
+      hit < (~clearQ & (hit | (runQ & eq))),
+    ], reset: reset);
+    // No reset: [clear] must be high for a cycle after reset before [run]
+    // goes high, so the timer is 0 before it counts.
+    Sequential(clk, [
       If(
         clearQ,
-        then: [timer < 0, hit < 0],
+        then: [timer < 0],
         orElse: [
           If(runQ & ~hit, then: [timer < timer + 1]),
-          If(runQ & eq, then: [hit < 1]),
         ],
       ),
-    ], reset: reset);
+    ]);
     return (hit: hit, run: runQ);
   }
 }
