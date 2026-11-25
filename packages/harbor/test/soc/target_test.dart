@@ -716,6 +716,29 @@ void main() {
       expect(pins, lessThan(tcl.indexOf('global_placement')));
     });
 
+    test('generateOpenroadTcl writes the powered netlist after fill', () {
+      final target = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      );
+      final tcl = target.generateOpenroadTcl();
+      final fill = tcl.indexOf('filler_placement');
+      expect(tcl, contains('write_verilog MySoC_final.v'));
+      expect(
+        tcl.indexOf('global_connect', fill),
+        lessThan(
+          tcl.indexOf('write_verilog -include_pwr_gnd MySoC_final_pwr.v'),
+        ),
+      );
+      final macro = target.generateMacroOpenroadTcl(
+        const HarborAsicMacro(moduleName: 'Core'),
+      );
+      expect(
+        macro,
+        contains('write_verilog -include_pwr_gnd Core_final_pwr.v'),
+      );
+    });
+
     test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
       final tcl = HarborAsicTarget(
         provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),

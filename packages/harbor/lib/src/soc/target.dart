@@ -1827,10 +1827,12 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln();
 
     _writeFill(buf, lib);
+    buf.writeln('global_connect');
 
     // Output macro artifacts
     buf.writeln('# Macro outputs');
     buf.writeln('write_def ${m}_final.def');
+    buf.writeln('write_verilog -include_pwr_gnd ${m}_final_pwr.v');
     buf.writeln('write_abstract_lef ${m}.lef');
     buf.writeln('write_timing_model ${m}.lib');
     buf.writeln();
@@ -2046,6 +2048,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln();
 
     _writeFill(buf, lib);
+    buf.writeln('global_connect');
 
     // Reports & outputs
     buf.writeln('report_checks -path_delay min_max > timing.rpt');
@@ -2053,6 +2056,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('report_power > power.rpt');
     buf.writeln('write_def ${topCell}_final.def');
     buf.writeln('write_verilog ${topCell}_final.v');
+    buf.writeln('write_verilog -include_pwr_gnd ${topCell}_final_pwr.v');
 
     return buf.toString();
   }
