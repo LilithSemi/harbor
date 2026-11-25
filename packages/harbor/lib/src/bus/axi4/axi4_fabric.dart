@@ -1999,21 +1999,35 @@ class HarborAxi4Fabric extends HarborFabricModule {
         final swallow = raw & n.neq(0);
         push[m] <= raw & ~swallow;
         final w = worst[m]!;
-        Sequential(c, reset: r, [
-          n < n + nonFinal.zeroExtend(lenW + 1) - swallow.zeroExtend(lenW + 1),
-          If(
-            swallow,
-            then: [
-              if (merged != null)
-                w < merged()
-              else
-                If(_respKey(payload()).gt(_respKey(w)), then: [w < payload()]),
-            ],
-            orElse: [
-              If(raw, then: [w < 0]),
-            ],
-          ),
-        ]);
+        // EXOKAY is the best code, so an empty worst keeps the code of the
+        // last B.
+        final exOkay = _resp(Axi4RespField.exOkay);
+        Sequential(
+          c,
+          reset: r,
+          resetValues: {w: exOkay},
+          [
+            n <
+                n +
+                    nonFinal.zeroExtend(lenW + 1) -
+                    swallow.zeroExtend(lenW + 1),
+            If(
+              swallow,
+              then: [
+                if (merged != null)
+                  w < merged()
+                else
+                  If(
+                    _respKey(payload()).gt(_respKey(w)),
+                    then: [w < payload()],
+                  ),
+              ],
+              orElse: [
+                If(raw, then: [w < exOkay]),
+              ],
+            ),
+          ],
+        );
       }
 
       if (stage != null) {

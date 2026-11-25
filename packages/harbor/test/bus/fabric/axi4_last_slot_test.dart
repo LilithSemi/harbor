@@ -79,27 +79,27 @@ String _sv(Module m) => [
 // registered grant.
 const _realtimeGolden = {
   (HarborFabricPipeline.compact, HarborFabricTopology.shared): (
-    -5402545984370467316,
+    -6197952989017142254,
     726513,
   ),
   (HarborFabricPipeline.compact, HarborFabricTopology.crossbar): (
-    -2930259836543658950,
+    6176319356580259434,
     741959,
   ),
   (HarborFabricPipeline.balanced, HarborFabricTopology.shared): (
-    7378622264927147043,
+    -4454277323641372759,
     931398,
   ),
   (HarborFabricPipeline.balanced, HarborFabricTopology.crossbar): (
-    7375273245388810228,
+    -9101656215279267560,
     957818,
   ),
   (HarborFabricPipeline.fast, HarborFabricTopology.shared): (
-    7212164165149453307,
+    -3774348401287510945,
     1015948,
   ),
   (HarborFabricPipeline.fast, HarborFabricTopology.crossbar): (
-    4522619541237310717,
+    -4196453084492496843,
     1062438,
   ),
 };

@@ -73,6 +73,58 @@ Future<void> _exclusiveAndMerge(HarborFabricTopology t) async {
   must(mgr['x']!.rBeats.where((e) => e.$4 == 1).length, 2);
 }
 
+// With a real-time master on the fabric, the other masters have split
+// bursts. An exclusive write of such a master still gets EXOKAY, and a
+// split write with one SLVERR piece gets SLVERR.
+Future<void> _exOkayKept(HarborFabricTopology t) async {
+  const masters = [
+    MasterCfg('rt', 3, 4, realtime: true),
+    MasterCfg('x', 3, 4, exclusiveIds: 4),
+  ];
+  const slaves = [SlaveCfg('s0', 5, 4, 0x00000, 0x10000)];
+  final shell = FabricShell(
+    t,
+    masters: masters,
+    slaves: slaves,
+    realtimeBurstCap: 4,
+  );
+  final sim = Sim(shell);
+  final rng = Random(3);
+  final x = AxiManager(
+    sim,
+    'x',
+    rng,
+    awIdle: 0,
+    wIdle: 0,
+    arIdle: 0,
+    stall: 0,
+    lockPorts: true,
+  );
+  AxiManager(sim, 'rt', rng, awIdle: 0, wIdle: 0, arIdle: 0, stall: 0);
+  // The slave answers the exclusive write with EXOKAY, and the second
+  // piece of the write at 0x2000 with SLVERR.
+  DetMem(
+    sim,
+    's0',
+    rng,
+    bResp: (a) => switch (a) {
+      0x500 => 1,
+      0x2010 => 2,
+      _ => 0,
+    },
+  );
+  await sim.start();
+  Simulator.setMaxSimTime(4000000);
+  x
+    ..read(rtRead(1, 0x500, 0), lock: true)
+    ..write(rtWrite(1, 0x500, 0), lock: true)
+    ..write(rtWrite(2, 0x2000, 15))
+    ..write(rtWrite(3, 0x3000, 0));
+  await waitUntil(sim, () => x.bResp.length == 3, limit: 20000);
+  await sim.stop();
+  must({for (final (id, resp) in x.bResp) id: resp}, {1: 1, 2: 2, 3: 0});
+}
+
 // Cycles to move 16 bursts of 256 beats: reads, then writes.
 Future<(int, int)> _stream(bool realtime) async {
   final b = await Bench.start(
@@ -237,6 +289,10 @@ void main() {
       test('axi4 ${t.name}: exclusive bursts stay whole and a split write '
           'keeps its worst code', () async {
         await _exclusiveAndMerge(t);
+      });
+      test('axi4 ${t.name}: an exclusive write keeps EXOKAY with a '
+          'real-time master', () async {
+        await _exOkayKept(t);
       });
       for (final slaves in [rtN1Slave, rtTwoSlaves]) {
         test(
