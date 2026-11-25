@@ -67,6 +67,8 @@ class Sky130Provider extends PdkProvider {
     ],
     decapCells: ['${_libName}__decap_*'],
     antennaCell: '${_libName}__diode_2',
+    pinHorizontalLayer: 'met3',
+    pinVerticalLayer: 'met2',
   );
 
   @override

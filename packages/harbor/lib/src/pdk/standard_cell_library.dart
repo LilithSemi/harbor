@@ -44,6 +44,12 @@ class StandardCellLibrary with HarborPrettyString {
   /// Antenna diode cell name for `repair_antennas`.
   final String? antennaCell;
 
+  /// Horizontal routing layer for top-level pins (`place_pins -hor_layers`).
+  final String? pinHorizontalLayer;
+
+  /// Vertical routing layer for top-level pins (`place_pins -ver_layers`).
+  final String? pinVerticalLayer;
+
   const StandardCellLibrary({
     required this.name,
     required this.libertyPath,
@@ -58,6 +64,8 @@ class StandardCellLibrary with HarborPrettyString {
     this.fillCells = const [],
     this.decapCells = const [],
     this.antennaCell,
+    this.pinHorizontalLayer,
+    this.pinVerticalLayer,
   });
 
   @override
@@ -88,6 +96,9 @@ class StandardCellLibrary with HarborPrettyString {
       buf.writeln('${c}decaps: [${decapCells.join(", ")}],');
     }
     if (antennaCell != null) buf.writeln('${c}antenna: $antennaCell,');
+    if (pinHorizontalLayer != null && pinVerticalLayer != null) {
+      buf.writeln('${c}pins: $pinHorizontalLayer/$pinVerticalLayer,');
+    }
     buf.write('$p)');
     return buf.toString();
   }

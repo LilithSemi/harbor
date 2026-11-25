@@ -672,6 +672,50 @@ void main() {
       expect(tcl, isNot(contains('metal_fill')));
     });
 
+    test('generateOpenroadTcl makes tracks and places pins first', () {
+      final tcl = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      final pins = tcl.indexOf(
+        'place_pins -hor_layers Metal3 -ver_layers Metal2',
+      );
+      final order = [
+        tcl.indexOf('initialize_floorplan'),
+        tcl.indexOf('make_tracks'),
+        tcl.indexOf('-skip_io'),
+        pins,
+        tcl.indexOf('global_placement -density', pins),
+        tcl.indexOf('detailed_placement'),
+      ];
+      expect(order, everyElement(isNonNegative));
+      expect(order, orderedEquals([...order]..sort()));
+
+      final sky = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(sky, contains('place_pins -hor_layers met3 -ver_layers met2'));
+
+      final bare = HarborAsicTarget(
+        provider: _BareCellProvider(),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(bare, contains('make_tracks'));
+      expect(bare, isNot(contains('place_pins')));
+      expect(bare, isNot(contains('-skip_io')));
+    });
+
+    test('generateMacroOpenroadTcl places pins on the PDK layers', () {
+      final tcl = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+      ).generateMacroOpenroadTcl(const HarborAsicMacro(moduleName: 'Core'));
+      final pins = tcl.indexOf('place_pins -hor_layers met3 -ver_layers met2');
+      expect(tcl.indexOf('make_tracks'), allOf(isNonNegative, lessThan(pins)));
+      expect(pins, lessThan(tcl.indexOf('global_placement')));
+    });
+
     test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
       final tcl = HarborAsicTarget(
         provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),

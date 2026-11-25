@@ -1794,14 +1794,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('    -utilization \$::env(TILE_UTIL) \\');
     buf.writeln('    -core_space 2 \\');
     buf.writeln('    -site \$::env(SITE_NAME)');
+    buf.writeln('make_tracks');
     buf.writeln();
 
-    // Pin placement on all edges for grid connectivity
-    if (macro.pinOnAllEdges) {
-      buf.writeln('# Place pins on all edges for macro connectivity');
-      buf.writeln('place_pins -hor_layers Metal3 -ver_layers Metal2');
-      buf.writeln();
-    }
+    if (macro.pinOnAllEdges) _writePlacePins(buf, lib);
 
     // Power
     buf.writeln('add_global_connection -net VDD -pin_pattern VDD -power');
@@ -1842,6 +1838,15 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('report_design_area > ${m}_area.rpt');
 
     return buf.toString();
+  }
+
+  /// Writes `place_pins` on the PDK pin layers. Writes nothing when the
+  /// library has no pin layers.
+  static void _writePlacePins(StringBuffer buf, StandardCellLibrary lib) {
+    final hor = lib.pinHorizontalLayer;
+    final ver = lib.pinVerticalLayer;
+    if (hor == null || ver == null) return;
+    buf.writeln('place_pins -hor_layers $hor -ver_layers $ver');
   }
 
   /// Writes antenna repair around detailed routing.
@@ -1972,6 +1977,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('        -core_space ${dieMarginUm.toStringAsFixed(0)} \\');
     buf.writeln('        -site \$::env(SITE_NAME)');
     buf.writeln('}');
+    buf.writeln('make_tracks');
     buf.writeln();
 
     // Macro placement with halos (halo width supplied by asix as MACRO_HALO)
@@ -1994,7 +2000,15 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('global_connect');
     buf.writeln();
 
-    // Placement (density supplied by asix as PLACEMENT_DENSITY)
+    // Placement (density supplied by asix as PLACEMENT_DENSITY). With pin
+    // layers, a first pass without the pins lets place_pins put each pin near
+    // its cells.
+    if (lib.pinHorizontalLayer != null && lib.pinVerticalLayer != null) {
+      buf.writeln(
+        'global_placement -density \$::env(PLACEMENT_DENSITY) -skip_io',
+      );
+      _writePlacePins(buf, lib);
+    }
     buf.writeln('global_placement -density \$::env(PLACEMENT_DENSITY)');
     buf.writeln('detailed_placement');
     buf.writeln();
