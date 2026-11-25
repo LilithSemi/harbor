@@ -1,4 +1,7 @@
 /// KLayout script generation for GDS manipulation, DRC, and LVS.
+library;
+
+import 'dart:convert';
 
 /// KLayout DRC rule deck configuration.
 class HarborKlayoutDrcConfig {
@@ -78,38 +81,59 @@ class HarborKlayoutScripts {
 
   /// Generates a KLayout DRC script.
   ///
-  /// Runs the PDK-provided DRC rule deck against the final GDS.
+  /// The script runs the [drc] deck on the final GDS in a second KLayout
+  /// process and writes `<top>_drc.xml`. It exits with code 1 when the deck
+  /// fails, when the report is missing, or when the report has violations.
+  /// The deck gets `input`, `report` and `topcell`, then the deck options.
   String generateDrc({required String gdsPath}) {
+    final deck = drc;
+    if (deck == null) {
+      throw StateError('generateDrc needs a DRC deck');
+    }
+    final report = '${topCell}_drc.xml';
+    final vars = {
+      'input': gdsPath,
+      'report': report,
+      'topcell': topCell,
+      ...deck.options,
+    };
     final buf = StringBuffer();
     buf.writeln('# Auto-generated KLayout DRC script');
     buf.writeln('# PDK: $pdkName');
     buf.writeln();
-    buf.writeln('import klayout.db as kdb');
+    buf.writeln('import shutil');
+    buf.writeln('import subprocess');
+    buf.writeln('import sys');
+    buf.writeln();
     buf.writeln('import klayout.rdb as rdb');
     buf.writeln();
-    buf.writeln('# Load layout');
-    buf.writeln('layout = kdb.Layout()');
-    buf.writeln('layout.read("$gdsPath")');
-    buf.writeln('top = layout.top_cell()');
-    buf.writeln();
-
-    if (drc != null) {
-      buf.writeln('# Run PDK DRC deck');
-      buf.writeln('# Deck: ${drc!.deckPath}');
-      for (final opt in drc!.options.entries) {
-        buf.writeln('# Option: ${opt.key} = ${opt.value}');
-      }
-      buf.writeln('exec(open("${drc!.deckPath}").read())');
-    } else {
-      buf.writeln('# No PDK DRC deck configured');
-      buf.writeln('# Add your DRC rules here');
+    buf.writeln('report = ${jsonEncode(report)}');
+    buf.writeln('cmd = [');
+    buf.writeln('    shutil.which("klayout") or "klayout",');
+    buf.writeln('    "-b",');
+    buf.writeln('    "-r",');
+    buf.writeln('    ${jsonEncode(deck.deckPath)},');
+    for (final e in vars.entries) {
+      buf.writeln('    "-rd",');
+      buf.writeln('    ${jsonEncode('${e.key}=${e.value}')},');
     }
-
+    buf.writeln(']');
+    buf.writeln('code = subprocess.call(cmd)');
+    buf.writeln('if code != 0:');
+    buf.writeln('    print(f"DRC: the deck stopped with exit code {code}")');
+    buf.writeln('    sys.exit(1)');
     buf.writeln();
-    buf.writeln('# Write DRC report');
-    buf.writeln('report = rdb.ReportDatabase("DRC: $topCell")');
-    buf.writeln('report.save("${topCell}_drc.xml")');
-    buf.writeln('print("DRC complete")');
+    buf.writeln('db = rdb.ReportDatabase("DRC: $topCell")');
+    buf.writeln('try:');
+    buf.writeln('    db.load(report)');
+    buf.writeln('except Exception as e:');
+    buf.writeln('    print(f"DRC: cannot read {report}: {e}")');
+    buf.writeln('    sys.exit(1)');
+    buf.writeln('count = db.num_items()');
+    buf.writeln('if count != 0:');
+    buf.writeln('    print(f"DRC: {count} violations in {report}")');
+    buf.writeln('    sys.exit(1)');
+    buf.writeln('print("DRC: no violations")');
 
     return buf.toString();
   }

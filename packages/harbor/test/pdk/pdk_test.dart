@@ -240,6 +240,38 @@ void main() {
       expect(result, contains('DRC'));
     });
 
+    test('generateDrc runs the deck and fails on violations', () {
+      final result = HarborKlayoutScripts(
+        pdkName: 'gf180',
+        topCell: 'TestSoC',
+        drc: const HarborKlayoutDrcConfig(
+          deckPath: '/deck/main.drc',
+          options: {'thr': '4'},
+        ),
+      ).generateDrc(gdsPath: 'TestSoC.gds');
+      expect(result, contains('"/deck/main.drc"'));
+      expect(result, contains('"input=TestSoC.gds"'));
+      expect(result, contains('"report=TestSoC_drc.xml"'));
+      expect(result, contains('"thr=4"'));
+      expect(result, contains('db.load(report)'));
+      expect(
+        RegExp(r'sys\.exit\(1\)').allMatches(result),
+        hasLength(3),
+        reason: 'deck error, missing report and violations each fail',
+      );
+      expect(result, isNot(contains('exec(')));
+    });
+
+    test('generateDrc needs a deck', () {
+      expect(
+        () => const HarborKlayoutScripts(
+          pdkName: 'gf180',
+          topCell: 'TestSoC',
+        ).generateDrc(gdsPath: 'TestSoC.gds'),
+        throwsStateError,
+      );
+    });
+
     test('generateLvs returns non-empty string', () {
       final result = scripts.generateLvs(gdsPath: '/build/final.gds');
       expect(result, isNotEmpty);

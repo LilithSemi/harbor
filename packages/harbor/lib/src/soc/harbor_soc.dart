@@ -2689,10 +2689,12 @@ class HarborSoC extends BridgeModule {
             );
           }
 
-          // DRC
-          File(
-            '$path/klayout/drc.py',
-          ).writeAsStringSync(klayout.generateDrc(gdsPath: '${t.topCell}.gds'));
+          // asix runs drc.py when it exists, so write it only with a deck.
+          if (t.klayoutDrc != null) {
+            File('$path/klayout/drc.py').writeAsStringSync(
+              klayout.generateDrc(gdsPath: '${t.topCell}.gds'),
+            );
+          }
 
           // LVS
           File(
