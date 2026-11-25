@@ -46,6 +46,10 @@ abstract class PdkProvider {
   /// verified pad cells.
   HarborPadLibrary? get padLibrary => null;
 
+  /// Core power ring for a generated pad ring. Null when [padLibrary] is
+  /// null.
+  HarborCoreRing? get coreRing => null;
+
   /// Returns an eFuse macro descriptor for OTP storage.
   ///
   /// [bits] is the number of fuse bits requested. Returns `null`

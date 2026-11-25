@@ -64,3 +64,41 @@ class HarborPadLibrary {
     return '${libName}__$m';
   }
 }
+
+/// Core power ring between the pad ring and the core.
+class HarborCoreRing {
+  /// Space from the core edge to the ring (um).
+  final double offsetUm;
+
+  /// Width of each ring wire (um).
+  final double widthUm;
+
+  /// Space between the power wire and the ground wire (um).
+  final double spaceUm;
+
+  /// Space from the inner edge of the pad cells to the ring (um).
+  final double padClearanceUm;
+
+  /// The two ring layers.
+  final List<String> layers;
+
+  /// Layer of the pad supply pins that the ring connects to.
+  final String padLayer;
+
+  /// Pad cell supply pins on the core power net.
+  final List<String> padPowerPins;
+
+  /// Pad cell supply pins on the core ground net.
+  final List<String> padGroundPins;
+
+  const HarborCoreRing({
+    required this.offsetUm,
+    required this.widthUm,
+    required this.spaceUm,
+    required this.padClearanceUm,
+    required this.layers,
+    required this.padLayer,
+    required this.padPowerPins,
+    required this.padGroundPins,
+  });
+}

@@ -2,7 +2,10 @@ import '../bus/port/fabric_kind.dart' show HarborFabricKind;
 import '../debug/jtag_remote.dart' show JtagRemote;
 import '../pdk/io_ring.dart';
 import '../pdk/klayout.dart';
+import '../pdk/pad_library.dart';
+import '../pdk/pad_plan.dart';
 import '../pdk/pdk_provider.dart';
+import '../pdk/sky130.dart';
 import '../pdk/standard_cell_library.dart';
 
 /// Marks a module whose registers must stay separate after flattening.
@@ -1690,6 +1693,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// Analog GDS files to merge into the final layout.
   final List<String> analogGdsPaths;
 
+  /// Pad ring around the core. With a plan, the flow top is `chip_top` and
+  /// the PnR die is `DIE_AREA`. Null gives a core-only flow.
+  final HarborPadPlan? padPlan;
+
   const HarborAsicTarget({
     required this.provider,
     required this.topCell,
@@ -1701,10 +1708,29 @@ class HarborAsicTarget extends HarborDeviceTarget {
     this.ioRing,
     this.klayoutDrc,
     this.analogGdsPaths = const [],
+    this.padPlan,
   });
 
   /// Whether this uses hierarchical macro hardening.
   bool get isHierarchical => macros.isNotEmpty;
+
+  /// Top cell of the synthesis and PnR flow.
+  String get flowTop => padPlan == null ? topCell : 'chip_top';
+
+  /// Pad cells and core ring of the PDK for [padPlan].
+  ({HarborPadLibrary library, HarborCoreRing ring}) get padCells {
+    final library = provider.padLibrary;
+    final ring = provider.coreRing;
+    if (library == null || ring == null) {
+      if (provider is Sky130Provider) {
+        throw ArgumentError('sky130 pad cells are not verified');
+      }
+      throw ArgumentError(
+        '${provider.name} has no verified pad cells for a pad ring',
+      );
+    }
+    return (library: library, ring: ring);
+  }
 
   /// Generates an SDC timing constraints file.
   ///
@@ -1734,10 +1760,12 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// Set [hasBlackboxes] when `blackboxes.v` exists next to the script.
   String generateYosysTcl({bool hasBlackboxes = false}) {
     final lib = provider.standardCellLibrary;
+    final top = flowTop;
+    if (padPlan != null) padCells;
     final buf = StringBuffer();
     // asix runs `yosys -c`, a Tcl shell, so the Yosys commands must be imported.
     buf.writeln('yosys -import');
-    buf.writeln('# Auto-generated Yosys synthesis for $topCell');
+    buf.writeln('# Auto-generated Yosys synthesis for $top');
     buf.writeln('# PDK: ${provider.name}');
     buf.writeln(
       '# Run by asix.mkTapeout (yosys -c). The standard-cell liberty',
@@ -1758,6 +1786,13 @@ class HarborAsicTarget extends HarborDeviceTarget {
     if (hasBlackboxes) {
       buf.writeln('read_verilog -lib \$ipdir/blackboxes.v');
     }
+    if (padPlan != null) {
+      buf.writeln(
+        r'read_verilog -lib $::env(IO_DIR)/verilog/'
+        r'$::env(IO_LIB_NAME)__blackbox.v',
+      );
+      buf.writeln(r'read_verilog $ipdir/chip_top.v');
+    }
 
     // In hierarchical mode, replace macros with blackbox stubs
     if (isHierarchical) {
@@ -1770,8 +1805,8 @@ class HarborAsicTarget extends HarborDeviceTarget {
       buf.writeln();
     }
 
-    buf.writeln('hierarchy -top $topCell -keep_portwidths');
-    buf.writeln('synth -top $topCell -flatten');
+    buf.writeln('hierarchy -top $top -keep_portwidths');
+    buf.writeln('synth -top $top -flatten');
     buf.writeln('dfflibmap -liberty \$::env(LIB_FILE)');
     buf.writeln('abc -liberty \$::env(LIB_FILE)');
     buf.writeln(
@@ -1779,7 +1814,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
       '-locell ${lib.tieLowCell} ZN',
     );
     buf.writeln('opt_clean -purge');
-    buf.writeln('write_verilog -noattr ${topCell}_synth.v');
+    buf.writeln('write_verilog -noattr ${top}_synth.v');
     buf.writeln('stat -liberty \$::env(LIB_FILE)');
     return buf.toString();
   }
@@ -1966,24 +2001,17 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// A [tile] grid stops one stripe layer below the top, so that the top
   /// level stripes can cross the tile. The top level connects to the tile
   /// pins of each cell in [macroCells].
+  ///
+  /// With a [ring], the global connections are already written, the stripes
+  /// extend to the core ring and the ring connects to the power pads.
   static void _writePower(
     StringBuffer buf,
     StandardCellLibrary lib, {
     bool tile = false,
     List<String> macroCells = const [],
+    HarborCoreRing? ring,
   }) {
-    for (final pin in lib.powerPins) {
-      buf.writeln(
-        'add_global_connection -net VDD -pin_pattern {^$pin\$} -power',
-      );
-    }
-    for (final pin in lib.groundPins) {
-      buf.writeln(
-        'add_global_connection -net VSS -pin_pattern {^$pin\$} -ground',
-      );
-    }
-    buf.writeln('global_connect');
-    buf.writeln();
+    if (ring == null) _writeGlobalConnections(buf, lib);
 
     final tap = lib.tapCell;
     if (tap != null) {
@@ -2021,13 +2049,34 @@ class HarborAsicTarget extends HarborDeviceTarget {
         'add_pdn_stripe -grid stdcell -layer ${s.layer} '
         '-width ${_um(s.widthUm)} -pitch ${_um(s.pitchUm)} '
         '-offset ${_um(s.offsetUm)} -spacing ${_um(s.spacingUm)} '
-        '-starts_with POWER',
+        '-starts_with POWER${ring == null ? '' : ' -extend_to_core_ring'}',
       );
+    }
+    if (ring != null) {
+      buf.writeln(
+        'add_pdn_ring -grid stdcell -layers {${ring.layers.join(' ')}} '
+        '-widths [list \$ring_width \$ring_width] \\',
+      );
+      buf.writeln(
+        '  -spacings [list \$ring_space \$ring_space] '
+        '-core_offset [list \$ring_offset \$ring_offset] \\',
+      );
+      buf.writeln('  -connect_to_pads -connect_to_pad_layers ${ring.padLayer}');
     }
     var below = pdn.railLayer;
     for (final s in stripes) {
       buf.writeln('add_pdn_connect -grid stdcell -layers {$below ${s.layer}}');
       below = s.layer;
+    }
+    if (ring != null) {
+      final [outer, inner] = ring.layers;
+      for (final pair in [
+        '$outer $inner',
+        '$outer ${ring.padLayer}',
+        '$inner ${ring.padLayer}',
+      ]) {
+        buf.writeln('add_pdn_connect -grid stdcell -layers {$pair}');
+      }
     }
     if (macroCells.isNotEmpty && stripes.length > 1) {
       final n = stripes.length;
@@ -2041,6 +2090,27 @@ class HarborAsicTarget extends HarborDeviceTarget {
       );
     }
     buf.writeln('pdngen');
+    buf.writeln();
+  }
+
+  /// Writes the VDD and VSS connections of the cell supply pins and of the
+  /// pad supply pins in [ring].
+  static void _writeGlobalConnections(
+    StringBuffer buf,
+    StandardCellLibrary lib, [
+    HarborCoreRing? ring,
+  ]) {
+    for (final pin in [...lib.powerPins, ...?ring?.padPowerPins]) {
+      buf.writeln(
+        'add_global_connection -net VDD -pin_pattern {^$pin\$} -power',
+      );
+    }
+    for (final pin in [...lib.groundPins, ...?ring?.padGroundPins]) {
+      buf.writeln(
+        'add_global_connection -net VSS -pin_pattern {^$pin\$} -ground',
+      );
+    }
+    buf.writeln('global_connect');
     buf.writeln();
   }
 
@@ -2103,8 +2173,11 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// to avoid DRC violations with macro-internal routing.
   String generateOpenroadTcl() {
     final lib = provider.standardCellLibrary;
+    final plan = padPlan;
+    final pads = plan == null ? null : padCells;
+    final top = flowTop;
     final buf = StringBuffer();
-    buf.writeln('# Auto-generated OpenROAD P&R for $topCell');
+    buf.writeln('# Auto-generated OpenROAD P&R for $top');
     buf.writeln('# PDK: ${provider.name}');
     buf.writeln('# Run by asix.mkTapeout (openroad -exit). All PDK paths and');
     buf.writeln('# floorplan knobs come from the env: LIB_FILE/TECH_LEF/');
@@ -2113,6 +2186,9 @@ class HarborAsicTarget extends HarborDeviceTarget {
       '# MACRO_HALO/PLACEMENT_DENSITY/DROUTE_END_ITER (+optional DIE_AREA,',
     );
     buf.writeln('# CORE_MARGIN_UM, LAYER_ADJ_*).');
+    if (pads != null) {
+      buf.writeln('# Pad ring: DIE_AREA, IO_DIR, IO_LIB_NAME, LIB_CORNER.');
+    }
     if (isHierarchical) {
       buf.writeln(
         '# Mode: hierarchical assembly '
@@ -2121,23 +2197,21 @@ class HarborAsicTarget extends HarborDeviceTarget {
     }
     buf.writeln();
 
-    // Read inputs (paths supplied by asix via env vars). The tech LEF is read
-    // explicitly, then every other cell LEF is globbed from CELL_LEF_DIR while
-    // skipping anything that looks like the tech LEF (avoids a double read).
-    buf.writeln('read_liberty \$::env(LIB_FILE)');
-    buf.writeln(
-      'if {[info exists ::env(TECH_LEF)] && \$::env(TECH_LEF) ne ""} {',
-    );
-    buf.writeln('    read_lef \$::env(TECH_LEF)');
-    buf.writeln('}');
-    buf.writeln(
-      'foreach _lef [lsort [glob -nocomplain \$::env(CELL_LEF_DIR)/*.lef]] {',
-    );
-    buf.writeln(
-      '    if {[string match *tech* [file tail \$_lef]]} { continue }',
-    );
-    buf.writeln('    read_lef \$_lef');
-    buf.writeln('}');
+    if (pads != null) {
+      _writePadRingReads(buf);
+    } else {
+      // Read inputs (paths supplied by asix via env vars). The tech LEF is
+      // read explicitly, then every other cell LEF is globbed from
+      // CELL_LEF_DIR while skipping anything that looks like the tech LEF
+      // (avoids a double read).
+      buf.writeln('read_liberty \$::env(LIB_FILE)');
+      buf.writeln(
+        'if {[info exists ::env(TECH_LEF)] && \$::env(TECH_LEF) ne ""} {',
+      );
+      buf.writeln('    read_lef \$::env(TECH_LEF)');
+      buf.writeln('}');
+      _writeCellLefs(buf);
+    }
 
     // Read macro LEF/LIB in hierarchical mode (asix copies these into the CWD)
     if (isHierarchical) {
@@ -2151,7 +2225,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
 
     buf.writeln();
     buf.writeln('read_verilog \$::env(SYNTH_V)');
-    buf.writeln('link_design $topCell');
+    buf.writeln('link_design $top');
     buf.writeln('read_sdc \$::env(SDC_FILE)');
     final rcLayer = lib.wireRcLayer;
     if (rcLayer != null) {
@@ -2163,43 +2237,11 @@ class HarborAsicTarget extends HarborDeviceTarget {
     }
     buf.writeln();
 
-    // Floorplan: a fixed DIE_AREA (fab-slot tapeouts) takes precedence over a
-    // utilization-driven auto floorplan.
-    buf.writeln('if {[info exists ::env(CORE_MARGIN_UM)]} {');
-    buf.writeln('    set _m \$::env(CORE_MARGIN_UM)');
-    if (dieMarginUm != null) {
-      buf.writeln('} else {');
-      buf.writeln('    set _m ${_um(dieMarginUm!)}');
+    if (plan != null && pads != null) {
+      _writePadRing(buf, lib, plan, pads.library, pads.ring);
+    } else {
+      _writeCoreFloorplan(buf);
     }
-    buf.writeln('}');
-    buf.writeln('if {[info exists ::env(DIE_AREA)]} {');
-    buf.writeln('    lassign \$::env(DIE_AREA) _dx0 _dy0 _dx1 _dy1');
-    buf.writeln('    if {[info exists _m]} {');
-    buf.writeln('        set _cx0 [expr {\$_dx0 + \$_m}]');
-    buf.writeln('        set _cy0 [expr {\$_dy0 + \$_m}]');
-    buf.writeln('        set _cx1 [expr {\$_dx1 - \$_m}]');
-    buf.writeln('        set _cy1 [expr {\$_dy1 - \$_m}]');
-    buf.writeln('    } else {');
-    for (final line in _autoCoreTcl) {
-      buf.writeln('        $line');
-    }
-    buf.writeln('    }');
-    buf.writeln('    initialize_floorplan \\');
-    buf.writeln('        -die_area "\$_dx0 \$_dy0 \$_dx1 \$_dy1" \\');
-    buf.writeln('        -core_area "\$_cx0 \$_cy0 \$_cx1 \$_cy1" \\');
-    buf.writeln('        -site \$::env(SITE_NAME)');
-    buf.writeln('} else {');
-    buf.writeln(
-      '    if {![info exists _m]} { set _m ${_um(defaultCoreSpaceUm)} }',
-    );
-    buf.writeln('    initialize_floorplan \\');
-    buf.writeln('        -utilization \$::env(UTILIZATION) \\');
-    buf.writeln('        -core_space \$_m \\');
-    buf.writeln('        -site \$::env(SITE_NAME)');
-    buf.writeln('}');
-    buf.writeln('make_tracks');
-    _writeLayerAdjustments(buf);
-    buf.writeln();
 
     // Macro placement with halos (halo width supplied by asix as MACRO_HALO)
     if (isHierarchical) {
@@ -2215,18 +2257,29 @@ class HarborAsicTarget extends HarborDeviceTarget {
       buf.writeln();
     }
 
-    _writePower(buf, lib, macroCells: [for (final m in macros) m.moduleName]);
+    _writePower(
+      buf,
+      lib,
+      macroCells: [for (final m in macros) m.moduleName],
+      ring: pads?.ring,
+    );
 
     // Placement (density supplied by asix as PLACEMENT_DENSITY). With pin
     // layers, a first pass without the pins lets place_pins put each pin near
-    // its cells.
-    if (lib.pinHorizontalLayer != null && lib.pinVerticalLayer != null) {
+    // its cells. A pad ring has its I/O terminals placed already.
+    if (pads != null) {
       buf.writeln(
         'global_placement -density \$::env(PLACEMENT_DENSITY) -skip_io',
       );
-      _writePlacePins(buf, lib);
+    } else {
+      if (lib.pinHorizontalLayer != null && lib.pinVerticalLayer != null) {
+        buf.writeln(
+          'global_placement -density \$::env(PLACEMENT_DENSITY) -skip_io',
+        );
+        _writePlacePins(buf, lib);
+      }
+      buf.writeln('global_placement -density \$::env(PLACEMENT_DENSITY)');
     }
-    buf.writeln('global_placement -density \$::env(PLACEMENT_DENSITY)');
     buf.writeln('detailed_placement');
     buf.writeln();
 
@@ -2274,11 +2327,274 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('report_checks -path_delay min_max > timing.rpt');
     buf.writeln('tee -file area.rpt {report_design_area}');
     buf.writeln('report_power > power.rpt');
-    buf.writeln('write_def ${topCell}_final.def');
-    buf.writeln('write_verilog ${topCell}_final.v');
-    buf.writeln('write_verilog -include_pwr_gnd ${topCell}_final_pwr.v');
+    buf.writeln('write_def ${top}_final.def');
+    buf.writeln('write_verilog ${top}_final.v');
+    buf.writeln('write_verilog -include_pwr_gnd ${top}_final_pwr.v');
 
     return buf.toString();
+  }
+
+  /// Writes a `read_lef` of each cell LEF in `CELL_LEF_DIR` except the tech
+  /// LEF.
+  static void _writeCellLefs(StringBuffer buf) {
+    buf.writeln(
+      'foreach _lef [lsort [glob -nocomplain \$::env(CELL_LEF_DIR)/*.lef]] {',
+    );
+    buf.writeln(
+      '    if {[string match *tech* [file tail \$_lef]]} { continue }',
+    );
+    buf.writeln('    read_lef \$_lef');
+    buf.writeln('}');
+  }
+
+  /// Writes the env checks, the PDK pad configuration and the LEF and
+  /// liberty reads of a pad ring flow.
+  static void _writePadRingReads(StringBuffer buf) {
+    for (final env in ['DIE_AREA', 'IO_DIR', 'IO_LIB_NAME']) {
+      buf.writeln('if {![info exists ::env($env)]} {');
+      buf.writeln('  puts stderr "The pad ring needs the $env env var"');
+      buf.writeln('  exit 1');
+      buf.writeln('}');
+    }
+    buf.writeln();
+    for (final line in const [
+      '# The pad cell names, sites, fillers and I/O terminals come from the '
+          'PDK pad configuration.',
+      r'set io_pdk_dir [file dirname [file dirname $::env(IO_DIR)]]',
+      r'set ::env(PDK) [file tail $io_pdk_dir]',
+      r'set ::env(PDK_ROOT) [file dirname $io_pdk_dir]',
+      r'set ::env(PAD_CELL_LIBRARY) $::env(IO_LIB_NAME)',
+      r'source $io_pdk_dir/libs.tech/librelane/$::env(IO_LIB_NAME)/config.tcl',
+      '',
+      r'read_lef $::env(TECH_LEF)',
+      r'dict for {site size} $::env(PAD_FAKE_SITES) {',
+      r'  lassign [split $size ","] site_w site_h',
+      r'  make_fake_io_site -name $site -width [string trim $site_w] '
+          r'-height [string trim $site_h]',
+      '}',
+    ]) {
+      buf.writeln(line);
+    }
+    _writeCellLefs(buf);
+    for (final line in const [
+      r'foreach _lef [lsort [glob $::env(IO_DIR)/lef/$::env(IO_LIB_NAME)__*.lef]] {',
+      r'    read_lef $_lef',
+      '}',
+      r'read_liberty $::env(LIB_FILE)',
+      r'read_liberty $::env(IO_DIR)/lib/$::env(IO_LIB_NAME)__$::env(LIB_CORNER).lib',
+    ]) {
+      buf.writeln(line);
+    }
+  }
+
+  /// Tcl of the pad slots and the core area inside the pad ring.
+  static const _padRingTcl = [
+    '',
+    r'set corner_site [pad::find_site $::env(PAD_CORNER_SITE_NAME)]',
+    r'set corner_w [expr double([$corner_site getWidth]) / $dbu]',
+    r'set corner_h [expr double([$corner_site getHeight]) / $dbu]',
+    '',
+    '# Each side centers its pads. The gap between two pads is a whole number '
+        'of micrometers,',
+    '# which puts the pads where the wafer.space pad mask has them. Filler '
+        'cells close the gaps.',
+    '# The formula matches the mask of the 0p5x0p5 slot only. Check the '
+        'other slots with CheckPadMask.',
+    '# The result is a list of pad name, start and width along the side.',
+    'proc pad_slots { side } {',
+    '  global pads block dbu dx0 dy0 dx1 dy1 corner_w corner_h',
+    r'  set horizontal [expr {$side eq "south" || $side eq "north"}]',
+    r'  set side_len [expr {$horizontal ? ($dx1 - $dx0) - 2 * $corner_w : '
+        r'($dy1 - $dy0) - 2 * $corner_h}]',
+    '  set pad_sum 0.0',
+    r'  foreach name $pads($side) {',
+    r'    set pad_sum [expr $pad_sum + [[[$block findInst $name] getMaster] '
+        r'getWidth] / double($dbu)]',
+    '  }',
+    r'  if { $pad_sum > $side_len } {',
+    r'    puts stderr "The pads of the $side side are wider than the side"',
+    '    exit 1',
+    '  }',
+    r'  set free [expr $side_len - $pad_sum]',
+    r'  set gap [expr floor($free / ([llength $pads($side)] + 1))]',
+    r'  set start [expr ($free - $gap * ([llength $pads($side)] - 1)) / 2]',
+    r'  set origin [expr {$horizontal ? $dx0 : $dy0}]',
+    r'  set pos [expr $origin + $start + [expr {$horizontal ? $corner_w : '
+        r'$corner_h}]]',
+    '  set slots {}',
+    r'  foreach name $pads($side) {',
+    r'    set w [expr [[[$block findInst $name] getMaster] getWidth] / '
+        r'double($dbu)]',
+    r'    lappend slots [list $name $pos $w]',
+    r'    set pos [expr $pos + $gap + $w]',
+    '  }',
+    r'  return $slots',
+    '}',
+    '',
+    '# The core starts at the inner edge of the pad ring. The PDN ring sits '
+        'between the pad cells and',
+    '# the core, so the straps from the power pads to the ring stay short.',
+    r'set ring_extent [expr $ring_offset + 2 * $ring_width + $ring_space]',
+    r'set cx0 [expr int(ceil($dx0 + $corner_w + $ring_extent + $pad_clearance))]',
+    r'set cy0 [expr int(ceil($dy0 + $corner_h + $ring_extent + $pad_clearance))]',
+    r'set cx1 [expr int(floor($dx1 - $corner_w - $ring_extent - $pad_clearance))]',
+    r'set cy1 [expr int(floor($dy1 - $corner_h - $ring_extent - $pad_clearance))]',
+    r'if { $cx0 >= $cx1 || $cy0 >= $cy1 } {',
+    '  puts stderr "The core does not fit inside the pad ring"',
+    '  exit 1',
+    '}',
+    '',
+    'foreach side {south east north west} {',
+    r'  foreach slot [pad_slots $side] {',
+    r'    lassign $slot name pos w',
+    r'    if { [[[$block findInst $name] getMaster] getName] ni $power_masters } '
+        'continue',
+    r'    if { $side eq "south" || $side eq "north" } {',
+    r'      lassign [list $cx0 $cx1] lo hi',
+    '    } else {',
+    r'      lassign [list $cy0 $cy1] lo hi',
+    '    }',
+    r'    if { $pos < $lo - $ring_extent || $pos + $w > $hi + $ring_extent } {',
+    r'      puts stderr "The power ring does not span the pad $name"',
+    '      exit 1',
+    '    }',
+    '  }',
+    '}',
+    '',
+    r'initialize_floorplan \',
+    r'  -die_area $::env(DIE_AREA) \',
+    r'  -core_area [list $cx0 $cy0 $cx1 $cy1] \',
+    r'  -site $::env(SITE_NAME)',
+    'make_tracks',
+  ];
+
+  /// Tcl that places the pads, corners, fillers and I/O terminals.
+  static const _padPlaceTcl = [
+    '# Pad ring. The PnR die edge is the outer edge of the pad cells, so the '
+        'sites have no offset.',
+    'make_io_sites \\',
+    r'  -horizontal_site $::env(PAD_SITE_NAME) \',
+    r'  -vertical_site $::env(PAD_SITE_NAME) \',
+    r'  -corner_site $::env(PAD_CORNER_SITE_NAME) \',
+    '  -offset 0',
+    '',
+    'foreach side {south east north west} {',
+    r'  foreach slot [pad_slots $side] {',
+    r'    lassign $slot name pos w',
+    r'    set master [[[$block findInst $name] getMaster] getName]',
+    r'    place_pad -row IO_[string toupper $side] -location $pos $name '
+        r'-master $master',
+    '  }',
+    '}',
+    r'place_corners $::env(PAD_CORNER)',
+    'foreach side {north south west east} {',
+    r'  place_io_fill -row IO_[string toupper $side] {*}$::env(PAD_FILLERS)',
+    '}',
+    'connect_by_abutment',
+    'foreach side {south east north west} {',
+    r'  foreach name $pads($side) {',
+    r'    set master [[[$block findInst $name] getMaster] getName]',
+    r'    foreach master_pin $::env(PAD_PLACE_IO_TERMINALS) {',
+    r'      lassign [split $master_pin /] terminal_master terminal_pin',
+    r'      if { $master eq $terminal_master } {',
+    r'        place_io_terminals $name/$terminal_pin',
+    '        break',
+    '      }',
+    '    }',
+    '  }',
+    '}',
+    'remove_io_rows',
+  ];
+
+  /// Writes the pad ring floorplan: the pad slots on `DIE_AREA`, the core
+  /// inside the ring, the supply connections and the placed pads.
+  static void _writePadRing(
+    StringBuffer buf,
+    StandardCellLibrary lib,
+    HarborPadPlan plan,
+    HarborPadLibrary library,
+    HarborCoreRing ring,
+  ) {
+    final powerMasters = {
+      for (final k in const [
+        HarborPadKind.ioPower,
+        HarborPadKind.ioGround,
+        HarborPadKind.corePower,
+        HarborPadKind.coreGround,
+      ])
+        library.cellName(k),
+    };
+    buf.writeln(r'lassign $::env(DIE_AREA) dx0 dy0 dx1 dy1');
+    buf.writeln();
+    buf.writeln('# The PDN ring and the pad ring set the size of the core.');
+    buf.writeln('set ring_offset ${_um(ring.offsetUm)}');
+    buf.writeln('set ring_width ${_um(ring.widthUm)}');
+    buf.writeln('set ring_space ${_um(ring.spaceUm)}');
+    buf.writeln('set pad_clearance ${_um(ring.padClearanceUm)}');
+    buf.writeln('set power_masters {${powerMasters.join(' ')}}');
+    buf.writeln();
+    buf.writeln('set block [ord::get_db_block]');
+    buf.writeln(r'set dbu [$block getDbUnitsPerMicron]');
+    buf.writeln();
+    for (final e in HarborPadPlan.sideOrder) {
+      final insts = [for (final p in plan.side(e)) p.inst].join(' ');
+      buf.writeln('set pads(${e.name}) {$insts}');
+    }
+    for (final line in _padRingTcl) {
+      buf.writeln(line);
+    }
+    _writeLayerAdjustments(buf);
+    buf.writeln();
+    buf.writeln(
+      '# The pad cells tie the I/O and core supplies together. '
+      'Both pin names join the same nets.',
+    );
+    _writeGlobalConnections(buf, lib, ring);
+    for (final line in _padPlaceTcl) {
+      buf.writeln(line);
+    }
+    buf.writeln();
+  }
+
+  /// Writes the core-only floorplan.
+  void _writeCoreFloorplan(StringBuffer buf) {
+    // Floorplan: a fixed DIE_AREA (fab-slot tapeouts) takes precedence over a
+    // utilization-driven auto floorplan.
+    buf.writeln('if {[info exists ::env(CORE_MARGIN_UM)]} {');
+    buf.writeln('    set _m \$::env(CORE_MARGIN_UM)');
+    if (dieMarginUm != null) {
+      buf.writeln('} else {');
+      buf.writeln('    set _m ${_um(dieMarginUm!)}');
+    }
+    buf.writeln('}');
+    buf.writeln('if {[info exists ::env(DIE_AREA)]} {');
+    buf.writeln('    lassign \$::env(DIE_AREA) _dx0 _dy0 _dx1 _dy1');
+    buf.writeln('    if {[info exists _m]} {');
+    buf.writeln('        set _cx0 [expr {\$_dx0 + \$_m}]');
+    buf.writeln('        set _cy0 [expr {\$_dy0 + \$_m}]');
+    buf.writeln('        set _cx1 [expr {\$_dx1 - \$_m}]');
+    buf.writeln('        set _cy1 [expr {\$_dy1 - \$_m}]');
+    buf.writeln('    } else {');
+    for (final line in _autoCoreTcl) {
+      buf.writeln('        $line');
+    }
+    buf.writeln('    }');
+    buf.writeln('    initialize_floorplan \\');
+    buf.writeln('        -die_area "\$_dx0 \$_dy0 \$_dx1 \$_dy1" \\');
+    buf.writeln('        -core_area "\$_cx0 \$_cy0 \$_cx1 \$_cy1" \\');
+    buf.writeln('        -site \$::env(SITE_NAME)');
+    buf.writeln('} else {');
+    buf.writeln(
+      '    if {![info exists _m]} { set _m ${_um(defaultCoreSpaceUm)} }',
+    );
+    buf.writeln('    initialize_floorplan \\');
+    buf.writeln('        -utilization \$::env(UTILIZATION) \\');
+    buf.writeln('        -core_space \$_m \\');
+    buf.writeln('        -site \$::env(SITE_NAME)');
+    buf.writeln('}');
+    buf.writeln('make_tracks');
+    _writeLayerAdjustments(buf);
+    buf.writeln();
   }
 }
 

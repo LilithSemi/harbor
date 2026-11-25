@@ -75,6 +75,18 @@ class Gf180mcuProvider extends PdkProvider {
     analogPin: 'ASIG5V',
   );
 
+  @override
+  HarborCoreRing get coreRing => const HarborCoreRing(
+    offsetUm: 6,
+    widthUm: 25,
+    spaceUm: 1.7,
+    padClearanceUm: 30,
+    layers: ['Metal4', 'Metal3'],
+    padLayer: 'Metal2',
+    padPowerPins: ['DVDD'],
+    padGroundPins: ['DVSS'],
+  );
+
   String get _libName => switch (voltage) {
     Gf180mcuVoltage.v3_3 => 'gf180mcu_fd_sc_mcu7t5v0',
     Gf180mcuVoltage.v5_0 => 'gf180mcu_fd_sc_mcu9t5v0',

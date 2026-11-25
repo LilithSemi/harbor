@@ -22,7 +22,10 @@ import '../bus/wishbone/wishbone_interface.dart';
 import '../bus/wishbone/wishbone_register_stage.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../clock/clock_domain.dart';
+import '../pdk/chip_top.dart';
 import '../pdk/klayout.dart';
+import '../pdk/pad_library.dart';
+import '../pdk/pad_plan.dart';
 import '../peripherals/flash.dart';
 import '../peripherals/harbor_ddr3.dart';
 import '../peripherals/harbor_sdram.dart';
@@ -2864,6 +2867,18 @@ class HarborSoC extends BridgeModule {
             ).writeAsStringSync(preplacePy.join('\n'));
           }
         case HarborAsicTarget():
+          final plan = t.padPlan;
+          if (plan != null) {
+            File('$path/chip_top.v').writeAsStringSync(
+              harborChipTopVerilog(
+                plan: plan,
+                library: t.padCells.library,
+                coreModule: t.topCell,
+                corePorts: _padCorePorts(plan),
+                topName: t.flowTop,
+              ),
+            );
+          }
           File('$path/$name.sdc').writeAsStringSync(t.generateSdc());
           File('$path/synth.tcl').writeAsStringSync(
             t.generateYosysTcl(hasBlackboxes: blackboxStubs.isNotEmpty),
@@ -2887,9 +2902,9 @@ class HarborSoC extends BridgeModule {
           // KLayout scripts
           final klayout = HarborKlayoutScripts(
             pdkName: t.provider.name,
-            topCell: t.topCell,
+            topCell: t.flowTop,
             drc: t.klayoutDrc,
-            lvsNetlistPath: '${t.topCell}_final.v',
+            lvsNetlistPath: '${t.flowTop}_final.v',
           );
 
           final klayoutDir = Directory('$path/klayout');
@@ -2899,9 +2914,9 @@ class HarborSoC extends BridgeModule {
           final lib = t.provider.standardCellLibrary;
           File('$path/klayout/def2gds.py').writeAsStringSync(
             klayout.generateDefToGds(
-              defPath: '${t.topCell}_final.def',
+              defPath: '${t.flowTop}_final.def',
               techLefPath: lib.techLefPath ?? lib.lefPath,
-              outputGdsPath: '${t.topCell}.gds',
+              outputGdsPath: '${t.flowTop}.gds',
             ),
           );
 
@@ -2909,9 +2924,9 @@ class HarborSoC extends BridgeModule {
           if (t.analogGdsPaths.isNotEmpty) {
             File('$path/klayout/gds_merge.py').writeAsStringSync(
               klayout.generateGdsMerge(
-                digitalGdsPath: '${t.topCell}.gds',
+                digitalGdsPath: '${t.flowTop}.gds',
                 analogGdsPaths: t.analogGdsPaths,
-                outputGdsPath: '${t.topCell}_merged.gds',
+                outputGdsPath: '${t.flowTop}_merged.gds',
               ),
             );
           }
@@ -2919,16 +2934,47 @@ class HarborSoC extends BridgeModule {
           // asix runs drc.py when it exists, so write it only with a deck.
           if (t.klayoutDrc != null) {
             File('$path/klayout/drc.py').writeAsStringSync(
-              klayout.generateDrc(gdsPath: '${t.topCell}.gds'),
+              klayout.generateDrc(gdsPath: '${t.flowTop}.gds'),
             );
           }
 
           // LVS
           File(
             '$path/klayout/lvs.py',
-          ).writeAsStringSync(klayout.generateLvs(gdsPath: '${t.topCell}.gds'));
+          ).writeAsStringSync(klayout.generateLvs(gdsPath: '${t.flowTop}.gds'));
       }
     }
+  }
+
+  /// The distinct ports of [plan], each checked against a port of this SoC.
+  List<HarborPadPort> _padCorePorts(HarborPadPlan plan) {
+    void check(String port, int width, Map<String, Logic> dir, String kind) {
+      if (dir[port]?.width != width) {
+        throw ArgumentError(
+          'Pad port $port is not a $width bit $kind of $definitionName',
+        );
+      }
+    }
+
+    final ports = <HarborPadPort>[];
+    for (final pad in plan.all) {
+      final p = pad.port;
+      if (p == null || ports.contains(p)) continue;
+      ports.add(p);
+      switch (p.kind) {
+        case HarborPadKind.input || HarborPadKind.clockInput:
+          check(p.name, p.width, inputs, 'input');
+        case HarborPadKind.output:
+          check(p.name, p.width, outputs, 'output');
+        case HarborPadKind.bidir:
+          check(p.outputName!, p.width, outputs, 'output');
+          check(p.outputEnable!, p.width, outputs, 'output');
+          check(p.inputName!, p.width, inputs, 'input');
+        case _:
+          check(p.name, p.width, {...inputs, ...outputs, ...inOuts}, 'port');
+      }
+    }
+    return ports;
   }
 
   /// Generates Verilog blackbox stubs for all SystemVerilog leaf modules.
