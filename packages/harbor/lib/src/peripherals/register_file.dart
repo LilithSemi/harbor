@@ -45,7 +45,7 @@ import '../soc/target.dart';
 /// dropped on every backend, and its `wr_ready` (or `wr{w}_ready`) output
 /// reads 0 during reset on every backend too, so a caller counting accepted
 /// writes does not count the drop. Reset clears the entries only on the flop
-/// backends. Block RAM keeps its contents through reset.
+/// backends with [resetEntries]. Block RAM keeps its contents through reset.
 ///
 /// A block RAM backend has a fixed read latency (ECP5 1, Xilinx 1, iCE40 0).
 /// A `forceReadLatency` that is different from it is an error.
@@ -74,6 +74,12 @@ class HarborRegisterFile extends BridgeModule {
   /// Each read port gets one 72-bit SDP block instead of two x36 TDP blocks.
   /// The default stays on the existing x36 backend until users select it.
   final bool useXilinxSdp72;
+
+  /// When true (the default), reset clears the entries of the flop backends.
+  /// When false, the flop entries take no reset and read X until written, as
+  /// block RAM does. Use false when the caller never reads an entry it did not
+  /// write, so the reset does not fan out to every entry flop.
+  final bool resetEntries;
 
   /// Adds a `wr_strb` input with one bit for each byte of the word. A write
   /// changes only the bytes whose bit is set. It needs one write port, one
@@ -172,11 +178,12 @@ class HarborRegisterFile extends BridgeModule {
     required bool reservedZero,
     required String backend,
     required bool byteWrite,
+    required bool resetEntries,
   }) =>
       'HarborRegisterFile_E${numEntries}_W${dataWidth}_'
       'R${numReadPorts}_W${numWritePorts}_B${numBanks}_'
       'L${readLatency}_BUF${writeBufferDepth}_Z${reservedZero ? 1 : 0}_'
-      '$backend${byteWrite ? '_BW' : ''}';
+      '$backend${byteWrite ? '_BW' : ''}${resetEntries ? '' : '_NR'}';
 
   /// Name of the storage backend that [target] selects for this shape.
   static String _backendName(
@@ -209,6 +216,7 @@ class HarborRegisterFile extends BridgeModule {
     this.reservedZero = true,
     this.useXilinxSdp72 = false,
     this.byteWrite = false,
+    this.resetEntries = true,
     HarborDeviceTarget? target,
     int? forceReadLatency,
     String? name,
@@ -244,6 +252,7 @@ class HarborRegisterFile extends BridgeModule {
              useXilinxSdp72,
            ),
            byteWrite: byteWrite,
+           resetEntries: resetEntries,
          ),
          name: name ?? 'regfile',
        ) {
@@ -1127,24 +1136,26 @@ class HarborRegisterFile extends BridgeModule {
     // [reservedZero], entry 0 (x0) is never stored, otherwise it is a normal
     // entry.
     final firstEntry = reservedZero ? 1 : 0;
+    final writes = [
+      for (var entry = firstEntry; entry < numEntries; entry++)
+        If(
+          bankWinEn[entry % numBanks] &
+              bankWinAddr[entry % numBanks].eq(Const(entry, width: addrWidth)),
+          then: [
+            storage[entry] <
+                _mergeBytes(bankWinData[entry % numBanks], storage[entry]),
+          ],
+        ),
+    ];
     Sequential(clk, [
-      If(
-        reset,
-        then: [for (final reg in storage) reg < zeroData],
-        orElse: [
-          for (var entry = firstEntry; entry < numEntries; entry++)
-            If(
-              bankWinEn[entry % numBanks] &
-                  bankWinAddr[entry % numBanks].eq(
-                    Const(entry, width: addrWidth),
-                  ),
-              then: [
-                storage[entry] <
-                    _mergeBytes(bankWinData[entry % numBanks], storage[entry]),
-              ],
-            ),
-        ],
-      ),
+      if (resetEntries)
+        If(
+          reset,
+          then: [for (final reg in storage) reg < zeroData],
+          orElse: writes,
+        )
+      else
+        ...writes,
     ]);
 
     // Combinational reads. When [reservedZero], entry 0 reads zero, otherwise it
@@ -1366,21 +1377,23 @@ class HarborRegisterFile extends BridgeModule {
     // [reservedZero], entry 0 (x0) is never stored, otherwise it is a normal
     // entry.
     final firstEntry = reservedZero ? 1 : 0;
+    final writes = [
+      for (var entry = firstEntry; entry < numEntries; entry++)
+        If(
+          bankWrEn[entry % numBanks] &
+              bankWrAddr[entry % numBanks].eq(Const(entry, width: addrWidth)),
+          then: [storage[entry] < bankWrData[entry % numBanks]],
+        ),
+    ];
     Sequential(clk, [
-      If(
-        reset,
-        then: [for (final reg in storage) reg < zeroData],
-        orElse: [
-          for (var entry = firstEntry; entry < numEntries; entry++)
-            If(
-              bankWrEn[entry % numBanks] &
-                  bankWrAddr[entry % numBanks].eq(
-                    Const(entry, width: addrWidth),
-                  ),
-              then: [storage[entry] < bankWrData[entry % numBanks]],
-            ),
-        ],
-      ),
+      if (resetEntries)
+        If(
+          reset,
+          then: [for (final reg in storage) reg < zeroData],
+          orElse: writes,
+        )
+      else
+        ...writes,
     ]);
 
     // Combinational reads with bypass. The youngest match wins: an accepted
