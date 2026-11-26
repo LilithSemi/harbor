@@ -1,5 +1,6 @@
 import '../bus/port/fabric_kind.dart' show HarborFabricKind;
 import '../debug/jtag_remote.dart' show JtagRemote;
+import '../pdk/fab_slot.dart';
 import '../pdk/io_ring.dart';
 import '../pdk/klayout.dart';
 import '../pdk/pad_library.dart';
@@ -2636,19 +2637,97 @@ class HarborAsicTarget extends HarborDeviceTarget {
     '}',
   ];
 
-  /// Tcl of the pad slots and the core area inside the pad ring.
-  static const _padRingTcl = [
+  /// Tcl of the corner size.
+  static const _padCornerTcl = [
     '',
     r'set corner_site [pad::find_site $::env(PAD_CORNER_SITE_NAME)]',
     r'set corner_w [expr double([$corner_site getWidth]) / $dbu]',
     r'set corner_h [expr double([$corner_site getHeight]) / $dbu]',
+  ];
+
+  /// Tcl of the pad slots on a fab slot. Each pad opening center goes on its
+  /// slot position. In R0, MX, R90 and MXR90 the cell edge at x = 0 is the
+  /// low edge along the side, in the other orientations it is the high edge.
+  static const _padSlotsFabTcl = [
+    '',
+    'proc pad_location { center w orient } {',
+    '  global pad_opening',
+    r'  if { $orient in {R0 MX R90 MXR90} } {',
+    r'    return [expr $center - $pad_opening]',
+    '  }',
+    r'  return [expr $center - $w + $pad_opening]',
+    '}',
+    '',
+    '# The result is a list of pad name, start and width along the side.',
+    'proc pad_slots { side } {',
+    '  global pads centers pad_orient block dbu dx0 dy0 dx1 dy1 corner_w '
+        'corner_h',
+    r'  set horizontal [expr {$side eq "south" || $side eq "north"}]',
+    r'  set end [expr {$horizontal ? $dx0 + $corner_w : $dy0 + $corner_h}]',
+    r'  set hi [expr {$horizontal ? $dx1 - $corner_w : $dy1 - $corner_h}]',
+    '  set slots {}',
+    r'  foreach name $pads($side) center $centers($side) {',
+    r'    set w [expr [[[$block findInst $name] getMaster] getWidth] / '
+        r'double($dbu)]',
+    r'    set pos [pad_location $center $w $pad_orient($side)]',
+    r'    if { $pos < $end - 0.001 || $pos + $w > $hi + 0.001 } {',
+    r'      puts stderr "The pad $name at $center on the $side side overlaps '
+        r'a pad or a corner"',
+    '      exit 1',
+    '    }',
+    r'    lappend slots [list $name $pos $w]',
+    r'    set end [expr $pos + $w]',
+    '  }',
+    r'  return $slots',
+    '}',
+  ];
+
+  /// Tcl that checks the orientation of each I/O row.
+  static const _padRowCheckTcl = [
+    'foreach side {south east north west} {',
+    '  set row ""',
+    r'  foreach r [$block getRows] {',
+    r'    if { [$r getName] eq "IO_[string toupper $side]" } { set row $r }',
+    '  }',
+    r'  if { $row eq "" } {',
+    r'    puts stderr "make_io_sites made no IO_[string toupper $side] row"',
+    '    exit 1',
+    '  }',
+    r'  if { [$row getOrient] ne $pad_orient($side) } {',
+    r'    puts stderr "The IO_[string toupper $side] row has orientation '
+        r'[$row getOrient], the pad openings need $pad_orient($side)"',
+    '    exit 1',
+    '  }',
+    '}',
+  ];
+
+  /// Tcl that checks the pad openings after the pads are placed.
+  static const _padPlacedCheckTcl = [
+    'foreach side {south east north west} {',
+    r'  set horizontal [expr {$side eq "south" || $side eq "north"}]',
+    r'  foreach name $pads($side) center $centers($side) {',
+    r'    set inst [$block findInst $name]',
+    r'    set box [$inst getBBox]',
+    r'    set lo [expr {($horizontal ? [$box xMin] : [$box yMin]) / '
+        r'double($dbu)}]',
+    r'    set w [expr [[$inst getMaster] getWidth] / double($dbu)]',
+    r'    set got [expr $center + $lo - [pad_location $center $w '
+        r'[$inst getOrient]]]',
+    r'    if { abs($got - $center) > 0.001 } {',
+    r'      puts stderr "The pad opening of $name is at $got, slot position '
+        r'$center"',
+    '      exit 1',
+    '    }',
+    '  }',
+    '}',
+  ];
+
+  /// Tcl of the evenly spread pad slots.
+  static const _padSlotsEvenTcl = [
     '',
     '# Each side centers its pads. The gap between two pads is a whole number '
-        'of micrometers,',
-    '# which puts the pads where the wafer.space pad mask has them. Filler '
-        'cells close the gaps.',
-    '# The formula matches the mask of the 0p5x0p5 slot only. Check the '
-        'other slots with CheckPadMask.',
+        'of micrometers.',
+    '# Filler cells close the gaps.',
     '# The result is a list of pad name, start and width along the side.',
     'proc pad_slots { side } {',
     '  global pads block dbu dx0 dy0 dx1 dy1 corner_w corner_h',
@@ -2679,6 +2758,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
     '  }',
     r'  return $slots',
     '}',
+  ];
+
+  /// Tcl of the core area inside the pad ring.
+  static const _padCoreAreaTcl = [
     '',
     '# The core starts at the inner edge of the pad ring. The PDN ring sits '
         'between the pad cells and',
@@ -2717,8 +2800,8 @@ class HarborAsicTarget extends HarborDeviceTarget {
     'make_tracks',
   ];
 
-  /// Tcl that places the pads, corners, fillers and I/O terminals.
-  static const _padPlaceTcl = [
+  /// Tcl of the I/O rows.
+  static const _padSitesTcl = [
     '# Pad ring. The PnR die edge is the outer edge of the pad cells, so the '
         'sites have no offset.',
     'make_io_sites \\',
@@ -2726,6 +2809,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
     r'  -vertical_site $::env(PAD_SITE_NAME) \',
     r'  -corner_site $::env(PAD_CORNER_SITE_NAME) \',
     '  -offset 0',
+  ];
+
+  /// Tcl that places the pads, corners, fillers and I/O terminals.
+  static const _padPlaceTcl = [
     '',
     'foreach side {south east north west} {',
     r'  foreach slot [pad_slots $side] {',
@@ -2735,6 +2822,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
         r'-master $master',
     '  }',
     '}',
+  ];
+
+  /// Tcl of the corners, fillers and I/O terminals.
+  static const _padFinishTcl = [
     r'place_corners $::env(PAD_CORNER)',
     'foreach side {north south west east} {',
     r'  place_io_fill -row IO_[string toupper $side] {*}$::env(PAD_FILLERS)',
@@ -2742,6 +2833,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     'connect_by_abutment',
     'foreach side {south east north west} {',
     r'  foreach name $pads($side) {',
+    r'    if { $name in $spare_pads } continue',
     r'    set master [[[$block findInst $name] getMaster] getName]',
     r'    foreach master_pin $::env(PAD_PLACE_IO_TERMINALS) {',
     r'      lassign [split $master_pin /] terminal_master terminal_pin',
@@ -2789,7 +2881,18 @@ class HarborAsicTarget extends HarborDeviceTarget {
       final insts = [for (final p in plan.side(e)) p.inst].join(' ');
       buf.writeln('set pads(${e.name}) {$insts}');
     }
-    for (final line in _padRingTcl) {
+    final spares = [
+      for (final p in plan.all)
+        if (p.kind == HarborPadKind.spare) p.inst,
+    ];
+    buf.writeln('set spare_pads {${spares.join(' ')}}');
+    final slot = plan.slot;
+    if (slot != null) _writeFabSlot(buf, plan, slot, library);
+    for (final line in [
+      ..._padCornerTcl,
+      ...(slot == null ? _padSlotsEvenTcl : _padSlotsFabTcl),
+      ..._padCoreAreaTcl,
+    ]) {
       buf.writeln(line);
     }
     _writeLayerAdjustments(buf);
@@ -2799,10 +2902,72 @@ class HarborAsicTarget extends HarborDeviceTarget {
       'Both pin names join the same nets.',
     );
     _writeGlobalConnections(buf, lib, ring);
-    for (final line in _padPlaceTcl) {
+    for (final line in [
+      ..._padSitesTcl,
+      if (slot != null) ..._padRowCheckTcl,
+      ..._padPlaceTcl,
+      if (slot != null) ..._padPlacedCheckTcl,
+      ..._padFinishTcl,
+    ]) {
       buf.writeln(line);
     }
     buf.writeln();
+  }
+
+  /// Orientation of the I/O row on each side after `make_io_sites`.
+  static const padRowOrient = {
+    HarborIoPadEdge.south: 'R0',
+    HarborIoPadEdge.east: 'R90',
+    HarborIoPadEdge.north: 'R180',
+    HarborIoPadEdge.west: 'R270',
+  };
+
+  /// Writes the slot positions of each pad and the check of `DIE_AREA`
+  /// against [slot].
+  static void _writeFabSlot(
+    StringBuffer buf,
+    HarborPadPlan plan,
+    HarborFabSlot slot,
+    HarborPadLibrary library,
+  ) {
+    final offset = library.openingOffsetUm;
+    final edge = library.openingEdgeUm;
+    if (offset == null || edge == null) {
+      throw ArgumentError(
+        '${library.libName} has no pad opening position for slot ${slot.name}',
+      );
+    }
+    final margin = slot.openingInsetUm - edge;
+    buf.writeln();
+    buf.writeln(
+      '# The pad openings must be on the pad mask of slot ${slot.name}. '
+      'The die is the slot',
+    );
+    buf.writeln('# less the seal ring margin, in slot coordinates.');
+    buf.writeln('set slot_margin ${_um(margin)}');
+    buf.writeln(
+      r'if { abs($dx0 - $slot_margin) > 0.001 || '
+      r'abs($dy0 - $slot_margin) > 0.001 || '
+      'abs(\$dx1 - ${_um(slot.widthUm - margin)}) > 0.001 || '
+      'abs(\$dy1 - ${_um(slot.heightUm - margin)}) > 0.001 } {',
+    );
+    buf.writeln('  puts stderr "DIE_AREA does not match slot ${slot.name}"');
+    buf.writeln('  exit 1');
+    buf.writeln('}');
+    buf.writeln('set pad_opening ${_um(offset)}');
+    for (final e in HarborPadPlan.sideOrder) {
+      buf.writeln('set pad_orient(${e.name}) ${padRowOrient[e]}');
+    }
+    for (final e in HarborPadPlan.sideOrder) {
+      final centers = slot.centers[e]!;
+      if (plan.side(e).length != centers.length) {
+        throw ArgumentError(
+          'The pad plan has ${plan.side(e).length} pads on the ${e.name} '
+          'side, slot ${slot.name} has ${centers.length}',
+        );
+      }
+      buf.writeln('set centers(${e.name}) {${centers.map(_um).join(' ')}}');
+    }
   }
 
   /// Writes the core-only floorplan.

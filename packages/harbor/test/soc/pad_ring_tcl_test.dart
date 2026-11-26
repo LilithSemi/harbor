@@ -471,6 +471,151 @@ void main() {
     expect(at, orderedEquals([...at]..sort()));
   });
 
+  group('wafer.space slot', () {
+    final slot = HarborFabSlot.waferSpace['0p5x0p5']!;
+    HarborPadPlan slotPlan() => HarborPadPlan.build(
+      ports: HarborPadPort.fromModule(
+        _Top(),
+        clocks: {'clk'},
+        analog: {'vref'},
+      ),
+      library: _gf180.padLibrary,
+      slot: slot,
+    );
+    String tcl() => HarborAsicTarget(
+      provider: _gf180,
+      topCell: 'top',
+      padPlan: slotPlan(),
+    ).generateOpenroadTcl();
+
+    test('pnr has the centers of the slot for each pad', () {
+      final plan = slotPlan();
+      final t = tcl();
+      for (final e in HarborPadPlan.sideOrder) {
+        expect(
+          t,
+          contains(
+            'set pads(${e.name}) {${[for (final p in plan.side(e)) p.inst].join(' ')}}',
+          ),
+        );
+      }
+      expect(
+        t,
+        contains(
+          'set centers(south) {${[for (var k = 0; k < 11; k++) 448 + 104 * k].join(' ')}}',
+        ),
+      );
+      expect(
+        t,
+        contains(
+          'set centers(north) {${[for (var k = 0; k < 11; k++) 448 + 104 * k].join(' ')}}',
+        ),
+      );
+      final vertical = [
+        for (var k = 0; k < 17; k++) 449.5 + 102 * k,
+      ].map((v) => v == v.roundToDouble() ? '${v.toInt()}' : '$v').join(' ');
+      expect(t, contains('set centers(east) {$vertical}'));
+      expect(t, contains('set centers(west) {$vertical}'));
+      expect(t, contains('set pad_opening 37.5'));
+      expect(
+        t,
+        contains(
+          'set spare_pads {${[for (final p in plan.all)
+            if (p.kind == HarborPadKind.spare) p.inst].join(' ')}}',
+        ),
+      );
+      expect(t, contains(r'    if { $name in $spare_pads } continue'));
+    });
+
+    test('pnr checks DIE_AREA against the slot', () {
+      final t = tcl();
+      expect(t, contains('set slot_margin 26'));
+      expect(
+        t,
+        contains(
+          r'if { abs($dx0 - $slot_margin) > 0.001 || '
+          r'abs($dy0 - $slot_margin) > 0.001 || '
+          r'abs($dx1 - 1910) > 0.001 || abs($dy1 - 2505) > 0.001 } {',
+        ),
+      );
+      expect(
+        t,
+        contains('  puts stderr "DIE_AREA does not match slot 0p5x0p5"'),
+      );
+      expect(
+        t.indexOf('DIE_AREA does not match'),
+        lessThan(t.indexOf('initialize_floorplan')),
+      );
+    });
+
+    for (final (side, orient, low) in [
+      ('south', 'R0', true),
+      ('east', 'R90', true),
+      ('north', 'R180', false),
+      ('west', 'R270', false),
+    ]) {
+      test('$side pads sit in $orient with the opening on the slot', () {
+        final t = tcl();
+        expect(t, contains('set pad_orient($side) $orient'));
+        expect(
+          const {'R0', 'MX', 'R90', 'MXR90'}.contains(orient),
+          low,
+          reason: 'cell x = 0 is the low edge along the side',
+        );
+        expect(
+          t,
+          contains(
+            'proc pad_location { center w orient } {\n'
+            '  global pad_opening\n'
+            r'  if { $orient in {R0 MX R90 MXR90} } {'
+            '\n'
+            r'    return [expr $center - $pad_opening]'
+            '\n  }\n'
+            r'  return [expr $center - $w + $pad_opening]',
+          ),
+        );
+        expect(
+          HarborAsicTarget.padRowOrient[HarborIoPadEdge.values.byName(side)],
+          orient,
+        );
+      });
+    }
+
+    test('pnr places pads on the slot and checks the rows and openings', () {
+      final t = tcl();
+      expect(t, isNot(contains(r'set gap [expr floor(')));
+      for (final line in [
+        r'  foreach name $pads($side) center $centers($side) {',
+        r'    set pos [pad_location $center $w $pad_orient($side)]',
+        r'      puts stderr "The pad $name at $center on the $side side '
+            r'overlaps a pad or a corner"',
+        r'  if { [$row getOrient] ne $pad_orient($side) } {',
+        r'    set got [expr $center + $lo - [pad_location $center $w '
+            r'[$inst getOrient]]]',
+        r'      puts stderr "The pad opening of $name is at $got, slot '
+            r'position $center"',
+        r'place_corners $::env(PAD_CORNER)',
+        r'place_io_fill -row IO_[string toupper $side] {*}$::env(PAD_FILLERS)',
+      ]) {
+        expect(t, contains(line));
+      }
+      final order = [
+        'DIE_AREA does not match',
+        'proc pad_slots',
+        'initialize_floorplan',
+        'make_io_sites',
+        r'[$row getOrient] ne',
+        'place_pad ',
+        'The pad opening of',
+        'place_corners',
+        'remove_io_rows',
+      ];
+      final at = [for (final s in order) t.indexOf(s)];
+      expect(at, isNot(contains(-1)));
+      expect(at, orderedEquals([...at]..sort()));
+    });
+  });
+
   test('a sky130 pad ring throws', () {
     final target = HarborAsicTarget(
       provider: Sky130Provider(pdkRoot: '/pdk/sky130A'),

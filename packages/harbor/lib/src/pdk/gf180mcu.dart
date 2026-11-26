@@ -48,6 +48,7 @@ class Gf180mcuProvider extends PdkProvider {
       HarborPadKind.ioGround: 'dvss',
       HarborPadKind.corePower: 'dvdd',
       HarborPadKind.coreGround: 'dvss',
+      HarborPadKind.spare: 'bi_24t',
     },
     tieOffs: {
       HarborPadKind.input: {'PU': "1'b0", 'PD': "1'b0"},
@@ -67,12 +68,23 @@ class Gf180mcuProvider extends PdkProvider {
         'PU': "1'b0",
         'PD': "1'b0",
       },
+      HarborPadKind.spare: {
+        'A': "1'b0",
+        'OE': "1'b0",
+        'IE': "1'b0",
+        'CS': "1'b0",
+        'SL': "1'b0",
+        'PU': "1'b0",
+        'PD': "1'b0",
+      },
     },
     padPin: 'PAD',
     inPin: 'Y',
     outPin: 'A',
     oePin: 'OE',
     analogPin: 'ASIG5V',
+    openingOffsetUm: 37.5,
+    openingEdgeUm: 2,
   );
 
   @override

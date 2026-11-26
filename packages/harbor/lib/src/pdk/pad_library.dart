@@ -8,7 +8,10 @@ enum HarborPadKind {
   ioPower,
   ioGround,
   corePower,
-  coreGround;
+  coreGround,
+
+  /// A tied-off pad cell on a slot position that no signal or power uses.
+  spare;
 
   /// True for the supply and ground pads.
   bool get isPower =>
@@ -44,6 +47,12 @@ class HarborPadLibrary {
   /// Pad pin of the analog cell.
   final String analogPin;
 
+  /// Distance from cell x = 0 to the center of the pad opening (um).
+  final double? openingOffsetUm;
+
+  /// Distance from the outer cell edge (cell y = 0) to the pad opening (um).
+  final double? openingEdgeUm;
+
   const HarborPadLibrary({
     required this.libName,
     required this.master,
@@ -53,6 +62,8 @@ class HarborPadLibrary {
     required this.outPin,
     required this.oePin,
     required this.analogPin,
+    this.openingOffsetUm,
+    this.openingEdgeUm,
   });
 
   /// Full cell name for [kind].

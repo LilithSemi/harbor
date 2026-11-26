@@ -1,5 +1,6 @@
 import 'package:rohd/rohd.dart';
 
+import 'fab_slot.dart';
 import 'io_ring.dart';
 import 'pad_library.dart';
 
@@ -33,9 +34,9 @@ class HarborPadPort {
     if (width < 1) {
       throw ArgumentError('Pad port $name has width $width');
     }
-    if (kind.isPower) {
+    if (kind.isPower || kind == HarborPadKind.spare) {
       throw ArgumentError(
-        'Pad port $name cannot have the power kind ${kind.name}',
+        'Pad port $name cannot have the pad kind ${kind.name}',
       );
     }
     final hasGroup =
@@ -195,11 +196,11 @@ class HarborPlacedPad {
   /// Full cell name from the pad library.
   final String master;
 
-  /// Core port of a signal pad. Null for a power pad.
+  /// Core port of a signal pad. Null for a power or spare pad.
   final HarborPadPort? port;
 
   /// Bit of [port] for a signal pad. Index of the pad of its kind for a
-  /// power pad.
+  /// power or spare pad.
   final int bit;
 
   const HarborPlacedPad({
@@ -226,7 +227,11 @@ class HarborPadPlan {
     HarborIoPadEdge.west,
   ];
 
-  HarborPadPlan._(this._sides);
+  /// Fab slot whose pad positions the plan fills. Null when the pads
+  /// spread evenly along each side.
+  final HarborFabSlot? slot;
+
+  HarborPadPlan._(this._sides, this.slot);
 
   /// Puts one signal pad per port bit on the sides, then adds power pads.
   ///
@@ -234,11 +239,17 @@ class HarborPadPlan {
   /// (`<port>[bit]`) to a side and position. Pinned pads come first on
   /// their side, by position. The other pads fill south, east, north and
   /// west in port order, up to a quarter of the signal pads per side.
+  ///
+  /// With a [slot], each side has exactly the pad positions of the slot.
+  /// A pinned pad goes to its position index, power pairs go near their
+  /// even spread points, signal pads fill the next free positions in port
+  /// order and spare pads fill the rest.
   factory HarborPadPlan.build({
     required List<HarborPadPort> ports,
     required HarborPadLibrary library,
     HarborIoRing? overrides,
     HarborPowerPadRule rule = const HarborPowerPadRule(),
+    HarborFabSlot? slot,
   }) {
     if (rule.ioPairsPerSide < 0 ||
         rule.corePairsPerSide < 0 ||
@@ -314,6 +325,30 @@ class HarborPadPlan {
       }
     }
 
+    // Signal pads that fit on side e of the slot next to their power pads.
+    int capacity(HarborIoPadEdge e) {
+      if (slot == null) return signals.length;
+      final n = slot.positions(e);
+      var s = 0;
+      while (s + 1 + _powerPads(rule, s + 1) <= n) {
+        s++;
+      }
+      return s;
+    }
+
+    if (slot != null) {
+      for (final MapEntry(key: pad, value: (edge, position))
+          in pinnedAt.entries) {
+        if (position >= slot.positions(edge)) {
+          throw ArgumentError(
+            'Pad ${pad.port!.name}[${pad.bit}] pins ${edge.name} position '
+            '$position, slot ${slot.name} has ${slot.positions(edge)} '
+            'positions on that side',
+          );
+        }
+      }
+    }
+
     final limit = (signals.length + 3) ~/ 4;
     final sideSignals = {
       for (final e in sideOrder)
@@ -323,21 +358,47 @@ class HarborPadPlan {
                 .map((p) => p.key)
                 .toList(),
     };
+    for (final e in sideOrder) {
+      final n = sideSignals[e]!.length;
+      if (n > capacity(e)) {
+        throw ArgumentError(
+          'The ${e.name} side needs ${n + _powerPads(rule, n)} pads, '
+          'slot ${slot!.name} has ${slot.positions(e)}',
+        );
+      }
+    }
     final free = signals.where((p) => !pinnedAt.containsKey(p)).iterator;
     var more = free.moveNext();
     for (final e in sideOrder) {
       final side = sideSignals[e]!;
-      while (more && side.length < limit) {
+      while (more && side.length < limit && side.length < capacity(e)) {
         side.add(free.current);
         more = free.moveNext();
       }
     }
     // Pinned pads over the limit on one side leave room on the others.
     for (final e in sideOrder) {
-      while (more) {
-        sideSignals[e]!.add(free.current);
+      final side = sideSignals[e]!;
+      while (more && side.length < capacity(e)) {
+        side.add(free.current);
         more = free.moveNext();
       }
+    }
+    if (more) {
+      var placed = 0;
+      final used = <String>[];
+      for (final e in sideOrder) {
+        final n = sideSignals[e]!.length;
+        placed += n;
+        used.add(
+          '${e.name} ${n + _powerPads(rule, n)} of ${slot!.positions(e)}',
+        );
+      }
+      throw ArgumentError(
+        'Slot ${slot!.name} has no position for '
+        '${signals.length - placed} more signal pads. Pads with power on '
+        'each side: ${used.join(', ')}',
+      );
     }
 
     final counts = {
@@ -367,6 +428,18 @@ class HarborPadPlan {
       );
     }
 
+    var spares = 0;
+    HarborPlacedPad spare() {
+      final n = spares++;
+      return HarborPlacedPad(
+        inst: 'spare_pad_$n',
+        kind: HarborPadKind.spare,
+        master: library.cellName(HarborPadKind.spare),
+        port: null,
+        bit: n,
+      );
+    }
+
     final sides = <HarborIoPadEdge, List<HarborPlacedPad>>{};
     for (final e in sideOrder) {
       final sig = sideSignals[e]!;
@@ -378,6 +451,12 @@ class HarborPadPlan {
         for (var i = 0; i < rule.corePairsPerSide; i++)
           [power(HarborPadKind.coreGround), power(HarborPadKind.corePower)],
       ];
+      if (slot != null) {
+        sides[e] = List.unmodifiable(
+          _fillSlot(e, slot, sig, pinnedAt, pairs, spare),
+        );
+        continue;
+      }
       // Pair j goes before signal (j + 1) * n / (pairs + 1), so one pair is
       // in the middle and more pairs spread along the side.
       final out = <HarborPlacedPad>[];
@@ -391,7 +470,67 @@ class HarborPadPlan {
       }
       sides[e] = List.unmodifiable(out);
     }
-    return HarborPadPlan._(sides);
+    final insts = <String>{};
+    for (final e in sideOrder) {
+      for (final pad in sides[e]!) {
+        if (!insts.add(pad.inst)) {
+          throw ArgumentError(
+            'Two pads have the instance name ${pad.inst}. Rename the port '
+            'that makes it',
+          );
+        }
+      }
+    }
+    return HarborPadPlan._(sides, slot);
+  }
+
+  static int _powerPads(HarborPowerPadRule rule, int signals) =>
+      2 *
+      (rule.ioPairsPerSide +
+          signals ~/ rule.signalPadsPerExtraIoPair +
+          rule.corePairsPerSide);
+
+  /// Pads of side [e] at the positions of [slot]. Pinned pads keep their
+  /// index. Pair j goes at the free index pair nearest to
+  /// (j + 1) * n / (pairs + 1).
+  static List<HarborPlacedPad> _fillSlot(
+    HarborIoPadEdge e,
+    HarborFabSlot slot,
+    List<HarborPlacedPad> sig,
+    Map<HarborPlacedPad, (HarborIoPadEdge, int)> pinnedAt,
+    List<List<HarborPlacedPad>> pairs,
+    HarborPlacedPad Function() spare,
+  ) {
+    final n = slot.positions(e);
+    final at = List<HarborPlacedPad?>.filled(n, null);
+    for (final pad in sig) {
+      final pin = pinnedAt[pad];
+      if (pin != null) at[pin.$2] = pad;
+    }
+    for (var j = 0; j < pairs.length; j++) {
+      final want = (j + 1) * n ~/ (pairs.length + 1) - 1;
+      int? found;
+      for (var d = 0; d < 2 * n && found == null; d++) {
+        final i = want + (d.isOdd ? (d + 1) ~/ 2 : -(d ~/ 2));
+        if (i >= 0 && i + 1 < n && at[i] == null && at[i + 1] == null) {
+          found = i;
+        }
+      }
+      if (found == null) {
+        throw ArgumentError(
+          'The pinned pads on the ${e.name} side leave no two free '
+          'positions next to each other for a power pair',
+        );
+      }
+      at[found] = pairs[j][0];
+      at[found + 1] = pairs[j][1];
+    }
+    final rest = sig.where((p) => !pinnedAt.containsKey(p)).iterator;
+    for (var i = 0; i < n; i++) {
+      if (at[i] != null) continue;
+      at[i] = rest.moveNext() ? rest.current : spare();
+    }
+    return [for (final p in at) p!];
   }
 
   /// Pads on side [e], in order along the side.

@@ -242,6 +242,215 @@ void main() {
     });
   });
 
+  group('wafer.space slot', () {
+    final slot = HarborFabSlot.waferSpace['0p5x0p5']!;
+    void refuses(void Function() f, String text) => expect(
+      f,
+      throwsA(
+        isA<ArgumentError>().having(
+          (e) => '${e.message}',
+          'message',
+          contains(text),
+        ),
+      ),
+    );
+
+    test('the table has the pad counts of each slot', () {
+      expect(
+        {
+          for (final MapEntry(:key, :value) in HarborFabSlot.waferSpace.entries)
+            key: [for (final e in HarborPadPlan.sideOrder) value.positions(e)],
+        },
+        {
+          '0p5x0p5': [11, 17, 11, 17],
+          '0p5x1': [8, 28, 8, 28],
+          '1x0p5': [24, 12, 24, 12],
+          '1x1': [17, 20, 17, 20],
+        },
+      );
+      expect(slot.centers[HarborIoPadEdge.south], [
+        for (var k = 0; k < 11; k++) 448 + 104.0 * k,
+      ]);
+      expect(slot.centers[HarborIoPadEdge.west], [
+        for (var k = 0; k < 17; k++) 449.5 + 102.0 * k,
+      ]);
+      expect(
+        slot.centers[HarborIoPadEdge.north],
+        slot.centers[HarborIoPadEdge.south],
+      );
+      expect(
+        slot.centers[HarborIoPadEdge.east],
+        slot.centers[HarborIoPadEdge.west],
+      );
+    });
+
+    test('a 0p5x0p5 plan has 11, 17, 11 and 17 pads', () {
+      final plan = HarborPadPlan.build(
+        ports: _signals(10),
+        library: _lib,
+        slot: slot,
+      );
+      expect(plan.slot, slot);
+      expect(
+        [for (final e in HarborPadPlan.sideOrder) plan.side(e).length],
+        [11, 17, 11, 17],
+      );
+    });
+
+    test('spare pads fill the positions that are left', () {
+      final plan = HarborPadPlan.build(
+        ports: _signals(10),
+        library: _lib,
+        slot: slot,
+      );
+      final spares = plan.all
+          .where((p) => p.kind == HarborPadKind.spare)
+          .toList();
+      expect(spares.length, 56 - 10 - 16);
+      expect(_insts(spares), [
+        for (var n = 0; n < spares.length; n++) 'spare_pad_$n',
+      ]);
+      for (final p in spares) {
+        expect(p.master, 'gf180mcu_fd_io__bi_24t');
+        expect(p.port, isNull);
+      }
+      expect(_lib.tieOffs[HarborPadKind.spare], {
+        'A': "1'b0",
+        'OE': "1'b0",
+        'IE': "1'b0",
+        'CS': "1'b0",
+        'SL': "1'b0",
+        'PU': "1'b0",
+        'PD': "1'b0",
+      });
+      // 3 signals, then the two power pairs near 1/3 and 2/3, then spares.
+      expect(_insts(plan.side(HarborIoPadEdge.south)), [
+        's0_pad_0',
+        's1_pad_0',
+        'dvss_pad_0',
+        'dvdd_pad_0',
+        's2_pad_0',
+        'spare_pad_0',
+        'vss_pad_0',
+        'vdd_pad_0',
+        'spare_pad_1',
+        'spare_pad_2',
+        'spare_pad_3',
+      ]);
+    });
+
+    test('40 signals use every position', () {
+      final plan = HarborPadPlan.build(
+        ports: _signals(40),
+        library: _lib,
+        slot: slot,
+        rule: const HarborPowerPadRule(signalPadsPerExtraIoPair: 16),
+      );
+      expect(plan.all.where((p) => p.kind == HarborPadKind.spare), isEmpty);
+      expect(
+        [
+          for (final e in HarborPadPlan.sideOrder)
+            plan.side(e).where((p) => p.port != null).length,
+        ],
+        [7, 13, 7, 13],
+      );
+    });
+
+    test('a pinned pad goes to its position index', () {
+      final plan = HarborPadPlan.build(
+        ports: _signals(4),
+        library: _lib,
+        slot: slot,
+        overrides: const HarborIoRing(
+          pads: [
+            HarborIoPad(
+              signalName: 's3',
+              edge: HarborIoPadEdge.west,
+              position: 9,
+            ),
+          ],
+        ),
+      );
+      expect(plan.side(HarborIoPadEdge.west)[9].inst, 's3_pad_0');
+      expect(plan.side(HarborIoPadEdge.west).length, 17);
+    });
+
+    test('too many signal pads are refused', () {
+      refuses(
+        () => HarborPadPlan.build(
+          ports: _signals(41),
+          library: _lib,
+          slot: slot,
+          rule: const HarborPowerPadRule(signalPadsPerExtraIoPair: 16),
+        ),
+        'Slot 0p5x0p5 has no position for 1 more signal pads. Pads with '
+        'power on each side: south 11 of 11, east 17 of 17, north 11 of 11, '
+        'west 17 of 17',
+      );
+    });
+
+    test('too many pinned pads on a side are refused', () {
+      refuses(
+        () => HarborPadPlan.build(
+          ports: _signals(8),
+          library: _lib,
+          slot: slot,
+          overrides: HarborIoRing(
+            pads: [
+              for (var i = 0; i < 8; i++)
+                HarborIoPad(
+                  signalName: 's$i',
+                  edge: HarborIoPadEdge.south,
+                  position: i,
+                ),
+            ],
+          ),
+        ),
+        'The south side needs 14 pads, slot 0p5x0p5 has 11',
+      );
+    });
+
+    test('a pinned position past the side is refused', () {
+      refuses(
+        () => HarborPadPlan.build(
+          ports: _signals(1),
+          library: _lib,
+          slot: slot,
+          overrides: const HarborIoRing(
+            pads: [
+              HarborIoPad(
+                signalName: 's0',
+                edge: HarborIoPadEdge.south,
+                position: 11,
+              ),
+            ],
+          ),
+        ),
+        'slot 0p5x0p5 has 11 positions',
+      );
+    });
+
+    test('a port name that makes a spare pad name is refused', () {
+      refuses(
+        () => HarborPadPlan.build(
+          ports: [
+            HarborPadPort(name: 'spare', width: 1, kind: HarborPadKind.input),
+          ],
+          library: _lib,
+          slot: slot,
+        ),
+        'Two pads have the instance name spare_pad_0',
+      );
+    });
+
+    test('a spare kind on a port is refused', () {
+      refuses(
+        () => HarborPadPort(name: 'p', width: 1, kind: HarborPadKind.spare),
+        'spare',
+      );
+    });
+  });
+
   test('sky130 has no pad library', () {
     expect(Sky130Provider(pdkRoot: '/pdk/sky130A').padLibrary, isNull);
   });

@@ -58,7 +58,11 @@ String harborChipTopVerilog({
     final port = pad.port;
     final String body;
     if (port == null) {
-      body = '';
+      body = [
+        for (final MapEntry(:key, :value)
+            in (library.tieOffs[pad.kind] ?? const {}).entries)
+          '.$key($value)',
+      ].join(', ');
     } else {
       final w = port.width;
       final pin = <String>[];

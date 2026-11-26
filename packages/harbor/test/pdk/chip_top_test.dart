@@ -142,4 +142,29 @@ void main() {
       ),
     );
   });
+
+  test('spare pads are tied off', () {
+    final slotPlan = HarborPadPlan.build(
+      ports: _ports,
+      library: _lib,
+      slot: HarborFabSlot.waferSpace['0p5x0p5'],
+    );
+    final v = harborChipTopVerilog(
+      plan: slotPlan,
+      library: _lib,
+      coreModule: 'soc',
+      corePorts: _ports,
+    );
+    final spares = v
+        .split('\n')
+        .where((l) => l.contains(' spare_pad_'))
+        .toList();
+    expect(spares.length, 56 - 9 - 16);
+    expect(
+      spares.first,
+      "  (* keep *) gf180mcu_fd_io__bi_24t spare_pad_0 (.A(1'b0), .OE(1'b0), "
+      ".IE(1'b0), .CS(1'b0), .SL(1'b0), .PU(1'b0), .PD(1'b0));",
+    );
+    expect(v, contains('  (* keep *) gf180mcu_fd_io__dvdd dvdd_pad_0 ();'));
+  });
 }
