@@ -558,7 +558,6 @@ void main() {
       test('$side pads sit in $orient with the opening on the slot', () {
         final t = tcl();
         final edge = HarborIoPadEdge.values.byName(side);
-        expect(HarborAsicTarget.padRowOrient[edge], orient);
         expect(t, contains('set pad_orient($side) $orient'));
         expect(slot.centers[edge], contains(opening));
         expect(opening - _gf180.padLibrary.openingOffsetUm!, location);
@@ -655,5 +654,79 @@ void main() {
       File('${dir.path}/klayout/def2gds.py').readAsStringSync(),
       contains('chip_top_final.def'),
     );
+  });
+
+  group('soc port coverage', () {
+    Future<void> generate(
+      List<HarborPadPort> Function(List<HarborPadPort>) edit,
+    ) async {
+      HarborSoC soc(HarborPadPlan? plan) => HarborSoC(
+        name: 'PadSoc',
+        compatible: 'test,pad-soc',
+        target: HarborAsicTarget(
+          provider: _gf180,
+          topCell: 'PadSoc',
+          padPlan: plan,
+        ),
+      )..addPeripheral(HarborUart(baseAddress: 0x10000000));
+
+      final probe = soc(null);
+      await probe.build();
+      final ports = edit(HarborPadPort.fromModule(probe, clocks: {'clk'}));
+      final padSoc = soc(
+        HarborPadPlan.build(ports: ports, library: _gf180.padLibrary),
+      );
+      final dir = await Directory.systemTemp.createTemp('harbor_pad_cover');
+      addTearDown(() => dir.delete(recursive: true));
+      await padSoc.generateAll(dir);
+    }
+
+    test('a soc port without a pad throws', () {
+      expect(
+        () => generate(
+          (ports) =>
+              ports.where((p) => p.kind == HarborPadKind.clockInput).toList(),
+        ),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.message,
+            'message',
+            contains('has no pad in the pad plan'),
+          ),
+        ),
+      );
+    });
+
+    test('a pad port of the wrong width throws', () {
+      expect(
+        () => generate(
+          (ports) => [
+            for (final p in ports)
+              if (p.kind == HarborPadKind.clockInput)
+                HarborPadPort(name: p.name, width: 2, kind: p.kind)
+              else
+                p,
+          ],
+        ),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.message,
+            'message',
+            'Pad port clk is not a 2 bit input of PadSoc',
+          ),
+        ),
+      );
+    });
+  });
+
+  test('the sdc of a pad ring names the clock pad port', () {
+    final sdc = HarborAsicTarget(
+      provider: _gf180,
+      topCell: 'top',
+      frequency: 50000000,
+      padPlan: _plan(),
+    ).generateSdc();
+    expect(sdc, contains('[get_ports {clk_PAD}]'));
+    expect(sdc, isNot(contains('{clk}')));
   });
 }

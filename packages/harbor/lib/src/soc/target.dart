@@ -1685,9 +1685,6 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// used internally by macros to avoid DRC violations).
   final int topRoutingMinLayer;
 
-  /// IO ring configuration (null = no IO ring generation).
-  final HarborIoRing? ioRing;
-
   /// KLayout scripts configuration (null = no KLayout scripts).
   final HarborKlayoutDrcConfig? klayoutDrc;
 
@@ -1702,7 +1699,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// before the other SRAM macros.
   final List<HarborMacroPin> macroPins;
 
-  const HarborAsicTarget({
+  HarborAsicTarget({
     required this.provider,
     required this.topCell,
     this.frequency = 0,
@@ -1710,12 +1707,24 @@ class HarborAsicTarget extends HarborDeviceTarget {
     this.macros = const [],
     this.dieMarginUm,
     this.topRoutingMinLayer = 2,
-    this.ioRing,
     this.klayoutDrc,
     this.analogGdsPaths = const [],
     this.padPlan,
     this.macroPins = const [],
-  });
+  }) {
+    final insts = <String>{};
+    for (final pin in macroPins) {
+      if (!insts.add(pin.inst)) {
+        throw ArgumentError('The SRAM ${pin.inst} has two macro pins');
+      }
+      if (pin.edge != HarborIoPadEdge.south &&
+          pin.edge != HarborIoPadEdge.north) {
+        throw ArgumentError(
+          'The SRAM ${pin.inst} must be on the south or north core edge',
+        );
+      }
+    }
+  }
 
   /// Whether this uses hierarchical macro hardening.
   bool get isHierarchical => macros.isNotEmpty;
@@ -1744,6 +1753,17 @@ class HarborAsicTarget extends HarborDeviceTarget {
     return (library: library, ring: ring);
   }
 
+  /// Chip top pad port of the clock input in [padPlan], or null.
+  String? get _clockPadPort {
+    for (final pad in padPlan?.all ?? const <HarborPlacedPad>[]) {
+      final p = pad.port;
+      if (p != null && p.kind == HarborPadKind.clockInput) {
+        return '${p.name}_PAD';
+      }
+    }
+    return null;
+  }
+
   /// Generates an SDC timing constraints file.
   ///
   /// Used by the FPGA/standalone flows. `asix.mkTapeout` ignores this and
@@ -1754,9 +1774,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('# Auto-generated SDC for $name');
     if (frequency > 0) {
       final periodNs = 1e9 / frequency;
+      final port = _clockPadPort ?? 'clk';
       buf.writeln(
         'create_clock -name clk -period ${periodNs.toStringAsFixed(3)} '
-        '[get_ports {clk}]',
+        '[get_ports {$port}]',
       );
     }
     buf.writeln('set_input_delay 0 -clock clk [all_inputs]');
@@ -2219,14 +2240,6 @@ class HarborAsicTarget extends HarborDeviceTarget {
       }
       if (srams.isEmpty) {
         throw ArgumentError('Macro pins need SRAM macros in the netlist');
-      }
-      for (final pin in macroPins) {
-        if (pin.edge != HarborIoPadEdge.south &&
-            pin.edge != HarborIoPadEdge.north) {
-          throw ArgumentError(
-            'The SRAM ${pin.inst} must be on the south or north core edge',
-          );
-        }
       }
     }
     final top = flowTop;
@@ -2911,7 +2924,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
   }
 
   /// Orientation of the I/O row on each side after `make_io_sites`.
-  static const padRowOrient = {
+  static const _padRowOrient = {
     HarborIoPadEdge.south: 'R0',
     HarborIoPadEdge.east: 'R90',
     HarborIoPadEdge.north: 'MX',
@@ -2952,7 +2965,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('}');
     buf.writeln('set pad_opening ${_um(offset)}');
     for (final e in HarborPadPlan.sideOrder) {
-      buf.writeln('set pad_orient(${e.name}) ${padRowOrient[e]}');
+      buf.writeln('set pad_orient(${e.name}) ${_padRowOrient[e]}');
     }
     for (final e in HarborPadPlan.sideOrder) {
       final centers = slot.centers[e]!;

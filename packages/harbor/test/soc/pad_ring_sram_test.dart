@@ -238,6 +238,24 @@ void main() {
     );
   });
 
+  test('two macro pins of one instance throw', () {
+    expect(
+      () => _target(
+        pins: const [
+          HarborMacroPin(inst: 'ram', edge: HarborIoPadEdge.north),
+          HarborMacroPin(inst: 'ram', edge: HarborIoPadEdge.south),
+        ],
+      ),
+      throwsA(
+        isA<ArgumentError>().having(
+          (e) => e.message,
+          'message',
+          'The SRAM ram has two macro pins',
+        ),
+      ),
+    );
+  });
+
   test('macro pins refuse a flow they cannot be placed in', () {
     const north = HarborMacroPin(inst: 'ram', edge: HarborIoPadEdge.north);
     Matcher fails(String message) => throwsA(

@@ -2980,6 +2980,22 @@ class HarborSoC extends BridgeModule {
           check(p.name, p.width, {...inputs, ...outputs, ...inOuts}, 'port');
       }
     }
+    final covered = <String>{
+      for (final p in ports)
+        if (p.kind == HarborPadKind.bidir) ...[
+          p.outputName!,
+          p.outputEnable!,
+          p.inputName!,
+        ] else
+          p.name,
+    };
+    for (final port in [...inputs.keys, ...outputs.keys, ...inOuts.keys]) {
+      if (!covered.contains(port)) {
+        throw ArgumentError(
+          'Port $port of $definitionName has no pad in the pad plan',
+        );
+      }
+    }
     return ports;
   }
 
