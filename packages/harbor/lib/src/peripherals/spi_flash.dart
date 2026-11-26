@@ -1074,10 +1074,9 @@ class HarborSpiFlashController extends BridgeModule
           ioRel < Const(0),
           ack < Const(0),
           datOut < Const(0, width: busWidth),
+          // The line tag and words are read only with lineValid.
           lineValid < Const(0),
-          lineTag < Const(0, width: 32),
           wordIdx < Const(0, width: 8),
-          for (final b in lineBuf) b < Const(0, width: busWidth),
           reqAddr < Const(0, width: 32),
           orphan < Const(0),
         ],
