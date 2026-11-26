@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:math';
 
 import 'package:rohd/rohd.dart';
@@ -275,14 +274,9 @@ class HarborFifoRam extends Module with SystemVerilog {
         // An X enable or address can write any entry.
         cells.fillRange(0, depth, unknown);
       }
-      // The read waits for clkStable, so a flop that samples rd_data at this
-      // edge takes the value from before the edge. When the simulation
-      // ends first, the stream has no element and no read is needed.
-      unawaited(
-        Simulator.clkStable.first
-            .then((_) => read())
-            .catchError((_) {}, test: (e) => e is StateError),
-      );
+      // A posedge event comes after the tick, so the flops that sample
+      // rd_data at this edge already have the value from before the edge.
+      read();
     });
   }
 
