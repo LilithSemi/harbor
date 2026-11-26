@@ -6,7 +6,8 @@
 // The Wishbone SoC hash moved when the grant cap learned to take the grant
 // from an idle owner, which is not a real-time change. All hashes moved
 // when the fabric started to count the slaves that a bus timeout cut off,
-// which is not a real-time change.
+// which is not a real-time change. The SoC hashes moved when the data
+// flops of the DMA and the memory and slave ports lost their reset.
 
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
@@ -164,10 +165,10 @@ void main() {
     'axi4_balanced_shared': (-3919233163272566078, 993695),
     'axi4_fast_crossbar': (7053870196394751652, 1167920),
     'axi4_fast_shared': (-6012133990712927097, 1091530),
-    'soc_axi4': (-2031679295772626019, 763298),
-    'soc_axi4_compact': (-394717168575693814, 718079),
-    'soc_tilelink': (3980852489748109613, 671753),
-    'soc_wishbone': (2951180329469432230, 536162),
+    'soc_axi4': (-5103710065501969971, 763224),
+    'soc_axi4_compact': (-1071858240770072218, 718005),
+    'soc_tilelink': (-6640930606375752563, 671679),
+    'soc_wishbone': (-2388610714771512310, 536088),
     'tl_crossbar': (-5608642720268730264, 149685),
     'tl_shared': (171527483369796812, 308006),
     'wb_crossbar': (-3765011429854336056, 33613),

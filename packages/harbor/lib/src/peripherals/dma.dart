@@ -530,9 +530,8 @@ class HarborDmaController extends BridgeModule
           activeCh < Const(0, width: channels.bitLength),
           dmaState < Const(sIdle, width: 3),
           xferCount < Const(0, width: 24),
-          readData < Const(0, width: dataWidth),
-          curSrc < Const(0, width: addressWidth),
-          curDst < Const(0, width: addressWidth),
+          // The beat data and the working pointers load before use and take
+          // no reset.
           reqSent < Const(0),
           wSent < Const(0),
           if (source == HarborDmaSource.peripheralStream)
