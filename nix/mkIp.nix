@@ -35,6 +35,7 @@ lib.extendMkDerivation {
     "dartSrc"
     "dartEntryPoint"
     "generateArgs"
+    "gitHashes"
     "pubspecLock"
   ];
 
@@ -45,6 +46,11 @@ lib.extendMkDerivation {
       dartSrc,
       dartEntryPoint ? "bin/generate.dart",
       generateArgs ? [ ],
+      gitHashes ? {
+        # rohd_hcl is fetched from git because the published 0.3.0 archive
+        # omits the workspace member declared in its pubspec.
+        rohd_hcl = "sha256-scU9PpBkBrc8qJ/SZpvWCzrp3iDpcChXlS4GcGm7Q0k=";
+      },
       pubspecLock,
       ...
     }@args:
@@ -54,7 +60,7 @@ lib.extendMkDerivation {
         pname = "${finalAttrs.name}-generator";
         version = "0.0.0";
         src = dartSrc;
-        inherit pubspecLock;
+        inherit gitHashes pubspecLock;
         dartEntryPoints."bin/generate" = dartEntryPoint;
       };
     in
@@ -62,6 +68,7 @@ lib.extendMkDerivation {
       "dartSrc"
       "dartEntryPoint"
       "generateArgs"
+      "gitHashes"
       "pubspecLock"
     ]
     // {

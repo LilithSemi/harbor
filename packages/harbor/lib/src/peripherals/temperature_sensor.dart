@@ -57,7 +57,8 @@ class HarborTemperatureSensor extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// Base address in the SoC memory map.
   final int baseAddress;
 
@@ -303,7 +304,7 @@ class HarborTemperatureSensor extends BridgeModule
                 // 0x08: STATUS
                 CaseItem(Const(0x08, width: 12), [
                   bus.dataOut <
-                      [Const(0, width: 30), overTemp, dataValid].swizzle(),
+                      [Const(0, width: 30), overTemp, dataValid].concat(),
                 ]),
                 // 0x10: TEMP_RAW
                 CaseItem(Const(0x10, width: 12), [

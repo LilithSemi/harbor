@@ -1,7 +1,49 @@
 import 'package:harbor/harbor.dart';
+import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
 void main() {
+  group('defaultOutstanding', () {
+    const axi = HarborFabricKind.axi4;
+    const wb = HarborFabricKind.wishbone;
+    test('small parts get 2', () {
+      for (final t in const [
+        HarborFpgaTarget.spartan7(device: 'xc7s50', package: 'csga324'),
+        HarborFpgaTarget.ecp5(device: 'LFE5U-85F', package: 'CABGA381'),
+        HarborFpgaTarget.ice40(device: 'up5k', package: 'sg48'),
+      ]) {
+        expect(t.defaultOutstanding(axi), 2, reason: t.name);
+        expect(t.defaultOutstanding(HarborFabricKind.tilelink), 2);
+        expect(t.defaultOutstanding(wb), 1);
+      }
+    });
+    test('big parts get 8', () {
+      for (final t in const [
+        HarborFpgaTarget.artix7(device: 'xc7a200t', package: 'fbg484'),
+        HarborFpgaTarget.kintex7(device: 'xc7k325t', package: 'ffg900'),
+        HarborSimTarget(),
+      ]) {
+        expect(t.defaultOutstanding(axi), 8, reason: t.name);
+        expect(t.defaultOutstanding(wb), 1);
+      }
+    });
+    test('an explicit value wins', () {
+      final s = HarborSdram(
+        config: const HarborSdramConfig.as4c16m16sb6(),
+        baseAddress: 0x80000000,
+        clockHz: 25000000,
+        busClockSync: true,
+        protocol: HarborFabricKind.axi4,
+        outstanding: 4,
+        target: const HarborFpgaTarget.ecp5(
+          device: 'LFE5U-85F',
+          package: 'CABGA381',
+        ),
+      );
+      expect(s.outstanding, 4);
+    });
+  });
+
   group('HarborFpgaTarget.ice40', () {
     late HarborFpgaTarget target;
 
@@ -66,6 +108,42 @@ void main() {
     test('hasEfuse is true', () {
       expect(target.hasEfuse, isTrue);
     });
+
+    test('generateYosysTcl marks modules before synthesis', () {
+      final lines = target
+          .generateYosysTcl(
+            'Top',
+            blockRamModules: ['Ram', 'Ram'],
+            preserveRegisterModules: ['Keep'],
+          )
+          .split('\n');
+      final marks = [
+        'select -assert-any Ram/m:*',
+        'setattr -set ram_style "block" Ram/m:*',
+        'select -assert-any Keep',
+        'proc Keep',
+        r'select -assert-any Keep/t:$*ff*',
+        r'setattr -set keep 1 Keep/t:$*ff*',
+      ];
+      final at = lines.indexOf('hierarchy -top Top');
+      expect(lines.sublist(at + 1, at + 1 + marks.length), equals(marks));
+      expect(lines.where((l) => l.startsWith('synth_')).single, isNotNull);
+      expect(
+        lines.indexWhere((l) => l.startsWith('synth_')),
+        greaterThan(at + marks.length),
+      );
+    });
+
+    test('generateYosysTcl refuses a module name that is not plain', () {
+      expect(
+        () => target.generateYosysTcl('Top', blockRamModules: ['a b']),
+        throwsArgumentError,
+      );
+      expect(
+        () => target.generateYosysTcl('Top', preserveRegisterModules: ['a;b']),
+        throwsArgumentError,
+      );
+    });
   });
 
   group('HarborFpgaTarget.spartan7', () {
@@ -86,6 +164,115 @@ void main() {
       );
       expect(target.vendor, equals(HarborFpgaVendor.openXc7));
       expect(target.constraintExtension, equals('xdc'));
+    });
+
+    test(
+      'clock constraints bind oscillator and explicit core net separately',
+      () {
+        const target = HarborFpgaTarget.spartan7(
+          device: 'xc7s50',
+          package: 'csga324',
+          useOpenXc7: true,
+        );
+
+        final at25MHz = target.generateClockConstraintPy(
+          coreClkMhz: 25,
+          coreClockNet: 'core_clk',
+          sourceClockNet: 'sysosc_clk',
+          sourceClkMhz: 100,
+          ddrCtrlMhz: 100,
+        );
+        expect(at25MHz, contains("('sysosc_clk', 100.00)"));
+        expect(at25MHz, contains("('core_clk', 35.00)"));
+        expect(at25MHz, isNot(contains("('sysosc_clk', 35.00)")));
+
+        final at3333MHz = target.generateClockConstraintPy(
+          coreClkMhz: 33.333333,
+          coreClockNet: 'core_clk',
+          sourceClockNet: 'sysosc_clk',
+          sourceClkMhz: 100,
+          ddrCtrlMhz: 100,
+        );
+        expect(at3333MHz, contains("('sysosc_clk', 100.00)"));
+        expect(at3333MHz, contains("('core_clk', 46.67)"));
+        expect(at3333MHz, isNot(contains("('sysosc_clk', 46.67)")));
+      },
+    );
+
+    test('default Yosys mapping keeps the standard Xilinx command', () {
+      const target = HarborFpgaTarget.spartan7(
+        device: 'xc7s50',
+        package: 'csga324',
+        useOpenXc7: true,
+      );
+      final result = target.generateYosysTcl('TopCell');
+      expect(
+        result,
+        equals(
+          [
+            '# Auto-generated Yosys synthesis for spartan7-xc7s50',
+            '# Target: xilinx (xc7s50)',
+            '',
+            'read_verilog -sv rtl/*.sv',
+            'hierarchy -top TopCell',
+            'synth_xilinx -top TopCell -flatten',
+            'write_json TopCell.json',
+            'stat',
+            '',
+          ].join('\n'),
+        ),
+      );
+    });
+
+    test('xilinxLut6Cost emits the staged LUT6 mapping flow in order', () {
+      const target = HarborFpgaTarget.spartan7(
+        device: 'xc7s50',
+        package: 'csga324',
+        useOpenXc7: true,
+        xilinxLut6Cost: 3,
+      );
+      final result = target.generateYosysTcl('TopCell');
+      final expectedSequence = [
+        'synth_xilinx -top TopCell -flatten -run begin:map_luts',
+        'select -assert-any =LUT6',
+        'setattr -mod -set abc9_lut 3 =LUT6',
+        'select -assert-any =LUT6 =A:abc9_lut=3 %i',
+        'opt_expr -mux_undef -noclkinv',
+        'abc9 -maxlut 6',
+        'clean',
+        'xilinx_srl -fixed -minlen 3',
+        'techmap -map +/xilinx/lut_map.v -map +/xilinx/cells_map.v -D LUT_WIDTH=6',
+        'xilinx_dffopt',
+        'opt_lut_ins -tech xilinx',
+        'synth_xilinx -top TopCell -run finalize:',
+        'write_json TopCell.json',
+      ];
+      var lastIndex = -1;
+      for (final command in expectedSequence) {
+        final index = result.indexOf(command);
+        expect(index, greaterThan(lastIndex), reason: command);
+        lastIndex = index;
+      }
+      expect(result, isNot(contains('synth_xilinx -top TopCell -flatten\n')));
+    });
+
+    test('xilinxLut6Cost must be positive', () {
+      expect(
+        () => HarborFpgaTarget.spartan7(
+          device: 'xc7s50',
+          package: 'csga324',
+          xilinxLut6Cost: 0,
+        ),
+        throwsA(isA<AssertionError>()),
+      );
+      expect(
+        () => HarborFpgaTarget.spartan7(
+          device: 'xc7s50',
+          package: 'csga324',
+          xilinxLut6Cost: -1,
+        ),
+        throwsA(isA<AssertionError>()),
+      );
     });
   });
 
@@ -504,10 +691,341 @@ void main() {
       expect(tcl, contains('synth'));
     });
 
+    test('generateYosysTcl imports yosys commands and flattens', () {
+      final target = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+        macros: const [HarborAsicMacro(moduleName: 'Core')],
+      );
+      final tcl = target.generateYosysTcl();
+      expect(tcl.split('\n').first, equals('yosys -import'));
+      expect(tcl, contains('synth -top MySoC -flatten'));
+      final macro = target.generateMacroYosysTcl(target.macros.first);
+      expect(macro.split('\n').first, equals('yosys -import'));
+      expect(macro, contains('synth -top Core -flatten'));
+    });
+
+    test('generateYosysTcl reads blackboxes.v only when told it exists', () {
+      final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
+      expect(target.generateYosysTcl(), isNot(contains('blackboxes.v')));
+      expect(
+        target.generateYosysTcl(hasBlackboxes: true),
+        contains('read_verilog -lib \$ipdir/blackboxes.v'),
+      );
+      final hier = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+        macros: const [HarborAsicMacro(moduleName: 'Core')],
+      );
+      expect(hier.generateYosysTcl(), isNot(contains('blackboxes.v')));
+    });
+
     test('generateOpenroadTcl contains read_liberty', () {
       final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
       final tcl = target.generateOpenroadTcl();
       expect(tcl, contains('read_liberty'));
+    });
+
+    test('generateOpenroadTcl repairs antennas and fills decap first', () {
+      final gf = Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD');
+      final tcl = HarborAsicTarget(
+        provider: gf,
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      const prefix = 'gf180mcu_fd_sc_mcu7t5v0';
+      expect(tcl, contains('set _diode ${prefix}__antenna'));
+      expect(tcl, contains('${prefix}__fillcap_*'));
+      final repair = tcl.indexOf('repair_antennas \$_diode -iterations 3');
+      final order = [
+        tcl.indexOf('global_route'),
+        repair,
+        tcl.indexOf('detailed_route', repair),
+        tcl.indexOf('check_antennas'),
+        tcl.indexOf('filler_placement'),
+      ];
+      expect(order, everyElement(isNonNegative));
+      expect(order, orderedEquals([...order]..sort()));
+      final fill = tcl.substring(tcl.indexOf('filler_placement'));
+      expect(fill.indexOf('__fillcap_'), lessThan(fill.indexOf('__fill_1')));
+      expect(tcl, isNot(contains('metal_fill')));
+    });
+
+    test('generateOpenroadTcl makes tracks and places pins first', () {
+      final tcl = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      final pins = tcl.indexOf(
+        'place_pins -hor_layers Metal3 -ver_layers Metal2',
+      );
+      final order = [
+        tcl.indexOf('initialize_floorplan'),
+        tcl.indexOf('make_tracks'),
+        tcl.indexOf('-skip_io'),
+        pins,
+        tcl.indexOf('global_placement -density', pins),
+        tcl.indexOf('detailed_placement'),
+      ];
+      expect(order, everyElement(isNonNegative));
+      expect(order, orderedEquals([...order]..sort()));
+
+      final sky = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(sky, contains('place_pins -hor_layers met3 -ver_layers met2'));
+
+      final bare = HarborAsicTarget(
+        provider: _BareCellProvider(),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(bare, contains('make_tracks'));
+      expect(bare, isNot(contains('place_pins')));
+      expect(bare, isNot(contains('-skip_io')));
+    });
+
+    test('generateMacroOpenroadTcl places pins on the PDK layers', () {
+      final tcl = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+      ).generateMacroOpenroadTcl(const HarborAsicMacro(moduleName: 'Core'));
+      final pins = tcl.indexOf('place_pins -hor_layers met3 -ver_layers met2');
+      expect(tcl.indexOf('make_tracks'), allOf(isNonNegative, lessThan(pins)));
+      expect(pins, lessThan(tcl.indexOf('global_placement')));
+    });
+
+    test('generateOpenroadTcl writes the powered netlist after fill', () {
+      final target = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      );
+      final tcl = target.generateOpenroadTcl();
+      final fill = tcl.indexOf('filler_placement');
+      expect(tcl, contains('write_verilog MySoC_final.v'));
+      expect(
+        tcl.indexOf('global_connect', fill),
+        lessThan(
+          tcl.indexOf('write_verilog -include_pwr_gnd MySoC_final_pwr.v'),
+        ),
+      );
+      final macro = target.generateMacroOpenroadTcl(
+        const HarborAsicMacro(moduleName: 'Core'),
+      );
+      expect(
+        macro,
+        contains('write_verilog -include_pwr_gnd Core_final_pwr.v'),
+      );
+    });
+
+    test('generateOpenroadTcl writes gf180 tap cells and a PDN', () {
+      final tcl = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      const prefix = 'gf180mcu_fd_sc_mcu7t5v0';
+      for (final line in [
+        r'add_global_connection -net VDD -pin_pattern {^VNW$} -power',
+        r'add_global_connection -net VSS -pin_pattern {^VPW$} -ground',
+        'tapcell -distance 20 \\\n'
+            '    -tapcell_master ${prefix}__filltie \\\n'
+            '    -endcap_master ${prefix}__endcap',
+        'define_pdn_grid -name stdcell -voltage_domains CORE '
+            '-pins {Metal4 Metal5}',
+        'add_pdn_stripe -grid stdcell -layer Metal1 -width 0.6 -followpins',
+        'add_pdn_stripe -grid stdcell -layer Metal4 -width 1.6 -pitch 40 '
+            '-offset 10 -spacing 1.7 -starts_with POWER',
+        'add_pdn_stripe -grid stdcell -layer Metal5 -width 1.6 '
+            '-pitch 153.18 -offset 16.65 -spacing 1.7 -starts_with POWER',
+        'add_pdn_connect -grid stdcell -layers {Metal1 Metal4}',
+        'add_pdn_connect -grid stdcell -layers {Metal4 Metal5}',
+      ]) {
+        expect(tcl, contains(line));
+      }
+      final order = [
+        tcl.indexOf('make_tracks'),
+        tcl.indexOf('tapcell'),
+        tcl.indexOf('pdngen'),
+        tcl.indexOf('global_placement'),
+      ];
+      expect(order, everyElement(isNonNegative));
+      expect(order, orderedEquals([...order]..sort()));
+    });
+
+    test('generateOpenroadTcl writes a PDN only for checked libraries', () {
+      final hd = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(hd, contains('-tapcell_master sky130_fd_sc_hd__tapvpwrvgnd_1'));
+      expect(hd, contains('add_pdn_connect -grid stdcell -layers {met4 met5}'));
+      expect(hd, contains(r'-pin_pattern {^VPWR$} -power'));
+
+      for (final provider in [
+        Sky130Provider(pdkRoot: '/pdk/sky130A', variant: Sky130Variant.hs),
+        _BareCellProvider(),
+      ]) {
+        final tcl = HarborAsicTarget(
+          provider: provider,
+          topCell: 'MySoC',
+        ).generateOpenroadTcl();
+        expect(tcl, isNot(contains('tapcell')));
+        expect(tcl, isNot(contains('pdngen')));
+        expect(tcl, contains(r'-pin_pattern {^VDD$} -power'));
+      }
+    });
+
+    test('hierarchical flow connects the top PDN to the tile PDN', () {
+      final target = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+        macros: const [HarborAsicMacro(moduleName: 'Core')],
+      );
+      final tile = target.generateMacroOpenroadTcl(target.macros.first);
+      expect(tile, contains('-pins {Metal4}'));
+      expect(tile, isNot(contains('-layer Metal5')));
+      expect(tile, contains('tapcell'));
+      final top = target.generateOpenroadTcl();
+      expect(
+        top,
+        contains(
+          'define_pdn_grid -name macros -macro -cells {Core} '
+          '-voltage_domains CORE -grid_over_boundary',
+        ),
+      );
+      expect(
+        top,
+        contains('add_pdn_connect -grid macros -layers {Metal4 Metal5}'),
+      );
+      expect(top.indexOf('cut_rows'), lessThan(top.indexOf('tapcell')));
+    });
+
+    test('generateOpenroadTcl takes the core margin from the env', () {
+      final auto = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(auto, isNot(contains('set _m 200')));
+      final env = auto.indexOf('if {[info exists ::env(CORE_MARGIN_UM)]} {');
+      expect(env, isNonNegative);
+      expect(env, lessThan(auto.indexOf('initialize_floorplan')));
+      expect(auto, contains(r'set _m $::env(CORE_MARGIN_UM)'));
+      expect(auto, contains('getInsts'));
+      expect(
+        auto,
+        contains(
+          r'set _side [expr {max(80.0, sqrt($_cells / $::env(UTILIZATION) '
+          r'+ $_macros))}]',
+        ),
+      );
+      expect(auto, contains(r'-core_area "$_cx0 $_cy0 $_cx1 $_cy1"'));
+      expect(auto, contains('if {![info exists _m]} { set _m 10 }'));
+
+      final fixed = HarborAsicTarget(
+        provider: pdk,
+        topCell: 'MySoC',
+        dieMarginUm: 40,
+      ).generateOpenroadTcl();
+      final head = fixed.substring(0, fixed.indexOf('initialize_floorplan'));
+      expect(
+        head,
+        contains(
+          'if {[info exists ::env(CORE_MARGIN_UM)]} {\n'
+          '    set _m \$::env(CORE_MARGIN_UM)\n'
+          '} else {\n'
+          '    set _m 40\n'
+          '}',
+        ),
+      );
+    });
+
+    test('generateOpenroadTcl repairs hold after CTS', () {
+      final tcl = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(tcl, contains('set_wire_rc -layer Metal2'));
+      final cts = tcl.indexOf('clock_tree_synthesis');
+      final hold = tcl.indexOf('repair_timing -hold');
+      expect(cts, isNonNegative);
+      expect(tcl.indexOf('set_propagated_clock', cts), lessThan(hold));
+      expect(hold, lessThan(tcl.indexOf('global_route')));
+      expect(
+        tcl.indexOf('detailed_placement', hold),
+        lessThan(tcl.indexOf('global_route')),
+      );
+    });
+
+    test('generateOpenroadTcl writes the area report with tee', () {
+      final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
+      expect(
+        target.generateOpenroadTcl(),
+        contains('tee -file area.rpt {report_design_area}'),
+      );
+      expect(
+        target.generateMacroOpenroadTcl(
+          const HarborAsicMacro(moduleName: 'Core'),
+        ),
+        contains('tee -file Core_area.rpt {report_design_area}'),
+      );
+    });
+
+    test('generateOpenroadTcl applies the LAYER_ADJ env vars', () {
+      final target = HarborAsicTarget(provider: pdk, topCell: 'MySoC');
+      const loop =
+          'foreach _name [array names ::env LAYER_ADJ_*] {\n'
+          '    set_global_routing_layer_adjustment '
+          '[string range \$_name 10 end] \$::env(\$_name)\n'
+          '}';
+      final tcl = target.generateOpenroadTcl();
+      expect(tcl.indexOf(loop), greaterThan(tcl.indexOf('make_tracks')));
+      expect(tcl.indexOf(loop), lessThan(tcl.indexOf('global_route')));
+      expect(
+        target.generateMacroOpenroadTcl(
+          const HarborAsicMacro(moduleName: 'Core'),
+        ),
+        contains(loop),
+      );
+    });
+
+    test('generateOpenroadTcl keeps the route guard in the antenna loop', () {
+      final tcl = HarborAsicTarget(
+        provider: Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD'),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      final loop = tcl.substring(tcl.indexOf('for {set _i 0}'));
+      expect(loop, contains('if {[info exists ::env(DROUTE_END_ITER)]}'));
+      expect(loop, contains('detailed_route -droute_end_iter'));
+    });
+
+    test('generateMacroOpenroadTcl orders antenna and fill steps', () {
+      final gf = Gf180mcuProvider(pdkRoot: '/pdk/gf180mcuD');
+      final tcl = HarborAsicTarget(
+        provider: gf,
+        topCell: 'MySoC',
+      ).generateMacroOpenroadTcl(const HarborAsicMacro(moduleName: 'Core'));
+      expect(
+        tcl.indexOf('global_route'),
+        lessThan(tcl.indexOf('repair_antennas')),
+      );
+      expect(
+        tcl.indexOf('repair_antennas'),
+        lessThan(tcl.indexOf('detailed_route')),
+      );
+      expect(
+        tcl.indexOf('check_antennas'),
+        lessThan(tcl.indexOf('filler_placement')),
+      );
+    });
+
+    test('generateOpenroadTcl omits antenna and decap steps when unset', () {
+      final tcl = HarborAsicTarget(
+        provider: _BareCellProvider(),
+        topCell: 'MySoC',
+      ).generateOpenroadTcl();
+      expect(tcl, isNot(contains('repair_antennas')));
+      expect(tcl, isNot(contains('check_antennas')));
+      expect(tcl, isNot(contains('filler_placement')));
+      expect(tcl, contains('detailed_route'));
     });
   });
 
@@ -532,4 +1050,108 @@ void main() {
       expect(HarborFpgaVendor.values, contains(HarborFpgaVendor.openXc7));
     });
   });
+
+  group('harborSynthesisMarks', () {
+    tearDown(Simulator.reset);
+
+    test('gives the reserved names of marked modules', () async {
+      final top = _Top([
+        (c) => _Keep(c, 'KeepA', reserve: true),
+        (c) => _Keep(c, 'KeepA', reserve: true),
+        (c) => _Ram(c, 'RamA', prefer: true),
+        (c) => _Ram(c, 'RamB', prefer: false),
+      ]);
+      await top.build();
+      final marks = harborSynthesisMarks(top);
+      expect(marks.preserve, ['KeepA']);
+      expect(marks.blockRam, ['RamA']);
+    });
+
+    test('a marked module that does not reserve its name throws', () async {
+      final top = _Top([(c) => _Keep(c, 'KeepB', reserve: false)]);
+      await top.build();
+      expect(
+        () => harborSynthesisMarks(top),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('KeepB'),
+          ),
+        ),
+      );
+    });
+
+    test('two different marked modules cannot share a name', () async {
+      final top = _Top([
+        (c) => _Keep(c, 'KeepC', reserve: true),
+        (c) => _Keep(c, 'KeepC', reserve: true, width: 2),
+      ]);
+      await top.build();
+      expect(
+        () => SynthBuilder(top, SystemVerilogSynthesizer()),
+        throwsA(predicate((e) => e.toString().contains('KeepC'))),
+      );
+    });
+  });
+}
+
+class _Keep extends Module implements HarborPreserveRegisters {
+  _Keep(
+    Logic clk,
+    String definitionName, {
+    required bool reserve,
+    int width = 1,
+  }) : super(definitionName: definitionName, reserveDefinitionName: reserve) {
+    final d = addInput('d', clk.replicate(width), width: width);
+    clk = addInput('clk', clk);
+    final q = addOutput('q', width: width);
+    Sequential(clk, [q < d]);
+  }
+}
+
+class _Ram extends Module implements HarborPreferBlockRam {
+  @override
+  final bool preferBlockRam;
+
+  _Ram(Logic clk, String definitionName, {required bool prefer})
+    : preferBlockRam = prefer,
+      super(definitionName: definitionName, reserveDefinitionName: true) {
+    addOutput('q') <= ~addInput('d', clk);
+  }
+}
+
+class _Top extends Module {
+  _Top(List<Module Function(Logic)> parts) : super(definitionName: 'Top') {
+    final clk = addInput('clk', Logic());
+    for (final (i, part) in parts.indexed) {
+      final m = part(clk);
+      addOutput('o$i', width: m.output('q').width) <= m.output('q');
+    }
+  }
+}
+
+class _BareCellProvider extends PdkProvider {
+  @override
+  String get name => 'bare';
+  @override
+  String get node => '0nm';
+  @override
+  int get metalLayers => 5;
+  @override
+  double get supplyVoltage => 1.0;
+  @override
+  StandardCellLibrary get standardCellLibrary => const StandardCellLibrary(
+    name: 'bare',
+    libertyPath: 'a.lib',
+    lefPath: 'a.lef',
+    cellPrefix: 'bare__',
+    siteName: 'site',
+    tieHighCell: 'bare__tieh',
+    tieLowCell: 'bare__tiel',
+  );
+  @override
+  AnalogBlock ioCell({required int index}) => throw UnimplementedError();
+  @override
+  AnalogBlock pll({required int index}) => throw UnimplementedError();
 }

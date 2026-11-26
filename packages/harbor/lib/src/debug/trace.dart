@@ -236,7 +236,7 @@ class HarborTraceEncoder extends BridgeModule
                 ]),
                 CaseItem(Const(0x04, width: 12), [
                   bus.dataOut <
-                      [Const(0, width: 30), overflowReg, enabled].swizzle(),
+                      [Const(0, width: 30), overflowReg, enabled].concat(),
                 ]),
                 CaseItem(Const(0x10, width: 12), [
                   If(

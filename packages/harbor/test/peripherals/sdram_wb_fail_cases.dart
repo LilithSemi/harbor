@@ -159,8 +159,8 @@ Future<void> sysResetCase(SdramWbStack s) async {
 }
 
 /// Pulses the memory reset in the middle of a read. The engine runs init
-/// again and bus_error goes high. In async mode the waiting bus cycle ends
-/// with a poison ack, in sync mode the front end runs the read again.
+/// again and bus_error goes high. The waiting bus cycle ends with a poison
+/// ack. A same-clock build has no memory reset.
 Future<void> memResetCase(SdramWbStack s) async {
   final addrs = await seed(s, 5, 0x42000000);
   expect(s.sdram.output('bus_error').value, equals(LogicValue.zero));
@@ -173,7 +173,7 @@ Future<void> memResetCase(SdramWbStack s) async {
   s.release();
   await s.sysClk.nextPosedge;
   expect(got, isNotNull, reason: 'the read must end');
-  if (!s.busClockSync) expect(got, equals(0xffffffff), reason: 'poison data');
+  expect(got, equals(0xffffffff), reason: 'poison data');
   expect(s.sdram.output('bus_error').value, equals(LogicValue.one));
 
   while (s.sdram.output('init_done').value != LogicValue.one) {

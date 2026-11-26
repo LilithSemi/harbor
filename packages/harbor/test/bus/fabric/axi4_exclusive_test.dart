@@ -9,7 +9,8 @@ import '../../peripherals/ddr3_fast_bench.dart';
 import '../../peripherals/sdram_memory_port_bench.dart';
 import '../port/memory_harness.dart';
 import '../port/port_harness.dart';
-import 'axi4_fabric_harness.dart' show exposeInterface;
+import 'axi4_fabric_harness.dart'
+    show exposeInterface, forEachPipeline, harnessPipeline;
 
 const _okay = 0;
 const _exOkay = 1;
@@ -56,6 +57,7 @@ void _linkFabric(
   expect(HarborAxi4Fabric.fullIdWidthOf(ms), _slaveIdW);
   HarborFabric.build(
     kind: HarborFabricKind.axi4,
+    pipeline: harnessPipeline,
     topology: HarborFabricTopology.shared,
     clk: top.input('clk'),
     reset: top.input('reset'),
@@ -637,79 +639,152 @@ Future<(double, int)> _rate(
 }
 
 void main() {
-  tearDown(endAndReset);
+  forEachPipeline((p) {
+    tearDown(endAndReset);
 
-  test('exclusive access on an SRAM', () async {
-    final top = _SramTop();
-    final s = Sim(top);
-    await s.start();
-    Simulator.setMaxSimTime(100000000);
-    final a = _Agents(s, top.sram.bus.fabricWaist);
-    final bad = await _scenarios(a, n: 20);
-    await s.stop();
-    expect(bad, isEmpty);
-  });
+    test('exclusive access on an SRAM', () async {
+      final top = _SramTop();
+      final s = Sim(top);
+      await s.start();
+      Simulator.setMaxSimTime(100000000);
+      final a = _Agents(s, top.sram.bus.fabricWaist);
+      final bad = await _scenarios(a, n: 20);
+      await s.stop();
+      expect(bad, isEmpty);
+    });
 
-  test('exclusive access on an ECP5 SDRAM', () async {
-    late _Agents a;
-    final bench = await SdramPortBench.start(
-      HarborFabricKind.axi4,
-      const HarborMemoryWaistConfig(
-        addressWidth: 25,
-        dataWidth: 32,
-        idWidth: _slaveIdW,
-        outstanding: 8,
-      ),
-      fabricPeriodPs: 20000,
-      exclusive: _excl,
-      link: (top, sdram) =>
-          _linkFabric(top, sdram, 25, BusAddressRange(0, 1 << 25), 8),
-      attach: (s) {},
+    test('exclusive access on an ECP5 SDRAM', () async {
+      late _Agents a;
+      final bench = await SdramPortBench.start(
+        HarborFabricKind.axi4,
+        const HarborMemoryWaistConfig(
+          addressWidth: 25,
+          dataWidth: 32,
+          idWidth: _slaveIdW,
+          outstanding: 8,
+        ),
+        fabricPeriodPs: 20000,
+        exclusive: _excl,
+        link: (top, sdram) =>
+            _linkFabric(top, sdram, 25, BusAddressRange(0, 1 << 25), 8),
+        attach: (s) {},
+      );
+      a = _Agents(bench.s, bench.sdram.bus!.fabricWaist);
+      final bad = [
+        ...await _scenarios(a, n: 16),
+        ...bench.model.errors.take(8),
+      ];
+      await bench.stop();
+      expect(bad, isEmpty);
+    });
+
+    test(
+      'exclusive access on a fast sim DDR3 with two read channels',
+      () async {
+        final top = Ddr3FabricBench(
+          cores: [
+            for (final (name, idW, excl) in _masters)
+              CoreCfg(
+                name,
+                idW,
+                4,
+                readChannel: excl == null ? 1 : 0,
+                exclusiveIds: excl,
+              ),
+          ],
+          readChannels: 2,
+          outstanding: 8,
+        );
+        final run = await Ddr3FabricRun.start(top);
+        final a = _Agents(run.sim, top.ddr.bus.fabricWaist);
+        final bad = [...await _scenarios(a, n: 16), ...run.allErrors.take(8)];
+        await run.sim.stop();
+        expect(bad, isEmpty);
+      },
     );
-    a = _Agents(bench.s, bench.sdram.bus!.fabricWaist);
-    final bad = [...await _scenarios(a, n: 16), ...bench.model.errors.take(8)];
-    await bench.stop();
-    expect(bad, isEmpty);
-  });
 
-  test('exclusive access on a fast sim DDR3 with two read channels', () async {
-    final top = Ddr3FabricBench(
-      cores: [
-        for (final (name, idW, excl) in _masters)
-          CoreCfg(
-            name,
-            idW,
-            4,
-            readChannel: excl == null ? 1 : 0,
-            exclusiveIds: excl,
+    test(
+      'an exclusive read that can miss a write in flight sets no slot',
+      () async {
+        final shell = MemSlaveShell(
+          const HarborMemoryWaistConfig(
+            addressWidth: 16,
+            dataWidth: 32,
+            idWidth: 4,
+            outstanding: 4,
           ),
-      ],
-      readChannels: 2,
-      outstanding: 8,
-    );
-    final run = await Ddr3FabricRun.start(top);
-    final a = _Agents(run.sim, top.ddr.bus.fabricWaist);
-    final bad = [...await _scenarios(a, n: 16), ...run.allErrors.take(8)];
-    await run.sim.stop();
-    expect(bad, isEmpty);
-  });
+          exclusive: const HarborAxi4Exclusive([(0, 4)]),
+        );
+        final s = Sim(shell);
+        await s.start();
+        final errors = <String>[];
+        final rng = Random(3);
+        final mem = WaistMemory(
+          s,
+          'mem',
+          rng,
+          outstanding: 4,
+          busBytes: 4,
+          errors: errors,
+          stall: 0,
+        );
+        final a = AxiManager(
+          s,
+          'bus',
+          rng,
+          awIdle: 0,
+          wIdle: 0,
+          arIdle: 0,
+          stall: 0,
+          lockPorts: true,
+        );
+        const q = 0x40;
+        mem.mem.write(q, 0x10, 0xf);
+        Burst word(int id, {int? data}) => Burst(
+          id: id,
+          write: data != null,
+          addr: q,
+          len: 0,
+          size: 2,
+          burst: 1,
+          data: data == null ? const [] : [data],
+          strb: data == null ? const [] : [0xf],
+        );
 
-  test(
-    'an exclusive read that can miss a write in flight sets no slot',
-    () async {
+        // ID 8 has no slot. Its write is taken with no data yet, so the
+        // exclusive read of ID 1 after it returns the old value.
+        a.write(word(8, data: 0x20), data: false);
+        await waitUntil(s, () => mem.writes.length == 1);
+        a.read(word(1), lock: true);
+        await waitUntil(s, () => a.rBeats.length == 1);
+        a.w.queue.add({'bus_WDATA': 0x20, 'bus_WSTRB': 0xf, 'bus_WLAST': 1});
+        await waitUntil(s, () => a.bResp.length == 1);
+        final (_, data, rResp, _) = a.rBeats.single;
+        a.write(word(1, data: data + 1), lock: true);
+        await waitUntil(s, () => a.bResp.length == 2);
+        await s.stop();
+        expect(errors, isEmpty);
+        expect((data, rResp), (0x10, _exOkay));
+        expect(a.bResp.last, (1, _okay));
+        expect(mem.mem.read(q), 0x20);
+      },
+    );
+
+    test('back to back takes match the monitor rules', () async {
       final shell = MemSlaveShell(
         const HarborMemoryWaistConfig(
           addressWidth: 16,
           dataWidth: 32,
-          idWidth: 4,
+          idWidth: 3,
           outstanding: 4,
         ),
         exclusive: const HarborAxi4Exclusive([(0, 4)]),
       );
       final s = Sim(shell);
       await s.start();
+      Simulator.setMaxSimTime(100000000);
       final errors = <String>[];
-      final rng = Random(3);
+      final rng = Random(11);
       final mem = WaistMemory(
         s,
         'mem',
@@ -729,8 +804,180 @@ void main() {
         stall: 0,
         lockPorts: true,
       );
-      const q = 0x40;
-      mem.mem.write(q, 0x10, 0xf);
+      final events = <_Event>[];
+      var cycle = 0;
+      s.onRise(() {
+        cycle++;
+        if (s.pre('mem_REQ_VALID') == 1 && s.pre('mem_REQ_READY') == 1) {
+          events.add((
+            cycle: cycle,
+            take: true,
+            id: s.pre('mem_REQ_ID'),
+            write: s.pre('mem_REQ_WRITE') == 1,
+            addr: s.pre('mem_REQ_ADDR'),
+          ));
+        }
+        if (s.pre('mem_WRESP_VALID') == 1 && s.pre('mem_WRESP_READY') == 1) {
+          events.add((cycle: cycle, take: false, id: 0, write: true, addr: 0));
+        }
+      });
+
+      // Random single-word accesses on three granules from IDs 0 to 3 (with
+      // slots) and 4 to 5 (none), sent in batches so takes come back to back.
+      final issued = <(int, int), (bool, int)>{};
+      final count = <int, int>{};
+      var value = 1;
+      Future<void> drain() => waitUntil(
+        s,
+        () =>
+            a.aw.idleNow &&
+            a.ar.idleNow &&
+            a.bResp.length == a.awOrder.length &&
+            a.rBeats.length == a.readBeatsExpected,
+      );
+      void op(int id, bool write, bool lock, int addr) {
+        final tag = id << 1 | (write ? 1 : 0);
+        final n = count[tag] = (count[tag] ?? -1) + 1;
+        final data = value++;
+        issued[(tag, n)] = (lock, data);
+        final burst = Burst(
+          id: id,
+          write: write,
+          addr: addr,
+          len: 0,
+          size: 2,
+          burst: 1,
+          data: write ? [data] : const [],
+          strb: write ? const [0xf] : const [],
+        );
+        if (write) {
+          a.write(burst, lock: lock);
+        } else {
+          a.read(burst, lock: lock);
+        }
+      }
+
+      // Each round either sends 6 random accesses at once, or reserves a
+      // granule for IDs 1 and 2 and then sends two accesses to it at once,
+      // which the waist takes in back to back cycles.
+      const x = 0x140;
+      final pairs = <List<(int, bool, bool)>>[
+        [(4, true, false), (1, true, true)],
+        [(1, true, true), (4, true, false)],
+        [(2, true, true), (1, true, true)],
+        [(1, false, true), (1, true, true)],
+        [(4, true, false), (1, false, true)],
+        [(1, true, true), (2, false, true)],
+      ];
+      for (var round = 0; round < 180; round++) {
+        if (round.isOdd) {
+          op(1, false, true, x);
+          op(2, false, true, x);
+          await drain();
+          for (final (id, write, lock) in pairs[rng.nextInt(pairs.length)]) {
+            op(id, write, lock, x);
+          }
+        } else {
+          for (var i = 0; i < 6; i++) {
+            final id = rng.nextInt(6);
+            op(
+              id,
+              rng.nextBool(),
+              id < 4 && rng.nextInt(4) != 0,
+              0x100 + 0x40 * rng.nextInt(3) + 4 * rng.nextInt(2),
+            );
+          }
+        }
+        await drain();
+      }
+      await s.stop();
+
+      final want = _model(events, issued, {0, 1, 2, 3});
+      final gotR = <int, List<int>>{};
+      for (final (id, _, resp, _) in a.rBeats) {
+        (gotR[id] ??= []).add(resp);
+      }
+      final gotB = <int, List<int>>{};
+      for (final (id, resp) in a.bResp) {
+        (gotB[id] ??= []).add(resp);
+      }
+      expect(errors, isEmpty);
+      expect(gotR, want.r);
+      expect(gotB, want.b);
+      for (final e in want.mem.entries) {
+        expect(mem.mem.read(e.key), e.value, reason: '0x${e.key}');
+      }
+
+      // The bypass cases happened: a take right after a conflicting take of
+      // each kind, in both orders.
+      final takes = [
+        for (final e in events)
+          if (e.take) e,
+      ];
+      final seen = <String>{};
+      for (var i = 1; i < takes.length; i++) {
+        final (p, q) = (takes[i - 1], takes[i]);
+        if (q.cycle != p.cycle + 1 || p.addr >> 6 != q.addr >> 6) continue;
+        seen.add('${p.write ? 'w' : 'r'}${q.write ? 'w' : 'r'}');
+        if (p.id == q.id) seen.add('same id');
+      }
+      expect(seen, containsAll(['ww', 'wr', 'rw', 'same id']));
+    });
+
+    for (final (seed, stall, idle) in [(2, 0.3, 0), (3, 0.3, 1)]) {
+      test('stress with stalls, seed $seed', () => _stress(seed, stall, idle));
+    }
+
+    test(
+      'plain traffic keeps one take per cycle on a monitored port',
+      () async {
+        const ex = HarborAxi4Exclusive([(0, 4)]);
+        for (final reads in [true, false]) {
+          final (plainRate, plainLat) = await _rate(null, reads: reads);
+          await endAndReset();
+          final (rate, lat) = await _rate(ex, reads: reads);
+          await endAndReset();
+          expect(plainRate, 1.0, reason: 'reads $reads, no monitor');
+          expect(rate, 1.0, reason: 'reads $reads, monitor');
+          expect(lat, plainLat, reason: 'reads $reads');
+        }
+      },
+    );
+
+    test('reset clears every reservation and the monitor recovers', () async {
+      final shell = MemSlaveShell(
+        const HarborMemoryWaistConfig(
+          addressWidth: 16,
+          dataWidth: 32,
+          idWidth: 3,
+          outstanding: 4,
+        ),
+        exclusive: const HarborAxi4Exclusive([(0, 4)]),
+      );
+      final s = Sim(shell);
+      await s.start();
+      final errors = <String>[];
+      final rng = Random(7);
+      final mem = WaistMemory(
+        s,
+        'mem',
+        rng,
+        outstanding: 4,
+        busBytes: 4,
+        errors: errors,
+        stall: 0,
+      );
+      final a = AxiManager(
+        s,
+        'bus',
+        rng,
+        awIdle: 0,
+        wIdle: 0,
+        arIdle: 0,
+        stall: 0,
+        lockPorts: true,
+      );
+      const q = 0x80;
       Burst word(int id, {int? data}) => Burst(
         id: id,
         write: data != null,
@@ -741,503 +988,275 @@ void main() {
         data: data == null ? const [] : [data],
         strb: data == null ? const [] : [0xf],
       );
-
-      // ID 8 has no slot. Its write is taken with no data yet, so the
-      // exclusive read of ID 1 after it returns the old value.
-      a.write(word(8, data: 0x20), data: false);
-      await waitUntil(s, () => mem.writes.length == 1);
       a.read(word(1), lock: true);
       await waitUntil(s, () => a.rBeats.length == 1);
-      a.w.queue.add({'bus_WDATA': 0x20, 'bus_WSTRB': 0xf, 'bus_WLAST': 1});
+      await s.cycles(2);
+      s.set('reset', 1);
+      await s.cycles(3);
+      s.set('reset', 0);
+      await s.cycles(2);
+      a.write(word(1, data: 0x55), lock: true);
       await waitUntil(s, () => a.bResp.length == 1);
-      final (_, data, rResp, _) = a.rBeats.single;
-      a.write(word(1, data: data + 1), lock: true);
+      a.read(word(1), lock: true);
+      await waitUntil(s, () => a.rBeats.length == 2);
+      a.write(word(1, data: 0x66), lock: true);
       await waitUntil(s, () => a.bResp.length == 2);
       await s.stop();
       expect(errors, isEmpty);
-      expect((data, rResp), (0x10, _exOkay));
-      expect(a.bResp.last, (1, _okay));
-      expect(mem.mem.read(q), 0x20);
-    },
-  );
-
-  test('back to back takes match the monitor rules', () async {
-    final shell = MemSlaveShell(
-      const HarborMemoryWaistConfig(
-        addressWidth: 16,
-        dataWidth: 32,
-        idWidth: 3,
-        outstanding: 4,
-      ),
-      exclusive: const HarborAxi4Exclusive([(0, 4)]),
-    );
-    final s = Sim(shell);
-    await s.start();
-    Simulator.setMaxSimTime(100000000);
-    final errors = <String>[];
-    final rng = Random(11);
-    final mem = WaistMemory(
-      s,
-      'mem',
-      rng,
-      outstanding: 4,
-      busBytes: 4,
-      errors: errors,
-      stall: 0,
-    );
-    final a = AxiManager(
-      s,
-      'bus',
-      rng,
-      awIdle: 0,
-      wIdle: 0,
-      arIdle: 0,
-      stall: 0,
-      lockPorts: true,
-    );
-    final events = <_Event>[];
-    var cycle = 0;
-    s.onRise(() {
-      cycle++;
-      if (s.pre('mem_REQ_VALID') == 1 && s.pre('mem_REQ_READY') == 1) {
-        events.add((
-          cycle: cycle,
-          take: true,
-          id: s.pre('mem_REQ_ID'),
-          write: s.pre('mem_REQ_WRITE') == 1,
-          addr: s.pre('mem_REQ_ADDR'),
-        ));
-      }
-      if (s.pre('mem_WRESP_VALID') == 1 && s.pre('mem_WRESP_READY') == 1) {
-        events.add((cycle: cycle, take: false, id: 0, write: true, addr: 0));
-      }
+      expect(a.bResp, [(1, _okay), (1, _exOkay)]);
+      expect(mem.mem.read(q), 0x66);
     });
 
-    // Random single-word accesses on three granules from IDs 0 to 3 (with
-    // slots) and 4 to 5 (none), sent in batches so takes come back to back.
-    final issued = <(int, int), (bool, int)>{};
-    final count = <int, int>{};
-    var value = 1;
-    Future<void> drain() => waitUntil(
-      s,
-      () =>
-          a.aw.idleNow &&
-          a.ar.idleNow &&
-          a.bResp.length == a.awOrder.length &&
-          a.rBeats.length == a.readBeatsExpected,
-    );
-    void op(int id, bool write, bool lock, int addr) {
-      final tag = id << 1 | (write ? 1 : 0);
-      final n = count[tag] = (count[tag] ?? -1) + 1;
-      final data = value++;
-      issued[(tag, n)] = (lock, data);
-      final burst = Burst(
-        id: id,
-        write: write,
+    test('the granule bounds an exclusive access and its clear', () async {
+      final shell = MemSlaveShell(
+        const HarborMemoryWaistConfig(
+          addressWidth: 16,
+          dataWidth: 32,
+          idWidth: 4,
+          outstanding: 4,
+        ),
+        exclusive: const HarborAxi4Exclusive([(0, 4)], granuleBytes: 16),
+      );
+      final s = Sim(shell);
+      await s.start();
+      final errors = <String>[];
+      final rng = Random(5);
+      final mem = WaistMemory(
+        s,
+        'mem',
+        rng,
+        outstanding: 4,
+        busBytes: 4,
+        errors: errors,
+        stall: 0.2,
+      );
+      final a = AxiManager(s, 'bus', rng, lockPorts: true);
+      Burst burst(int addr, int len, {int? data}) => Burst(
+        id: 1,
+        write: data != null,
         addr: addr,
-        len: 0,
+        len: len,
         size: 2,
         burst: 1,
-        data: write ? [data] : const [],
-        strb: write ? const [0xf] : const [],
+        data: data == null ? const [] : [for (var i = 0; i <= len; i++) data],
+        strb: data == null ? const [] : List.filled(len + 1, 0xf),
       );
-      if (write) {
-        a.write(burst, lock: lock);
-      } else {
-        a.read(burst, lock: lock);
+      Future<List<int>> read(Burst b) async {
+        final from = a.rBeats.length;
+        a.read(b, lock: true);
+        await waitUntil(s, () => a.rBeats.length == from + b.beats);
+        return [for (final r in a.rBeats.sublist(from)) r.$3];
       }
-    }
 
-    // Each round either sends 6 random accesses at once, or reserves a
-    // granule for IDs 1 and 2 and then sends two accesses to it at once,
-    // which the waist takes in back to back cycles.
-    const x = 0x140;
-    final pairs = <List<(int, bool, bool)>>[
-      [(4, true, false), (1, true, true)],
-      [(1, true, true), (4, true, false)],
-      [(2, true, true), (1, true, true)],
-      [(1, false, true), (1, true, true)],
-      [(4, true, false), (1, false, true)],
-      [(1, true, true), (2, false, true)],
-    ];
-    for (var round = 0; round < 180; round++) {
-      if (round.isOdd) {
-        op(1, false, true, x);
-        op(2, false, true, x);
-        await drain();
-        for (final (id, write, lock) in pairs[rng.nextInt(pairs.length)]) {
-          op(id, write, lock, x);
+      Future<int> write(Burst b, {bool lock = true}) async {
+        final from = a.bResp.length;
+        a.write(b, lock: lock);
+        await waitUntil(s, () => a.bResp.length > from);
+        return a.bResp.last.$2;
+      }
+
+      // 32 bytes is more than the 16 byte granule: OKAY and no effect.
+      expect(await read(burst(0x80, 7)), List.filled(8, _okay));
+      expect(await write(burst(0x80, 7, data: 0x77)), _okay);
+      expect(mem.mem.read(0x80), isNot(0x77));
+
+      // 16 bytes fit. A plain write to another word of the granule clears it.
+      expect(await read(burst(0x80, 3)), List.filled(4, _exOkay));
+      expect(await write(burst(0x8c, 0, data: 0x11), lock: false), _okay);
+      expect(await write(burst(0x80, 3, data: 0x22)), _okay);
+      expect(mem.mem.read(0x80), isNot(0x22));
+
+      // A plain write to the next granule does not.
+      expect(await read(burst(0x80, 3)), List.filled(4, _exOkay));
+      expect(await write(burst(0x90, 0, data: 0x33), lock: false), _okay);
+      expect(await write(burst(0x80, 3, data: 0x44)), _exOkay);
+      expect(mem.mem.read(0x80), 0x44);
+      await s.stop();
+      expect(errors, isEmpty);
+    });
+
+    group('build checks', () {
+      Axi4Interface axi(int idW) =>
+          Axi4Interface(addressWidth: 16, dataWidth: 32, idWidth: idW);
+      List<HarborFabricMaster> masters({int? m1 = HarborExclusive.auto}) => [
+        HarborFabricMaster(name: 'm0', interface: axi(2), exclusiveIds: 4),
+        HarborFabricMaster(name: 'm1', interface: axi(2), exclusiveIds: m1),
+        HarborFabricMaster(name: 'm2', interface: axi(1)),
+      ];
+      final ids = HarborAxi4Fabric.exclusiveOf(masters());
+      Object build(
+        List<HarborFabricMaster> ms,
+        int slaveIdW,
+        HarborAxi4Exclusive? ids,
+      ) {
+        try {
+          HarborFabric.build(
+            kind: HarborFabricKind.axi4,
+            pipeline: harnessPipeline,
+            topology: HarborFabricTopology.shared,
+            clk: Logic(),
+            reset: Logic(),
+            masters: ms,
+            slaves: [
+              HarborFabricSlave(
+                name: 'dram',
+                range: BusAddressRange(0, 0x10000),
+                interface: axi(slaveIdW),
+                outstanding: 4,
+                exclusive: ids,
+              ),
+            ],
+          );
+          return 'built';
+        } on ArgumentError catch (e) {
+          return e.message.toString();
         }
-      } else {
-        for (var i = 0; i < 6; i++) {
-          final id = rng.nextInt(6);
-          op(
-            id,
-            rng.nextBool(),
-            id < 4 && rng.nextInt(4) != 0,
-            0x100 + 0x40 * rng.nextInt(3) + 4 * rng.nextInt(2),
+      }
+
+      test('a monitored slave that the fabric would remap throws', () {
+        expect(
+          build(masters(), 3, ids),
+          allOf(contains('dram'), contains('ID width 4')),
+        );
+      });
+
+      test('a monitored slave with full IDs builds', () {
+        expect(build(masters(), 4, ids), 'built');
+      });
+
+      test('monitor IDs that are not the exclusive masters throw', () {
+        expect(build(masters(m1: 2), 4, ids), contains('slots for'));
+        expect(
+          build([HarborFabricMaster(name: 'm0', interface: axi(2))], 4, ids),
+          contains('no exclusive master'),
+        );
+      });
+
+      test('an exclusive master that reaches a memory slave with no monitor '
+          'throws', () {
+        expect(
+          build(masters(), 4, null),
+          allOf(contains('m0'), contains('dram'), contains('no exclusive')),
+        );
+      });
+
+      test('automatic slot counts split the budget in powers of two', () {
+        const a = HarborExclusive.auto;
+        expect(HarborExclusive.slotCounts([3, 2, 4], [2, a, a]), [2, 4, 2]);
+        expect(HarborExclusive.slotCounts([1, 1], [a, a], budget: 1), [1, 1]);
+        expect(HarborExclusive.slotCounts([4, 4, 4, 4], [a, a, a, a]), [
+          2,
+          2,
+          2,
+          2,
+        ]);
+        expect(HarborExclusive.slotCounts([2, 2], [3, a], budget: 2), [3, 1]);
+        expect(() => HarborExclusive.slotCounts([1], [3]), throwsArgumentError);
+      });
+
+      test('an exclusive master on a read channel without the monitor '
+          'throws', () {
+        final ms = [
+          HarborFabricMaster(
+            name: 'm0',
+            interface: axi(2),
+            exclusiveIds: 1,
+            readChannel: 1,
+          ),
+          HarborFabricMaster(name: 'm1', interface: axi(2)),
+        ];
+        expect(
+          () => HarborFabric.build(
+            kind: HarborFabricKind.axi4,
+            pipeline: harnessPipeline,
+            topology: HarborFabricTopology.shared,
+            clk: Logic(),
+            reset: Logic(),
+            masters: ms,
+            slaves: [
+              HarborFabricSlave(
+                name: 'dram',
+                range: BusAddressRange(0, 0x10000),
+                interface: axi(3),
+                readInterfaces: [
+                  Axi4ReadOnlyInterface(
+                    addressWidth: 16,
+                    dataWidth: 32,
+                    idWidth: 3,
+                  ),
+                ],
+                outstanding: 4,
+                exclusive: HarborAxi4Fabric.exclusiveOf(ms),
+              ),
+            ],
+          ),
+          throwsA(
+            isA<ArgumentError>().having(
+              (e) => e.message,
+              'message',
+              contains('read channel 0'),
+            ),
+          ),
+        );
+      });
+
+      test('a monitor on a port that is not full AXI4 throws', () {
+        for (final (kind, readOnly) in [
+          (HarborFabricKind.wishbone, false),
+          (HarborFabricKind.tilelink, false),
+          (HarborFabricKind.axi4, true),
+        ]) {
+          expect(
+            () => MemSlaveShell(
+              const HarborMemoryWaistConfig(addressWidth: 16, dataWidth: 32),
+              kind: kind,
+              readOnly: readOnly,
+              exclusive: const HarborAxi4Exclusive([(0, 2)]),
+            ),
+            throwsArgumentError,
           );
         }
-      }
-      await drain();
-    }
-    await s.stop();
+      });
 
-    final want = _model(events, issued, {0, 1, 2, 3});
-    final gotR = <int, List<int>>{};
-    for (final (id, _, resp, _) in a.rBeats) {
-      (gotR[id] ??= []).add(resp);
-    }
-    final gotB = <int, List<int>>{};
-    for (final (id, resp) in a.bResp) {
-      (gotB[id] ??= []).add(resp);
-    }
-    expect(errors, isEmpty);
-    expect(gotR, want.r);
-    expect(gotB, want.b);
-    for (final e in want.mem.entries) {
-      expect(mem.mem.read(e.key), e.value, reason: '0x${e.key}');
-    }
-
-    // The bypass cases happened: a take right after a conflicting take of
-    // each kind, in both orders.
-    final takes = [
-      for (final e in events)
-        if (e.take) e,
-    ];
-    final seen = <String>{};
-    for (var i = 1; i < takes.length; i++) {
-      final (p, q) = (takes[i - 1], takes[i]);
-      if (q.cycle != p.cycle + 1 || p.addr >> 6 != q.addr >> 6) continue;
-      seen.add('${p.write ? 'w' : 'r'}${q.write ? 'w' : 'r'}');
-      if (p.id == q.id) seen.add('same id');
-    }
-    expect(seen, containsAll(['ww', 'wr', 'rw', 'same id']));
-  });
-
-  for (final (seed, stall, idle) in [(2, 0.3, 0), (3, 0.3, 1)]) {
-    test('stress with stalls, seed $seed', () => _stress(seed, stall, idle));
-  }
-
-  test('plain traffic keeps one take per cycle on a monitored port', () async {
-    const ex = HarborAxi4Exclusive([(0, 4)]);
-    for (final reads in [true, false]) {
-      final (plainRate, plainLat) = await _rate(null, reads: reads);
-      await endAndReset();
-      final (rate, lat) = await _rate(ex, reads: reads);
-      await endAndReset();
-      expect(plainRate, 1.0, reason: 'reads $reads, no monitor');
-      expect(rate, 1.0, reason: 'reads $reads, monitor');
-      expect(lat, plainLat, reason: 'reads $reads');
-    }
-  });
-
-  test('reset clears every reservation and the monitor recovers', () async {
-    final shell = MemSlaveShell(
-      const HarborMemoryWaistConfig(
-        addressWidth: 16,
-        dataWidth: 32,
-        idWidth: 3,
-        outstanding: 4,
-      ),
-      exclusive: const HarborAxi4Exclusive([(0, 4)]),
-    );
-    final s = Sim(shell);
-    await s.start();
-    final errors = <String>[];
-    final rng = Random(7);
-    final mem = WaistMemory(
-      s,
-      'mem',
-      rng,
-      outstanding: 4,
-      busBytes: 4,
-      errors: errors,
-      stall: 0,
-    );
-    final a = AxiManager(
-      s,
-      'bus',
-      rng,
-      awIdle: 0,
-      wIdle: 0,
-      arIdle: 0,
-      stall: 0,
-      lockPorts: true,
-    );
-    const q = 0x80;
-    Burst word(int id, {int? data}) => Burst(
-      id: id,
-      write: data != null,
-      addr: q,
-      len: 0,
-      size: 2,
-      burst: 1,
-      data: data == null ? const [] : [data],
-      strb: data == null ? const [] : [0xf],
-    );
-    a.read(word(1), lock: true);
-    await waitUntil(s, () => a.rBeats.length == 1);
-    await s.cycles(2);
-    s.set('reset', 1);
-    await s.cycles(3);
-    s.set('reset', 0);
-    await s.cycles(2);
-    a.write(word(1, data: 0x55), lock: true);
-    await waitUntil(s, () => a.bResp.length == 1);
-    a.read(word(1), lock: true);
-    await waitUntil(s, () => a.rBeats.length == 2);
-    a.write(word(1, data: 0x66), lock: true);
-    await waitUntil(s, () => a.bResp.length == 2);
-    await s.stop();
-    expect(errors, isEmpty);
-    expect(a.bResp, [(1, _okay), (1, _exOkay)]);
-    expect(mem.mem.read(q), 0x66);
-  });
-
-  test('the granule bounds an exclusive access and its clear', () async {
-    final shell = MemSlaveShell(
-      const HarborMemoryWaistConfig(
-        addressWidth: 16,
-        dataWidth: 32,
-        idWidth: 4,
-        outstanding: 4,
-      ),
-      exclusive: const HarborAxi4Exclusive([(0, 4)], granuleBytes: 16),
-    );
-    final s = Sim(shell);
-    await s.start();
-    final errors = <String>[];
-    final rng = Random(5);
-    final mem = WaistMemory(
-      s,
-      'mem',
-      rng,
-      outstanding: 4,
-      busBytes: 4,
-      errors: errors,
-      stall: 0.2,
-    );
-    final a = AxiManager(s, 'bus', rng, lockPorts: true);
-    Burst burst(int addr, int len, {int? data}) => Burst(
-      id: 1,
-      write: data != null,
-      addr: addr,
-      len: len,
-      size: 2,
-      burst: 1,
-      data: data == null ? const [] : [for (var i = 0; i <= len; i++) data],
-      strb: data == null ? const [] : List.filled(len + 1, 0xf),
-    );
-    Future<List<int>> read(Burst b) async {
-      final from = a.rBeats.length;
-      a.read(b, lock: true);
-      await waitUntil(s, () => a.rBeats.length == from + b.beats);
-      return [for (final r in a.rBeats.sublist(from)) r.$3];
-    }
-
-    Future<int> write(Burst b, {bool lock = true}) async {
-      final from = a.bResp.length;
-      a.write(b, lock: lock);
-      await waitUntil(s, () => a.bResp.length > from);
-      return a.bResp.last.$2;
-    }
-
-    // 32 bytes is more than the 16 byte granule: OKAY and no effect.
-    expect(await read(burst(0x80, 7)), List.filled(8, _okay));
-    expect(await write(burst(0x80, 7, data: 0x77)), _okay);
-    expect(mem.mem.read(0x80), isNot(0x77));
-
-    // 16 bytes fit. A plain write to another word of the granule clears it.
-    expect(await read(burst(0x80, 3)), List.filled(4, _exOkay));
-    expect(await write(burst(0x8c, 0, data: 0x11), lock: false), _okay);
-    expect(await write(burst(0x80, 3, data: 0x22)), _okay);
-    expect(mem.mem.read(0x80), isNot(0x22));
-
-    // A plain write to the next granule does not.
-    expect(await read(burst(0x80, 3)), List.filled(4, _exOkay));
-    expect(await write(burst(0x90, 0, data: 0x33), lock: false), _okay);
-    expect(await write(burst(0x80, 3, data: 0x44)), _exOkay);
-    expect(mem.mem.read(0x80), 0x44);
-    await s.stop();
-    expect(errors, isEmpty);
-  });
-
-  group('build checks', () {
-    Axi4Interface axi(int idW) =>
-        Axi4Interface(addressWidth: 16, dataWidth: 32, idWidth: idW);
-    List<HarborFabricMaster> masters({int? m1 = HarborExclusive.auto}) => [
-      HarborFabricMaster(name: 'm0', interface: axi(2), exclusiveIds: 4),
-      HarborFabricMaster(name: 'm1', interface: axi(2), exclusiveIds: m1),
-      HarborFabricMaster(name: 'm2', interface: axi(1)),
-    ];
-    final ids = HarborAxi4Fabric.exclusiveOf(masters());
-    Object build(
-      List<HarborFabricMaster> ms,
-      int slaveIdW,
-      HarborAxi4Exclusive? ids,
-    ) {
-      try {
-        HarborFabric.build(
-          kind: HarborFabricKind.axi4,
-          topology: HarborFabricTopology.shared,
-          clk: Logic(),
-          reset: Logic(),
-          masters: ms,
-          slaves: [
-            HarborFabricSlave(
-              name: 'dram',
-              range: BusAddressRange(0, 0x10000),
-              interface: axi(slaveIdW),
-              outstanding: 4,
-              exclusive: ids,
-            ),
-          ],
-        );
-        return 'built';
-      } on ArgumentError catch (e) {
-        return e.message.toString();
-      }
-    }
-
-    test('a monitored slave that the fabric would remap throws', () {
-      expect(
-        build(masters(), 3, ids),
-        allOf(contains('dram'), contains('ID width 4')),
-      );
-    });
-
-    test('a monitored slave with full IDs builds', () {
-      expect(build(masters(), 4, ids), 'built');
-    });
-
-    test('monitor IDs that are not the exclusive masters throw', () {
-      expect(build(masters(m1: 2), 4, ids), contains('slots for'));
-      expect(
-        build([HarborFabricMaster(name: 'm0', interface: axi(2))], 4, ids),
-        contains('no exclusive master'),
-      );
-    });
-
-    test('an exclusive master that reaches a memory slave with no monitor '
-        'throws', () {
-      expect(
-        build(masters(), 4, null),
-        allOf(contains('m0'), contains('dram'), contains('no exclusive')),
-      );
-    });
-
-    test('automatic slot counts split the budget in powers of two', () {
-      const a = HarborExclusive.auto;
-      expect(HarborExclusive.slotCounts([3, 2, 4], [2, a, a]), [2, 4, 2]);
-      expect(HarborExclusive.slotCounts([1, 1], [a, a], budget: 1), [1, 1]);
-      expect(HarborExclusive.slotCounts([4, 4, 4, 4], [a, a, a, a]), [
-        2,
-        2,
-        2,
-        2,
-      ]);
-      expect(HarborExclusive.slotCounts([2, 2], [3, a], budget: 2), [3, 1]);
-      expect(() => HarborExclusive.slotCounts([1], [3]), throwsArgumentError);
-    });
-
-    test('an exclusive master on a read channel without the monitor '
-        'throws', () {
-      final ms = [
-        HarborFabricMaster(
-          name: 'm0',
-          interface: axi(2),
-          exclusiveIds: 1,
-          readChannel: 1,
-        ),
-        HarborFabricMaster(name: 'm1', interface: axi(2)),
-      ];
-      expect(
-        () => HarborFabric.build(
-          kind: HarborFabricKind.axi4,
-          topology: HarborFabricTopology.shared,
-          clk: Logic(),
-          reset: Logic(),
-          masters: ms,
-          slaves: [
-            HarborFabricSlave(
-              name: 'dram',
-              range: BusAddressRange(0, 0x10000),
-              interface: axi(3),
-              readInterfaces: [
-                Axi4ReadOnlyInterface(
-                  addressWidth: 16,
-                  dataWidth: 32,
-                  idWidth: 3,
-                ),
-              ],
-              outstanding: 4,
-              exclusive: HarborAxi4Fabric.exclusiveOf(ms),
-            ),
-          ],
-        ),
-        throwsA(
-          isA<ArgumentError>().having(
-            (e) => e.message,
-            'message',
-            contains('read channel 0'),
-          ),
-        ),
-      );
-    });
-
-    test('a monitor on a port that is not full AXI4 throws', () {
-      for (final (kind, readOnly) in [
-        (HarborFabricKind.wishbone, false),
-        (HarborFabricKind.tilelink, false),
-        (HarborFabricKind.axi4, true),
-      ]) {
+      test('exclusive access on another fabric kind throws', () {
         expect(
-          () => MemSlaveShell(
-            const HarborMemoryWaistConfig(addressWidth: 16, dataWidth: 32),
-            kind: kind,
-            readOnly: readOnly,
-            exclusive: const HarborAxi4Exclusive([(0, 2)]),
+          () => HarborFabric.checkPorts(
+            kind: HarborFabricKind.wishbone,
+            masters: [
+              HarborFabricMaster(
+                name: 'm0',
+                interface: axi(1),
+                exclusiveIds: 1,
+              ),
+            ],
+            slaves: const [],
+            addressWidth: 16,
+            dataWidth: 32,
           ),
           throwsArgumentError,
         );
-      }
-    });
+      });
 
-    test('exclusive access on another fabric kind throws', () {
-      expect(
-        () => HarborFabric.checkPorts(
-          kind: HarborFabricKind.wishbone,
-          masters: [
-            HarborFabricMaster(name: 'm0', interface: axi(1), exclusiveIds: 1),
-          ],
-          slaves: const [],
-          addressWidth: 16,
-          dataWidth: 32,
-        ),
-        throwsArgumentError,
-      );
-    });
+      test('no monitor logic without exclusive IDs', () async {
+        Future<String> sv(HarborAxi4Exclusive? ids) async {
+          final m = HarborSram(
+            baseAddress: 0,
+            size: 1024,
+            protocol: HarborFabricKind.axi4,
+            idWidth: _slaveIdW,
+            exclusive: ids,
+          );
+          await m.build();
+          return m.dumpSystemVerilog();
+        }
 
-    test('no monitor logic without exclusive IDs', () async {
-      Future<String> sv(HarborAxi4Exclusive? ids) async {
-        final m = HarborSram(
-          baseAddress: 0,
-          size: 1024,
-          protocol: HarborFabricKind.axi4,
-          idWidth: _slaveIdW,
-          exclusive: ids,
-        );
-        await m.build();
-        return m.generateSynth();
-      }
-
-      final plain = await sv(null);
-      expect(plain, isNot(contains('excl_')));
-      expect(plain, contains('HarborAxi4MemorySlave_a10_d32_i5_n1 '));
-      final monitored = await sv(_excl);
-      expect(monitored, contains('excl_match'));
-      expect(monitored, contains('HarborAxi4MemorySlave_a10_d32_i5_n1_x'));
+        final plain = await sv(null);
+        expect(plain, isNot(contains('excl_')));
+        expect(plain, contains('HarborAxi4MemorySlave_a10_d32_i5_n1 '));
+        final monitored = await sv(_excl);
+        expect(monitored, contains('excl_match'));
+        expect(monitored, contains('HarborAxi4MemorySlave_a10_d32_i5_n1_x'));
+      });
     });
   });
 }

@@ -160,6 +160,6 @@ class HarborIntraDir extends BridgeModule {
       }
       outs.add(px);
     }
-    output('pred') <= outs.reversed.toList().swizzle();
+    output('pred') <= outs.reversed.toList().concat();
   }
 }

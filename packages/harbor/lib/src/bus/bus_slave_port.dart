@@ -11,6 +11,15 @@ import 'wishbone/wishbone_interface.dart';
 
 export 'port/fabric_kind.dart';
 
+/// Marks a device whose register ports a fabric may adapt when they are
+/// narrower than the fabric.
+///
+/// Only a device that software reaches with register sized accesses may have
+/// it. A memory window, such as a flash XIP window, is read with wide loads
+/// and fetches, so it must be built at the fabric width and must not have it.
+/// A device without it throws on a fabric of another width.
+mixin HarborNarrowSlaveOk {}
+
 /// The register slave waist of a device, with the native port for one fabric
 /// kind built in front of it.
 ///
@@ -89,6 +98,22 @@ class BusSlavePort {
     this.cdcDepth = 0,
   });
 
+  BusSlavePort._inner(
+    BusSlavePort port, {
+    required String name,
+    required this.addr,
+    required this.dataIn,
+    required this.stb,
+    required this.we,
+    required this.sel,
+  }) : dataOut = Logic(name: '${name}_dat_out', width: port.dataIn.width),
+       ack = Logic(name: '${name}_ack_out'),
+       err = port.err == null ? null : Logic(name: '${name}_err_out'),
+       kind = port.kind,
+       interfaceRef = port.interfaceRef,
+       reset = port.reset,
+       cdcDepth = port.cdcDepth;
+
   /// Entries in each FIFO of a register port crossing.
   static const crossingDepth = 2;
 
@@ -155,6 +180,7 @@ class BusSlavePort {
     HarborFabricClock? fabricClock,
   }) {
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
+      harborMarkCrossed(module, name, fabricClock.clk);
       return _crossed(
         module,
         name,
@@ -332,12 +358,12 @@ class BusSlavePort {
     final idx = addr.getRange(2, 2 + (words - 1).bitLength);
     return [
       for (var i = words - 1; i >= 0; i--)
-        mux(
+        mux<Logic>(
           idx.eq(Const(i, width: idx.width)),
           Const(0xf, width: 4),
           Const(0, width: 4),
         ),
-    ].swizzle();
+    ].concat();
   }
 
   // AW, W and AR each go into a holding register. A write runs once both AW
@@ -428,7 +454,7 @@ class BusSlavePort {
     ]);
 
     // SLVERR is 0b10, OKAY is 0b00.
-    Logic resp(Logic e) => [e, Const(0)].swizzle();
+    Logic resp(Logic e) => [e, Const(0)].concat();
 
     axi.awReady <= ~awHeld;
     axi.wReady <= ~wHeld;
@@ -561,7 +587,7 @@ class BusSlavePort {
     final respOpcode = mux(
       withData,
       Const(TileLinkDOpcode.accessAckData.value, width: 3),
-      mux(
+      mux<Logic>(
         aOpcode.eq(Const(5, width: 3)),
         Const(2, width: 3),
         Const(TileLinkDOpcode.accessAck.value, width: 3),
@@ -596,8 +622,6 @@ class BusSlavePort {
           aSize < tl.aSize,
           aSource < tl.aSource,
           aAddress < tl.aAddress,
-          aMask < tl.aMask,
-          aData < tl.aData,
           aDrainLeft < drainBeats,
         ]),
         ElseIf(tl.aValid & draining, [
@@ -623,11 +647,20 @@ class BusSlavePort {
           dOpcode < respOpcode,
           dSize < aSize,
           dSource < aSource,
-          dData < mux(stb, dataOut, Const(0, width: dataWidth)),
           dDenied < denied,
           // A denied response with data must also be corrupt.
           dCorrupt < (denied & withData),
         ],
+      ),
+    ]);
+
+    // The write data, the mask and the response data are read only with
+    // their valid, so they take no reset.
+    Sequential(clk, [
+      If(tl.aValid & ~aHeld, then: [aMask < tl.aMask, aData < tl.aData]),
+      If(
+        respond,
+        then: [dData < mux(stb, dataOut, Const(0, width: dataWidth))],
       ),
     ]);
 
@@ -657,6 +690,30 @@ class BusSlavePort {
     );
   }
 }
+
+/// A waist for device logic behind an arbiter between [port] and a second
+/// master. The arbiter drives [addr], [dataIn], [stb], [we] and [sel]. The
+/// device logic drives `ack`, `dataOut` and, when [port] has one, `err`.
+/// The new signals have names that start with [name]. The waist has the
+/// kind, interface, reset and crossing of [port]. Only the arbiters in this
+/// package use it.
+BusSlavePort harborInnerSlavePort(
+  BusSlavePort port, {
+  required String name,
+  required Logic addr,
+  required Logic dataIn,
+  required Logic stb,
+  required Logic we,
+  required Logic sel,
+}) => BusSlavePort._inner(
+  port,
+  name: name,
+  addr: addr,
+  dataIn: dataIn,
+  stb: stb,
+  we: we,
+  sel: sel,
+);
 
 /// Byte-lane write helpers for a [BusSlavePort].
 ///
@@ -701,7 +758,7 @@ extension BusSlavePortByteLane on BusSlavePort {
           oldValue.getRange(b * 8, b * 8 + _byteBits(width, b)),
         ),
     ];
-    return bytes.rswizzle();
+    return bytes.rconcat();
   }
 
   /// [BusSlavePort.dataIn] at byte address [offset], with every byte [sel]
@@ -721,7 +778,7 @@ extension BusSlavePortByteLane on BusSlavePort {
           Const(0, width: _byteBits(width, b)),
         ),
     ];
-    return bytes.rswizzle();
+    return bytes.rconcat();
   }
 
   /// Width of byte [b] of a [width]-bit register: 8, except the last byte of

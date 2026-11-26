@@ -103,7 +103,7 @@ class _Bench extends Module {
           ? col.getRange(0, colBits)
           : col.zeroExtend(colBits);
       final l = k == 0 ? line : line.getRange(1).zeroExtend(line.width);
-      final idx = [frame, l, c].swizzle();
+      final idx = [frame, l, c].concat();
       final items = <CaseItem>[];
       for (var f = 0; f < frames.length; f++) {
         if (k >= frames[f].planes.length) continue;

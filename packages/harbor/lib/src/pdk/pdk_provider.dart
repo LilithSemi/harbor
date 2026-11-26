@@ -1,4 +1,5 @@
 import 'analog_block.dart';
+import 'pad_library.dart';
 import 'standard_cell_library.dart';
 
 /// Abstract interface for PDK-specific configuration.
@@ -41,6 +42,14 @@ abstract class PdkProvider {
   /// Returns a power pad cell descriptor.
   AnalogBlock? powerPad({required String net}) => null;
 
+  /// Pad cells for a generated pad ring. Null when the PDK has no
+  /// verified pad cells.
+  HarborPadLibrary? get padLibrary => null;
+
+  /// Core power ring for a generated pad ring. Null when [padLibrary] is
+  /// null.
+  HarborCoreRing? get coreRing => null;
+
   /// Returns an eFuse macro descriptor for OTP storage.
   ///
   /// [bits] is the number of fuse bits requested. Returns `null`
@@ -71,6 +80,11 @@ abstract class PdkProvider {
 
   /// Whether this PDK provides SRAM macros.
   bool get hasSramMacro => false;
+
+  /// Library of the [sramMacro] cells. A cell name is the library name,
+  /// `__` and the macro name. Null when the cell names have no library
+  /// prefix.
+  String? get sramLibName => null;
 
   /// Number of metal layers available for routing.
   int get metalLayers;

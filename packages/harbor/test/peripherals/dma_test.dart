@@ -257,8 +257,22 @@ class _Dut {
   final RegBus bus;
   final BeatMemory mem;
   final Logic irq;
+  final Logic? sData;
+  final Logic? sValid;
+  final Logic? sLast;
 
-  _Dut(this.dma, this.top, this.clk, this.reset, this.bus, this.mem, this.irq);
+  _Dut(
+    this.dma,
+    this.top,
+    this.clk,
+    this.reset,
+    this.bus,
+    this.mem,
+    this.irq, {
+    this.sData,
+    this.sValid,
+    this.sLast,
+  });
 
   Future<void> bw(int addr, int data) => bus.write(addr, data);
   Future<int> br(int addr) => bus.read(addr);
@@ -314,10 +328,16 @@ Future<_Dut> _setUpDut(
     mem.writeWord(i * busBytes, dmaMem[i]);
   }
 
+  Logic? sData;
+  Logic? sValid;
+  Logic? sLast;
   if (source == HarborDmaSource.peripheralStream) {
-    top.input('s_data').srcConnection! <= Const(0, width: dataWidth);
-    top.input('s_valid').srcConnection! <= Const(0);
-    top.input('s_last').srcConnection! <= Const(0);
+    sData = Logic(name: 's_data_in', width: dataWidth)..put(0);
+    sValid = Logic(name: 's_valid_in')..put(0);
+    sLast = Logic(name: 's_last_in')..put(0);
+    top.input('s_data').srcConnection! <= sData;
+    top.input('s_valid').srcConnection! <= sValid;
+    top.input('s_last').srcConnection! <= sLast;
   }
 
   await top.build();
@@ -333,7 +353,18 @@ Future<_Dut> _setUpDut(
   reset.inject(0);
   await clk.nextPosedge;
 
-  return _Dut(dma, top, clk, reset, bus, mem, irq);
+  return _Dut(
+    dma,
+    top,
+    clk,
+    reset,
+    bus,
+    mem,
+    irq,
+    sData: sData,
+    sValid: sValid,
+    sLast: sLast,
+  );
 }
 
 void _transferEngineTests(HarborFabricKind kind) {
@@ -443,9 +474,9 @@ void _peripheralStreamTests(HarborFabricKind kind) {
           kind,
           source: HarborDmaSource.peripheralStream,
         );
-        final sData = d.top.input('s_data');
-        final sValid = d.top.input('s_valid');
-        final sLast = d.top.input('s_last');
+        final sData = d.sData!;
+        final sValid = d.sValid!;
+        final sLast = d.sLast!;
         final sReady = d.dma.output('s_ready');
 
         await d.bw(_ctrl, 1); // global enable

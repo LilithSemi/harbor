@@ -18,6 +18,13 @@ import 'wishbone_interface.dart';
 /// transfer becomes an orphan. The downstream cycle still runs to its end, its
 /// termination is discarded, and the slice takes no new request until then.
 ///
+/// When both sides have CTI, a transfer that ends with CTI 010 (an incrementing
+/// burst) and no error leaves CYC high downstream while the master holds CYC,
+/// so the next beat of the burst reaches the slave inside the same burst. CTI
+/// and BTE of every beat pass through. Without it a burst would reach the
+/// slave as separate cycles. CYC drops when the master drops it, or after a
+/// beat that does not continue the burst.
+///
 /// `up` is a consumer and `down` is a provider. [config] sets the `down` side.
 /// [upConfig] sets the `up` side and defaults to [config]. When `up` has no ERR
 /// or RTY, the slice returns that termination as ACK with [wishbonePoison]
@@ -81,6 +88,8 @@ class WishboneRegisterStage extends BridgeModule {
     // Optional request tags that both sides carry are latched, the rest of
     // the downstream ones are tied to 0.
     final tagLatches = <(Logic, Logic)>[];
+    Logic? ctiR;
+    Logic? bteR;
     for (final n in wishboneOptionalRequestPorts) {
       final d = down.tryPort(n);
       if (d == null) continue;
@@ -92,6 +101,8 @@ class WishboneRegisterStage extends BridgeModule {
       final r = Logic(name: '${n.toLowerCase()}_r', width: d.width);
       d <= r;
       tagLatches.add((r, u));
+      if (n == 'CTI') ctiR = r;
+      if (n == 'BTE') bteR = r;
     }
 
     final ackR = Logic(name: 'ack_r');
@@ -102,7 +113,9 @@ class WishboneRegisterStage extends BridgeModule {
         ? Logic(name: 'tgd_miso_r', width: down.tgdMiso!.width)
         : null;
 
-    down.cyc <= busy;
+    // CYC stays up between the beats of a burst.
+    final hold = ctiR == null ? null : Logic(name: 'burst_hold');
+    down.cyc <= (hold == null ? busy : busy | hold);
     down.stb <= busy;
     down.we <= weR;
     down.adr <= adrR;
@@ -146,8 +159,10 @@ class WishboneRegisterStage extends BridgeModule {
           misoR < 0,
           if (tgdMisoR != null) tgdMisoR < 0,
           busErr < 0,
+          if (hold != null) hold < 0,
         ],
         orElse: [
+          if (hold != null) hold < (hold & up.cyc),
           if (badFold != null) busErr < (busErr | badFold),
           ackR < 0,
           errR < 0,
@@ -176,6 +191,14 @@ class WishboneRegisterStage extends BridgeModule {
                 then: [
                   busy < 0,
                   orphan < 0,
+                  if (hold != null)
+                    hold <
+                        (ctiR!.eq(Const(2, width: 3)) &
+                            (bteR == null ? Const(1) : bteR.eq(0)) &
+                            dAck &
+                            ~dErr &
+                            ~dRty &
+                            ~drop),
                   If(
                     ~drop,
                     then: [

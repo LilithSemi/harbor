@@ -333,11 +333,11 @@ class HarborIntraReconWalkSeq extends BridgeModule {
     Logic frameRowSel(Logic r) {
       Logic v = [
         for (var c = f - 1; c >= 0; c--) frame[(f - 1) * f + c],
-      ].swizzle();
+      ].concat();
       for (var rr = f - 2; rr >= 0; rr--) {
         v = mux(
           r.eq(Const(rr, width: iw)),
-          [for (var c = f - 1; c >= 0; c--) frame[rr * f + c]].swizzle(),
+          [for (var c = f - 1; c >= 0; c--) frame[rr * f + c]].concat(),
           v,
         );
       }
@@ -347,11 +347,11 @@ class HarborIntraReconWalkSeq extends BridgeModule {
     Logic frameColSel(Logic c) {
       Logic v = [
         for (var rr = f - 1; rr >= 0; rr--) frame[rr * f + (f - 1)],
-      ].swizzle();
+      ].concat();
       for (var cc = f - 2; cc >= 0; cc--) {
         v = mux(
           c.eq(Const(cc, width: iw)),
-          [for (var rr = f - 1; rr >= 0; rr--) frame[rr * f + cc]].swizzle(),
+          [for (var rr = f - 1; rr >= 0; rr--) frame[rr * f + cc]].concat(),
           v,
         );
       }
@@ -589,9 +589,9 @@ class HarborIntraReconWalkSeq extends BridgeModule {
       pred.input('have_above').srcConnection! <= haveA;
       pred.input('have_left').srcConnection! <= haveL;
       pred.input('above').srcConnection! <=
-          [for (var i = side - 1; i >= 0; i--) aboveAll[i]].swizzle();
+          [for (var i = side - 1; i >= 0; i--) aboveAll[i]].concat();
       pred.input('left').srcConnection! <=
-          [for (var i = side - 1; i >= 0; i--) leftAll[i]].swizzle();
+          [for (var i = side - 1; i >= 0; i--) leftAll[i]].concat();
       pred.input('above_left').srcConnection! <= corner;
       pred.input('row').srcConnection! <=
           rowc.getRange(0, pred.input('row').width);
@@ -695,9 +695,9 @@ class HarborIntraReconWalkSeq extends BridgeModule {
         de.input('mode').srcConnection! <= yMode;
         de.input('angle_delta').srcConnection! <= deltaPort;
         de.input('above').srcConnection! <=
-            [for (var i = 2 * side - 1; i >= 0; i--) aRef[i]].swizzle();
+            [for (var i = 2 * side - 1; i >= 0; i--) aRef[i]].concat();
         de.input('left').srcConnection! <=
-            [for (var i = 2 * side - 1; i >= 0; i--) lRef[i]].swizzle();
+            [for (var i = 2 * side - 1; i >= 0; i--) lRef[i]].concat();
         de.input('corner').srcConnection! <= cornerV;
         de.input('enable_edge_filter').srcConnection! <=
             input('enable_edge_filter');
@@ -755,9 +755,9 @@ class HarborIntraReconWalkSeq extends BridgeModule {
         fi.input('above').srcConnection! <=
             [
               for (var i = side; i >= 0; i--) (i == 0 ? cornerFI : aFI(i - 1)),
-            ].swizzle();
+            ].concat();
         fi.input('left').srcConnection! <=
-            [for (var r = side - 1; r >= 0; r--) lFI(r)].swizzle();
+            [for (var r = side - 1; r >= 0; r--) lFI(r)].concat();
         final fiPred = fi.output('pred'); // (r,c) at (r*side+c)*8
         fiRowPix = [
           for (var c = 0; c < side; c++)
@@ -877,7 +877,7 @@ class HarborIntraReconWalkSeq extends BridgeModule {
       for (var c = 0; c < side; c++) {
         final p = predRowSel[c].zeroExtend(sumW);
         final res = residualAt(c);
-        final sum = (p + [res[cw - 1].replicate(2), res].swizzle()).getRange(
+        final sum = (p + [res[cw - 1].replicate(2), res].concat()).getRange(
           0,
           sumW,
         );
@@ -911,9 +911,9 @@ class HarborIntraReconWalkSeq extends BridgeModule {
         predR.input('have_above').srcConnection! <= haveA;
         predR.input('have_left').srcConnection! <= haveL;
         predR.input('above').srcConnection! <=
-            [for (var i = bw - 1; i >= 0; i--) aboveAll[i]].swizzle();
+            [for (var i = bw - 1; i >= 0; i--) aboveAll[i]].concat();
         predR.input('left').srcConnection! <=
-            [for (var i = bh - 1; i >= 0; i--) leftAll[i]].swizzle();
+            [for (var i = bh - 1; i >= 0; i--) leftAll[i]].concat();
         predR.input('above_left').srcConnection! <= corner;
         final predBlk = predR.output('pred'); // (r,c) at (r*bw+c)*8
 
@@ -968,7 +968,7 @@ class HarborIntraReconWalkSeq extends BridgeModule {
         for (var c = 0; c < bw; c++) {
           final p = predAt(c).zeroExtend(18);
           final res = resAt(c);
-          final sum = (p + [res[15].replicate(2), res].swizzle()).getRange(
+          final sum = (p + [res[15].replicate(2), res].concat()).getRange(
             0,
             18,
           );
@@ -1062,7 +1062,7 @@ class HarborIntraReconWalkSeq extends BridgeModule {
     final heightVal = rect ? mux(isRect, rectSel(1), sideVal) : sideVal;
     final widthVal = rect ? mux(isRect, rectSel(0), sideVal) : sideVal;
 
-    output('frame') <= [for (var i = nPix - 1; i >= 0; i--) frame[i]].swizzle();
+    output('frame') <= [for (var i = nPix - 1; i >= 0; i--) frame[i]].concat();
 
     const sIdle = 0, sTxStart = 1, sTxWait = 2, sRows = 3, sDone = 4;
     final st = Logic(name: 'st', width: 3);

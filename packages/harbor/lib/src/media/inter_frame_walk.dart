@@ -2364,7 +2364,7 @@ class HarborInterFrameWalk extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 
@@ -3085,7 +3085,7 @@ class HarborInterFrameWalk extends BridgeModule {
       mux(
         lIntra & aIntra,
         Const(3, width: 2),
-        mux(lIntra | aIntra, Const(1, width: 2), Const(0, width: 2)),
+        mux<Logic>(lIntra | aIntra, Const(1, width: 2), Const(0, width: 2)),
       ),
       mux(
         hasAbove | hasLeft,
@@ -3133,7 +3133,7 @@ class HarborInterFrameWalk extends BridgeModule {
     Logic ctx3(Logic a, Logic b) => mux(
       a.eq(b),
       Const(1, width: 2),
-      mux(a.lt(b), Const(0, width: 2), Const(2, width: 2)),
+      mux<Logic>(a.lt(b), Const(0, width: 2), Const(2, width: 2)),
     );
     final ll2 = (c1 + c2).getRange(0, 3);
     final l3g = (c3 + c4).getRange(0, 3);
@@ -3457,12 +3457,12 @@ class HarborInterFrameWalk extends BridgeModule {
       crPhase,
       (crPhase - Const(3, width: 3)).getRange(0, 3),
     );
-    final crStride = mux(
+    final crStride = mux<Logic>(
       crPhase.lt(Const(3, width: 3)),
       Const(3, width: ecw),
       Const(2, width: ecw),
     );
-    final crBase = mux(
+    final crBase = mux<Logic>(
       crPhase.lt(Const(3, width: 3)),
       Const(cCompRef, width: ecw),
       Const(cCompBwdRef, width: ecw),
@@ -3495,7 +3495,7 @@ class HarborInterFrameWalk extends BridgeModule {
         mux(
           comp,
           grp.zeroExtend(3),
-          mux(
+          mux<Logic>(
             ref0.eq(Const(7, width: 3)),
             Const(3, width: 3),
             Const(0, width: 3),
@@ -3773,7 +3773,7 @@ class HarborInterFrameWalk extends BridgeModule {
       mux(
         drlAHi & ~drlBHi,
         Const(1, width: 2),
-        mux(~drlAHi & ~drlBHi, Const(2, width: 2), Const(0, width: 2)),
+        mux<Logic>(~drlAHi & ~drlBHi, Const(2, width: 2), Const(0, width: 2)),
       ),
     );
     final drlCtxIdx = (Const(cDrl, width: ecw) + drlCtx.zeroExtend(ecw))
@@ -3984,7 +3984,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 clBorder)
             .getRange(0, 20);
     Logic clampS(Logic v16, Logic lo20, Logic hi20) {
-      final v = [v16[15].replicate(4), v16].swizzle(); // sign extend to 20
+      final v = [v16[15].replicate(4), v16].concat(); // sign extend to 20
       final lt = (v - lo20).getRange(0, 20)[19];
       final gt = (hi20 - v).getRange(0, 20)[19];
       return mux(lt, lo20.getRange(0, 16), mux(gt, hi20.getRange(0, 16), v16));
@@ -4390,7 +4390,7 @@ class HarborInterFrameWalk extends BridgeModule {
     // appended plane-type-1 banks, luma uses plane-type-0.
     final pC = curPlane.or();
     Logic pmux(int b0, int b1) =>
-        mux(pC, Const(b1, width: ecw), Const(b0, width: ecw));
+        mux<Logic>(pC, Const(b1, width: ecw), Const(b0, width: ecw));
     // coeff_base CDF context flat index (base_eob for eob-1, else general/2d).
     final baseSubCtx = mux(
       isEobMinus1,
@@ -4552,7 +4552,11 @@ class HarborInterFrameWalk extends BridgeModule {
         final delta = mux(
           s.eq(Const(1, width: 8)),
           Const(0xff, width: 8),
-          mux(s.eq(Const(2, width: 8)), Const(1, width: 8), Const(0, width: 8)),
+          mux<Logic>(
+            s.eq(Const(2, width: 8)),
+            Const(1, width: 8),
+            Const(0, width: 8),
+          ),
         );
         sum = (sum + mux(inR, delta, Const(0, width: 8))).getRange(0, 8);
       }
@@ -4600,7 +4604,7 @@ class HarborInterFrameWalk extends BridgeModule {
       return mux(
         zero,
         Const(0, width: 2),
-        mux(neg, Const(1, width: 2), Const(2, width: 2)),
+        mux<Logic>(neg, Const(1, width: 2), Const(2, width: 2)),
       );
     }
 
@@ -4624,7 +4628,11 @@ class HarborInterFrameWalk extends BridgeModule {
                 mux(
                   dcValNeg,
                   Const(1 << 6, width: 8),
-                  mux(dcValPos, Const(2 << 6, width: 8), Const(0, width: 8)),
+                  mux<Logic>(
+                    dcValPos,
+                    Const(2 << 6, width: 8),
+                    Const(0, width: 8),
+                  ),
                 ))
             .getRange(0, 8);
     List<Conditional> setEntropyCtx(int plane, Logic aOff, Logic lOff) {
@@ -4676,7 +4684,7 @@ class HarborInterFrameWalk extends BridgeModule {
     final tx32Ctx = mux(
       sqrTx.eq(Const(1, width: 3)),
       Const(cInterTx32Sq1, width: ecw),
-      mux(
+      mux<Logic>(
         sqrTx.eq(Const(2, width: 3)),
         Const(cInterTx32Sq2, width: ecw),
         Const(cInterTx32, width: ecw),
@@ -4688,7 +4696,7 @@ class HarborInterFrameWalk extends BridgeModule {
       mux(
         sqrTx.eq(Const(0, width: 3)),
         Const(cInterTx4, width: ecw),
-        mux(
+        mux<Logic>(
           sqrTx.eq(Const(1, width: 3)),
           Const(cInterTx8, width: ecw),
           Const(cInterTx16, width: ecw),
@@ -4713,7 +4721,7 @@ class HarborInterFrameWalk extends BridgeModule {
                   0,
                   ecw,
                 ) +
-                mux(is2d, Const(0, width: ecw), Const(1, width: ecw)))
+                mux<Logic>(is2d, Const(0, width: ecw), Const(1, width: ecw)))
             .getRange(0, ecw);
     final chromaUvTx = rom(_uvTx420, bbs, 5);
     final chromaTxsCtx = rom(_txsCtxOf, chromaUvTx, 3);
@@ -4795,7 +4803,7 @@ class HarborInterFrameWalk extends BridgeModule {
         mux(
           blkDim.eq(Const(16, width: 7)),
           Const(2, width: 3),
-          mux(
+          mux<Logic>(
             blkDim.eq(Const(8, width: 7)),
             Const(1, width: 3),
             Const(0, width: 3),
@@ -5665,7 +5673,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 CaseItem(Const(1, width: 3), [
                   // LAST(1) vs LAST2(2). then bwd.
                   ref0R <
-                      mux(
+                      mux<Logic>(
                         sym.eq(Const(0, width: ec.symWidth)),
                         Const(1, width: 3),
                         Const(2, width: 3),
@@ -5676,7 +5684,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 CaseItem(Const(2, width: 3), [
                   // LAST3(3) vs GOLDEN(4). then bwd.
                   ref0R <
-                      mux(
+                      mux<Logic>(
                         sym.eq(Const(0, width: ec.symWidth)),
                         Const(3, width: 3),
                         Const(4, width: 3),
@@ -5701,7 +5709,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 CaseItem(Const(4, width: 3), [
                   // BWDREF(5) vs ALTREF2(6).
                   ref1R <
-                      mux(
+                      mux<Logic>(
                         sym.eq(Const(0, width: ec.symWidth)),
                         Const(5, width: 3),
                         Const(6, width: 3),
@@ -5742,7 +5750,7 @@ class HarborInterFrameWalk extends BridgeModule {
                   // {LAST, GOLDEN} vs {LAST, LAST3}.
                   ref0R < Const(1, width: 3),
                   ref1R <
-                      mux(
+                      mux<Logic>(
                         sym.eq(Const(0, width: ec.symWidth)),
                         Const(4, width: 3),
                         Const(3, width: 3),
@@ -6214,7 +6222,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 ]),
                 CaseItem(Const(3, width: 3), [
                   ref0R <
-                      mux(
+                      mux<Logic>(
                         sym.eq(Const(0, width: ec.symWidth)),
                         Const(1, width: 3),
                         Const(2, width: 3),
@@ -6223,7 +6231,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 ]),
                 CaseItem(Const(4, width: 3), [
                   ref0R <
-                      mux(
+                      mux<Logic>(
                         sym.eq(Const(0, width: ec.symWidth)),
                         Const(3, width: 3),
                         Const(4, width: 3),
@@ -6245,7 +6253,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 ]),
                 CaseItem(Const(5, width: 3), [
                   ref0R <
-                      mux(
+                      mux<Logic>(
                         sym.eq(Const(0, width: ec.symWidth)),
                         Const(5, width: 3),
                         Const(6, width: 3),
@@ -6756,7 +6764,7 @@ class HarborInterFrameWalk extends BridgeModule {
             CaseItem(Const(sRefCap, width: stW), [
               symCnt < (symCnt + Const(1, width: 12)), symValid < Const(1),
               modeR <
-                  mux(
+                  mux<Logic>(
                     sym.eq(Const(0, width: ec.symWidth)),
                     Const(13, width: 5),
                     Const(14, width: 5),
@@ -7177,7 +7185,7 @@ class HarborInterFrameWalk extends BridgeModule {
               symCnt < (symCnt + Const(1, width: 12)),
               symValid < Const(1),
               motionModeReg <
-                  mux(
+                  mux<Logic>(
                     sym.getRange(0, 1).eq(Const(0, width: 1)),
                     Const(0, width: 2),
                     Const(1, width: 2),
@@ -7839,7 +7847,7 @@ class HarborInterFrameWalk extends BridgeModule {
             .getRange(0, 2);
     final nm = newmv.gt(Const(0, width: 5));
     final c0 =
-        (mux(
+        (mux<Logic>(
                   refMatch.gte(Const(1, width: 2)),
                   Const(1, width: 8),
                   Const(0, width: 8),
@@ -7855,7 +7863,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 ))
             .getRange(0, 8);
     final c1 =
-        (mux(nm, Const(2, width: 8), Const(3, width: 8)) |
+        (mux<Logic>(nm, Const(2, width: 8), Const(3, width: 8)) |
                 mux(
                   refMatch.eq(Const(1, width: 2)),
                   Const(3 << 4, width: 8),
@@ -7867,7 +7875,7 @@ class HarborInterFrameWalk extends BridgeModule {
                 ))
             .getRange(0, 8);
     final c2 =
-        (mux(
+        (mux<Logic>(
                   newmv.gte(Const(1, width: 5)),
                   Const(4, width: 8),
                   Const(5, width: 8),

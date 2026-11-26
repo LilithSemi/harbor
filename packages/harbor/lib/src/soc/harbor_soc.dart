@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:math' show max;
 
+import 'package:meta/meta.dart' show visibleForTesting;
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
 
@@ -12,26 +13,67 @@ import '../bus/bus.dart';
 import '../bus/bus_error_source.dart';
 import '../bus/bus_slave_port.dart';
 import '../bus/fabric.dart';
+import '../bus/fabric_narrow.dart';
 import '../bus/port/memory_port.dart';
+import '../bus/port/port_cdc.dart';
 import '../bus/tilelink/tilelink_interface.dart';
 import '../bus/wishbone/wishbone_arbiter.dart';
 import '../bus/wishbone/wishbone_interface.dart';
 import '../bus/wishbone/wishbone_register_stage.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../clock/clock_domain.dart';
+import '../pdk/chip_top.dart';
 import '../pdk/klayout.dart';
+import '../pdk/pad_library.dart';
+import '../pdk/pad_plan.dart';
 import '../peripherals/flash.dart';
 import '../peripherals/harbor_ddr3.dart';
 import '../peripherals/harbor_sdram.dart';
+import 'board_led.dart';
 import '../peripherals/maskrom.dart';
+import '../peripherals/reset_controller.dart';
 import '../peripherals/spi_flash.dart';
 import '../peripherals/sram.dart';
 import 'acpi.dart';
+import 'board.dart';
+import 'board_zon.dart';
 import 'cpu.dart';
 import 'device_tree.dart';
 import 'graph.dart';
 import 'svd.dart';
 import 'target.dart';
+
+/// The nets and ports that the `create_clock` lines of [xdc] constrain.
+@visibleForTesting
+Set<String> harborXdcClockNets(String xdc) => {
+  for (final m in RegExp(
+    r'^\s*create_clock\b[^\[\n]*\[get_(?:nets|ports)\s+\{?([^\]\}\s]+)',
+    multiLine: true,
+  ).allMatches(xdc))
+    m.group(1)!,
+};
+
+/// Throws when a clock net in [netByDomain], keyed by domain name, is not in
+/// [constrained]. A hierarchical name in [constrained] also matches its last
+/// part. nextpnr gives a net with no constraint a 12 MHz default target and
+/// does not fail.
+@visibleForTesting
+void harborCheckClockNets(
+  Map<String, String> netByDomain,
+  Set<String> constrained,
+) {
+  final names = {
+    ...constrained,
+    for (final c in constrained) c.split(RegExp('[./]')).last,
+  };
+  for (final MapEntry(key: domain, value: net) in netByDomain.entries) {
+    if (names.contains(net)) continue;
+    throw StateError(
+      'Clock domain "$domain" runs on net $net, which has no clock '
+      'constraint. nextpnr would time it at its 12 MHz default.',
+    );
+  }
+}
 
 /// Selects how a slave that more than one fabric channel reaches is shared.
 ///
@@ -150,11 +192,43 @@ class HarborSoC extends BridgeModule {
     return port;
   }
 
+  Logic? _busTimeouts;
+
+  /// Adds a `bus_timeouts` output (or [portName]) with the number of slaves
+  /// that a bus timeout cut off since reset, summed over every fabric. It is
+  /// 8 bits wide and saturates at 255. [buildFabric] adds it as `bus_timeouts`
+  /// when any slave has a timeout, and a later call returns that port.
+  Logic exposeBusTimeouts({String portName = 'bus_timeouts'}) {
+    if (fabrics.isEmpty) {
+      throw StateError('exposeBusTimeouts needs buildFabric first');
+    }
+    if (_busTimeouts case final done?) {
+      if (portName != done.name) {
+        throw StateError('bus timeouts are already on ${done.name}');
+      }
+      return done;
+    }
+    final total = fabrics
+        .map((f) => f.timeoutCount.zeroExtend(9))
+        .reduce((a, b) => a + b);
+    final port = addOutput(portName, width: 8);
+    _busTimeouts = port;
+    port <=
+        mux(
+          total.gte(Const(255, width: 9)),
+          Const(255, width: 8),
+          total.slice(7, 0),
+        );
+    return port;
+  }
+
   /// Modules already added as submodules + clock-wired. A module may be BOTH a
   /// master and a peripheral (a dual-role device like a DMA or an accelerator
   /// with CSR slave + bus master). This set keeps the second [addMaster] /
   /// [addPeripheral] from double-adding or double-driving its clk/reset.
   final Set<BridgeModule> _wired = {};
+  final Set<BridgeModule> _fabricWired = {};
+  final Map<BridgeModule, String?> _boundDomain = {};
 
   /// Adds [module] as a submodule and wires its clk/reset exactly once, even if
   /// it is registered as both a master and a peripheral.
@@ -164,9 +238,69 @@ class HarborSoC extends BridgeModule {
     final domain = domainFor(clockDomainName);
     final (clk, reset) = domain != null
         ? (domain.clk, domain.reset)
-        : (_boardClk, input('reset'));
+        : (_boardClk, _systemReset);
     module.input('clk').srcConnection! <= clk;
-    module.input('reset').srcConnection! <= reset;
+    if (module is HarborResetController) {
+      // The controller makes the soft reset, so its own reset is the hard
+      // reset only.
+      // The reset of its own domain, held with the PLL lock and without the
+      // soft reset request, which the controller makes itself.
+      module.input('por').srcConnection! <=
+          (domain != null ? _clockGen.hardResetOf(domain) : _hardReset);
+      final pin = _pinReset;
+      if (pin == null) {
+        module.input('ext_reset').srcConnection! <= Const(0);
+      } else {
+        final sync = Logic(name: 'ext_reset_sync', width: 2);
+        Sequential(clk, [
+          sync < [sync[0], pin].concat(),
+        ]);
+        module.input('ext_reset').srcConnection! <= sync[1];
+      }
+      module.input('wdog_reset').srcConnection! <= (_resetWatchdog ?? Const(0));
+      module.input('watchdog_wired').srcConnection! <=
+          Const(_resetWatchdog == null ? 0 : 1);
+      module.input('debug_reset').srcConnection! <= (_resetDebug ?? Const(0));
+    } else {
+      module.input('reset').srcConnection! <=
+          _localReset(domain, reset, '${module.name}_reset_branch');
+    }
+  }
+
+  // The domain name a module is registered under. The first registration
+  // binds the module to its domain. A later one with no name keeps that
+  // domain, and a later one with another domain throws.
+  String? _bindDomain(BridgeModule module, String? clockDomainName) {
+    if (!_boundDomain.containsKey(module)) {
+      _boundDomain[module] = clockDomainName;
+      return clockDomainName;
+    }
+    final bound = _boundDomain[module];
+    if (clockDomainName == null) return bound;
+    final first = domainFor(bound);
+    final now = domainFor(clockDomainName);
+    if (!identical(first?.clk, now?.clk)) {
+      throw StateError(
+        '${module.name} is on clock domain "${first?.config.name}" from its '
+        'first registration, and now on "${now?.config.name}". A module has '
+        'one clock domain.',
+      );
+    }
+    return clockDomainName;
+  }
+
+  // Throws when [clockDomainName] is set and names no domain, so a typo does
+  // not fall back to the fabric domain.
+  void _requireDomain(BridgeModule module, String? clockDomainName) {
+    if (clockDomainName == null || _clockDomains.containsKey(clockDomainName)) {
+      return;
+    }
+    throw ArgumentError.value(
+      clockDomainName,
+      'clockDomainName',
+      '${module.name} names a clock domain that does not exist '
+          '(domains: ${_clockDomains.keys.join(', ')})',
+    );
   }
 
   /// The clock domain a peripheral registered under [clockDomainName] actually
@@ -180,27 +314,84 @@ class HarborSoC extends BridgeModule {
     if (clockDomainName != null && _clockDomains.containsKey(clockDomainName)) {
       return _clockDomains[clockDomainName];
     }
-    if (_clockDomains.isEmpty) return null;
-    // Mirrors [defaultClock]: the conventional 'sys' bus domain, else the first
-    // registered one. NOT "the primary domain": on a SoC where sys is a CLKOS
-    // secondary those are different clocks, and picking the wrong one emits a
-    // plausible but wrong rate.
-    return _clockDomains['sys'] ?? _clockDomains.values.first;
+    if (_clockDomains.isEmpty && fabricClockDomain == null) return null;
+    return _fabricDomain;
+  }
+
+  /// The clock domain of the fabric, or null when the SoC has no domains.
+  /// Throws when [fabricClockDomain] is set and names no domain.
+  HarborClockDomain? get fabricDomain => _fabricDomain;
+
+  /// The domain of the fabric and of every peripheral with no domain name.
+  ///
+  /// This is [fabricClockDomain] when it is set. Otherwise it is the
+  /// conventional 'sys' domain, else the first registered one. It is not the
+  /// primary domain: when sys is a CLKOS secondary, those are different
+  /// clocks. It is null when no domains exist.
+  HarborClockDomain? get _fabricDomain {
+    final fabricName = fabricClockDomain;
+    if (fabricName != null) {
+      return _clockDomains[fabricName] ??
+          (throw StateError(
+            'SoC "$name": the fabric clock domain "$fabricName" does not '
+            'exist (domains: ${_clockDomains.keys.join(', ')}). Add it with '
+            'addClockDomainFromNet or the clocks list before addPeripheral '
+            'or addMaster with no domain name, and before buildFabric.',
+          ));
+    }
+    return _clockDomains['sys'] ?? _clockDomains.values.firstOrNull;
   }
 
   late final HarborClockGenerator _clockGen;
+
+  // The reset that is not the soft reset: the reset pin or the power-on
+  // reset, and the reset request. The SoC reset adds the soft reset request
+  // to it.
+  late final Logic _hardReset;
+
+  late final Logic _hardResetSync;
+
+  /// The reset pin or the power-on reset on [boardClk], without the reset
+  /// request and the soft reset. It asserts at once and releases after two
+  /// board clocks.
+  Logic get hardReset => _hardResetSync;
+
+  /// The minimum number of [boardClk] cycles that a reset request holds the
+  /// SoC in reset.
+  static const int resetRequestHoldCycles = 1024;
+
+  // The reset of everything on the SoC, with the soft reset request.
+  late final Logic _systemReset;
+
+  // The reset pin, active high, or null when the SoC has only the power-on
+  // reset. The reset controller reports it as an external reset.
+  late final Logic? _pinReset;
+
+  Logic? _softResetRequest;
+  HarborResetController? _resetController;
+  String? _resetControllerDomain;
+  Logic? _resetWatchdog;
+  Logic? _resetDebug;
 
   late final Logic _boardClk;
 
   /// The board clock after the input buffer. It is the `clk` port itself for
   /// a single-ended clock. It runs before any MMCM or PLL locks.
   Logic get boardClk => _boardClk;
+
+  Logic? _sharedOscillator;
+
+  /// The oscillator clock after the shared Xilinx input buffer, or null when
+  /// the SoC has none. The DDR3 clock tree or a domain on the input clock
+  /// makes it. A clock generator that adds an MMCM takes its input from here,
+  /// so that every MMCM shares one buffer.
+  Logic? get sharedOscillatorClock => _sharedOscillator;
   final Map<String, HarborClockDomain> _clockDomains = {};
 
   /// The Xilinx DDR3-fast clock tree, built in this SoC's clock generation when
   /// [xilinxDdr3Tree] is provided. Null otherwise. Exposes the DDR CK / CLKDIV /
   /// IDELAYCTRL-ref / CK90 / DQS clocks for the DDR controller peripheral, and
-  /// its spare `coreClk` drives any [HarborClockConfig.providedByDdr3Tree] domain
+  /// its spare `coreClk` drives any [HarborClockSource.ddr3Core] domain
   /// (so the core runs off the SAME MMCM as the DDR clocks: one MMCM on the pin).
   late final XilinxDdr3Clocks? xilinxDdr3Clocks;
 
@@ -208,8 +399,43 @@ class HarborSoC extends BridgeModule {
   /// nextpnr `--pre-pack` addClock over-constraint can be emitted at build time.
   double? _xilinxCoreClkMhz;
 
+  /// Board oscillator rate for the Xilinx DDR3 clock tree.
+  double? _xilinxSourceClkMhz;
+
+  /// Whether the SoC builds the Xilinx DDR3 clock tree. A DDR3 build times its
+  /// PLL clocks in the DDR3 clocks.py, and not in pll_clocks.py.
+  late final bool _hasDdr3ClockTree;
+
+  /// Clock net name to MHz for each Xilinx PLL domain.
+  final Map<String, double> _xilinxPllClockMhz = {};
+
+  /// Rate in MHz of the shared input buffer net for the domains that run on
+  /// it, or null when no domain does.
+  double? _xilinxPassthroughMhz;
+
+  // True once a Xilinx PLL domain is wired to the clock pin.
+  bool _xilinxPadPlls = false;
+
+  /// Clock net name to MHz for each domain on the DDR3 clock tree.
+  final Map<String, double> _ddr3TreeClockMhz = {};
+
+  /// Domain name to clock net for each domain on a Harbor PLL or MMCM.
+  final Map<String, String> _domainClockNet = {};
   final String acpiOemId;
   final String acpiOemTableId;
+
+  /// Product name for the device tree root `model` property. Defaults to
+  /// [name]. ACPI has no product name field, so it does not appear there.
+  final String model;
+  final String? _explicitModel;
+
+  /// Manufacturer name. When set, it is the vendor of the generated SVD file
+  /// and replaces [svdVendor]. Null leaves [svdVendor] in use.
+  final String? manufacturer;
+
+  /// The board preset this SoC builds for, or null. It fills the board fields
+  /// of [generateBoardZon].
+  final HarborBoard? board;
 
   /// Vendor name for the generated CMSIS-SVD file.
   final String svdVendor;
@@ -255,6 +481,11 @@ class HarborSoC extends BridgeModule {
   /// path already takes a real external `reset` pin.
   final bool externalReset;
 
+  /// Adds a software reset request to the SoC reset. The request comes from
+  /// the controller that [addResetController] takes, and [buildFabric] throws
+  /// when there is none.
+  final bool softReset;
+
   /// Reservation slots per monitored memory slave that masters added with
   /// `exclusiveIds: HarborExclusive.auto` share (see
   /// [HarborExclusive.slotCounts]).
@@ -263,13 +494,85 @@ class HarborSoC extends BridgeModule {
   /// The reservation granule of the memory exclusive monitors, in bytes.
   final int exclusiveGranuleBytes;
 
+  /// The name of the clock domain of the fabric, or null for the default.
+  ///
+  /// The default is the sys domain, else the first domain. The named domain
+  /// must exist before the first [addPeripheral] or [addMaster] with no domain
+  /// name, and before [buildFabric]. Otherwise they throw. Do not name one
+  /// output of a coClkos pair as the fabric while masters run on the other
+  /// output: phase-locked outputs break the async crossing.
+  final String? fabricClockDomain;
+
+  /// Names of the domains where each module reset gets its own copy of the
+  /// final release flop, on ECP5 and openXC7. Synthesis keeps each copy, so
+  /// the reset fanout splits per module. A simulation target ignores them.
+  /// Another target throws, and [buildFabric] throws for a name with no
+  /// domain.
+  final Set<String> localResetDomains;
+
+  Logic _localReset(HarborClockDomain? domain, Logic fallback, String name) =>
+      _localResets(domain, fallback, name, 1).single;
+
+  List<Logic> _localResets(
+    HarborClockDomain? domain,
+    Logic fallback,
+    String name,
+    int copies,
+  ) {
+    final t = target;
+    final taps = domain == null ? null : _clockGen.resetBranchSource(domain);
+    if (domain == null ||
+        taps == null ||
+        !localResetDomains.contains(domain.config.name) ||
+        t is! HarborFpgaTarget ||
+        (t.vendor != HarborFpgaVendor.ecp5 &&
+            t.vendor != HarborFpgaVendor.openXc7)) {
+      return List.filled(copies, fallback);
+    }
+    final branch = addSubModule(
+      HarborRegisteredResetBranch(name: name, copies: copies),
+    );
+    branch.input('clk').srcConnection! <= domain.clk;
+    branch.input('reset_assert').srcConnection! <= taps.hold;
+    branch.input('release_in').srcConnection! <= taps.release;
+    return branch.resetOuts;
+  }
+
+  /// [copies] copies of the reset of the clock domain [domainName], for logic
+  /// that the SoC does not wire, from a branch with the instance name [name].
+  /// In a domain of [localResetDomains], each copy is its own kept release
+  /// flop and releases on the same edge as the domain reset.
+  /// Otherwise each copy is the domain reset. Throws when there is no such
+  /// domain.
+  List<Logic> resetCopies(String domainName, String name, {int copies = 1}) {
+    final domain = _clockDomains[domainName];
+    if (domain == null) {
+      throw ArgumentError.value(domainName, 'domainName', 'no such domain');
+    }
+    if (copies < 1) {
+      throw ArgumentError.value(copies, 'copies', 'must be at least 1');
+    }
+    return _localResets(domain, domain.reset, name, copies);
+  }
+
+  bool _fabricBuilt = false;
+
   /// Creates a new SoC.
   ///
   /// Accepts an optional list of [clocks] to generate PLL-derived
   /// clock domains. If empty, the external `clk` input is used directly.
+  ///
+  /// A high [resetRequest] resets the logic of every clock domain, as the
+  /// reset pin does. The SoC samples it on [boardClk], so it must be high at
+  /// a board clock edge. The reset then holds for at least
+  /// [resetRequestHoldCycles] board clocks after it goes low. The PLLs and
+  /// MMCMs keep running.
   HarborSoC({
     required String name,
     required this.compatible,
+    String? model,
+    this.manufacturer,
+    this.board,
     this.fabricKind = HarborFabricKind.wishbone,
     this.fabricTopology,
     this.acpiOemId = 'LILSEM',
@@ -280,13 +583,32 @@ class HarborSoC extends BridgeModule {
     this.interruptGsiBase = 0,
     this.interruptContexts = const [],
     this.externalReset = false,
+    this.softReset = false,
+    Logic? resetRequest,
     this.cpus = const [],
     this.target,
     this.exclusiveSlotBudget = HarborExclusive.defaultSlotBudget,
     this.exclusiveGranuleBytes = HarborExclusive.defaultGranuleBytes,
     List<HarborClockConfig> clocks = const [],
     XilinxDdr3TreeSpec? xilinxDdr3Tree,
-  }) : super(name, name: name) {
+    this.fabricClockDomain,
+    this.localResetDomains = const {},
+  }) : model = model ?? name,
+       _explicitModel = model,
+       super(name, name: name) {
+    final t = target;
+    if (localResetDomains.isNotEmpty &&
+        t != null &&
+        t is! HarborSimTarget &&
+        !(t is HarborFpgaTarget &&
+            (t.vendor == HarborFpgaVendor.ecp5 ||
+                t.vendor == HarborFpgaVendor.openXc7))) {
+      throw ArgumentError.value(
+        localResetDomains,
+        'localResetDomains',
+        'local reset flops are for ECP5 and openXC7 targets, not ${t.name}',
+      );
+    }
     if (exclusiveSlotBudget < 1) {
       throw ArgumentError.value(
         exclusiveSlotBudget,
@@ -328,7 +650,7 @@ class HarborSoC extends BridgeModule {
       createPort('reset_n', PortDirection.input);
     }
 
-    final Logic resetSignal;
+    Logic resetSignal;
     if (usePowerOnReset) {
       final porCount = Logic(name: 'porCount', width: 8);
       Sequential(_boardClk, [
@@ -341,13 +663,66 @@ class HarborSoC extends BridgeModule {
     } else {
       resetSignal = input('reset');
     }
+    final boardReset = resetSignal;
+    final hardSync = [
+      Logic(name: 'hardResetSync1'),
+      Logic(name: 'hardResetSync2'),
+    ];
+    Sequential(
+      _boardClk,
+      [hardSync[0] < 0, hardSync[1] < hardSync[0]],
+      reset: boardReset,
+      resetValues: {hardSync[0]: 1, hardSync[1]: 1},
+      asyncReset: true,
+    );
+    _hardResetSync = hardSync[1].named('hardReset');
+    // A module in the SoC can reset the logic of every domain. The request
+    // is stretched here, and only the pin or the power-on reset clears the
+    // stretch, so a request that its own reset clears still holds.
+    if (resetRequest != null) {
+      final requestQ = Logic(name: 'resetRequestQ');
+      final hold = Logic(name: 'resetRequestHold');
+      final left = Logic(
+        name: 'resetRequestLeft',
+        width: (resetRequestHoldCycles - 1).bitLength,
+      );
+      Sequential(_boardClk, reset: _hardResetSync, [
+        requestQ < resetRequest,
+        If(
+          requestQ,
+          then: [left < resetRequestHoldCycles - 1, hold < 1],
+          orElse: [
+            If(left.neq(0), then: [left < left - 1], orElse: [hold < 0]),
+          ],
+        ),
+      ]);
+      resetSignal = (resetSignal | hold).named('systemResetRequest');
+    }
+    _hardReset = resetSignal;
+    if (softReset) {
+      _softResetRequest = Logic(name: 'softResetRequest');
+      resetSignal = (resetSignal | _softResetRequest!).named('sysResetSoft');
+    }
+    _systemReset = resetSignal;
+    _pinReset = !usePowerOnReset
+        ? input('reset')
+        : externalReset
+        ? ~input('reset_n')
+        : null;
 
+    // Without a DDR3 tree, a domain on the input clock and every MMCM share
+    // one input BUFG, so the pin has a single load.
+    final passthroughBuffer =
+        xilinxDdr3Tree == null && _needsInputBuffer(clocks)
+        ? _buildSharedInputBufg()
+        : null;
     _clockGen = HarborClockGenerator(
       parent: this,
-      inputClk: _boardClk,
-      inputReset: resetSignal,
+      inputClk: passthroughBuffer ?? _boardClk,
+      inputReset: _hardReset,
+      softReset: _softResetRequest,
       target: target,
-    );
+    )..bufferedInputClk = passthroughBuffer;
 
     // Xilinx DDR3-fast (single-oscillator, e.g. Arty S7): build the shared DDR3
     // clock tree HERE (from the `clk` pin). The core/sys clock is generated by a
@@ -357,12 +732,12 @@ class HarborSoC extends BridgeModule {
     // crossed reads (the creek boot coin-flip). Two independent PLLs drift, so
     // the crossing is genuinely async. Both PLLs source one shared input BUFG so
     // openXC7 accepts two PLLs on the pin's single clock-capable route.
+    _hasDdr3ClockTree = xilinxDdr3Tree != null;
     final ddrSpec = xilinxDdr3Tree;
     ({Logic coreClk, Logic locked, double coreMhz})? corePll;
     if (ddrSpec != null) {
-      final sharedIn = addSubModule(XilinxBufg(name: 'sysosc_bufg'));
-      sharedIn.input('I').srcConnection! <= _boardClk;
-      final shared = sharedIn.output('O');
+      final shared = _buildSharedInputBufg();
+      _clockGen.bufferedInputClk = shared;
       // Decoupled core PLL off the shared input. The DDR tree no longer emits
       // its CLKOUT5 core clock.
       corePll = buildXilinxCorePll(
@@ -372,6 +747,7 @@ class HarborSoC extends BridgeModule {
         coreClkHz: ddrSpec.coreClkHz,
       );
       _xilinxCoreClkMhz = corePll.coreMhz;
+      _xilinxSourceClkMhz = ddrSpec.sourceHz / 1e6;
       xilinxDdr3Clocks = buildXilinxDdr3ClockTree(
         this,
         source: shared,
@@ -389,11 +765,25 @@ class HarborSoC extends BridgeModule {
     }
 
     for (final clkConfig in clocks) {
-      if (clkConfig.providedByDdr3Tree) {
+      if (clkConfig.source == HarborClockSource.ddr3Controller) {
+        _addDdr3ControllerClock(clkConfig);
+        continue;
+      }
+      if (clkConfig.source == HarborClockSource.ddr3Core) {
         if (corePll == null) {
           throw StateError(
-            'clock "${clkConfig.name}" is providedByDdr3Tree but no '
+            'clock "${clkConfig.name}" has source ddr3Core but no '
             'xilinxDdr3Tree/coreClkHz was supplied to build its core clock.',
+          );
+        }
+        final coreHz = (corePll.coreMhz * 1e6).round();
+        if ((clkConfig.frequency - coreHz).abs() >
+            coreHz * clkConfig.tolerancePpm / 1e6) {
+          throw StateError(
+            'clock "${clkConfig.name}" is '
+            '${clkConfig.frequencyMhz.toStringAsFixed(3)} MHz but the core '
+            'clock of the DDR3 tree is ${corePll.coreMhz.toStringAsFixed(3)} '
+            'MHz. Use HarborClockSource.pll for a different rate.',
           );
         }
         // Hold reset until BOTH the core PLL and the DDR3 clock-tree PLL have
@@ -407,31 +797,300 @@ class HarborSoC extends BridgeModule {
         final combinedLocked = ddrLocked == null
             ? corePll.locked
             : (corePll.locked & ddrLocked).named('core_ddr_pll_locked');
+        // Give the PLL-derived BUFG output a stable name for generated timing
+        // constraints. ROHD otherwise disambiguates output ports as O/O_0.
+        final coreClk = corePll.coreClk.named('core_clk');
+        _ddr3TreeClockMhz['core_clk'] = corePll.coreMhz;
+        _domainClockNet[clkConfig.name] = 'core_clk';
         _clockDomains[clkConfig.name] = _clockGen.createDomainFromClock(
           clkConfig,
-          corePll.coreClk,
+          coreClk,
           locked: combinedLocked,
+          hardReset: _hardReset,
         );
         continue;
       }
-      final sec = clkConfig.coClkosSecondary;
-      if (sec != null) {
-        // One EHXPLLL drives both: CLKOP = this domain, CLKOS = the secondary.
-        // Avoids a 2nd PLL block that may not lock on silicon.
-        final shared = _clockGen.createDomainWithSecondary(
-          clkConfig,
-          secondaryFrequency: sec.frequency,
-          secondaryName: sec.name,
-          secondaryTolerancePpm: sec.tolerancePpm,
+      _addPllClock(clkConfig);
+    }
+  }
+
+  /// Adds a clock domain from [config] after the constructor, for a helper
+  /// that needs its own domains. A [HarborClockConfig.coClkosSecondary]
+  /// adds the secondary domain too. Returns the domain of [config]. Call it
+  /// before [build], and not for a name that already has a domain.
+  HarborClockDomain addClockDomain(HarborClockConfig config) {
+    if (_clockDomains.containsKey(config.name)) {
+      throw ArgumentError.value(
+        config.name,
+        'config',
+        'a clock domain with this name exists',
+      );
+    }
+    _addPllClock(config);
+    return _clockDomains[config.name]!;
+  }
+
+  /// Adds a clock domain driven by the net [clk], which another block makes.
+  /// The rate of [config] must be the real rate of [clk], since the device
+  /// tree reads it. This adds no timing constraint: the caller must constrain
+  /// the net, or the module that makes it must be a [HarborClockRateProvider].
+  /// A Himbächel build refuses a net that has no constraint.
+  /// The reset of the domain holds while the SoC hard reset or the soft reset
+  /// is high, and until [locked] is high or the lock timer ends. Call it before
+  /// [buildFabric] and [build], and not for a name that already has a domain.
+  HarborClockDomain addClockDomainFromNet(
+    HarborClockConfig config,
+    Logic clk, {
+    Logic? locked,
+  }) {
+    if (hasBuilt || _fabricBuilt) {
+      throw StateError(
+        'addClockDomainFromNet("${config.name}") was called after '
+        'buildFabric or build',
+      );
+    }
+    if (_clockDomains.containsKey(config.name)) {
+      throw ArgumentError.value(
+        config.name,
+        'config',
+        'a clock domain with this name exists',
+      );
+    }
+    // On hardware the DDR3 sources bind their tree nets in the constructor.
+    // A net domain with such a label would pass the sameClock check on the
+    // wrong clock.
+    if (config.source != HarborClockSource.pll && target is! HarborSimTarget) {
+      throw ArgumentError.value(
+        config.source,
+        'config.source',
+        'a net clock domain on hardware must have source pll',
+      );
+    }
+    return _clockDomains[config.name] = _clockGen.createDomainFromClock(
+      config,
+      clk,
+      locked: locked,
+      hardReset: _hardReset,
+    );
+  }
+
+  void _addDdr3ControllerClock(HarborClockConfig config) {
+    final tree = xilinxDdr3Clocks;
+    if (tree == null) {
+      throw StateError(
+        'clock "${config.name}" has source ddr3Controller but the SoC has '
+        'no xilinxDdr3Tree to give its controller clock.',
+      );
+    }
+    final mhz = tree.controllerClkMhz;
+    final hz = (mhz * 1e6).round();
+    if ((config.frequency - hz).abs() > hz * config.tolerancePpm / 1e6) {
+      throw StateError(
+        'clock "${config.name}" is ${config.frequencyMhz.toStringAsFixed(3)} '
+        'MHz but the controller clock of the DDR3 tree is '
+        '${mhz.toStringAsFixed(3)} MHz.',
+      );
+    }
+    _ddr3TreeClockMhz['ddr_clk'] = mhz;
+    _domainClockNet[config.name] = 'ddr_clk';
+    _clockDomains[config.name] = _clockGen.createDomainFromClock(
+      config,
+      tree.controllerClk,
+      locked: tree.locked,
+      hardReset: _hardReset,
+    );
+  }
+
+  bool get _isXilinxFpga {
+    final t = target;
+    return t is HarborFpgaTarget &&
+        (t.vendor == HarborFpgaVendor.vivado ||
+            t.vendor == HarborFpgaVendor.openXc7);
+  }
+
+  // A passthrough domain takes the input clock with no PLL.
+  bool _isPassthrough(HarborClockConfig c) =>
+      c.source == HarborClockSource.pll &&
+      c.coClkosSecondary == null &&
+      (c.isPrimary || (c.sourceFrequency == c.frequency && !c.forcePll));
+
+  bool _needsInputBuffer(List<HarborClockConfig> clocks) =>
+      _isXilinxFpga && clocks.any(_isPassthrough);
+
+  /// The one BUFG on the input clock pin. Stable net names keep timing
+  /// constraints independent of duplicate BUFG port names in the RTL.
+  Logic _buildSharedInputBufg() {
+    final existing = _sharedOscillator;
+    if (existing != null) return existing;
+    final bufg = addSubModule(XilinxBufg(name: 'sysosc_bufg'));
+    bufg.input('I').srcConnection! <= _boardClk;
+    return _sharedOscillator = bufg.output('O').named('sysosc_clk');
+  }
+
+  void _addPllClock(HarborClockConfig clkConfig) {
+    final passthrough = _isXilinxFpga && _isPassthrough(clkConfig);
+    if (passthrough) {
+      final t = target as HarborFpgaTarget;
+      if (t.frequency > 0 && t.frequency != clkConfig.frequency) {
+        throw StateError(
+          'clock "${clkConfig.name}" runs on the input clock at '
+          '${clkConfig.frequency / 1e6} MHz, but the target clock is '
+          '${t.frequency / 1e6} MHz.',
         );
-        // Register the secondary FIRST so a 'sys'-named secondary stays the
-        // default clock (values.first), then the CLKOP primary.
-        _clockDomains[sec.name] = shared.secondary;
-        _clockDomains[clkConfig.name] = shared.primary;
-      } else {
-        _clockDomains[clkConfig.name] = _clockGen.createDomain(clkConfig);
+      }
+      if (_clockGen.bufferedInputClk == null) {
+        if (_xilinxPadPlls) {
+          throw StateError(
+            'clock "${clkConfig.name}" runs on the input clock and was added '
+            'after a PLL domain took the clock pin. Put it in the clocks '
+            'list of the constructor.',
+          );
+        }
+        _clockGen.bufferedInputClk = _buildSharedInputBufg();
       }
     }
+    final t = target;
+    final namePllClock =
+        t is HarborFpgaTarget && t.vendor == HarborFpgaVendor.openXc7;
+    final sec = clkConfig.coClkosSecondary;
+    final List<HarborClockDomain> domains;
+    if (sec != null) {
+      // One EHXPLLL drives both: CLKOP = this domain, CLKOS = the secondary.
+      // Avoids a 2nd PLL block that may not lock on silicon.
+      final shared = _clockGen.createDomainWithSecondary(
+        clkConfig,
+        secondaryFrequency: sec.frequency,
+        secondaryName: sec.name,
+        secondaryTolerancePpm: sec.tolerancePpm,
+        namePllClock: namePllClock,
+      );
+      // Register the secondary FIRST so a 'sys'-named secondary stays the
+      // default clock (values.first), then the CLKOP primary.
+      domains = [shared.secondary, shared.primary];
+    } else {
+      final domain = _clockGen.createDomain(
+        clkConfig,
+        namePllClock: namePllClock,
+      );
+      domains = [domain];
+      if (_isXilinxFpga && !passthrough) _xilinxPadPlls = true;
+      if (_sharedOscillator != null &&
+          identical(domain.clk, _sharedOscillator)) {
+        final mhz = clkConfig.frequency / 1e6;
+        if (_xilinxPassthroughMhz != null && _xilinxPassthroughMhz != mhz) {
+          throw StateError(
+            'clock "${clkConfig.name}" runs on the input clock at $mhz MHz, '
+            'but another domain runs on it at $_xilinxPassthroughMhz MHz.',
+          );
+        }
+        _xilinxPassthroughMhz = mhz;
+      }
+    }
+    for (final domain in domains) {
+      _clockDomains[domain.name] = domain;
+      final pll = domain.pllClock;
+      if (pll == null) continue;
+      _xilinxPllClockMhz[pll.net] = pll.hz / 1e6;
+      _domainClockNet[domain.name] = pll.net;
+    }
+  }
+
+  // Throws when the hold of [controller] on [clockDomainName] is under 4
+  // edges of the slowest clock domain. A domain added later can make it so.
+  void _checkResetHold(
+    HarborResetController controller,
+    String? clockDomainName,
+  ) {
+    final need = requiredResetHoldCycles(clockDomainName);
+    if (controller.minHoldCycles >= need) return;
+    final fix = need > HarborResetController.maxMinHoldCycles
+        ? 'No valid minHoldCycles exists for this clock ratio, since the '
+              'most it takes is ${HarborResetController.maxMinHoldCycles}. '
+              'Put the controller on a slower clock domain.'
+        : 'Build it with HarborResetController(minHoldCycles: $need).';
+    throw ArgumentError(
+      'the reset controller needs minHoldCycles of at least $need, which '
+      'is 4 edges of the slowest clock domain, but it has '
+      '${controller.minHoldCycles}. $fix',
+    );
+  }
+
+  /// The least reset hold time in cycles of a controller on the domain
+  /// [clockDomainName]: 4 edges of the slowest clock domain. A SoC with no
+  /// clock domains needs none.
+  int requiredResetHoldCycles(String? clockDomainName) {
+    final own = domainFor(clockDomainName)?.config.frequency;
+    if (own == null || _clockDomains.isEmpty) return 1;
+    final slowest = _clockDomains.values
+        .map((d) => d.config.frequency)
+        .reduce((a, b) => a < b ? a : b);
+    return (4 * own + slowest - 1) ~/ slowest;
+  }
+
+  /// Adds [controller] and ORs its `system_reset` into the SoC reset beside
+  /// the reset pin, so a write of 0xDEAD to its SW_RST_KEY register reboots
+  /// the SoC. The SoC needs `softReset: true`, and it takes one controller.
+  ///
+  /// - The controller runs on the hard reset only, the reset pin or the
+  ///   power-on reset, so it keeps its state and its reset cause through a
+  ///   soft reset. It holds the soft reset for its hold time, 256 clock
+  ///   cycles by default, and then releases it on a clock edge.
+  /// - The controller resets its own bus port with the SoC reset, so a
+  ///   response that is still in the port at the start of a reset never
+  ///   reaches the fabric after it.
+  /// - The reset pin is the controller's `ext_reset`, so a pin reset reads as
+  ///   external. A SoC that has only a reset pin and no power-on reset
+  ///   (simulation, ASIC) also reads external after a cold boot.
+  /// - The controller needs `minHoldCycles` of at least
+  ///   [requiredResetHoldCycles], and this throws when it has less.
+  /// - A [watchdog] makes WDOG_RST_EN 1 after reset, so an expiry resets the
+  ///   SoC. Without one it is 0. The watchdog must run on the clock domain of
+  ///   the controller, and this throws when it does not.
+  /// - [watchdog] and [debug] are optional reset requests for its `wdog_reset`
+  ///   and `debug_reset` inputs. A controller on another fabric clock is not
+  ///   accepted, since its bus port would then reset itself.
+  T addResetController<T extends HarborResetController>(
+    T controller, {
+    String? clockDomainName,
+    Logic? watchdog,
+    Logic? debug,
+  }) {
+    final request = _softResetRequest;
+    if (request == null) {
+      throw StateError('addResetController needs softReset: true');
+    }
+    if (_resetController != null) {
+      throw StateError('a SoC takes one reset controller');
+    }
+    if (controller.tryInput(BusSlavePort.fabricClkPort) != null) {
+      throw ArgumentError(
+        'the reset controller must run on the fabric clock, without a '
+        'crossing',
+      );
+    }
+    if (watchdog != null) {
+      for (final e in _peripherals) {
+        if (!identical(e.module, watchdog.parentModule)) continue;
+        if (!identical(
+          domainFor(e.clockDomainName),
+          domainFor(clockDomainName),
+        )) {
+          throw ArgumentError(
+            'the watchdog ${e.module.name} and the reset controller run on '
+            'different clock domains, and wdog_reset has no synchroniser. '
+            'Put both on one domain.',
+          );
+        }
+      }
+    }
+    _checkResetHold(controller, clockDomainName);
+    _resetController = controller;
+    _resetControllerDomain = clockDomainName;
+    _resetWatchdog = watchdog;
+    _resetDebug = debug;
+    addPeripheral(controller, clockDomainName: clockDomainName);
+    request <= controller.systemReset;
+    return controller;
   }
 
   /// Gets a clock domain by name.
@@ -440,19 +1099,21 @@ class HarborSoC extends BridgeModule {
   /// the raw `clk`/`reset` inputs if no domains were configured.
   HarborClockDomain? clockDomain(String name) => _clockDomains[name];
 
+  /// The inputs of a [HarborRegisteredResetBranch] for the domain [name], or
+  /// null when there is no such domain.
+  ({Logic hold, Logic release})? resetBranchSource(String name) {
+    final domain = _clockDomains[name];
+    return domain == null ? null : _clockGen.resetBranchSource(domain);
+  }
+
   /// The default clock and reset signals.
   ///
   /// If clock domains are configured, returns the first domain.
   /// Otherwise returns the raw input clock and reset.
   (Logic clk, Logic reset) get defaultClock {
-    if (_clockDomains.isNotEmpty) {
-      // Prefer the conventional 'sys' bus domain: it may not be the first
-      // registered entry when it is a CLKOS secondary of another PLL, and fall
-      // back to the first domain otherwise.
-      final d = _clockDomains['sys'] ?? _clockDomains.values.first;
-      return (d.clk, d.reset);
-    }
-    return (_boardClk, input('reset'));
+    final d = _fabricDomain;
+    if (d != null) return (d.clk, d.reset);
+    return (_boardClk, _systemReset);
   }
 
   /// Joins a differential board clock (`clk` and the target's
@@ -513,6 +1174,8 @@ class HarborSoC extends BridgeModule {
       );
     }
 
+    _requireDomain(peripheral, clockDomainName);
+    clockDomainName = _bindDomain(peripheral, clockDomainName);
     final dt = (peripheral as HarborDeviceTreeNodeProvider).dtNode;
     _peripherals.add(
       _PeripheralEntry(
@@ -522,12 +1185,14 @@ class HarborSoC extends BridgeModule {
         busTimeoutCycles: busTimeoutCycles,
       ),
     );
-    _wireOnce(peripheral, clockDomainName);
-    if (peripheral.tryInput(BusSlavePort.fabricClkPort) != null) {
-      final (clk, reset) = defaultClock;
-      peripheral.input(BusSlavePort.fabricClkPort).srcConnection! <= clk;
-      peripheral.input(BusSlavePort.fabricResetPort).srcConnection! <= reset;
+    if (peripheral is HarborSecondarySlaveProvider) {
+      for (final slave
+          in (peripheral as HarborSecondarySlaveProvider).secondarySlaves) {
+        addPeripheralSlave(peripheral, slave.busInterfaceName, slave.range);
+      }
     }
+    _wireOnce(peripheral, clockDomainName);
+    _wireFabricClock(peripheral);
 
     // A driver that divides its input clock cannot work without knowing the
     // rate. The peripheral does not know which domain it landed on, the SoC
@@ -597,6 +1262,25 @@ class HarborSoC extends BridgeModule {
   /// exclusive access for this master (see [HarborFabricMaster.exclusiveIds]
   /// and [memoryBusShape]).
   ///
+  /// [realtime] makes this a real-time master (see
+  /// [HarborFabricMaster.realtime]): it wins arbitration, and the bursts of
+  /// the other masters are capped while it waits (see
+  /// [buildFabric]'s `realtimeBurstCap`).
+  ///
+  /// [writeStallFree] declares that this master never stalls write data
+  /// inside a burst (see [HarborFabricMaster.writeStallFree]).
+  ///
+  /// [targetRanges] lists the address ranges this master is meant to reach.
+  /// [buildFabric] throws when a range is not fully covered by the slaves of
+  /// the master's channel. Null skips the check.
+  ///
+  /// [burstRanges] lists the address ranges where this master issues
+  /// multi-beat bursts, for example the ranges a cache with a line over one
+  /// bus word refills from, or a DMA engine moves data to. A master with no
+  /// [burstRanges] issues single beats only. [buildFabric] throws when a
+  /// burst range holds a slave that cannot take bursts (see
+  /// [HarborFabric.slaveTakesBursts]).
+  ///
   /// A module can be a peripheral and a master, or have more than one
   /// master port. Its master then takes the name
   /// `<module>_<busInterfaceName>` on the fabric.
@@ -612,20 +1296,32 @@ class HarborSoC extends BridgeModule {
     int? outstanding,
     int? readChannel,
     int? exclusiveIds,
+    bool realtime = false,
+    bool writeStallFree = false,
+    List<BusAddressRange>? targetRanges,
+    List<BusAddressRange>? burstRanges,
   }) {
+    _requireDomain(master, clockDomainName);
+    clockDomainName = _bindDomain(master, clockDomainName);
     _masters.add(
       _MasterEntry(
         module: master,
         busInterfaceName: busInterfaceName,
+        clockDomainName: clockDomainName,
         pipeline: pipeline,
         channel: channel,
         memory: memory,
         outstanding: outstanding,
         readChannel: readChannel,
         exclusiveIds: exclusiveIds,
+        realtime: realtime,
+        writeStallFree: writeStallFree,
+        targetRanges: targetRanges,
+        burstRanges: burstRanges,
       ),
     );
     _wireOnce(master, clockDomainName);
+    _wireFabricClock(master);
     return master;
   }
 
@@ -644,9 +1340,83 @@ class HarborSoC extends BridgeModule {
     return pullUpPort(peripheral.port(portName), newPortName: topName);
   }
 
+  /// Binds the pins of [driver] to the LED pins of [board].
+  ///
+  /// Channel `k` of [driver] drives `board.ledChannels[k]`. A catalog pin
+  /// such as `led[3]` joins one top-level vector port `led`, bit 3, so that
+  /// the pin constraints match. A pin without an index, such as `led0_r`,
+  /// is a 1-bit port of the same name. The pin indices of one vector must be
+  /// 0 to N-1 with no gap.
+  void bindBoardLeds(HarborLedDriver driver, HarborBoard board) {
+    if (board.ledChannels.length > driver.channelCount) {
+      throw ArgumentError(
+        '${board.name} has ${board.ledChannels.length} LED channels but the '
+        'driver has ${driver.channelCount}',
+      );
+    }
+    final vectors = <String, Map<int, Logic>>{};
+    for (var k = 0; k < board.ledChannels.length; k++) {
+      final pins = board.ledChannels[k].pins;
+      final outs = driver.channelOut(k);
+      if (pins.length != outs.length) {
+        throw ArgumentError(
+          'LED channel $k has ${outs.length} outputs for ${pins.length} pins',
+        );
+      }
+      for (var i = 0; i < pins.length; i++) {
+        final m = RegExp(r'^(\w+)\[(\d+)\]$').firstMatch(pins[i]);
+        if (m == null) {
+          addOutput(pins[i]) <= outs[i];
+        } else {
+          (vectors[m.group(1)!] ??= {})[int.parse(m.group(2)!)] = outs[i];
+        }
+      }
+    }
+    for (final MapEntry(key: name, value: bits) in vectors.entries) {
+      for (var i = 0; i < bits.length; i++) {
+        if (!bits.containsKey(i)) {
+          throw ArgumentError('LED pin $name[$i] is missing');
+        }
+      }
+      addOutput(name, width: bits.length) <=
+          [for (var i = 0; i < bits.length; i++) bits[i]!].rconcat();
+    }
+  }
+
   /// Peripheral -> (its port name -> top-level port name), for every pin
   /// pulled up with [exposePin].
   final Map<BridgeModule, Map<String, String>> _exposedPins = {};
+
+  /// The clock nets and rates of every [HarborClockRateProvider] module in
+  /// the hierarchy of the SoC, a bus peripheral or not. Each module gets its
+  /// instance path from the SoC, with `.` between the names. Call it after
+  /// the build.
+  Map<String, double> _peripheralClockMhz() {
+    final rates = <String, double>{};
+    void walk(Module m, String path) {
+      if (m is HarborClockRateProvider) {
+        rates.addAll((m as HarborClockRateProvider).clockRates(path));
+      }
+      for (final child in m.subModules) {
+        walk(child, '$path.${child.uniqueInstanceName}');
+      }
+    }
+
+    for (final child in subModules) {
+      walk(child, child.uniqueInstanceName);
+    }
+    return rates;
+  }
+
+  /// Throws when a clock domain runs on a net that is not in [constrained].
+  /// A domain on the board clock has the pad constraint.
+  void _checkClockDomainConstraints(Set<String> constrained) {
+    harborCheckClockNets({
+      for (final MapEntry(key: domain, value: d) in _clockDomains.entries)
+        if (!identical(d.clk, _boardClk))
+          domain: _domainClockNet[domain] ?? d.clk.name,
+    }, constrained);
+  }
 
   /// Lines of every [HarborPinConstraintProvider] peripheral, each line once.
   List<String> _devicePinConstraints(HarborFpgaTarget t) {
@@ -683,21 +1453,28 @@ class HarborSoC extends BridgeModule {
         .where((e) => identical(e.module, peripheral))
         .firstOrNull;
     final domainName = entry?.clockDomainName;
-    // A peripheral with no explicit domain is wired to [defaultClock] (the
-    // 'sys' bus domain when present), NOT the primary input clock. Resolve the
-    // same fallback so the reported clock matches the one the peripheral's bus
-    // is actually clocked by, which is what a sim model must sample.
-    final domain =
-        (domainName != null ? _clockDomains[domainName] : null) ??
-        _clockDomains['sys'] ??
-        _clockDomains.values.firstOrNull;
+    // A peripheral with no explicit domain is wired to [defaultClock], not the
+    // primary input clock. [domainFor] gives the clock its bus runs on, which
+    // is what a sim model must sample.
+    if (target is! HarborSimTarget) {
+      throw StateError('simClockOf is for a HarborSimTarget SoC only');
+    }
+    final domain = domainFor(domainName);
     if (domain == null || domain.config.isPrimary) {
       return (port: 'clk', hz: primaryHz);
     }
-    // A domain with no port of its own IS the input clock (it runs at the
-    // source rate), so a model on it samples `clk`.
+    // A domain with no port of its own that runs on the input clock samples
+    // `clk`. A domain made from a net has no sim port to sample.
     final port = domain.simPort;
-    if (port == null) return (port: 'clk', hz: primaryHz);
+    if (port == null) {
+      if (!identical(domain.clk, _boardClk)) {
+        throw StateError(
+          'clock domain "${domain.config.name}" has no sim clock port: it '
+          'comes from a net, and a sim model cannot sample it',
+        );
+      }
+      return (port: 'clk', hz: primaryHz);
+    }
     return (port: port, hz: domain.config.frequency);
   }
 
@@ -724,26 +1501,59 @@ class HarborSoC extends BridgeModule {
         .toList();
     errors.addAll(validateAddressMappings(mappings));
 
+    // A second port may sit inside its own peripheral's window, but not in
+    // the window of another peripheral or of another second port.
+    for (final (i, a) in _secondarySlaves.indexed) {
+      for (final b in _secondarySlaves.skip(i + 1)) {
+        final x = a.addressRange;
+        final y = b.addressRange;
+        if (x.start < y.end && y.start < x.end) {
+          errors.add(
+            '${a.module.name}.${a.busInterfaceName} overlaps '
+            '${b.module.name}.${b.busInterfaceName}: $x and $y',
+          );
+        }
+      }
+    }
+    for (final slave in _secondarySlaves) {
+      for (final e in _peripherals) {
+        if (identical(e.module, slave.module)) continue;
+        final a = slave.addressRange;
+        final b = e.addressRange;
+        if (a.start < b.end && b.start < a.end) {
+          errors.add(
+            '${slave.module.name}.${slave.busInterfaceName} overlaps '
+            '${e.module.name}: $a and $b',
+          );
+        }
+      }
+    }
+
     // Register maps: internal overlaps and out-of-block registers. The register
     // map and its block size both come from the SVD view, so they are checked
     // against a single source.
     for (final entry in _peripherals) {
       final m = entry.module;
       if (m is! HarborSvdPeripheralProvider) continue;
-      final sp = (m as HarborSvdPeripheralProvider).svdPeripheral;
-      final regs = sp.registers;
-      if (regs == null) continue;
+      final provider = m as HarborSvdPeripheralProvider;
+      for (final sp in [
+        provider.svdPeripheral,
+        ...provider.extraSvdPeripherals,
+      ]) {
+        final regs = sp.registers;
+        if (regs == null) continue;
 
-      for (final overlap in regs.validate()) {
-        errors.add('${sp.name}: $overlap');
-      }
-      for (final f in regs.fields) {
-        if (f.end > sp.size) {
-          errors.add(
-            "${sp.name}: register '${f.name}' @ 0x${f.offset.toRadixString(16)} "
-            '(${f.width}B) exceeds address block size '
-            '0x${sp.size.toRadixString(16)}',
-          );
+        for (final overlap in regs.validate()) {
+          errors.add('${sp.name}: $overlap');
+        }
+        for (final f in regs.fields) {
+          if (f.end > sp.size) {
+            errors.add(
+              "${sp.name}: register '${f.name}' @ 0x${f.offset.toRadixString(16)} "
+              '(${f.width}B) exceeds address block size '
+              '0x${sp.size.toRadixString(16)}',
+            );
+          }
         }
       }
     }
@@ -800,21 +1610,64 @@ class HarborSoC extends BridgeModule {
   /// [busTimeoutCycles] is the timeout of every slave that does not hold
   /// memory (see [HarborFabricSlave.timeout]). A slave that times out is cut
   /// off until reset. Memory (system RAM, SRAM, flash, mask ROM) gets none,
-  /// and [addPeripheral] can set the timeout of one peripheral.
+  /// because DDR3 holds its bus until calibration ends and may calibrate
+  /// again. A board that lets a master such as PCIe DMA reach DDR3 early
+  /// passes a long [addPeripheral] `busTimeoutCycles` for that memory, so the
+  /// master gets an error response instead of waiting for ever.
+  /// A fabric with a timeout on any slave adds the `bus_timeouts` output (see
+  /// [exposeBusTimeouts]).
   /// [maxGrantCycles] sets the Wishbone grant hold cap (see
-  /// [WishboneArbiter.maxGrantCycles]). Both are off by default.
+  /// [WishboneArbiter.maxGrantCycles]). It is [harborDefaultWishboneGrantCap]
+  /// on a Wishbone fabric with two or more masters, so a master that polls
+  /// back to back cannot starve the others. Pass null or 0 to turn it off.
+  /// [busTimeoutCycles] is off by default.
+  /// [realtimeBurstCap] is the most beats of a burst another master sends
+  /// to a slave in one grant while a real-time master waits (see
+  /// [HarborFabric.build]). It has no effect without a real-time master.
+  /// [axi4Pipeline] sets the register stages of each AXI4 fabric (see
+  /// [HarborFabricPipeline]). Wishbone and TileLink fabrics ignore it.
   void buildFabric({
     bool pipeline = false,
     Map<String, Set<String>>? channelSlaves,
     HarborMemConverge converge = HarborMemConverge.arbiter,
     int? busTimeoutCycles,
-    int? maxGrantCycles,
+    int? maxGrantCycles = harborDefaultWishboneGrantCap,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
+    HarborFabricPipeline axi4Pipeline = HarborFabricPipeline.balanced,
   }) {
+    _fabricBuilt = true;
+    _fabricDomain; // throws when fabricClockDomain names no domain
+    final unknown = localResetDomains.where(
+      (n) => !_clockDomains.containsKey(n),
+    );
+    if (unknown.isNotEmpty) {
+      throw StateError(
+        'localResetDomains names ${unknown.join(', ')}, but $name has no '
+        'clock domain with that name.',
+      );
+    }
     final errors = validate();
     if (errors.isNotEmpty) {
       throw StateError('Validation errors in $name:\n${errors.join("\n")}');
     }
+    if (softReset && _resetController == null) {
+      throw StateError('$name has softReset but no reset controller');
+    }
+    if (_resetController case final c?) {
+      _checkResetHold(c, _resetControllerDomain);
+    }
 
+    if (_peripherals.isEmpty) {
+      for (final m in _masters) {
+        final target = m.targetRanges?.firstOrNull;
+        if (target != null) {
+          throw StateError(
+            '${m.module.name}_${m.busInterfaceName}: target range $target '
+            'is not covered by any slave, the SoC has none',
+          );
+        }
+      }
+    }
     if (_peripherals.isEmpty || _masters.isEmpty) return;
     if (fabrics.isNotEmpty) {
       throw StateError('buildFabric was already called');
@@ -868,6 +1721,25 @@ class HarborSoC extends BridgeModule {
     }
 
     final reach = {for (final c in channels) c: reachOf(c)};
+    for (final m in _masters) {
+      for (final target in m.targetRanges ?? const <BusAddressRange>[]) {
+        final covers = [
+          for (var i = 0; i < slaves.length; i++)
+            if (reach[m.channel]?.contains(slaveName(i)) ?? true)
+              slaves[i].range,
+        ]..sort((a, b) => a.start.compareTo(b.start));
+        var next = target.start;
+        for (final r in covers) {
+          if (r.start <= next && r.end > next) next = r.end;
+        }
+        if (next < target.end) {
+          throw StateError(
+            '${m.module.name}_${m.busInterfaceName}: target range $target is '
+            'not covered by the slaves of channel "${m.channel}"',
+          );
+        }
+      }
+    }
     if (channelSlaves != null) {
       final orphans = [
         for (var i = 0; i < slaves.length; i++)
@@ -905,6 +1777,26 @@ class HarborSoC extends BridgeModule {
 
     ({bool memory, int outstanding}) shapeOf(int i) =>
         _slaveShape(slaves[i].module, slaves[i].iface, slaveIntf(i));
+
+    for (final m in _masters) {
+      for (final target in m.burstRanges ?? const <BusAddressRange>[]) {
+        for (var i = 0; i < slaves.length; i++) {
+          final r = slaves[i].range;
+          if (!(reach[m.channel]?.contains(slaveName(i)) ?? true)) continue;
+          if (r.start >= target.end || r.end <= target.start) continue;
+          if (HarborFabric.slaveTakesBursts(
+            fabricKind,
+            memory: shapeOf(i).memory,
+          )) {
+            continue;
+          }
+          throw StateError(
+            '${m.module.name}_${m.busInterfaceName}: burst range $target '
+            'holds ${slaveName(i)} at $r, which cannot take bursts',
+          );
+        }
+      }
+    }
     // The map check takes the largest Wishbone burst block of any slave.
     final burstBeats = slaves
         .map(
@@ -954,6 +1846,7 @@ class HarborSoC extends BridgeModule {
       timeout: timeoutOf(i),
       memory: shapeOf(i).memory,
       offset: true,
+      narrowOk: slaves[i].module is HarborNarrowSlaveOk,
     );
 
     // A master takes its module name, or the module name plus its bus
@@ -986,12 +1879,21 @@ class HarborSoC extends BridgeModule {
           name: masterName(m),
           interface: intf,
           outstanding: m.outstanding,
-          memory: m.memory ?? intf is Axi4Interface,
+          memory: m.isMemoryPort,
           reach: reach[m.channel],
           readChannel: m.readChannel,
           exclusiveIds: slotsOf[m],
+          realtime: m.realtime,
+          writeStallFree: m.writeStallFree,
         ),
       );
+    }
+
+    void exposeTimeouts() {
+      if (_busTimeouts == null &&
+          Iterable<int>.generate(slaves.length).any((i) => timeoutOf(i) > 0)) {
+        exposeBusTimeouts();
+      }
     }
 
     HarborFabricModule build(
@@ -1004,11 +1906,13 @@ class HarborSoC extends BridgeModule {
         kind: fabricKind,
         topology: topology,
         clk: clk,
-        reset: reset,
+        reset: _localReset(_fabricDomain, reset, '${name}_reset_branch'),
         masters: ms,
         slaves: ss,
         wishboneBurstBeats: burstBeats,
         maxGrantCycles: maxGrantCycles,
+        realtimeBurstCap: realtimeBurstCap,
+        pipeline: axi4Pipeline,
         name: name,
       );
       fabrics.add(f);
@@ -1025,6 +1929,7 @@ class HarborSoC extends BridgeModule {
         [for (final c in channels) ...masters[c]!],
         [for (var i = 0; i < slaves.length; i++) realSlave(i)],
       );
+      exposeTimeouts();
       return;
     }
 
@@ -1037,13 +1942,13 @@ class HarborSoC extends BridgeModule {
       });
     List<String> users(int i) => [
       for (final c in order)
-        if (reach[c]!.contains(slaveName(i))) c,
+        if (reach[c]?.contains(slaveName(i)) ?? true) c,
     ];
     final legs = <int, List<(String, PairInterface)>>{};
     for (final c in order) {
       final ss = <HarborFabricSlave>[];
       for (var i = 0; i < slaves.length; i++) {
-        if (!reach[c]!.contains(slaveName(i))) continue;
+        if (!(reach[c]?.contains(slaveName(i)) ?? true)) continue;
         if (users(i).length == 1) {
           ss.add(realSlave(i));
           continue;
@@ -1056,7 +1961,20 @@ class HarborSoC extends BridgeModule {
         }
         // A leg to the converge fabric. It passes the full address on, and
         // on Wishbone it has ERR so a cut off reaches the master as ERR.
-        final leg = switch (slaveIntf(i)) {
+        // A narrow slave gets a leg of the fabric widths, and the converge
+        // fabric adapts it.
+        final (fabricAddrW, fabricDataW) = harborPortWidths(
+          masters[c]!.first.interface,
+        );
+        final (slaveAddrW, slaveDataW) = harborPortWidths(slaveIntf(i));
+        final leg = switch (slaveAddrW == fabricAddrW &&
+                slaveDataW == fabricDataW
+            ? slaveIntf(i)
+            : harborWidenPort(
+                slaveIntf(i),
+                addressWidth: fabricAddrW,
+                dataWidth: fabricDataW,
+              )) {
           final WishboneInterface w => WishboneInterface(
             w.config.copyWith(useErr: true),
           ),
@@ -1081,6 +1999,8 @@ class HarborSoC extends BridgeModule {
             outstanding: m.outstanding,
             memory: m.memory,
             exclusiveIds: m.exclusiveIds,
+            realtime: m.realtime,
+            writeStallFree: m.writeStallFree,
           ),
       ], ss);
     }
@@ -1095,11 +2015,14 @@ class HarborSoC extends BridgeModule {
               interface: leg,
               outstanding: shapeOf(i).outstanding,
               memory: shapeOf(i).memory,
+              realtime: masters[c]!.any((m) => m.realtime),
+              writeStallFree: masters[c]!.every((m) => m.writeStallFree),
             ),
         ],
         [realSlave(i)],
       );
     }
+    exposeTimeouts();
   }
 
   // The masters in the order of the one fabric that [buildFabric] builds.
@@ -1217,25 +2140,97 @@ class HarborSoC extends BridgeModule {
     );
   }
 
-  /// Throws when a peripheral runs on a clock other than the fabric clock
-  /// and has no crossing to it.
+  // Drives the fabric clock inputs of the ports of [module] once, whether it
+  // is a master, a peripheral or both.
+  void _wireFabricClock(BridgeModule module) {
+    if (module.tryInput(BusSlavePort.fabricClkPort) == null) return;
+    if (!_fabricWired.add(module)) return;
+    final (clk, reset) = defaultClock;
+    module.input(BusSlavePort.fabricClkPort).srcConnection! <= clk;
+    module.input(BusSlavePort.fabricResetPort).srcConnection! <=
+        _localReset(_fabricDomain, reset, '${module.name}_fabric_reset_branch');
+  }
+
+  // True when [fabricClk], the fabric clock a port crosses to, is the
+  // `fabric_clk` input of [module], which the SoC drives.
+  bool _crossedToOwnClock(BridgeModule module, Logic? fabricClk) =>
+      fabricClk != null &&
+      identical(fabricClk, module.tryInput(BusSlavePort.fabricClkPort));
+
+  /// Throws when a peripheral or a master runs on a clock other than the
+  /// fabric clock and has a bus port with no crossing to it.
   void _checkClockDomains() {
     final (fabricClk, _) = defaultClock;
+    // A module off the fabric clock crosses through its fabric clock input,
+    // which the SoC drives. A module on the fabric clock can cross inward to
+    // its own device clock with no such input.
+    void needFabricClk(BridgeModule m) {
+      if (m.tryInput(BusSlavePort.fabricClkPort) != null) return;
+      throw StateError(
+        '${m.name} has a clock crossing but no '
+        '${BusSlavePort.fabricClkPort} input to drive. Build its fabric '
+        'clock with BusSlavePort.fabricClockInputs.',
+      );
+    }
+
     for (final e in _peripherals) {
       final domain = domainFor(e.clockDomainName);
       if (domain == null || identical(domain.clk, fabricClk)) continue;
-      if (e.module.tryInput(BusSlavePort.fabricClkPort) == null) {
+      final crossed = harborCrossedPorts(e.module);
+      final open = [
+        'bus',
+        for (final s in _secondarySlaves)
+          if (identical(s.module, e.module)) s.busInterfaceName,
+      ].where((n) => !_crossedToOwnClock(e.module, crossed[n]));
+      if (open.isNotEmpty) {
         throw StateError(
           'peripheral ${e.module.name} runs on clock domain '
-          '"${e.clockDomainName}", not on the fabric clock. Build it with '
+          '"${domain.config.name}", not on the fabric clock. Port '
+          '${open.join(', ')} has no crossing to its '
+          '${BusSlavePort.fabricClkPort}. Build it with '
           'crossFabricClock so its port crosses to the fabric clock.',
         );
       }
+      needFabricClk(e.module);
+    }
+    for (final e in _peripherals) {
+      final m = e.module;
+      if (m is! HarborDdr3 || !m.sameClock) continue;
+      final domain = domainFor(e.clockDomainName);
+      if (domain == null ||
+          domain.config.source != HarborClockSource.ddr3Controller ||
+          !identical(domain.clk, fabricClk) ||
+          (xilinxDdr3Clocks != null &&
+              !identical(domain.clk, xilinxDdr3Clocks!.controllerClk))) {
+        throw StateError(
+          '${m.name} is built with sameClock, so it must sit on the fabric '
+          'clock domain and that domain must have source ddr3Controller. It '
+          'sits on ${domain == null ? 'no clock domain' : '"${domain.config.name}"'}.',
+        );
+      }
+    }
+    for (final e in _masters) {
+      final domain = domainFor(e.clockDomainName);
+      if (domain == null || identical(domain.clk, fabricClk)) continue;
+      if (!_crossedToOwnClock(
+        e.module,
+        harborCrossedPorts(e.module)[e.busInterfaceName],
+      )) {
+        throw StateError(
+          'master ${e.module.name} port ${e.busInterfaceName} runs on clock '
+          'domain "${domain.config.name}", not on the fabric clock. Build the '
+          'port with a fabricClock built on the ${BusSlavePort.fabricClkPort} '
+          'input so it crosses to the fabric clock.',
+        );
+      }
+      needFabricClk(e.module);
     }
   }
 
   // Puts a register stage in front of a master port and returns the stage's
   // fabric side.
+  int _registerStages = 0;
+
   InterfaceReference _registerStage(InterfaceReference port) {
     final cfg = (port.interface as WishboneInterface).config;
     final reg = WishboneRegisterStage(config: cfg);
@@ -1243,7 +2238,12 @@ class HarborSoC extends BridgeModule {
     _fabricErrorFlags.add(reg.output('bus_error'));
     final (clk, reset) = defaultClock;
     reg.input('clk').srcConnection! <= clk;
-    reg.input('reset').srcConnection! <= reset;
+    reg.input('reset').srcConnection! <=
+        _localReset(
+          _fabricDomain,
+          reset,
+          '${reg.name}_${_registerStages++}_reset_branch',
+        );
     connectInterfaces(port, reg.interface('up'));
     return reg.interface('down');
   }
@@ -1317,11 +2317,16 @@ class HarborSoC extends BridgeModule {
         .expand((p) => p.systemMemory)
         .toList();
     return HarborDeviceTreeGenerator(
-      model: name,
+      model: model,
       compatible: compatible,
       cpus: cpus,
       peripherals: providers,
       memories: memories,
+      reservedMemories: _peripherals
+          .map((e) => e.module)
+          .whereType<HarborReservedMemoryProvider>()
+          .expand((p) => p.reservedMemory)
+          .toList(),
       interrupts: {
         for (final p in providers)
           if (assign[p] != null) p: [assign[p]!],
@@ -1329,6 +2334,24 @@ class HarborSoC extends BridgeModule {
       interruptContexts: interruptContexts,
     ).generate();
   }
+
+  /// Generates the Zig object notation file that the firmware reads to make
+  /// its SMBIOS tables.
+  ///
+  /// Each field is present only when this SoC knows it. The memory fields
+  /// come from the peripherals that back system memory.
+  String generateBoardZon() => HarborBoardZonGenerator(
+    vendor: manufacturer,
+    product: _explicitModel,
+    family: name,
+    cpus: cpus,
+    memories: _peripherals
+        .map((e) => e.module)
+        .whereType<HarborSystemMemoryProvider>()
+        .map((p) => p.memoryInfo)
+        .toList(),
+    board: board,
+  ).generate();
 
   /// Generates a CMSIS-SVD (System View Description) file.
   String generateSvd() {
@@ -1338,10 +2361,10 @@ class HarborSoC extends BridgeModule {
         .whereType<HarborSvdPeripheralProvider>()
         .toList();
     return HarborSvdGenerator(
-      vendor: svdVendor,
+      vendor: manufacturer ?? svdVendor,
       name: name,
       version: svdVersion,
-      description: compatible,
+      description: _explicitModel ?? compatible,
       cpus: cpus,
       peripherals: providers,
       interrupts: {
@@ -1380,6 +2403,7 @@ class HarborSoC extends BridgeModule {
   /// Generates:
   /// - `rtl/`: SystemVerilog files + filelist.f (via rohd_bridge)
   /// - `<name>.dts`: device tree source
+  /// - `<name>.board.zon`: firmware SMBIOS board data
   /// - `<name>.dot`: Graphviz topology graph
   /// - `<name>.mermaid.md`: Mermaid topology graph
   /// - Target-specific files:
@@ -1427,6 +2451,46 @@ class HarborSoC extends BridgeModule {
             'assign w1 = w0;\n'
             'endmodule\n';
       }
+      if (fileContents.name == name && _xilinxSourceClkMhz != null) {
+        // These clock aliases otherwise disappear in Yosys because they are
+        // only consumed as clocks. Keep the actual BUFG output nets named so
+        // the nextpnr addClock hook can target mapped nets reliably.
+        for (final clockNet in ['sysosc_clk', 'core_clk', 'ddr_clk']) {
+          final declaration = RegExp(
+            '^logic $clockNet;\\s*\$',
+            multiLine: true,
+          );
+          if (!declaration.hasMatch(contents)) {
+            throw StateError(
+              'Generated top RTL is missing preserved clock net $clockNet.',
+            );
+          }
+          contents = contents.replaceFirst(
+            declaration,
+            '(* keep = 1 *) logic $clockNet;',
+          );
+        }
+      }
+      if (fileContents.name == name) {
+        for (final clockNet in [
+          if (_xilinxPassthroughMhz != null) 'sysosc_clk',
+          ..._xilinxPllClockMhz.keys,
+        ]) {
+          final declaration = RegExp(
+            '^logic $clockNet;\\s*\$',
+            multiLine: true,
+          );
+          if (!declaration.hasMatch(contents)) {
+            throw StateError(
+              'Generated top RTL is missing the PLL clock net $clockNet.',
+            );
+          }
+          contents = contents.replaceFirst(
+            declaration,
+            '(* keep = 1 *) logic $clockNet;',
+          );
+        }
+      }
       File('$rtlPath/$fileName').writeAsStringSync(contents);
       filelist.writeln('./rtl/$fileName');
     }
@@ -1443,6 +2507,7 @@ class HarborSoC extends BridgeModule {
 
     // Device tree
     File('$path/$name.dts').writeAsStringSync(generateDts());
+    File('$path/$name.board.zon').writeAsStringSync(generateBoardZon());
 
     // CMSIS-SVD
     File('$path/$name.svd').writeAsStringSync(generateSvd());
@@ -1621,10 +2686,34 @@ class HarborSoC extends BridgeModule {
                     .toList()
                   ..sort())
               : <String>[];
-          File(
-            '$path/synth.tcl',
-          ).writeAsStringSync(t.generateYosysTcl(name, svFiles: svFiles));
-          File('$path/Makefile').writeAsStringSync(t.generateMakefile(name));
+          final marks = harborSynthesisMarks(this);
+          File('$path/synth.tcl').writeAsStringSync(
+            t.generateYosysTcl(
+              name,
+              svFiles: svFiles,
+              blockRamModules: marks.blockRam,
+              preserveRegisterModules: marks.preserve,
+            ),
+          );
+          final providedClocks = _peripheralClockMhz();
+          final pllClocks = {
+            if (_xilinxPassthroughMhz != null && !_hasDdr3ClockTree)
+              'sysosc_clk': _xilinxPassthroughMhz!,
+            ..._xilinxPllClockMhz,
+            ...providedClocks,
+          };
+          final pllScript =
+              t.vendor == HarborFpgaVendor.openXc7 &&
+              !t.useHimbaechel &&
+              pllClocks.isNotEmpty &&
+              !_hasDdr3ClockTree;
+          File('$path/Makefile').writeAsStringSync(
+            t.generateMakefile(
+              name,
+              pllClockScript: pllScript,
+              knownPorts: knownPorts,
+            ),
+          );
 
           // OpenOCD config, auto-emitted when the SoC has a JTAG debug master.
           final jtag = masters.whereType<HarborJtagDebug>();
@@ -1648,9 +2737,10 @@ class HarborSoC extends BridgeModule {
           final preplacePy = <String>[];
 
           // openXC7 DDR3 nextpnr helper scripts. Legacy nextpnr-xilinx needs
-          // the train SERDES pinned off the dead _SING tile through pre-place.
-          // Himbächel pairs the SERDES during packing, so it only uses the
-          // clock constraint script below.
+          // the train SERDES pinned off the dead _SING tile through pre-place
+          // and the clocks.py script below. Himbächel has no Python, so it
+          // pairs the SERDES during packing and reads the clocks from the XDC.
+          var clocksPyWritten = false;
           if (t.vendor == HarborFpgaVendor.openXc7) {
             final ddr = peripherals.whereType<HarborDdr3>().firstOrNull;
             if (ddr != null) {
@@ -1670,6 +2760,7 @@ class HarborSoC extends BridgeModule {
               // margin show up as an honest WNS. --timing-allow-fail keeps a
               // bitstream written when the aggressive target is not met.
               final coreMhz = _xilinxCoreClkMhz;
+              final sourceMhz = _xilinxSourceClkMhz;
               // The over-constraint targets the `ddr_clk` net = the controller
               // LOGIC clock (controllerClk), which is CK/8 at gearRatio 2 and
               // CK/4 at gearRatio 1. Use controllerClkMhz (the realised logic
@@ -1677,16 +2768,78 @@ class HarborSoC extends BridgeModule {
               // CK/4). At gearRatio 1 the two are equal, so this is byte-
               // identical for the legacy path.
               final ddrCtrlMhz = xilinxDdr3Clocks?.controllerClkMhz;
-              if (coreMhz != null && ddrCtrlMhz != null) {
+              if (!t.useHimbaechel &&
+                  coreMhz != null &&
+                  sourceMhz != null &&
+                  ddrCtrlMhz != null) {
+                clocksPyWritten = true;
                 Directory('$path/support/nextpnr').createSync(recursive: true);
                 File('$path/support/nextpnr/clocks.py').writeAsStringSync(
                   t.generateClockConstraintPy(
                     coreClkMhz: coreMhz,
+                    coreClockNet: 'core_clk',
+                    sourceClockNet: 'sysosc_clk',
+                    sourceClkMhz: sourceMhz,
                     ddrCtrlMhz: ddrCtrlMhz,
+                    extraClocks: pllClocks,
                   ),
                 );
               }
             }
+            if (_hasDdr3ClockTree &&
+                !t.useHimbaechel &&
+                pllClocks.isNotEmpty &&
+                !clocksPyWritten) {
+              throw StateError(
+                'The clock rates of ${pllClocks.keys.join(', ')} need '
+                'support/nextpnr/clocks.py, and a design with a DDR3 clock '
+                'tree writes it only with a DDR3 controller and the rates of '
+                'its clocks. Use Himbächel or add the controller.',
+              );
+            }
+            if (t.useHimbaechel) {
+              // One create_clock for each clock net. A net that the board
+              // constraints already time is not timed again.
+              final ddrClkMhz = xilinxDdr3Clocks?.controllerClkMhz;
+              final xdc = File('$path/$name.${t.constraintExtension}');
+              final text = xdc.readAsStringSync();
+              final timed = harborXdcClockNets(text);
+              final lines = StringBuffer(text);
+              for (final e in {
+                if (_hasDdr3ClockTree && _xilinxPassthroughMhz != null)
+                  'sysosc_clk': _xilinxPassthroughMhz!,
+                ..._ddr3TreeClockMhz,
+                if (ddr != null && ddrClkMhz != null) 'ddr_clk': ddrClkMhz,
+                ...pllClocks,
+              }.entries) {
+                if (!timed.add(e.key)) continue;
+                lines.writeln(
+                  'create_clock -period '
+                  '${(1000 / e.value).toStringAsFixed(3)} '
+                  '[get_nets ${e.key}]',
+                );
+              }
+              xdc.writeAsStringSync(lines.toString());
+              _checkClockDomainConstraints(timed);
+            } else if (!_hasDdr3ClockTree && pllClocks.isNotEmpty) {
+              Directory('$path/support/nextpnr').createSync(recursive: true);
+              File(
+                '$path/support/nextpnr/pll_clocks.py',
+              ).writeAsStringSync(t.generatePllClockConstraintPy(pllClocks));
+            }
+          } else if (t.vendor == HarborFpgaVendor.vivado &&
+              providedClocks.isNotEmpty) {
+            // Vivado names a net in a flat design with `/` between the names.
+            final xdc = File('$path/$name.${t.constraintExtension}');
+            final lines = StringBuffer(xdc.readAsStringSync());
+            for (final e in providedClocks.entries) {
+              lines.writeln(
+                'create_clock -period '
+                '${(1000 / e.value).toStringAsFixed(3)} '
+                '[get_nets ${e.key.replaceAll('.', '/')}]',
+              );
+            }
+            xdc.writeAsStringSync(lines.toString());
           }
 
           // Peripheral-contributed pins. The peripheral names its own cells;
@@ -1714,9 +2867,29 @@ class HarborSoC extends BridgeModule {
             ).writeAsStringSync(preplacePy.join('\n'));
           }
         case HarborAsicTarget():
+          final plan = t.padPlan;
+          if (plan != null) {
+            File('$path/chip_top.v').writeAsStringSync(
+              harborChipTopVerilog(
+                plan: plan,
+                library: t.padCells.library,
+                coreModule: t.topCell,
+                corePorts: _padCorePorts(plan),
+                topName: t.flowTop,
+              ),
+            );
+          }
           File('$path/$name.sdc').writeAsStringSync(t.generateSdc());
-          File('$path/synth.tcl').writeAsStringSync(t.generateYosysTcl());
-          File('$path/pnr.tcl').writeAsStringSync(t.generateOpenroadTcl());
+          File('$path/synth.tcl').writeAsStringSync(
+            t.generateYosysTcl(hasBlackboxes: blackboxStubs.isNotEmpty),
+          );
+          final leaves = <BridgeModule>[];
+          _collectLeafModules(this, leaves);
+          File('$path/pnr.tcl').writeAsStringSync(
+            t.generateOpenroadTcl(
+              leafCells: [for (final m in leaves) m.definitionName],
+            ),
+          );
 
           // Hierarchical macro scripts
           if (t.isHierarchical) {
@@ -1735,9 +2908,9 @@ class HarborSoC extends BridgeModule {
           // KLayout scripts
           final klayout = HarborKlayoutScripts(
             pdkName: t.provider.name,
-            topCell: t.topCell,
+            topCell: t.flowTop,
             drc: t.klayoutDrc,
-            lvsNetlistPath: '${t.topCell}_final.v',
+            lvsNetlistPath: '${t.flowTop}_final.v',
           );
 
           final klayoutDir = Directory('$path/klayout');
@@ -1747,9 +2920,9 @@ class HarborSoC extends BridgeModule {
           final lib = t.provider.standardCellLibrary;
           File('$path/klayout/def2gds.py').writeAsStringSync(
             klayout.generateDefToGds(
-              defPath: '${t.topCell}_final.def',
+              defPath: '${t.flowTop}_final.def',
               techLefPath: lib.techLefPath ?? lib.lefPath,
-              outputGdsPath: '${t.topCell}.gds',
+              outputGdsPath: '${t.flowTop}.gds',
             ),
           );
 
@@ -1757,24 +2930,73 @@ class HarborSoC extends BridgeModule {
           if (t.analogGdsPaths.isNotEmpty) {
             File('$path/klayout/gds_merge.py').writeAsStringSync(
               klayout.generateGdsMerge(
-                digitalGdsPath: '${t.topCell}.gds',
+                digitalGdsPath: '${t.flowTop}.gds',
                 analogGdsPaths: t.analogGdsPaths,
-                outputGdsPath: '${t.topCell}_merged.gds',
+                outputGdsPath: '${t.flowTop}_merged.gds',
               ),
             );
           }
 
-          // DRC
-          File(
-            '$path/klayout/drc.py',
-          ).writeAsStringSync(klayout.generateDrc(gdsPath: '${t.topCell}.gds'));
+          // asix runs drc.py when it exists, so write it only with a deck.
+          if (t.klayoutDrc != null) {
+            File('$path/klayout/drc.py').writeAsStringSync(
+              klayout.generateDrc(gdsPath: '${t.flowTop}.gds'),
+            );
+          }
 
           // LVS
           File(
             '$path/klayout/lvs.py',
-          ).writeAsStringSync(klayout.generateLvs(gdsPath: '${t.topCell}.gds'));
+          ).writeAsStringSync(klayout.generateLvs(gdsPath: '${t.flowTop}.gds'));
       }
     }
+  }
+
+  /// The distinct ports of [plan], each checked against a port of this SoC.
+  List<HarborPadPort> _padCorePorts(HarborPadPlan plan) {
+    void check(String port, int width, Map<String, Logic> dir, String kind) {
+      if (dir[port]?.width != width) {
+        throw ArgumentError(
+          'Pad port $port is not a $width bit $kind of $definitionName',
+        );
+      }
+    }
+
+    final ports = <HarborPadPort>[];
+    for (final pad in plan.all) {
+      final p = pad.port;
+      if (p == null || ports.contains(p)) continue;
+      ports.add(p);
+      switch (p.kind) {
+        case HarborPadKind.input || HarborPadKind.clockInput:
+          check(p.name, p.width, inputs, 'input');
+        case HarborPadKind.output:
+          check(p.name, p.width, outputs, 'output');
+        case HarborPadKind.bidir:
+          check(p.outputName!, p.width, outputs, 'output');
+          check(p.outputEnable!, p.width, outputs, 'output');
+          check(p.inputName!, p.width, inputs, 'input');
+        case _:
+          check(p.name, p.width, {...inputs, ...outputs, ...inOuts}, 'port');
+      }
+    }
+    final covered = <String>{
+      for (final p in ports)
+        if (p.kind == HarborPadKind.bidir) ...[
+          p.outputName!,
+          p.outputEnable!,
+          p.inputName!,
+        ] else
+          p.name,
+    };
+    for (final port in [...inputs.keys, ...outputs.keys, ...inOuts.keys]) {
+      if (!covered.contains(port)) {
+        throw ArgumentError(
+          'Port $port of $definitionName has no pad in the pad plan',
+        );
+      }
+    }
+    return ports;
   }
 
   /// Generates Verilog blackbox stubs for all SystemVerilog leaf modules.
@@ -1864,6 +3086,9 @@ class _SecondarySlave {
 class _MasterEntry {
   final BridgeModule module;
   final String busInterfaceName;
+
+  /// The clock domain of the master, or null for the fabric domain.
+  final String? clockDomainName;
   final bool pipeline;
 
   /// The fabric channel this master lives on.
@@ -1881,14 +3106,64 @@ class _MasterEntry {
   /// AXI4 exclusive slots, as in [HarborFabricMaster.exclusiveIds].
   final int? exclusiveIds;
 
+  /// Real-time flag, as in [HarborFabricMaster.realtime].
+  final bool realtime;
+
+  /// Write stall flag, as in [HarborFabricMaster.writeStallFree].
+  final bool writeStallFree;
+
+  /// Address ranges the master must reach, or null for no check.
+  final List<BusAddressRange>? targetRanges;
+
+  /// Address ranges where the master issues bursts, or null for none.
+  final List<BusAddressRange>? burstRanges;
+
+  /// The memory port flag: [memory], else true for a full AXI4 port.
+  bool get isMemoryPort =>
+      memory ?? module.interface(busInterfaceName).interface is Axi4Interface;
+
   const _MasterEntry({
     required this.module,
     required this.busInterfaceName,
+    this.clockDomainName,
     this.pipeline = false,
     this.channel = 'primary',
     this.memory,
     this.outstanding,
     this.readChannel,
     this.exclusiveIds,
+    this.realtime = false,
+    this.writeStallFree = false,
+    this.targetRanges,
+    this.burstRanges,
   });
+}
+
+/// The definition names of the [HarborPreferBlockRam] modules that prefer
+/// block RAM and of the [HarborPreserveRegisters] modules under the built
+/// module [top]. The synthesis script finds a module by this name, so a
+/// marked module must reserve its definition name. Otherwise this throws.
+({List<String> blockRam, List<String> preserve}) harborSynthesisMarks(
+  Module top,
+) {
+  final blockRam = <String>{};
+  final preserve = <String>{};
+  void walk(Module m) {
+    final ram = m is HarborPreferBlockRam;
+    final keep = m is HarborPreserveRegisters;
+    if ((ram || keep) && !m.reserveDefinitionName) {
+      throw StateError(
+        '${m.name} is marked for synthesis but does not reserve its '
+        'definition name ${m.definitionName}, so the script cannot find it.',
+      );
+    }
+    if (ram && (m as HarborPreferBlockRam).preferBlockRam) {
+      blockRam.add(m.definitionName);
+    }
+    if (keep) preserve.add(m.definitionName);
+    m.subModules.forEach(walk);
+  }
+
+  walk(top);
+  return (blockRam: blockRam.toList(), preserve: preserve.toList());
 }

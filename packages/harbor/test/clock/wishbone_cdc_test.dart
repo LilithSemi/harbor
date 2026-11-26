@@ -17,8 +17,8 @@ void main() {
     const dw = 32;
     final dut = HarborWishboneCdcBridge(addressWidth: aw, dataWidth: dw);
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
 
@@ -115,6 +115,6 @@ void main() {
   });
 
   test('handles near-equal asynchronous clocks', () async {
-    await runXfer(sPeriod: 10, mPeriod: 11);
+    await runXfer(sPeriod: 10, mPeriod: 12);
   });
 }

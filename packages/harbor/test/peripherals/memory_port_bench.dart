@@ -185,6 +185,9 @@ class MemoryPortCheck {
 List<Burst> longBursts(Random rng, int busBytes) {
   final size = busBytes.bitLength - 1;
   final strb = (1 << busBytes) - 1;
+  int data() => busBytes == 8
+      ? (rng.nextInt(1 << 32) << 32) | rng.nextInt(1 << 32)
+      : rng.nextInt(1 << 32);
   Burst w(int addr, int burst, int len, {bool zero = false}) => Burst(
     id: 0,
     write: true,
@@ -192,7 +195,7 @@ List<Burst> longBursts(Random rng, int busBytes) {
     len: len,
     size: size,
     burst: burst,
-    data: [for (var i = 0; i <= len; i++) rng.nextInt(1 << 31)],
+    data: [for (var i = 0; i <= len; i++) data()],
     strb: List.filled(len + 1, zero ? 0 : strb),
   );
   Burst r(int addr, int burst, int len) => Burst(

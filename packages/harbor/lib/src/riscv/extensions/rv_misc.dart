@@ -755,6 +755,10 @@ const rvSvpbmt = RiscVExtension(name: 'Svpbmt', key: null, misaBit: null);
 /// Sstc: Supervisor-mode timer interrupts (stimecmp CSR).
 const rvSstc = RiscVExtension(name: 'Sstc', key: null, misaBit: null);
 
+/// N: user-level trap handling (ustatus, uie, uip, utvec, uscratch, uepc,
+/// ucause, utval). Withdrawn before ratification.
+const rvN = RiscVExtension(name: 'N', key: 'N', misaBit: 13);
+
 /// Sscofpmf: Count overflow and mode-based filtering.
 const rvSscofpmf = RiscVExtension(name: 'Sscofpmf', key: null, misaBit: null);
 

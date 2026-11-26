@@ -46,7 +46,7 @@ void main() {
       ckPeriodPs: 3333,
     );
     await ddr.build();
-    final sv = ddr.generateSynth();
+    final sv = ddr.dumpSystemVerilog();
     expect(sv, contains('module HarborDdr3'));
     expect(sv, contains('sdram_dq'));
     // The port layer crosses the memory waist, the device has no bridge.
@@ -78,10 +78,10 @@ void main() {
           ),
         );
         await ddr.build();
-        final sv = ddr.generateSynth();
+        final sv = ddr.dumpSystemVerilog();
         expect(sv, contains('sdram_dq'));
         expect(ddr.bus.kind, kind);
-        final n = HarborDdr3.defaultOutstanding(kind);
+        final n = kind == HarborFabricKind.wishbone ? 1 : 2;
         expect(ddr.outstanding, n);
         expect(ddr.bus.cdcDepth, harborCdcDepth(n));
         expect(ddr.definitionName, contains('_${kind.name}_'));
@@ -111,7 +111,7 @@ void main() {
   test('two read channels on AXI4 cross each port once', () async {
     final ddr = _arty(HarborFabricKind.axi4, readChannels: 2, outstanding: 4);
     await ddr.build();
-    final sv = ddr.generateSynth();
+    final sv = ddr.dumpSystemVerilog();
     expect(ddr.readBuses, hasLength(1));
     expect(ddr.interface('bus_r1').interface, isA<Axi4ReadOnlyInterface>());
     expect(sv, contains('bus_r1_ARVALID'));
@@ -241,7 +241,7 @@ void main() {
       readChannels: 2,
     );
     await ddr.build();
-    final sv = ddr.generateSynth();
+    final sv = ddr.dumpSystemVerilog();
     expect(sv, contains('harbor_sim_dram'));
     expectNoEmptyPort(sv, 'sim_dram(');
   });
@@ -282,7 +282,7 @@ void main() {
       target: const HarborSimTarget(),
     );
     await ddr.build();
-    final sv = ddr.generateSynth();
+    final sv = ddr.dumpSystemVerilog();
     expect(sv, contains('harbor_sim_dram'));
     expectNoEmptyPort(sv, 'sim_dram(');
   });

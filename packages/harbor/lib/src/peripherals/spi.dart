@@ -59,6 +59,10 @@ class HarborSpiController extends BridgeModule
   /// a block device the kernel can mount as root.
   final bool sdCard;
 
+  /// Device tree child nodes after the SD slot, one per device on a chip
+  /// select. A child names its chip select in `reg`.
+  final List<HarborDeviceTreeChild> children;
+
   /// SD-over-SPI maximum clock. Conservative default for a first bring-up.
   final int sdMaxFrequency;
 
@@ -95,6 +99,7 @@ class HarborSpiController extends BridgeModule
     this.busDataWidth = 32,
     this.sdCard = false,
     this.sdMaxFrequency = 12000000,
+    this.children = const [],
     this.dma = false,
     this.dmaAddressWidth = 32,
     this.clockFrequency = 0,
@@ -118,6 +123,24 @@ class HarborSpiController extends BridgeModule
          ]),
          name: name ?? 'spi',
        ) {
+    for (final child in children) {
+      final reg = child.properties['reg'];
+      if (reg is! int) continue;
+      if (reg < 0 || reg >= csCount) {
+        throw ArgumentError.value(
+          reg,
+          'children',
+          '${child.name} uses a chip select that csCount ($csCount) lacks',
+        );
+      }
+      if (sdCard && (reg == 0 || child.name == 'mmc@0')) {
+        throw ArgumentError.value(
+          child.name,
+          'children',
+          'chip select 0 belongs to the SD card slot',
+        );
+      }
+    }
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -568,7 +591,7 @@ class HarborSpiController extends BridgeModule
                                 dmaWord.getRange((b + 1) * 8, busDataWidth),
                               rxData,
                               if (b > 0) dmaWord.getRange(0, b * 8),
-                            ].swizzle(),
+                            ].concat(),
                         }, defaultValue: dmaWord),
                     dmaByteIdx < (dmaByteIdx + Const(1, width: byteIdxWidth)),
                     dmaLen < (dmaLen - Const(1, width: 32)),
@@ -662,19 +685,19 @@ class HarborSpiController extends BridgeModule
     // An SD card on CS0: describe it so the in-tree `mmc_spi` driver binds and
     // exposes a block device (root can then live on the card). `voltage-ranges`
     // is a single 3.3 V min-max pair in mV.
-    children: sdCard
-        ? [
-            HarborDeviceTreeChild(
-              name: 'mmc@0',
-              properties: {
-                'compatible': 'mmc-spi-slot',
-                'reg': 0,
-                'spi-max-frequency': sdMaxFrequency,
-                'voltage-ranges': [3300, 3300],
-              },
-            ),
-          ]
-        : const [],
+    children: [
+      if (sdCard)
+        HarborDeviceTreeChild(
+          name: 'mmc@0',
+          properties: {
+            'compatible': 'mmc-spi-slot',
+            'reg': 0,
+            'spi-max-frequency': sdMaxFrequency,
+            'voltage-ranges': [3300, 3300],
+          },
+        ),
+      ...children,
+    ],
   );
 
   @override

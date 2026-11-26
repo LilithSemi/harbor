@@ -309,9 +309,9 @@ class HarborIntraReconWalk extends BridgeModule {
       pred.input('have_above').srcConnection! <= haveA;
       pred.input('have_left').srcConnection! <= haveL;
       pred.input('above').srcConnection! <=
-          [for (var i = side - 1; i >= 0; i--) aboveAll[i]].swizzle();
+          [for (var i = side - 1; i >= 0; i--) aboveAll[i]].concat();
       pred.input('left').srcConnection! <=
-          [for (var i = side - 1; i >= 0; i--) leftAll[i]].swizzle();
+          [for (var i = side - 1; i >= 0; i--) leftAll[i]].concat();
       pred.input('above_left').srcConnection! <= corner;
 
       // runtime tx_type only for TX_4X4 / 8X8 / 16X16 (s <= 2). TX_32X32 /
@@ -353,7 +353,7 @@ class HarborIntraReconWalk extends BridgeModule {
     const sIdle = 0, sPred = 1, sTxWait = 2, sWrite = 3, sDone = 4;
     final st = Logic(name: 'st', width: 3);
     output('done') <= st.eq(Const(sDone, width: 3));
-    output('frame') <= [for (var i = nPix - 1; i >= 0; i--) frame[i]].swizzle();
+    output('frame') <= [for (var i = nPix - 1; i >= 0; i--) frame[i]].concat();
 
     Combinational([
       txStart < Const(0),

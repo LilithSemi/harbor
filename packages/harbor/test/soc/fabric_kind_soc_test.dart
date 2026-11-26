@@ -291,7 +291,7 @@ void main() {
       expect(soc.fabric!.foldError, isNull);
 
       final clk = SimpleClockGenerator(10).clk;
-      final periphClk = SimpleClockGenerator(17).clk;
+      final periphClk = SimpleClockGenerator(18).clk;
       final reset = Logic(name: 'reset')..inject(1);
       soc.input('clk').srcConnection! <= clk;
       soc.input('periph_clk').srcConnection! <= periphClk;
@@ -544,10 +544,10 @@ void main() {
       final slave = _slavesOf(soc.fabric!).single;
       expect(slave.memory, isTrue);
       expect(slave.outstanding, sdram.outstanding);
-      expect(sdram.outstanding, kind == HarborFabricKind.wishbone ? 1 : 8);
+      expect(sdram.outstanding, kind == HarborFabricKind.wishbone ? 1 : 2);
       await soc.build();
       expect(
-        soc.generateSynth(),
+        soc.dumpSystemVerilog(),
         contains(
           kind == HarborFabricKind.wishbone
               ? 'SdramWishbonePort'

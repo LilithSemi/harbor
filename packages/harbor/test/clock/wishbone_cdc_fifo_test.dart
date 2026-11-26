@@ -31,6 +31,7 @@ void main() {
     required int sPeriod,
     required int mPeriod,
     bool registerMaster = false,
+    bool checkMasterClock = false,
   }) async {
     const aw = 32;
     const dw = 32;
@@ -41,8 +42,8 @@ void main() {
       registerMaster: registerMaster,
     );
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
     final sCyc = Logic(name: 's_cyc');
@@ -62,6 +63,21 @@ void main() {
     dut.input('s_sel').srcConnection! <= sSel;
     dut.input('m_clk').srcConnection! <= mClk;
     dut.input('m_reset').srcConnection! <= mReset;
+
+    var checking = false;
+    var lastMasterEdge = -1;
+    final offClockChanges = <String>[];
+    final monitors = <StreamSubscription>[];
+    monitors.add(mClk.posedge.listen((_) => lastMasterEdge = Simulator.time));
+    for (final port in ['m_adr', 'm_dat_w', 'm_we', 'm_sel']) {
+      monitors.add(
+        dut.output(port).changed.listen((_) {
+          if (checking && Simulator.time != lastMasterEdge) {
+            offClockChanges.add('$port at ${Simulator.time}');
+          }
+        }),
+      );
+    }
 
     // Fast-side model: a single 32-bit register, one-cycle combinational ACK.
     final mem = Logic(name: 'mem', width: dw);
@@ -114,22 +130,37 @@ void main() {
       return rd;
     }
 
+    checking = checkMasterClock;
     const magic = 0xC0DE1234;
     await doXfer(we: true, adr: 0x40, data: magic);
     final rd = await doXfer(we: false, adr: 0x40);
     expect(rd, equals(magic), reason: 'read-back must match the written value');
 
+    checking = false;
+    for (final monitor in monitors) {
+      await monitor.cancel();
+    }
     await Simulator.endSimulation();
+    expect(
+      offClockChanges,
+      isEmpty,
+      reason:
+          'Master payload must stay in the master clock domain even while idle',
+    );
   }
+
+  test('idle master payload never follows asynchronous FIFO writes', () async {
+    await runXfer(sPeriod: 10, mPeriod: 26, checkMasterClock: true);
+  });
 
   test('write then read crosses domains (FIFO bridge)', () async {
     await runXfer(sPeriod: 40, mPeriod: 12); // creek-like 25:83
   });
   test('also works when master is slower than slave', () async {
-    await runXfer(sPeriod: 10, mPeriod: 25);
+    await runXfer(sPeriod: 10, mPeriod: 26);
   });
   test('near-equal asynchronous clocks', () async {
-    await runXfer(sPeriod: 10, mPeriod: 11);
+    await runXfer(sPeriod: 10, mPeriod: 12);
   });
 
   Future<int> hammer({
@@ -148,8 +179,8 @@ void main() {
       depth: 8,
       registerMaster: registerMaster,
     );
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
     final sCyc = Logic(name: 's_cyc');
@@ -229,7 +260,7 @@ void main() {
     return done;
   }
 
-  for (final ratio in const [(s: 40, m: 12), (s: 10, m: 25), (s: 12, m: 12)]) {
+  for (final ratio in const [(s: 40, m: 12), (s: 10, m: 26), (s: 12, m: 12)]) {
     for (final ackDelay in const [1, 4]) {
       test('FIFO hammer s=${ratio.s} m=${ratio.m} ack=$ackDelay', () async {
         final done = await hammer(
@@ -250,7 +281,7 @@ void main() {
     required bool postedWrites,
     required int n,
     int sPeriod = 50,
-    int mPeriod = 13,
+    int mPeriod = 14,
     int ackDelay = 6,
     bool registerMaster = false,
   }) async {
@@ -263,8 +294,8 @@ void main() {
       postedWrites: postedWrites,
       registerMaster: registerMaster,
     );
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
     final sCyc = Logic(name: 's_cyc');
@@ -428,14 +459,14 @@ void main() {
     test('write then read crosses domains', () async {
       await runXfer(sPeriod: 40, mPeriod: 10, registerMaster: true);
       await Simulator.reset();
-      await runXfer(sPeriod: 10, mPeriod: 25, registerMaster: true);
+      await runXfer(sPeriod: 10, mPeriod: 26, registerMaster: true);
     });
 
     // An ACK of 0 holds ACK high while CYC is high, so a late CYC drop would
     // show as a second transfer.
     for (final ratio in const [
       (s: 40, m: 10),
-      (s: 10, m: 25),
+      (s: 10, m: 26),
       (s: 12, m: 12),
     ]) {
       for (final ackDelay in const [0, 1, 4]) {
@@ -490,8 +521,8 @@ void main() {
           useErr: useErr,
           registerMaster: true,
         );
-        final sClk = SimpleClockGenerator(sPeriod).clk;
-        final mClk = SimpleClockGenerator(mPeriod).clk;
+        final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+        final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
         final sReset = Logic(name: 's_reset');
         final mReset = Logic(name: 'm_reset');
         final sCyc = Logic(name: 's_cyc');

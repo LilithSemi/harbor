@@ -69,7 +69,7 @@ Future<_Run> _simulate(
   int fs = 2,
 }) async {
   const pixelPeriod = 14;
-  final pixelClk = SimpleClockGenerator(pixelPeriod).clk;
+  final pixelClk = SimpleClockGenerator(pixelPeriod + (pixelPeriod & 1)).clk;
   final sysClk = SimpleClockGenerator(6).clk;
   final pixelReset = Logic(name: 'pixel_reset');
   final sysReset = Logic(name: 'sys_reset');

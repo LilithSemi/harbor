@@ -33,7 +33,8 @@ class HarborImsic extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// Base address for this hart's IMSIC.
   final int baseAddress;
 

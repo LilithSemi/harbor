@@ -3,6 +3,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:harbor/harbor.dart';
+import 'package:harbor/src/bus/fabric_util.dart' show harborSimWatch, simHigh;
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
@@ -593,6 +594,15 @@ void main() {
       );
       await stage.build();
       expect(stage.definitionName, 'HarborPcieStreamRegister_W$width');
+      // The data flops take no reset, so X may show only while valid is low.
+      harborSimWatch(clk, reset, () {
+        if (!down.valid.value.isValid) return 'down valid is X';
+        if (!simHigh(down.valid)) return null;
+        for (final f in [down.data, down.keep, down.last, down.user]) {
+          if (!f.value.isValid) return 'down ${f.name} is X with valid';
+        }
+        return null;
+      });
       final driver = PcieStreamDriver(
         clk: clk,
         stream: up,

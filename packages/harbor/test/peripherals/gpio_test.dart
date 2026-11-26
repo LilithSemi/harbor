@@ -13,6 +13,7 @@ const _dir = 0x10;
 const _irqEn = 0x18;
 const _irqStatus = 0x20;
 const _irqEdge = 0x28;
+const _irqFall = 0x30;
 
 void main() {
   group('HarborGpio', () {
@@ -37,6 +38,18 @@ void main() {
       expect(dt.reg.start, equals(0x10001000));
       expect(dt.properties['ngpios'], equals(8));
       expect(dt.properties['gpio-controller'], equals(true));
+    });
+
+    test('DT node has no sifive compatible and names a label', () {
+      final gpio = HarborGpio(baseAddress: 0x10001000);
+      expect(gpio.dtNode.compatible, equals(['harbor,gpio']));
+      expect(gpio.dtNode.label, equals('gpio'));
+      expect(gpio.dtNode.interruptDomainCells, equals(2));
+      expect(
+        gpio.dtNode.properties.containsKey('interrupt-controller'),
+        isFalse,
+      );
+      expect(gpio.acpiDevice.properties['compatible'], equals(['harbor,gpio']));
     });
 
     test('supports TileLink protocol', () {
@@ -138,6 +151,63 @@ void _registerTests(HarborFabricKind kind) {
       await clk.nextPosedge;
       await busWrite(_irqStatus, 0xffffffff);
       expect(await busRead(_irqStatus), equals(0));
+      await Simulator.endSimulation();
+    });
+
+    // Moves pin 0 to [level], waits a few clocks and reads IRQ_STATUS[0].
+    Future<int> pinStep(int level) async {
+      pins.inject(level);
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      await clk.nextPosedge;
+      return (await busRead(_irqStatus)) & 1;
+    }
+
+    test('IRQ_FALL reads back what was written', () async {
+      await setUpDut();
+      await busWrite(_irqFall, 0xA5A5A5A5);
+      expect(await busRead(_irqFall), equals(0xA5A5A5A5));
+      await Simulator.endSimulation();
+    });
+
+    test('a falling edge pin triggers on the fall only', () async {
+      await setUpDut();
+      await busWrite(_irqFall, 1);
+      expect(await pinStep(1), equals(0));
+      expect(await pinStep(0), equals(1));
+      await busWrite(_irqStatus, 1);
+      expect(await pinStep(0), equals(0));
+      await Simulator.endSimulation();
+    });
+
+    test('a rising edge pin does not trigger on the fall', () async {
+      await setUpDut();
+      await busWrite(_irqEdge, 1);
+      expect(await pinStep(1), equals(1));
+      await busWrite(_irqStatus, 1);
+      expect(await pinStep(0), equals(0));
+      await Simulator.endSimulation();
+    });
+
+    test('a both edge pin triggers on each edge', () async {
+      await setUpDut();
+      await busWrite(_irqEdge, 1);
+      await busWrite(_irqFall, 1);
+      expect(await pinStep(1), equals(1));
+      await busWrite(_irqStatus, 1);
+      expect(await pinStep(1), equals(0));
+      expect(await pinStep(0), equals(1));
+      await Simulator.endSimulation();
+    });
+
+    test('a pin with neither bit set triggers on a high level', () async {
+      await setUpDut();
+      expect(await pinStep(1), equals(1));
+      await busWrite(_irqStatus, 1);
+      expect(await pinStep(1), equals(1));
+      await pinStep(0);
+      await busWrite(_irqStatus, 1);
+      expect(await pinStep(0), equals(0));
       await Simulator.endSimulation();
     });
 

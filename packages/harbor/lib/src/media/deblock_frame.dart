@@ -483,7 +483,7 @@ class HarborDeblockFrame extends BridgeModule {
       isChroma: false,
     );
     output('out') <=
-        [for (var i = width * height - 1; i >= 0; i--) gridY[i]].swizzle();
+        [for (var i = width * height - 1; i >= 0; i--) gridY[i]].concat();
 
     // chroma planes
     if (numPlanes == 3) {
@@ -504,7 +504,7 @@ class HarborDeblockFrame extends BridgeModule {
           isChroma: true,
         );
         output('out_$plane') <=
-            [for (var i = cw * ch - 1; i >= 0; i--) grid[i]].swizzle();
+            [for (var i = cw * ch - 1; i >= 0; i--) grid[i]].concat();
       }
     }
   }

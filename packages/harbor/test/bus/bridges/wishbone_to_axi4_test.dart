@@ -4,14 +4,41 @@ import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
 
+/// Convenience names for the channels of an AXI4 read cluster.
+extension on Axi4ReadCluster {
+  Logic get arValid => arIntf.valid;
+  Logic get arReady => arIntf.ready;
+  Logic get arAddr => arIntf.addr;
+  Logic? get arSize => arIntf.size;
+  Logic get rValid => rIntf.valid;
+  Logic get rReady => rIntf.ready;
+  Logic get rData => rIntf.data;
+  Logic? get rResp => rIntf.resp;
+}
+
+/// Convenience names for the channels of an AXI4 write cluster.
+extension on Axi4WriteCluster {
+  Logic get awValid => awIntf.valid;
+  Logic get awReady => awIntf.ready;
+  Logic get awAddr => awIntf.addr;
+  Logic? get awSize => awIntf.size;
+  Logic get wValid => wIntf.valid;
+  Logic get wReady => wIntf.ready;
+  Logic get wData => wIntf.data;
+  Logic get wStrb => wIntf.strb;
+  Logic get bValid => bIntf.valid;
+  Logic get bReady => bIntf.ready;
+  Logic? get bResp => bIntf.resp;
+}
+
 void main() {
   tearDown(() async => Simulator.reset());
 
   Future<void> withBridge(
     Future<void> Function(
       WishboneInterface wb,
-      Axi4ReadInterface axiRead,
-      Axi4WriteInterface axiWrite,
+      Axi4ReadCluster axiRead,
+      Axi4WriteCluster axiWrite,
       Logic clk,
     )
     body,
@@ -22,24 +49,21 @@ void main() {
       useErr: true,
     );
     final wb = WishboneInterface(wbConfig);
-    final axiRead = Axi4ReadInterface(
+    final axiRead = Axi4ReadCluster(
       idWidth: 0,
       addrWidth: 32,
       lenWidth: 0,
       dataWidth: 32,
-      aruserWidth: 0,
-      ruserWidth: 0,
+      userWidth: 0,
       useLock: false,
       useLast: false,
     );
-    final axiWrite = Axi4WriteInterface(
+    final axiWrite = Axi4WriteCluster(
       idWidth: 0,
       addrWidth: 32,
       lenWidth: 0,
       dataWidth: 32,
-      awuserWidth: 0,
-      wuserWidth: 0,
-      buserWidth: 0,
+      userWidth: 0,
       useLock: false,
     );
 

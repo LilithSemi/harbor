@@ -57,6 +57,7 @@ void main() {
       eng.port('dma_read_data').getsLogic(Const(0, width: 128));
       eng.port('dma_read_valid').getsLogic(Const(0));
       eng.port('dma_write_ack').getsLogic(Const(0));
+      eng.port('dma_err').getsLogic(Const(0));
       final tb = PeripheralTestBench(eng);
       await tb.init();
       // Session 0 SESS_SRC_SIZE at 0x118, SESS_WIDTH at 0x130.

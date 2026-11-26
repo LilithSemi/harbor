@@ -75,7 +75,7 @@ class HarborSgrProcUnit extends BridgeModule {
       name: 'p1',
     );
     addSubModule(pass1);
-    pass1.input('padded').srcConnection! <= sub.reversed.toList().swizzle();
+    pass1.input('padded').srcConnection! <= sub.reversed.toList().concat();
     pass1.input('s').srcConnection! <= input('s1');
     final flt1 = pass1.output('flt');
 
@@ -98,6 +98,6 @@ class HarborSgrProcUnit extends BridgeModule {
       }
     }
 
-    output('out') <= outParts.reversed.toList().swizzle();
+    output('out') <= outParts.reversed.toList().concat();
   }
 }

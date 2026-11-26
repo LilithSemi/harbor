@@ -18,6 +18,9 @@ import 'package:test/test.dart';
   HarborSdramCycles cycles,
   int k,
 ) {
+  // Every reset starts with a precharge slot of rp + 1 cycles, which a
+  // power-on fills with nop and cke low.
+  k -= cycles.rp + 1;
   final p = cycles.powerUp;
   final rp = cycles.rp;
   final mrd = cycles.mrd;
@@ -62,6 +65,8 @@ import 'package:test/test.dart';
 }
 
 int _totalEdges(HarborSdramCycles cycles) =>
+    cycles.rp +
+    1 +
     cycles.powerUp +
     3 +
     cycles.rp +
@@ -74,7 +79,7 @@ Future<void> _runTrace(int clockHz) async {
     const HarborSdramConfig.as4c16m16sb6(),
     clockHz: clockHz,
   );
-  final clk = SimpleClockGenerator(cycles.tCkPs).clk;
+  final clk = SimpleClockGenerator(cycles.tCkPs + (cycles.tCkPs & 1)).clk;
   final reset = Logic(name: 'reset')..inject(1);
   final dut = SdramInitSequencer(cycles, clk: clk, reset: reset);
   await dut.build();
@@ -122,7 +127,7 @@ void main() {
       const HarborSdramConfig.as4c16m16sb6(),
       clockHz: 125000000,
     );
-    final clk = SimpleClockGenerator(cycles.tCkPs).clk;
+    final clk = SimpleClockGenerator(cycles.tCkPs + (cycles.tCkPs & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final dut = SdramInitSequencer(cycles, clk: clk, reset: reset);
     await dut.build();

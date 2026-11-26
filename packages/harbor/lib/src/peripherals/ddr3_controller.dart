@@ -380,7 +380,7 @@ class Ddr3Controller extends Module {
     required Logic resetN,
     required Logic bank,
     required Logic addr,
-  }) => [csN, cmd3, odt, cke, resetN, bank, addr].swizzle();
+  }) => [csN, cmd3, odt, cke, resetN, bank, addr].concat();
 
   /// Command-issue (ddr3_controller.v:911-1152), reset-phase default only for
   /// now. o_phy_cmd = {cmd_d[3],cmd_d[2],cmd_d[1],cmd_d[0]}: the current ROM
@@ -533,7 +533,7 @@ class Ddr3Controller extends Module {
     final instrBank = _instruction.getRange(16, 16 + baBits);
     final instrAddr = [
       for (var i = 0; i < rowBits; i++) (i == 10 ? a10 : _instruction[i]),
-    ].rswizzle();
+    ].rconcat();
     final zeroBank = Const(0, width: baBits);
     final zeroAddr = Const(0, width: rowBits);
 
@@ -573,7 +573,7 @@ class Ddr3Controller extends Module {
     final s2LaunchWrite = s2RightRow & s2We & s2WrReady;
     final s2LaunchRead = s2RightRow & ~s2We & s2RdReady;
     final s2Launch = s2LaunchWrite | s2LaunchRead;
-    final s2Ack = [s2Aux, Const(1)].swizzle();
+    final s2Ack = [s2Aux, Const(1)].concat();
     // The stage1 checks use registers only. When stage2 is empty or issues,
     // they give the same result as a check of the next-state values.
     Logic pickS1(List<Logic> regs) => cases(
@@ -906,10 +906,8 @@ class Ddr3Controller extends Module {
     final acceptWb = wbCyc & ~oWbStall;
     final acceptCalib = ~done & ~oWbStallCalib;
     // Address field decode helper (wb or calib).
-    Logic colOf(Logic a) => [
-      a.getRange(0, colBits - clog2sr2),
-      Const(0, width: clog2sr2),
-    ].swizzle();
+    Logic colOf(Logic a) =>
+        [a.getRange(0, colBits - clog2sr2), Const(0, width: clog2sr2)].concat();
     Logic bankOf(Logic a) =>
         a.getRange(colBits - clog2sr2, baBits + colBits - clog2sr2);
     Logic rowOf(Logic a) => a.getRange(
@@ -1129,7 +1127,7 @@ class Ddr3Controller extends Module {
                               dq * b + 8 * l + 8,
                             ),
                           ),
-                    ].rswizzle(),
+                    ].rconcat(),
               // o_wb_ack_read_q: shift down; inject shiftRegQ[0] at added_read_pipe_max.
               for (var i = 1; i < maxAckDelay; i++)
                 ackReadQ[i - 1] < ackReadQ[i],
@@ -1148,7 +1146,7 @@ class Ddr3Controller extends Module {
     ]);
 
     // --- outputs ---
-    output('o_phy_cmd') <= [cmdD[3], cmdD[2], cmdD[1], cmdD[0]].swizzle();
+    output('o_phy_cmd') <= [cmdD[3], cmdD[2], cmdD[1], cmdD[0]].concat();
     output('o_phy_data') <= s2Data[depth - 1];
     output('o_phy_dm') <= s2Dm[depth - 1];
     output('o_wb_stall') <= oWbStall;
@@ -1225,7 +1223,7 @@ class Ddr3Controller extends Module {
       Const(0, width: params.rowBits - 11),
       Const(0), // A10 = 0
       col.getRange(0, 10),
-    ].swizzle(),
+    ].concat(),
   );
 
   Logic _actCmd(Logic bank, Logic row, Logic odt, Logic cke, Logic resetN) =>
@@ -1251,7 +1249,7 @@ class Ddr3Controller extends Module {
           Const(0, width: params.rowBits - 11),
           Const(0), // A10 = 0 (single-bank precharge)
           row.getRange(0, 10),
-        ].swizzle(),
+        ].concat(),
       );
 
   // Reset-sequence registers, exposed for the sim testbench.
@@ -1601,15 +1599,22 @@ class Ddr3Controller extends Module {
       conditionalType: ConditionalType.unique,
     );
 
-    final dqsRefByte = laneSlice(bitslipReference, 8);
-    final dqsByte = laneSlice(iserdesDqs, 8);
+    // The lane-selected samples are registered. The ISERDES samples sit far
+    // from the controller, so the calibration decisions read the flops.
+    final dqsRefByte = Logic(name: 'dqs_ref_byte', width: 8);
+    final dqsByte = Logic(name: 'dqs_byte', width: 8);
+    Sequential(clk, [
+      dqsRefByte < laneSlice(bitslipReference, 8),
+      dqsByte < laneSlice(iserdesDqs, 8),
+    ]);
     final dqsTargetIndexValue = mux(
       dqsStartIndexStored[0],
       dqsStartIndexStored + 2,
       dqsStartIndexStored + 1,
     );
-    // MPR-read data latency: READ_DELAY(1) + issue/ISERDES pipeline (1310-1319).
-    const readCalDelay = 4;
+    // MPR-read data latency: READ_DELAY(1) + issue/ISERDES pipeline (1310-1319)
+    // + the dqsByte register.
+    const readCalDelay = 5;
     // dqs_store[dqs_start_index +: 10]: a variable 10-bit window (zero-extended
     // so a scan near the top pads with 0, matching Verilog +:).
     final dqsWindow =
@@ -1620,7 +1625,7 @@ class Ddr3Controller extends Module {
     Logic gatherLane(int l) => [
       for (var b = 7; b >= 0; b--)
         readDataStore.getRange(dq * b + 8 * l, dq * b + 8 * l + 8),
-    ].swizzle();
+    ].concat();
     final readGather = cases(
       laneReg,
       {for (var l = 0; l < lanes; l++) Const(l, width: laneW): gatherLane(l)},
@@ -1838,6 +1843,7 @@ class Ddr3Controller extends Module {
                               width: 6,
                             ),
                         laneReg < Const(0, width: laneW),
+                        trainDelay < Const(1, width: 4),
                         for (var l = 0; l < lanes; l++) ...[
                           oOdelayDataLd[l] < Const(1),
                           oOdelayDqsLd[l] < Const(1),
@@ -1871,7 +1877,7 @@ class Ddr3Controller extends Module {
                     orElse: [
                       for (var l = 0; l < lanes; l++)
                         If(laneReg.eq(l), then: [oBitslip[l] < Const(1)]),
-                      trainDelay < Const(3, width: 4),
+                      trainDelay < Const(4, width: 4),
                     ],
                   ),
                 ],
@@ -1897,7 +1903,7 @@ class Ddr3Controller extends Module {
                       [
                         dqsByte,
                         dqsStore.getRange(8, _storedDqsSize * 8),
-                      ].swizzle(),
+                      ].concat(),
                   dqsCountRepeat < dqsCountRepeat + 1,
                   If(
                     dqsCountRepeat.eq(_storedDqsSize - 1),
@@ -1922,8 +1928,11 @@ class Ddr3Controller extends Module {
                         dqsStartIndexRepeat + 1,
                         Const(0, width: 1),
                       ),
+                  // The counter holds the earlier matches only. The current
+                  // start index must also match before calibration continues.
                   If(
-                    dqsStartIndexRepeat.eq(_repeatDqsAnalyze),
+                    dqsStartIndex.eq(dqsStartIndexStored) &
+                        dqsStartIndexRepeat.eq(_repeatDqsAnalyze),
                     then: [
                       initialDqs < Const(0),
                       dqsStartIndexRepeat < Const(0),
@@ -1966,7 +1975,7 @@ class Ddr3Controller extends Module {
                         // ddr3_controller.v:2682-2683): a lane needs at most
                         // one extra controller-clock cycle of read pipe.
                         addedReadPipe[l] <
-                            mux(
+                            mux<Logic>(
                               (dqTargetIndex[l].getRange(4, 6).zeroExtend(4) +
                                       dqTargetIndex[l]
                                           .getRange(0, 4)
@@ -1981,6 +1990,7 @@ class Ddr3Controller extends Module {
                                 dqTargetIndex[l].getRange(0, 3)),
                       ],
                     ),
+                  trainDelay < Const(1, width: 4),
                   state < Const(_stBitslipTrain2, width: 6),
                 ],
                 orElse: [
@@ -2017,6 +2027,7 @@ class Ddr3Controller extends Module {
                           ],
                           orElse: [
                             laneReg < laneReg + 1,
+                            trainDelay < Const(1, width: 4),
                             state < Const(_stBitslipTrain1, width: 6),
                           ],
                         )
@@ -2042,7 +2053,7 @@ class Ddr3Controller extends Module {
                     orElse: [
                       for (var l = 0; l < lanes; l++)
                         If(laneReg.eq(l), then: [oBitslip[l] < Const(1)]),
-                      trainDelay < Const(3, width: 4),
+                      trainDelay < Const(4, width: 4),
                     ],
                   ),
                 ],
@@ -2191,7 +2202,7 @@ class Ddr3Controller extends Module {
                         [
                           for (var l = lanes - 1; l >= 0; l--)
                             gatherLane(l).eq(writePattern.getRange(0, 64)),
-                        ].swizzle(),
+                        ].concat(),
                     levelWait! < Const(readLevelWaitTicks, width: 6),
                     state < Const(_stReadLevelWait, width: 6),
                   ],
@@ -2261,7 +2272,7 @@ class Ddr3Controller extends Module {
       output('o_phy_read_level_check') <= levelCheck!;
       output('o_phy_read_level_pass') <= levelPass!;
       if (runtimeTrainable) {
-        output('o_phy_read_clk_sel') <= _rtClkSel!.rswizzle();
+        output('o_phy_read_clk_sel') <= _rtClkSel!.rconcat();
       }
     }
     if (runtimeTrainable) {
@@ -2269,13 +2280,13 @@ class Ddr3Controller extends Module {
       // Each APPLY that commits the bitslip knob drives one strobe cycle,
       // one slip per APPLY, on both PHY paths.
       output('o_phy_bitslip') <=
-          mux(active, _rtBitslipStep!.rswizzle(), oBitslip.rswizzle());
+          mux(active, _rtBitslipStep!.rconcat(), oBitslip.rconcat());
       output('o_phy_idelay_data_ld') <=
-          mux(active, _rtIdelayLd!.rswizzle(), oIdelayDataLd.rswizzle());
-      output('o_phy_idelay_dqs_ld') <= oIdelayDqsLd.rswizzle();
+          mux(active, _rtIdelayLd!.rconcat(), oIdelayDataLd.rconcat());
+      output('o_phy_idelay_dqs_ld') <= oIdelayDqsLd.rconcat();
       output('o_phy_odelay_data_ld') <=
-          mux(active, _rtOdelayLd!.rswizzle(), oOdelayDataLd.rswizzle());
-      output('o_phy_odelay_dqs_ld') <= oOdelayDqsLd.rswizzle();
+          mux(active, _rtOdelayLd!.rconcat(), oOdelayDataLd.rconcat());
+      output('o_phy_odelay_dqs_ld') <= oOdelayDqsLd.rconcat();
       output('o_phy_write_leveling_calib') <=
           mux(active, laneSlice5(_rtWlevel!, _rtLaneSel!, laneW), oWlCalib);
       output('o_phy_odelay_data_cntvaluein') <=
@@ -2295,11 +2306,11 @@ class Ddr3Controller extends Module {
       output('o_phy_idelay_dqs_cntvaluein') <=
           laneSlice5(idelayDqsCnt, laneReg, laneW);
     } else {
-      output('o_phy_bitslip') <= oBitslip.rswizzle();
-      output('o_phy_idelay_data_ld') <= oIdelayDataLd.rswizzle();
-      output('o_phy_idelay_dqs_ld') <= oIdelayDqsLd.rswizzle();
-      output('o_phy_odelay_data_ld') <= oOdelayDataLd.rswizzle();
-      output('o_phy_odelay_dqs_ld') <= oOdelayDqsLd.rswizzle();
+      output('o_phy_bitslip') <= oBitslip.rconcat();
+      output('o_phy_idelay_data_ld') <= oIdelayDataLd.rconcat();
+      output('o_phy_idelay_dqs_ld') <= oIdelayDqsLd.rconcat();
+      output('o_phy_odelay_data_ld') <= oOdelayDataLd.rconcat();
+      output('o_phy_odelay_dqs_ld') <= oOdelayDqsLd.rconcat();
       output('o_phy_write_leveling_calib') <= oWlCalib;
       output('o_phy_odelay_data_cntvaluein') <=
           laneSlice5(odelayDataCnt, laneReg, laneW);
@@ -2315,7 +2326,7 @@ class Ddr3Controller extends Module {
     // Words 2/3 = the lane-0 read-data gather (what ANALYZE_DATA compares).
     final gather0 = [
       for (var b = 7; b >= 0; b--) readDataStore.getRange(dq * b, dq * b + 8),
-    ].swizzle();
+    ].concat();
     final match0 = writePattern.getRange(0, 64).eq(gather0);
     // Debug word 1 (IDLE-gate diagnostic): [5:0]=state, [6]=reset_done,
     // [7]=idelayctrl_rdy, [12:8]=instruction_address, [13]=match0. The two
@@ -2333,7 +2344,7 @@ class Ddr3Controller extends Module {
           idelayctrlRdy,
           _resetDone,
           state,
-        ].swizzle();
+        ].concat();
     // Words 2/3 = the sticky-latched BIST read gather vs expected window (lane
     // in laneReg at capture); low 32 bits of each. capValid = debug1[17].
     output('o_debug2') <= capRead.getRange(0, 32);
@@ -2646,7 +2657,7 @@ class Ddr3Controller extends Module {
           ] else
             Const(0, width: 7), // [7:1]
           busy, // [0] BUSY
-        ].swizzle(),
+        ].concat(),
         if (selfTrain)
           Const(wRdClkSel, width: wb2AddrBits): laneSlice5(
             rtClkSel!,
@@ -2660,7 +2671,7 @@ class Ddr3Controller extends Module {
           Const(lanes, width: 4), // [7:4] lanes
           Const(0, width: 3), // [3:1]
           active, // [0] runtimeActive
-        ].swizzle(),
+        ].concat(),
       },
       defaultValue: Const(0, width: wb2DataBits),
       conditionalType: ConditionalType.unique,

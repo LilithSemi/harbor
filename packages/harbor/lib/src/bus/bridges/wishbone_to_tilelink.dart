@@ -120,7 +120,11 @@ class WishboneToTileLinkBridge extends Module {
     // Wishbone -> TileLink Channel A. Issued once and held until A_READY.
     tl.aValid <= aValidReg;
     tl.aOpcode <=
-        mux(weReg, Const(0, width: 3), Const(4, width: 3)); // Put=0, Get=4
+        mux<Logic>(
+          weReg,
+          Const(0, width: 3),
+          Const(4, width: 3),
+        ); // Put=0, Get=4
     tl.aParam <= Const(0, width: 3);
     tl.aSize <= _sizeFromSel(selReg, config.sizeWidth);
     tl.aSource <= Const(0, width: config.sourceWidth);

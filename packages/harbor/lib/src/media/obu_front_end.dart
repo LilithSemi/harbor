@@ -98,7 +98,7 @@ class HarborObuFrontEnd extends BridgeModule {
     Logic st(int v) => Const(v, width: 3);
 
     // Byte-granular view at the cursor: bytes >> (cursor * 8).
-    final cursorShift = [cursor, Const(0, width: 3)].swizzle(); // cursor*8
+    final cursorShift = [cursor, Const(0, width: 3)].concat(); // cursor*8
     final cursorView = (bytesIn >>> cursorShift.zeroExtend(totalBits))
         .getRange(0, viewBits)
         .named('cursor_view');
@@ -109,7 +109,7 @@ class HarborObuFrontEnd extends BridgeModule {
     final obuSize = obu.output('obu_size');
 
     // Payload view: shift the cursor view past the OBU header.
-    final hdrShift = [headerLen, Const(0, width: 3)].swizzle(); // header_len*8
+    final hdrShift = [headerLen, Const(0, width: 3)].concat(); // header_len*8
     final payloadView = (cursorView >>> hdrShift.zeroExtend(viewBits))
         .getRange(0, 512)
         .named('payload_view');

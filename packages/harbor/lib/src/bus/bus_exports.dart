@@ -4,7 +4,7 @@
 export 'bus.dart';
 export 'bus_error_source.dart';
 export 'bus_master_port.dart';
-export 'bus_slave_port.dart';
+export 'bus_slave_port.dart' hide harborInnerSlavePort;
 export 'firewall.dart';
 
 // Port layer
@@ -12,7 +12,7 @@ export 'port/fabric_kind.dart';
 export 'port/dma_request_adapter.dart';
 export 'port/memory_port.dart';
 export 'port/memory_waist.dart';
-export 'port/port_cdc.dart';
+export 'port/port_cdc.dart' hide harborMarkCrossed;
 export 'port/register_waist.dart';
 export 'port/waist_arbiter.dart';
 

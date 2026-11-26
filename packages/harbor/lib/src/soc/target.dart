@@ -1,7 +1,30 @@
+import '../bus/port/fabric_kind.dart' show HarborFabricKind;
 import '../debug/jtag_remote.dart' show JtagRemote;
+import '../pdk/fab_slot.dart';
 import '../pdk/io_ring.dart';
 import '../pdk/klayout.dart';
+import '../pdk/pad_library.dart';
+import '../pdk/pad_plan.dart';
 import '../pdk/pdk_provider.dart';
+import '../pdk/sky130.dart';
+import '../pdk/standard_cell_library.dart';
+
+/// Marks a module whose registers must stay separate after flattening.
+///
+/// The module must reserve its definition name, so that the name in the
+/// output is the name the script uses. The FPGA synthesis script keeps its
+/// flops. The module stays portable ROHD.
+abstract interface class HarborPreserveRegisters {}
+
+/// A memory whose read register can go into target block RAM.
+///
+/// The register can be in the consumer. The module must reserve its
+/// definition name, so that the name in the output is the name the script
+/// uses, and contain only memories that accept a synchronous read.
+/// This is a synthesis preference. It does not change the simulated timing.
+abstract interface class HarborPreferBlockRam {
+  bool get preferBlockRam;
+}
 
 /// Build target describing whether the SoC targets an FPGA or ASIC,
 /// and which vendor/PDK to use.
@@ -20,6 +43,15 @@ sealed class HarborDeviceTarget {
   /// A null answer means the block must build the array from flops instead.
   /// Every target answers, so a new family only has to add its own case.
   HarborBlockRam? get blockRam => null;
+
+  /// The default outstanding limit of a memory port on a fabric of [kind].
+  /// Wishbone is 1. AXI4 and TileLink are 2 on a small part (Spartan-7, ECP5,
+  /// iCE40) and 8 on every other target. An explicit `outstanding:` wins.
+  int defaultOutstanding(HarborFabricKind kind) =>
+      kind == HarborFabricKind.wishbone ? 1 : (smallPart ? 2 : 8);
+
+  /// True for a part where the area of a deep outstanding queue does not fit.
+  bool get smallPart => false;
 
   const HarborDeviceTarget();
 }
@@ -71,6 +103,68 @@ enum _XilinxFamily {
   kintex7,
 }
 
+/// Bits that a [HarborBitstreamPatch] sets in one word of a frame.
+class HarborFramePatch {
+  /// Frame address.
+  final int frame;
+
+  /// Index of the 32-bit word in the frame.
+  final int word;
+
+  /// Bits that are set in the word. The other bits do not change.
+  final int orMask;
+
+  const HarborFramePatch({
+    required this.frame,
+    required this.word,
+    required this.orMask,
+  });
+
+  /// The frame address as the text of a frame file.
+  String get frameText =>
+      '0x${frame.toRadixString(16).toUpperCase().padLeft(8, '0')}';
+
+  /// The mask as 8 hex digits.
+  String get maskText =>
+      '0x${orMask.toRadixString(16).toUpperCase().padLeft(8, '0')}';
+}
+
+/// Edits that a board needs in the bitstream, which the tools do not make.
+///
+/// The openXC7 Makefile appends [fasmLines] to the FASM after nextpnr, and
+/// sets the bits of [frames] after fasm2frames. The Makefile has the patch
+/// only when the design uses [whenPin] of the board catalog.
+class HarborBitstreamPatch {
+  /// Name of the pin of the board catalog that needs the patch.
+  final String whenPin;
+
+  /// FASM lines to append.
+  final List<String> fasmLines;
+
+  /// Frame bits to set.
+  final List<HarborFramePatch> frames;
+
+  const HarborBitstreamPatch({
+    required this.whenPin,
+    this.fasmLines = const [],
+    this.frames = const [],
+  });
+
+  /// Throws an [ArgumentError] when a FASM line has a character that the
+  /// Makefile quoting does not take: a quote, a dollar sign or a line break.
+  void check() {
+    for (final line in fasmLines) {
+      if (line.contains(RegExp("['\\\$\\n\\r]"))) {
+        throw ArgumentError.value(
+          line,
+          'fasmLines',
+          "has ', \$ or a line break",
+        );
+      }
+    }
+  }
+}
+
 /// FPGA target with vendor-specific toolchain configuration.
 ///
 /// ```dart
@@ -90,6 +184,14 @@ class HarborFpgaTarget extends HarborDeviceTarget {
 
   /// Uses nextpnr's Himbächel Xilinx backend for the openXC7 flow.
   final bool useHimbaechel;
+
+  final HarborPlacer? _placer;
+
+  /// The nextpnr placer the openXC7 Makefile uses by default. It is static
+  /// with Himbächel and heap with nextpnr-xilinx, which has no static placer.
+  /// The `PLACER` Make variable overrides it.
+  HarborPlacer get placer =>
+      _placer ?? (useHimbaechel ? HarborPlacer.static_ : HarborPlacer.heap);
 
   /// Device part number (e.g., `'up5k'`, `'lfe5u-45f'`, `'xc7s50'`).
   final String device;
@@ -145,10 +247,38 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// IBUFDS, so the XDC also constrains this net.
   static const differentialClockNet = 'sysclk_diff';
 
-  /// Xilinx speed grade (`'1'`, `'2'`, `'2L'`, `'3'`). It completes the part
-  /// name that the openXC7 flow gives to prjxray, for example
-  /// `xc7a200tfbg484-2`. Other vendors ignore it.
+  /// Speed grade of the part.
+  ///
+  /// Xilinx: `'1'`, `'2'`, `'2L'`, `'3'`. It completes the part name that the
+  /// openXC7 flow gives to prjxray, for example `xc7a200tfbg484-2`.
+  /// ECP5: `'6'`, `'7'` or `'8'`, passed to nextpnr-ecp5 as `--speed`.
+  /// iCE40 has no grade. See [checkSpeedGrade].
   final String speedGrade;
+
+  /// The speed grade that a vendor uses when a target gives none.
+  static String defaultSpeedGrade(HarborFpgaVendor vendor) =>
+      vendor == HarborFpgaVendor.ecp5 ? '6' : '1';
+
+  /// Throws an [ArgumentError] if [grade] is not valid for [vendor].
+  static void checkSpeedGrade(HarborFpgaVendor vendor, String grade) {
+    final ok = switch (vendor) {
+      HarborFpgaVendor.ecp5 => const {'6', '7', '8'}.contains(grade),
+      HarborFpgaVendor.ice40 => grade == '1',
+      HarborFpgaVendor.vivado ||
+      HarborFpgaVendor.openXc7 => RegExp(r'^[1-3][A-Z]*$').hasMatch(grade),
+    };
+    if (!ok) {
+      throw ArgumentError.value(
+        grade,
+        'speedGrade',
+        'is not a valid speed grade for ${vendor.name}',
+      );
+    }
+  }
+
+  /// Edits that the openXC7 Makefile makes to the FASM and the frames of a
+  /// design. A patch is in the Makefile only when [pinMap] has its pin.
+  final List<HarborBitstreamPatch> bitstreamPatches;
 
   /// Optional bitstream programming command for a `prog` Makefile target
   /// (e.g. `'openFPGALoader -b ulx3s \$(TOP).bit'`). When null, no `prog`
@@ -161,9 +291,22 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   /// Xilinx family only has to set this field.
   final _XilinxFamily? _xilinxFamily;
 
+  @override
+  bool get smallPart =>
+      vendor == HarborFpgaVendor.ecp5 ||
+      vendor == HarborFpgaVendor.ice40 ||
+      _xilinxFamily == _XilinxFamily.spartan7;
+
   /// Runs the full `synth_ecp5`, including its `autoname` pass. Other
   /// vendors ignore it.
   final bool ecp5Autoname;
+
+  /// Optional cost for the open-XC7 Xilinx LUT6 cells during ABC9 mapping.
+  ///
+  /// When set, Yosys maps the design into 6-input LUTs without MUXF7/MUXF8
+  /// cells, and this positive value overrides the LUT6 area cost used by
+  /// ABC9. Null keeps the standard `synth_xilinx` flow unchanged.
+  final int? xilinxLut6Cost;
 
   /// Whether this FPGA supports eFuse OTP storage.
   ///
@@ -215,11 +358,17 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
     this.clockNPortName,
-    this.speedGrade = '1',
+    String? speedGrade,
     this.progCommand,
     this.ecp5Autoname = false,
+    this.xilinxLut6Cost,
     this.useHimbaechel = false,
-  }) : assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
+    HarborPlacer? placer,
+    this.bitstreamPatches = const [],
+  }) : _placer = placer,
+       speedGrade = speedGrade ?? (vendor == HarborFpgaVendor.ecp5 ? '6' : '1'),
+       assert(xilinxLut6Cost == null || xilinxLut6Cost > 0),
+       assert(!useHimbaechel || vendor == HarborFpgaVendor.openXc7),
        _xilinxFamily = null;
 
   /// iCE40 UP5K target using Yosys + nextpnr-ice40.
@@ -231,13 +380,16 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
     this.progCommand,
-  }) : name = 'ice40-$device',
+  }) : bitstreamPatches = const [],
+       name = 'ice40-$device',
        vendor = HarborFpgaVendor.ice40,
        _xilinxFamily = null,
        clockNPortName = null,
        speedGrade = '1',
        useHimbaechel = false,
-       ecp5Autoname = false;
+       _placer = null,
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Lattice ECP5 target using Yosys + nextpnr-ecp5.
   const HarborFpgaTarget.ecp5({
@@ -247,14 +399,17 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.pinMap = const {},
     this.extraConstraints = const {},
     this.clockPortName = 'clk',
+    this.speedGrade = '6',
     this.progCommand,
     this.ecp5Autoname = false,
-  }) : name = 'ecp5-$device',
+  }) : bitstreamPatches = const [],
+       name = 'ecp5-$device',
        vendor = HarborFpgaVendor.ecp5,
        clockNPortName = null,
-       speedGrade = '1',
        useHimbaechel = false,
-       _xilinxFamily = null;
+       _placer = null,
+       _xilinxFamily = null,
+       xilinxLut6Cost = null;
 
   /// Xilinx Spartan-7 target using Vivado or openXC7.
   ///
@@ -272,12 +427,17 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
-  }) : name = 'spartan7-$device',
+    HarborPlacer? placer,
+    this.xilinxLut6Cost,
+    this.bitstreamPatches = const [],
+  }) : _placer = placer,
+       name = 'spartan7-$device',
        vendor = useOpenXc7 || useHimbaechel
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.spartan7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       assert(xilinxLut6Cost == null || xilinxLut6Cost > 0);
 
   /// Xilinx Artix-7 target using Vivado or openXC7.
   ///
@@ -295,12 +455,16 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
-  }) : name = 'artix7-$device',
+    HarborPlacer? placer,
+    this.bitstreamPatches = const [],
+  }) : _placer = placer,
+       name = 'artix7-$device',
        vendor = useOpenXc7 || useHimbaechel
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.artix7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Xilinx Kintex-7 target using Vivado or openXC7.
   ///
@@ -318,12 +482,16 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     this.progCommand,
     bool useOpenXc7 = false,
     this.useHimbaechel = false,
-  }) : name = 'kintex7-$device',
+    HarborPlacer? placer,
+    this.bitstreamPatches = const [],
+  }) : _placer = placer,
+       name = 'kintex7-$device',
        vendor = useOpenXc7 || useHimbaechel
            ? HarborFpgaVendor.openXc7
            : HarborFpgaVendor.vivado,
        _xilinxFamily = _XilinxFamily.kintex7,
-       ecp5Autoname = false;
+       ecp5Autoname = false,
+       xilinxLut6Cost = null;
 
   /// Yosys synthesis target string for this FPGA family.
   String get _yosysSynthTarget => switch (vendor) {
@@ -386,7 +554,15 @@ class HarborFpgaTarget extends HarborDeviceTarget {
   ///
   /// Produces a JSON netlist for nextpnr (iCE40/ECP5) or a
   /// Verilog netlist for Vivado/openXC7.
-  String generateYosysTcl(String topCell, {List<String> svFiles = const []}) {
+  ///
+  /// [blockRamModules] and [preserveRegisterModules] are definition names of
+  /// [HarborPreferBlockRam] and [HarborPreserveRegisters] modules.
+  String generateYosysTcl(
+    String topCell, {
+    List<String> svFiles = const [],
+    List<String> preserveRegisterModules = const [],
+    List<String> blockRamModules = const [],
+  }) {
     final buf = StringBuffer();
     buf.writeln('# Auto-generated Yosys synthesis for $name');
     buf.writeln('# Target: ${_yosysSynthTarget} ($device)');
@@ -399,6 +575,27 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       buf.writeln('read_verilog -sv rtl/*.sv');
     }
     buf.writeln('hierarchy -top $topCell');
+
+    // Set the attributes before flatten removes the module names. Yosys
+    // then moves the read register into the block RAM.
+    final ident = RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$');
+    for (final module in blockRamModules.toSet()) {
+      if (!ident.hasMatch(module)) {
+        throw ArgumentError.value(module, 'blockRamModules');
+      }
+      buf.writeln('select -assert-any $module/m:*');
+      buf.writeln('setattr -set ram_style "block" $module/m:*');
+    }
+    for (final module in preserveRegisterModules.toSet()) {
+      if (!ident.hasMatch(module)) {
+        throw ArgumentError.value(module, 'preserveRegisterModules');
+      }
+      // opt_merge reads the keep flag of the cell, not of its output wire.
+      buf.writeln('select -assert-any $module');
+      buf.writeln('proc $module');
+      buf.writeln('select -assert-any $module/t:\$*ff*');
+      buf.writeln('setattr -set keep 1 $module/t:\$*ff*');
+    }
 
     switch (vendor) {
       case HarborFpgaVendor.ice40:
@@ -428,7 +625,32 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         // has caused unrelated issues before, so it is NOT used here. De-congest
         // that path a targeted way instead (register-duplicate s2_bank with a
         // synth-flow keep, or floorplan the controller).
-        buf.writeln('synth_xilinx -top $topCell -flatten');
+        final lut6Cost = xilinxLut6Cost;
+        if (lut6Cost == null) {
+          buf.writeln('synth_xilinx -top $topCell -flatten');
+        } else {
+          // This staged flow lets ABC9 run before Xilinx LUT mapping. The
+          // abc9_lut cell attribute supplies the custom LUT6 cost. Keep the
+          // `=LUT6` selector on setattr: ordinary selection patterns exclude
+          // library modules and would leave their mapping cost unchanged.
+          buf.writeln(
+            'synth_xilinx -top $topCell -flatten -run begin:map_luts',
+          );
+          buf.writeln('select -assert-any =LUT6');
+          buf.writeln('setattr -mod -set abc9_lut $lut6Cost =LUT6');
+          buf.writeln('select -assert-any =LUT6 =A:abc9_lut=$lut6Cost %i');
+          buf.writeln('opt_expr -mux_undef -noclkinv');
+          buf.writeln('abc9 -maxlut 6');
+          buf.writeln('clean');
+          buf.writeln('xilinx_srl -fixed -minlen 3');
+          buf.writeln(
+            'techmap -map +/xilinx/lut_map.v -map +/xilinx/cells_map.v '
+            '-D LUT_WIDTH=6',
+          );
+          buf.writeln('xilinx_dffopt');
+          buf.writeln('opt_lut_ins -tech xilinx');
+          buf.writeln('synth_xilinx -top $topCell -run finalize:');
+        }
         buf.writeln('write_json $topCell.json');
     }
 
@@ -458,8 +680,10 @@ class HarborFpgaTarget extends HarborDeviceTarget {
             '--asc $topCell.asc'
             '${frequency > 0 ? " --freq ${(frequency / 1e6).toStringAsFixed(0)}" : ""}';
       case HarborFpgaVendor.ecp5:
+        checkSpeedGrade(vendor, speedGrade);
         final ecp5Size = _ecp5DeviceSize(device);
         return 'nextpnr-ecp5 --$ecp5Size --package $package '
+            '--speed $speedGrade '
             '--json $topCell.json '
             '--lpf $topCell.lpf '
             '--textcfg $topCell.config'
@@ -680,22 +904,29 @@ class HarborFpgaTarget extends HarborDeviceTarget {
 
   /// Generates the nextpnr-xilinx `--pre-pack` clock over-constraint
   /// (`support/nextpnr/clocks.py`). nextpnr-xilinx does not propagate the XDC
-  /// `create_clock` through a PLLE2/MMCM or BUFG, so every derived clock (the
-  /// core net `O`, the DDR controller net `ddr_clk`) reaches the timing engine
-  /// UNCONSTRAINED - zero margin, setup-only, single-corner. addClock at a rate
-  /// ABOVE the real one restores a timing budget: it drives timing-aware
+  /// `create_clock` through a PLLE2/MMCM or BUFG, so the named oscillator/core
+  /// aliases and DDR controller net reach the timing engine UNCONSTRAINED -
+  /// zero margin, setup-only, single-corner. addClock restores a timing budget:
+  /// the core and DDR are added ABOVE their real rates, while the source is
+  /// added at its actual rate. This drives timing-aware
   /// placement/routing to prioritise these paths and surfaces true silicon
   /// margin as an honest WNS. The core is over-constrained modestly (it already
   /// runs well under its routing ceiling); the DDR controller carries the larger
   /// margin because it is far more slack-critical per cycle.
   String generateClockConstraintPy({
     required double coreClkMhz,
+    required String coreClockNet,
+    required String sourceClockNet,
+    required double sourceClkMhz,
     required double ddrCtrlMhz,
+    Map<String, double> extraClocks = const {},
   }) {
     final coreTarget = (coreClkMhz * 1.4);
     final ddrTarget = (ddrCtrlMhz * 1.25);
     final buf = StringBuffer();
-    buf.writeln('# --pre-pack over-constraint for the PLL/BUFG-derived clocks');
+    buf.writeln(
+      '# --pre-pack over-constraint for source and PLL/BUFG-derived clocks',
+    );
     buf.writeln(
       '# that nextpnr-xilinx leaves UNCONSTRAINED (create_clock does',
     );
@@ -706,7 +937,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     );
     buf.writeln('for net, mhz in [');
     buf.writeln(
-      "    ('O', ${coreTarget.toStringAsFixed(2)}),"
+      "    ('$sourceClockNet', ${sourceClkMhz.toStringAsFixed(2)}),"
+      '  # board oscillator, real ~${sourceClkMhz.toStringAsFixed(1)} MHz',
+    );
+    buf.writeln(
+      "    ('$coreClockNet', ${coreTarget.toStringAsFixed(2)}),"
       '  # core, real ~${coreClkMhz.toStringAsFixed(1)} MHz',
     );
     buf.writeln(
@@ -719,8 +954,55 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     buf.writeln("        print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
     buf.writeln('    except Exception as e:');
     buf.writeln("        print('ADDCLOCK %s FAILED: %s' % (net, e))");
+    if (extraClocks.isNotEmpty) {
+      buf.writeln();
+      buf.write(_netCheckPy);
+      buf.writeln('# Clocks of the devices. A missing net stops the build.');
+      buf.writeln('for net, mhz in [');
+      for (final e in extraClocks.entries) {
+        buf.writeln("    ('${e.key}', ${e.value.toStringAsFixed(2)}),");
+      }
+      buf.writeln(']:');
+      buf.writeln('    require_net(net)');
+      buf.writeln('    ctx.addClock(net, mhz)');
+      buf.writeln("    print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
+    }
     return buf.toString();
   }
+
+  /// Generates `support/nextpnr/pll_clocks.py` for a design with PLL clocks
+  /// and no DDR3 tree. Each net in [mhzByNet] gets an `addClock` at its real
+  /// rate, because nextpnr gives a clock that comes from a MMCM and a BUFG a
+  /// default 12 MHz target.
+  ///
+  /// nextpnr only warns when `addClock` gets a net that is not in the design,
+  /// and then it keeps its default target. The script looks each net up first
+  /// and stops the build when a net is missing.
+  String generatePllClockConstraintPy(Map<String, double> mhzByNet) {
+    final buf = StringBuffer(_netCheckPy);
+    buf.writeln('for net, mhz in [');
+    for (final e in mhzByNet.entries) {
+      buf.writeln("    ('${e.key}', ${e.value.toStringAsFixed(2)}),");
+    }
+    buf.writeln(']:');
+    buf.writeln('    require_net(net)');
+    buf.writeln('    ctx.addClock(net, mhz)');
+    buf.writeln("    print('ADDCLOCK %s -> %.2f MHz' % (net, mhz))");
+    return buf.toString();
+  }
+
+  /// Python that defines `require_net`. It raises when `ctx.getNetByAlias`,
+  /// the lookup that `addClock` uses, finds no net of the name or fails.
+  static const _netCheckPy = '''
+def require_net(net):
+    try:
+        found = ctx.getNetByAlias(net) is not None
+    except Exception:
+        found = False
+    if not found:
+        raise Exception("net '%s' does not exist in design" % net)
+
+''';
 
   /// Generates the nextpnr-xilinx `--pre-route` BEL-placement diagnostic
   /// (`support/nextpnr/show_bels.py`) for the openXC7 DDR3 flow. It prints
@@ -740,8 +1022,46 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     return buf.toString();
   }
 
+  /// Throws when a KC705 class part (xc7k325t, ffg900) has the PCIe reference
+  /// clock pin in the design and no patch. The tools do not set the inter-quad
+  /// reference clock path of this part, and the link does not come up without
+  /// it. A target that a caller rebuilds from a board drops the patches.
+  void _checkKc705RefclkPatch(
+    List<HarborBitstreamPatch> patches,
+    Set<String>? knownPorts,
+  ) {
+    const pin = 'pcie_refclk_p';
+    if (vendor != HarborFpgaVendor.openXc7 ||
+        device.toLowerCase() != 'xc7k325t' ||
+        package.toLowerCase() != 'ffg900' ||
+        !pinMap.containsKey(pin) ||
+        !_emitPin(pin, knownPorts) ||
+        patches.isNotEmpty) {
+      return;
+    }
+    throw StateError(
+      'The design has $pin on $device-$package and the target has no '
+      'bitstream patch for the PCIe reference clock. Build the target with '
+      'HarborBoard.fpgaTarget, which also takes extraConstraints, or pass '
+      'bitstreamPatches.',
+    );
+  }
+
   /// Generates a complete Makefile for the FPGA build flow.
-  String generateMakefile(String topCell) {
+  ///
+  /// With [pllClockScript], an openXC7 Makefile also takes
+  /// `support/nextpnr/pll_clocks.py` as a `--pre-pack` script. That script
+  /// has no `--timing-allow-fail`, so a missed clock fails the build.
+  ///
+  /// [knownPorts] is the set of top-level port base names of the design. A
+  /// [bitstreamPatches] entry is in the Makefile only when the design has its
+  /// pin, with the rule of [generateConstraints]. With null the design is
+  /// taken to have every pin of [pinMap].
+  String generateMakefile(
+    String topCell, {
+    bool pllClockScript = false,
+    Set<String>? knownPorts,
+  }) {
     final buf = StringBuffer();
     buf.writeln('# Auto-generated Makefile for $name');
     buf.writeln('TOP = $topCell');
@@ -810,6 +1130,13 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       // fasm2frames / xc7frames2bit are assumed on
       // PATH in the dev shell; the data files come from Make variables the
       // caller (nix/user) can override with `?=`.
+      if (placer == HarborPlacer.static_ && !useHimbaechel) {
+        throw ArgumentError.value(
+          placer,
+          'placer',
+          'the static placer needs useHimbaechel',
+        );
+      }
       buf.writeln();
       buf.writeln(
         '# openXC7 (${useHimbaechel ? 'Himbächel' : 'nextpnr-xilinx'} + '
@@ -844,13 +1171,14 @@ class HarborFpgaTarget extends HarborDeviceTarget {
       );
       buf.writeln('THREADS ?= \$(shell nproc)');
       buf.writeln(
-        '# nextpnr placer: heap (analytical, default) or sa (annealing). heap is',
+        '# nextpnr placer: static (default with Himbaechel), heap or sa. '
+        'static gives much shorter wires',
       );
       buf.writeln(
-        '# usually better on dense designs but its legalization is single-'
-        'threaded and slow; sa is an alternative when heap stalls.',
+        '# than heap on dense designs. heap is analytical and its '
+        'legalization is single-threaded.',
       );
-      buf.writeln('PLACER ?= heap');
+      buf.writeln('PLACER ?= ${placer.nextpnrName}');
       if (useHimbaechel) {
         buf.writeln('ROUTER ?= router2');
       } else {
@@ -878,17 +1206,33 @@ class HarborFpgaTarget extends HarborDeviceTarget {
           '--pre-route support/nextpnr/show_bels.py,)',
         );
       }
-      buf.writeln(
-        '# --pre-pack over-constrains the PLL/BUFG-derived clocks (which',
-      );
-      buf.writeln(
-        '# nextpnr leaves unconstrained); --timing-allow-fail still writes a',
-      );
-      buf.writeln('# bitstream when the aggressive target is not met.');
-      buf.writeln(
-        'PREPACK := \$(if \$(wildcard support/nextpnr/clocks.py),'
-        '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
-      );
+      // Himbächel has no Python, so the XDC carries its clocks.
+      if (!useHimbaechel) {
+        buf.writeln(
+          '# --pre-pack over-constrains the PLL/BUFG-derived clocks (which',
+        );
+        buf.writeln(
+          '# nextpnr leaves unconstrained); --timing-allow-fail still writes a',
+        );
+        buf.writeln('# bitstream when the aggressive target is not met.');
+        buf.writeln(
+          pllClockScript
+              ? 'PREPACK := \$(if \$(wildcard support/nextpnr/pll_clocks.py),'
+                    '--pre-pack support/nextpnr/pll_clocks.py,)'
+              : 'PREPACK := \$(if \$(wildcard support/nextpnr/clocks.py),'
+                    '--pre-pack support/nextpnr/clocks.py --timing-allow-fail,)',
+        );
+      }
+      buf.writeln();
+      final patches = [
+        for (final p in bitstreamPatches)
+          if (pinMap.containsKey(p.whenPin) && _emitPin(p.whenPin, knownPorts))
+            p,
+      ];
+      _checkKc705RefclkPatch(patches, knownPorts);
+      // A failed step must not leave a file that a new run takes as up to
+      // date.
+      buf.writeln('.DELETE_ON_ERROR:');
       buf.writeln();
       buf.writeln('pnr: \$(TOP).fasm');
       buf.writeln('\$(TOP).fasm: \$(TOP).json \$(TOP).$constraintExtension');
@@ -897,9 +1241,9 @@ class HarborFpgaTarget extends HarborDeviceTarget {
           '\tnextpnr-himbaechel --device \$(PART) '
           '-o xdc=\$(TOP).$constraintExtension '
           '--json \$(TOP).json --write \$(TOP)_routed.json '
-          '-o fasm=\$(TOP).fasm \$(PREPACK) --placer \$(PLACER) '
+          '-o fasm=\$(TOP).fasm --placer \$(PLACER) '
           '--router \$(ROUTER) --threads \$(THREADS) --seed \$(SEED) '
-          '\$(PNRFLAGS)',
+          '-l \$(TOP)_pnr.log \$(PNRFLAGS)',
         );
       } else {
         buf.writeln(
@@ -907,15 +1251,31 @@ class HarborFpgaTarget extends HarborDeviceTarget {
           '--xdc \$(TOP).$constraintExtension '
           '--json \$(TOP).json --write \$(TOP)_routed.json '
           '--fasm \$(TOP).fasm \$(PREPACK) \$(PREPLACE) \$(PREROUTE) '
-          '--placer \$(PLACER) --seed \$(SEED) \$(PNRFLAGS)',
+          '--placer \$(PLACER) --seed \$(SEED) -l \$(TOP)_pnr.log '
+          '\$(PNRFLAGS)',
         );
       }
+      // nextpnr only warns when a clock constraint matches no net, and then
+      // it does not apply the constraint. addClock gives its own warning.
+      buf.writeln(
+        "\t! grep -E 'matched nothing, so the .*constraint was NOT applied|ignoring clock constraint' "
+        "\$(TOP)_pnr.log || { echo 'A clock constraint matched no net, see "
+        "\$(TOP)_pnr.log' >&2; exit 1; }",
+      );
       // nextpnr-xilinx always writes the 0.675 V internal VREF (SSTL135) for
       // a bank with SSTL inputs and ignores INTERNAL_VREF. SSTL15 needs 0.75 V.
       if (sstlVrefMv == 750) {
         buf.writeln(
           "\tsed -i 's/\\.VREF\\.V_675_MV\$\$/.VREF.V_750_MV/' \$(TOP).fasm",
         );
+      }
+      for (final patch in patches) {
+        patch.check();
+      }
+      for (final patch in patches) {
+        for (final line in patch.fasmLines) {
+          buf.writeln("\techo '$line' >> \$(TOP).fasm");
+        }
       }
       buf.writeln();
       buf.writeln('pack: \$(TOP).$bitstreamExtension');
@@ -924,6 +1284,11 @@ class HarborFpgaTarget extends HarborDeviceTarget {
         '\tfasm2frames --db-root \$(XRAY_DB)/\$(FAMILY) --part \$(PART) '
         '\$(TOP).fasm \$(TOP).frames',
       );
+      for (final patch in patches) {
+        for (final f in patch.frames) {
+          buf.writeln(_framePatchRecipe(f));
+        }
+      }
       buf.writeln('\$(TOP).$bitstreamExtension: \$(TOP).frames');
       buf.writeln(
         '\txc7frames2bit --part_file \$(XRAY_DB)/\$(FAMILY)/\$(PART)/part.yaml '
@@ -949,6 +1314,18 @@ class HarborFpgaTarget extends HarborDeviceTarget {
     );
     return buf.toString();
   }
+
+  /// The Makefile line that sets [patch] in `$(TOP).frames`. It stops the
+  /// build when the frame is not in the file.
+  static String _framePatchRecipe(HarborFramePatch patch) =>
+      '\tperl -pi -e \'if (/^${patch.frameText}\\s/i) { chomp; '
+      'my (\$\$a, \$\$w) = split / /, \$\$_, 2; '
+      'my @w = split /,/, \$\$w; '
+      '\$\$w[${patch.word}] = sprintf("0x%08X", '
+      'hex(\$\$w[${patch.word}]) | ${patch.maskText}); '
+      '\$\$_ = "\$\$a " . join(",", @w) . "\\n"; \$\$hit = 1 } '
+      'END { die "frame ${patch.frameText} is not in the frames\\n" '
+      'unless \$\$hit }\' \$(TOP).frames';
 
   /// Generates a pin constraint file in the vendor's format.
   ///
@@ -1293,15 +1670,20 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// Empty list = flat flow (no hierarchical hardening).
   final List<HarborAsicMacro> macros;
 
-  /// Margin around the die edge in um.
-  final double dieMarginUm;
+  /// Space from the PnR die edge to the core (um).
+  ///
+  /// The `CORE_MARGIN_UM` env var overrides it. With neither and a
+  /// `DIE_AREA`, the core is a square in the middle of the die, sized from
+  /// the cell area and `UTILIZATION`. With neither and no `DIE_AREA`, the
+  /// space is [defaultCoreSpaceUm].
+  final double? dieMarginUm;
+
+  /// Core space for a floorplan from `UTILIZATION` with no margin set (um).
+  static const double defaultCoreSpaceUm = 10;
 
   /// Minimum metal layer for top-level routing (skip lower layers
   /// used internally by macros to avoid DRC violations).
   final int topRoutingMinLayer;
-
-  /// IO ring configuration (null = no IO ring generation).
-  final HarborIoRing? ioRing;
 
   /// KLayout scripts configuration (null = no KLayout scripts).
   final HarborKlayoutDrcConfig? klayoutDrc;
@@ -1309,21 +1691,78 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// Analog GDS files to merge into the final layout.
   final List<String> analogGdsPaths;
 
-  const HarborAsicTarget({
+  /// Pad ring around the core. With a plan, the flow top is `chip_top` and
+  /// the PnR die is `DIE_AREA`. Null gives a core-only flow.
+  final HarborPadPlan? padPlan;
+
+  /// SRAM macros at a set core edge of the pad ring. The flow places them
+  /// before the other SRAM macros.
+  final List<HarborMacroPin> macroPins;
+
+  HarborAsicTarget({
     required this.provider,
     required this.topCell,
     this.frequency = 0,
     this.utilization = 0.5,
     this.macros = const [],
-    this.dieMarginUm = 200.0,
+    this.dieMarginUm,
     this.topRoutingMinLayer = 2,
-    this.ioRing,
     this.klayoutDrc,
     this.analogGdsPaths = const [],
-  });
+    this.padPlan,
+    this.macroPins = const [],
+  }) {
+    final insts = <String>{};
+    for (final pin in macroPins) {
+      if (!insts.add(pin.inst)) {
+        throw ArgumentError('The SRAM ${pin.inst} has two macro pins');
+      }
+      if (pin.edge != HarborIoPadEdge.south &&
+          pin.edge != HarborIoPadEdge.north) {
+        throw ArgumentError(
+          'The SRAM ${pin.inst} must be on the south or north core edge',
+        );
+      }
+    }
+  }
 
   /// Whether this uses hierarchical macro hardening.
   bool get isHierarchical => macros.isNotEmpty;
+
+  /// Top cell of the synthesis and PnR flow.
+  String get flowTop => padPlan == null ? topCell : 'chip_top';
+
+  /// Pad cells and core ring of the PDK for [padPlan].
+  ({HarborPadLibrary library, HarborCoreRing ring}) get padCells {
+    final library = provider.padLibrary;
+    final ring = provider.coreRing;
+    if (library == null || ring == null) {
+      if (provider is Sky130Provider) {
+        throw ArgumentError('sky130 pad cells are not verified');
+      }
+      throw ArgumentError(
+        '${provider.name} has no verified pad cells for a pad ring',
+      );
+    }
+    if (ring.layers.length != 2) {
+      throw ArgumentError(
+        'The core ring of ${provider.name} needs two layers, '
+        'not ${ring.layers.length}',
+      );
+    }
+    return (library: library, ring: ring);
+  }
+
+  /// Chip top pad port of the clock input in [padPlan], or null.
+  String? get _clockPadPort {
+    for (final pad in padPlan?.all ?? const <HarborPlacedPad>[]) {
+      final p = pad.port;
+      if (p != null && p.kind == HarborPadKind.clockInput) {
+        return '${p.name}_PAD';
+      }
+    }
+    return null;
+  }
 
   /// Generates an SDC timing constraints file.
   ///
@@ -1335,9 +1774,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('# Auto-generated SDC for $name');
     if (frequency > 0) {
       final periodNs = 1e9 / frequency;
+      final port = _clockPadPort ?? 'clk';
       buf.writeln(
         'create_clock -name clk -period ${periodNs.toStringAsFixed(3)} '
-        '[get_ports {clk}]',
+        '[get_ports {$port}]',
       );
     }
     buf.writeln('set_input_delay 0 -clock clk [all_inputs]');
@@ -1349,10 +1789,16 @@ class HarborAsicTarget extends HarborDeviceTarget {
   ///
   /// In hierarchical mode, macro modules are replaced with blackbox
   /// stubs so only the glue logic is synthesized at the top level.
-  String generateYosysTcl() {
+  ///
+  /// Set [hasBlackboxes] when `blackboxes.v` exists next to the script.
+  String generateYosysTcl({bool hasBlackboxes = false}) {
     final lib = provider.standardCellLibrary;
+    final top = flowTop;
+    if (padPlan != null) padCells;
     final buf = StringBuffer();
-    buf.writeln('# Auto-generated Yosys synthesis for $topCell');
+    // asix runs `yosys -c`, a Tcl shell, so the Yosys commands must be imported.
+    buf.writeln('yosys -import');
+    buf.writeln('# Auto-generated Yosys synthesis for $top');
     buf.writeln('# PDK: ${provider.name}');
     buf.writeln(
       '# Run by asix.mkTapeout (yosys -c). The standard-cell liberty',
@@ -1370,8 +1816,16 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('set ipdir [file dirname [info script]]');
     buf.writeln('read_verilog -sv \$ipdir/rtl/*.sv');
 
-    // Read blackbox stubs for hard macros (SRAM, etc.)
-    buf.writeln('read_verilog -lib \$ipdir/blackboxes.v');
+    if (hasBlackboxes) {
+      buf.writeln('read_verilog -lib \$ipdir/blackboxes.v');
+    }
+    if (padPlan != null) {
+      buf.writeln(
+        r'read_verilog -lib $::env(IO_DIR)/verilog/'
+        r'$::env(IO_LIB_NAME)__blackbox.v',
+      );
+      buf.writeln(r'read_verilog $ipdir/chip_top.v');
+    }
 
     // In hierarchical mode, replace macros with blackbox stubs
     if (isHierarchical) {
@@ -1384,8 +1838,8 @@ class HarborAsicTarget extends HarborDeviceTarget {
       buf.writeln();
     }
 
-    buf.writeln('hierarchy -top $topCell -keep_portwidths');
-    buf.writeln('synth -top $topCell');
+    buf.writeln('hierarchy -top $top -keep_portwidths');
+    buf.writeln('synth -top $top -flatten');
     buf.writeln('dfflibmap -liberty \$::env(LIB_FILE)');
     buf.writeln('abc -liberty \$::env(LIB_FILE)');
     buf.writeln(
@@ -1393,7 +1847,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
       '-locell ${lib.tieLowCell} ZN',
     );
     buf.writeln('opt_clean -purge');
-    buf.writeln('write_verilog -noattr ${topCell}_synth.v');
+    buf.writeln('write_verilog -noattr ${top}_synth.v');
     buf.writeln('stat -liberty \$::env(LIB_FILE)');
     return buf.toString();
   }
@@ -1404,6 +1858,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
   String generateMacroYosysTcl(HarborAsicMacro macro) {
     final lib = provider.standardCellLibrary;
     final buf = StringBuffer();
+    buf.writeln('yosys -import');
     buf.writeln(
       '# Auto-generated Yosys synthesis for macro: ${macro.moduleName}',
     );
@@ -1480,20 +1935,13 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln('    -utilization \$::env(TILE_UTIL) \\');
     buf.writeln('    -core_space 2 \\');
     buf.writeln('    -site \$::env(SITE_NAME)');
+    buf.writeln('make_tracks');
+    _writeLayerAdjustments(buf);
     buf.writeln();
 
-    // Pin placement on all edges for grid connectivity
-    if (macro.pinOnAllEdges) {
-      buf.writeln('# Place pins on all edges for macro connectivity');
-      buf.writeln('place_pins -hor_layers Metal3 -ver_layers Metal2');
-      buf.writeln();
-    }
+    if (macro.pinOnAllEdges) _writePlacePins(buf, lib);
 
-    // Power
-    buf.writeln('add_global_connection -net VDD -pin_pattern VDD -power');
-    buf.writeln('add_global_connection -net VSS -pin_pattern VSS -ground');
-    buf.writeln('global_connect');
-    buf.writeln();
+    _writePower(buf, lib, tile: true);
 
     // Placement
     buf.writeln('global_placement -density \$::env(TILE_UTIL)');
@@ -1513,25 +1961,258 @@ class HarborAsicTarget extends HarborDeviceTarget {
 
     // Routing
     buf.writeln('global_route -allow_congestion');
-    buf.writeln('detailed_route');
+    _writeDetailedRoute(buf, lib, '    detailed_route', '    detailed_route');
     buf.writeln();
 
-    // Fill
-    if (lib.fillCells.isNotEmpty) {
-      buf.writeln('filler_placement ${lib.fillCells.join(" ")}');
-      buf.writeln();
-    }
+    _writeFill(buf, lib);
+    buf.writeln('global_connect');
 
     // Output macro artifacts
     buf.writeln('# Macro outputs');
     buf.writeln('write_def ${m}_final.def');
+    buf.writeln('write_verilog -include_pwr_gnd ${m}_final_pwr.v');
     buf.writeln('write_abstract_lef ${m}.lef');
     buf.writeln('write_timing_model ${m}.lib');
     buf.writeln();
     buf.writeln('report_checks -path_delay min_max > ${m}_timing.rpt');
-    buf.writeln('report_design_area > ${m}_area.rpt');
+    buf.writeln('tee -file ${m}_area.rpt {report_design_area}');
 
     return buf.toString();
+  }
+
+  /// Writes `place_pins` on the PDK pin layers. Writes nothing when the
+  /// library has no pin layers.
+  static void _writePlacePins(StringBuffer buf, StandardCellLibrary lib) {
+    final hor = lib.pinHorizontalLayer;
+    final ver = lib.pinVerticalLayer;
+    if (hor == null || ver == null) return;
+    buf.writeln('place_pins -hor_layers $hor -ver_layers $ver');
+  }
+
+  /// Tcl that sets `_cx0 _cy0 _cx1 _cy1` to a square core in the middle of
+  /// the die. The core holds the cell area at `UTILIZATION`, plus each macro
+  /// with its `MACRO_HALO`, and has a side of at least 80 um.
+  static const _autoCoreTcl = [
+    r'set _block [ord::get_db_block]',
+    r'set _dbu [$_block getDbUnitsPerMicron]',
+    r'set _halo [expr {[info exists ::env(MACRO_HALO)] ? $::env(MACRO_HALO) : 0}]',
+    r'set _cells 0.0',
+    r'set _macros 0.0',
+    r'foreach _inst [$_block getInsts] {',
+    r'    set _master [$_inst getMaster]',
+    r'    set _w [expr {double([$_master getWidth]) / $_dbu}]',
+    r'    set _h [expr {double([$_master getHeight]) / $_dbu}]',
+    r'    if {[$_master isBlock]} {',
+    r'        set _macros [expr {$_macros + ($_w + 2 * $_halo) * ($_h + 2 * $_halo)}]',
+    r'    } else {',
+    r'        set _cells [expr {$_cells + $_w * $_h}]',
+    r'    }',
+    r'}',
+    r'set _side [expr {max(80.0, sqrt($_cells / $::env(UTILIZATION) + $_macros))}]',
+    r'set _cx0 [expr {int(($_dx0 + $_dx1 - $_side) / 2)}]',
+    r'set _cy0 [expr {int(($_dy0 + $_dy1 - $_side) / 2)}]',
+    r'set _cx1 [expr {$_cx0 + ceil($_side)}]',
+    r'set _cy1 [expr {$_cy0 + ceil($_side)}]',
+  ];
+
+  /// Writes a global routing adjustment for each `LAYER_ADJ_<layer>` env var
+  /// that asix exports from the PDK.
+  static void _writeLayerAdjustments(StringBuffer buf) {
+    buf.writeln('foreach _name [array names ::env LAYER_ADJ_*] {');
+    buf.writeln(
+      '    set_global_routing_layer_adjustment '
+      '[string range \$_name 10 end] \$::env(\$_name)',
+    );
+    buf.writeln('}');
+  }
+
+  static String _um(double v) =>
+      v == v.roundToDouble() ? v.toInt().toString() : v.toString();
+
+  /// Writes the power connections, the tap and endcap cells, and the PDN.
+  ///
+  /// A [tile] grid stops one stripe layer below the top, so that the top
+  /// level stripes can cross the tile. The top level connects to the tile
+  /// pins of each cell in [macroCells].
+  ///
+  /// With a [ring], the global connections are already written, the stripes
+  /// extend to the core ring and the ring connects to the power pads.
+  static void _writePower(
+    StringBuffer buf,
+    StandardCellLibrary lib, {
+    bool tile = false,
+    List<String> macroCells = const [],
+    HarborCoreRing? ring,
+    bool srams = false,
+  }) {
+    if (ring == null) _writeGlobalConnections(buf, lib);
+
+    final tap = lib.tapCell;
+    if (tap != null) {
+      if (macroCells.isNotEmpty) {
+        buf.writeln(
+          'cut_rows -halo_width_x \$::env(MACRO_HALO) '
+          '-halo_width_y \$::env(MACRO_HALO)',
+        );
+      }
+      final endcap = lib.endcapCell;
+      buf.writeln('tapcell -distance ${_um(lib.tapDistanceUm)} \\');
+      buf.writeln('    -tapcell_master $tap${endcap == null ? '' : ' \\'}');
+      if (endcap != null) buf.writeln('    -endcap_master $endcap');
+      buf.writeln('global_connect');
+      buf.writeln();
+    }
+
+    final pdn = lib.pdn;
+    if (pdn == null) return;
+    var stripes = pdn.stripes;
+    if (tile && stripes.length > 1) {
+      stripes = stripes.sublist(0, stripes.length - 1);
+    }
+    buf.writeln('set_voltage_domain -name CORE -power VDD -ground VSS');
+    buf.writeln(
+      'define_pdn_grid -name stdcell -voltage_domains CORE '
+      '-pins {${stripes.map((s) => s.layer).join(' ')}}',
+    );
+    buf.writeln(
+      'add_pdn_stripe -grid stdcell -layer ${pdn.railLayer} '
+      '-width ${_um(pdn.railWidthUm)} -followpins',
+    );
+    for (final s in stripes) {
+      buf.writeln(
+        'add_pdn_stripe -grid stdcell -layer ${s.layer} '
+        '-width ${_um(s.widthUm)} -pitch ${_um(s.pitchUm)} '
+        '-offset ${_um(s.offsetUm)} -spacing ${_um(s.spacingUm)} '
+        '-starts_with POWER${ring == null ? '' : ' -extend_to_core_ring'}',
+      );
+    }
+    if (ring != null) {
+      buf.writeln(
+        'add_pdn_ring -grid stdcell -layers {${ring.layers.join(' ')}} '
+        '-widths [list \$ring_width \$ring_width] \\',
+      );
+      buf.writeln(
+        '  -spacings [list \$ring_space \$ring_space] '
+        '-core_offset [list \$ring_offset \$ring_offset] \\',
+      );
+      buf.writeln('  -connect_to_pads -connect_to_pad_layers ${ring.padLayer}');
+    }
+    var below = pdn.railLayer;
+    for (final s in stripes) {
+      buf.writeln('add_pdn_connect -grid stdcell -layers {$below ${s.layer}}');
+      below = s.layer;
+    }
+    if (ring != null) {
+      final [outer, inner] = ring.layers;
+      for (final pair in [
+        '$outer $inner',
+        '$outer ${ring.padLayer}',
+        '$inner ${ring.padLayer}',
+      ]) {
+        buf.writeln('add_pdn_connect -grid stdcell -layers {$pair}');
+      }
+    }
+    if (macroCells.isNotEmpty && stripes.length > 1) {
+      final n = stripes.length;
+      buf.writeln(
+        'define_pdn_grid -name macros -macro -cells {${macroCells.join(' ')}} '
+        '-voltage_domains CORE -grid_over_boundary',
+      );
+      buf.writeln(
+        'add_pdn_connect -grid macros '
+        '-layers {${stripes[n - 2].layer} ${stripes[n - 1].layer}}',
+      );
+    }
+    if (srams) {
+      buf.writeln(
+        r'define_pdn_grid -name sram -macro -instances $srams '
+        '-voltage_domains CORE -grid_over_boundary',
+      );
+      buf.writeln(
+        'add_pdn_connect -grid sram -layers '
+        '{${ring!.sramPdnLayers.join(' ')}}',
+      );
+    }
+    buf.writeln('pdngen');
+    if (srams) {
+      for (final line in _sramPowerCheckTcl) {
+        buf.writeln(line);
+      }
+    }
+    buf.writeln();
+  }
+
+  /// Writes the VDD and VSS connections of the cell supply pins and of the
+  /// pad supply pins in [ring].
+  static void _writeGlobalConnections(
+    StringBuffer buf,
+    StandardCellLibrary lib, [
+    HarborCoreRing? ring,
+  ]) {
+    for (final pin in [...lib.powerPins, ...?ring?.padPowerPins]) {
+      buf.writeln(
+        'add_global_connection -net VDD -pin_pattern {^$pin\$} -power',
+      );
+    }
+    for (final pin in [...lib.groundPins, ...?ring?.padGroundPins]) {
+      buf.writeln(
+        'add_global_connection -net VSS -pin_pattern {^$pin\$} -ground',
+      );
+    }
+    buf.writeln('global_connect');
+    buf.writeln();
+  }
+
+  /// Writes antenna repair around detailed routing.
+  ///
+  /// [withEnv] runs when [guardEnv] is set, [without] runs otherwise. With no
+  /// guard, [without] runs.
+  static void _writeDetailedRoute(
+    StringBuffer buf,
+    StandardCellLibrary lib,
+    String withEnv,
+    String without, {
+    String? guardEnv,
+  }) {
+    final diode = lib.antennaCell;
+    if (diode != null) {
+      buf.writeln('set _diode $diode');
+      buf.writeln(
+        'repair_antennas \$_diode -iterations 3 -ratio_margin 10 '
+        '-allow_congestion',
+      );
+    }
+    void route() {
+      if (guardEnv == null) {
+        buf.writeln(without.trim());
+        return;
+      }
+      buf.writeln('if {[info exists ::env($guardEnv)]} {');
+      buf.writeln(withEnv);
+      buf.writeln('} else {');
+      buf.writeln(without);
+      buf.writeln('}');
+    }
+
+    route();
+    if (diode != null) {
+      buf.writeln('for {set _i 0} {\$_i < 3 && [check_antennas]} {incr _i} {');
+      buf.writeln(
+        '    if {![repair_antennas \$_diode -ratio_margin 10 '
+        '-allow_congestion]} { break }',
+      );
+      route();
+      buf.writeln('}');
+      buf.writeln('check_antennas');
+    }
+  }
+
+  /// Writes decap cell fill, then plain cell fill. Metal fill is left to asix.
+  static void _writeFill(StringBuffer buf, StandardCellLibrary lib) {
+    final cells = [...lib.decapCells, ...lib.fillCells];
+    if (cells.isEmpty) return;
+    buf.writeln('filler_placement {${cells.join(" ")}}');
+    buf.writeln();
   }
 
   /// Generates an OpenROAD place-and-route TCL script for the top level.
@@ -1539,17 +2220,45 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// In hierarchical mode, reads pre-hardened macro LEF/LIB files
   /// and places them with halos. Routes only on upper metal layers
   /// to avoid DRC violations with macro-internal routing.
-  String generateOpenroadTcl() {
+  ///
+  /// [leafCells] are the hard cells of the netlist. A pad ring flow places
+  /// the SRAM macros among them and gives them a power grid.
+  String generateOpenroadTcl({List<String> leafCells = const []}) {
     final lib = provider.standardCellLibrary;
+    final plan = padPlan;
+    final pads = plan == null ? null : padCells;
+    final srams = pads == null ? const <String>[] : _sramCells(leafCells);
+    if (pads != null && isHierarchical) {
+      throw ArgumentError(
+        'A pad ring cannot have hardened macros: macro_placement would '
+        'move the SRAM macros',
+      );
+    }
+    if (macroPins.isNotEmpty) {
+      if (pads == null) {
+        throw ArgumentError('Macro pins need a pad ring');
+      }
+      if (srams.isEmpty) {
+        throw ArgumentError('Macro pins need SRAM macros in the netlist');
+      }
+    }
+    final top = flowTop;
     final buf = StringBuffer();
-    buf.writeln('# Auto-generated OpenROAD P&R for $topCell');
+    buf.writeln('# Auto-generated OpenROAD P&R for $top');
     buf.writeln('# PDK: ${provider.name}');
     buf.writeln('# Run by asix.mkTapeout (openroad -exit). All PDK paths and');
     buf.writeln('# floorplan knobs come from the env: LIB_FILE/TECH_LEF/');
     buf.writeln('# CELL_LEF_DIR/SYNTH_V/SDC_FILE/SITE_NAME/UTILIZATION/');
     buf.writeln(
-      '# MACRO_HALO/PLACEMENT_DENSITY/DROUTE_END_ITER (+optional DIE_AREA).',
+      '# MACRO_HALO/PLACEMENT_DENSITY/DROUTE_END_ITER (+optional DIE_AREA,',
     );
+    buf.writeln('# CORE_MARGIN_UM, LAYER_ADJ_*).');
+    if (pads != null) {
+      buf.writeln('# Pad ring: DIE_AREA, IO_DIR, IO_LIB_NAME, LIB_CORNER.');
+    }
+    if (srams.isNotEmpty) {
+      buf.writeln('# SRAM macros: SRAM_DIR, SRAM_LIB_NAME.');
+    }
     if (isHierarchical) {
       buf.writeln(
         '# Mode: hierarchical assembly '
@@ -1558,23 +2267,21 @@ class HarborAsicTarget extends HarborDeviceTarget {
     }
     buf.writeln();
 
-    // Read inputs (paths supplied by asix via env vars). The tech LEF is read
-    // explicitly, then every other cell LEF is globbed from CELL_LEF_DIR while
-    // skipping anything that looks like the tech LEF (avoids a double read).
-    buf.writeln('read_liberty \$::env(LIB_FILE)');
-    buf.writeln(
-      'if {[info exists ::env(TECH_LEF)] && \$::env(TECH_LEF) ne ""} {',
-    );
-    buf.writeln('    read_lef \$::env(TECH_LEF)');
-    buf.writeln('}');
-    buf.writeln(
-      'foreach _lef [lsort [glob -nocomplain \$::env(CELL_LEF_DIR)/*.lef]] {',
-    );
-    buf.writeln(
-      '    if {[string match *tech* [file tail \$_lef]]} { continue }',
-    );
-    buf.writeln('    read_lef \$_lef');
-    buf.writeln('}');
+    if (pads != null) {
+      _writePadRingReads(buf, srams);
+    } else {
+      // Read inputs (paths supplied by asix via env vars). The tech LEF is
+      // read explicitly, then every other cell LEF is globbed from
+      // CELL_LEF_DIR while skipping anything that looks like the tech LEF
+      // (avoids a double read).
+      buf.writeln('read_liberty \$::env(LIB_FILE)');
+      buf.writeln(
+        'if {[info exists ::env(TECH_LEF)] && \$::env(TECH_LEF) ne ""} {',
+      );
+      buf.writeln('    read_lef \$::env(TECH_LEF)');
+      buf.writeln('}');
+      _writeCellLefs(buf);
+    }
 
     // Read macro LEF/LIB in hierarchical mode (asix copies these into the CWD)
     if (isHierarchical) {
@@ -1588,29 +2295,24 @@ class HarborAsicTarget extends HarborDeviceTarget {
 
     buf.writeln();
     buf.writeln('read_verilog \$::env(SYNTH_V)');
-    buf.writeln('link_design $topCell');
+    buf.writeln('link_design $top');
     buf.writeln('read_sdc \$::env(SDC_FILE)');
+    final rcLayer = lib.wireRcLayer;
+    if (rcLayer != null) {
+      buf.writeln('if {[info exists ::env(RC_TCL)]} {');
+      buf.writeln('    source \$::env(RC_TCL)');
+      buf.writeln('} else {');
+      buf.writeln('    set_wire_rc -layer $rcLayer');
+      buf.writeln('}');
+    }
     buf.writeln();
 
-    // Floorplan: a fixed DIE_AREA (fab-slot tapeouts) takes precedence over a
-    // utilization-driven auto floorplan. The core is inset from the die by the
-    // die margin on every side.
-    buf.writeln('if {[info exists ::env(DIE_AREA)]} {');
-    buf.writeln('    lassign \$::env(DIE_AREA) _dx0 _dy0 _dx1 _dy1');
-    buf.writeln('    set _m ${dieMarginUm.toStringAsFixed(0)}');
-    buf.writeln('    initialize_floorplan \\');
-    buf.writeln('        -die_area "\$_dx0 \$_dy0 \$_dx1 \$_dy1" \\');
-    buf.writeln(
-      '        -core_area "[expr {\$_dx0 + \$_m}] [expr {\$_dy0 + \$_m}] [expr {\$_dx1 - \$_m}] [expr {\$_dy1 - \$_m}]" \\',
-    );
-    buf.writeln('        -site \$::env(SITE_NAME)');
-    buf.writeln('} else {');
-    buf.writeln('    initialize_floorplan \\');
-    buf.writeln('        -utilization \$::env(UTILIZATION) \\');
-    buf.writeln('        -core_space ${dieMarginUm.toStringAsFixed(0)} \\');
-    buf.writeln('        -site \$::env(SITE_NAME)');
-    buf.writeln('}');
-    buf.writeln();
+    if (plan != null && pads != null) {
+      _writePadRing(buf, lib, plan, pads.library, pads.ring);
+      if (srams.isNotEmpty) _writeSramPlacement(buf, pads.ring);
+    } else {
+      _writeCoreFloorplan(buf);
+    }
 
     // Macro placement with halos (halo width supplied by asix as MACRO_HALO)
     if (isHierarchical) {
@@ -1626,14 +2328,30 @@ class HarborAsicTarget extends HarborDeviceTarget {
       buf.writeln();
     }
 
-    // Power
-    buf.writeln('add_global_connection -net VDD -pin_pattern VDD -power');
-    buf.writeln('add_global_connection -net VSS -pin_pattern VSS -ground');
-    buf.writeln('global_connect');
-    buf.writeln();
+    _writePower(
+      buf,
+      lib,
+      macroCells: [for (final m in macros) m.moduleName],
+      ring: pads?.ring,
+      srams: srams.isNotEmpty,
+    );
 
-    // Placement (density supplied by asix as PLACEMENT_DENSITY)
-    buf.writeln('global_placement -density \$::env(PLACEMENT_DENSITY)');
+    // Placement (density supplied by asix as PLACEMENT_DENSITY). With pin
+    // layers, a first pass without the pins lets place_pins put each pin near
+    // its cells. A pad ring has its I/O terminals placed already.
+    if (pads != null) {
+      buf.writeln(
+        'global_placement -density \$::env(PLACEMENT_DENSITY) -skip_io',
+      );
+    } else {
+      if (lib.pinHorizontalLayer != null && lib.pinVerticalLayer != null) {
+        buf.writeln(
+          'global_placement -density \$::env(PLACEMENT_DENSITY) -skip_io',
+        );
+        _writePlacePins(buf, lib);
+      }
+      buf.writeln('global_placement -density \$::env(PLACEMENT_DENSITY)');
+    }
     buf.writeln('detailed_placement');
     buf.writeln();
 
@@ -1644,9 +2362,14 @@ class HarborAsicTarget extends HarborDeviceTarget {
         'clock_tree_synthesis -buf_list '
         '{${lib.clockBufferCells.join(" ")}}',
       );
+      buf.writeln('set_propagated_clock [all_clocks]');
       buf.writeln('detailed_placement');
       buf.writeln();
     }
+    buf.writeln('estimate_parasitics -placement');
+    buf.writeln('repair_timing -hold');
+    buf.writeln('detailed_placement');
+    buf.writeln();
 
     // Routing: skip lower metal layers in hierarchical mode
     if (isHierarchical && topRoutingMinLayer > 1) {
@@ -1660,31 +2383,659 @@ class HarborAsicTarget extends HarborDeviceTarget {
       );
     }
     buf.writeln('global_route -allow_congestion');
-    buf.writeln('if {[info exists ::env(DROUTE_END_ITER)]} {');
-    buf.writeln('    detailed_route -droute_end_iter \$::env(DROUTE_END_ITER)');
-    buf.writeln('} else {');
-    buf.writeln('    detailed_route');
-    buf.writeln('}');
+    _writeDetailedRoute(
+      buf,
+      lib,
+      '    detailed_route -droute_end_iter \$::env(DROUTE_END_ITER)',
+      '    detailed_route',
+      guardEnv: 'DROUTE_END_ITER',
+    );
     buf.writeln();
 
-    // Fill
-    if (lib.fillCells.isNotEmpty) {
-      buf.writeln('filler_placement ${lib.fillCells.join(" ")}');
-      buf.writeln();
-    }
+    _writeFill(buf, lib);
+    buf.writeln('global_connect');
 
     // Reports & outputs
     buf.writeln('report_checks -path_delay min_max > timing.rpt');
-    buf.writeln('report_design_area > area.rpt');
+    buf.writeln('tee -file area.rpt {report_design_area}');
     buf.writeln('report_power > power.rpt');
-    buf.writeln('write_def ${topCell}_final.def');
-    buf.writeln('write_verilog ${topCell}_final.v');
+    buf.writeln('write_def ${top}_final.def');
+    buf.writeln('write_verilog ${top}_final.v');
+    buf.writeln('write_verilog -include_pwr_gnd ${top}_final_pwr.v');
 
     return buf.toString();
+  }
+
+  /// Writes a `read_lef` of each cell LEF in `CELL_LEF_DIR` except the tech
+  /// LEF.
+  static void _writeCellLefs(StringBuffer buf) {
+    buf.writeln(
+      'foreach _lef [lsort [glob -nocomplain \$::env(CELL_LEF_DIR)/*.lef]] {',
+    );
+    buf.writeln(
+      '    if {[string match *tech* [file tail \$_lef]]} { continue }',
+    );
+    buf.writeln('    read_lef \$_lef');
+    buf.writeln('}');
+  }
+
+  /// Writes the env checks, the PDK pad configuration and the LEF and
+  /// liberty reads of a pad ring flow.
+  static void _writePadRingReads(StringBuffer buf, List<String> srams) {
+    for (final env in [
+      'DIE_AREA',
+      'IO_DIR',
+      'IO_LIB_NAME',
+      'TECH_LEF',
+      'LIB_CORNER',
+      if (srams.isNotEmpty) ...['SRAM_DIR', 'SRAM_LIB_NAME'],
+    ]) {
+      buf.writeln('if {![info exists ::env($env)]} {');
+      buf.writeln('  puts stderr "The pad ring needs the $env env var"');
+      buf.writeln('  exit 1');
+      buf.writeln('}');
+    }
+    buf.writeln();
+    for (final line in const [
+      '# The pad cell names, sites, fillers and I/O terminals come from the '
+          'PDK pad configuration.',
+      r'set io_pdk_dir [file dirname [file dirname $::env(IO_DIR)]]',
+      r'set ::env(PDK) [file tail $io_pdk_dir]',
+      r'set ::env(PDK_ROOT) [file dirname $io_pdk_dir]',
+      r'set ::env(PAD_CELL_LIBRARY) $::env(IO_LIB_NAME)',
+      r'source $io_pdk_dir/libs.tech/librelane/$::env(IO_LIB_NAME)/config.tcl',
+      '',
+      r'read_lef $::env(TECH_LEF)',
+      r'dict for {site size} $::env(PAD_FAKE_SITES) {',
+      r'  lassign [split $size ","] site_w site_h',
+      r'  make_fake_io_site -name $site -width [string trim $site_w] '
+          r'-height [string trim $site_h]',
+      '}',
+    ]) {
+      buf.writeln(line);
+    }
+    _writeCellLefs(buf);
+    for (final line in const [
+      r'foreach _lef [lsort [glob $::env(IO_DIR)/lef/$::env(IO_LIB_NAME)__*.lef]] {',
+      r'    read_lef $_lef',
+      '}',
+    ]) {
+      buf.writeln(line);
+    }
+    for (final cell in srams) {
+      buf.writeln(
+        'read_lef \$::env(SRAM_DIR)/lef/\$::env(SRAM_LIB_NAME)__$cell.lef',
+      );
+    }
+    buf.writeln(r'read_liberty $::env(LIB_FILE)');
+    for (final cell in srams) {
+      buf.writeln(
+        'read_liberty \$::env(SRAM_DIR)/lib/'
+        '\$::env(SRAM_LIB_NAME)__${cell}__\$::env(LIB_CORNER).lib',
+      );
+    }
+    buf.writeln(
+      r'read_liberty $::env(IO_DIR)/lib/$::env(IO_LIB_NAME)__$::env(LIB_CORNER).lib',
+    );
+  }
+
+  /// The SRAM macro names in [leafCells], without the library prefix.
+  List<String> _sramCells(List<String> leafCells) {
+    final libName = provider.sramLibName;
+    if (libName == null) return const [];
+    final prefix = '${libName}__';
+    return {
+      for (final c in leafCells)
+        if (c.startsWith(prefix)) c.substring(prefix.length),
+    }.toList()..sort();
+  }
+
+  /// Writes the SRAM placement inside the pad ring and the row cuts at the
+  /// macro halos.
+  void _writeSramPlacement(StringBuffer buf, HarborCoreRing ring) {
+    buf.writeln(
+      '# SRAM macros. The signal pins are on the bottom side of the macro, '
+      'so the pins of a north',
+    );
+    buf.writeln(
+      '# macro face into the core. The antenna repair needs free sites below '
+      'the pins: a south macro',
+    );
+    buf.writeln(
+      '# sits above the core edge by sram_lift, and the area sram_lift below '
+      'a north macro stays free.',
+    );
+    buf.writeln(
+      'set halo [expr {[info exists ::env(MACRO_HALO)] ? '
+      '\$::env(MACRO_HALO) : ${_um(ring.macroHaloUm)}}]',
+    );
+    buf.writeln('set sram_lift ${_um(ring.sramLiftUm)}');
+    buf.writeln('set macro_channel ${_um(ring.macroChannelUm)}');
+    final pins = [
+      for (final p in macroPins)
+        '{${p.inst} ${p.edge.name} {${p.offsetUm == null ? '' : _um(p.offsetUm!)}}}',
+    ];
+    buf.writeln('set sram_pins {${pins.join(' ')}}');
+    for (final line in _sramPlaceTcl) {
+      buf.writeln(line);
+    }
+    buf.writeln();
+  }
+
+  /// Tcl that finds and places the SRAM macros.
+  static const _sramPlaceTcl = [
+    'set srams {}',
+    r'foreach inst [$block getInsts] {',
+    r'  if { [string match $::env(SRAM_LIB_NAME)__* [[$inst getMaster] getName]] } {',
+    r'    lappend srams [$inst getName]',
+    '  }',
+    '}',
+    r'set srams [lsort $srams]',
+    r'if { [llength $srams] == 0 } {',
+    r'  puts stderr "The netlist has no SRAM of $::env(SRAM_LIB_NAME)"',
+    '  exit 1',
+    '}',
+    'set sram_rects {}',
+    '',
+    '# Tries the SRAM at x on the edge. The result is "placed", "full" when '
+        'the SRAM goes out of the',
+    '# core, or the east side of the macro that is in the way.',
+    'proc sram_try { name edge x } {',
+    '  global block dbu halo sram_lift macro_channel cx0 cy0 cx1 cy1 '
+        'sram_rects',
+    r'  set master [[$block findInst $name] getMaster]',
+    r'  set w [expr [$master getWidth] / double($dbu)]',
+    r'  set h [expr [$master getHeight] / double($dbu)]',
+    '  # y0 is the bottom of the macro and of the free area below its pins.',
+    r'  if { $edge eq "south" } {',
+    r'    set y [expr $cy0 + $halo + $sram_lift]',
+    r'    set y0 $y',
+    '  } else {',
+    r'    set y [expr $cy1 - $halo - $h]',
+    r'    set y0 [expr $y - $sram_lift]',
+    '  }',
+    r'  if { $x < $cx0 + $halo || $x + $w + $halo > $cx1 || '
+        r'$y0 < $cy0 + $halo || $y + $h + $halo > $cy1 } {',
+    '    return full',
+    '  }',
+    r'  foreach rect $sram_rects {',
+    r'    lassign $rect rx0 ry0 rx1 ry1',
+    r'    if { $x < $rx1 + $macro_channel && $x + $w + $macro_channel > $rx0 '
+        r'&& $y0 < $ry1 + $macro_channel && $y + $h + $macro_channel > $ry0 } {',
+    r'      return $rx1',
+    '    }',
+    '  }',
+    r'  place_macro -macro_name $name -location [list $x $y] -orientation R0',
+    r'  lappend sram_rects [list $x $y0 [expr $x + $w] [expr $y + $h]]',
+    '  return placed',
+    '}',
+    '',
+    '# Puts the SRAM on the first free location of the edge, from west to '
+        'east.',
+    'proc sram_pack { name edge } {',
+    '  global cx0 halo macro_channel',
+    r'  set x [expr $cx0 + $halo]',
+    '  while 1 {',
+    r'    set result [sram_try $name $edge $x]',
+    r'    if { $result eq "placed" || $result eq "full" } { return $result }',
+    r'    set x [expr $result + $macro_channel]',
+    '  }',
+    '}',
+    '',
+    r'foreach pin $sram_pins {',
+    r'  lassign $pin name edge offset',
+    r'  if { $name ni $srams } {',
+    r'    puts stderr "The pinned SRAM $name is not in the netlist"',
+    '    exit 1',
+    '  }',
+    r'  if { $offset eq "" } {',
+    r'    set result [sram_pack $name $edge]',
+    '  } else {',
+    r'    set result [sram_try $name $edge [expr $cx0 + $offset]]',
+    '  }',
+    r'  if { $result eq "full" } {',
+    r'    puts stderr "The SRAM $name does not fit in the core"',
+    '    exit 1',
+    '  }',
+    r'  if { $result ne "placed" } {',
+    r'    puts stderr "The SRAM $name overlaps another SRAM"',
+    '    exit 1',
+    '  }',
+    '}',
+    r'foreach name $srams {',
+    r'  if { [lsearch -index 0 $sram_pins $name] >= 0 } { continue }',
+    r'  if { [sram_pack $name south] ne "placed" && '
+        r'[sram_pack $name north] ne "placed" } {',
+    r'    puts stderr "The SRAM $name does not fit in the core"',
+    '    exit 1',
+    '  }',
+    '}',
+    r'cut_rows -halo_width_x $halo -halo_width_y $halo',
+  ];
+
+  /// Tcl that stops the flow when an SRAM supply pin has no net or the
+  /// power grid does not reach it.
+  static const _sramPowerCheckTcl = [
+    r'foreach name $srams {',
+    '  foreach pin {VDD VSS} {',
+    r'    set iterm [[$block findInst $name] findITerm $pin]',
+    r'    if { $iterm eq "NULL" || [$iterm getNet] eq "NULL" } {',
+    r'      puts stderr "The SRAM pin $name/$pin has no net"',
+    '      exit 1',
+    '    }',
+    '  }',
+    '}',
+    '# The pad ring nets have no terminals. Cells that are not fixed yet are '
+        'not checked.',
+    'foreach net {VDD VSS} {',
+    r'  set pg_report pdn_$net.rpt',
+    r'  file delete -force $pg_report',
+    r'  if { [catch {check_power_grid -net $net -floorplanning '
+        r'-dont_require_terminals -error_file $pg_report} err] } {',
+    '    set floating {}',
+    r'    if { [file exists $pg_report] } {',
+    r'      set fh [open $pg_report]',
+    r'      set floating [regexp -all -inline {inst:\S+} [read $fh]]',
+    r'      close $fh',
+    '    }',
+    r'    foreach name $srams {',
+    r'      if { "inst:$name" in $floating } {',
+    r'        puts stderr "The SRAM $name is not connected to the $net power grid"',
+    '        exit 1',
+    '      }',
+    '    }',
+    r'    puts stderr "The $net power grid is not connected: $err"',
+    '    exit 1',
+    '  }',
+    '}',
+  ];
+
+  /// Tcl of the corner size.
+  static const _padCornerTcl = [
+    '',
+    r'set corner_site [pad::find_site $::env(PAD_CORNER_SITE_NAME)]',
+    r'set corner_w [expr double([$corner_site getWidth]) / $dbu]',
+    r'set corner_h [expr double([$corner_site getHeight]) / $dbu]',
+  ];
+
+  /// Tcl of the pad slots on a fab slot. Each pad opening center goes on its
+  /// slot position. The I/O rows of `make_io_sites` keep cell x = 0 at the
+  /// low edge along each side, so the opening is the same distance from the
+  /// low edge on every side.
+  static const _padSlotsFabTcl = [
+    '',
+    '# The result is a list of pad name, start and width along the side.',
+    'proc pad_slots { side } {',
+    '  global pads centers pad_opening block dbu dx0 dy0 dx1 dy1 corner_w '
+        'corner_h',
+    r'  set horizontal [expr {$side eq "south" || $side eq "north"}]',
+    r'  set end [expr {$horizontal ? $dx0 + $corner_w : $dy0 + $corner_h}]',
+    r'  set hi [expr {$horizontal ? $dx1 - $corner_w : $dy1 - $corner_h}]',
+    '  set slots {}',
+    r'  foreach name $pads($side) center $centers($side) {',
+    r'    set w [expr [[[$block findInst $name] getMaster] getWidth] / '
+        r'double($dbu)]',
+    r'    set pos [expr $center - $pad_opening]',
+    r'    if { $pos < $end - 0.001 || $pos + $w > $hi + 0.001 } {',
+    r'      puts stderr "The pad $name at $center on the $side side overlaps '
+        r'a pad or a corner"',
+    '      exit 1',
+    '    }',
+    r'    lappend slots [list $name $pos $w]',
+    r'    set end [expr $pos + $w]',
+    '  }',
+    r'  return $slots',
+    '}',
+  ];
+
+  /// Tcl that checks the orientation of each I/O row.
+  static const _padRowCheckTcl = [
+    'foreach side {south east north west} {',
+    '  set row ""',
+    r'  foreach r [$block getRows] {',
+    r'    if { [$r getName] eq "IO_[string toupper $side]" } { set row $r }',
+    '  }',
+    r'  if { $row eq "" } {',
+    r'    puts stderr "make_io_sites made no IO_[string toupper $side] row"',
+    '    exit 1',
+    '  }',
+    r'  if { [$row getOrient] ne $pad_orient($side) } {',
+    r'    puts stderr "The IO_[string toupper $side] row has orientation '
+        r'[$row getOrient], the pad openings need $pad_orient($side)"',
+    '    exit 1',
+    '  }',
+    '}',
+  ];
+
+  /// Tcl that checks the pad openings after the pads are placed.
+  static const _padPlacedCheckTcl = [
+    'foreach side {south east north west} {',
+    r'  set horizontal [expr {$side eq "south" || $side eq "north"}]',
+    r'  foreach name $pads($side) center $centers($side) {',
+    r'    set inst [$block findInst $name]',
+    r'    set box [$inst getBBox]',
+    r'    set lo [expr {($horizontal ? [$box xMin] : [$box yMin]) / '
+        r'double($dbu)}]',
+    r'    if { [$inst getOrient] ne $pad_orient($side) } {',
+    r'      puts stderr "The pad $name has orientation [$inst getOrient], the '
+        r'pad opening needs $pad_orient($side)"',
+    '      exit 1',
+    '    }',
+    r'    set got [expr $lo + $pad_opening]',
+    r'    if { abs($got - $center) > 0.001 } {',
+    r'      puts stderr "The pad opening of $name is at $got, slot position '
+        r'$center"',
+    '      exit 1',
+    '    }',
+    '  }',
+    '}',
+  ];
+
+  /// Tcl of the evenly spread pad slots.
+  static const _padSlotsEvenTcl = [
+    '',
+    '# Each side centers its pads. The gap between two pads is a whole number '
+        'of micrometers.',
+    '# Filler cells close the gaps.',
+    '# The result is a list of pad name, start and width along the side.',
+    'proc pad_slots { side } {',
+    '  global pads block dbu dx0 dy0 dx1 dy1 corner_w corner_h',
+    r'  set horizontal [expr {$side eq "south" || $side eq "north"}]',
+    r'  set side_len [expr {$horizontal ? ($dx1 - $dx0) - 2 * $corner_w : '
+        r'($dy1 - $dy0) - 2 * $corner_h}]',
+    '  set pad_sum 0.0',
+    r'  foreach name $pads($side) {',
+    r'    set pad_sum [expr $pad_sum + [[[$block findInst $name] getMaster] '
+        r'getWidth] / double($dbu)]',
+    '  }',
+    r'  if { $pad_sum > $side_len } {',
+    r'    puts stderr "The pads of the $side side are wider than the side"',
+    '    exit 1',
+    '  }',
+    r'  set free [expr $side_len - $pad_sum]',
+    r'  set gap [expr floor($free / ([llength $pads($side)] + 1))]',
+    r'  set start [expr ($free - $gap * ([llength $pads($side)] - 1)) / 2]',
+    r'  set origin [expr {$horizontal ? $dx0 : $dy0}]',
+    r'  set pos [expr $origin + $start + [expr {$horizontal ? $corner_w : '
+        r'$corner_h}]]',
+    '  set slots {}',
+    r'  foreach name $pads($side) {',
+    r'    set w [expr [[[$block findInst $name] getMaster] getWidth] / '
+        r'double($dbu)]',
+    r'    lappend slots [list $name $pos $w]',
+    r'    set pos [expr $pos + $gap + $w]',
+    '  }',
+    r'  return $slots',
+    '}',
+  ];
+
+  /// Tcl of the core area inside the pad ring.
+  static const _padCoreAreaTcl = [
+    '',
+    '# The core starts at the inner edge of the pad ring. The PDN ring sits '
+        'between the pad cells and',
+    '# the core, so the straps from the power pads to the ring stay short.',
+    r'set ring_extent [expr $ring_offset + 2 * $ring_width + $ring_space]',
+    r'set cx0 [expr int(ceil($dx0 + $corner_w + $ring_extent + $pad_clearance))]',
+    r'set cy0 [expr int(ceil($dy0 + $corner_h + $ring_extent + $pad_clearance))]',
+    r'set cx1 [expr int(floor($dx1 - $corner_w - $ring_extent - $pad_clearance))]',
+    r'set cy1 [expr int(floor($dy1 - $corner_h - $ring_extent - $pad_clearance))]',
+    r'if { $cx0 >= $cx1 || $cy0 >= $cy1 } {',
+    '  puts stderr "The core does not fit inside the pad ring"',
+    '  exit 1',
+    '}',
+    '',
+    'foreach side {south east north west} {',
+    r'  foreach slot [pad_slots $side] {',
+    r'    lassign $slot name pos w',
+    r'    if { [[[$block findInst $name] getMaster] getName] ni $power_masters } '
+        'continue',
+    r'    if { $side eq "south" || $side eq "north" } {',
+    r'      lassign [list $cx0 $cx1] lo hi',
+    '    } else {',
+    r'      lassign [list $cy0 $cy1] lo hi',
+    '    }',
+    r'    if { $pos < $lo - $ring_extent || $pos + $w > $hi + $ring_extent } {',
+    r'      puts stderr "The power ring does not span the pad $name"',
+    '      exit 1',
+    '    }',
+    '  }',
+    '}',
+    '',
+    r'initialize_floorplan \',
+    r'  -die_area $::env(DIE_AREA) \',
+    r'  -core_area [list $cx0 $cy0 $cx1 $cy1] \',
+    r'  -site $::env(SITE_NAME)',
+    'make_tracks',
+  ];
+
+  /// Tcl of the I/O rows.
+  static const _padSitesTcl = [
+    '# Pad ring. The PnR die edge is the outer edge of the pad cells, so the '
+        'sites have no offset.',
+    'make_io_sites \\',
+    r'  -horizontal_site $::env(PAD_SITE_NAME) \',
+    r'  -vertical_site $::env(PAD_SITE_NAME) \',
+    r'  -corner_site $::env(PAD_CORNER_SITE_NAME) \',
+    '  -offset 0',
+  ];
+
+  /// Tcl that places the pads, corners, fillers and I/O terminals.
+  static const _padPlaceTcl = [
+    '',
+    'foreach side {south east north west} {',
+    r'  foreach slot [pad_slots $side] {',
+    r'    lassign $slot name pos w',
+    r'    set master [[[$block findInst $name] getMaster] getName]',
+    r'    place_pad -row IO_[string toupper $side] -location $pos $name '
+        r'-master $master',
+    '  }',
+    '}',
+  ];
+
+  /// Tcl of the corners, fillers and I/O terminals.
+  static const _padFinishTcl = [
+    r'place_corners $::env(PAD_CORNER)',
+    'foreach side {north south west east} {',
+    r'  place_io_fill -row IO_[string toupper $side] {*}$::env(PAD_FILLERS)',
+    '}',
+    'connect_by_abutment',
+    'foreach side {south east north west} {',
+    r'  foreach name $pads($side) {',
+    r'    if { $name in $spare_pads } continue',
+    r'    set master [[[$block findInst $name] getMaster] getName]',
+    r'    foreach master_pin $::env(PAD_PLACE_IO_TERMINALS) {',
+    r'      lassign [split $master_pin /] terminal_master terminal_pin',
+    r'      if { $master eq $terminal_master } {',
+    r'        place_io_terminals $name/$terminal_pin',
+    '        break',
+    '      }',
+    '    }',
+    '  }',
+    '}',
+    'remove_io_rows',
+  ];
+
+  /// Writes the pad ring floorplan: the pad slots on `DIE_AREA`, the core
+  /// inside the ring, the supply connections and the placed pads.
+  static void _writePadRing(
+    StringBuffer buf,
+    StandardCellLibrary lib,
+    HarborPadPlan plan,
+    HarborPadLibrary library,
+    HarborCoreRing ring,
+  ) {
+    final powerMasters = {
+      for (final k in const [
+        HarborPadKind.ioPower,
+        HarborPadKind.ioGround,
+        HarborPadKind.corePower,
+        HarborPadKind.coreGround,
+      ])
+        library.cellName(k),
+    };
+    buf.writeln(r'lassign $::env(DIE_AREA) dx0 dy0 dx1 dy1');
+    buf.writeln();
+    buf.writeln('# The PDN ring and the pad ring set the size of the core.');
+    buf.writeln('set ring_offset ${_um(ring.offsetUm)}');
+    buf.writeln('set ring_width ${_um(ring.widthUm)}');
+    buf.writeln('set ring_space ${_um(ring.spaceUm)}');
+    buf.writeln('set pad_clearance ${_um(ring.padClearanceUm)}');
+    buf.writeln('set power_masters {${powerMasters.join(' ')}}');
+    buf.writeln();
+    buf.writeln('set block [ord::get_db_block]');
+    buf.writeln(r'set dbu [$block getDbUnitsPerMicron]');
+    buf.writeln();
+    for (final e in HarborPadPlan.sideOrder) {
+      final insts = [for (final p in plan.side(e)) p.inst].join(' ');
+      buf.writeln('set pads(${e.name}) {$insts}');
+    }
+    final spares = [
+      for (final p in plan.all)
+        if (p.kind == HarborPadKind.spare) p.inst,
+    ];
+    buf.writeln('set spare_pads {${spares.join(' ')}}');
+    final slot = plan.slot;
+    if (slot != null) _writeFabSlot(buf, plan, slot, library);
+    for (final line in [
+      ..._padCornerTcl,
+      ...(slot == null ? _padSlotsEvenTcl : _padSlotsFabTcl),
+      ..._padCoreAreaTcl,
+    ]) {
+      buf.writeln(line);
+    }
+    _writeLayerAdjustments(buf);
+    buf.writeln();
+    buf.writeln(
+      '# The pad cells tie the I/O and core supplies together. '
+      'Both pin names join the same nets.',
+    );
+    _writeGlobalConnections(buf, lib, ring);
+    for (final line in [
+      ..._padSitesTcl,
+      if (slot != null) ..._padRowCheckTcl,
+      ..._padPlaceTcl,
+      if (slot != null) ..._padPlacedCheckTcl,
+      ..._padFinishTcl,
+    ]) {
+      buf.writeln(line);
+    }
+    buf.writeln();
+  }
+
+  /// Orientation of the I/O row on each side after `make_io_sites`.
+  static const _padRowOrient = {
+    HarborIoPadEdge.south: 'R0',
+    HarborIoPadEdge.east: 'R90',
+    HarborIoPadEdge.north: 'MX',
+    HarborIoPadEdge.west: 'MXR90',
+  };
+
+  /// Writes the slot positions of each pad and the check of `DIE_AREA`
+  /// against [slot].
+  static void _writeFabSlot(
+    StringBuffer buf,
+    HarborPadPlan plan,
+    HarborFabSlot slot,
+    HarborPadLibrary library,
+  ) {
+    final offset = library.openingOffsetUm;
+    final edge = library.openingEdgeUm;
+    if (offset == null || edge == null) {
+      throw ArgumentError(
+        '${library.libName} has no pad opening position for slot ${slot.name}',
+      );
+    }
+    final margin = slot.openingInsetUm - edge;
+    buf.writeln();
+    buf.writeln(
+      '# The pad openings must be on the pad mask of slot ${slot.name}. '
+      'The die is the slot',
+    );
+    buf.writeln('# less the seal ring margin, in slot coordinates.');
+    buf.writeln('set slot_margin ${_um(margin)}');
+    buf.writeln(
+      r'if { abs($dx0 - $slot_margin) > 0.001 || '
+      r'abs($dy0 - $slot_margin) > 0.001 || '
+      'abs(\$dx1 - ${_um(slot.widthUm - margin)}) > 0.001 || '
+      'abs(\$dy1 - ${_um(slot.heightUm - margin)}) > 0.001 } {',
+    );
+    buf.writeln('  puts stderr "DIE_AREA does not match slot ${slot.name}"');
+    buf.writeln('  exit 1');
+    buf.writeln('}');
+    buf.writeln('set pad_opening ${_um(offset)}');
+    for (final e in HarborPadPlan.sideOrder) {
+      buf.writeln('set pad_orient(${e.name}) ${_padRowOrient[e]}');
+    }
+    for (final e in HarborPadPlan.sideOrder) {
+      final centers = slot.centers[e]!;
+      if (plan.side(e).length != centers.length) {
+        throw ArgumentError(
+          'The pad plan has ${plan.side(e).length} pads on the ${e.name} '
+          'side, slot ${slot.name} has ${centers.length}',
+        );
+      }
+      buf.writeln('set centers(${e.name}) {${centers.map(_um).join(' ')}}');
+    }
+  }
+
+  /// Writes the core-only floorplan.
+  void _writeCoreFloorplan(StringBuffer buf) {
+    // Floorplan: a fixed DIE_AREA (fab-slot tapeouts) takes precedence over a
+    // utilization-driven auto floorplan.
+    buf.writeln('if {[info exists ::env(CORE_MARGIN_UM)]} {');
+    buf.writeln('    set _m \$::env(CORE_MARGIN_UM)');
+    if (dieMarginUm != null) {
+      buf.writeln('} else {');
+      buf.writeln('    set _m ${_um(dieMarginUm!)}');
+    }
+    buf.writeln('}');
+    buf.writeln('if {[info exists ::env(DIE_AREA)]} {');
+    buf.writeln('    lassign \$::env(DIE_AREA) _dx0 _dy0 _dx1 _dy1');
+    buf.writeln('    if {[info exists _m]} {');
+    buf.writeln('        set _cx0 [expr {\$_dx0 + \$_m}]');
+    buf.writeln('        set _cy0 [expr {\$_dy0 + \$_m}]');
+    buf.writeln('        set _cx1 [expr {\$_dx1 - \$_m}]');
+    buf.writeln('        set _cy1 [expr {\$_dy1 - \$_m}]');
+    buf.writeln('    } else {');
+    for (final line in _autoCoreTcl) {
+      buf.writeln('        $line');
+    }
+    buf.writeln('    }');
+    buf.writeln('    initialize_floorplan \\');
+    buf.writeln('        -die_area "\$_dx0 \$_dy0 \$_dx1 \$_dy1" \\');
+    buf.writeln('        -core_area "\$_cx0 \$_cy0 \$_cx1 \$_cy1" \\');
+    buf.writeln('        -site \$::env(SITE_NAME)');
+    buf.writeln('} else {');
+    buf.writeln(
+      '    if {![info exists _m]} { set _m ${_um(defaultCoreSpaceUm)} }',
+    );
+    buf.writeln('    initialize_floorplan \\');
+    buf.writeln('        -utilization \$::env(UTILIZATION) \\');
+    buf.writeln('        -core_space \$_m \\');
+    buf.writeln('        -site \$::env(SITE_NAME)');
+    buf.writeln('}');
+    buf.writeln('make_tracks');
+    _writeLayerAdjustments(buf);
+    buf.writeln();
   }
 }
 
 /// Supported FPGA vendors / toolchains.
+/// The nextpnr placer for the openXC7 flow.
+enum HarborPlacer {
+  heap('heap'),
+  sa('sa'),
+
+  /// Only nextpnr-himbaechel has this placer.
+  static_('static');
+
+  const HarborPlacer(this.nextpnrName);
+
+  /// The value of the nextpnr `--placer` option.
+  final String nextpnrName;
+}
+
 enum HarborFpgaVendor {
   /// Lattice iCE40: Yosys + nextpnr-ice40
   ice40,
@@ -2463,6 +3814,23 @@ mixin HarborNextpnrPreplaceProvider {
   /// pin on [ctx]. Return null (not an empty string) for a part or a family
   /// this peripheral has no verified placement for.
   String? nextpnrPreplacePy(HarborNextpnrPreplaceContext ctx);
+}
+
+/// A device that states the rates of its own clocks, for the nets that the
+/// open flows do not time from the pin constraints. Such a net is the output
+/// of a MMCM or of a clock buffer, which nextpnr times at 12 MHz when it has
+/// no rate.
+///
+/// The SoC calls [clockRates] and gives the rates to the nextpnr clock script,
+/// or to the constraint file in a flow that has no script. A standalone top
+/// can pass the result to [HarborFpgaTarget.generatePllClockConstraintPy].
+mixin HarborClockRateProvider {
+  /// The clock nets of the device and their rates in MHz.
+  ///
+  /// [instance] is the name of the device in the top module, or the path to
+  /// it from the top module with `.` between the names. Each net name has the
+  /// same form, from the top module.
+  Map<String, double> clockRates(String instance);
 }
 
 /// A device that adds timing constraints for its own pins, such as the

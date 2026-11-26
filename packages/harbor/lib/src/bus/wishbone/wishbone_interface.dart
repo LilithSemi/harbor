@@ -254,7 +254,7 @@ const wishboneOptionalRequestPorts = ['CTI', 'BTE', 'TGA', 'TGD_MOSI'];
 const wishbonePoisonWord = 0xDEADBEEF;
 
 /// [wishbonePoisonWord] repeated and cut to [width] bits.
-Const wishbonePoison(int width) {
+Logic wishbonePoison(int width) {
   var v = BigInt.zero;
   for (var i = 0; i < width; i += 32) {
     v = (v << 32) | BigInt.from(wishbonePoisonWord);

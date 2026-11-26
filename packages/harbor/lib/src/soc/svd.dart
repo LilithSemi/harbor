@@ -83,6 +83,9 @@ class HarborSvdPeripheral {
 mixin HarborSvdPeripheralProvider {
   /// The SVD peripheral description for this device.
   HarborSvdPeripheral get svdPeripheral;
+
+  /// More SVD peripherals for the same device, after [svdPeripheral].
+  List<HarborSvdPeripheral> get extraSvdPeripherals => const [];
 }
 
 /// Generates a CMSIS-SVD (System View Description) file from a list of
@@ -143,8 +146,9 @@ class HarborSvdGenerator {
   });
 
   /// SVD peripheral descriptions from the peripherals.
-  List<HarborSvdPeripheral> get devices =>
-      peripherals.map((p) => p.svdPeripheral).toList();
+  List<HarborSvdPeripheral> get devices => [
+    for (final p in peripherals) ...[p.svdPeripheral, ...p.extraSvdPeripherals],
+  ];
 
   /// Generates the CMSIS-SVD XML source as a string.
   String generate() {
@@ -173,6 +177,9 @@ class HarborSvdGenerator {
     for (final provider in peripherals) {
       final dev = provider.svdPeripheral;
       _writePeripheral(buf, dev, _interruptsFor(provider, dev));
+      for (final extra in provider.extraSvdPeripherals) {
+        _writePeripheral(buf, extra, extra.interrupts);
+      }
     }
     buf.writeln('  </peripherals>');
 

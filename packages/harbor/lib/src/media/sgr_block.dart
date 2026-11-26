@@ -40,12 +40,12 @@ class HarborSgrBlock extends BridgeModule {
           for (var dr = 0; dr < winSide; dr++)
             for (var dc = 0; dc < winSide; dc++) pad(r + dr, c + dc),
         ];
-        core.input('window').srcConnection! <= win.reversed.toList().swizzle();
+        core.input('window').srcConnection! <= win.reversed.toList().concat();
         core.input('s').srcConnection! <= s;
         outPx.add(core.output('out'));
       }
     }
 
-    output('out') <= outPx.reversed.toList().swizzle();
+    output('out') <= outPx.reversed.toList().concat();
   }
 }

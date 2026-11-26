@@ -13,6 +13,7 @@
 #     device = "lfe5u-45f";
 #     package = "CABGA381";
 #     frequency = 50000000;
+#     speedGrade = "6";           # ECP5 only: "6", "7" or "8"
 #   }
 #
 # Outputs:
@@ -40,6 +41,7 @@ lib.extendMkDerivation {
     "device"
     "package_"
     "frequency"
+    "speedGrade"
   ];
 
   extendDrvArgs =
@@ -52,6 +54,7 @@ lib.extendMkDerivation {
       device ? "",
       package_ ? "",
       frequency ? 0,
+      speedGrade ? "6",
       ...
     }@args:
 
@@ -88,6 +91,8 @@ lib.extendMkDerivation {
       intermediateExt = if isIce40 then "asc" else "config";
 
       freqFlag = lib.optionalString (frequency > 0) "--freq ${toString (frequency / 1000000)}";
+
+      speedFlag = lib.optionalString isEcp5 "--speed ${speedGrade}";
     in
     builtins.removeAttrs args [
       "ip"
@@ -96,6 +101,7 @@ lib.extendMkDerivation {
       "device"
       "package_"
       "frequency"
+      "speedGrade"
     ]
     // {
       dontUnpack = true;
@@ -140,6 +146,7 @@ lib.extendMkDerivation {
             $CONSTRAINT \
             ${if isIce40 then "--asc ${topCell}.asc" else "--textcfg ${topCell}.config"} \
             ${freqFlag} \
+            ${speedFlag} \
             2>&1 | tee pnr.log
 
           ${lib.optionalString (packCmd != null) ''

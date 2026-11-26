@@ -39,6 +39,7 @@ void main() {
   group('HarborSpiFlashController', () {
     test('creates with QSPI config', () {
       final flash = HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig.w25q128(),
         baseAddress: 0x20000000,
       );
@@ -47,6 +48,7 @@ void main() {
 
     test('standard SPI has MOSI/MISO', () {
       final flash = HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig(
           size: 1024 * 1024,
           mode: HarborSpiFlashMode.standard,
@@ -58,6 +60,7 @@ void main() {
 
     test('DT compatible is jedec,spi-nor', () {
       final flash = HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig.w25q128(),
         baseAddress: 0x20000000,
       );
@@ -66,10 +69,12 @@ void main() {
 
     test('two different configs give different definition names', () {
       final a = HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig(size: 1024 * 1024),
         baseAddress: 0x20000000,
       );
       final b = HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig(size: 2 * 1024 * 1024),
         baseAddress: 0x20000000,
       );
@@ -94,6 +99,7 @@ void _registerPortTests(HarborFabricKind kind) {
 
     Future<void> setUpDut() async {
       flash = HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig(
           size: 1024 * 1024,
           mode: HarborSpiFlashMode.standard,

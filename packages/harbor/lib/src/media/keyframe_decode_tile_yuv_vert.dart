@@ -180,7 +180,7 @@ class HarborKeyframeDecodeTileYuvVert extends BridgeModule {
             0,
             2,
           ),
-      ].swizzle();
+      ].concat();
       final reconYModes = ymCap;
       final reconTxTypes = ttCap;
       final reconCoeffs = [
@@ -188,13 +188,13 @@ class HarborKeyframeDecodeTileYuvVert extends BridgeModule {
           Const(0, width: 192 * 16),
           coeffCap.getRange(l * 64 * 16, l * 64 * 16 + 64 * 16),
         ],
-      ].swizzle();
+      ].concat();
       int posVal(int row, int col) => row | (col << miBits);
       final posNone = Const(posVal(0, 0), width: maxLeaves * 2 * miBits);
       final posSplit = [
         for (var l = maxLeaves - 1; l >= 0; l--)
           Const(posVal(l >> 1, l & 1), width: 2 * miBits),
-      ].swizzle();
+      ].concat();
       final reconPositions = mux(
         reconLeafCount.eq(Const(4, width: cntW)),
         posSplit,
@@ -256,7 +256,7 @@ class HarborKeyframeDecodeTileYuvVert extends BridgeModule {
     Logic lumaBottomRow(Logic fr) => [
       for (var cc = f - 1; cc >= 0; cc--)
         fr.getRange(((f - 1) * f + cc) * 8, ((f - 1) * f + cc) * 8 + 8),
-    ].swizzle();
+    ].concat();
     // chroma 4x4 bottom-row extractor (row cBs-1, cols 0..cBs-1), packed as
     // above[i*8 +: 8] = chroma pixel (row cBs-1, col i).
     Logic chromaBottomRow(Logic recon) => [
@@ -265,7 +265,7 @@ class HarborKeyframeDecodeTileYuvVert extends BridgeModule {
           ((cBs - 1) * cBs + cc) * 8,
           ((cBs - 1) * cBs + cc) * 8 + 8,
         ),
-    ].swizzle();
+    ].concat();
     // chroma 4x4 bottom-row pixel at col 0 (the SB1 above_left corner source).
     // The predictor resolves the corner from above[0] when only above is
     // available.
@@ -338,9 +338,7 @@ class HarborKeyframeDecodeTileYuvVert extends BridgeModule {
               return ((a + b + cc2 + d) << 1).getRange(0, cflAcBits);
             })(),
       ];
-      final cflAcPacked = [
-        for (var k = cN - 1; k >= 0; k--) cflAc[k],
-      ].swizzle();
+      final cflAcPacked = [for (var k = cN - 1; k >= 0; k--) cflAc[k]].concat();
 
       final cd = chromaDerive(uvModeCap);
 

@@ -4,6 +4,7 @@ import 'package:rohd/rohd.dart';
 
 import '../../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../fabric.dart';
+import '../fabric_narrow.dart';
 import '../fabric_util.dart';
 import '../port/fabric_kind.dart';
 import '../port/reg_fifo.dart';
@@ -32,7 +33,7 @@ Logic _dHasData(Logic op) => op.eq(_accessAckData) | op.eq(5);
 Logic _respOp(Logic op) => mux(
   op.eq(TileLinkAOpcode.get.value) | op.eq(2) | op.eq(3),
   Const(_accessAckData, width: 3),
-  mux(op.eq(5), Const(_hintAck, width: 3), Const(0, width: 3)),
+  mux<Logic>(op.eq(5), Const(_hintAck, width: 3), Const(0, width: 3)),
 );
 
 // A response stream from one target, with its slave side source.
@@ -64,6 +65,14 @@ class _Resp {
 ///
 /// TileLink has no order between sources, and a master has one message per
 /// source in flight, so the fabric keeps no order between messages.
+///
+/// A master with [HarborFabricMaster.realtime] wins every arbitration for a
+/// target. A message cannot be cut, so `realtimeBurstCap` does not apply: a
+/// real-time message waits for the message that holds the target, and the
+/// largest message of the other masters sets the wait (see
+/// [HarborFabric.realtimeWaitBound]). A build that needs a short wait keeps
+/// the messages of the other masters small, for example with the burst
+/// length of their memory ports.
 ///
 /// A message that hits no slave, or that its slave cannot take, goes to an
 /// internal error slave. It takes all A beats, then answers denied with the
@@ -101,12 +110,19 @@ class HarborTileLinkFabric extends HarborFabricModule {
     final cfg0 = _tl(masters.first.name, masters.first.interface).config;
     final addrW = cfg0.addressWidth;
     final dataW = cfg0.dataWidth;
-    for (final (name, intf) in [
-      for (final m in masters) (m.name, m.interface),
-      for (final s in slaves) (s.name, s.interface),
+    final narrow = <bool>[];
+    for (final s in slaves) {
+      _tl(s.name, s.interface);
+      narrow.add(
+        harborSlaveAdapts(s, kind: 'TileLink', addrW: addrW, dataW: dataW),
+      );
+    }
+    for (final (name, intf, isSlave) in [
+      for (final m in masters) (m.name, m.interface, false),
+      for (final s in slaves) (s.name, s.interface, true),
     ]) {
       final t = _tl(name, intf).config;
-      if (t.addressWidth != addrW || t.dataWidth != dataW) {
+      if (!isSlave && (t.addressWidth != addrW || t.dataWidth != dataW)) {
         throw ArgumentError(
           '$name: TileLink widths (addr ${t.addressWidth}, data '
           '${t.dataWidth}) differ from addr $addrW, data $dataW',
@@ -130,6 +146,7 @@ class HarborTileLinkFabric extends HarborFabricModule {
     final c = addInput('clk', clk);
     final r = addInput('reset', reset);
     addOutput('bus_error');
+    addOutput('timeout_count', width: timeoutCountWidth(slaves.length));
 
     final nm = masters.length;
     final ns = slaves.length;
@@ -158,14 +175,37 @@ class HarborTileLinkFabric extends HarborFabricModule {
         ),
     ];
     final sa = [
-      for (final s in slaves)
-        (s.interface as TileLinkInterface).clone()..pairConnectIO(
-          this,
-          s.interface,
-          PairRole.provider,
-          uniquify: (n) => '${s.name}_$n',
-        ),
+      for (final (t, s) in slaves.indexed)
+        _slavePort(s, narrow[t], c, r, addrW, dataW),
     ];
+    // A TL-UL slave takes a message of one of its own beats or less.
+    final slaveBeatLog2 = [
+      for (var t = 0; t < slaves.length; t++)
+        narrow[t] ? (sCfg[t].dataWidth ~/ 8).bitLength - 1 : beatLog2,
+    ];
+    // A master that declares writeStallFree sends the beats of a Put message
+    // with no gap.
+    for (var m = 0; m < nm; m++) {
+      if (!masters[m].writeStallFree) continue;
+      final a = ma[m];
+      var left = 0;
+      harborSimWatch(c, r, () {
+        final valid = simHigh(a.aValid);
+        final bad = left > 0 && !valid
+            ? '${masters[m].name} declares writeStallFree and leaves a gap '
+                  'inside a Put message'
+            : null;
+        if (valid && simHigh(a.aReady)) {
+          if (left > 0) {
+            left--;
+          } else if (simInt(a.aOpcode) < 4) {
+            final size = simInt(a.aSize);
+            left = size > beatLog2 ? (1 << (size - beatLog2)) - 1 : 0;
+          }
+        }
+        return bad;
+      });
+    }
     final tName = [for (final s in slaves) s.name, 'err'];
     final tSrcW = [for (final x in sCfg) x.sourceWidth, fw];
     final tN = [for (final s in slaves) s.outstanding, errorOutstanding];
@@ -260,12 +300,18 @@ class HarborTileLinkFabric extends HarborFabricModule {
           (masters[m].reaches(slaves[t].name)
                   ? inRange(addr, slaves[t].range)
                   : Const(0)) &
-              _fits(slaves[t].memory, sCfg[t].sizeWidth, beatLog2, op, size),
+              _fits(
+                slaves[t].memory,
+                sCfg[t].sizeWidth,
+                slaveBeatLog2[t],
+                op,
+                size,
+              ),
       ];
       final tgt = [...hits, ~anyOf(hits)];
       mFirst.add(first);
       mLast.add(last);
-      mFull.add(pW > 0 ? [Const(m, width: pW), src].swizzle() : src);
+      mFull.add(pW > 0 ? [Const(m, width: pW), src].concat() : src);
       mBeatData.add(beatData);
       firstReq.add([
         for (var t = 0; t < nt; t++)
@@ -281,6 +327,9 @@ class HarborTileLinkFabric extends HarborFabricModule {
       ]);
     }
 
+    final rt = [for (final m in masters) m.realtime];
+    final hasRt = rt.contains(true);
+
     // Arbitration with a lock that holds a target for the rest of a
     // message.
     final grant = [
@@ -288,9 +337,12 @@ class HarborTileLinkFabric extends HarborFabricModule {
     ];
     if (topology == HarborFabricTopology.crossbar) {
       for (var t = 0; t < nt; t++) {
-        final rr = roundRobin('${tName[t]}_a', c, r, [
-          for (var m = 0; m < nm; m++) firstReq[m][t],
-        ]);
+        final rr = roundRobin(
+          '${tName[t]}_a',
+          c,
+          r,
+          realtimeFirst([for (var m = 0; m < nm; m++) firstReq[m][t]], rt),
+        );
         for (var m = 0; m < nm; m++) {
           grant[m][t] <= rr[m] | contReq[m][t];
         }
@@ -300,9 +352,14 @@ class HarborTileLinkFabric extends HarborFabricModule {
       }
     } else {
       final busLock = Logic(name: 'bus_a_lock');
-      final rr = roundRobin('bus_a', c, r, [
-        for (var m = 0; m < nm; m++) anyOf(firstReq[m]) & ~busLock,
-      ]);
+      final rr = roundRobin(
+        'bus_a',
+        c,
+        r,
+        realtimeFirst([
+          for (var m = 0; m < nm; m++) anyOf(firstReq[m]) & ~busLock,
+        ], rt),
+      );
       final g = [for (var m = 0; m < nm; m++) rr[m] | anyOf(contReq[m])];
       for (var m = 0; m < nm; m++) {
         mPop[m] <= g[m];
@@ -426,6 +483,7 @@ class HarborTileLinkFabric extends HarborFabricModule {
       dataW: dataW,
     );
     output('bus_error') <= anyOf(dead);
+    output('timeout_count') <= timeoutCountOf(dead, slaves.length);
 
     // D to the masters. The master index on top of the full source picks
     // the master, and a lock keeps the beats of a message together.
@@ -501,14 +559,29 @@ class HarborTileLinkFabric extends HarborFabricModule {
     } else {
       final lock = Logic(name: 'bus_d_lock');
       final lockT = Logic(name: 'bus_d_lock_target', width: tW);
-      final g = roundRobin('bus_d', c, r, [
+      final dReq = [
         for (var t = 0; t < nt; t++)
           resp[t].valid &
               anyOf([
                 for (var m = 0; m < nm; m++) dest[t][m] & outs[m].pushReady,
               ]) &
               (~lock | lockT.eq(Const(t, width: tW))),
-      ]);
+      ];
+      // A response for a real-time master goes first.
+      var dArb = dReq;
+      if (hasRt) {
+        final rtD = [
+          for (var t = 0; t < nt; t++)
+            dReq[t] &
+                anyOf([
+                  for (var m = 0; m < nm; m++)
+                    if (rt[m]) dest[t][m],
+                ]),
+        ];
+        final rtAny = anyOf(rtD);
+        dArb = [for (var t = 0; t < nt; t++) dReq[t] & (rtD[t] | ~rtAny)];
+      }
+      final g = roundRobin('bus_d', c, r, dArb);
       final any = anyOf(g);
       final last = pick(g, dLast);
       for (var m = 0; m < nm; m++) {
@@ -760,6 +833,30 @@ class HarborTileLinkFabric extends HarborFabricModule {
         ]);
   }
 
+  // The slave port. A narrow slave gets a fabric width port in front of it.
+  TileLinkInterface _slavePort(
+    HarborFabricSlave s,
+    bool narrow,
+    Logic clk,
+    Logic reset,
+    int addrW,
+    int dataW,
+  ) {
+    final n = (s.interface as TileLinkInterface).clone()
+      ..pairConnectIO(
+        this,
+        s.interface,
+        PairRole.provider,
+        uniquify: (x) => '${s.name}_$x',
+      );
+    if (!narrow) return n;
+    final wide =
+        harborWidenPort(s.interface, addressWidth: addrW, dataWidth: dataW)
+            as TileLinkInterface;
+    harborNarrowTileLink(clk, reset, name: s.name, w: wide, n: n);
+    return wide;
+  }
+
   static TileLinkInterface _tl(String name, PairInterface p) => switch (p) {
     final TileLinkInterface t => t,
     _ => throw ArgumentError(
@@ -778,7 +875,10 @@ class HarborTileLinkFabric extends HarborFabricModule {
     final c0 = _tl(masters.first.name, masters.first.interface).config;
     String port(String name, PairInterface p, bool memory) {
       final t = _tl(name, p).config;
-      return '${memory ? 'H' : 'L'}s${t.sourceWidth}z${t.sizeWidth}';
+      final w = t.addressWidth == c0.addressWidth && t.dataWidth == c0.dataWidth
+          ? ''
+          : 'W${t.addressWidth}x${t.dataWidth}';
+      return '${memory ? 'H' : 'L'}s${t.sourceWidth}z${t.sizeWidth}$w';
     }
 
     return harborStableDefinitionName('HarborTileLinkFabric', [
@@ -787,7 +887,8 @@ class HarborTileLinkFabric extends HarborFabricModule {
       'd${c0.dataWidth}',
       for (final m in masters)
         'M${m.name}${port(m.name, m.interface, m.memory)}'
-            'o${m.outstandingOn(HarborFabricKind.tilelink)}${m.reachTag(slaves)}',
+            'o${m.outstandingOn(HarborFabricKind.tilelink)}${m.reachTag(slaves)}'
+            '${m.realtime ? 'Q' : ''}',
       for (final s in slaves)
         'S${s.name}${port(s.name, s.interface, s.memory)}n${s.outstanding}'
             '${s.offset ? 'O' : ''}t${s.timeout}r${s.range.start.toRadixString(16)}'

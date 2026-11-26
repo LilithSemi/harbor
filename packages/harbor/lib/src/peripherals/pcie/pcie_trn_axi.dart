@@ -84,7 +84,7 @@ class HarborPcieTrnAxi extends Module {
     final swappedRx = [
       trnRxData.slice(31, 0),
       trnRxData.slice(63, 32),
-    ].swizzle();
+    ].concat();
     final eofLocation =
         (trnRxEof.zeroExtend(5) << Const(4, width: 5)) |
         (trnRxRem[0].zeroExtend(5) << Const(2, width: 5)) |
@@ -118,8 +118,8 @@ class HarborPcieTrnAxi extends Module {
                 then: [
                   rxDataReg < swappedRx,
                   rxKeepReg <
-                      mux(
-                        trnRxRem[0],
+                      mux<Logic>(
+                        ~trnRxEof | trnRxRem[0],
                         Const(0xff, width: 8),
                         Const(0x0f, width: 8),
                       ),
@@ -154,12 +154,19 @@ class HarborPcieTrnAxi extends Module {
     final trnAccept = (trnTxDstReady[0] & linkUp).named('trn_accept');
     final acceptTx = (~txValidReg | trnAccept).named('accept_tx');
     final txTransfer = (txValidReg & trnAccept).named('tx_transfer');
+    // Finish the active packet before granting the configuration request.
+    // Blocking its remaining data would prevent the grant.
+    final packetNeedsData =
+        (txInPacket | txValidReg) & ~(txValidReg & txLastReg);
+    final acceptPacket = (~trnTxCfgReq | packetNeedsData).named(
+      'accept_packet',
+    );
     final swappedTx = [
       txDataReg.slice(31, 0),
       txDataReg.slice(63, 32),
-    ].swizzle();
+    ].concat();
 
-    addOutput('tx_ready') <= acceptTx & linkUp & ~trnTxCfgReq;
+    addOutput('tx_ready') <= acceptTx & linkUp & acceptPacket;
     addOutput('tx_idle') <= ~txValidReg & ~txInPacket;
     addOutput('trn_tx_data', width: 128) <= swappedTx.zeroExtend(128);
     addOutput('trn_tx_rem', width: 2) <= txKeepReg[7].zeroExtend(2);
@@ -180,9 +187,9 @@ class HarborPcieTrnAxi extends Module {
           If(
             acceptTx,
             then: [
-              txValidReg < txValid & ~trnTxCfgReq,
+              txValidReg < txValid & acceptPacket,
               If(
-                txValid & ~trnTxCfgReq,
+                txValid & acceptPacket,
                 then: [
                   txDataReg < txData,
                   txKeepReg < txKeep,

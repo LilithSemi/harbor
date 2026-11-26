@@ -26,7 +26,7 @@ void main() {
   test('a simulation forwards the clock with plain logic', () async {
     final fwd = build(const HarborSimTarget());
     await fwd.build();
-    final sv = fwd.generateSynth();
+    final sv = fwd.dumpSystemVerilog();
     expect(
       sv,
       isNot(contains('ODDRX1F')),
@@ -40,13 +40,13 @@ void main() {
   test('an ECP5 build uses ODDRX1F', () async {
     final fwd = build(ecp5);
     await fwd.build();
-    expect(fwd.generateSynth(), contains('ODDRX1F'));
+    expect(fwd.dumpSystemVerilog(), contains('ODDRX1F'));
   });
 
   test('a Xilinx 7-series build uses ODDR', () async {
     final fwd = build(arty);
     await fwd.build();
-    final sv = fwd.generateSynth();
+    final sv = fwd.dumpSystemVerilog();
     expect(sv, contains('ODDR'));
     expect(sv, isNot(contains('ODDRX1F')));
   });

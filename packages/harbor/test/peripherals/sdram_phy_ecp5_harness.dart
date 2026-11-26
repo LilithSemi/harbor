@@ -87,44 +87,26 @@ int sdramPhyExpectedWord(int bank, int row, int col, int data, int dqmBits) {
 const sdramPhyTestConfig = HarborSdramConfig.as4c16m16sb6();
 const sdramPhyTestGap = 20; // generous: above every datasheet minimum.
 
-/// ECP5 tSUPLL / tHPLL (Lattice FPGA-DS-02012 v1.9, table 3.22): the fpga's
-/// own input register wants data this far clear of the capture edge, on
-/// top of the chip's own valid window ([SdramPhyEcp5]'s class doc).
-const sdramPhyTsuNs = 0.85;
-const sdramPhyThNs = 0.98;
-
-/// The raw pad-level sample point, in sdram_clk cycles past the chip's own
-/// committing edge `E` ([SdramPhyEcp5]'s class doc): `0.5` for rising
-/// capture (the inverted clock's own rising edge), `0` for falling, plus
-/// [HarborSdramPhyConfig.captureCycleOffset] whole cycles more.
-double sdramPhyCaptureM(HarborSdramPhyConfig phy) =>
-    (phy.captureEdge == HarborSdramCaptureEdge.rising ? 0.5 : 0.0) +
-    phy.captureCycleOffset;
-
-/// Whether a beat sampled at [sdramPhyCaptureM] cycles past `E` lands
-/// inside `[E - tCk + d + tAC, E + d + tOH]` with the fpga's own tSU/tH
-/// margin still clear on both sides, for the given [periodPs] (`tCk`),
-/// [tAcNs] and board flight [fpgaToSdramNs] + `sdramToFpgaNs` (0.5 ns,
-/// [SdramPinModel]'s default). `tOH` is the datasheet's fixed 2.5 ns.
+/// Whether [phy] with the board flight [fpgaToSdramNs] captures inside the
+/// window for the clock [periodPs] and [casLatency] on the ULX3S part. See
+/// [HarborSdramPhyConfig.captureOkAt].
 bool sdramPhyCaptureOk({
   required int periodPs,
-  required double tAcNs,
+  required int casLatency,
   required double fpgaToSdramNs,
   required HarborSdramPhyConfig phy,
 }) {
-  const tOhNs = 2.5;
-  const sdramToFpgaNs = 0.5;
-  final m = sdramPhyCaptureM(phy);
-  final samplePs = (m * periodPs).round();
-  final dPs = ((fpgaToSdramNs + sdramToFpgaNs) * 1000).round();
-  final dMinPs =
-      samplePs - (tOhNs * 1000).round() + (sdramPhyThNs * 1000).round();
-  final dMaxPs =
-      samplePs +
-      periodPs -
-      (tAcNs * 1000).round() -
-      (sdramPhyTsuNs * 1000).round();
-  return dPs >= dMinPs && dPs <= dMaxPs;
+  final timing = sdramPhyTestConfig.timing;
+  return HarborSdramPhyConfig(
+    captureEdge: phy.captureEdge,
+    captureCycleOffset: phy.captureCycleOffset,
+    fpgaToSdramNs: fpgaToSdramNs,
+    sdramToFpgaNs: phy.sdramToFpgaNs,
+  ).captureOkAt(
+    periodPs: periodPs,
+    tAcNs: timing.tAcByCl[casLatency]!,
+    tOhNs: timing.tOh,
+  );
 }
 
 /// The 16 [Ecp5Bb] dq pad buffers inside [phy], indexed the way
@@ -185,7 +167,7 @@ Future<SdramPhyEcp5RunResult> runSdramPhyEcp5Case({
 }) async {
   const bank = 0, row = 0;
   final config = sdramPhyTestConfig;
-  final clk = SimpleClockGenerator(periodPs).clk;
+  final clk = SimpleClockGenerator(periodPs + (periodPs & 1)).clk;
   final reset = Logic(name: 'reset')..inject(0);
   final driver = SdramPhyEcp5Driver(clk);
   final dqPad = LogicNet(name: 'dq_pad', width: config.dataWidth);
@@ -211,8 +193,8 @@ Future<SdramPhyEcp5RunResult> runSdramPhyEcp5Case({
   await sdramPhy.build();
 
   final bbs = _sdramPhyDqBbs(sdramPhy, config.dataWidth);
-  final fpgaDqOe = [for (final bb in bbs) ~bb.input('T')].rswizzle();
-  final fpgaDqOut = [for (final bb in bbs) bb.input('I')].rswizzle();
+  final fpgaDqOe = [for (final bb in bbs) ~bb.input('T')].rconcat();
+  final fpgaDqOut = [for (final bb in bbs) bb.input('I')].rconcat();
 
   final rules = const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000);
   final model = SdramPinModel(

@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:rohd/rohd.dart';
 
 import '../../clock/cdc.dart';
+import '../fabric_util.dart' show widthOf;
 import 'memory_waist.dart';
 import 'reg_fifo.dart';
 
@@ -17,6 +20,17 @@ class HarborFabricClock {
   /// True when a device on [deviceClk] needs a crossing to this clock.
   bool crossesFrom(Logic deviceClk) => !identical(clk, deviceClk);
 }
+
+final _crossedPorts = Expando<Map<String, Logic>>('crossedPorts');
+
+/// Records that the port [port] of [module] crosses to the fabric clock
+/// [fabricClk].
+void harborMarkCrossed(Module module, String port, Logic fabricClk) =>
+    (_crossedPorts[module] ??= {})[port] = fabricClk;
+
+/// The ports of [module] that cross to a fabric clock, with that clock.
+Map<String, Logic> harborCrossedPorts(Module module) =>
+    _crossedPorts[module] ?? const {};
 
 /// The default depth of a memory waist crossing: [outstanding] plus 2,
 /// rounded up to a power of two.
@@ -61,6 +75,21 @@ class HarborMemoryWaistCdc extends Module {
   /// Entries in each FIFO.
   final int depth;
 
+  /// Cycles after a device reset that the fabric side waits with no response
+  /// before it gives up on the requests in flight. 0 turns the wait limit
+  /// off. Only the master side uses it.
+  ///
+  /// The master side sends an epoch bit on top of the request ID, so the
+  /// fabric waist of a master crossing has one more ID bit than the device
+  /// waist. A give up flips the epoch and drops each response with the old
+  /// one. After two give ups an old response would look current. So the
+  /// fabric side gives up again only after it has seen every response owed
+  /// from the last give up, and stays in recover mode until then.
+  final int recoverTimeout;
+
+  /// Default of [recoverTimeout].
+  static const defaultRecoverTimeout = 1 << 20;
+
   /// The device side reset joined with the fabric reset.
   Logic get deviceReset => output('device_reset');
 
@@ -86,6 +115,16 @@ class HarborMemoryWaistCdc extends Module {
   /// [slave] set, because that side answers and drops nothing.
   Logic get debugDropped => output('debug_dropped');
 
+  /// Times the fabric side gave up waiting for the responses owed after a
+  /// device reset, on the fabric clock. It saturates at 255. It is 0 with
+  /// [slave] set.
+  Logic get debugRecoverTimeouts => output('debug_recover_timeouts');
+
+  /// High while responses from before the last give up are still owed. The
+  /// fabric side does not give up again until they arrive. It is 0 with
+  /// [slave] set.
+  Logic get debugGiveupHeld => output('debug_giveup_held');
+
   HarborMemoryWaistCdc({
     required Logic fabricClk,
     required Logic fabricReset,
@@ -96,6 +135,7 @@ class HarborMemoryWaistCdc extends Module {
     required bool slave,
     int? depth,
     HarborResetCopy? deviceResetCopy,
+    this.recoverTimeout = defaultRecoverTimeout,
     super.name = 'memory_waist_cdc',
   }) : depth = depth ?? harborCdcDepth(fabric.config.outstanding),
        super(
@@ -104,12 +144,20 @@ class HarborMemoryWaistCdc extends Module {
              '_a${fabric.config.addressWidth}_d${fabric.config.dataWidth}'
              '_i${fabric.config.idWidth}_n${fabric.config.outstanding}'
              '_q${depth ?? harborCdcDepth(fabric.config.outstanding)}'
-             '${deviceResetCopy == null ? '' : '_r'}',
+             '${deviceResetCopy == null ? '' : '_r'}'
+             '${slave || recoverTimeout == defaultRecoverTimeout ? '' : '_t$recoverTimeout'}',
        ) {
+    if (recoverTimeout < 0) {
+      throw ArgumentError.value(
+        recoverTimeout,
+        'recoverTimeout',
+        'must be >= 0',
+      );
+    }
     final config = fabric.config;
     if (device.config.addressWidth != config.addressWidth ||
         device.config.dataWidth != config.dataWidth ||
-        device.config.idWidth != config.idWidth ||
+        device.config.idWidth + (slave ? 0 : 1) != config.idWidth ||
         device.config.outstanding != config.outstanding) {
       throw ArgumentError('fabric $config and device ${device.config} differ');
     }
@@ -186,7 +234,7 @@ class HarborMemoryWaistCdc extends Module {
     final up = slave ? f : d;
     final dn = slave ? d : f;
 
-    final idW = config.idWidth;
+    final idW = device.config.idWidth;
     final dataW = config.dataWidth;
     const lenW = HarborMemoryWaistConfig.lenWidth;
     final reqWidths = [
@@ -231,9 +279,9 @@ class HarborMemoryWaistCdc extends Module {
     Logic nonZero(Logic c) => ~c.eq(Const(0, width: c.width));
     final fifos = [reqF, wdF, rdF, wrF];
     addOutput('debug_empty', width: 4) <=
-        [for (final q in fifos.reversed) q.rdEmpty].swizzle();
+        [for (final q in fifos.reversed) q.rdEmpty].concat();
     addOutput('debug_full', width: 4) <=
-        [for (final q in fifos.reversed) q.wrFull].swizzle();
+        [for (final q in fifos.reversed) q.wrFull].concat();
 
     if (slave) {
       // Fabric side: the requester. The queues hold what is in flight, so
@@ -267,6 +315,8 @@ class HarborMemoryWaistCdc extends Module {
       addOutput('debug_writes', width: cntW) <= wrQ.count;
       addOutput('debug_recover') <= mode;
       addOutput('debug_dropped', width: 16) <= Const(0, width: 16);
+      addOutput('debug_recover_timeouts', width: 8) <= Const(0, width: 8);
+      addOutput('debug_giveup_held') <= Const(0);
 
       up.reqReady <= ~reqF.wrFull & ~mode & rdQ.pushReady & wrQ.pushReady;
       reqFire <= up.reqValid & up.reqReady;
@@ -494,12 +544,16 @@ class HarborMemoryWaistCdc extends Module {
     up.wrespExOkay <= bEx;
     wrF.pop(up.wrespReady & ~dWr);
 
-    // Fabric side: the responder. Write data goes out only for a write
-    // already sent, so a device reset never leaves stray beats behind.
+    // Fabric side: the responder. After a device reset, write data goes out
+    // as filler for each write already sent, so a device reset never leaves
+    // a write without its data. The ID to the fabric has the `epoch` bit on
+    // top. A timeout flips it, so a response to a request that was given up
+    // does not match the requests after it.
     final recover = Logic(name: 'recover');
     final mode = (recover | fJoinSync).named('fabric_mode_recover');
     final reqFire = Logic(name: 'f_req_fire');
     final wdLastFire = Logic(name: 'f_wdata_last_fire');
+    final epoch = Logic(name: 'epoch');
     final [id, write, addr, len, size, burst, exclusive] = harborUnpack(
       reqF.rdData,
       reqWidths,
@@ -516,13 +570,23 @@ class HarborMemoryWaistCdc extends Module {
     final outR = Logic(name: 'out_reads', width: cntW);
     final outW = Logic(name: 'out_writes', width: cntW);
     final wBeat = Logic(name: 'w_beat', width: lenW);
+    // Oldest entries of the write length queue that still get filler data
+    // after a timeout.
+    final fill = Logic(name: 'filler_writes', width: cntW);
+    // Reads and writes of the old epoch that a give up left owed. The fabric
+    // side gives up again only when both are 0, so an old response cannot
+    // match the epoch after two flips.
+    final goneR = Logic(name: 'gone_reads', width: cntW);
+    final goneW = Logic(name: 'gone_writes', width: cntW);
+    addOutput('debug_giveup_held') <= nonZero(goneR) | nonZero(goneW);
     addOutput('debug_reads', width: cntW) <= outR;
     addOutput('debug_writes', width: cntW) <= outW;
     addOutput('debug_recover') <= mode;
 
+    final filling = (mode | nonZero(fill)).named('filler_data');
     final reqOpen = ~mode & lenQ.pushReady;
     dn.reqValid <= ~reqF.rdEmpty & reqOpen;
-    dn.reqId <= id;
+    dn.reqId <= [epoch, id].concat();
     dn.reqWrite <= write;
     dn.reqAddr <= addr;
     dn.reqLen <= len;
@@ -534,83 +598,114 @@ class HarborMemoryWaistCdc extends Module {
 
     final [wData, wStrb, wLast] = harborUnpack(wdF.rdData, wdWidths);
     final wOpen = lenQ.popValid;
-    dn.wdataValid <= wOpen & (mode | ~wdF.rdEmpty);
-    dn.wdataData <= wData & (~mode).replicate(dataW);
-    dn.wdataStrb <= mux(mode, Const(0, width: config.strbWidth), wStrb);
-    final drainLast = Logic(name: 'w_drain_last');
-    dn.wdataLast <= mux(mode, drainLast, wLast);
-    wdF.pop(dn.wdataReady & wOpen & ~mode);
+    dn.wdataValid <= wOpen & (filling | ~wdF.rdEmpty);
+    dn.wdataData <= wData & (~filling).replicate(dataW);
+    dn.wdataStrb <= mux(filling, Const(0, width: config.strbWidth), wStrb);
+    dn.wdataLast <= mux(filling, wBeat.eq(lenQ.popData), wLast);
+    wdF.pop(dn.wdataReady & wOpen & ~filling);
     final wdFire = dn.wdataValid & dn.wdataReady;
     wdLastFire <= wdFire & dn.wdataLast;
 
-    // Responses to requests sent before a device reset are dropped. READY
-    // stays low while nothing is in flight.
-    dn.rdataReady <= (mode | ~rdF.wrFull) & nonZero(outR);
+    // A response with the wrong epoch belongs to a request that was given
+    // up. It is always taken and dropped. Responses to requests before a
+    // device reset are dropped too. READY stays low while nothing is in
+    // flight.
+    final rOld = dn.rdataValid & (dn.rdataId[idW] ^ epoch);
+    final bOld = dn.wrespValid & (dn.wrespId[idW] ^ epoch);
+    dn.rdataReady <= rOld | ((mode | ~rdF.wrFull) & nonZero(outR));
     rdF.push(
-      dn.rdataValid & dn.rdataReady & ~mode,
+      dn.rdataValid & dn.rdataReady & ~mode & ~rOld,
       harborPack([
-        dn.rdataId,
+        dn.rdataId.slice(idW - 1, 0),
         dn.rdataData,
         dn.rdataErr,
         dn.rdataLast,
         dn.rdataExOkay,
       ]),
     );
-    dn.wrespReady <= (mode | ~wrF.wrFull) & nonZero(outW);
+    dn.wrespReady <= bOld | ((mode | ~wrF.wrFull) & nonZero(outW));
     wrF.push(
-      dn.wrespValid & dn.wrespReady & ~mode,
-      harborPack([dn.wrespId, dn.wrespErr, dn.wrespExOkay]),
+      dn.wrespValid & dn.wrespReady & ~mode & ~bOld,
+      harborPack([dn.wrespId.slice(idW - 1, 0), dn.wrespErr, dn.wrespExOkay]),
     );
-    final rDone = dn.rdataValid & dn.rdataReady & dn.rdataLast;
-    final bDone = dn.wrespValid & dn.wrespReady;
+    final rTake = dn.rdataValid & dn.rdataReady;
+    final bTake = dn.wrespValid & dn.wrespReady;
+    final rDone = rTake & dn.rdataLast & ~rOld;
+    final bDone = bTake & ~bOld;
     final dropped = Logic(name: 'dropped', width: 16);
     addOutput('debug_dropped', width: 16) <= dropped;
     final reqR = reqFire & ~write;
     final reqW = reqFire & write;
 
-    // drainLast is wBeat equal to the head length, one beat early. When the
-    // head changes, wBeat is 0.
-    final ptrW = lenQ.readIndex.width;
-    final rdNext = lenQ.readIndex.eq(Const(n - 1, width: ptrW));
-    Logic second = lenQ.entries[0];
-    for (var i = n - 1; i >= 0; i--) {
-      final at = mux(
-        rdNext,
-        Const(0, width: ptrW),
-        lenQ.readIndex + 1,
-      ).eq(Const(i, width: ptrW));
-      second = mux(at, lenQ.entries[i], second);
+    // A device reset can leave requests that never get a response. When
+    // nothing moves for [recoverTimeout] cycles, the fabric side gives up
+    // on the responses: the epoch flips and the counts clear. Filler data
+    // for the writes already sent stays owed.
+    final expire = Logic(name: 'recover_expire');
+    final timeouts = Logic(name: 'recover_timeouts', width: 8);
+    addOutput('debug_recover_timeouts', width: 8) <= timeouts;
+    if (recoverTimeout > 0) {
+      final waiting =
+          mode &
+          (nonZero(outR) | nonZero(outW) | lenQ.popValid) &
+          ~nonZero(goneR) &
+          ~nonZero(goneW);
+      final progress = rTake | bTake | wdFire;
+      final tw = widthOf(recoverTimeout);
+      final timer = Logic(name: 'recover_timer', width: tw);
+      expire <=
+          waiting & ~progress & timer.eq(Const(recoverTimeout - 1, width: tw));
+      Sequential(fClk, reset: fReset, [
+        If.block([
+          Iff(~waiting | progress | expire, [timer < 0]),
+          Else([timer < timer + 1]),
+        ]),
+      ]);
+    } else {
+      expire <= Const(0);
     }
-    final nextHead = mux(
-      lenQ.popFire & lenQ.count.gt(1),
-      second,
-      len,
-    ).named('w_next_head_len');
-    final headChange = lenQ.popFire | (lenQ.count.eq(0) & lenQ.pushFire);
 
     Sequential(fClk, reset: fReset, [
-      If.block([
-        Iff(headChange, [drainLast < nextHead.eq(0)]),
-        ElseIf(wdFire, [drainLast < (wBeat + 1).eq(lenQ.popData)]),
-      ]),
+      If(expire, then: [epoch < ~epoch]),
+      If(
+        expire & ~timeouts.eq(Const(255, width: 8)),
+        then: [timeouts < timeouts + 1],
+      ),
       dropped <
           dropped +
-              (dn.rdataValid & dn.rdataReady & mode).zeroExtend(16) +
-              (bDone & mode).zeroExtend(16),
+              (rTake & (mode | rOld)).zeroExtend(16) +
+              (bTake & (mode | bOld)).zeroExtend(16),
       If.block([
         Iff(wdLastFire, [wBeat < Const(0, width: lenW)]),
         ElseIf(wdFire, [wBeat < wBeat + 1]),
       ]),
       If.block([
-        Iff(reqR & ~rDone, [outR < outR + 1]),
+        Iff(expire, [fill < lenQ.count]),
+        ElseIf(wdLastFire & nonZero(fill), [fill < fill - 1]),
+      ]),
+      If.block([
+        Iff(expire, [goneR < outR]),
+        ElseIf(rTake & rOld & dn.rdataLast & nonZero(goneR), [
+          goneR < goneR - 1,
+        ]),
+      ]),
+      If.block([
+        Iff(expire, [goneW < outW]),
+        ElseIf(bTake & bOld & nonZero(goneW), [goneW < goneW - 1]),
+      ]),
+      If.block([
+        Iff(expire, [outR < 0]),
+        ElseIf(reqR & ~rDone, [outR < outR + 1]),
         ElseIf(rDone & ~reqR, [outR < outR - 1]),
       ]),
       If.block([
-        Iff(reqW & ~bDone, [outW < outW + 1]),
+        Iff(expire, [outW < 0]),
+        ElseIf(reqW & ~bDone, [outW < outW + 1]),
         ElseIf(bDone & ~reqW, [outW < outW - 1]),
       ]),
       If.block([
         Iff(fJoinSync, [recover < Const(1)]),
+        ElseIf(expire, [recover < Const(0)]),
         ElseIf(~lenQ.popValid & ~nonZero(outR) & ~nonZero(outW), [
           recover < Const(0),
         ]),
@@ -685,11 +780,13 @@ class _Fifo {
 /// A gray pointer FIFO between two clocks, for a waist crossing whose two
 /// sides can sit far from the logic that uses them.
 ///
-/// It has the cycle timing of a flop array [HarborCdcFifo]. The outputs are
-/// flops: `rd_data` is a head register that holds the entry at the read
-/// pointer. `wr_full_push` and `wr_full_hold` give the next full flag with
-/// and without a push, and `rd_empty_pop` and `rd_empty_hold` the next empty
-/// flag with and without a pop. With `trustWrite` or `trustRead`, the user
+/// It has the cycle timing of a flop array [HarborCdcFifo]. The entries are
+/// in a RAM with an asynchronous read port, which is distributed RAM on
+/// Xilinx and ECP5. The outputs are flops: `rd_data` is a head register
+/// that holds the entry at the read pointer. `wr_full_push` and
+/// `wr_full_hold` give the next full flag with and without a push, and
+/// `rd_empty_pop` and `rd_empty_hold` the next empty flag with and without a
+/// pop. With `trustWrite` or `trustRead`, the user
 /// gives that enable only when the FIFO can take it. Each side makes its next state for both values of its enable
 /// ahead, so `wr_en` and `rd_en` only select one.
 class HarborWaistCdcFifo extends Module {
@@ -728,26 +825,17 @@ class HarborWaistCdcFifo extends Module {
 
     final pw = depth.bitLength;
     Logic gray(Logic b) => b ^ (b >>> 1);
-    Logic rotate(Logic x) => [x.getRange(0, depth - 1), x[depth - 1]].swizzle();
-    Logic pick(Logic sel, List<Logic> v) => [
-      for (var i = 0; i < depth; i++) v[i] & sel[i].replicate(width),
-    ].reduce((a, b) => a | b);
-    final mem = [
-      for (var i = 0; i < depth; i++) Logic(name: 'mem_$i', width: width),
-    ];
-
     // Write side.
     final wrPtr = Logic(name: 'wr_ptr', width: pw);
     final rdGray = Logic(name: 'rd_ptr_gray', width: pw);
     final wrGray = Logic(name: 'wr_ptr_gray', width: pw);
     final wrFull = Logic(name: 'wr_full_reg');
-    final wrSel = Logic(name: 'wr_sel', width: depth);
     final rdGraySync0 = Logic(name: 'rd_gray_sync0', width: pw);
     final rdGraySync = Logic(name: 'rd_ptr_gray_sync', width: pw);
     // Full: the write gray equals the read gray with the top 2 bits
     // inverted.
     Logic fullAt(Logic g) => g.eq(
-      [~rdGraySync.getRange(pw - 2), rdGraySync.getRange(0, pw - 2)].swizzle(),
+      [~rdGraySync.getRange(pw - 2), rdGraySync.getRange(0, pw - 2)].concat(),
     );
     // Registers that hold the pointer plus one and its gray code.
     final wrPtr1 = Logic(name: 'wr_ptr_1', width: pw);
@@ -757,8 +845,6 @@ class HarborWaistCdcFifo extends Module {
     addOutput('wr_full_push') <= ~wrReset & fullAt(wrGray1);
     addOutput('wr_full_hold') <= ~wrReset & fullAt(wrGray);
     Sequential(wrClk, [
-      for (var i = 0; i < depth; i++)
-        If(push & wrSel[i], then: [mem[i] < wrData]),
       If(
         wrReset,
         then: [
@@ -767,7 +853,6 @@ class HarborWaistCdcFifo extends Module {
           wrPtr1 < 1,
           wrGray1 < 1,
           wrFull < 0,
-          wrSel < 1,
           rdGraySync0 < 0,
           rdGraySync < 0,
         ],
@@ -779,7 +864,6 @@ class HarborWaistCdcFifo extends Module {
           wrPtr1 < mux(push, wrPtr1 + 1, wrPtr1),
           wrGray1 < mux(push, gray(wrPtr1 + 1), wrGray1),
           wrFull < fullNext,
-          wrSel < mux(push, rotate(wrSel), wrSel),
         ],
       ),
     ]);
@@ -790,19 +874,28 @@ class HarborWaistCdcFifo extends Module {
     // edges before the empty flag falls, so the head holds it by then.
     final rdPtr = Logic(name: 'rd_ptr', width: pw);
     final rdEmpty = Logic(name: 'rd_empty_reg');
-    final rdSel = Logic(name: 'rd_sel', width: depth);
     final head = Logic(name: 'rd_head', width: width);
     final wrGraySync0 = Logic(name: 'wr_gray_sync0', width: pw);
     final wrGraySync = Logic(name: 'wr_ptr_gray_sync', width: pw);
     final rdPtr1 = Logic(name: 'rd_ptr_1', width: pw);
     final rdGray1 = Logic(name: 'rd_ptr_gray_1', width: pw);
-    final rdSel1 = rotate(rdSel);
     final pop = (trustRead ? rdEn : rdEn & ~rdEmpty).named('rd_pop');
+    final rdSelectPtr = mux(pop, rdPtr1, rdPtr);
+    final rdSelectSlot = rdSelectPtr.getRange(0, pw - 1);
+    final mem = _CdcRam(
+      wrClk,
+      width: width,
+      depth: depth,
+      wrEn: push,
+      wrAddr: wrPtr.getRange(0, pw - 1),
+      wrData: wrData,
+      rdAddr: rdSelectSlot,
+    );
     final emptyNext = mux(pop, rdGray1.eq(wrGraySync), rdGray.eq(wrGraySync));
     addOutput('rd_empty_pop') <= rdReset | rdGray1.eq(wrGraySync);
     addOutput('rd_empty_hold') <= rdReset | rdGray.eq(wrGraySync);
     Sequential(rdClk, [
-      head < mux(pop, pick(rdSel1, mem), pick(rdSel, mem)),
+      head < mem.rdData,
       If(
         rdReset,
         then: [
@@ -811,7 +904,6 @@ class HarborWaistCdcFifo extends Module {
           rdPtr1 < 1,
           rdGray1 < 1,
           rdEmpty < 1,
-          rdSel < 1,
           wrGraySync0 < 0,
           wrGraySync < 0,
         ],
@@ -823,11 +915,93 @@ class HarborWaistCdcFifo extends Module {
           rdPtr1 < mux(pop, rdPtr1 + 1, rdPtr1),
           rdGray1 < mux(pop, gray(rdPtr1 + 1), rdGray1),
           rdEmpty < emptyNext,
-          rdSel < mux(pop, rdSel1, rdSel),
         ],
       ),
     ]);
     addOutput('rd_empty') <= rdEmpty;
     addOutput('rd_data', width: width) <= head;
   }
+}
+
+/// The entries of a [HarborWaistCdcFifo]: one write port on the write clock
+/// and an asynchronous read port. The read side samples the read data only
+/// into its head register, and only uses an entry after its pointer crossed.
+class _CdcRam extends Module with SystemVerilog {
+  final int width;
+  final int depth;
+  final int addrWidth;
+
+  Logic get rdData => output('rd_data');
+
+  _CdcRam(
+    Logic clk, {
+    required this.width,
+    required this.depth,
+    required Logic wrEn,
+    required Logic wrAddr,
+    required Logic wrData,
+    required Logic rdAddr,
+  }) : addrWidth = (depth - 1).bitLength,
+       super(
+         name: 'mem',
+         definitionName: 'HarborWaistCdcRam_${width}x$depth',
+         reserveDefinitionName: true,
+       ) {
+    clk = addInput('clk', clk);
+    wrEn = addInput('wr_en', wrEn);
+    wrAddr = addInput('wr_addr', wrAddr, width: addrWidth);
+    wrData = addInput('wr_data', wrData, width: width);
+    rdAddr = addInput('rd_addr', rdAddr, width: addrWidth);
+    final out = Logic(name: 'rd_out', width: width);
+    addOutput('rd_data', width: width) <= out;
+
+    final unknown = LogicValue.filled(width, LogicValue.x);
+    final cells = List<LogicValue>.filled(depth, unknown);
+    void read() {
+      final a = rdAddr.value;
+      out.put(a.isValid ? cells[a.toInt()] : unknown);
+    }
+
+    read();
+    rdAddr.glitch.listen((_) => read());
+    clk.glitch.listen((event) {
+      if (event.previousValue != LogicValue.zero ||
+          event.newValue != LogicValue.one) {
+        return;
+      }
+      final we = wrEn.value;
+      if (!we.isValid) {
+        // An X enable can write any entry, so all of them become X.
+        cells.fillRange(0, depth, unknown);
+      } else if (we.toBool()) {
+        final wa = wrAddr.value;
+        if (wa.isValid) {
+          cells[wa.toInt()] = wrData.value;
+        } else {
+          cells.fillRange(0, depth, unknown);
+        }
+      } else {
+        return;
+      }
+      unawaited(Simulator.clkStable.first.then((_) => read()));
+    });
+  }
+
+  @override
+  String? definitionVerilog(String definitionType) =>
+      '''
+module $definitionType (
+  input logic clk,
+  input logic wr_en,
+  input logic [${addrWidth - 1}:0] wr_addr,
+  input logic [${width - 1}:0] wr_data,
+  input logic [${addrWidth - 1}:0] rd_addr,
+  output logic [${width - 1}:0] rd_data
+);
+  logic [${width - 1}:0] mem [0:${depth - 1}];
+  always_ff @(posedge clk) begin
+    if (wr_en) mem[wr_addr] <= wr_data;
+  end
+  assign rd_data = mem[rd_addr];
+endmodule''';
 }

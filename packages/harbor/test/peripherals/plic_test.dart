@@ -43,6 +43,16 @@ void main() {
       final b = HarborPlic(baseAddress: 0x0C000000, sources: 64);
       expect(a.definitionName, isNot(equals(b.definitionName)));
     });
+
+    test('the registered output changes only its own definition name', () {
+      final plain = HarborPlic(baseAddress: 0x0C000000);
+      final reg = HarborPlic(baseAddress: 0x0C000000, registeredOutput: true);
+      expect(
+        plain.definitionName,
+        equals('HarborPlic_wishbone_a26_d32_s32_c1_p3'),
+      );
+      expect(reg.definitionName, contains('_rq'));
+    });
   });
 
   for (final kind in HarborFabricKind.values) {

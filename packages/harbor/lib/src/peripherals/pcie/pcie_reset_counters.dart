@@ -104,7 +104,7 @@ class HarborPcieResetCounters extends Module {
         gray < harborGray(bin),
       ]);
       harborSimPowerUp(freeClk, [prev, bin, gray]);
-      final user = sync([low, gray].swizzle(), clk, 'perst_user');
+      final user = sync([low, gray].concat(), clk, 'perst_user');
       perstCount = harborGrayToBin(user.slice(7, 0)).named('perst_count');
       perstLow = user[8];
     } else {
@@ -171,6 +171,6 @@ class HarborPcieResetCounters extends Module {
           hotCount,
           perstCount,
           userCount,
-        ].swizzle();
+        ].concat();
   }
 }

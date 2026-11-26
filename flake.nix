@@ -125,6 +125,9 @@
             };
 
             pubspecLock = lib.importJSON ./pubspec.lock.json;
+            gitHashes = {
+              rohd_hcl = "sha256-scU9PpBkBrc8qJ/SZpvWCzrp3iDpcChXlS4GcGm7Q0k=";
+            };
             dartEntryPoints = { };
 
             dontBuild = true;

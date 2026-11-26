@@ -40,6 +40,7 @@ void main() {
 
       // 4-word (16-byte) read-ahead line.
       final flash = HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig(
           size: 1024 * 1024,
           mode: HarborSpiFlashMode.standard,
@@ -177,6 +178,7 @@ void main() {
     final addr = Logic(name: 'addr', width: 32);
 
     final flash = HarborSpiFlashController(
+      clockHz: 100000000,
       config: const HarborSpiFlashConfig(
         size: 1024 * 1024,
         mode: HarborSpiFlashMode.standard,
@@ -276,6 +278,7 @@ void _singleReadTest(HarborFabricKind kind) {
     final miso = Logic(name: 'miso');
 
     final flash = HarborSpiFlashController(
+      clockHz: 100000000,
       config: const HarborSpiFlashConfig(
         size: 1024 * 1024,
         mode: HarborSpiFlashMode.standard,

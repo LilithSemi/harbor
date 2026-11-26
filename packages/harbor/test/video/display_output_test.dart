@@ -81,7 +81,7 @@ void main() {
       );
       await dvi.build();
       expect(dvi.definitionName, equals('HarborFramebufferDisplay'));
-      final sv = dvi.generateSynth();
+      final sv = dvi.dumpSystemVerilog();
       expect(sv, contains('gpdi'));
       expect(sv, isNot(contains('rgb')));
       expect(sv, isNot(contains('pclk')));
@@ -107,7 +107,7 @@ void main() {
     );
     await prgb.build();
     expect(prgb.definitionName, equals('HarborFramebufferDisplay_parallelRgb'));
-    final sv = prgb.generateSynth();
+    final sv = prgb.dumpSystemVerilog();
     expect(sv, contains('rgb'));
     expect(sv, contains('pclk'));
     expect(sv, isNot(contains('gpdi')));

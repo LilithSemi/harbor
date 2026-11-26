@@ -274,7 +274,7 @@ void main() {
       () async {
         const aw = 24, dw = 32;
         final sClk = SimpleClockGenerator(50).clk;
-        final mClk = SimpleClockGenerator(13).clk;
+        final mClk = SimpleClockGenerator(14).clk;
         final sReset = Logic(name: 's_reset')..inject(1);
         final mReset = Logic(name: 'm_reset')..inject(1);
         final sCyc = Logic(name: 's_cyc')..inject(0);
@@ -647,7 +647,7 @@ class _Harness {
     int period = 10,
     int ackLatency = 3,
     bool splitReset = false,
-  }) : clk = SimpleClockGenerator(period).clk {
+  }) : clk = SimpleClockGenerator(period + (period & 1)).clk {
     acks = _AckPipe(mAck, mAckAux, mData, latency: ackLatency);
     dut = Ddr3BurstAdapter(
       busAddrWidth: busAddrW,

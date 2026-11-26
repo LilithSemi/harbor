@@ -180,9 +180,22 @@ void main() {
         clockFrequency: 48000000,
       );
       final dev = uart.acpiDevice;
-      expect(dev.hid, equals('PNP0501'));
-      expect(dev.cid, contains('PNP0501'));
+      expect(dev.hid, equals('RSCV0003'));
+      expect(dev.cid, isEmpty);
       expect(dev.memory.single.start, equals(0x10000000));
+    });
+
+    test('UART ASL binds by _HID RSCV0003 with no _CID', () {
+      final asl = HarborAcpiGenerator(
+        oemId: 'MDSTLL',
+        oemTableId: 'CREEKV1',
+        peripherals: [
+          HarborUart(baseAddress: 0x10000000, clockFrequency: 48000000),
+        ],
+      ).generate();
+      expect(asl, contains('Name (_HID, "RSCV0003")'));
+      expect(asl, isNot(contains('_CID')));
+      expect(asl, isNot(contains('PNP0501')));
     });
 
     test('SRAM flows through the generator', () {

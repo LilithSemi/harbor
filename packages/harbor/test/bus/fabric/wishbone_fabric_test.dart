@@ -150,6 +150,37 @@ Future<void> _timeout(HarborFabricTopology t) async {
   must(b.busError(), 1);
   must(other.beats.first.ack, 1);
   must(other.beats.first.rdata, b.golden['s0']!.read(0x0800));
+  must(b.timeoutCount(), 1);
+}
+
+// Two silent slaves are both cut off. The count is 2, and the slave that
+// answers still works.
+Future<void> _twoCutOff(HarborFabricTopology t) async {
+  final b = await WbBench.start(
+    t,
+    slaves: const [
+      PortCfg('s0', base: 0x00000, size: 0x8000),
+      PortCfg('s1', base: 0x10000, size: 0x8000, timeout: 30),
+      PortCfg('s2', base: 0x20000, size: 0x8000, timeout: 30),
+    ],
+  );
+  b.memories['s1']!.hold = true;
+  b.memories['s2']!.hold = true;
+  must(b.timeoutCount(), 0);
+  final a = rd(0x10000);
+  final c = rd(0x20000);
+  b.managers['m0']!.queue.add(a);
+  b.managers['m1']!.queue.add(c);
+  await b.drain(limit: 400);
+  final other = rd(0x0800);
+  b.send(0, other);
+  await b.drain(limit: 200);
+  await b.sim.stop();
+  must(a.beats.first.err, 1);
+  must(c.beats.first.err, 1);
+  must(b.timeoutCount(), 2);
+  must(other.beats.first.ack, 1);
+  must(other.beats.first.rdata, b.golden['s0']!.read(0x0800));
 }
 
 // A master with a reach set gets the decode error for every slave out of
@@ -215,6 +246,11 @@ void main() {
       test(
         'timeout cuts a slave off and drops late answers',
         () => isolated(() => _timeout(t)),
+        timeout: long,
+      );
+      test(
+        'two silent slaves count 2',
+        () => isolated(() => _twoCutOff(t)),
         timeout: long,
       );
     });

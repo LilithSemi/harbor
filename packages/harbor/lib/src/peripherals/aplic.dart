@@ -27,7 +27,8 @@ class HarborAplic extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   final int sources;
   final int harts;
   final int priorityBits;
@@ -218,7 +219,7 @@ class HarborAplic extends BridgeModule
                               i--
                             )
                               pending[i],
-                          ].swizzle().zeroExtend(32),
+                          ].concat().zeroExtend(32),
                     ],
                   ),
                 ],
@@ -263,7 +264,7 @@ class HarborAplic extends BridgeModule
                               i--
                             )
                               enabled[i],
-                          ].swizzle().zeroExtend(32),
+                          ].concat().zeroExtend(32),
                     ],
                   ),
                 ],

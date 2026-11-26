@@ -354,13 +354,13 @@ void main() {
     final top = CdcMemLoop(_cfg, HarborFabricKind.axi4);
     await top.build();
     final names = definitions(top);
-    expect(names, contains('HarborMemoryWaistCdcSlave_a16_d32_i2_n4_q8'));
-    expect(names, contains('HarborMemoryWaistCdcMaster_a16_d32_i2_n4_q8'));
+    expect(names, contains('HarborMemoryWaistCdcSlave_a16_d32_i3_n4_q8'));
+    expect(names, contains('HarborMemoryWaistCdcMaster_a16_d32_i3_n4_q8'));
     final deep = CdcMemLoop(_cfg, HarborFabricKind.axi4, depth: 16);
     await deep.build();
     expect(
       definitions(deep),
-      contains('HarborMemoryWaistCdcSlave_a16_d32_i2_n4_q16'),
+      contains('HarborMemoryWaistCdcSlave_a16_d32_i3_n4_q16'),
     );
   });
 }

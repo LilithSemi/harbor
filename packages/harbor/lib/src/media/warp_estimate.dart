@@ -81,10 +81,10 @@ class HarborWarpEstimate extends BridgeModule {
     Logic sgn(Logic a) => a[_w - 1];
     // arithmetic shift right by constant n.
     Logic asrC(Logic x, int n) =>
-        n <= 0 ? x : [x[_w - 1].replicate(n), x.getRange(n, _w)].swizzle();
+        n <= 0 ? x : [x[_w - 1].replicate(n), x.getRange(n, _w)].concat();
     // logical shift left by constant n.
     Logic lslC(Logic x, int n) =>
-        n <= 0 ? x : [x.getRange(0, _w - n), Const(0, width: n)].swizzle();
+        n <= 0 ? x : [x.getRange(0, _w - n), Const(0, width: n)].concat();
     // signed less-than.
     Logic slt(Logic a, Logic b) =>
         mux(sgn(a) ^ sgn(b), sgn(a), sub(a, b)[_w - 1]);

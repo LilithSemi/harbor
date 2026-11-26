@@ -203,7 +203,7 @@ class HarborIntraDirAngle extends BridgeModule {
         final baseX = [
           xz2[w - 1].replicate(6),
           xz2.getRange(6, w),
-        ].swizzle().getRange(0, w); // arithmetic >>6
+        ].concat().getRange(0, w); // arithmetic >>6
         final shX = xz2.getRange(1, 6);
         // baseX >= -1  <=>  (baseX + 1) sign bit == 0
         final baseXp1 = (baseX + Const(1, width: w)).getRange(0, w);
@@ -218,7 +218,7 @@ class HarborIntraDirAngle extends BridgeModule {
         final baseY = [
           yz2[w - 1].replicate(6),
           yz2.getRange(6, w),
-        ].swizzle().getRange(0, w);
+        ].concat().getRange(0, w);
         final shY = yz2.getRange(1, 6);
         // signed small index for aAt/lAt: use a 12-bit two's complement slice.
         final bX = baseX.getRange(0, 12);
@@ -245,6 +245,6 @@ class HarborIntraDirAngle extends BridgeModule {
         out.add(px.getRange(0, 8));
       }
     }
-    output('pred') <= [for (var i = bs * bs - 1; i >= 0; i--) out[i]].swizzle();
+    output('pred') <= [for (var i = bs * bs - 1; i >= 0; i--) out[i]].concat();
   }
 }

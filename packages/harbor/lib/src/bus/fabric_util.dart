@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:rohd/rohd.dart';
 
 import 'bus.dart';
+import 'port/reg_fifo.dart' show harborLoad;
 
 /// Width that holds 0 to [maxValue].
 int widthOf(int maxValue) => max(1, maxValue.bitLength);
@@ -52,21 +53,67 @@ List<Logic> highestOf(List<Logic> v) =>
 Logic countOf(List<Logic> bits, int width) =>
     bits.map((b) => b.zeroExtend(width)).reduce((a, b) => a + b);
 
+/// Width of the `timeout_count` output of a fabric with [slaves] slaves.
+int timeoutCountWidth(int slaves) => widthOf(slaves);
+
+/// The number of cut off flags set in [dead], for a fabric with [slaves]
+/// slaves.
+Logic timeoutCountOf(List<Logic> dead, int slaves) {
+  final w = timeoutCountWidth(slaves);
+  return dead.isEmpty ? Const(0, width: w) : countOf(dead, w);
+}
+
 /// Round robin over [req]. The caller puts every condition of a transfer in
 /// [req], so a grant is always taken and the pointer moves on each grant.
 List<Logic> roundRobin(String name, Logic clk, Logic reset, List<Logic> req) {
   final n = req.length;
   if (n == 1) return req;
-  final r = req.rswizzle();
+  final r = req.rconcat();
   final last = Logic(name: '${name}_rr', width: n);
   final masked = r & ~((last << 1) - 1);
   final pick = mux(masked.neq(0), masked, r);
   final g = (pick & (~pick + 1)).named('${name}_grant');
-  Sequential(clk, reset: reset, [
-    If(r.neq(0), then: [last < g]),
-  ]);
+  Sequential(clk, reset: reset, [last < harborLoad(last, r.neq(0), g)]);
   return [for (var i = 0; i < n; i++) g[i]];
 }
+
+/// [req] with the requests of masters that are not real-time held back
+/// while a real-time request is up. [rt] has one flag per request. With no
+/// real-time flag it returns [req] unchanged.
+List<Logic> realtimeFirst(List<Logic> req, List<bool> rt) {
+  if (!rt.contains(true)) return req;
+  final any = anyOf([
+    for (var i = 0; i < req.length; i++)
+      if (rt[i]) req[i],
+  ]);
+  return [for (var i = 0; i < req.length; i++) rt[i] ? req[i] : req[i] & ~any];
+}
+
+/// Simulation only: calls [check] at each rising edge of [clk] out of
+/// [reset], and stops the simulation with the message it returns. The
+/// generated RTL does not have it.
+void harborSimWatch(Logic clk, Logic reset, String? Function() check) {
+  clk.glitch.listen((args) {
+    if (!LogicValue.isPosedge(
+          args.previousValue,
+          args.newValue,
+          ignoreInvalid: true,
+        ) ||
+        reset.value != LogicValue.zero) {
+      return;
+    }
+    final message = check();
+    if (message != null) {
+      Simulator.throwException(Exception(message), StackTrace.current);
+    }
+  });
+}
+
+/// The value of [l] as a bool, false when it has an unknown bit.
+bool simHigh(Logic l) => l.value.isValid && l.value.toBigInt() != BigInt.zero;
+
+/// The value of [l] as an int, 0 when it has an unknown bit.
+int simInt(Logic l) => l.value.isValid ? l.value.toInt() : 0;
 
 /// High when [addr] is in [range].
 Logic inRange(Logic addr, BusAddressRange range) {

@@ -43,7 +43,7 @@ class HarborDeblock6 extends BridgeModule {
     }
 
     Logic ashr(Logic x, int sh) =>
-        [x[w - 1].replicate(sh), x.getRange(sh, w)].swizzle();
+        [x[w - 1].replicate(sh), x.getRange(sh, w)].concat();
     Logic mul(Logic a, int k) => (a.zeroExtend(w) * kc(k)).getRange(0, w);
     Logic rp3(Logic sum) => (sum + kc(4)).getRange(3, 3 + bd);
     Logic wsum(List<List<Object>> terms) {

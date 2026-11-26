@@ -57,7 +57,7 @@ class HarborObuStreamWalker extends BridgeModule {
     const sIdle = 0, sWalk = 1, sDone = 2;
 
     // Byte-granular view of the buffer at the cursor: bytes >> (cursor * 8).
-    final cursorBits = [cursor, Const(0, width: 3)].swizzle(); // cursor * 8
+    final cursorBits = [cursor, Const(0, width: 3)].concat(); // cursor * 8
     final view = (bytesIn >>> cursorBits.zeroExtend(totalBits))
         .getRange(0, totalBits)
         .named('view');
@@ -72,7 +72,7 @@ class HarborObuStreamWalker extends BridgeModule {
     final isSeq = obuType.eq(Const(1, width: 4));
 
     // Sequence-header payload view: shift past the OBU header.
-    final hdrBits = [headerLen, Const(0, width: 3)].swizzle(); // header_len * 8
+    final hdrBits = [headerLen, Const(0, width: 3)].concat(); // header_len * 8
     final seqView = (view >>> hdrBits.zeroExtend(totalBits)).getRange(0, 128);
     final seq = HarborSeqHeaderParser(name: 'seq');
     addSubModule(seq);

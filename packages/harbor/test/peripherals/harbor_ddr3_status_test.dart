@@ -51,13 +51,15 @@ void main() {
       }
       expect(ddr.output('cal_state').width, 6);
       expect(ddr.output('cal_attempts').width, 8);
-      final sv = ddr.generateSynth();
+      final sv = ddr.dumpSystemVerilog();
       for (final n in ['init_done', 'cal_done', 'cal_failed', 'cal_state']) {
         expect(sv, matches(RegExp('output logic (\\[5:0\\] )?$n\\b')));
       }
       expect(sv, matches(RegExp(r'output logic \[7:0\] cal_attempts\b')));
     });
   }
+
+  test('sameClock: the status flags follow the controller', _sameClockStatus);
 
   for (final (ddrPeriod, label) in [
     (14, 'uneven clock ratio'),
@@ -74,7 +76,7 @@ Future<void> _fastSimOrder(int ddrPeriod) async {
   {
     final ddr = _ddr(target: _artix, fastSim: true);
     final clk = SimpleClockGenerator(10).clk;
-    final ddrClk = SimpleClockGenerator(ddrPeriod).clk;
+    final ddrClk = SimpleClockGenerator(ddrPeriod + (ddrPeriod & 1)).clk;
     final reset = Logic(name: 'reset')..inject(1);
     final ddrReset = Logic(name: 'ddr_reset')..inject(1);
     ddr.input('clk').srcConnection! <= clk;
@@ -120,4 +122,57 @@ Future<void> _fastSimOrder(int ddrPeriod) async {
     expect(last.state, Ddr3Controller.calStateDone);
     expect(last.attempts, 1);
   }
+}
+
+Future<void> _sameClockStatus() async {
+  final ddr = HarborDdr3(
+    config: const HarborDdrConfig.ax7203(),
+    baseAddress: 0,
+    clockHz: 100000000,
+    busAddressWidth: 32,
+    busDataWidth: 32,
+    ckPeriodPs: 2500,
+    fastSim: true,
+    sameClock: true,
+    target: _artix,
+  );
+  final clk = SimpleClockGenerator(10).clk;
+  final reset = Logic(name: 'reset')..inject(1);
+  ddr.input('clk').srcConnection! <= clk;
+  ddr.input('reset').srcConnection! <= reset;
+  for (final e in ddr.inputs.entries) {
+    if (e.key != 'clk' && e.key != 'reset') {
+      e.value.srcConnection! <= Const(0, width: e.value.width);
+    }
+  }
+  await ddr.build();
+  Simulator.setMaxSimTime(1 << 40);
+  unawaited(Simulator.run());
+  for (var i = 0; i < 8; i++) {
+    await clk.nextPosedge;
+  }
+  reset.inject(0);
+
+  Ddr3Status? last;
+  for (var i = 0; i < 20000 && !(last?.done ?? false); i++) {
+    await clk.nextPosedge;
+    last = ddr3Status(ddr);
+  }
+  expect(last!.done, isTrue, reason: 'cal_done never rose');
+  expect(last.init, isTrue);
+  expect(last.failed, isFalse);
+  expect(last.state, Ddr3Controller.calStateDone);
+  expect(last.attempts, 1);
+
+  // A Xilinx controller has no failure source, so one cycle of the flag stands
+  // in for it.
+  final flags = ddr.internalSignals.firstWhere((s) => s.name == 'status_flags');
+  await clk.nextNegedge;
+  flags.put(4);
+  await clk.nextPosedge;
+  for (var i = 0; i < 4; i++) {
+    await clk.nextPosedge;
+  }
+  expect(ddr3Status(ddr).failed, isTrue, reason: "cal_failed does not stick");
+  await Simulator.endSimulation();
 }

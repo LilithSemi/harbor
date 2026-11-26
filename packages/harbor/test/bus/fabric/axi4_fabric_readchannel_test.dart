@@ -234,18 +234,20 @@ Future<void> _concurrencyAndOwnWrite(HarborFabricTopology t) async {
 }
 
 void main() {
-  for (final topology in HarborFabricTopology.values) {
-    for (final seed in [1, 2]) {
+  forEachPipeline((p) {
+    for (final topology in HarborFabricTopology.values) {
+      for (final seed in [1, 2]) {
+        test(
+          '${topology.name} 2-channel random traffic, seed $seed',
+          () => isolated(() => _random(topology, seed)),
+          timeout: const Timeout(Duration(minutes: 10)),
+        );
+      }
       test(
-        '${topology.name} 2-channel random traffic, seed $seed',
-        () => isolated(() => _random(topology, seed)),
-        timeout: const Timeout(Duration(minutes: 10)),
+        '${topology.name}: both read channels progress together and a '
+        'channel 1 read sees its own write',
+        () => isolated(() => _concurrencyAndOwnWrite(topology)),
       );
     }
-    test(
-      '${topology.name}: both read channels progress together and a '
-      'channel 1 read sees its own write',
-      () => isolated(() => _concurrencyAndOwnWrite(topology)),
-    );
-  }
+  });
 }

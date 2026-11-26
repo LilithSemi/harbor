@@ -42,6 +42,22 @@ class HarborIoPad {
       powerNet = 'VSS';
 }
 
+/// Puts an SRAM macro on a core edge of a pad ring flow.
+class HarborMacroPin {
+  /// Instance name of the macro in the netlist.
+  final String inst;
+
+  /// Core edge of the macro. Only [HarborIoPadEdge.south] and
+  /// [HarborIoPadEdge.north] are permitted.
+  final HarborIoPadEdge edge;
+
+  /// Space from the west core edge to the macro (um). Null puts the macro
+  /// on the first free location of the edge.
+  final double? offsetUm;
+
+  const HarborMacroPin({required this.inst, required this.edge, this.offsetUm});
+}
+
 /// IO ring configuration for an ASIC die.
 ///
 /// Describes the pad ring around the die perimeter, including

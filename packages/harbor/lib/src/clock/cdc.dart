@@ -117,7 +117,7 @@ Logic harborGrayToBin(Logic g) {
   for (var i = g.width - 2; i >= 0; i--) {
     bits[i] = bits[i + 1] ^ g[i];
   }
-  return bits.rswizzle();
+  return bits.rconcat();
 }
 
 /// Reset for one side of a two-clock bridge.
@@ -398,7 +398,7 @@ class HarborCdcFifo extends BridgeModule {
           [
             ~rdPtrGraySync.getRange(ptrWidth - 2, ptrWidth),
             rdPtrGraySync.getRange(0, ptrWidth - 2),
-          ].swizzle(),
+          ].concat(),
         )
         .named('wr_full_next');
     output('wr_full') <= wrFull;
@@ -419,7 +419,7 @@ class HarborCdcFifo extends BridgeModule {
     final rdPtrBinSync = rdBinBits.reversed
         .map((b) => b!)
         .toList()
-        .swizzle()
+        .concat()
         .named('rd_ptr_bin_sync');
     // Occupancy modulo 2*depth (ptrWidth bits wrap correctly under subtraction).
     final occupancy = (wrPtr - rdPtrBinSync).named('fifo_occupancy');

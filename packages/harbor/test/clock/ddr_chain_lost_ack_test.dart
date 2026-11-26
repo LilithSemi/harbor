@@ -41,7 +41,7 @@ void main() {
     );
 
     final sClk = SimpleClockGenerator(20).clk;
-    final mClk = SimpleClockGenerator(7).clk;
+    final mClk = SimpleClockGenerator(8).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
 

@@ -1,0 +1,80 @@
+import 'package:harbor/harbor.dart';
+import 'package:test/test.dart';
+
+import 'plane_memory.dart';
+import 'sdram_scanout_harness.dart';
+
+/// [hActive]-pixel lines of 4 active lines with the horizontal timing of
+/// a 720p60 mode, or of a 1080p60 mode at half size (960 pixels).
+HarborDisplayTiming _timing(int hActive) => HarborDisplayTiming(
+  hActive: hActive,
+  hFrontPorch: hActive == 960 ? 44 : 110,
+  hSyncWidth: hActive == 960 ? 22 : 40,
+  hBackPorch: hActive == 960 ? 74 : 220,
+  vActive: 4,
+  vFrontPorch: 1,
+  vSyncWidth: 1,
+  vBackPorch: 1,
+  pixelClock: hActive == 960 ? 148500000 : 74250000,
+);
+
+/// Scans nv12 lines of [hActive] pixels from the sdram scanout port at
+/// 125 MHz for 2 frames and checks every request and the underrun flag.
+Future<void> scanNv12(int hActive, int pixelPeriodPs) async {
+  final stride = hActive <= 1024 ? 1024 : 2048;
+  const chroma = SdramScanoutBench.sdramBase + 0x20000;
+  final b = SdramScanoutBench(
+    timing: _timing(hActive),
+    memPeriodPs: 8000,
+    pixelPeriodPs: pixelPeriodPs,
+    stride: stride,
+    formats: const [HarborPixelFormat.nv12],
+    planeBases: const [chroma],
+    planePitches: [stride],
+  );
+  await b.start();
+  expect(b.sdram.scanoutStride(hActive), stride);
+  await b.waitFrames(2);
+
+  final fb = b.fbBase;
+  // Each request lies in one plane line of the frame.
+  bool inLine(int a, int n) {
+    for (var y = 0; y < 4; y++) {
+      final s = fb + y * stride;
+      if (a >= s && a + 2 * n <= s + hActive) return true;
+    }
+    for (var c = 0; c < 2; c++) {
+      final s = chroma + c * stride;
+      if (a >= s && a + 2 * n <= s + hActive) return true;
+    }
+    return false;
+  }
+
+  var words = 0;
+  for (final (a, n) in b.requests) {
+    expect(inLine(a, n), isTrue, reason: '0x${a.toRadixString(16)} $n');
+    expect(a >> 10, (a + 2 * n - 1) >> 10, reason: 'crosses a page');
+    words += n;
+  }
+  // The luma line of a line start goes before its chroma line.
+  expectLumaFirst(
+    [for (final (a, n) in b.requests) (a, 2 * n)],
+    luma: fb,
+    chroma: chroma,
+    pitch0: stride,
+    pitch1: stride,
+    lineBytes0: hActive,
+  );
+  // Four luma lines and two chroma lines of hActive / 2 words a frame.
+  expect(words ~/ (3 * hActive), greaterThanOrEqualTo(b.frames - 1));
+  final worst = b.lineCycles.reduce((a, c) => a > c ? a : c);
+  final best = b.lineCycles.reduce((a, c) => a < c ? a : c);
+  print(
+    'nv12 $hActive at 125 MHz: plane line fetch $best to $worst mem '
+    'cycles, ${(hActive * 125e6 / worst / 1e6).toStringAsFixed(1)} MB/s '
+    'worst line, frames ${b.frames}, underrun frames ${b.underrunFrames}',
+  );
+  expect(b.underrunFrames, isZero);
+  expect(b.model.errors, isEmpty);
+  await b.stop();
+}

@@ -4,9 +4,13 @@ import '../../soc/target.dart';
 import '../bram.dart';
 import 'gtp_pcie_phy.dart';
 import 'gtp_primitives.dart';
+import 'gtx_pcie_phy.dart';
+import 'gtx_primitives.dart';
 import 'pcie_2_1.dart';
 import 'pcie_interrupt.dart';
+import 'pcie_phy.dart';
 import 'pcie_pipe.dart';
+import 'pipe_clock.dart';
 import 'pcie_reset_counters.dart';
 import 'pcie_trn_axi.dart';
 
@@ -28,6 +32,15 @@ class HarborPcieEndpointConfig {
   /// Number of MSI vectors the endpoint asks for: 1, 2, 4 or 8.
   final int msiVectors;
 
+  /// The minimum time in nanoseconds from one accepted MSI to the next.
+  ///
+  /// The default 0 sets no minimum. A held cause sends a new MSI only after
+  /// the driver clears it, so the host already sets the MSI rate, and a gap
+  /// adds delay to each interrupt. Set a gap on a board with causes that can
+  /// change faster than the host can take interrupts. Causes that come
+  /// during the gap stay pending and go out in the next MSI.
+  final int minMsiIntervalNs;
+
   const HarborPcieEndpointConfig({
     this.vendorId = 0x10ee,
     this.deviceId = 0x7203,
@@ -41,16 +54,43 @@ class HarborPcieEndpointConfig {
     this.packetMemoryEntries = 2048,
     this.bar2Bytes = 0,
     this.msiVectors = 1,
+    this.minMsiIntervalNs = 0,
   });
+
+  /// [minMsiIntervalNs] in cycles of a [userClkHz] clock, rounded up.
+  /// Throws an [ArgumentError] when it is negative or does not fit the gap
+  /// counter of [HarborPcieInterrupt].
+  int minMsiCycles(int userClkHz) {
+    if (minMsiIntervalNs < 0) {
+      throw ArgumentError.value(
+        minMsiIntervalNs,
+        'minMsiIntervalNs',
+        'must not be negative',
+      );
+    }
+    final cycles = (minMsiIntervalNs * userClkHz + 999999999) ~/ 1000000000;
+    if (cycles > HarborPcieInterrupt.maxMinMsiCycles) {
+      throw ArgumentError.value(
+        minMsiIntervalNs,
+        'minMsiIntervalNs',
+        'is $cycles cycles at $userClkHz Hz, more than the '
+            '${HarborPcieInterrupt.maxMinMsiCycles} the gap counter holds',
+      );
+    }
+    return cycles;
+  }
 }
 
 /// PCIe physical endpoint with 64-bit AXI transmit and receive streams.
+///
+/// An Artix-7 target uses the GTP PHY at 2.5 GT/s. A Kintex-7 target uses the
+/// GTX PHY, and it runs at 5 GT/s with [gen2].
 ///
 /// [freeClk] is a clock that runs while PERST# is low, such as the board
 /// oscillator. The reset counters use it to see PERST# on the pin. No
 /// endpoint clock runs while PERST# is low: PERST# resets the MMCM, and the
 /// host can stop the reference clock.
-class HarborPcieEndpoint extends Module {
+class HarborPcieEndpoint extends Module with HarborClockRateProvider {
   Logic get txP => output('tx_p');
   Logic get txN => output('tx_n');
   Logic get userClk => output('user_clk');
@@ -88,11 +128,43 @@ class HarborPcieEndpoint extends Module {
   /// and did not come back, since PERST# or power-on. It stops at 255. A
   /// restart resets all user logic on [userReset], so a bus master or driver
   /// sees transfers in flight abort. Null when the watchdog is off.
-  Logic? get linkRetrains =>
-      timeouts.linkWait == 0 ? null : output('link_retrains');
+  Logic? get linkRetrains => _linkWait == 0 ? null : output('link_retrains');
 
   /// The [HarborPcieResetCounters] status, for the DMA reset status input.
   Logic get resetStatus => output('reset_status');
+
+  /// Frequency of [userClk] in Hz, from the PHY. It is [userClkFreq] when set.
+  /// Else it is 62.5 MHz for a GTP x1 or a GTX at 2.5 GT/s, and 125 MHz for a
+  /// GTX at 5 GT/s. It is also the
+  /// value of the hard block USER_CLK_FREQ parameter.
+  int get userClkHz => _phy.userClkHz;
+
+  /// Bits 0 to 4: CPLLLOCK, RXCDRLOCK, TXRESETDONE, RXRESETDONE, MMCM lock.
+  /// Null with a GTP PHY.
+  Logic? get phyLocks => gtx ? output('phy_locks') : null;
+
+  /// A bit is high from the first timeout of a GTX reset wait until PERST#,
+  /// see [HarborGtxPciePhy.timeoutFlags]. Null with a GTP PHY.
+  Logic? get phyTimeoutFlags => gtx ? output('phy_timeout_flags') : null;
+
+  /// See [HarborGtxPciePhy.rxDebug]. Null with a GTP PHY.
+  Logic? get phyRxDebug => gtx ? output('phy_rx_debug') : null;
+
+  /// Bits 0 to 3: TXDLYSRESETDONE, TXPHINITDONE, TXPHALIGNDONE and PHYSTATUS
+  /// of the GT. Null with a GTP PHY.
+  Logic? get phyTxSync => gtx ? output('phy_tx_sync') : null;
+
+  /// Bits 0 to 2: the three TX sync done signals were high since PERST#.
+  Logic? get phyTxSyncSeen => gtx ? output('phy_tx_sync_seen') : null;
+
+  /// Number of TXPHALIGNDONE rising edges since PERST#, it stops at 15.
+  Logic? get phyPhAlignCount => gtx ? output('phy_phalign_count') : null;
+
+  /// PLLTSSMSTATE of the hard block. Null with a GTP PHY.
+  Logic? get ltssmStateOut => gtx ? output('ltssm_state_out') : null;
+
+  /// 0 for a 125 MHz PIPE clock and 1 for 250 MHz. Null with a GTP PHY.
+  Logic? get pclkSel => gtx ? output('pclk_sel') : null;
 
   HarborPcieEndpoint({
     required HarborDeviceTarget target,
@@ -112,18 +184,55 @@ class HarborPcieEndpoint extends Module {
     this.config = const HarborPcieEndpointConfig(),
     this.pipeStages = 1,
     this.timeouts = const HarborGtpPcieTimeouts(),
+    this.gtxTimeouts = const HarborGtxPcieTimeouts(),
+    bool? gen2,
+    this.userClkFreq,
+    this.waitRxCdrLock = false,
+    this.debugSkipTxPhaseAlign = false,
+    this.debugBuild = false,
+    this.hardBlockOverrides = const {},
     super.name = 'pcie_endpoint',
-  }) : super(
+  }) : gtx = _isKintex7(target),
+       gen2 = gen2 ?? _isKintex7(target),
+       super(
          definitionName: _definitionName(
            config,
            pipeStages,
-           timeouts,
+           _isKintex7(target) ? gtxTimeouts.linkWait : timeouts.linkWait,
            freeClk != null,
+           gtx: _isKintex7(target),
+           gen2: gen2 ?? _isKintex7(target),
+           userClkRequest: userClkFreq,
+           waitRxCdrLock: waitRxCdrLock,
+           debugSkip: debugSkipTxPhaseAlign,
+           overrides: hardBlockOverrides,
+           gtxTimeouts: gtxTimeouts,
          ),
        ) {
     harborCheckPipeStages(pipeStages);
+    if (hardBlockOverrides.isNotEmpty && !debugBuild) {
+      throw ArgumentError('hardBlockOverrides needs debugBuild');
+    }
+    for (final key in hardBlockOverrides.keys) {
+      if (_derivedParameters.contains(key)) {
+        throw ArgumentError.value(
+          key,
+          'hardBlockOverrides',
+          'the endpoint derives this parameter',
+        );
+      }
+    }
     _checkTarget(target);
     _checkConfig(config);
+    if (this.gen2 && !gtx) {
+      throw UnsupportedError('the GTP PHY runs at 2.5 GT/s only');
+    }
+    if (userClkFreq != null) {
+      checkUserClk(gen2: this.gen2, hz: userClkFreq!);
+      if (!gtx && userClkFreq != 62500000) {
+        throw UnsupportedError('the GTP PHY has a 62.5 MHz user clock only');
+      }
+    }
     refClkP = addInput('refclk_p', refClkP);
     refClkN = addInput('refclk_n', refClkN);
     perstN = addInput('perst_n', perstN);
@@ -146,25 +255,45 @@ class HarborPcieEndpoint extends Module {
     );
 
     final pipe = HarborPciePipeLane();
-    final watch = timeouts.linkWait != 0;
+    final watch = _linkWait != 0;
     final hardLinkUp = watch ? Logic(name: 'hard_link_up') : null;
     final phyLinkUpN = watch ? Logic(name: 'phy_link_up_n') : null;
     final ltssmState = watch ? Logic(name: 'ltssm_state', width: 6) : null;
-    final phy = HarborArtix7PciePhy(
-      refClkP: refClkP,
-      refClkN: refClkN,
-      perstN: perstN,
-      hardLinkUp: hardLinkUp,
-      phyLinkUpN: phyLinkUpN,
-      ltssmState: ltssmState,
-      rxP: rxP,
-      rxN: rxN,
-      pipe: pipe,
-      waitForRxResetStatus:
-          (target as HarborFpgaTarget).vendor != HarborFpgaVendor.openXc7,
-      pipeStages: pipeStages,
-      timeouts: timeouts,
-    );
+    final HarborPciePhy phy = gtx
+        ? HarborKintex7PciePhy(
+            refClkP: refClkP,
+            refClkN: refClkN,
+            perstN: perstN,
+            hardLinkUp: hardLinkUp,
+            phyLinkUpN: phyLinkUpN,
+            ltssmState: ltssmState,
+            rxP: rxP,
+            rxN: rxN,
+            pipe: pipe,
+            gen2: this.gen2,
+            userClkRequest: userClkFreq,
+            waitRxCdrLock: waitRxCdrLock,
+            debugSkipTxPhaseAlign: debugSkipTxPhaseAlign,
+            debugBuild: debugBuild,
+            pipeStages: pipeStages,
+            timeouts: gtxTimeouts,
+          )
+        : HarborArtix7PciePhy(
+            refClkP: refClkP,
+            refClkN: refClkN,
+            perstN: perstN,
+            hardLinkUp: hardLinkUp,
+            phyLinkUpN: phyLinkUpN,
+            ltssmState: ltssmState,
+            rxP: rxP,
+            rxN: rxN,
+            pipe: pipe,
+            waitForRxResetStatus:
+                (target as HarborFpgaTarget).vendor != HarborFpgaVendor.openXc7,
+            pipeStages: pipeStages,
+            timeouts: timeouts,
+          );
+    _phy = phy;
     final hardInputs = harborPcie21TiedInputs();
     hardInputs['PIPECLK'] = phy.pclk;
     hardInputs['USERCLK'] = phy.userClk1;
@@ -236,6 +365,8 @@ class HarborPcieEndpoint extends Module {
         },
         'MSI_CAP_MULTIMSGCAP': '${config.msiVectors.bitLength - 1}',
         ..._packetMemoryParameters(config.packetMemoryEntries),
+        ..._gtxParameters,
+        ...hardBlockOverrides,
       },
     );
 
@@ -302,6 +433,7 @@ class HarborPcieEndpoint extends Module {
       busMasterEnable: hardBlock.output('CFGCOMMANDBUSMASTERENABLE'),
       interruptDisable: hardBlock.output('CFGCOMMANDINTERRUPTDISABLE'),
       interruptRdyN: hardBlock.output('CFGINTERRUPTRDYN'),
+      minMsiCycles: config.minMsiCycles(phy.userClkHz),
     );
     interruptN <= interrupt.interruptN;
     interruptDi <= interrupt.interruptDi;
@@ -376,13 +508,35 @@ class HarborPcieEndpoint extends Module {
     addOutput('user_reset') <= reset;
     addOutput('link_up') <= link;
     addOutput('mmcm_lock') <= phy.mmcmLock;
+    if (phy is HarborKintex7PciePhy) {
+      addOutput('phy_locks', width: 5) <=
+          [
+            phy.mmcmLock,
+            phy.rxResetDone,
+            phy.txResetDone,
+            phy.rxCdrLock,
+            phy.cpllLock,
+          ].concat();
+      addOutput('phy_timeout_flags', width: HarborGtxPciePhy.timeoutFlagBits) <=
+          phy.timeoutFlags;
+      addOutput('pclk_sel') <= phy.pclkSel;
+      addOutput('phy_rx_debug', width: HarborGtxPciePhy.rxDebugBits) <=
+          phy.rxDebug;
+      addOutput('phy_tx_sync', width: 4) <= phy.txSync;
+      addOutput('phy_tx_sync_seen', width: 3) <= phy.txSyncSeen;
+      addOutput('phy_phalign_count', width: 4) <= phy.phAlignCount;
+    }
+    if (gtx) {
+      addOutput('ltssm_state_out', width: 6) <=
+          hardBlock.output('PLLTSSMSTATE');
+    }
     addOutput('reset_state', width: 4) <= phy.resetState;
     addOutput('reset_fail_state', width: 4) <= phy.resetFailState;
     addOutput('reset_retries', width: 8) <= phy.resetRetries;
     if (watch) addOutput('link_retrains', width: 8) <= phy.linkRetrains!;
     addOutput('reset_status', width: 64) <= counters.status;
     addOutput('completer_id', width: 16) <=
-        [busNumber, deviceNumber, functionNumber].swizzle();
+        [busNumber, deviceNumber, functionNumber].concat();
     addOutput('rx_data', width: 64) <= stream.rxData;
     addOutput('rx_keep', width: 8) <= stream.rxKeep;
     addOutput('rx_last') <= stream.rxLast;
@@ -403,20 +557,135 @@ class HarborPcieEndpoint extends Module {
 
   final HarborPcieEndpointConfig config;
 
-  /// Registers on each PIPE signal between the GTP and the hard block.
+  /// Registers on each PIPE signal between the GT and the hard block.
   final int pipeStages;
 
-  /// Bounds of the GTP reset waits and of the link training watchdog.
-  /// [HarborGtpPcieTimeouts.linkWait] 0 removes the watchdog.
+  /// Bounds of the GTP reset waits and of the link training watchdog, for an
+  /// Artix-7 target. [HarborGtpPcieTimeouts.linkWait] 0 removes the watchdog.
   final HarborGtpPcieTimeouts timeouts;
+
+  /// The same as [timeouts] for a Kintex-7 target.
+  final HarborGtxPcieTimeouts gtxTimeouts;
+
+  /// True when the PHY is a GTX, that is a Kintex-7 target.
+  final bool gtx;
+
+  /// The link runs at 5 GT/s when the partner supports it. The default is
+  /// true on a Kintex-7 target and false on an Artix-7 target.
+  final bool gen2;
+
+  /// Wait for RXCDRLOCK in the GTX reset sequence.
+  final bool waitRxCdrLock;
+
+  /// Debug option, see [HarborGtxPciePhy.debugSkipTxPhaseAlign].
+  final bool debugSkipTxPhaseAlign;
+
+  /// Allows the debug options.
+  final bool debugBuild;
+
+  /// Parameters of the PCIe hard block, applied last.
+  final Map<String, String> hardBlockOverrides;
+
+  int get _linkWait => gtx ? gtxTimeouts.linkWait : timeouts.linkWait;
+
+  late final HarborPciePhy _phy;
+
+  /// The pipe clocks and their rates in MHz. [instance] is the path to this
+  /// endpoint from the top module, `pcie_endpoint` for the default name in the
+  /// top module.
+  ///
+  /// `pclk` is 250 MHz with [gen2] and 125 MHz without. `userclk1` is the
+  /// user clock of the PHY. The net `txoutclk_buf` is TXOUTCLK after its
+  /// buffer, 100 MHz from the reference clock. A GTX PHY also has the
+  /// 62.5 MHz `oob_clk`.
+  @override
+  Map<String, double> clockRates(String instance) {
+    final pipe =
+        '$instance.${_phy.name}.${gtx ? 'gtx' : 'gtp'}_pcie_phy.pipe_clock';
+    return {
+      '$pipe.txoutclk_buf': 100,
+      '$pipe.pclk': gen2 ? 250 : 125,
+      '$pipe.userclk1': _phy.userClkHz / 1e6,
+      if (gtx) '$pipe.oob_clk': 62.5,
+    };
+  }
+
+  /// The user clock in Hz that the caller asked for, or null for the default:
+  /// 62.5 MHz at 2.5 GT/s and 125 MHz at 5 GT/s. The interface is 64 bits
+  /// wide at x1. It sets USER_CLK_FREQ and the user clock divide of the pipe
+  /// clock MMCM. A slower clock gives the user logic more time per cycle.
+  /// 62.5 MHz at 5 GT/s is the recommended clock of PG054 for x1.
+  final int? userClkFreq;
+
+  /// The user clock frequencies in Hz that the x1 64-bit interface allows
+  /// for a link rate, PG054 Table 2-8 and Table 4-3. It is the set that the
+  /// PHY can make, [HarborPipeClock.x1UserClkHz], at 2.5 and at 5.0 GT/s.
+  static const Map<bool, Set<int>> legalUserClkHz = {
+    false: HarborPipeClock.x1UserClkHz,
+    true: HarborPipeClock.x1UserClkHz,
+  };
+
+  /// Throws an [ArgumentError] unless [hz] is a legal user clock for a x1
+  /// link at 5 GT/s with [gen2] and at 2.5 GT/s without it.
+  static void checkUserClk({required bool gen2, required int hz}) {
+    if (!legalUserClkHz[gen2]!.contains(hz)) {
+      throw ArgumentError.value(
+        hz,
+        'userClkFreq',
+        'is not a user clock of a x1 64-bit link at '
+            '${gen2 ? '5.0' : '2.5'} GT/s: ${legalUserClkHz[gen2]!.join(', ')}',
+      );
+    }
+  }
+
+  /// Hard block parameters of the endpoint, for a GTX PHY. USER_CLK_FREQ
+  /// comes from the divide of the user clock MMCM output: 1 for 62.5 MHz, 2
+  /// for 125 MHz and 3 for 250 MHz. PG054 recommends 62.5 MHz for a x1 link at
+  /// 5 GT/s, and the default is 125 MHz. At 5 GT/s the link speed is 2. LINK_STATUS_SLOT_CLOCK_CONFIG
+  /// says that the link uses the reference clock of the slot, as the PHY does.
+  Map<String, String> get _gtxParameters => gtx
+      ? {
+          'USER_CLK_FREQ':
+              '${HarborPipeClock.userClkFreqCode(HarborPipeClock.vcoHz ~/ _phy.userClkHz)}',
+          'LINK_STATUS_SLOT_CLOCK_CONFIG': '"TRUE"',
+          if (gen2) ...{
+            'LINK_CAP_MAX_LINK_SPEED': "4'h2",
+            'LINK_CTRL2_TARGET_LINK_SPEED': "4'h2",
+          },
+        }
+      : const {};
+
+  /// Parameters that the endpoint sets from its own options.
+  static const _derivedParameters = {
+    'USER_CLK_FREQ',
+    'LINK_STATUS_SLOT_CLOCK_CONFIG',
+    'LINK_CAP_MAX_LINK_SPEED',
+    'LINK_CTRL2_TARGET_LINK_SPEED',
+  };
+
+  /// A stable 32-bit FNV-1a hash of [overrides], in hex.
+  static String _overridesHash(Map<String, String> overrides) {
+    var h = 0x811c9dc5;
+    for (final key in overrides.keys.toList()..sort()) {
+      for (final c in '$key=${overrides[key]};'.codeUnits) {
+        h = ((h ^ c) * 0x01000193) & 0xffffffff;
+      }
+    }
+    return h.toRadixString(16).padLeft(8, '0');
+  }
+
+  static bool _isKintex7(HarborDeviceTarget target) =>
+      target is HarborFpgaTarget &&
+      target.device.toLowerCase().startsWith('xc7k');
 
   static void _checkTarget(HarborDeviceTarget target) {
     if (target is! HarborFpgaTarget ||
         (target.vendor != HarborFpgaVendor.vivado &&
             target.vendor != HarborFpgaVendor.openXc7) ||
-        !target.device.toLowerCase().startsWith('xc7a')) {
+        !(target.device.toLowerCase().startsWith('xc7a') ||
+            target.device.toLowerCase().startsWith('xc7k'))) {
       throw UnsupportedError(
-        'HarborPcieEndpoint supports Xilinx Artix-7 targets only',
+        'HarborPcieEndpoint supports Xilinx Artix-7 and Kintex-7 targets only',
       );
     }
   }
@@ -454,18 +723,40 @@ class HarborPcieEndpoint extends Module {
     }
   }
 
+  /// The user clock in Hz when [userClkFreq] is null.
+  static int _defaultUserClkHz(bool gtx, bool gen2) =>
+      HarborPipeClock.userClkHz(
+        gtx ? HarborGtxPciePhy.userClkDivide(gen2: gen2) : 16,
+      );
+
   static String _definitionName(
     HarborPcieEndpointConfig config,
     int pipeStages,
-    HarborGtpPcieTimeouts timeouts,
-    bool freeClk,
-  ) => [
+    int linkWait,
+    bool freeClk, {
+    required bool gtx,
+    required bool gen2,
+    int? userClkRequest,
+    required bool waitRxCdrLock,
+    required bool debugSkip,
+    required Map<String, String> overrides,
+    required HarborGtxPcieTimeouts gtxTimeouts,
+  }) => [
     'HarborPcieEndpoint_Xilinx7_X1',
+    if (gtx) 'Gtx',
+    if (gen2) 'G2',
+    if (userClkRequest != null &&
+        userClkRequest != _defaultUserClkHz(gtx, gen2))
+      'Uc${userClkRequest ~/ 1000}',
+    if (gtx && waitRxCdrLock) 'CdrWait',
+    if (gtx && gtxTimeouts.definitionTag.isNotEmpty) gtxTimeouts.definitionTag,
+    if (debugSkip) 'DebugNoPhAlign',
+    if (overrides.isNotEmpty) 'Ov${_overridesHash(overrides)}',
     if (config.packetMemoryEntries != 2048) 'Pm${config.packetMemoryEntries}',
     if (config.bar2Bytes != 0) 'Bar2x${config.bar2Bytes.toRadixString(16)}',
     if (config.msiVectors != 1) 'Msi${config.msiVectors}',
     if (pipeStages != 0) 'Pipe$pipeStages',
-    if (timeouts.linkWait != 0) 'LinkWd',
+    if (linkWait != 0) 'LinkWd',
     if (freeClk) 'Free',
   ].join('_');
 

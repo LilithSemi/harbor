@@ -17,6 +17,9 @@ import '../bus/port/reg_fifo.dart';
 /// One controller word holds `ctrlDataWidth / dataWidth` bus beats. A full
 /// size INCR or WRAP burst goes out as one controller command per word it
 /// touches, cut at its wrap point. A narrow or FIXED beat is one command.
+/// A WRAP burst must have 2, 4, 8 or 16 beats and an address aligned to its
+/// size, at most the bus size. The port stops the simulation on another
+/// WRAP length or a larger size.
 /// RDATA_ERR and WRESP_ERR are always low.
 ///
 /// A round robin arbiter picks the next command from the write path and the
@@ -147,50 +150,128 @@ class Ddr3MemoryPort extends Module {
           : hi.zeroExtend(ctrlAddrWidth);
     }
 
-    // Beats of the next command of a burst at [a] with [left] beats after
-    // it, and the beat index in the controller word where it starts.
-    (Logic, Logic) chunk(
+    // Beat index in the controller word where a command at [a] starts.
+    Logic wordIdx(Logic a) =>
+        rB > 0 ? a.getRange(busSize, busSize + rB) : Const(0);
+
+    // The beat indices of a controller word that one command can cover
+    // from its start, as a mask: the whole word, or the wrap window inside
+    // it. A WRAP burst has a window of 2, 4, 8 or 16 beats.
+    final maskW = rB > 4 ? rB : 4;
+    Logic beatMask(Logic burst, Logic wrapLen) {
+      final word = Const(ratio - 1, width: maskW);
+      return mux(
+        burst.eq(HarborMemoryBurst.wrap.value),
+        wrapLen.getRange(0, 4).zeroExtend(maskW) & word,
+        word,
+      );
+    }
+
+    // A full size INCR or WRAP command ends at the controller word or at
+    // the wrap point. Other commands are one beat.
+    Logic isFull(Logic size, Logic burst) =>
+        size.eq(busSize) & burst.neq(HarborMemoryBurst.fixed.value);
+
+    // Beats of each command after the first. A legal burst has its address
+    // at a word start or at a wrap start after its first command, so this
+    // depends on the burst fields only.
+    Logic nextCap(Logic size, Logic burst, Logic wrapLen) {
+      if (rB == 0) return Const(1, width: kw);
+      final cap = beatMask(burst, wrapLen).getRange(0, rB).zeroExtend(kw) + 1;
+      return mux(isFull(size, burst), cap, Const(1, width: kw));
+    }
+
+    // Beats, last flag and beats after the command, for the first command
+    // of a burst of [len] + 1 beats that starts at [a]. The command has at
+    // most [t] + 1 beats, where [t] counts the beats that follow its first.
+    (Logic, Logic, Logic) firstCmd(
       Logic a,
-      Logic left,
+      Logic len,
       Logic size,
       Logic burst,
-      Logic wrapLen,
     ) {
-      final idx = rB > 0 ? a.getRange(busSize, busSize + rB) : Const(0);
-      if (rB == 0) return (idx, Const(1, width: kw));
-      const cw = lenW + 1;
-      final full = size.eq(busSize) & burst.neq(HarborMemoryBurst.fixed.value);
-      final toEnd = Const(ratio, width: cw) - idx.zeroExtend(cw);
-      final pos = a.getRange(busSize, busSize + 4) & wrapLen.getRange(0, 4);
-      final toWrap =
-          wrapLen.getRange(0, 4).zeroExtend(cw) + 1 - pos.zeroExtend(cw);
-      final cap = mux(
-        burst.eq(HarborMemoryBurst.wrap.value) & toWrap.lt(toEnd),
-        toWrap,
-        toEnd,
+      if (rB == 0) {
+        final last = len.eq(0);
+        return (Const(1, width: kw), last, len);
+      }
+      final idx = a.getRange(busSize, busSize + maskW);
+      final t = mux(
+        isFull(size, burst),
+        ~idx & beatMask(burst, len),
+        Const(0, width: maskW),
       );
-      final rem = left.zeroExtend(cw) + 1;
-      final k = mux(rem.lt(cap), rem, cap).getRange(0, kw);
-      return (idx, mux(full, k, Const(1, width: kw)));
+      final last = len.lte(t.zeroExtend(lenW));
+      final span = mux(last, len.getRange(0, rB), t.getRange(0, rB));
+      return (
+        span.zeroExtend(kw) + 1,
+        last,
+        mux(last, Const(0, width: lenW), len - t.zeroExtend(lenW)),
+      );
+    }
+
+    // Beats, last flag and beats after the command, for the command that
+    // follows one that leaves [rest] beats. [cap] is [nextCap]. The beats
+    // after a last command are not used.
+    (Logic, Logic, Logic) stepCmd(Logic rest, Logic cap) {
+      final capL = cap.zeroExtend(lenW);
+      final last = rest.lte(capL);
+      return (mux(last, rest.getRange(0, kw), cap), last, rest - capL);
+    }
+
+    // The address bits that a burst moves.
+    final lowW = aw < 12 ? aw : 12;
+
+    // The address bits below the beat of [size], as one compare per bit.
+    Logic sizeMaskOf(Logic size) => [
+      for (var i = lowW - 1; i >= 0; i--)
+        i < (1 << sizeW) - 1 ? size.gt(Const(i, width: sizeW)) : Const(0),
+    ].concat();
+
+    // The address bits that stay in place in a WRAP burst of [wrapLen] + 1
+    // beats of [size].
+    Logic wrapMaskOf(Logic size, Logic wrapLen) =>
+        (wrapLen.zeroExtend(lowW) << size) | sizeMaskOf(size);
+
+    // A request as the queues keep it: the fields of the first command are
+    // ready when the splitter loads it.
+    // A legal WRAP burst has a size of at most the bus size, so its mask has
+    // no bit above a window of 16 beats.
+    final maskKeep = lowW < busSize + 4 ? lowW : busSize + 4;
+    final headWidths = [aw, sizeW, burstW, kw, 1, lenW, kw, maskKeep];
+    Logic packReq(HarborMemoryWaist w) {
+      final (k, last, rest) = firstCmd(
+        w.reqAddr,
+        w.reqLen,
+        w.reqSize,
+        w.reqBurst,
+      );
+      return harborPack([
+        w.reqAddr,
+        w.reqSize,
+        w.reqBurst,
+        k,
+        last,
+        rest,
+        nextCap(w.reqSize, w.reqBurst, w.reqLen),
+        wrapMaskOf(w.reqSize, w.reqLen).getRange(0, maskKeep),
+      ]);
     }
 
     // The byte address after [k] beats by the FIXED, INCR and WRAP rules. A
     // legal burst stays in its 4 KB page, and the ports send an illegal one
     // as FIXED, so only the low 12 bits move.
-    Logic next(Logic a, Logic k, Logic size, Logic burst, Logic wrapLen) {
-      final lw = aw < 12 ? aw : 12;
+    Logic next(Logic a, Logic k, Logic size, Logic burst, Logic wrapMask) {
+      final lw = lowW;
       final lo = a.getRange(0, lw);
-      final bytes = Const(1, width: lw) << size;
-      final sizeMask = bytes - 1;
+      final sizeMask = sizeMaskOf(size);
       final incr = (lo & ~sizeMask) + (k.zeroExtend(lw) << size);
-      final wrapMask = (wrapLen.zeroExtend(lw) << size) | sizeMask;
       final wrapNext = (lo & ~wrapMask) | (incr & wrapMask);
       final nlo = mux(
         burst.eq(HarborMemoryBurst.fixed.value),
         lo,
         mux(burst.eq(HarborMemoryBurst.wrap.value), wrapNext, incr),
       );
-      return aw > lw ? [a.getRange(lw), nlo].swizzle() : nlo;
+      return aw > lw ? [a.getRange(lw), nlo].concat() : nlo;
     }
 
     Logic lane(Logic word, Logic idx) => rB == 0
@@ -233,17 +314,25 @@ class Ddr3MemoryPort extends Module {
       final reqFire = (w.reqValid & w.reqReady).named('${p}_req_fire');
       final rd = (reqFire & ~w.reqWrite).named('${p}_rd_fire');
       final sLoad = Logic(name: '${p}_s_load');
+      _check(
+        clk,
+        reset,
+        reqFire &
+            w.reqBurst.eq(HarborMemoryBurst.wrap.value) &
+            ~[1, 3, 7, 15].map((l) => w.reqLen.eq(l)).reduce((x, y) => x | y),
+        'a WRAP burst of a length other than 2, 4, 8 or 16 beats',
+      );
+      _check(
+        clk,
+        reset,
+        reqFire &
+            w.reqBurst.eq(HarborMemoryBurst.wrap.value) &
+            w.reqSize.gt(Const(busSize, width: sizeW)),
+        'a WRAP burst of a size above the bus size',
+      );
       final rdataFire = (w.rdataValid & w.rdataReady).named('${p}_rd_out');
       final rLastBeat = Logic(name: '${p}_r_last');
-      final rdReq = _Queue(
-        '${p}_rd_req',
-        clk,
-        clr,
-        n,
-        rd,
-        harborPack([w.reqAddr, w.reqLen, w.reqSize, w.reqBurst]),
-        sLoad,
-      );
+      final rdReq = _Queue('${p}_rd_req', clk, clr, n, rd, packReq(w), sLoad);
       final rdResp = _Queue(
         '${p}_rd_resp',
         clk,
@@ -258,13 +347,17 @@ class Ddr3MemoryPort extends Module {
       // Splitter: one read request at a time into commands.
       final sValid = Logic(name: '${p}_s_valid');
       final sAddr = Logic(name: '${p}_s_addr', width: aw);
-      final sLeft = Logic(name: '${p}_s_left', width: lenW);
+      final sRest = Logic(name: '${p}_s_rest', width: lenW);
       final sSize = Logic(name: '${p}_s_size', width: sizeW);
       final sBurst = Logic(name: '${p}_s_burst', width: burstW);
-      final sWrap = Logic(name: '${p}_s_wrap', width: lenW);
-      final (sIdx, sK) = chunk(sAddr, sLeft, sSize, sBurst, sWrap);
-      final sLast = sLeft.zeroExtend(lenW + 1).lt(sK.zeroExtend(lenW + 1));
-      final head = harborUnpack(rdReq.data, [aw, lenW, sizeW, burstW]);
+      final sWmask = Logic(name: '${p}_s_wmask', width: lowW);
+      final sK = Logic(name: '${p}_s_k', width: kw);
+      final sLast = Logic(name: '${p}_s_last');
+      final sCap = Logic(name: '${p}_s_cap', width: kw);
+      final sIdx = wordIdx(sAddr);
+      final [hAddr, hSize, hBurst, loadK, loadLast, loadRest, hCap, hWmask] =
+          harborUnpack(rdReq.data, headWidths);
+      final (stepK, stepLast, stepRest) = stepCmd(sRest, sCap);
       sLoad <= ~sValid & rdReq.valid & ~clr;
 
       // Read buffer ring: a word is taken at issue, filled by the controller
@@ -332,7 +425,7 @@ class Ddr3MemoryPort extends Module {
           If(
             issue & aIdx.eq(i),
             then: [
-              ringInfo[i] < (rB > 0 ? [sK, sIdx].swizzle() : sK),
+              ringInfo[i] < (rB > 0 ? [sK, sIdx].concat() : sK),
             ],
           ),
           If(chAck & kIdx.eq(i), then: [ringData[i] < ctrlData]),
@@ -341,18 +434,23 @@ class Ddr3MemoryPort extends Module {
         If(
           sLoad,
           then: [
-            sAddr < head[0],
-            sLeft < head[1],
-            sSize < head[2],
-            sBurst < head[3],
-            sWrap < head[1],
+            sAddr < hAddr,
+            sRest < loadRest,
+            sSize < hSize,
+            sBurst < hBurst,
+            sWmask < hWmask.zeroExtend(lowW),
+            sK < loadK,
+            sLast < loadLast,
+            sCap < hCap,
           ],
           orElse: [
             If(
               issue,
               then: [
-                sAddr < next(sAddr, sK, sSize, sBurst, sWrap),
-                sLeft < sLeft - sK.zeroExtend(lenW),
+                sAddr < next(sAddr, sK, sSize, sBurst, sWmask),
+                sRest < stepRest,
+                sK < stepK,
+                sLast < stepLast,
               ],
             ),
           ],
@@ -410,8 +508,11 @@ class Ddr3MemoryPort extends Module {
             kw: kw,
             ctrlAddrWidth: ctrlAddrWidth,
             ctrlDataWidth: ctrlDataWidth,
-            chunk: chunk,
+            packReq: packReq,
+            headWidths: headWidths,
+            stepCmd: stepCmd,
             next: next,
+            lowW: lowW,
             wordAddr: wordAddr,
             accepted: accepted,
             blocked: blocked,
@@ -496,7 +597,7 @@ class Ddr3MemoryPort extends Module {
               mux(
                 g[0],
                 Const(0, width: 4),
-                [indexOf(rGrant, 3), Const(1)].swizzle(),
+                [indexOf(rGrant, 3), Const(1)].concat(),
               ),
         ],
       ),
@@ -531,8 +632,11 @@ class Ddr3MemoryPort extends Module {
     required int kw,
     required int ctrlAddrWidth,
     required int ctrlDataWidth,
-    required (Logic, Logic) Function(Logic, Logic, Logic, Logic, Logic) chunk,
+    required Logic Function(HarborMemoryWaist) packReq,
+    required List<int> headWidths,
+    required (Logic, Logic, Logic) Function(Logic, Logic) stepCmd,
     required Logic Function(Logic, Logic, Logic, Logic, Logic) next,
+    required int lowW,
     required Logic Function(Logic) wordAddr,
     required Logic accepted,
     required Logic blocked,
@@ -545,23 +649,15 @@ class Ddr3MemoryPort extends Module {
     final wr = (reqFire & w.reqWrite).named('wr_fire');
     final aLoad = Logic(name: 'wa_load');
     final wrespFire = (w.wrespValid & w.wrespReady).named('wresp_fire');
-    final wrReq = _Queue(
-      'wr_req',
-      clk,
-      clr,
-      n,
-      wr,
-      harborPack([w.reqAddr, w.reqLen, w.reqSize, w.reqBurst]),
-      aLoad,
-    );
+    final wrReq = _Queue('wr_req', clk, clr, n, wr, packReq(w), aLoad);
     final wrId = _Queue('wr_id', clk, clr, n, wr, w.reqId, wrespFire);
 
     final aValid = Logic(name: 'wa_valid');
     final aAddr = Logic(name: 'wa_addr', width: aw);
-    final aLeft = Logic(name: 'wa_left', width: lenW);
+    final aRest = Logic(name: 'wa_rest', width: lenW);
     final aSize = Logic(name: 'wa_size', width: sizeW);
     final aBurst = Logic(name: 'wa_burst', width: burstW);
-    final aWrap = Logic(name: 'wa_wrap', width: lenW);
+    final aWmask = Logic(name: 'wa_wmask', width: lowW);
     final aJ = Logic(name: 'wa_beat', width: kw);
     final accData = [
       for (var l = 0; l < ratio; l++) Logic(name: 'wa_data$l', width: busDW),
@@ -569,11 +665,21 @@ class Ddr3MemoryPort extends Module {
     final accSel = [
       for (var l = 0; l < ratio; l++) Logic(name: 'wa_sel$l', width: strbW),
     ];
-    final (aIdx, aK) = chunk(aAddr, aLeft, aSize, aBurst, aWrap);
-    final aLast = aLeft.zeroExtend(lenW + 1).lt(aK.zeroExtend(lenW + 1));
+    // Flops hold the beat count and the last flag of the current command,
+    // the beats left after it, and the beat count of each later command.
+    // They change on the same edges as the state, so no count logic is on
+    // the WDATA ready path.
+    final aK = Logic(name: 'wa_k', width: kw);
+    final aLast = Logic(name: 'wa_last');
+    final aCap = Logic(name: 'wa_cap', width: kw);
+    final bs = strbW.bitLength - 1;
+    final aIdx = rB > 0 ? aAddr.getRange(bs, bs + rB) : Const(0);
     final lastBeat = (aJ + 1).eq(aK).named('wa_cmd_end');
     final laneIdx = rB > 0 ? (aIdx + aJ.getRange(0, rB)) : Const(0);
-    final head = harborUnpack(wrReq.data, [aw, lenW, sizeW, burstW]);
+    final [hAddr, hSize, hBurst, loadK, loadLast, loadRest, hCap, hWmask] =
+        harborUnpack(wrReq.data, headWidths);
+    final nAddr = next(aAddr, aK, aSize, aBurst, aWmask).named('wa_next_addr');
+    final (stepK, stepLast, stepRest) = stepCmd(aRest, aCap);
     aLoad <= ~aValid & wrReq.valid & ~clr;
 
     final take = Logic(name: 'wq_take');
@@ -600,10 +706,10 @@ class Ddr3MemoryPort extends Module {
     ];
     final mergedData = [
       for (var l = ratio - 1; l >= 0; l--) mux(hit[l], w.wdataData, accData[l]),
-    ].swizzle();
+    ].concat();
     final mergedSel = [
       for (var l = ratio - 1; l >= 0; l--) mux(hit[l], beatSel, accSel[l]),
-    ].swizzle();
+    ].concat();
     wqPush <= beat & lastBeat;
     wqData <= harborPack([wordAddr(aAddr), mergedData, mergedSel, aLast]);
 
@@ -626,18 +732,23 @@ class Ddr3MemoryPort extends Module {
       If(
         aLoad,
         then: [
-          aAddr < head[0],
-          aLeft < head[1],
-          aSize < head[2],
-          aBurst < head[3],
-          aWrap < head[1],
+          aAddr < hAddr,
+          aRest < loadRest,
+          aSize < hSize,
+          aBurst < hBurst,
+          aWmask < hWmask.zeroExtend(lowW),
+          aK < loadK,
+          aLast < loadLast,
+          aCap < hCap,
         ],
         orElse: [
           If(
             beat & lastBeat,
             then: [
-              aAddr < next(aAddr, aK, aSize, aBurst, aWrap),
-              aLeft < aLeft - aK.zeroExtend(lenW),
+              aAddr < nAddr,
+              aRest < stepRest,
+              aK < stepK,
+              aLast < stepLast,
             ],
           ),
         ],

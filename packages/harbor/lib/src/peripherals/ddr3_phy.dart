@@ -112,7 +112,6 @@ class Ddr3Phy extends Ddr3PhyBase {
     // [dqsNPad].
     required LogicNet dqsPad,
     required LogicNet dqsNPad,
-    bool himbaechel = false,
     super.name = 'ddr3_phy',
   }) {
     // --- clocks/reset ---
@@ -214,21 +213,24 @@ class Ddr3Phy extends Ddr3PhyBase {
     // DCI is not used on the HR bank; tie locked high (ddr3_phy.v:dci_locked=1).
     output('o_controller_idelayctrl_rdy') <= idelayctrlRdyW & Const(1);
 
-    // --- CK / CK# differential output via OBUFDS off a CK-rate ODDR ---
+    // --- CK / CK# differential output via OBUFDS off an OSERDESE2 ---
+    // An ODDR in an HP bank tile gives no clock through openXC7, and the
+    // module then answers nothing. An OSERDESE2 is the form every other DDR3
+    // output uses and works on HR and HP banks.
     // CK is driven INVERTED (= !i_ddr3_clk), matching the ODELAY-less reference
     // (ddr3_phy.v OBUFDS .I(!i_ddr3_clk)). With write leveling skipped on the HR
     // bank, the DQS strobe (which rides !CK) must land edge-aligned to CK for
     // tDQSS; a non-inverted CK puts DQS 180 deg off and writes fail while
-    // (self-training) reads still pass. d1=0/d2=1 makes Q follow !C.
-    final ckOddr = XilinxOddr(
-      c: ddr3Clk,
-      d1: Const(0),
-      d2: Const(1),
-      r: syncRst,
-      omitInactiveSet: himbaechel,
-      name: 'ck_oddr',
+    // (self-training) reads still pass. The 0,1 data pattern makes OQ follow !CLK.
+    final ckSerdes = XilinxOserdese2(
+      clk: ddr3Clk,
+      clkdiv: controllerClk,
+      d: [for (var i = 0; i < 8; i++) Const(i.isOdd ? 1 : 0)],
+      rst: syncRst,
+      hasTristate: false,
+      name: 'ck_oserdes',
     );
-    final ckDiff = XilinxObufds(i: ckOddr.q, name: 'ck_obufds');
+    final ckDiff = XilinxObufds(i: ckSerdes.oq, name: 'ck_obufds');
     addOutput('o_ddr3_clk_p') <= ckDiff.o;
     addOutput('o_ddr3_clk_n') <= ckDiff.ob;
 
@@ -256,7 +258,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       oserdesCmd.add(os.oq);
     }
     // bit i of the word = oserdesCmd[i] (element 0 = LSB).
-    final oserdesCmdW = oserdesCmd.rswizzle().named('oserdes_cmd');
+    final oserdesCmdW = oserdesCmd.rconcat().named('oserdes_cmd');
 
     // CMD field layout (ddr3_phy.v:61-67): top 7 control bits, then BA, then ADDR.
     final cmdCsN = cmdLen - 1;
@@ -343,7 +345,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       }
     }
     output('o_controller_iserdes_data') <=
-        [for (final b in iserdesData) b!].rswizzle();
+        [for (final b in iserdesData) b!].rconcat();
 
     // --- DM (data-mask) write, one OSERDESE2 per lane, no tristate -> OBUF ---
     // Faithful to ddr3_phy.v:672-731 (HR-bank branch). DM rides CK@90 like DQ.
@@ -359,7 +361,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       );
       dmOut.add(XilinxObuf(i: os.oq, name: 'dm_obuf_$l').o);
     }
-    addOutput('o_ddr3_dm', width: lanes) <= dmOut.rswizzle();
+    addOutput('o_ddr3_dm', width: lanes) <= dmOut.rconcat();
 
     // --- toggle_dqs_q: registered i_controller_toggle_dqs (ddr3_phy.v:107,127) ---
     final toggleDqsQ = Logic(name: 'toggle_dqs_q');
@@ -430,7 +432,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       }
     }
     output('o_controller_iserdes_dqs') <=
-        [for (final b in iserdesDqs) b!].rswizzle();
+        [for (final b in iserdesDqs) b!].rconcat();
 
     // --- (e) bitslip-reference: OSERDESE2_train -> ISERDESE2_train (OFB loopback) ---
     // A pad-less fabric model of the ISERDES barrel-shift the calibration engine
@@ -469,7 +471,7 @@ class Ddr3Phy extends Ddr3PhyBase {
       }
     }
     output('o_controller_iserdes_bitslip_reference') <=
-        [for (final b in bitslipRef) b!].rswizzle();
+        [for (final b in bitslipRef) b!].rconcat();
   }
 
   /// UberDDR3 command length = 4 (cs/ras/cas/we-ish) + 3 (odt/cke/reset) + BA +

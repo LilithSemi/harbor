@@ -146,8 +146,8 @@ class HarborCoeffCtxDecoder extends BridgeModule {
       blockPos.getRange(3, 6),
       blockPos.getRange(2, 4).zeroExtend(3),
     );
-    final wM1 = mux(size8, Const(7, width: 3), Const(3, width: 3));
-    final wM2 = mux(size8, Const(6, width: 3), Const(2, width: 3));
+    final wM1 = mux<Logic>(size8, Const(7, width: 3), Const(3, width: 3));
+    final wM2 = mux<Logic>(size8, Const(6, width: 3), Const(2, width: 3));
     final colLtM1 = col.lt(wM1);
     final colLtM2 = col.lt(wM2);
     final rowLtM1 = row.lt(wM1);
@@ -159,17 +159,17 @@ class HarborCoeffCtxDecoder extends BridgeModule {
         selByIdx(levels, idx.getRange(0, posWidth), posWidth).zeroExtend(4);
     Logic gate(Logic en, Logic v) =>
         mux(en, v.getRange(0, 4), Const(0, width: 4)).zeroExtend(5);
-    final dBelow = mux(
+    final dBelow = mux<Logic>(
       size8,
       Const(8, width: posWidth),
       Const(4, width: posWidth),
     );
-    final dBR = mux(
+    final dBR = mux<Logic>(
       size8,
       Const(9, width: posWidth),
       Const(5, width: posWidth),
     );
-    final dBelow2 = mux(
+    final dBelow2 = mux<Logic>(
       size8,
       Const(16, width: posWidth),
       Const(8, width: posWidth),
@@ -212,7 +212,7 @@ class HarborCoeffCtxDecoder extends BridgeModule {
         mux(
           state.eq(Const(sBase, width: 3)),
           baseCtx,
-          mux(
+          mux<Logic>(
             state.eq(Const(sBr, width: 3)),
             Const(7, width: entCtxWidth),
             Const(8, width: entCtxWidth),
@@ -245,7 +245,7 @@ class HarborCoeffCtxDecoder extends BridgeModule {
 
     final sym = entDec.output('symbol');
     // EOB symbol (0..15) clamped to the block's coefficient count.
-    final numCoeffs = mux(
+    final numCoeffs = mux<Logic>(
       size8,
       Const(64, width: posWidth),
       Const(16, width: posWidth),

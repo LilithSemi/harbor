@@ -17,6 +17,8 @@
 #include <linux/watchdog.h>
 #include <linux/io.h>
 #include <linux/of.h>
+#include <linux/math64.h>
+#include <linux/property.h>
 #include <linux/clk.h>
 
 #define HARBOR_WDT_CTRL	   0x00
@@ -97,6 +99,8 @@ static int harbor_wdt_probe(struct platform_device *pdev)
 {
 	struct harbor_wdt *hw;
 	struct clk *clk;
+	u32 width = 32;
+	u64 max_count;
 
 	hw = devm_kzalloc(&pdev->dev, sizeof(*hw), GFP_KERNEL);
 	if (!hw)
@@ -109,13 +113,36 @@ static int harbor_wdt_probe(struct platform_device *pdev)
 	clk = devm_clk_get_optional_enabled(&pdev->dev, NULL);
 	if (IS_ERR(clk))
 		return PTR_ERR(clk);
-	hw->clk_rate = clk ? clk_get_rate(clk) : 1000000;
+	if (clk) {
+		hw->clk_rate = clk_get_rate(clk);
+	} else {
+		u32 rate;
+
+		if (device_property_read_u32(&pdev->dev, "clock-frequency",
+					     &rate))
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "no clock and no clock-frequency\n");
+		hw->clk_rate = rate;
+	}
+	if (!hw->clk_rate)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "watchdog clock rate is 0\n");
 
 	hw->wdd.info = &harbor_wdt_info;
 	hw->wdd.ops = &harbor_wdt_ops;
 	hw->wdd.min_timeout = 1;
-	hw->wdd.max_timeout = 0xFFFFFFFF / hw->clk_rate;
-	hw->wdd.timeout = 30;
+	device_property_read_u32(&pdev->dev, "harbor,counter-width", &width);
+	if (width < 1 || width > 32)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "bad harbor,counter-width %u\n", width);
+	max_count = (1ULL << width) - 1;
+	if (div_u64(max_count, hw->clk_rate) < 1)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "a %u bit counter at %lu Hz is under 1 s\n",
+				     width, hw->clk_rate);
+
+	hw->wdd.max_timeout = div_u64(max_count, hw->clk_rate);
+	hw->wdd.timeout = min_t(unsigned int, 30, hw->wdd.max_timeout);
 	hw->wdd.parent = &pdev->dev;
 
 	watchdog_set_drvdata(&hw->wdd, hw);

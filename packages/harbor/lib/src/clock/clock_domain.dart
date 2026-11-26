@@ -6,6 +6,7 @@ import '../blackbox/ice40/ice40.dart';
 import '../blackbox/ecp5/ecp5.dart';
 import '../blackbox/xilinx/xilinx.dart';
 import '../util/pretty_string.dart';
+import 'cdc.dart' show harborSimPowerUp;
 
 /// Configuration for a clock domain.
 ///
@@ -67,6 +68,20 @@ class HarborDynamicClockRate extends HarborClockRate {
       '(nom ${(nominalFrequency / 1e6).toStringAsFixed(0)} MHz)';
 }
 
+/// Where the clock of a [HarborClockConfig] comes from.
+enum HarborClockSource {
+  /// A PLL or MMCM of the clock generator, or the input clock itself.
+  pll,
+
+  /// The separate core PLL beside the Xilinx DDR3 clock tree. The SoC needs an
+  /// `xilinxDdr3Tree`.
+  ddr3Core,
+
+  /// The controller clock of the DDR3 clock tree, which is also the `ddr_clk`
+  /// of the DDR3 controller. The rate of the config must be its real rate.
+  ddr3Controller,
+}
+
 /// Configuration for a clock domain.
 ///
 /// Describes the desired frequency (fixed or dynamic) and relationship
@@ -111,13 +126,8 @@ class HarborClockConfig with HarborPrettyString {
   /// domains, see [HarborClockGenerator.createDomainWithSecondary].
   final ({String name, int frequency, int tolerancePpm})? coClkosSecondary;
 
-  /// Run this domain off the shared Xilinx DDR3-fast clock tree's spare core
-  /// CLKOUT instead of a dedicated PLL/MMCM. On a single-oscillator board (Arty
-  /// S7) a second MMCM on the raw clock pin cannot share the pin's one dedicated
-  /// clock-capable route, so the core clock is folded onto a spare output of the
-  /// DDR MMCM. When set, [HarborSoC] must be built with an `xilinxDdr3Tree` spec.
-  /// The domain is then clocked by that tree's `coreClk`. Ignored otherwise.
-  final bool providedByDdr3Tree;
+  /// Where the clock of this domain comes from. See [HarborClockSource].
+  final HarborClockSource source;
 
   /// Allowed error of the achieved frequency, in parts per million. 0 (the
   /// default) demands an exact PLL solution. A pixel clock may set this.
@@ -131,7 +141,7 @@ class HarborClockConfig with HarborPrettyString {
     this.isPrimary = false,
     this.forcePll = false,
     this.coClkosSecondary,
-    this.providedByDdr3Tree = false,
+    this.source = HarborClockSource.pll,
     this.tolerancePpm = 0,
   });
 
@@ -205,6 +215,9 @@ class HarborClockConfig with HarborPrettyString {
       buf.writeln('${c}source: $sourceFrequency Hz,');
     }
     if (isPrimary) buf.writeln('${c}primary,');
+    if (source != HarborClockSource.pll) {
+      buf.writeln('${c}clockSource: ${source.name},');
+    }
     buf.write('$p)');
     return buf.toString();
   }
@@ -246,6 +259,10 @@ class HarborClockDomain {
   /// The achieved frequency in Hz when a PLL tolerance was used, else null.
   final double? achievedFrequencyHz;
 
+  /// The named net of the Xilinx MMCM clock and the rate it really runs at,
+  /// or null when the domain was not asked to name it.
+  final ({String net, double hz})? pllClock;
+
   const HarborClockDomain({
     required this.config,
     required this.clk,
@@ -254,6 +271,7 @@ class HarborClockDomain {
     this.frequencySelect,
     this.simPort,
     this.achievedFrequencyHz,
+    this.pllClock,
   });
 
   /// The domain name.
@@ -301,14 +319,38 @@ class HarborClockGenerator {
   /// The target device (determines which PLL primitive to use).
   final HarborDeviceTarget? target;
 
+  /// A software reset request, or null for none. Every domain reset asserts
+  /// while it is high, in addition to [inputReset] and the PLL lock. The
+  /// request is not in [hardResetOf].
+  final Logic? softReset;
+
+  /// The global-buffered copy of [inputClk], or null for none. A domain that
+  /// passes the input clock through runs on this net when it is set. The Xilinx
+  /// SoC sets it, since a clock from a pad needs a BUFG there.
+  Logic? bufferedInputClk;
+
   final List<HarborClockDomain> _domains = [];
+  final Map<Logic, Logic> _hardResets = {};
+  final Map<Logic, ({Logic hold, Logic release})> _resetBranchSources = {};
+
+  /// The inputs of a [HarborRegisteredResetBranch] for [domain]: the
+  /// immediate reset source and the stage before the final release flop.
+  ({Logic hold, Logic release})? resetBranchSource(HarborClockDomain domain) =>
+      _resetBranchSources[domain.reset];
 
   HarborClockGenerator({
     required this.parent,
     required this.inputClk,
     required this.inputReset,
     this.target,
+    this.softReset,
   });
+
+  /// The reset of [domain] without the software reset request: its reset
+  /// source and PLL lock, with the same re-timing. It is the reset of
+  /// [domain] when the generator has no [softReset].
+  Logic hardResetOf(HarborClockDomain domain) =>
+      _hardResets[domain.reset] ?? domain.reset;
 
   /// All created clock domains.
   List<HarborClockDomain> get domains => List.unmodifiable(_domains);
@@ -318,17 +360,34 @@ class HarborClockGenerator {
   /// deassertion is re-timed through a two-flop synchronizer clocked in the
   /// domain. This avoids recovery/removal hazards when the source (input
   /// reset, power-on reset, or PLL lock) releases asynchronously to [domClk].
-  /// The pipe resets to zero while [assertSrc] is high and shifts in ones
-  /// after it falls, so reset releases two clean domain edges later. FPGA
+  /// The pipe clears at once while [assertSrc] is high, also with no clock
+  /// edge, and shifts in ones after it falls, so reset releases two clean
+  /// domain edges later. Thus a [HarborRegisteredResetBranch] on the pipe
+  /// sees each pulse that the domain reset sees. FPGA
   /// flops power up to zero (reset asserted), and on ASIC the externally
   /// held reset clears the pipe within two edges regardless of power-up
   /// state.
   Logic _domainReset(Logic domClk, Logic assertSrc, String name) {
+    final soft = softReset;
+    if (soft == null) return _retimed(domClk, assertSrc, name);
+    final full = _retimed(domClk, assertSrc | soft, name);
+    _hardResets[full] = _retimed(domClk, assertSrc, '${name}Hard');
+    return full;
+  }
+
+  Logic _retimed(Logic domClk, Logic assertSrc, String name) {
     final pipe = Logic(name: '${name}RstSync', width: 2);
-    Sequential(domClk, reset: assertSrc, [
-      pipe < [pipe[0], Const(1)].swizzle(),
-    ]);
-    return (assertSrc | ~pipe[1]).named('${name}Reset');
+    Sequential(
+      domClk,
+      [
+        pipe < [pipe[0], Const(1)].concat(),
+      ],
+      reset: assertSrc,
+      asyncReset: true,
+    );
+    final result = (assertSrc | ~pipe[1]).named('${name}Reset');
+    _resetBranchSources[result] = (hold: assertSrc, release: pipe[0]);
+    return result;
   }
 
   /// Creates a clock domain.
@@ -345,6 +404,7 @@ class HarborClockGenerator {
     HarborClockConfig config,
     Logic providedClk, {
     Logic? locked,
+    Logic? hardReset,
   }) {
     // Reset hold until the providing PLL is up, BELT-AND-SUSPENDERS: release on
     // (PLL LOCKED) OR (a fixed fallback timer expires), whichever comes first.
@@ -359,16 +419,22 @@ class HarborClockGenerator {
     // anyway. The release is re-synchronised onto [providedClk]. No counter reset.
     // The FPGA INIT=0 power-up value initialises it.
     final lockCnt = Logic(name: '${config.name}_provLockCnt', width: 18);
-    Sequential(inputClk, [
+    // A target that is not an FPGA has no defined power-up value, so the
+    // timer takes the hard reset there.
+    final timerReset = target is HarborFpgaTarget ? null : inputReset;
+    Sequential(inputClk, reset: timerReset, [
       If(~lockCnt[17], then: [lockCnt < lockCnt + 1]),
     ]);
     final timerHold = ~lockCnt[17];
     // Assert while NOT-locked AND timer-not-expired => release on LOCKED or timer.
-    final assertSrc = (locked != null ? (~locked & timerHold) : timerHold)
+    final lockHold = locked != null ? (~locked & timerHold) : timerHold;
+    // [hardReset] holds the domain whatever the lock state.
+    final assertSrc = (hardReset != null ? (lockHold | hardReset) : lockHold)
         .named('${config.name}_provResetHold');
-    // [inputReset] (the raw-pin POR counter) is intentionally NOT mixed in: the
-    // timer above already covers power-up, and dropping it lets that POR counter
-    // DCE so the raw pin feeds ONLY the PLL (the UberDDR3 arrangement).
+    // [inputReset] (the raw-pin POR counter) is intentionally NOT mixed in
+    // unless the caller passes [hardReset]: the timer above already covers
+    // power-up, and dropping it lets that POR counter DCE so the raw pin feeds
+    // ONLY the PLL (the UberDDR3 arrangement).
     final domain = HarborClockDomain(
       config: config,
       clk: providedClk,
@@ -379,12 +445,16 @@ class HarborClockGenerator {
     return domain;
   }
 
-  HarborClockDomain createDomain(HarborClockConfig config) {
+  HarborClockDomain createDomain(
+    HarborClockConfig config, {
+    bool namePllClock = false,
+  }) {
+    final passClk = bufferedInputClk ?? inputClk;
     if (config.isPrimary) {
       final domain = HarborClockDomain(
         config: config,
-        clk: inputClk,
-        reset: _domainReset(inputClk, inputReset, config.name),
+        clk: passClk,
+        reset: _domainReset(passClk, inputReset, config.name),
       );
       _domains.add(domain);
       return domain;
@@ -405,8 +475,8 @@ class HarborClockGenerator {
     if (config.frequency == sourceFreq && !config.forcePll) {
       final domain = HarborClockDomain(
         config: config,
-        clk: inputClk,
-        reset: _domainReset(inputClk, inputReset, config.name),
+        clk: passClk,
+        reset: _domainReset(passClk, inputReset, config.name),
       );
       _domains.add(domain);
       return domain;
@@ -426,7 +496,7 @@ class HarborClockGenerator {
 
     switch (t) {
       case HarborFpgaTarget():
-        return _createFpgaPll(config, sourceFreq, t);
+        return _createFpgaPll(config, sourceFreq, t, namePllClock);
       case HarborAsicTarget():
         return _createAsicPll(config, sourceFreq);
       case HarborSimTarget():
@@ -462,6 +532,7 @@ class HarborClockGenerator {
     HarborClockConfig config,
     int sourceFreq,
     HarborFpgaTarget fpga,
+    bool namePllClock,
   ) {
     switch (fpga.vendor) {
       case HarborFpgaVendor.ice40:
@@ -470,7 +541,7 @@ class HarborClockGenerator {
         return _createEcp5Pll(config, sourceFreq);
       case HarborFpgaVendor.vivado:
       case HarborFpgaVendor.openXc7:
-        return _createXilinxPll(config, sourceFreq);
+        return _createXilinxPll(config, sourceFreq, namePllClock: namePllClock);
     }
   }
 
@@ -1086,6 +1157,7 @@ class HarborClockGenerator {
     required int secondaryFrequency,
     String? secondaryName,
     int secondaryTolerancePpm = 0,
+    bool namePllClock = false,
   }) {
     final secName = secondaryName ?? '${config.name}_s';
     final secConfig = HarborClockConfig.fixed(
@@ -1126,10 +1198,15 @@ class HarborClockGenerator {
       if (config.sourceFrequency == null) {
         throw ArgumentError('Clock "${config.name}" requires sourceFrequency');
       }
-      final primaryX = _createXilinxPll(config, config.sourceFrequency!);
+      final primaryX = _createXilinxPll(
+        config,
+        config.sourceFrequency!,
+        namePllClock: namePllClock,
+      );
       final secondaryX = _createXilinxPll(
         secConfig,
         secConfig.sourceFrequency!,
+        namePllClock: namePllClock,
       );
       return (primary: primaryX, secondary: secondaryX);
     }
@@ -1194,7 +1271,11 @@ class HarborClockGenerator {
     return (primary: primary, secondary: secondary);
   }
 
-  HarborClockDomain _createXilinxPll(HarborClockConfig config, int sourceFreq) {
+  HarborClockDomain _createXilinxPll(
+    HarborClockConfig config,
+    int sourceFreq, {
+    bool namePllClock = false,
+  }) {
     final periodNs = 1e9 / sourceFreq;
     // MMCM: fout = fin * CLKFBOUT_MULT_F / (DIVCLK_DIVIDE * CLKOUT0_DIVIDE_F).
     // The VCO (fin*M/D) MUST land in 600-1200 MHz or the MMCM never locks. The
@@ -1249,11 +1330,21 @@ class HarborClockGenerator {
     ]);
     final lockHold = (~lockCnt[17]).named('${config.name}_mmcmLockHold');
 
+    // A stable name lets the generated nextpnr clock script find this net.
+    final domClk = namePllClock
+        ? bufg.output('O').named('${config.name}_clk')
+        : bufg.output('O');
     final domain = HarborClockDomain(
       config: config,
-      clk: bufg.output('O'),
-      reset: _domainReset(bufg.output('O'), inputReset | lockHold, config.name),
+      clk: domClk,
+      reset: _domainReset(domClk, inputReset | lockHold, config.name),
       locked: mmcm.output('LOCKED'),
+      pllClock: namePllClock
+          ? (
+              net: '${config.name}_clk',
+              hz: sourceFreq * mult / (divClk * outDiv),
+            )
+          : null,
     );
     _domains.add(domain);
     return domain;
@@ -1262,10 +1353,13 @@ class HarborClockGenerator {
   HarborClockDomain _createAsicPll(HarborClockConfig config, int sourceFreq) {
     // ASIC: no specific PLL primitive, just pass through
     // The actual PLL would be an analog block from the PDK
+    final soft = softReset;
+    final reset = soft == null ? inputReset : (inputReset | soft);
+    if (soft != null) _hardResets[reset] = inputReset;
     final domain = HarborClockDomain(
       config: config,
       clk: inputClk,
-      reset: inputReset,
+      reset: reset,
     );
     _domains.add(domain);
     return domain;
@@ -1527,4 +1621,55 @@ Ecp5Ddr3Clocks buildEcp5Ddr3ClockTree(
     controllerClkMhz: sol.fout / 1.0e6 / 4,
     vcoMhz: sol.vco / 1.0e6,
   );
+}
+
+/// Local copies of the final release flop of a domain reset. Each of the
+/// [copies] outputs comes from its own flop, and synthesis keeps each flop,
+/// so each copy drives its own part of the reset fanout. A copy sets at once
+/// on `reset_assert` and clears on the edge after `release_in` goes high.
+/// All copies share the stage before them, so they release on the same edge.
+/// On the domain reset pipe of [HarborClockGenerator], this is also the edge
+/// where the domain reset releases.
+class HarborRegisteredResetBranch extends BridgeModule
+    implements HarborPreserveRegisters {
+  /// The number of outputs.
+  final int copies;
+
+  HarborRegisteredResetBranch({required super.name, this.copies = 1})
+    : super(
+        copies == 1
+            ? 'HarborRegisteredResetBranch'
+            : 'HarborRegisteredResetBranch_x$copies',
+      ) {
+    if (copies < 1) {
+      throw ArgumentError.value(copies, 'copies', 'must be at least 1');
+    }
+    createPort('clk', PortDirection.input);
+    createPort('reset_assert', PortDirection.input);
+    createPort('release_in', PortDirection.input);
+    final flops = [
+      for (var i = 0; i < copies; i++)
+        Logic(name: i == 0 ? 'reset_q' : 'reset_q_$i'),
+    ];
+    Sequential(
+      input('clk'),
+      [for (final q in flops) q < ~input('release_in')],
+      reset: input('reset_assert'),
+      asyncReset: true,
+      resetValues: {for (final q in flops) q: Const(1)},
+    );
+    // A ROHD flop does not see a reset that is high from time 0.
+    harborSimPowerUp(input('clk'), flops, value: 1);
+    for (var i = 0; i < copies; i++) {
+      addOutput(outputName(i)) <= flops[i];
+    }
+  }
+
+  /// The output port name of copy [i].
+  static String outputName(int i) => i == 0 ? 'reset_out' : 'reset_out_$i';
+
+  /// The outputs, one for each copy.
+  List<Logic> get resetOuts => [
+    for (var i = 0; i < copies; i++) output(outputName(i)),
+  ];
 }

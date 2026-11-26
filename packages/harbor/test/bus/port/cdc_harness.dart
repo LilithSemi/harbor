@@ -231,10 +231,11 @@ class CdcMemDevice extends BridgeModule {
     required bool slave,
     required bool cross,
     int? depth,
+    int recoverTimeout = HarborMemoryWaistCdc.defaultRecoverTimeout,
   }) : super(
          'CdcTestMem${slave ? 'Slave' : 'Master'}_${kind.name}'
          '_a${config.addressWidth}_d${config.dataWidth}_i${config.idWidth}'
-         '_n${config.outstanding}_c${cross}_q$depth',
+         '_n${config.outstanding}_c${cross}_q${depth}_t${recoverTimeout.toString().replaceAll('-', 'm')}',
          name: slave ? 'memory' : 'requester',
        ) {
     _clockPorts(this);
@@ -263,7 +264,9 @@ class CdcMemDevice extends BridgeModule {
         reset: input('reset'),
         fabricClock: fabric,
         cdcDepth: depth,
+        recoverTimeout: recoverTimeout,
       );
+      port.addDebugOutputs(this, 'dbg');
       output('dev_reset') <= port.reset;
       exposeWaist(this, port.waist, 'up', PairRole.consumer);
     }
@@ -289,8 +292,17 @@ class CdcMemLoop extends BridgeModule {
     final a = addSubModule(
       CdcMemDevice(config, kind, slave: false, cross: cross, depth: depth),
     );
+    // The master crossing adds an epoch bit to the ID.
+    final memConfig = cross
+        ? HarborMemoryWaistConfig(
+            addressWidth: config.addressWidth,
+            dataWidth: config.dataWidth,
+            idWidth: config.idWidth + 1,
+            outstanding: config.outstanding,
+          )
+        : config;
     final b = addSubModule(
-      CdcMemDevice(config, kind, slave: true, cross: cross, depth: depth),
+      CdcMemDevice(memConfig, kind, slave: true, cross: cross, depth: depth),
     );
     _wireClocks(this, a, 'a');
     _wireClocks(this, b, 'b');
@@ -315,9 +327,12 @@ class MultiSim {
   late final Sim b;
 
   MultiSim(this.dut, this.ratio) {
-    fabric = Sim(dut, clk: SimpleClockGenerator(ratio.fabric).clk);
-    a = Sim(dut, clk: SimpleClockGenerator(ratio.a).clk);
-    b = Sim(dut, clk: SimpleClockGenerator(ratio.b).clk);
+    fabric = Sim(
+      dut,
+      clk: SimpleClockGenerator(ratio.fabric + (ratio.fabric & 1)).clk,
+    );
+    a = Sim(dut, clk: SimpleClockGenerator(ratio.a + (ratio.a & 1)).clk);
+    b = Sim(dut, clk: SimpleClockGenerator(ratio.b + (ratio.b & 1)).clk);
     _hookPulses();
   }
 

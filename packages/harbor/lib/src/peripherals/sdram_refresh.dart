@@ -80,9 +80,14 @@ class SdramRefreshCredit extends Module {
     output('owed') <=
         (owedOffset.zeroExtend(owedWidth) -
             Const(maxPulledIn, width: owedWidth));
-    output('need') <= owedOffset.gt(maxPulledIn);
-    output('may_pull_in') <= owedOffset.gt(0);
-    output('force_refresh') <= owedOffset.gte(span);
+    // The flags are registers loaded from the next count, so they hold the
+    // same values in each cycle as a compare of the count would.
+    final needReg = Logic(name: 'need_reg');
+    final mayPullInReg = Logic(name: 'may_pull_in_reg');
+    final forceReg = Logic(name: 'force_refresh_reg');
+    output('need') <= needReg;
+    output('may_pull_in') <= mayPullInReg;
+    output('force_refresh') <= forceReg;
 
     final tick1 = tick & enable;
     // A tick only moves owedOffset up if it is not already at the ceiling,
@@ -91,23 +96,27 @@ class SdramRefreshCredit extends Module {
     // wins. If both are unsaturated they cancel, and owedOffset holds.
     final tickReal = tick1 & owedOffset.lt(span);
     final issueReal = issued & owedOffset.gt(0);
+    final owedNext = mux(
+      tickReal & issueReal,
+      owedOffset,
+      mux(tickReal, owedOffset + 1, mux(issueReal, owedOffset - 1, owedOffset)),
+    );
     Sequential(clk, [
       If(
         reset,
         then: [
           owedOffset < Const(maxPulledIn, width: spanWidth),
           tickCounter < Const(0, width: tickWidth),
+          needReg < Const(0),
+          mayPullInReg < Const(maxPulledIn > 0 ? 1 : 0),
+          forceReg < Const(maxPulledIn >= span ? 1 : 0),
         ],
         orElse: [
           tickCounter < mux(tick, Const(0, width: tickWidth), tickCounter + 1),
-          If(
-            tickReal & issueReal,
-            then: [],
-            orElse: [
-              If(tickReal, then: [owedOffset < owedOffset + 1]),
-              If(issueReal, then: [owedOffset < owedOffset - 1]),
-            ],
-          ),
+          owedOffset < owedNext,
+          needReg < owedNext.gt(maxPulledIn),
+          mayPullInReg < owedNext.gt(0),
+          forceReg < owedNext.gte(span),
         ],
       ),
     ]);

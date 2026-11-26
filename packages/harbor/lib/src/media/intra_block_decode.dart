@@ -309,7 +309,7 @@ class HarborIntraBlockDecode extends BridgeModule {
     output('coeffs_out') <=
         [
           for (var i = maxCoeffs - 1; i >= 0; i--) coeffs[i].signExtend(16),
-        ].swizzle();
+        ].concat();
     output('done') <= state.eq(Const(sDone, width: 3));
   }
 }

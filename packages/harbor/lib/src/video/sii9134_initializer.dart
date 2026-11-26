@@ -102,12 +102,12 @@ class HarborSii9134Initializer extends Module {
       mux(
         index.eq(0),
         Const(0x7a, width: 8),
-        mux(index.eq(1), Const(0x2f, width: 8), Const(0x00, width: 8)),
+        mux<Logic>(index.eq(1), Const(0x2f, width: 8), Const(0x00, width: 8)),
       ),
       mux(
         index.eq(0),
         Const(0x72, width: 8),
-        mux(index.eq(1), Const(0x08, width: 8), Const(0x35, width: 8)),
+        mux<Logic>(index.eq(1), Const(0x08, width: 8), Const(0x35, width: 8)),
       ),
     );
 

@@ -4,11 +4,27 @@ import 'dart:math';
 import 'package:harbor/harbor.dart';
 import 'package:rohd/rohd.dart';
 import 'package:rohd_bridge/rohd_bridge.dart';
+import 'package:test/test.dart';
 
 import '../port/memory_harness.dart';
 import '../port/port_harness.dart';
 
 export '../port/cdc_harness.dart' show isolated, must;
+
+/// The level a test builds when it names none. [forEachPipeline] sets it.
+HarborFabricPipeline harnessPipeline = HarborFabricPipeline.balanced;
+
+/// Runs [body] in one group per pipeline level, with [harnessPipeline] set
+/// to that level in each test.
+void forEachPipeline(void Function(HarborFabricPipeline p) body) {
+  for (final p in HarborFabricPipeline.values) {
+    group(p.name, () {
+      setUp(() => harnessPipeline = p);
+      tearDown(() => harnessPipeline = HarborFabricPipeline.balanced);
+      body(p);
+    });
+  }
+}
 
 const addrW = 20;
 const dataW = 32;
@@ -28,12 +44,35 @@ class MasterCfg {
   /// This master's explicit read channel at every multi-channel slave it
   /// reaches. Null spreads it round robin.
   final int? readChannel;
+
+  /// A real-time master (see [HarborFabricMaster.realtime]).
+  final bool realtime;
+
+  /// AXI4 exclusive slots (see [HarborFabricMaster.exclusiveIds]).
+  final int? exclusiveIds;
+
+  /// The master declares that it never stalls write data inside a burst.
+  final bool writeStallFree;
+
+  /// The slaves this master reaches, or null for all (see
+  /// [HarborFabricMaster.reach]).
+  final Set<String>? reach;
+
+  /// The master is a memory master port behind a clock crossing from
+  /// `dev_clk`, with its device waist on `<name>_w_*`. The native port has
+  /// [idWidth] bits, the device one less.
+  final bool cdc;
   const MasterCfg(
     this.name,
     this.idWidth,
     this.outstanding, {
     this.lite = false,
     this.readChannel,
+    this.realtime = false,
+    this.exclusiveIds,
+    this.writeStallFree = false,
+    this.reach,
+    this.cdc = false,
   });
 }
 
@@ -51,6 +90,9 @@ class SlaveCfg {
   /// Read channels on this slave: 1 is the full port alone, 2 or more adds
   /// read-only ports.
   final int readChannels;
+
+  /// The slave sees addresses minus [base].
+  final bool offset;
   const SlaveCfg(
     this.name,
     this.idWidth,
@@ -60,7 +102,11 @@ class SlaveCfg {
     this.timeout = 0,
     this.lite = false,
     this.readChannels = 1,
+    this.offset = false,
   });
+
+  /// The address this slave sees for [addr].
+  int see(int addr) => offset ? addr - base : addr;
 }
 
 PairInterface _intf(int idWidth, bool lite) => lite
@@ -114,13 +160,20 @@ class FabricShell extends BridgeModule {
     HarborFabricTopology topology, {
     List<MasterCfg> masters = masters3,
     List<SlaveCfg> slaves = slaves3,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
+    HarborFabricPipeline? pipeline,
   }) : super('FabricTestShell_${topology.name}', name: 'shell') {
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
     final ms = <HarborFabricMaster>[];
     for (final m in masters) {
-      final intf = _intf(m.idWidth, m.lite);
-      exposeInterface(this, intf, m.name, PairDirection.fromProvider);
+      final PairInterface intf;
+      if (m.cdc) {
+        intf = _cdcMaster(m);
+      } else {
+        intf = _intf(m.idWidth, m.lite);
+        exposeInterface(this, intf, m.name, PairDirection.fromProvider);
+      }
       ms.add(
         HarborFabricMaster(
           name: m.name,
@@ -128,10 +181,15 @@ class FabricShell extends BridgeModule {
           outstanding: m.outstanding,
           memory: !m.lite,
           readChannel: m.readChannel,
+          realtime: m.realtime,
+          exclusiveIds: m.exclusiveIds,
+          writeStallFree: m.writeStallFree,
+          reach: m.reach,
         ),
       );
     }
     final ss = <HarborFabricSlave>[];
+    final monitor = HarborAxi4Fabric.exclusiveOf(ms);
     for (final s in slaves) {
       final intf = _intf(s.idWidth, s.lite);
       exposeInterface(this, intf, s.name, PairDirection.fromConsumer);
@@ -154,6 +212,8 @@ class FabricShell extends BridgeModule {
           timeout: s.timeout,
           memory: !s.lite,
           readInterfaces: readIntfs,
+          offset: s.offset,
+          exclusive: s.lite ? null : monitor,
         ),
       );
     }
@@ -164,9 +224,63 @@ class FabricShell extends BridgeModule {
       reset: input('reset'),
       masters: ms,
       slaves: ss,
+      realtimeBurstCap: realtimeBurstCap,
+      pipeline: pipeline ?? harnessPipeline,
     );
     createPort('bus_error', PortDirection.output);
     output('bus_error') <= fabric.busError;
+    createPort('timeout_count', PortDirection.output, width: 8);
+    output('timeout_count') <= fabric.timeoutCount.zeroExtend(8);
+  }
+}
+
+extension on FabricShell {
+  // The AXI4 port of a memory master behind a clock crossing.
+  Axi4Interface _cdcMaster(MasterCfg m) {
+    if (tryInput('dev_clk') == null) {
+      createPort('dev_clk', PortDirection.input);
+      createPort('dev_reset', PortDirection.input);
+    }
+    final device = HarborMemoryWaist(
+      HarborMemoryWaistConfig(
+        addressWidth: addrW,
+        dataWidth: dataW,
+        idWidth: m.idWidth - 1,
+        outstanding: m.outstanding,
+      ),
+    );
+    exposeWaist(this, device, '${m.name}_w', PairRole.consumer);
+    final fabric = HarborMemoryWaist(
+      HarborMemoryWaistConfig(
+        addressWidth: addrW,
+        dataWidth: dataW,
+        idWidth: m.idWidth,
+        outstanding: m.outstanding,
+      ),
+    );
+    HarborMemoryWaistCdc(
+      fabricClk: input('clk'),
+      fabricReset: input('reset'),
+      deviceClk: input('dev_clk'),
+      deviceReset: input('dev_reset'),
+      fabric: fabric,
+      device: device,
+      slave: false,
+      name: '${m.name}_cdc',
+    );
+    final axi = Axi4Interface(
+      addressWidth: addrW,
+      dataWidth: dataW,
+      idWidth: m.idWidth,
+    );
+    HarborAxi4MemoryMaster(
+      clk: input('clk'),
+      reset: input('reset'),
+      waist: fabric,
+      axi: axi,
+      name: '${m.name}_axi4',
+    );
+    return axi;
   }
 }
 
@@ -195,8 +309,16 @@ class Bench {
     int seed = 1,
     double stall = 0.3,
     int maxTime = 4000000,
+    int realtimeBurstCap = HarborFabric.defaultRealtimeBurstCap,
+    HarborFabricPipeline? pipeline,
   }) async {
-    final shell = FabricShell(topology, masters: masters, slaves: slaves);
+    final shell = FabricShell(
+      topology,
+      masters: masters,
+      slaves: slaves,
+      realtimeBurstCap: realtimeBurstCap,
+      pipeline: pipeline,
+    );
     final sim = Sim(shell);
     final rng = Random(seed);
     final b = Bench._(sim, masters, slaves, rng);
@@ -277,6 +399,8 @@ class Bench {
 
   int busError() => sim.pre('bus_error');
 
+  int timeoutCount() => sim.pre('timeout_count');
+
   /// Waits until every manager has all its responses.
   Future<void> drain({int limit = 30000}) => waitUntil(
     sim,
@@ -299,15 +423,8 @@ class Bench {
     return null;
   }
 
-  /// The response code [x] must get: DECERR when unmapped, SLVERR for a
-  /// burst or a narrow access to an AXI4-Lite slave.
-  int respOf(Burst x) {
-    final s = slaveOf(x.addr);
-    if (s == null) return 3;
-    final full = busBytes.bitLength - 1;
-    if (slaveCfgs[s].lite && (x.len != 0 || x.size != full)) return 2;
-    return 0;
-  }
+  /// The response code [x] must get: DECERR when unmapped.
+  int respOf(Burst x) => slaveOf(x.addr) == null ? 3 : 0;
 
   /// The memory of each slave after every write that must succeed.
   List<WordMemory> golden() {
@@ -328,8 +445,9 @@ class Bench {
   void checkRegions() {
     for (final s in slaveCfgs) {
       final m = memories[s.name]!;
+      final lo = s.see(s.base);
       for (final x in [...m.awOrder, ...m.arOrder]) {
-        if (x.addr < s.base || x.addr >= s.base + s.size) {
+        if (x.addr < lo || x.addr >= lo + s.size) {
           errors.add('${s.name} got $x outside its region');
         }
       }

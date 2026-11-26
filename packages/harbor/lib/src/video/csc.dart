@@ -247,7 +247,7 @@ class HarborCsc extends Module {
       final bias = [
         o[i],
         Const(1 << (shift - 1), width: shift),
-      ].swizzle().zeroExtend(_sumW);
+      ].concat().zeroExtend(_sumW);
       final a = reg(
         p[i][0].signExtend(_sumW) + p[i][1].signExtend(_sumW),
         '${name}_a_s3',

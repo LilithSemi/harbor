@@ -234,7 +234,7 @@ class HarborTxSizeDecode extends BridgeModule {
     Logic packCdf(List<int> icdf) => [
       for (var s = _maxSyms - 1; s >= 0; s--)
         Const(s < icdf.length ? icdf[s] : 0, width: 16),
-    ].swizzle();
+    ].concat();
 
     // select the ctx (0..2) CDF row at runtime. cat is a const.
     Logic selCdf() {
@@ -266,7 +266,7 @@ class HarborTxSizeDecode extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 

@@ -47,9 +47,9 @@ class HarborGlobalWarpModel extends BridgeModule {
     Logic neg(Logic a) => sub(sc(0), a);
     Logic sgn(Logic a) => a[_w - 1];
     Logic asrC(Logic x, int n) =>
-        n <= 0 ? x : [x[_w - 1].replicate(n), x.getRange(n, _w)].swizzle();
+        n <= 0 ? x : [x[_w - 1].replicate(n), x.getRange(n, _w)].concat();
     Logic lslC(Logic x, int n) =>
-        n <= 0 ? x : [x.getRange(0, _w - n), Const(0, width: n)].swizzle();
+        n <= 0 ? x : [x.getRange(0, _w - n), Const(0, width: n)].concat();
     Logic slt(Logic a, Logic b) =>
         mux(sgn(a) ^ sgn(b), sgn(a), sub(a, b)[_w - 1]);
     Logic absS(Logic a) => mux(sgn(a), neg(a), a);

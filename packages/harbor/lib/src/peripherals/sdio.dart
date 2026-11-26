@@ -9,6 +9,7 @@ import '../bus/bus_slave_port.dart';
 import '../bus/port/memory_port.dart';
 import '../bus/port/memory_waist.dart';
 import '../bus/port/port_cdc.dart';
+import '../bus/port/reg_fifo.dart' show HarborFifoRam;
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
@@ -95,6 +96,10 @@ class HarborSdioConfig with HarborPrettyString {
   /// firmware can override this default and calibrate against a known pattern.
   final bool sampleReadOnFall;
 
+  /// Invert the physical card-detect input before exposing STATUS[0].
+  /// Some sockets assert their detect switch low when a card is inserted.
+  final bool cardDetectActiveLow;
+
   const HarborSdioConfig({
     this.maxBusWidth = HarborSdioBusWidth.four,
     this.maxSpeed = HarborSdioSpeed.highSpeed,
@@ -104,6 +109,7 @@ class HarborSdioConfig with HarborPrettyString {
     this.maxFrequency = 50000000,
     this.maxIoFunctions = 0,
     this.sampleReadOnFall = false,
+    this.cardDetectActiveLow = false,
   });
 
   /// SD card controller (standard 4-bit, up to high speed).
@@ -115,7 +121,8 @@ class HarborSdioConfig with HarborPrettyString {
       supports1v8 = false,
       maxFrequency = 50000000,
       maxIoFunctions = 0,
-      sampleReadOnFall = false;
+      sampleReadOnFall = false,
+      cardDetectActiveLow = false;
 
   /// SDIO WiFi/BT controller (4-bit, high speed, I/O functions).
   ///
@@ -128,7 +135,8 @@ class HarborSdioConfig with HarborPrettyString {
       supports1v8 = false,
       maxFrequency = 50000000,
       maxIoFunctions = 2,
-      sampleReadOnFall = false;
+      sampleReadOnFall = false,
+      cardDetectActiveLow = false;
 
   /// SD 3.0 UHS-I controller with full SDIO support.
   const HarborSdioConfig.uhs()
@@ -139,7 +147,8 @@ class HarborSdioConfig with HarborPrettyString {
       supports1v8 = true,
       maxFrequency = 208000000,
       maxIoFunctions = 7,
-      sampleReadOnFall = false;
+      sampleReadOnFall = false,
+      cardDetectActiveLow = false;
 
   /// eMMC controller (8-bit, HS200).
   const HarborSdioConfig.emmc()
@@ -150,12 +159,14 @@ class HarborSdioConfig with HarborPrettyString {
       supports1v8 = true,
       maxFrequency = 200000000,
       maxIoFunctions = 0,
-      sampleReadOnFall = false;
+      sampleReadOnFall = false,
+      cardDetectActiveLow = false;
 
   @override
   String toString() =>
       'HarborSdioConfig(${maxBusWidth.width}-bit, ${maxSpeed.name}, '
-      '${maxFrequency ~/ 1000000} MHz)';
+      '${maxFrequency ~/ 1000000} MHz'
+      '${cardDetectActiveLow ? ', active-low CD' : ''})';
 
   @override
   String toPrettyString([
@@ -167,6 +178,7 @@ class HarborSdioConfig with HarborPrettyString {
     buf.writeln('${c}busWidth: ${maxBusWidth.width}-bit,');
     buf.writeln('${c}speed: ${maxSpeed.name},');
     buf.writeln('${c}maxFrequency: ${maxFrequency ~/ 1000000} MHz,');
+    if (cardDetectActiveLow) buf.writeln('${c}cardDetectActiveLow,');
     if (supportsIo) buf.writeln('${c}SDIO I/O,');
     if (supportsEmmc) buf.writeln('${c}eMMC,');
     if (supports1v8) buf.writeln('${c}1.8V signaling,');
@@ -179,8 +191,13 @@ class HarborSdioConfig with HarborPrettyString {
 ///
 /// Register map (each register in its own 8-byte slot; the byte-addressed fabric
 /// decodes byte-offset >> 3, so these byte offsets map to indices 0,1,2,...):
-/// - 0x00: CTRL      (enable, bus width, speed mode, reset)
-/// - 0x08: STATUS    ([0] card detect, [8] busy, [9] data ready)
+/// - 0x00: CTRL      ([0] enable, [5:4] bus width, [8] sample edge (a build with
+///   sampleReadOnFall holds it at 1), [9] DAT
+///   reset, write 1. It also stops a command in flight. Wait for STATUS[8] to
+///   clear before the buffer is used again, since memory writes already sent
+///   still finish.)
+/// - 0x08: STATUS    ([0] card detect, [8] busy, [9] data ready, [15:12]
+///   DAT engine state, 0 when idle, for diagnostics)
 /// - 0x10: CLK_DIV   (clock divider)
 /// - 0x18: CMD       (command index + argument trigger)
 /// - 0x20: CMD_ARG   (command argument)
@@ -194,13 +211,35 @@ class HarborSdioConfig with HarborPrettyString {
 /// - 0x60: INT_STATUS (interrupt status, write-1-to-clear)
 /// - 0x68: INT_ENABLE (interrupt enable)
 /// - 0x70: ADMA_ADDR  (DMA buffer address, or descriptor table base)
+/// - 0x78: DATA_TIMEOUT (SD clocks a card read waits for a block start bit,
+///   0 is off, reset 4194304). A timeout on a PIO read raises only the
+///   timeout bit, there is no data-done. A DMA read adds data-done once the
+///   ADMA has drained.
+/// - 0x80: ADMA_ERR (read only, ADMA Error State of the first ADMA error:
+///   1 fetching a descriptor, 3 transferring data, 0 no error). The codes
+///   are those of the ADMA Error State field of the SD Host Controller
+///   Simplified Specification. It has no Length Mismatch bit.
+/// - 0x88: ADMA_ERR_ADDR (read only, the address of the access that failed:
+///   the descriptor word for state 1 and the data address for state 3, or
+///   for a write error the start address of the burst that failed. The
+///   specification gives a descriptor address for both states.)
+/// - 0x90: DIAG     (read only, the raw bus: [0] sampled CMD level, [1] CMD
+///   pad enable, [11:4] sampled DAT levels, [23:16] DAT pad enables. The
+///   same value leaves the `sd_diag` port.)
+///
+/// The first error stays in ADMA_ERR and ADMA_ERR_ADDR until a write of 1
+/// to INT_STATUS[7] clears them. A later error does not replace it.
 ///
 /// CMD bits: [5:0] index, [7:6] response type (0 none, 1 short, 2 long R2,
 /// 3 short+busy), [8] data present, [9] direction (0 write, 1 read), [10] use
-/// ADMA DMA, [11] ADMA_ADDR is a descriptor table. INT_STATUS bits (each
+/// ADMA DMA, [11] ADMA_ADDR is a descriptor table, [12] the response has no
+/// CRC7 (R3), [13] the response does not echo the index (R3). INT_STATUS bits (each
 /// write-1-to-clear): [0] cmd-done, [1] data-done, [2] data-request,
 /// [3] data-CRC-error, [4] cmd-timeout, [5] write-error, [6] RX overrun,
-/// [7] ADMA error.
+/// [7] ADMA error, [8] data timeout, [9] response CRC7 error, [10] response
+/// end bit or transmission bit error, [11] response index error. A response
+/// with one of these errors never sets cmd-done. A driver must set CMD[12]
+/// and CMD[13] for an R3 command such as ACMD41, or bits 9 and 11 set.
 ///
 /// DMA: with CMD[10] set and CMD[11] clear, ADMA_ADDR is the buffer address
 /// and BLK_COUNT * BLK_SIZE is its length. With CMD[11] set, ADMA_ADDR points
@@ -216,14 +255,21 @@ class HarborSdioConfig with HarborPrettyString {
 /// it. Reads (descriptors and card-write data) go out only when no write is
 /// in flight. Add it to a SoC with
 /// `soc.addMaster(sdio, busInterfaceName: 'dma', memory: true,
-/// outstanding: sdio.dmaOutstanding)`.
+/// outstanding: sdio.dmaOutstanding, writeStallFree: true)`. The ADMA sends a
+/// write request only when it holds a batch of [dmaWriteBatch] words, so it
+/// never stalls write data inside a burst.
 ///
-/// A read or write error response sets ADMA error and stops the walker. The
-/// transfer still ends: on a card read the controller drops the rest of the
-/// card data, on a card write it sends zero words to the card until the
-/// block count ends. Each card write block from the error on goes out with
-/// an inverted CRC16, so the card rejects it and does not program it. The
-/// driver must treat the transfer as failed.
+/// An error response (Wishbone ERR, AXI4 SLVERR or DECERR, TileLink denied
+/// or corrupt) on a descriptor fetch, a data read or a data write stops the
+/// walker. It sets INT_STATUS[7] ADMA error, which the SD Host Controller
+/// Simplified Specification calls ADMA Error in the Error Interrupt Status
+/// register, and it fills ADMA_ERR and ADMA_ERR_ADDR (see above).
+/// INT_ENABLE[7] raises `interrupt`. Data-done does not set for the failed
+/// transfer. The transfer still ends and BUSY clears: on a card read the
+/// controller drops the rest of the card data, on a card write it sends zero
+/// words to the card until the block count ends. Each card write block from
+/// the error on goes out with an inverted CRC16, so the card rejects it and
+/// does not program it. The driver must treat the transfer as failed.
 ///
 /// STATUS[8] busy is also set while an ADMA access is in flight, for example
 /// after a command timeout. A CMD write while busy is ignored, so the driver
@@ -304,11 +350,31 @@ class HarborSdioController extends BridgeModule
   final int dmaWriteBatch;
 
   /// SD clocks a card write waits for the end of the card's busy after the
-  /// CRC status. Then the transfer ends with write error and data-done.
+  /// CRC status. Then the transfer ends with write error and data-done. The
+  /// default is one second at the configured maximum SD clock.
   final int writeBusyTimeout;
 
-  /// The default [writeBusyTimeout]: 0.67 s at 25 MHz.
-  static const defaultWriteBusyTimeout = 1 << 24;
+  /// SD clocks after a write status token in which the card must pull DAT0
+  /// low. A card that does not has no busy phase. This is a chosen margin, not
+  /// a limit taken from the physical layer specification.
+  static const writeBusyStartClocks = 16;
+
+  /// SD clocks the host keeps CMD released after a response that ended with an
+  /// error or a reset: a long response frame (136) plus the longest response
+  /// delay (64). A card that is still answering finds the line free.
+  static const cmdQuietClocks = 200;
+
+  /// High SD clocks the host keeps on CMD between the end of one frame and
+  /// the start bit of the next command (NCC and NRC, 8 at minimum).
+  static const cmdGapClocks = 8;
+
+  /// SD clocks the host runs after enable before it sends the first command.
+  /// The physical layer specification asks for 74 at minimum.
+  static const initClocks = 80;
+
+  /// The reset value of DATA_TIMEOUT: 4194304 SD clocks. A 25 MHz system clock
+  /// gives at most a 12.5 MHz SD clock, so this is at least 335 ms.
+  static const defaultDataTimeout = 1 << 22;
 
   // With [ownPads], the FSM's CMD/DAT input signals come from the inout pads;
   // held here so the late pad wiring can drive them.
@@ -331,23 +397,19 @@ class HarborSdioController extends BridgeModule
     this.rxFifoDepth = 16,
     this.dmaBurstBeats = 16,
     this.dmaWriteBatch = 4,
-    this.writeBusyTimeout = defaultWriteBusyTimeout,
+    int? writeBusyTimeout,
     String? name,
   }) : assert(
          dmaDataWidth == 32 || dmaDataWidth == 64,
          'dmaDataWidth must be 32 or 64',
        ),
        assert(
-         rxFifoDepth >= 2 && (rxFifoDepth & (rxFifoDepth - 1)) == 0,
-         'rxFifoDepth must be a power of two, at least 2',
-       ),
-       assert(
          dmaBurstBeats >= 1 && dmaBurstBeats <= 256,
          'dmaBurstBeats must be 1 to 256',
        ),
        assert(dmaWriteBatch >= 1, 'dmaWriteBatch must be at least 1'),
-       assert(writeBusyTimeout >= 1, 'writeBusyTimeout must be at least 1'),
        assert(dmaOutstanding >= 1, 'dmaOutstanding must be at least 1'),
+       writeBusyTimeout = writeBusyTimeout ?? config.maxFrequency,
        super(
          harborStableDefinitionName('HarborSdioController', [
            ...BusSlavePort.definitionNameParts(
@@ -359,6 +421,7 @@ class HarborSdioController extends BridgeModule
            'bw${config.maxBusWidth.width}',
            'sp${config.maxSpeed.name}',
            'sf${config.sampleReadOnFall}',
+           if (config.cardDetectActiveLow) 'cdlow',
            if (target is HarborFpgaTarget) 'tg${target.vendor.name}',
            if (ownPads) 'pads',
            'ma$dmaAddressWidth',
@@ -368,11 +431,24 @@ class HarborSdioController extends BridgeModule
            'rx$rxFifoDepth',
            'db$dmaBurstBeats',
            'wb$dmaWriteBatch',
-           if (writeBusyTimeout != defaultWriteBusyTimeout)
-             'bt$writeBusyTimeout',
+           if (writeBusyTimeout != null) 'bt$writeBusyTimeout',
          ]),
          name: name ?? 'sdio',
        ) {
+    if (rxFifoDepth < 2 || (rxFifoDepth & (rxFifoDepth - 1)) != 0) {
+      throw ArgumentError.value(
+        rxFifoDepth,
+        'rxFifoDepth',
+        'must be a power of two, at least 2',
+      );
+    }
+    if (this.writeBusyTimeout <= writeBusyStartClocks) {
+      throw ArgumentError.value(
+        this.writeBusyTimeout,
+        'writeBusyTimeout',
+        'must be larger than $writeBusyStartClocks SD clocks',
+      );
+    }
     createPort('clk', PortDirection.input);
     createPort('reset', PortDirection.input);
 
@@ -399,10 +475,11 @@ class HarborSdioController extends BridgeModule
       addOutput('sd_cmd_oe');
       createPort('sd_cmd_in', PortDirection.input);
       addOutput('sd_dat_out', width: maxBusW);
-      addOutput('sd_dat_oe');
+      addOutput('sd_dat_oe', width: maxBusW);
       createPort('sd_dat_in', PortDirection.input, width: maxBusW);
     }
     createPort('sd_cd', PortDirection.input); // card detect
+    addOutput('sd_diag', width: 32);
     addOutput('interrupt');
 
     final fabricClock = BusSlavePort.fabricClockInputs(
@@ -423,14 +500,20 @@ class HarborSdioController extends BridgeModule
       module: this,
       name: 'dma',
       kind: fabricKind,
+      // The ADMA makes 32-bit addresses. On a wider AXI4 bus the waist stays
+      // 32 bits and the port puts zeros above it.
       config: HarborMemoryWaistConfig(
-        addressWidth: dmaAddressWidth,
+        addressWidth:
+            fabricKind == HarborFabricKind.axi4 && dmaAddressWidth > 32
+            ? 32
+            : dmaAddressWidth,
         dataWidth: dmaDataWidth,
         outstanding: dmaOutstanding,
       ),
       clk: input('clk'),
       reset: input('reset'),
       fabricClock: fabricClock,
+      busAddressWidth: dmaAddressWidth,
     );
 
     final clk = input('clk');
@@ -438,18 +521,24 @@ class HarborSdioController extends BridgeModule
         ? (bus.reset | dmaPort.reset).named('core_reset')
         : bus.reset;
     final cardDetect = input('sd_cd');
+    final cardPresent = config.cardDetectActiveLow ? ~cardDetect : cardDetect;
     // Raw CMD-in source: the inout pad's captured value (ownPads) or the split
     // input port. CMD stays SDR even in HS400, so it only gets input-delay tune.
     final cmdInRaw = ownPads ? _sdCmdInInt! : input('sd_cmd_in');
-    final cmdIn = _uhsTuned
+    final cmdInConditioned = _uhsTuned
         ? _uhsConditionBit(cmdInRaw, 'cmd', ddr: false)
         : cmdInRaw;
+    // Every pad input goes through one flop, so no logic reads a pad
+    // directly. The sampling strobes below are late by the same cycle.
+    final cmdIn = flop(input('clk'), cmdInConditioned).named('cmd_in_q');
 
     // CMD FSM states.
     const sIdle = 0;
     const sSend = 1;
     const sWait = 2;
     const sRecv = 3;
+    const sEnd = 4; // hold the end bit for one SD clock
+    const sBusy = 5; // wait for the card to release DAT0 after an R1b
 
     // INT_STATUS bits.
     const intCmdDone = 0x01;
@@ -457,6 +546,7 @@ class HarborSdioController extends BridgeModule
 
     // Response NCR timeout, in SD clocks (spec allows up to 64, round up).
     const respTimeout = 128;
+    final timeoutW = respTimeout.bitLength;
 
     // Registers
     final ctrlEnable = Logic(name: 'ctrl_enable');
@@ -471,24 +561,69 @@ class HarborSdioController extends BridgeModule
     final cmdRespType = Logic(name: 'cmd_resp_type', width: 2);
     final cmdDataPresent = Logic(name: 'cmd_data_present');
     final cmdDataDir = Logic(name: 'cmd_data_dir');
-    final resp = List.generate(4, (i) => Logic(name: 'resp$i', width: 32));
+    // Bits [127:0] of the last response frame, and whether it was an R2.
+    // RESP0-3 read from them. A short response puts its 32-bit payload, frame
+    // bits [39:8], in RESP0 and reads 0 in RESP1-3.
+    final respRaw = Logic(name: 'resp_raw', width: 128);
+    final respLong = Logic(name: 'resp_long');
+    // CMD[12] no CRC7 in the response, CMD[13] no echoed index (R3).
+    final cmdNoCrc = Logic(name: 'cmd_no_crc');
+    final cmdNoIdx = Logic(name: 'cmd_no_idx');
+    final respCrc = Logic(name: 'resp_crc', width: 7);
+    final respTxBad = Logic(name: 'resp_tx_bad');
+    final cmdHold = Logic(name: 'cmd_hold', width: 8);
+    final cmdGap = Logic(name: 'cmd_gap', width: 4);
+    final initCnt = Logic(name: 'init_cnt', width: 8);
+    // A command may start when no hold, gap or power-up time is left.
+    final cmdFree =
+        (cmdHold.eq(Const(0, width: 8)) &
+                cmdGap.eq(Const(0, width: 4)) &
+                initCnt.eq(Const(0, width: 8)))
+            .named('cmd_free');
+    final resp = [
+      mux(respLong, respRaw.getRange(0, 32), respRaw.getRange(8, 40)),
+      for (var i = 1; i < 4; i++)
+        respRaw.getRange(32 * i, 32 * i + 32) & respLong.replicate(32),
+    ];
     final blkSize = Logic(name: 'blk_size', width: 12);
     final blkCount = Logic(name: 'blk_count', width: 16);
-    final intStatus = Logic(name: 'int_status', width: 8);
-    final intEnable = Logic(name: 'int_enable', width: 8);
+    // SD clocks a card read waits for a block start bit. 0 turns it off.
+    final dataTimeout = Logic(name: 'data_timeout', width: 24);
+    final dataTimeoutCnt = Logic(name: 'data_timeout_cnt', width: 24);
+    final dataTimeoutNext =
+        (dataTimeoutCnt.zeroExtend(25) + Const(1, width: 25)).named(
+          'data_timeout_next',
+        );
+    // INT_STATUS, one register per bit. Events in the same cycle that set
+    // different bits all latch.
+    final intBits = [for (var i = 0; i < 12; i++) Logic(name: 'int_status_$i')];
+    final intStatus = intBits.rconcat().named('int_status');
+    // High while a DMA transfer has failed on the bus. Data-done does not
+    // latch then, so a failed transfer never reports that it finished.
+    final dmaStopped = Logic(name: 'dma_stopped');
+    List<Conditional> setInt(int mask) => [
+      for (var i = 0; i < 12; i++)
+        if ((mask >> i) & 1 == 1)
+          if (i == 1)
+            If(~dmaStopped, then: [intBits[i] < Const(1)])
+          else
+            intBits[i] < Const(1),
+    ];
+    final intEnable = Logic(name: 'int_enable', width: 12);
     final busy = Logic(name: 'busy');
     final divCount = Logic(name: 'div_count', width: 16);
     final sdClkReg = Logic(name: 'sd_clk_reg');
 
     // CMD engine state.
-    final state = Logic(name: 'cmd_state', width: 2);
-    final cmdShift = Logic(name: 'cmd_shift', width: 48);
+    final state = Logic(name: 'cmd_state', width: 3);
+    final cmdShift = Logic(name: 'cmd_shift', width: 40);
+    final cmdCrc = Logic(name: 'cmd_crc', width: 7);
     final cmdCnt = Logic(name: 'cmd_cnt', width: 7);
     final cmdOut = Logic(name: 'cmd_out');
     final cmdOe = Logic(name: 'cmd_oe');
-    final respShift = Logic(name: 'resp_shift', width: 136);
+    final respShift = Logic(name: 'resp_shift', width: 128);
     final respCnt = Logic(name: 'resp_cnt', width: 8);
-    final toCnt = Logic(name: 'to_cnt', width: 16);
+    final toCnt = Logic(name: 'to_cnt', width: timeoutW);
 
     // DAT engine state. PIO block read/write at 1/4/8-bit width (selected at
     // runtime via CTRL[5:4]): [laneCount] bits move per SD clock, one per lane,
@@ -505,21 +640,27 @@ class HarborSdioController extends BridgeModule
     const dWStatWait = 8; // write: hunt for the CRC status token start bit
     const dWStat = 9; // write: capture the 3-bit CRC status
     const dWBusy = 10; // write: wait out card programming (DAT0 busy)
+    const dWEndHold = 11; // write: hold the end bit for one SD clock
+    const dWStatEnd = 12; // write: check the end bit of the CRC status token
+    const dWLate = 13; // write: wait for a card that turned busy late
 
     const intDataDone = 0x02;
     const intDataReq = 0x04;
     const intDataCrcErr = 0x08;
     const intWriteErr = 0x20; // card reported a write/CRC-status error
     const intRxOverrun = 0x40; // a received word was dropped (RX FIFO full)
+    const intCmdCrcErr = 0x200; // response CRC7 mismatch
+    const intCmdEndErr = 0x400; // response end bit or transmission bit wrong
+    const intCmdIdxErr = 0x800; // response index differs from the command
+    const intDataTimeout = 0x100; // no block start bit within DATA_TIMEOUT
 
     final maxW = config.maxBusWidth.width;
     final datState = Logic(name: 'dat_state', width: 4);
-    // One CRC16 generator and CRC shift register per data lane.
+    // One CRC16 register per data lane. It runs over the data bits, then over
+    // the 16 CRC bits: a card read ends with a zero remainder, a card write
+    // shifts the register out.
     final crc16 = [
       for (var l = 0; l < maxW; l++) Logic(name: 'dat_crc16_$l', width: 16),
-    ];
-    final crcShift = [
-      for (var l = 0; l < maxW; l++) Logic(name: 'dat_crc_shift_$l', width: 16),
     ];
     final byteShift = Logic(name: 'dat_byte_shift', width: 8);
     final bitsInByte = Logic(name: 'dat_bits_in_byte', width: 4);
@@ -549,22 +690,36 @@ class HarborSdioController extends BridgeModule
     // could no longer arrive, leaving its bus request asserted.
     final rxDepth = rxFifoDepth;
     final rxPtrW = (rxDepth - 1).bitLength;
-    final rxFifo = [
-      for (var i = 0; i < rxDepth; i++) Logic(name: 'rx_fifo_$i', width: 32),
-    ];
+    final rxRd = Logic(name: 'rx_fifo_rd', width: rxPtrW);
+    final rxWr = Logic(name: 'rx_fifo_wr', width: rxPtrW);
+    final rxWrEn = Logic(name: 'rx_fifo_wr_en');
+    final rxWrData = Logic(name: 'rx_fifo_wr_data', width: 32);
     final rxCount = Logic(name: 'rx_fifo_count', width: rxPtrW + 1);
     final rxEmpty = rxCount.eq(Const(0, width: rxPtrW + 1)).named('rx_empty');
     final rxFull = rxCount
         .eq(Const(rxDepth, width: rxPtrW + 1))
         .named('rx_full');
-    // Shift FIFO: the head is always at index 0. On a pop the whole array
-    // shifts down toward index 0 by the number of words retired, and a push
-    // writes at the tail, so the head reads need no muxes.
-    //
-    // [rxHead] is the oldest word. [rxHead2] is the second oldest, which a
-    // full 64-bit beat carries together with [rxHead].
-    final rxHead = rxFifo[0].named('rx_head');
-    final rxHead2 = rxFifo[1].named('rx_head2');
+    // The words are in a RAM with an asynchronous read, which is distributed
+    // RAM on Xilinx and ECP5. [rxHead] is the oldest word. [rxHead2] is the
+    // second oldest, which a full 64-bit beat carries together with
+    // [rxHead]. It reads a second copy of the RAM at the next index.
+    HarborFifoRam rxRam(String ramName, Logic rdAddr) => HarborFifoRam(
+      name: ramName,
+      clk: clk,
+      wrEn: rxWrEn,
+      wrAddr: rxWr,
+      wrData: rxWrData,
+      rdAddr: rdAddr,
+      depth: rxDepth,
+      zeroInit: false,
+    );
+    final rxHead = rxRam('rx_ram', rxRd).rdData.named('rx_head');
+    final rxHead2 = dmaDataWidth == 64
+        ? rxRam(
+            'rx_ram2',
+            (rxRd + 1).named('rx_fifo_rd2'),
+          ).rdData.named('rx_head2')
+        : rxHead;
 
     // Write: set when the serializer has consumed all four bytes of the holding
     // register and needs the NEXT word before it can shift again. The SD clock
@@ -580,11 +735,17 @@ class HarborSdioController extends BridgeModule
     final busWidthSel = Logic(name: 'bus_width_sel', width: 2);
     // Write CRC-status token + busy tracking.
     final statShift = Logic(name: 'dat_stat_shift', width: 3);
-    final statCnt = Logic(name: 'dat_stat_cnt', width: 2);
+    final statCntW = writeBusyStartClocks.bitLength;
+    final statCnt = Logic(name: 'dat_stat_cnt', width: statCntW);
     final busySeen = Logic(name: 'dat_busy_seen');
-    final statWaitCnt = Logic(name: 'dat_stat_wait', width: 16);
-    final busyW = writeBusyTimeout.bitLength;
+    final statWaitCnt = Logic(name: 'dat_stat_wait', width: timeoutW);
+    final busyW = this.writeBusyTimeout.bitLength;
     final busyCnt = Logic(name: 'dat_busy_wait', width: busyW);
+    // Keep the write-data start at least two SD clock cycles after the
+    // command response end, even when the first DMA/PIO word is already ready.
+    final wrNwrCnt = Logic(name: 'dat_wr_nwr_count', width: 2);
+    // DAT0 was high at the last sample edge, so the card is not busy.
+    final wrLineFree = Logic(name: 'dat_wr_line_free');
 
     // ADMA. It bridges memory to the DAT word handshake: on a card read it
     // writes the RX FIFO words to memory, on a card write it reads words into
@@ -599,13 +760,34 @@ class HarborSdioController extends BridgeModule
     final admaState = Logic(name: 'adma_state', width: 3);
     final descPtr = Logic(name: 'adma_desc_ptr', width: 32);
     final descAddr = Logic(name: 'adma_addr', width: 32);
-    final descBytes = Logic(name: 'adma_bytes', width: 16);
+    // Wide enough for BLK_COUNT * BLK_SIZE on a direct transfer.
+    const descBytesW = 28;
+    final descBytes = Logic(name: 'adma_bytes', width: descBytesW);
     final descEnd = Logic(name: 'adma_end');
     final admaBase = Logic(name: 'adma_base', width: 32);
     final fetchHi = Logic(name: 'adma_fetch_hi');
     final admaErr = Logic(name: 'adma_err');
+    // The transfer in flight got a bus error. Clears when a command starts.
+    final dmaFailed = Logic(name: 'adma_failed');
+    // ADMA Error State of the first error, and the address of its access.
+    final admaErrState = Logic(name: 'adma_err_state', width: 2);
+    final admaErrAddr = Logic(name: 'adma_err_addr', width: 32);
+    // Start addresses of the write bursts sent and not yet answered, oldest
+    // first. A write error response names the burst at the head.
+    final qW = dmaOutstanding <= 1 ? 1 : (dmaOutstanding - 1).bitLength;
+    final wrQ = [
+      for (var i = 0; i < dmaOutstanding; i++)
+        Logic(name: 'dma_wq_$i', width: 32),
+    ];
+    final wrQTail = Logic(name: 'dma_wq_tail', width: qW);
+    final wrQHead = Logic(name: 'dma_wq_head', width: qW);
     // Set by an error in a card write. The CRC16 then goes out inverted.
     final wrAbort = Logic(name: 'dat_wr_abort');
+    // A buffer address or length that is not a word multiple is an ADMA error.
+    // This flag lasts one cycle and joins the bus errors in [dmaFault], with
+    // the error state in [alignState] and the address in [descAddr].
+    final alignPend = Logic(name: 'adma_align_pend');
+    final alignState = Logic(name: 'adma_align_state', width: 2);
 
     final mw = dmaPort.waist;
     final reqValid = Logic(name: 'dma_req_valid');
@@ -630,12 +812,12 @@ class HarborSdioController extends BridgeModule
     final wFire = (wActive & mw.wdataReady).named('dma_w_fire');
     final rFire = (rdPending & mw.rdataValid).named('dma_r_fire');
     final bFire = (mw.wrespValid & mw.wrespReady).named('dma_b_fire');
-    final dmaFault = ((rFire & mw.rdataErr) | (bFire & mw.wrespErr)).named(
-      'dma_fault',
-    );
+    final dmaFault = ((rFire & mw.rdataErr) | (bFire & mw.wrespErr) | alignPend)
+        .named('dma_fault');
     final writesBusy = (wActive | wInflight.neq(Const(0, width: ifW))).named(
       'dma_writes_busy',
     );
+    dmaStopped <= dmaMode & (dmaFailed | dmaFault);
     final dmaInFlight = (writesBusy | reqValid | rdPending).named(
       'dma_in_flight',
     );
@@ -663,16 +845,20 @@ class HarborSdioController extends BridgeModule
       laneCount = mux(
         wSel1,
         Const(1, width: 4),
-        mux(wSel4, Const(4, width: 4), Const(8, width: 4)),
+        mux<Logic>(wSel4, Const(4, width: 4), Const(8, width: 4)),
       );
       laneMask = mux(
         wSel1,
         Const(0x01, width: maxW),
-        mux(wSel4, Const(0x0F, width: maxW), Const(0xFF, width: maxW)),
+        mux<Logic>(wSel4, Const(0x0F, width: maxW), Const(0xFF, width: maxW)),
       );
     } else if (maxW >= 4) {
-      laneCount = mux(wSel1, Const(1, width: 4), Const(4, width: 4));
-      laneMask = mux(wSel1, Const(0x01, width: maxW), Const(0x0F, width: maxW));
+      laneCount = mux<Logic>(wSel1, Const(1, width: 4), Const(4, width: 4));
+      laneMask = mux<Logic>(
+        wSel1,
+        Const(0x01, width: maxW),
+        Const(0x0F, width: maxW),
+      );
     } else {
       laneCount = Const(1, width: 4);
       laneMask = Const(0x01, width: maxW);
@@ -688,11 +874,18 @@ class HarborSdioController extends BridgeModule
     // and the clock resumes. This is SD-native flow control (the host may stop
     // SDCLK mid-block), so DMA lands correctly regardless of memory latency, with
     // no startup word drops, and the descriptor/bounce can live in ordinary DRAM.
+    // A word in the push stage still counts as taken: the strobe is one cycle
+    // behind the SD clock edge it belongs to.
+    final rxPushNow = Logic(name: 'rx_push_now');
+    final rxFullSoon =
+        (rxFull |
+                (rxPushNow & rxCount.eq(Const(rxDepth - 1, width: rxPtrW + 1))))
+            .named('rx_full_soon');
     final datDmaStall =
         (dmaMode &
                 cmdDataDir &
                 datState.eq(Const(dRead, width: 4)) &
-                rxFull &
+                rxFullSoon &
                 ~sdClkReg)
             .named('dat_dma_stall');
     // Write backpressure, the mirror of the read stall above. The serializer
@@ -713,18 +906,26 @@ class HarborSdioController extends BridgeModule
     // strobe) MUST share this so the byte counter and the FIFO push stay in
     // lockstep. Rising is the default, falling shifts the sample half a period
     // later for round-trip margin.
-    final readEdge = mux(sampleFall, sdFall, sdRise).named('read_edge');
+    // The strobes are one cycle late, as the input flops are, so the logic
+    // sees each pad value at the edge it was sampled on.
+    final readEdge = flop(
+      clk,
+      mux(sampleFall, sdFall, sdRise),
+      reset: reset,
+    ).named('read_edge');
+    final respEdge = flop(clk, sdRise, reset: reset).named('resp_edge');
 
     // Receive combinationals, hoisted out of the DAT engine below so the RX FIFO
     // push condition can share them: the lane group sampled this SD clock, the
     // byte it completes, and whether it completes one.
     final rawDatIn = ownPads ? _sdDatInInt! : input('sd_dat_in');
-    final datIn = _uhsTuned
+    final datInConditioned = _uhsTuned
         ? [
             for (var l = 0; l < maxW; l++)
               _uhsConditionBit(rawDatIn[l], 'dat$l', ddr: _uhsDdr),
-          ].rswizzle()
+          ].rconcat()
         : rawDatIn;
+    final datIn = flop(clk, datInConditioned).named('dat_in_q');
 
     final rdGroup = (datIn & laneMask).named('dat_rd_group');
     final rdFull = ((byteShift << laneCount) | rdGroup.zeroExtend(8))
@@ -742,7 +943,8 @@ class HarborSdioController extends BridgeModule
                 byteDone &
                 byteInWord.eq(Const(3, width: 2)))
             .named('rx_push');
-    final rxWord = [asmB0, asmB1, asmB2, rdFull].rswizzle().named('rx_word');
+    rxPushNow <= rxPush;
+    final rxWord = [asmB0, asmB1, asmB2, rdFull].rconcat().named('rx_word');
 
     // One register access per bus cycle. ACK is a single-cycle pulse, so a
     // master that keeps STB asserted after seeing it would re-enter the handler
@@ -758,6 +960,9 @@ class HarborSdioController extends BridgeModule
         (holdServed ? bus.stb & ~bus.ack & ~busServed : bus.stb & ~bus.ack)
             .named('bus_access');
 
+    // Register index: the byte offset >> 3 in the 0x1000 window.
+    final regIndex = bus.windowAddr(0x1000).getRange(3).named('reg_index');
+
     // Pop strobes. The ADMA retires its word or words on the WDATA handshake.
     // The CPU retires one by reading DATA during a card read. A walker that
     // has parked during a DMA card read drops the words that are left, so a
@@ -769,7 +974,7 @@ class HarborSdioController extends BridgeModule
                 ~bus.we &
                 cmdDataDir &
                 ~rxEmpty &
-                bus.windowAddr(0x1000).getRange(3).eq(Const(0x09, width: 9)) &
+                regIndex.eq(Const(0x09, width: 9)) &
                 bus.selAny(0x48, 4))
             .named('rx_pop_cpu');
     final rxPopDrop =
@@ -780,39 +985,28 @@ class HarborSdioController extends BridgeModule
                 ~rxEmpty)
             .named('rx_pop_drop');
     final rxPop = (rxPopAdma | rxPopCpu | rxPopDrop).named('rx_pop');
-    // A word is only really taken when the FIFO had one to give.
-    final rxPushOk = (rxPush & ~rxFull).named('rx_push_ok');
     // How many words leave the FIFO this cycle. A packed pop is only armed when
     // two words were counted, so the count cannot underflow.
     final rxPop2Ok = (rxPopAdma2 & rxCount.gte(Const(2, width: rxPtrW + 1)))
         .named('rx_pop2_ok');
     final rxPop1Ok = (rxPop & ~rxEmpty & ~rxPop2Ok).named('rx_pop1_ok');
-    // Shift-FIFO update helpers (see the sequential RX FIFO block). A pop
-    // shifts the whole array down toward index 0 by this many words.
+    // A push goes in when the FIFO has room, or when a pop in the same cycle
+    // makes room. The pop reads its words before the push writes the RAM.
+    final rxPushOk = (rxPush & (~rxFull | rxPop1Ok | rxPop2Ok)).named(
+      'rx_push_ok',
+    );
+    // Words that leave the RX FIFO this cycle.
     final rxPopCount = mux(
       rxPop2Ok,
       Const(2, width: rxPtrW + 1),
-      mux(rxPop1Ok, Const(1, width: rxPtrW + 1), Const(0, width: rxPtrW + 1)),
+      mux<Logic>(
+        rxPop1Ok,
+        Const(1, width: rxPtrW + 1),
+        Const(0, width: rxPtrW + 1),
+      ),
     );
-    // Tail slot a push writes, after the same-cycle shift has moved it. It
-    // equals the new occupancy before the push (count minus popped words).
-    final rxTailIdx = (rxCount - rxPopCount).named('rx_tail_idx');
-    // Value slot i takes after the shift. Out-of-range shift sources hold the
-    // current value; those slots are always past the new valid range, so the
-    // held value is unused (a tail insert or the next push overwrites it).
-    Logic rxShifted(int i) {
-      if (i + 2 < rxDepth) {
-        return mux(
-          rxPop2Ok,
-          rxFifo[i + 2],
-          mux(rxPop1Ok, rxFifo[i + 1], rxFifo[i]),
-        );
-      }
-      if (i + 1 < rxDepth) {
-        return mux(rxPop1Ok, rxFifo[i + 1], rxFifo[i]);
-      }
-      return rxFifo[i];
-    }
+    rxWrEn <= rxPushOk;
+    rxWrData <= rxWord;
 
     // Card-read write requests. A request covers only words already in the
     // RX FIFO, so its write data never waits on the card. On a 64-bit port a
@@ -820,7 +1014,7 @@ class HarborSdioController extends BridgeModule
     // beats of two words. Otherwise a beat carries one word in its addressed
     // half.
     final packTarget = dmaDataWidth == 64
-        ? (~descAddr[2] & descBytes.gte(Const(8, width: 16))).named(
+        ? (~descAddr[2] & descBytes.gte(Const(8, width: descBytesW))).named(
             'dma_pack_target',
           )
         : Const(0);
@@ -844,7 +1038,7 @@ class HarborSdioController extends BridgeModule
         .named('dma_w_room');
     final issueWrite =
         (admaState.eq(Const(aMemWrite, width: 3)) &
-                descBytes.neq(Const(0, width: 16)) &
+                descBytes.neq(Const(0, width: descBytesW)) &
                 ~wActive &
                 ~reqValid &
                 wRoom &
@@ -854,27 +1048,46 @@ class HarborSdioController extends BridgeModule
 
     // Beats of the request: the fewest of the burst cap, the words ready, the
     // descriptor bytes left and the beats to the next 4 KB boundary.
-    const cw = 17;
-    Logic min2(Logic a, Logic b) => mux(a.lt(b), a, b);
+    const cw = descBytesW + 1;
+    // The fewest of the burst cap and [terms]. A term with a bit set above
+    // the width of the cap is larger than the cap and cannot win, so each
+    // compare is only as wide as the cap.
+    Logic minCap(List<Logic> terms) {
+      // With a cap of one beat every term is at least one, because a request
+      // needs a word, a whole beat of bytes and room to the 4 KB boundary. The
+      // controller stops a transfer with an address or length that is not a
+      // word multiple, so a running walker always has word aligned buffers.
+      if (dmaBurstBeats == 1) return Const(1, width: cw);
+      final w = dmaBurstBeats.bitLength;
+      Logic m = Const(dmaBurstBeats, width: w);
+      for (final t in terms) {
+        final fits = t.getRange(w).eq(Const(0, width: t.width - w));
+        final low = t.getRange(0, w);
+        m = mux(fits & low.lt(m), low, m);
+      }
+      return m.zeroExtend(cw);
+    }
+
     final to4k =
         (Const(4096, width: cw) - descAddr.getRange(0, 12).zeroExtend(cw))
             .named('dma_to_4k');
     final bytesLeft = descBytes.zeroExtend(cw);
     final wordsReady = rxCount.zeroExtend(cw);
-    final capBeats = Const(dmaBurstBeats, width: cw);
     final Logic wrBeats;
     final Logic wrBytes;
     if (dmaDataWidth == 32) {
-      wrBeats = min2(
-        min2(capBeats, wordsReady),
-        min2((bytesLeft + Const(3, width: cw)) >> 2, to4k >> 2),
-      ).named('dma_wr_beats');
+      wrBeats = minCap([
+        wordsReady,
+        (bytesLeft + Const(3, width: cw)) >> 2,
+        to4k >> 2,
+      ]).named('dma_wr_beats');
       wrBytes = (wrBeats << 2).named('dma_wr_bytes');
     } else {
-      final packBeats = min2(
-        min2(capBeats, wordsReady >> 1),
-        min2(bytesLeft >> 3, to4k >> 3),
-      ).named('dma_pack_beats');
+      final packBeats = minCap([
+        wordsReady >> 1,
+        bytesLeft >> 3,
+        to4k >> 3,
+      ]).named('dma_pack_beats');
       wrBeats = mux(
         usePack,
         packBeats,
@@ -887,16 +1100,31 @@ class HarborSdioController extends BridgeModule
       ).named('dma_wr_bytes');
     }
     final wrLen = (wrBeats - Const(1, width: cw)).getRange(0, 8);
+    // The walker moves through a buffer by one word on a card write and by
+    // [wrBytes] on a card read. One adder and one subtractor serve both.
+    final stepBytes = mux(
+      cmdDataDir,
+      wrBytes,
+      Const(4, width: cw),
+    ).named('adma_step_bytes');
+    final descAddrNext = (descAddr + stepBytes.zeroExtend(32)).named(
+      'adma_addr_next',
+    );
+    // Bytes left after the step, 0 when the step takes them all. The top
+    // bit of the difference is the borrow.
+    final bytesDiff =
+        (bytesLeft.zeroExtend(cw + 1) - stepBytes.zeroExtend(cw + 1)).named(
+          'adma_bytes_diff',
+        );
     final bytesAfter = mux(
-      bytesLeft.gt(wrBytes),
-      bytesLeft - wrBytes,
-      Const(0, width: cw),
-    ).getRange(0, 16).named('dma_bytes_after');
+      bytesDiff[cw],
+      Const(0, width: descBytesW),
+      bytesDiff.getRange(0, descBytesW),
+    ).named('dma_bytes_after');
 
-    // Reads go out only when no write is in flight.
-    final fetchAddr =
-        (descPtr + mux(fetchHi, Const(4, width: 32), Const(0, width: 32)))
-            .named('adma_fetch_addr');
+    // Reads go out only when no write is in flight. The descriptor pointer
+    // moves by one word after each descriptor word.
+    final fetchAddr = descPtr;
     final readReady = (~rdPending & ~reqValid & ~writesBusy).named(
       'dma_read_ready',
     );
@@ -913,9 +1141,9 @@ class HarborSdioController extends BridgeModule
     mw.reqId <= Const(0, width: mw.config.idWidth);
     mw.reqWrite <= reqWrite;
     mw.reqAddr <=
-        (dmaAddressWidth <= 32
-            ? reqAddr.getRange(0, dmaAddressWidth)
-            : reqAddr.zeroExtend(dmaAddressWidth));
+        (mw.config.addressWidth <= 32
+            ? reqAddr.getRange(0, mw.config.addressWidth)
+            : reqAddr.zeroExtend(mw.config.addressWidth));
     mw.reqLen <= reqLen;
     mw.reqSize <= reqSize;
     mw.reqBurst <= Const(HarborMemoryBurst.incr.value, width: 2);
@@ -926,61 +1154,161 @@ class HarborSdioController extends BridgeModule
       mw.wdataData <= rxHead;
       mw.wdataStrb <= Const(0xF, width: 4);
     } else {
-      mw.wdataData <= [mux(wPack, rxHead2, rxHead), rxHead].swizzle();
+      mw.wdataData <= [mux(wPack, rxHead2, rxHead), rxHead].concat();
       mw.wdataStrb <=
           mux(
             wPack,
             Const(0xFF, width: 8),
-            mux(wHi, Const(0xF0, width: 8), Const(0x0F, width: 8)),
+            mux<Logic>(wHi, Const(0xF0, width: 8), Const(0x0F, width: 8)),
           );
     }
     mw.rdataReady <= rdPending;
     mw.wrespReady <= writesBusy | (reqValid & reqWrite);
 
     output('sd_clk') <= sdClkReg & ctrlEnable;
+    // Per-lane drive. The host drives a lane only while it writes on it. DAT3
+    // is released in 1-bit mode too. The card pull-up holds it high, so the
+    // card does not read an SPI mode select. The pad or board must also pull
+    // each DAT line up.
+    final datOePins = [
+      for (var l = 0; l < maxW; l++) datOeReg & laneMask[l],
+    ].rconcat().named('dat_oe_pins');
+    final datOutPins = datOutReg;
+    // The host drives CMD only while it sends a command. At rest CMD is
+    // released and relies on the pad or board pull-up. A board without one
+    // must add a pull-up in its pin constraints.
+    final cmdPadOe = cmdOe;
     if (ownPads) {
       // One IOBUF per bidirectional line: drive when the FSM asserts its output
       // enable, otherwise release and read the pad back in.
       final cmdPad = inOut('sd_cmd');
-      cmdPad <= TriStateBuffer(cmdOut, enable: cmdOe).out;
+      cmdPad <= TriStateBuffer(cmdOut, enable: cmdPadOe).out;
       _sdCmdInInt! <= cmdPad;
-      // Per-lane IOBUF: lane l drives its pad when datOeReg is set, else reads.
+      // Per-lane IOBUF: lane l drives its pad when its enable is set, else reads.
       final datInBits = <Logic>[];
       for (var l = 0; l < maxBusW; l++) {
         final datPad = inOut('sd_dat$l');
-        datPad <= TriStateBuffer(datOutReg[l], enable: datOeReg).out;
+        datPad <= TriStateBuffer(datOutPins[l], enable: datOePins[l]).out;
         datInBits.add(datPad);
       }
-      _sdDatInInt! <= datInBits.rswizzle(); // lane 0 = LSB
+      _sdDatInInt! <= datInBits.rconcat(); // lane 0 = LSB
     } else {
       output('sd_cmd_out') <= cmdOut;
-      output('sd_cmd_oe') <= cmdOe;
-      output('sd_dat_out') <= datOutReg;
-      output('sd_dat_oe') <= datOeReg;
+      output('sd_cmd_oe') <= cmdPadOe;
+      output('sd_dat_out') <= datOutPins;
+      output('sd_dat_oe') <= datOePins;
     }
-    final intView = (intStatus | (admaErr.zeroExtend(8) << 7)).named(
+    final intView = (intStatus | (admaErr.zeroExtend(12) << 7)).named(
       'int_view',
     );
     interrupt <= (intView & intEnable).or();
 
-    // Command frame from the value being written to CMD (index + flags) plus
-    // the already-latched argument: {0, 1, index[5:0], arg[31:0]} then CRC7 and
-    // the end bit, MSB-first.
+    // Command content from the value being written to CMD (index + flags) plus
+    // the already-latched argument: {0, 1, index[5:0], arg[31:0]}. The send
+    // logic adds the CRC7 and the end bit, MSB-first.
     final wrIndex = bus.dataIn.getRange(0, 6);
     final cmdContent = [
       Const(0, width: 1),
       Const(1, width: 1),
       wrIndex,
       cmdArg,
-    ].swizzle();
-    final cmdFrame = [
-      cmdContent,
-      _crc7(cmdContent),
-      Const(1, width: 1),
-    ].swizzle();
+    ].concat();
+
+    // Raw bus view: [0] CMD level, [1] CMD pad enable, [11:4] DAT levels,
+    // [23:16] DAT pad enables. The levels are the sampled pad values.
+    final diag =
+        (cmdIn.zeroExtend(32) |
+                (cmdPadOe.zeroExtend(32) << 1) |
+                (datIn.zeroExtend(32) << 4) |
+                (datOePins.zeroExtend(32) << 16))
+            .named('sd_diag_value');
+    output('sd_diag') <= diag;
+
+    // Register read data, by register index. An index past the last
+    // register reads 0.
+    final readValues = <Logic>[
+      ctrlEnable.zeroExtend(32) |
+          (busWidthSel.zeroExtend(32) << 4) |
+          (sampleFall.zeroExtend(32) << 8),
+      cardPresent.zeroExtend(32) |
+          ((busy | dmaInFlight).zeroExtend(32) << 8) |
+          (mux(cmdDataDir, ~rxEmpty, dataValid).zeroExtend(32) << 9) |
+          // [15:12] the DAT engine state, for diagnostics. A read of the
+          // state as data also stops yosys from making the engine a new FSM.
+          (datState.zeroExtend(32) << 12),
+      clkDiv.zeroExtend(32),
+      cmdIndex.zeroExtend(32) | (cmdRespType.zeroExtend(32) << 6),
+      cmdArg,
+      ...resp,
+      // A card read pops the RX FIFO (see `rxPopCpu`). A card write reads
+      // back the holding register.
+      mux(cmdDataDir, mux(rxEmpty, Const(0, width: 32), rxHead), dataReg),
+      blkSize.zeroExtend(32),
+      blkCount.zeroExtend(32),
+      intView.zeroExtend(32),
+      intEnable.zeroExtend(32),
+      admaBase,
+      dataTimeout.zeroExtend(32),
+      admaErrState.zeroExtend(32),
+      admaErrAddr,
+      diag,
+    ];
+    final readWord = Logic(name: 'reg_read_word', width: 32);
+    Combinational([
+      Case(
+        regIndex.getRange(0, 5),
+        [
+          for (var i = 0; i < readValues.length; i++)
+            CaseItem(Const(i, width: 5), [readWord < readValues[i]]),
+        ],
+        defaultItem: [readWord < Const(0, width: 32)],
+      ),
+    ]);
+    // The card did not answer the command in time.
+    final cmdTimeoutNow =
+        (state.eq(Const(sWait, width: 3)) &
+                respEdge &
+                cmdIn &
+                toCnt.eq(Const(respTimeout, width: timeoutW)))
+            .named('cmd_timeout_now');
+
+    // INT_STATUS bits a write clears in this cycle.
+    final intClear =
+        ((busAccess & bus.we & regIndex.eq(Const(0x0C, width: 9))).replicate(
+                  12,
+                ) &
+                bus.selMasked(0x60, 12))
+            .named('int_clear');
+    final readHit = (~bus.we & regIndex.getRange(5).eq(Const(0, width: 4)))
+        .named('reg_read_hit');
 
     // Received response after the in-flight bit is shifted in.
-    final respNext = [respShift.getRange(0, 135), cmdIn].swizzle();
+    final respNext = [respShift.getRange(0, 127), cmdIn].concat();
+
+    // Checks on the last response bit: end bit, CRC7 remainder and echoed
+    // index. A card sends the transmission bit as 0.
+    final respIsLong = cmdRespType.eq(Const(2, width: 2));
+    final respLast =
+        (state.eq(Const(sRecv, width: 3)) &
+                respEdge &
+                respCnt.eq(Const(1, width: 8)))
+            .named('resp_last');
+    final respEndBad = (~cmdIn | respTxBad).named('resp_end_bad');
+    final respCrcBad = (respCrc.neq(Const(0, width: 7)) & ~cmdNoCrc).named(
+      'resp_crc_bad',
+    );
+    final respIdxBad =
+        (~respIsLong & ~cmdNoIdx & respNext.getRange(40, 46).neq(cmdIndex))
+            .named('resp_idx_bad');
+    final respErrNow = (respLast & (respEndBad | respCrcBad | respIdxBad))
+        .named('resp_err_now');
+
+    // Stops the walker for an address or length that is not a word multiple.
+    List<Conditional> alignError(Logic state) => [
+      admaState < Const(aIdle, width: 3),
+      alignPend < Const(1),
+      alignState < state,
+    ];
 
     Sequential(clk, [
       If(
@@ -994,25 +1322,35 @@ class HarborSdioController extends BridgeModule
           cmdRespType < Const(0, width: 2),
           cmdDataPresent < Const(0),
           cmdDataDir < Const(0),
-          for (var i = 0; i < 4; i++) resp[i] < Const(0, width: 32),
+          respRaw < Const(0, width: 128),
+          respLong < Const(0),
+          cmdNoCrc < Const(0),
+          cmdNoIdx < Const(0),
+          respCrc < Const(0, width: 7),
+          respTxBad < Const(0),
+          cmdHold < Const(0, width: 8),
+          cmdGap < Const(0, width: 4),
+          initCnt < Const(initClocks, width: 8),
           blkSize < Const(512, width: 12),
           blkCount < Const(1, width: 16),
-          intStatus < Const(0, width: 8),
-          intEnable < Const(0, width: 8),
+          dataTimeout < Const(defaultDataTimeout, width: 24),
+          dataTimeoutCnt < Const(0, width: 24),
+          for (final b in intBits) b < Const(0),
+          intEnable < Const(0, width: 12),
           busy < Const(0),
           divCount < Const(0, width: 16),
           sdClkReg < Const(0),
-          state < Const(sIdle, width: 2),
-          cmdShift < Const(0, width: 48),
+          state < Const(sIdle, width: 3),
+          cmdShift < Const(0, width: 40),
+          cmdCrc < Const(0, width: 7),
           cmdCnt < Const(0, width: 7),
           cmdOut < Const(1), // CMD idles high
           cmdOe < Const(0),
-          respShift < Const(0, width: 136),
+          respShift < Const(0, width: 128),
           respCnt < Const(0, width: 8),
-          toCnt < Const(0, width: 16),
+          toCnt < Const(0, width: timeoutW),
           datState < Const(dIdle, width: 4),
           for (final c in crc16) c < Const(0, width: 16),
-          for (final c in crcShift) c < Const(0, width: 16),
           byteShift < Const(0, width: 8),
           bitsInByte < Const(8, width: 4),
           byteCnt < Const(0, width: 13),
@@ -1021,25 +1359,35 @@ class HarborSdioController extends BridgeModule
           dataReg < Const(0, width: 32),
           dataValid < Const(0),
           rxCount < Const(0, width: rxPtrW + 1),
-          for (final w in rxFifo) w < Const(0, width: 32),
+          rxRd < Const(0, width: rxPtrW),
+          rxWr < Const(0, width: rxPtrW),
           byteInWord < Const(0, width: 2),
           wrNeedFill < Const(0),
           busWidthSel < Const(0, width: 2),
           statShift < Const(0, width: 3),
-          statCnt < Const(0, width: 2),
+          statCnt < Const(0, width: statCntW),
           busySeen < Const(0),
-          statWaitCnt < Const(0, width: 16),
+          statWaitCnt < Const(0, width: timeoutW),
           busyCnt < Const(0, width: busyW),
+          wrNwrCnt < Const(0, width: 2),
+          wrLineFree < Const(1),
           dmaMode < Const(0),
           admaState < Const(aIdle, width: 3),
           descPtr < Const(0, width: 32),
           descAddr < Const(0, width: 32),
-          descBytes < Const(0, width: 16),
+          descBytes < Const(0, width: descBytesW),
           descEnd < Const(0),
           admaBase < Const(0, width: 32),
           fetchHi < Const(0),
           admaErr < Const(0),
+          dmaFailed < Const(0),
+          admaErrState < Const(0, width: 2),
+          admaErrAddr < Const(0, width: 32),
+          wrQTail < Const(0, width: qW),
+          wrQHead < Const(0, width: qW),
           wrAbort < Const(0),
+          alignPend < Const(0),
+          alignState < Const(0, width: 2),
           reqValid < Const(0),
           reqWrite < Const(0),
           reqAddr < Const(0, width: 32),
@@ -1063,8 +1411,21 @@ class HarborSdioController extends BridgeModule
           bus.dataOut < Const(0, width: dw),
         ],
         orElse: [
+          // INT_STATUS write-1-to-clear. It comes before every event that
+          // sets a bit, so a set in the same cycle wins.
+          for (var i = 0; i < 12; i++)
+            If(intClear[i], then: [intBits[i] < Const(0)]),
+          If(
+            intClear[7],
+            then: [
+              admaErr < Const(0),
+              admaErrState < Const(0, width: 2),
+              admaErrAddr < Const(0, width: 32),
+            ],
+          ),
           bus.ack < Const(0),
           bus.dataOut < Const(0, width: dw),
+          alignPend < Const(0),
 
           // SD clock divider. Frozen while datStall holds, so the clock stays
           // low and the card pauses until the ADMA drains the pending read word
@@ -1080,52 +1441,105 @@ class HarborSdioController extends BridgeModule
             ],
           ),
 
+          // Counts the quiet time after a failed response.
+          If(
+            sdRise & cmdHold.neq(Const(0, width: 8)),
+            then: [cmdHold < (cmdHold - Const(1, width: 8))],
+          ),
+          If(
+            sdFall & cmdGap.neq(Const(0, width: 4)),
+            then: [cmdGap < (cmdGap - Const(1, width: 4))],
+          ),
+          // The power-up clocks count from enable, and a cleared enable
+          // starts them again.
+          If(
+            ~ctrlEnable,
+            then: [initCnt < Const(initClocks, width: 8)],
+            orElse: [
+              If(
+                sdFall & initCnt.neq(Const(0, width: 8)),
+                then: [initCnt < (initCnt - Const(1, width: 8))],
+              ),
+            ],
+          ),
+
           // CMD engine.
           Case(state, [
             // Serialize the command, MSB-first, one bit per SD falling edge.
-            CaseItem(Const(sSend, width: 2), [
+            CaseItem(Const(sSend, width: 3), [
+              // A command written while the quiet time runs waits for it. CMD
+              // stays released until then, and STATUS shows busy meanwhile.
+              If(
+                ~cmdOe & cmdFree,
+                then: [cmdOe < Const(1)],
+              ),
+              If(
+                sdFall & cmdOe,
+                then: [
+                  // Bits 48 to 9 are the content, which runs through the CRC7.
+                  // Then the CRC goes out, and the ones that fill it from the
+                  // right are the end bit.
+                  If(
+                    cmdCnt.gt(Const(8, width: 7)),
+                    then: [
+                      cmdOut < cmdShift[39],
+                      cmdShift <
+                          [cmdShift.getRange(0, 39), Const(0)].concat(),
+                      cmdCrc < _crc7Next(cmdCrc, cmdShift[39]),
+                    ],
+                    orElse: [
+                      cmdOut < cmdCrc[6],
+                      cmdCrc < [cmdCrc.getRange(0, 6), Const(1)].concat(),
+                    ],
+                  ),
+                  cmdCnt < (cmdCnt - Const(1, width: 7)),
+                  // The last bit is the end bit. Keep it driven for one more
+                  // SD clock, so a pad with a slow pull-up reads it high.
+                  If(
+                    cmdCnt.eq(Const(1, width: 7)),
+                    then: [state < Const(sEnd, width: 3)],
+                  ),
+                ],
+              ),
+            ]),
+            CaseItem(Const(sEnd, width: 3), [
               If(
                 sdFall,
                 then: [
-                  cmdOut < cmdShift[47],
-                  cmdShift < [cmdShift.getRange(0, 47), Const(0)].swizzle(),
-                  cmdCnt < (cmdCnt - Const(1, width: 7)),
+                  cmdOe < Const(0),
                   If(
-                    cmdCnt.eq(Const(1, width: 7)),
+                    cmdRespType.eq(Const(0, width: 2)),
+                    // No response expected: the command is done.
                     then: [
-                      If(
-                        cmdRespType.eq(Const(0, width: 2)),
-                        // No response expected: command done, release the line.
-                        then: [
-                          state < Const(sIdle, width: 2),
-                          busy < Const(0),
-                          cmdOe < Const(0),
-                          intStatus < (intStatus | Const(intCmdDone, width: 8)),
-                        ],
-                        // Wait for the card to drive the response.
-                        orElse: [
-                          state < Const(sWait, width: 2),
-                          cmdOe < Const(0),
-                          toCnt < Const(0, width: 16),
-                        ],
-                      ),
+                      cmdGap < Const(cmdGapClocks, width: 4),
+                      state < Const(sIdle, width: 3),
+                      busy < Const(0),
+                      ...setInt(intCmdDone),
+                    ],
+                    // Wait for the card to drive the response.
+                    orElse: [
+                      state < Const(sWait, width: 3),
+                      toCnt < Const(0, width: timeoutW),
                     ],
                   ),
                 ],
               ),
             ]),
             // Hunt for the response start bit, with an NCR timeout.
-            CaseItem(Const(sWait, width: 2), [
+            CaseItem(Const(sWait, width: 3), [
               If(
-                sdRise,
+                respEdge,
                 then: [
                   If(
                     ~cmdIn,
                     then: [
-                      state < Const(sRecv, width: 2),
-                      respShift < Const(0, width: 136),
+                      // The shift register is not cleared. The capture below
+                      // takes only bits this response shifts in.
+                      state < Const(sRecv, width: 3),
+                      respCrc < Const(0, width: 7),
+                      respTxBad < Const(0),
                       respCnt <
-                          mux(
+                          mux<Logic>(
                             cmdRespType.eq(Const(2, width: 2)),
                             Const(
                               135,
@@ -1135,14 +1549,21 @@ class HarborSdioController extends BridgeModule
                           ),
                     ],
                     orElse: [
-                      toCnt < (toCnt + Const(1, width: 16)),
+                      toCnt < (toCnt + Const(1, width: timeoutW)),
                       If(
-                        toCnt.eq(Const(respTimeout, width: 16)),
+                        toCnt.eq(Const(respTimeout, width: timeoutW)),
                         then: [
-                          state < Const(sIdle, width: 2),
+                          state < Const(sIdle, width: 3),
                           busy < Const(0),
-                          intStatus <
-                              (intStatus | Const(intCmdTimeout, width: 8)),
+                          // A PIO card-write word may have been loaded before
+                          // CMD24. If the card never starts a response, the
+                          // data FSM never consumes it; discard it so it
+                          // cannot become the first word of a later transfer.
+                          If(
+                            cmdDataPresent & ~cmdDataDir & ~dmaMode,
+                            then: [dataValid < Const(0)],
+                          ),
+                          ...setInt(intCmdTimeout),
                         ],
                       ),
                     ],
@@ -1151,22 +1572,69 @@ class HarborSdioController extends BridgeModule
               ),
             ]),
             // Shift the response in on rising edges, capture on the last bit.
-            CaseItem(Const(sRecv, width: 2), [
+            CaseItem(Const(sRecv, width: 3), [
               If(
-                sdRise,
+                respEdge,
                 then: [
                   respShift < respNext,
                   respCnt < (respCnt - Const(1, width: 8)),
+                  // The CRC7 runs over the header and payload and then over
+                  // the card CRC itself, so a good frame leaves zero. A long
+                  // response covers only the register field.
                   If(
-                    respCnt.eq(Const(1, width: 8)),
+                    respCnt.gte(Const(2, width: 8)) &
+                        (~respIsLong | respCnt.lte(Const(128, width: 8))),
                     then: [
-                      state < Const(sIdle, width: 2),
-                      intStatus < (intStatus | Const(intCmdDone, width: 8)),
+                      respCrc <
+                          [
+                            respCrc[5],
+                            respCrc[4],
+                            respCrc[3],
+                            respCrc[2] ^ (cmdIn ^ respCrc[6]),
+                            respCrc[1],
+                            respCrc[0],
+                            cmdIn ^ respCrc[6],
+                          ].concat(),
+                    ],
+                  ),
+                  If(
+                    respCnt.eq(
+                      mux<Logic>(
+                        respIsLong,
+                        Const(135, width: 8),
+                        Const(47, width: 8),
+                      ),
+                    ),
+                    then: [respTxBad < cmdIn],
+                  ),
+                  If(
+                    respCnt.eq(Const(1, width: 8)) & respErrNow,
+                    then: [
+                      state < Const(sIdle, width: 3),
+                      busy < Const(0),
+                      If(
+                        cmdDataPresent & ~cmdDataDir & ~dmaMode,
+                        then: [dataValid < Const(0)],
+                      ),
+                      If(respEndBad, then: [...setInt(intCmdEndErr)]),
+                      If(respCrcBad, then: [...setInt(intCmdCrcErr)]),
+                      If(respIdxBad, then: [...setInt(intCmdIdxErr)]),
+                    ],
+                  ),
+                  If(
+                    respCnt.eq(Const(1, width: 8)) & ~respErrNow,
+                    then: [
+                      state < Const(sIdle, width: 3),
+                      // The card drives the end bit until the next falling
+                      // edge, and that edge does not count as a high clock.
+                      cmdGap < Const(cmdGapClocks + 1, width: 4),
+                      ...setInt(intCmdDone),
                       // Hand off to the data engine when the command carries a
                       // data phase, otherwise the command is done.
                       If(
                         cmdDataPresent,
                         then: [
+                          dataTimeoutCnt < Const(0, width: 24),
                           byteCnt < blkSize.zeroExtend(13),
                           blockLeft < blkCount,
                           for (final c in crc16) c < Const(0, width: 16),
@@ -1175,42 +1643,80 @@ class HarborSdioController extends BridgeModule
                           If(
                             cmdDataDir,
                             then: [datState < Const(dRWait, width: 4)],
-                            orElse: [datState < Const(dWStart, width: 4)],
+                            orElse: [
+                              datState < Const(dWStart, width: 4),
+                              wrNwrCnt < Const(3, width: 2),
+                              wrLineFree < Const(1),
+                            ],
                           ),
                         ],
-                        orElse: [busy < Const(0)],
+                        orElse: [
+                          // A response with busy holds the command until the
+                          // card releases DAT0.
+                          If(
+                            cmdRespType.eq(Const(3, width: 2)),
+                            then: [
+                              state < Const(sBusy, width: 3),
+                              busySeen < Const(0),
+                              busyCnt < Const(0, width: busyW),
+                              statCnt <
+                                  Const(writeBusyStartClocks, width: statCntW),
+                            ],
+                            orElse: [busy < Const(0)],
+                          ),
+                        ],
                       ),
                       // The ADMA descriptor fetch is kicked off at command issue
                       // (see the CMD write handler), not here, so the engine is
                       // already parked in its memory state before the first data
                       // word and no startup words are dropped.
-                      // R2: low 128 bits of the 136-bit frame into RESP0-3.
-                      // Short: the 32-bit payload (frame bits [39:8]) into RESP0.
-                      If(
-                        cmdRespType.eq(Const(2, width: 2)),
-                        then: [
-                          resp[0] < respNext.getRange(0, 32),
-                          resp[1] < respNext.getRange(32, 64),
-                          resp[2] < respNext.getRange(64, 96),
-                          resp[3] < respNext.getRange(96, 128),
-                        ],
-                        orElse: [
-                          resp[0] < respNext.getRange(8, 40),
-                          resp[1] < Const(0, width: 32),
-                          resp[2] < Const(0, width: 32),
-                          resp[3] < Const(0, width: 32),
-                        ],
-                      ),
+                      // Keep the frame. RESP0-3 take their bits on a read.
+                      respRaw < respNext,
+                      respLong < cmdRespType.eq(Const(2, width: 2)),
                     ],
+                  ),
+                ],
+              ),
+            ]),
+            // Wait for DAT0 to rise after an R1b. The card pulls it low
+            // within [writeBusyStartClocks] clocks of the response, so a
+            // line that stays high has no busy phase.
+            CaseItem(Const(sBusy, width: 3), [
+              If(
+                readEdge,
+                then: [
+                  If(~datIn[0], then: [busySeen < Const(1)]),
+                  If(
+                    statCnt.neq(Const(0, width: statCntW)),
+                    then: [statCnt < (statCnt - Const(1, width: statCntW))],
+                  ),
+                  busyCnt < (busyCnt + Const(1, width: busyW)),
+                  If(
+                    busyCnt.eq(Const(this.writeBusyTimeout, width: busyW)),
+                    then: [
+                      state < Const(sIdle, width: 3),
+                      busy < Const(0),
+                      ...setInt(intCmdTimeout),
+                    ],
+                  ),
+                  If(
+                    (busySeen | statCnt.eq(Const(0, width: statCntW))) &
+                        datIn[0],
+                    then: [state < Const(sIdle, width: 3), busy < Const(0)],
                   ),
                 ],
               ),
             ]),
           ]),
 
+          If(
+            respErrNow | cmdTimeoutNow,
+            then: [cmdHold < Const(cmdQuietClocks, width: 8)],
+          ),
+
           // DAT engine (1/4/8-bit PIO). Each SD clock moves [laneCount] bits,
           // one per active lane, MSB group first, each lane has its own CRC16.
-          () {
+          ...() {
             final bitsNext = mux(
               byteDone,
               Const(8, width: 4),
@@ -1220,27 +1726,38 @@ class HarborSdioController extends BridgeModule
             // byte), aligned so lane 0 is the lowest of the group.
             final wrShift = Const(8, width: 4) - laneCount.zeroExtend(4);
             final wrGroup = (byteShift >> wrShift).getRange(0, maxW) & laneMask;
-            // Next CRC16 per lane, for the bit that lane carries this clock.
-            final crcNextRd = [
+            // The CRC16 of each active lane steps on the edge that moves a bit.
+            // The bit is the data bit of the lane, or the top CRC bit while a
+            // card write sends the CRC, which shifts the register left.
+            final datRdPhase =
+                datState.eq(Const(dRead, width: 4)) |
+                datState.eq(Const(dRCrc, width: 4));
+            final datWrPhase =
+                datState.eq(Const(dWrite, width: 4)) |
+                datState.eq(Const(dWCrc, width: 4));
+            final crcStepEn = (datRdPhase & readEdge) | (datWrPhase & sdFall);
+            final crcNext = [
               for (var l = 0; l < maxW; l++)
-                mux(laneMask[l], _crc16Next(crc16[l], datIn[l]), crc16[l]),
-            ];
-            final crcNextWr = [
-              for (var l = 0; l < maxW; l++)
-                mux(laneMask[l], _crc16Next(crc16[l], wrGroup[l]), crc16[l]),
-            ];
-            // Read CRC shift-in (value after this clock) and the CRC drive vec.
-            final rxCrcNext = [
-              for (var l = 0; l < maxW; l++)
-                [crcShift[l].getRange(0, 15), datIn[l]].swizzle(),
+                _crc16Next(
+                  crc16[l],
+                  mux(
+                    datRdPhase,
+                    datIn[l],
+                    mux(
+                      datState.eq(Const(dWCrc, width: 4)),
+                      crc16[l][15],
+                      wrGroup[l],
+                    ),
+                  ),
+                ),
             ];
             final crcOutVec =
-                [for (var l = 0; l < maxW; l++) crcShift[l][15]].rswizzle() &
+                [for (var l = 0; l < maxW; l++) crc16[l][15]].rconcat() &
                 laneMask;
-            // Read CRC mismatch on any active lane.
+            // A good card CRC leaves a zero remainder on every active lane.
             var crcBad = Const(0) as Logic;
             for (var l = 0; l < maxW; l++) {
-              crcBad = crcBad | (laneMask[l] & crc16[l].neq(rxCrcNext[l]));
+              crcBad = crcBad | (laneMask[l] & crcNext[l].or());
             }
             // Next data byte for write (within the current word).
             final nextByte = mux(
@@ -1253,7 +1770,10 @@ class HarborSdioController extends BridgeModule
               ),
             );
 
-            return Case(datState, [
+            return [
+              for (var l = 0; l < maxW; l++)
+                If(crcStepEn & laneMask[l], then: [crc16[l] < crcNext[l]]),
+              Case(datState, [
               // READ: hunt for the block start bit (0) on DAT0.
               CaseItem(Const(dRWait, width: 4), [
                 If(
@@ -1262,6 +1782,32 @@ class HarborSdioController extends BridgeModule
                     datState < Const(dRead, width: 4),
                     bitsInByte < Const(8, width: 4),
                     byteShift < Const(0, width: 8),
+                  ],
+                  orElse: [
+                    If(
+                      readEdge,
+                      then: [
+                        dataTimeoutCnt < dataTimeoutNext.getRange(0, 24),
+                        // The check is count >= timeout - 1. It is written
+                        // as count + 1 >= timeout to use the adder of the
+                        // count.
+                        If(
+                          dataTimeout.neq(Const(0, width: 24)) &
+                              dataTimeoutNext.gte(dataTimeout.zeroExtend(25)),
+                          then: [
+                            datState < Const(dIdle, width: 4),
+                            ...setInt(intDataTimeout),
+                            // A DMA read ends when the ADMA has landed what
+                            // the card sent, as on a normal end.
+                            If(
+                              dmaMode,
+                              then: [dmaTailWait < Const(1)],
+                              orElse: [busy < Const(0)],
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
                   ],
                 ),
               ]),
@@ -1272,7 +1818,6 @@ class HarborSdioController extends BridgeModule
                   then: [
                     byteShift < mux(byteDone, Const(0, width: 8), rdFull),
                     bitsInByte < bitsNext,
-                    for (var l = 0; l < maxW; l++) crc16[l] < crcNextRd[l],
                     If(
                       byteDone,
                       then: [
@@ -1283,10 +1828,7 @@ class HarborSdioController extends BridgeModule
                           CaseItem(Const(2, width: 2), [asmB2 < rdFull]),
                           // Byte 3 completes a word. The word itself is pushed
                           // into the RX FIFO by the block below, off `rxPush`.
-                          CaseItem(Const(3, width: 2), [
-                            intStatus <
-                                (intStatus | Const(intDataReq, width: 8)),
-                          ]),
+                          CaseItem(Const(3, width: 2), [...setInt(intDataReq)]),
                         ]),
                         byteInWord < (byteInWord + Const(1, width: 2)),
                         byteCnt < (byteCnt - Const(1, width: 13)),
@@ -1295,7 +1837,6 @@ class HarborSdioController extends BridgeModule
                           then: [
                             datState < Const(dRCrc, width: 4),
                             crcBitCnt < Const(16, width: 5),
-                            for (final c in crcShift) c < Const(0, width: 16),
                           ],
                         ),
                       ],
@@ -1308,28 +1849,18 @@ class HarborSdioController extends BridgeModule
                 If(
                   readEdge,
                   then: [
-                    for (var l = 0; l < maxW; l++) crcShift[l] < rxCrcNext[l],
                     crcBitCnt < (crcBitCnt - Const(1, width: 5)),
                     If(
                       crcBitCnt.eq(Const(1, width: 5)),
                       then: [
-                        // Latch CRC-error and (on the final block) data-done in
-                        // ONE intStatus write. Two separate `intStatus < ...`
-                        // assignments race under last-write-wins, so a CRC error
-                        // on the final block was silently dropped by the later
-                        // data-done write.
-                        intStatus <
-                            (intStatus |
-                                mux(
-                                  crcBad,
-                                  Const(intDataCrcErr, width: 8),
-                                  Const(0, width: 8),
-                                ) |
-                                mux(
-                                  blockLeft.eq(Const(1, width: 16)) & ~dmaMode,
-                                  Const(intDataDone, width: 8),
-                                  Const(0, width: 8),
-                                )),
+                        // Each interrupt bit is its own register, so the CRC
+                        // error and the data-done of the final block both
+                        // latch in the same cycle.
+                        If(crcBad, then: setInt(intDataCrcErr)),
+                        If(
+                          blockLeft.eq(Const(1, width: 16)) & ~dmaMode,
+                          then: setInt(intDataDone),
+                        ),
                         If(
                           blockLeft.eq(Const(1, width: 16)),
                           then: [
@@ -1347,6 +1878,7 @@ class HarborSdioController extends BridgeModule
                             byteCnt < blkSize.zeroExtend(13),
                             for (final c in crc16) c < Const(0, width: 16),
                             byteInWord < Const(0, width: 2),
+                            dataTimeoutCnt < Const(0, width: 24),
                             datState < Const(dRWait, width: 4),
                           ],
                         ),
@@ -1358,16 +1890,33 @@ class HarborSdioController extends BridgeModule
               // WRITE: drive the start bit once the CPU has provided data.
               CaseItem(Const(dWStart, width: 4), [
                 If(
-                  sdFall & dataValid,
-                  then: [
-                    datOeReg < Const(1),
-                    datOutReg <
-                        Const(0, width: maxW), // start bit (all lanes 0)
-                    byteShift < dataReg.getRange(0, 8),
-                    bitsInByte < Const(8, width: 4),
-                    byteInWord < Const(0, width: 2),
-                    wrNeedFill < Const(0),
-                    datState < Const(dWrite, width: 4),
+                  sdFall & wrNwrCnt.gt(Const(1, width: 2)),
+                  then: [wrNwrCnt < (wrNwrCnt - Const(1, width: 2))],
+                  orElse: [
+                    // A card that turns busy late holds DAT0 low. Wait it out
+                    // instead of driving the start bit onto a busy line.
+                    If(readEdge, then: [wrLineFree < datIn[0]]),
+                    If(
+                      readEdge & ~datIn[0],
+                      then: [
+                        datState < Const(dWLate, width: 4),
+                        busyCnt < Const(0, width: busyW),
+                      ],
+                    ),
+                    // The line was high at the last sample edge.
+                    If(
+                      sdFall & dataValid & wrLineFree & ~(readEdge & ~datIn[0]),
+                      then: [
+                        datOeReg < Const(1),
+                        datOutReg <
+                            Const(0, width: maxW), // start bit (all lanes 0)
+                        byteShift < dataReg.getRange(0, 8),
+                        bitsInByte < Const(8, width: 4),
+                        byteInWord < Const(0, width: 2),
+                        wrNeedFill < Const(0),
+                        datState < Const(dWrite, width: 4),
+                      ],
+                    ),
                   ],
                 ),
               ]),
@@ -1377,7 +1926,6 @@ class HarborSdioController extends BridgeModule
                   sdFall,
                   then: [
                     datOutReg < wrGroup,
-                    for (var l = 0; l < maxW; l++) crc16[l] < crcNextWr[l],
                     byteShift < (byteShift << laneCount).getRange(0, 8),
                     bitsInByte < bitsNext,
                     If(
@@ -1392,12 +1940,9 @@ class HarborSdioController extends BridgeModule
                             // the holding register too, so a multi-block write
                             // starts its next block on a freshly supplied word
                             // instead of replaying this block's last one.
-                            for (var l = 0; l < maxW; l++)
-                              crcShift[l] < crcNextWr[l],
                             crcBitCnt < Const(16, width: 5),
                             dataValid < Const(0),
-                            intStatus <
-                                (intStatus | Const(intDataReq, width: 8)),
+                            ...setInt(intDataReq),
                             datState < Const(dWCrc, width: 4),
                           ],
                           orElse: [
@@ -1411,8 +1956,7 @@ class HarborSdioController extends BridgeModule
                               then: [
                                 dataValid < Const(0),
                                 wrNeedFill < Const(1),
-                                intStatus <
-                                    (intStatus | Const(intDataReq, width: 8)),
+                                ...setInt(intDataReq),
                               ],
                               orElse: [byteShift < nextByte],
                             ),
@@ -1440,9 +1984,6 @@ class HarborSdioController extends BridgeModule
                   sdFall,
                   then: [
                     datOutReg < mux(wrAbort, ~crcOutVec & laneMask, crcOutVec),
-                    for (var l = 0; l < maxW; l++)
-                      crcShift[l] <
-                          [crcShift[l].getRange(0, 15), Const(0)].swizzle(),
                     crcBitCnt < (crcBitCnt - Const(1, width: 5)),
                     If(
                       crcBitCnt.eq(Const(1, width: 5)),
@@ -1451,42 +1992,48 @@ class HarborSdioController extends BridgeModule
                   ],
                 ),
               ]),
-              // WRITE the end bit, then release the line for the card's
-              // CRC-status token.
+              // WRITE the end bit and keep it driven for one SD clock.
               CaseItem(Const(dWEnd, width: 4), [
                 If(
                   sdFall,
                   then: [
                     datOutReg < laneMask, // end bit (1 on active lanes)
+                    datState < Const(dWEndHold, width: 4),
+                  ],
+                ),
+              ]),
+              // Release the line for the card's CRC-status token.
+              CaseItem(Const(dWEndHold, width: 4), [
+                If(
+                  sdFall,
+                  then: [
                     datOeReg < Const(0),
                     datState < Const(dWStatWait, width: 4),
-                    statWaitCnt < Const(0, width: 16),
+                    statWaitCnt < Const(0, width: timeoutW),
                   ],
                 ),
               ]),
               // WRITE: hunt for the CRC status token start bit on DAT0.
               CaseItem(Const(dWStatWait, width: 4), [
                 If(
-                  sdRise,
+                  readEdge,
                   then: [
                     If(
                       ~datIn[0],
                       then: [
                         datState < Const(dWStat, width: 4),
                         statShift < Const(0, width: 3),
-                        statCnt < Const(3, width: 2),
+                        statCnt < Const(3, width: statCntW),
                       ],
                       orElse: [
-                        statWaitCnt < (statWaitCnt + Const(1, width: 16)),
+                        statWaitCnt < (statWaitCnt + Const(1, width: timeoutW)),
                         If(
-                          statWaitCnt.eq(Const(respTimeout, width: 16)),
+                          statWaitCnt.eq(Const(respTimeout, width: timeoutW)),
                           then: [
                             // No token: treat as a write error and finish.
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
-                            intStatus <
-                                (intStatus |
-                                    Const(intWriteErr | intDataDone, width: 8)),
+                            ...setInt(intWriteErr | intDataDone),
                           ],
                         ),
                       ],
@@ -1497,12 +2044,12 @@ class HarborSdioController extends BridgeModule
               // WRITE: capture the 3-bit CRC status (010 == accepted).
               CaseItem(Const(dWStat, width: 4), [
                 If(
-                  sdRise,
+                  readEdge,
                   then: [
-                    statShift < [statShift.getRange(0, 2), datIn[0]].swizzle(),
-                    statCnt < (statCnt - Const(1, width: 2)),
+                    statShift < [statShift.getRange(0, 2), datIn[0]].concat(),
+                    statCnt < (statCnt - Const(1, width: statCntW)),
                     If(
-                      statCnt.eq(Const(1, width: 2)),
+                      statCnt.eq(Const(1, width: statCntW)),
                       then: [
                         // A rejected block has no busy, so the transfer
                         // ends here.
@@ -1510,15 +2057,13 @@ class HarborSdioController extends BridgeModule
                           [
                             statShift.getRange(0, 2),
                             datIn[0],
-                          ].swizzle().neq(Const(0x2, width: 3)),
+                          ].concat().neq(Const(0x2, width: 3)),
                           then: [
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
-                            intStatus <
-                                (intStatus |
-                                    Const(intWriteErr | intDataDone, width: 8)),
+                            ...setInt(intWriteErr | intDataDone),
                           ],
-                          orElse: [datState < Const(dWBusy, width: 4)],
+                          orElse: [datState < Const(dWStatEnd, width: 4)],
                         ),
                         busySeen < Const(0),
                         busyCnt < Const(0, width: busyW),
@@ -1527,41 +2072,49 @@ class HarborSdioController extends BridgeModule
                   ],
                 ),
               ]),
-              // WRITE: wait out programming. The card pulls DAT0 low (busy),
-              // then releases it high when done.
-              CaseItem(Const(dWBusy, width: 4), [
+              // WRITE: the end bit of the CRC status token must be high.
+              CaseItem(Const(dWStatEnd, width: 4), [
                 If(
-                  sdRise,
+                  readEdge,
                   then: [
-                    If(~datIn[0], then: [busySeen < Const(1)]),
-                    busyCnt < (busyCnt + Const(1, width: busyW)),
                     If(
-                      busyCnt.eq(Const(writeBusyTimeout, width: busyW)),
+                      datIn[0],
                       then: [
+                        datState < Const(dWBusy, width: 4),
+                        statCnt < Const(writeBusyStartClocks, width: statCntW),
+                      ],
+                      orElse: [
                         datState < Const(dIdle, width: 4),
                         busy < Const(0),
-                        intStatus <
-                            (intStatus |
-                                Const(intWriteErr | intDataDone, width: 8)),
+                        ...setInt(intWriteErr | intDataDone),
                       ],
                     ),
+                  ],
+                ),
+              ]),
+              // WRITE: DAT0 went low after the busy window closed. Wait for
+              // the card to release it, then start the block again.
+              CaseItem(Const(dWLate, width: 4), [
+                If(
+                  readEdge,
+                  then: [
+                    busyCnt < (busyCnt + Const(1, width: busyW)),
                     If(
-                      busySeen & datIn[0],
+                      datIn[0],
                       then: [
+                        datState < Const(dWStart, width: 4),
+                        wrNwrCnt < Const(3, width: 2),
+                        wrLineFree < Const(1),
+                      ],
+                      orElse: [
                         If(
-                          blockLeft.eq(Const(1, width: 16)),
+                          busyCnt.eq(
+                            Const(this.writeBusyTimeout, width: busyW),
+                          ),
                           then: [
                             datState < Const(dIdle, width: 4),
                             busy < Const(0),
-                            intStatus <
-                                (intStatus | Const(intDataDone, width: 8)),
-                          ],
-                          orElse: [
-                            blockLeft < (blockLeft - Const(1, width: 16)),
-                            byteCnt < blkSize.zeroExtend(13),
-                            for (final c in crc16) c < Const(0, width: 16),
-                            byteInWord < Const(0, width: 2),
-                            datState < Const(dWStart, width: 4),
+                            ...setInt(intWriteErr | intDataDone),
                           ],
                         ),
                       ],
@@ -1569,19 +2122,60 @@ class HarborSdioController extends BridgeModule
                   ],
                 ),
               ]),
-            ]);
+              // WRITE: wait out programming. The card pulls DAT0 low (busy)
+              // within [writeBusyStartClocks] SD clocks of the token, then releases it high when
+              // done. A card that never pulls it low has no busy phase.
+              CaseItem(Const(dWBusy, width: 4), [
+                If(
+                  readEdge,
+                  then: [
+                    If(~datIn[0], then: [busySeen < Const(1)]),
+                    If(
+                      statCnt.neq(Const(0, width: statCntW)),
+                      then: [statCnt < (statCnt - Const(1, width: statCntW))],
+                    ),
+                    busyCnt < (busyCnt + Const(1, width: busyW)),
+                    If(
+                      busyCnt.eq(Const(this.writeBusyTimeout, width: busyW)),
+                      then: [
+                        datState < Const(dIdle, width: 4),
+                        busy < Const(0),
+                        ...setInt(intWriteErr | intDataDone),
+                      ],
+                    ),
+                    If(
+                      (busySeen | statCnt.eq(Const(0, width: statCntW))) &
+                          datIn[0],
+                      then: [
+                        If(
+                          blockLeft.eq(Const(1, width: 16)),
+                          then: [
+                            datState < Const(dIdle, width: 4),
+                            busy < Const(0),
+                            ...setInt(intDataDone),
+                          ],
+                          orElse: [
+                            blockLeft < (blockLeft - Const(1, width: 16)),
+                            byteCnt < blkSize.zeroExtend(13),
+                            for (final c in crc16) c < Const(0, width: 16),
+                            byteInWord < Const(0, width: 2),
+                            datState < Const(dWStart, width: 4),
+                            wrNwrCnt < Const(3, width: 2),
+                            wrLineFree < Const(1),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ]),
+              ]),
+            ];
           }(),
 
-          // RX FIFO update, shift-FIFO discipline. Push and pop can land in the
-          // same cycle, so the count moves by the net of the two and both the
-          // shift and the tail insert must compose.
-          //
-          // On a pop the whole array shifts down toward index 0 by the number
-          // of words retired (1 or 2). The head therefore stays at index 0 and
-          // the four reads above need no muxes. On a push the new word goes at
-          // the tail, which the same-cycle shift has already moved to index
-          // (count - popped). That slot holds a word that is beyond the old
-          // valid range, so the tail insert overwrites it with no conflict.
+          // RX FIFO update. Push and pop can land in the same cycle, so the
+          // count moves by the net of the two. A push writes the RAM at
+          // [rxWr], a pop moves [rxRd] past the words it retires.
           //
           // The push is GATED on the FIFO having room. An ungated push past the
           // last slot would overwrite an entry nobody has read yet, so the
@@ -1590,21 +2184,13 @@ class HarborSdioController extends BridgeModule
           // `rx_fifo_count` is wide enough to hold depth+1, so one overflow
           // made `rx_full` compare false again and released the clock stall,
           // letting the corruption run away. Drop the word and say so instead.
-          for (var i = 0; i < rxDepth; i++)
-            rxFifo[i] <
-                mux(
-                  rxPushOk & rxTailIdx.eq(Const(i, width: rxPtrW + 1)),
-                  rxWord,
-                  rxShifted(i),
-                ),
-          If(
-            rxPush & rxFull & ~rxPop,
-            then: [intStatus < (intStatus | Const(intRxOverrun, width: 8))],
-          ),
+          rxWr < (rxWr + rxPushOk.zeroExtend(rxPtrW)),
+          rxRd < (rxRd.zeroExtend(rxPtrW + 1) + rxPopCount).getRange(0, rxPtrW),
+          If(rxPush & ~rxPushOk, then: [...setInt(intRxOverrun)]),
           // count' = count + (1 if pushed) - (words popped)
           rxCount <
               (rxCount +
-                  mux(
+                  mux<Logic>(
                     rxPushOk,
                     Const(1, width: rxPtrW + 1),
                     Const(0, width: rxPtrW + 1),
@@ -1612,7 +2198,7 @@ class HarborSdioController extends BridgeModule
                   mux(
                     rxPop2Ok,
                     Const(2, width: rxPtrW + 1),
-                    mux(
+                    mux<Logic>(
                       rxPop1Ok,
                       Const(1, width: rxPtrW + 1),
                       Const(0, width: rxPtrW + 1),
@@ -1635,7 +2221,73 @@ class HarborSdioController extends BridgeModule
           ),
           wInflight <
               (wInflight + issueWrite.zeroExtend(ifW) - bFire.zeroExtend(ifW)),
-          If(dmaFault, then: [admaErr < Const(1)]),
+          If(dmaFault, then: [admaErr < Const(1), dmaFailed < Const(1)]),
+          // The first error keeps its state and address until INT_STATUS[7]
+          // clears. A read error is on the descriptor fetch or on a data
+          // read. A write error is on the data.
+          for (var i = 0; i < dmaOutstanding; i++)
+            If(
+              issueWrite & wrQTail.eq(Const(i, width: qW)),
+              then: [wrQ[i] < descAddr],
+            ),
+          If(
+            issueWrite,
+            then: [
+              wrQTail <
+                  mux<Logic>(
+                    wrQTail.eq(Const(dmaOutstanding - 1, width: qW)),
+                    Const(0, width: qW),
+                    wrQTail + Const(1, width: qW),
+                  ),
+            ],
+          ),
+          If(
+            bFire,
+            then: [
+              wrQHead <
+                  mux<Logic>(
+                    wrQHead.eq(Const(dmaOutstanding - 1, width: qW)),
+                    Const(0, width: qW),
+                    wrQHead + Const(1, width: qW),
+                  ),
+            ],
+          ),
+          If(
+            dmaFault & (~admaErr | intClear[7]),
+            then: [
+              admaErrState <
+                  mux<Logic>(
+                    alignPend,
+                    alignState,
+                    mux<Logic>(
+                      rFire &
+                          mw.rdataErr &
+                          admaState.eq(Const(aFetch, width: 3)),
+                      Const(1, width: 2),
+                      Const(3, width: 2),
+                    ),
+                  ),
+              admaErrAddr <
+                  mux<Logic>(
+                    alignPend,
+                    descAddr,
+                    mux<Logic>(
+                    rFire & mw.rdataErr,
+                    reqAddr,
+                    [
+                      for (var i = dmaOutstanding - 1; i >= 0; i--) i,
+                    ].fold<Logic>(
+                      Const(0, width: 32),
+                      (acc, i) => mux<Logic>(
+                        wrQHead.eq(Const(i, width: qW)),
+                        wrQ[i],
+                        acc,
+                      ),
+                    ),
+                    ),
+                  ),
+            ],
+          ),
           If(dmaFault & dmaMode & ~cmdDataDir, then: [wrAbort < Const(1)]),
 
           // A DMA read completes when the walker has parked, the RX FIFO is
@@ -1649,7 +2301,7 @@ class HarborSdioController extends BridgeModule
             then: [
               dmaTailWait < Const(0),
               busy < Const(0),
-              intStatus < (intStatus | Const(intDataDone, width: 8)),
+              ...setInt(intDataDone),
             ],
           ),
 
@@ -1675,13 +2327,19 @@ class HarborSdioController extends BridgeModule
                   If(
                     fetchHi,
                     then: [
-                      descBytes < rdWord.getRange(0, 16),
+                      descBytes < rdWord.getRange(0, 16).zeroExtend(descBytesW),
                       descEnd < rdWord[31],
                       fetchHi < Const(0),
                       admaState < Const(aNext, width: 3),
+                      If(
+                        descAddr.getRange(0, 2).neq(Const(0, width: 2)) |
+                            rdWord.getRange(0, 2).neq(Const(0, width: 2)),
+                        then: alignError(Const(3, width: 2)),
+                      ),
                     ],
                     orElse: [descAddr < rdWord, fetchHi < Const(1)],
                   ),
+                  descPtr < (descPtr + Const(4, width: 32)),
                 ],
               ),
             ]),
@@ -1704,13 +2362,8 @@ class HarborSdioController extends BridgeModule
                 then: [
                   dataReg < rdWord,
                   dataValid < Const(1),
-                  descAddr < (descAddr + Const(4, width: 32)),
-                  descBytes <
-                      mux(
-                        descBytes.gt(Const(4, width: 16)),
-                        descBytes - Const(4, width: 16),
-                        Const(0, width: 16),
-                      ),
+                  descAddr < descAddrNext,
+                  descBytes < bytesAfter,
                   admaState < Const(aNext, width: 3),
                 ],
               ),
@@ -1734,15 +2387,19 @@ class HarborSdioController extends BridgeModule
                   reqAddr < descAddr,
                   reqLen < wrLen,
                   reqSize <
-                      mux(usePack, Const(3, width: 3), Const(2, width: 3)),
+                      mux<Logic>(
+                        usePack,
+                        Const(3, width: 3),
+                        Const(2, width: 3),
+                      ),
                   wActive < Const(1),
                   wLeft < wrLen,
                   wPack < usePack,
                   wHi < descAddr[2],
-                  descAddr < (descAddr + wrBytes.zeroExtend(32)),
+                  descAddr < descAddrNext,
                   descBytes < bytesAfter,
                   If(
-                    bytesAfter.eq(Const(0, width: 16)),
+                    bytesAfter.eq(Const(0, width: descBytesW)),
                     then: [admaState < Const(aNext, width: 3)],
                   ),
                 ],
@@ -1757,13 +2414,12 @@ class HarborSdioController extends BridgeModule
             ]),
             CaseItem(Const(aNext, width: 3), [
               If(
-                descBytes.eq(Const(0, width: 16)),
+                descBytes.eq(Const(0, width: descBytesW)),
                 then: [
                   If(
                     descEnd,
                     then: [admaState < Const(aIdle, width: 3)],
                     orElse: [
-                      descPtr < (descPtr + Const(8, width: 32)),
                       fetchHi < Const(0),
                       admaState < Const(aFetch, width: 3),
                     ],
@@ -1780,7 +2436,12 @@ class HarborSdioController extends BridgeModule
             ]),
           ]),
           // An error response stops the walker. Writes already sent finish.
-          If(dmaFault, then: [admaState < Const(aIdle, width: 3)]),
+          // A command with no response stops it too, so a later PIO
+          // transfer finds no DMA work left.
+          If(
+            dmaFault | cmdTimeoutNow | respErrNow,
+            then: [admaState < Const(aIdle, width: 3)],
+          ),
           // A parked walker in a DMA card write feeds zero words, so the
           // serializer reaches the end of the block count.
           If(
@@ -1800,6 +2461,7 @@ class HarborSdioController extends BridgeModule
             then: [
               busServed < Const(1),
               bus.ack < Const(1),
+              If(readHit, then: [bus.dataOut < readWord.zeroExtend(dw)]),
 
               // Each register sits in its own 8-byte slot (byte offset >> 3),
               // matching every other Harbor peripheral on the byte-addressed
@@ -1807,8 +2469,8 @@ class HarborSdioController extends BridgeModule
               // indices 0,1,2. Decode every address bit of the 0x1000 window
               // and ignore the bits above it, so absolute and relative
               // addresses both work. An unused offset reads 0 and ignores
-              // writes.
-              Case(bus.windowAddr(0x1000).getRange(3), [
+              // writes. The read data comes from [readWord].
+              Case(regIndex, [
                 // 0x00: CTRL ([0] enable, [5:4] reports max bus width,
                 // [8] read-data sample edge 0:rising 1:falling).
                 CaseItem(Const(0x00, width: 9), [
@@ -1822,6 +2484,54 @@ class HarborSdioController extends BridgeModule
                         bus.selAny(0x00, 1),
                         then: [
                           ctrlEnable < bus.dataIn[0],
+                          // Without the clock a write cannot finish, so a
+                          // disable stops it and releases the pads.
+                          If(
+                            ~bus.dataIn[0] &
+                                datState.gte(Const(dWStart, width: 4)),
+                            then: [
+                              datState < Const(dIdle, width: 4),
+                              datOeReg < Const(0),
+                              datOutReg < Const(0, width: maxW),
+                              wrAbort < Const(0),
+                              wrNeedFill < Const(0),
+                              dmaTailWait < Const(0),
+                              admaState < Const(aIdle, width: 3),
+                              busy < Const(0),
+                              ...setInt(intWriteErr | intDataDone),
+                            ],
+                          ),
+                          If(
+                            ~bus.dataIn[0] &
+                                (state.eq(Const(sWait, width: 3)) |
+                                    state.eq(Const(sRecv, width: 3))),
+                            then: [cmdHold < Const(cmdQuietClocks, width: 8)],
+                          ),
+                          // A command that is on the wire stops with the
+                          // clock. The card sees a short frame and may answer
+                          // it, so CMD stays released for the quiet time.
+                          If(
+                            ~bus.dataIn[0] &
+                                (state.eq(Const(sSend, width: 3)) |
+                                    state.eq(Const(sEnd, width: 3))),
+                            then: [
+                              cmdOe < Const(0),
+                              cmdOut < Const(1),
+                              state < Const(sIdle, width: 3),
+                              busy < Const(0),
+                              cmdHold < Const(cmdQuietClocks, width: 8),
+                              ...setInt(intCmdTimeout),
+                            ],
+                          ),
+                          // A command that waits for busy end needs the clock too.
+                          If(
+                            ~bus.dataIn[0] & state.eq(Const(sBusy, width: 3)),
+                            then: [
+                              state < Const(sIdle, width: 3),
+                              busy < Const(0),
+                              ...setInt(intCmdTimeout),
+                            ],
+                          ),
                           // [5:4] selects the active bus width (0:1-bit,
                           // 1:4-bit, 2:8-bit), clamped to the configured
                           // maximum.
@@ -1833,41 +2543,62 @@ class HarborSdioController extends BridgeModule
                       // round-trip margin at speed.
                       If(
                         bus.selAny(0x01, 1),
-                        then: [sampleFall < bus.dataIn[8]],
+                        then: [
+                          // A build that fixes the sample edge keeps it.
+                          sampleFall <
+                              (config.sampleReadOnFall
+                                  ? Const(1)
+                                  : bus.dataIn[8]),
+                          // [9] DAT reset: a write of 1 stops the data engine,
+                          // empties the RX FIFO and parks the ADMA walker.
+                          // Memory accesses already sent still finish.
+                          If(
+                            bus.dataIn[9],
+                            then: [
+                              datState < Const(dIdle, width: 4),
+                              datOeReg < Const(0),
+                              datOutReg < Const(0, width: maxW),
+                              wrAbort < Const(0),
+                              rxCount < Const(0, width: rxPtrW + 1),
+                              rxRd < Const(0, width: rxPtrW),
+                              rxWr < Const(0, width: rxPtrW),
+                              dmaTailWait < Const(0),
+                              admaState < Const(aIdle, width: 3),
+                              dataValid < Const(0),
+                              wrNeedFill < Const(0),
+                              byteInWord < Const(0, width: 2),
+                              busy < Const(0),
+                              // A command that waits for its answer stops
+                              // too, so a late card answer starts nothing.
+                              If(
+                                state.eq(Const(sWait, width: 3)) |
+                                    state.eq(Const(sRecv, width: 3)),
+                                then: [
+                                  cmdHold < Const(cmdQuietClocks, width: 8),
+                                ],
+                              ),
+                              // A frame that is cut off keeps the card busy,
+                              // so the next command waits for idle clocks.
+                              If(
+                                state.eq(Const(sSend, width: 3)) |
+                                    state.eq(Const(sEnd, width: 3)),
+                                then: [cmdGap < Const(cmdGapClocks, width: 4)],
+                              ),
+                              state < Const(sIdle, width: 3),
+                              cmdOe < Const(0),
+                              cmdOut < Const(1),
+                            ],
+                          ),
+                        ],
                       ),
                     ],
-                    orElse: [
-                      bus.dataOut <
-                          ctrlEnable.zeroExtend(dw) |
-                              (busWidthSel.zeroExtend(dw) <<
-                                  Const(4, width: 32)) |
-                              (sampleFall.zeroExtend(dw) <<
-                                  Const(8, width: 32)),
-                    ],
                   ),
                 ]),
-                // 0x08: STATUS ([0] card detect, [8] busy, [9] data ready).
-                // Busy includes ADMA accesses in flight, which also block
-                // a CMD write.
-                CaseItem(Const(0x01, width: 9), [
-                  bus.dataOut <
-                      cardDetect.zeroExtend(dw) |
-                          ((busy | dmaInFlight).zeroExtend(dw) <<
-                              Const(8, width: 32)) |
-                          (mux(
-                                cmdDataDir,
-                                ~rxEmpty,
-                                dataValid,
-                              ).zeroExtend(dw) <<
-                              Const(9, width: 32)),
-                ]),
+                // 0x08: STATUS is read only. Busy includes ADMA accesses in
+                // flight, which also block a CMD write.
                 // 0x10: CLK_DIV.
                 CaseItem(Const(0x02, width: 9), [
-                  If(
-                    bus.we,
-                    then: [clkDiv < bus.selMerge(clkDiv, 0x10)],
-                    orElse: [bus.dataOut < clkDiv.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [clkDiv < bus.selMerge(clkDiv, 0x10)]),
                 ]),
                 // 0x18: CMD. Writing triggers a command when not busy and the
                 // ADMA has nothing in flight. [5:0] index, [7:6] response
@@ -1885,20 +2616,30 @@ class HarborSdioController extends BridgeModule
                           cmdRespType < bus.dataIn.getRange(6, 8),
                           cmdDataPresent < bus.dataIn[8],
                           cmdDataDir < bus.dataIn[9],
+                          cmdNoCrc < bus.dataIn[12],
+                          cmdNoIdx < bus.dataIn[13],
                           wrAbort < Const(0),
+                          dmaFailed < Const(0),
                           dmaMode < bus.dataIn[10],
-                          cmdShift < cmdFrame,
+                          cmdShift < cmdContent,
+                          cmdCrc < Const(0, width: 7),
                           cmdCnt < Const(48, width: 7),
                           cmdOut < Const(1),
-                          cmdOe < Const(1),
+                          cmdOe < cmdFree,
                           busy < Const(1),
-                          state < Const(sSend, width: 2),
+                          state < Const(sSend, width: 3),
                           // Start every data phase with an empty RX FIFO, so
                           // a word left by an earlier transfer cannot shift
-                          // the new block.
+                          // the new block, and with a parked walker. A DMA
+                          // command below starts the walker again.
                           If(
                             bus.dataIn[8],
-                            then: [rxCount < Const(0, width: rxPtrW + 1)],
+                            then: [
+                              admaState < Const(aIdle, width: 3),
+                              rxCount < Const(0, width: rxPtrW + 1),
+                              rxRd < Const(0, width: rxPtrW),
+                              rxWr < Const(0, width: rxPtrW),
+                            ],
                           ),
                           // Start the ADMA at command issue, so its first
                           // memory access overlaps the command and response.
@@ -1917,8 +2658,8 @@ class HarborSdioController extends BridgeModule
                                 orElse: [
                                   descAddr < admaBase,
                                   descBytes <
-                                      (blkCount * blkSize.zeroExtend(16))
-                                          .getRange(0, 16),
+                                      (blkCount.zeroExtend(descBytesW) *
+                                          blkSize.zeroExtend(descBytesW)),
                                   descEnd < Const(1),
                                   If(
                                     bus.dataIn[9],
@@ -1931,32 +2672,34 @@ class HarborSdioController extends BridgeModule
                                   ),
                                 ],
                               ),
+                              If(
+                                admaBase.getRange(0, 2).neq(Const(0, width: 2)) |
+                                    (~bus.dataIn[11] &
+                                        (blkCount.getRange(0, 2) *
+                                                blkSize.getRange(0, 2))
+                                            .neq(Const(0, width: 2))),
+                                then: [
+                                  descAddr < admaBase,
+                                  ...alignError(
+                                    mux(
+                                      bus.dataIn[11],
+                                      Const(1, width: 2),
+                                      Const(3, width: 2),
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ],
                           ),
                         ],
                       ),
                     ],
-                    orElse: [
-                      bus.dataOut <
-                          cmdIndex.zeroExtend(dw) |
-                              (cmdRespType.zeroExtend(dw) <<
-                                  Const(6, width: 32)),
-                    ],
                   ),
                 ]),
                 // 0x20: CMD_ARG.
                 CaseItem(Const(0x04, width: 9), [
-                  If(
-                    bus.we,
-                    then: [cmdArg < bus.selMerge(cmdArg, 0x20)],
-                    orElse: [bus.dataOut < cmdArg.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [cmdArg < bus.selMerge(cmdArg, 0x20)]),
                 ]),
-                // 0x28-0x40: RESP0-3.
-                for (var i = 0; i < 4; i++)
-                  CaseItem(Const(0x05 + i, width: 9), [
-                    bus.dataOut < resp[i].zeroExtend(dw),
-                  ]),
                 // 0x48: DATA. One-word PIO buffer. CPU writes fill it (for a
                 // write transfer), reads drain it (for a read transfer).
                 CaseItem(Const(0x09, width: 9), [
@@ -1966,57 +2709,33 @@ class HarborSdioController extends BridgeModule
                       dataReg < bus.selMerge(dataReg, 0x48),
                       dataValid < Const(1),
                     ],
-                    // A card read pops the RX FIFO (see `rxPopCpu`); a card write
-                    // reads back the holding register.
-                    orElse: [
-                      bus.dataOut <
-                          mux(cmdDataDir, rxHead, dataReg).zeroExtend(dw),
-                    ],
                   ),
                 ]),
                 // 0x50: BLK_SIZE.
                 CaseItem(Const(0x0A, width: 9), [
-                  If(
-                    bus.we,
-                    then: [blkSize < bus.selMerge(blkSize, 0x50)],
-                    orElse: [bus.dataOut < blkSize.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [blkSize < bus.selMerge(blkSize, 0x50)]),
                 ]),
                 // 0x58: BLK_COUNT.
                 CaseItem(Const(0x0B, width: 9), [
-                  If(
-                    bus.we,
-                    then: [blkCount < bus.selMerge(blkCount, 0x58)],
-                    orElse: [bus.dataOut < blkCount.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [blkCount < bus.selMerge(blkCount, 0x58)]),
                 ]),
-                // 0x60: INT_STATUS (write-1-to-clear).
-                CaseItem(Const(0x0C, width: 9), [
-                  If(
-                    bus.we,
-                    then: [
-                      intStatus < (intStatus & ~bus.selMasked(0x60, 8)),
-                      admaErr <
-                          ((admaErr | dmaFault) & ~bus.selMasked(0x60, 8)[7]),
-                    ],
-                    orElse: [bus.dataOut < intView.zeroExtend(dw)],
-                  ),
-                ]),
+                // 0x60: INT_STATUS (write-1-to-clear) is cleared at the top
+                // of this block, by [intClear].
                 // 0x68: INT_ENABLE.
                 CaseItem(Const(0x0D, width: 9), [
+                  If(bus.we, then: [intEnable < bus.selMerge(intEnable, 0x68)]),
+                ]),
+                // 0x78: DATA_TIMEOUT, SD clocks a card read waits for a block
+                // start bit. 0 turns it off.
+                CaseItem(Const(0x0F, width: 9), [
                   If(
                     bus.we,
-                    then: [intEnable < bus.selMerge(intEnable, 0x68)],
-                    orElse: [bus.dataOut < intEnable.zeroExtend(dw)],
+                    then: [dataTimeout < bus.selMerge(dataTimeout, 0x78)],
                   ),
                 ]),
                 // 0x70: ADMA_ADDR (descriptor table base for DMA transfers).
                 CaseItem(Const(0x0E, width: 9), [
-                  If(
-                    bus.we,
-                    then: [admaBase < bus.selMerge(admaBase, 0x70)],
-                    orElse: [bus.dataOut < admaBase.zeroExtend(dw)],
-                  ),
+                  If(bus.we, then: [admaBase < bus.selMerge(admaBase, 0x70)]),
                 ]),
               ]),
             ],
@@ -2026,15 +2745,19 @@ class HarborSdioController extends BridgeModule
     ]);
   }
 
-  /// Bit-serial SD CRC7 (polynomial x^7 + x^3 + 1) over [data], which is
-  /// presented MSB-first. Returns the 7-bit CRC, MSB-first.
-  Logic _crc7(Logic data) {
-    var c = List<Logic>.generate(7, (_) => Const(0)); // c[0] = LSB
-    for (var i = data.width - 1; i >= 0; i--) {
-      final inv = data[i] ^ c[6];
-      c = [inv, c[0], c[1], c[2] ^ inv, c[3], c[4], c[5]];
-    }
-    return [c[6], c[5], c[4], c[3], c[2], c[1], c[0]].swizzle();
+  /// One step of the SD command CRC7 (polynomial x^7 + x^3 + 1) over [bit].
+  /// Seed with zero at the start of a frame.
+  Logic _crc7Next(Logic crc, Logic bit) {
+    final inv = bit ^ crc[6];
+    return [
+      crc[5],
+      crc[4],
+      crc[3],
+      crc[2] ^ inv,
+      crc[1],
+      crc[0],
+      inv,
+    ].concat();
   }
 
   /// One step of the SD data CRC16 (CCITT, x^16 + x^12 + x^5 + 1) over [bit].
@@ -2052,7 +2775,7 @@ class HarborSdioController extends BridgeModule
         else
           crc[i - 1],
     ];
-    return next.rswizzle(); // next[0] is the LSB
+    return next.rconcat(); // next[0] is the LSB
   }
 
   /// Whether the read path is conditioned with UHS IO primitives: a target is
@@ -2128,6 +2851,7 @@ class HarborSdioController extends BridgeModule
       if (config.maxSpeed.index >= HarborSdioSpeed.sdr104.index)
         'sd-uhs-sdr104': true,
       if (config.supportsEmmc) 'non-removable': true,
+      'harbor,busy-timeout-clocks': writeBusyTimeout,
     },
   );
 
@@ -2150,6 +2874,7 @@ class HarborSdioController extends BridgeModule
       if (config.maxSpeed.index >= HarborSdioSpeed.sdr104.index)
         'sd-uhs-sdr104': true,
       if (config.supportsEmmc) 'non-removable': true,
+      'harbor,busy-timeout-clocks': writeBusyTimeout,
     },
   );
 
@@ -2203,6 +2928,9 @@ class HarborSdioController extends BridgeModule
     ];
   }
 
+  /// The C++ source of the simulated SD card, for a host test that compiles it.
+  static const simCardHeader = _sdCardHeader;
+
   static const _sdCardHeader = r'''
 #pragma once
 // Simulated SD card for the Verilator harness. Speaks enough of the SD protocol
@@ -2230,6 +2958,7 @@ struct SdCard {
 
   int   rx_active = 0;
   int   rx_n = 0;
+  int   rx_extra = 0;
   uint8_t rx[48];
 
   int   resp_active = 0;
@@ -2305,6 +3034,11 @@ struct SdCard {
     resp[1] = 0;
     for (int i = 0; i < 6; i++) resp[2 + i] = 1;
     for (int i = 0; i < 128; i++) resp[8 + i] = reg[127 - i];
+    // The CRC7 covers register bits 127:8 and replaces bits 7:1. Bit 0 is the
+    // end bit.
+    uint8_t c = crc7(resp + 8, 120);
+    for (int i = 0; i < 7; i++) resp[128 + i] = (c >> (6 - i)) & 1;
+    resp[135] = 1;
     resp_len = 136;
   }
 
@@ -2389,8 +3123,11 @@ struct SdCard {
     int fall = prev_clk && !sclk;
     prev_clk = sclk;
 
-    if (prev_oe && !cmd_oe && rx_active && rx_n >= 40) {
+    // The host releases CMD after a frame that expects a response. With no
+    // response CMD stays driven high, so a clock past the end bit ends it.
+    if (((prev_oe && !cmd_oe) || rx_extra) && rx_active && rx_n >= 40) {
       rx_active = 0;
+      rx_extra = 0;
       decode_and_respond();
     }
     prev_oe = cmd_oe;
@@ -2398,9 +3135,11 @@ struct SdCard {
     if (rise) {
       if (cmd_oe) {
         if (!rx_active) {
-          if (cmd_out == 0) { rx_active = 1; rx_n = 0; rx[rx_n++] = 0; }
+          if (cmd_out == 0) { rx_active = 1; rx_n = 0; rx_extra = 0; rx[rx_n++] = 0; }
         } else if (rx_n < 48) {
           rx[rx_n++] = cmd_out & 1;
+        } else {
+          rx_extra = 1;
         }
       }
     }

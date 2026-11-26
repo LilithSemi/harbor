@@ -39,7 +39,7 @@ class HarborInverseDct8 extends BridgeModule {
 
     Logic roundShift(Logic x) {
       final r = (x + Const(2048, width: w)).getRange(0, w);
-      return [r[w - 1].replicate(12), r.getRange(12, w)].swizzle();
+      return [r[w - 1].replicate(12), r.getRange(12, w)].concat();
     }
 
     List<Logic> inv1d(List<Logic> inp) => [
@@ -69,6 +69,6 @@ class HarborInverseDct8 extends BridgeModule {
       }
     }
 
-    output('residual') <= out.reversed.toList().swizzle();
+    output('residual') <= out.reversed.toList().concat();
   }
 }

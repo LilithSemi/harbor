@@ -26,8 +26,11 @@ class HarborSdramPhyConfig {
   /// Fixed at synthesis: [SdramPhyEcp5.readLatency] depends on it.
   final int captureCycles;
 
-  /// Which clock edge the raw pad-level sample is taken on.
-  final HarborSdramCaptureEdge captureEdge;
+  /// Which clock edge the raw pad-level sample is taken on. Null picks the
+  /// edge from the controller clock in [HarborSdram]: rising when the
+  /// capture window allows it, else falling. A [SdramPhyEcp5] built on its
+  /// own takes rising for null.
+  final HarborSdramCaptureEdge? captureEdge;
 
   /// Extra whole sdram_clk cycles the raw pad-level sample point moves
   /// back by. Adds no extra register: the capture register already
@@ -38,12 +41,116 @@ class HarborSdramPhyConfig {
   /// `DELAYF` tap count on every dq input, or null for no delay line.
   final int? dqDelayTaps;
 
+  /// Board flight from the fpga to the sdram, in ns. The default is the
+  /// ULX3S.
+  final double fpgaToSdramNs;
+
+  /// Board flight from the sdram back to the fpga, in ns. The default is
+  /// the ULX3S.
+  final double sdramToFpgaNs;
+
+  /// Setup and hold of the fpga input register (Lattice FPGA-DS-02012
+  /// v1.9, table 3.22), in ns.
+  static const double fpgaSetupNs = 0.85;
+  static const double fpgaHoldNs = 0.98;
+
   const HarborSdramPhyConfig({
     this.captureCycles = 2,
-    this.captureEdge = HarborSdramCaptureEdge.rising,
+    this.captureEdge,
     this.captureCycleOffset = 0,
     this.dqDelayTaps,
+    this.fpgaToSdramNs = 4.6,
+    this.sdramToFpgaNs = 0.5,
   });
+
+  /// [captureEdge], or rising when it is null.
+  HarborSdramCaptureEdge get edge =>
+      captureEdge ?? HarborSdramCaptureEdge.rising;
+
+  /// Whether a read beat sampled on [edgeOverride] (default [edge]) lands
+  /// inside the chip's valid window, with the fpga setup and hold still
+  /// clear on both sides. The window is `[E - tCk + d + tAC, E + d + tOH]`
+  /// around the chip's committing edge `E`, with `d` the round trip board
+  /// flight (as4c16m16sb datasheet rev 2.0, table 16 p21, fig 20 p24).
+  /// Rising capture samples half a cycle after `E`, falling capture on `E`,
+  /// each plus [captureCycleOffset] whole cycles.
+  bool captureOk({
+    required int clockHz,
+    required HarborSdramConfig config,
+    required int casLatency,
+    HarborSdramCaptureEdge? edgeOverride,
+  }) => captureOkAt(
+    periodPs: (1e12 / clockHz).round(),
+    tAcNs: config.timing.tAcByCl[casLatency]!,
+    tOhNs: config.timing.tOh,
+    edgeOverride: edgeOverride,
+  );
+
+  /// [captureOk] for a clock period in ps and the chip's tAC and tOH in ns.
+  bool captureOkAt({
+    required int periodPs,
+    required double tAcNs,
+    required double tOhNs,
+    HarborSdramCaptureEdge? edgeOverride,
+  }) {
+    final m =
+        ((edgeOverride ?? edge) == HarborSdramCaptureEdge.rising ? 0.5 : 0.0) +
+        captureCycleOffset;
+    final samplePs = (m * periodPs).round();
+    final dPs = ((fpgaToSdramNs + sdramToFpgaNs) * 1000).round();
+    final dMinPs =
+        samplePs - (tOhNs * 1000).round() + (fpgaHoldNs * 1000).round();
+    final dMaxPs =
+        samplePs +
+        periodPs -
+        (tAcNs * 1000).round() -
+        (fpgaSetupNs * 1000).round();
+    return dPs >= dMinPs && dPs <= dMaxPs;
+  }
+
+  /// This config with its capture edge set for [clockHz]. A null
+  /// [captureEdge] becomes rising when that edge is inside the window, else
+  /// falling. Throws an [ArgumentError] naming `captureEdge` and `clockHz`
+  /// when the edge, set or picked, misses the window.
+  HarborSdramPhyConfig resolve({
+    required int clockHz,
+    required HarborSdramConfig config,
+    required int casLatency,
+  }) {
+    bool ok(HarborSdramCaptureEdge e) => captureOk(
+      clockHz: clockHz,
+      config: config,
+      casLatency: casLatency,
+      edgeOverride: e,
+    );
+    final HarborSdramCaptureEdge pick;
+    if (captureEdge != null) {
+      pick = captureEdge!;
+    } else if (ok(HarborSdramCaptureEdge.rising)) {
+      pick = HarborSdramCaptureEdge.rising;
+    } else {
+      pick = HarborSdramCaptureEdge.falling;
+    }
+    if (!ok(pick)) {
+      final both = captureEdge == null
+          ? 'neither the rising nor the falling edge fits'
+          : 'the ${pick.name} edge misses the window';
+      throw ArgumentError.value(
+        pick.name,
+        'captureEdge',
+        '$both at clockHz $clockHz with CL$casLatency and a board flight of '
+            '${fpgaToSdramNs + sdramToFpgaNs} ns',
+      );
+    }
+    return HarborSdramPhyConfig(
+      captureCycles: captureCycles,
+      captureEdge: pick,
+      captureCycleOffset: captureCycleOffset,
+      dqDelayTaps: dqDelayTaps,
+      fpgaToSdramNs: fpgaToSdramNs,
+      sdramToFpgaNs: sdramToFpgaNs,
+    );
+  }
 }
 
 /// Sdr sdram PHY for the ULX3S ECP5. Every output pin goes through one
@@ -209,16 +316,14 @@ class SdramPhyEcp5 extends SdramPhyBase {
     oBa <=
         [
           for (var i = 0; i < bankBits; i++) ofsData(ba[i], 'ba_ofs_$i'),
-        ].rswizzle();
+        ].rconcat();
     oAddr <=
         [
           for (var i = 0; i < config.rowWidth; i++)
             ofsData(addr[i], 'addr_ofs_$i'),
-        ].rswizzle();
+        ].rconcat();
     oDqm <=
-        [
-          for (var i = 0; i < dqmBits; i++) ofs(dqm[i], 'dqm_ofs_$i'),
-        ].rswizzle();
+        [for (var i = 0; i < dqmBits; i++) ofs(dqm[i], 'dqm_ofs_$i')].rconcat();
 
     oClk <= Ecp5Oddrx1f(sclk: clk, d0: Const(0), d1: Const(1), rst: Const(0)).q;
 
@@ -256,11 +361,13 @@ class SdramPhyEcp5 extends SdramPhyBase {
         ).z;
       }
 
-      final bit = _phyConfig.captureEdge == HarborSdramCaptureEdge.rising
+      // All flops of one pad share the IOLOGIC LSR. The output flops have
+      // no reset, so the capture flop has none either.
+      final bit = _phyConfig.edge == HarborSdramCaptureEdge.rising
           ? Ecp5Ifs1p3bx(d: padIn, sclk: clk, name: 'dq_in_ifs_$i').q
           : Ecp5Iddrx1f(
               sclk: clk,
-              rst: reset,
+              rst: Const(0),
               d: padIn,
               name: 'dq_in_iddr_$i',
             ).q1;
@@ -272,7 +379,7 @@ class SdramPhyEcp5 extends SdramPhyBase {
     // adds no register of its own: the capture register above already
     // free-runs every cycle, so readLatency alone (not more fabric here)
     // accounts for reading the bit it holds a cycle (or more) later.
-    var capturedBus = captured.rswizzle();
+    var capturedBus = captured.rconcat();
     for (var c = 0; c < _phyConfig.captureCycles - 1; c++) {
       capturedBus = flop(clk, capturedBus, reset: reset);
     }

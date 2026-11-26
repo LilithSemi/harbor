@@ -173,6 +173,10 @@ class HarborDualClockScanout extends Module {
   /// Pixel word for the previous cycle's [col] in the active buffer.
   Logic get pixel => output('pixel');
 
+  /// One system clock pulse for each errored read beat of a memory waist.
+  /// Always 0 on a scanout port, which has no error response.
+  Logic get fetchError => output('fetch_error');
+
   /// Latches if a line was not ready at a swap.
   Logic get underrun => output('underrun');
 
@@ -328,10 +332,18 @@ class HarborDualClockScanout extends Module {
                      'b$burstWords',
                      'i${memory.config.idWidth}',
                      'n${memory.config.outstanding}',
+                     if (memory.config.dataWidth != 32)
+                       'd${memory.config.dataWidth}',
                    ],
                  ],
                ),
        ) {
+    if (planar && memory != null && memory.config.dataWidth != 32) {
+      throw ArgumentError(
+        'a planar or overlay scanout reads a 32 bit memory waist, got '
+        '${memory.config}',
+      );
+    }
     if (!planar) {
       if (wordsPerLine == null || vActive == null || vActive < 1) {
         throw ArgumentError('a one plane build needs wordsPerLine and vActive');
@@ -450,13 +462,14 @@ class HarborDualClockScanout extends Module {
     if (port) {
       // fb_base can come from a CSR, so a scanout port forces both to whole
       // 32-bit words.
-      fbBase = [fbBase.getRange(2), Const(0, width: 2)].swizzle();
-      stride = [stride.getRange(2), Const(0, width: 2)].swizzle();
+      fbBase = [fbBase.getRange(2), Const(0, width: 2)].concat();
+      stride = [stride.getRange(2), Const(0, width: 2)].concat();
     }
     wordsPerLine = addInput('words_per_line', wordsPerLine, width: 16);
 
     addOutput('pixel', width: 32);
     addOutput('underrun');
+    addOutput('underrun_count', width: 16);
 
     final reqToggle = Logic(name: 'req_toggle'); // pixel domain
     final reqAddr = Logic(name: 'req_addr', width: 32); // pixel, quasi-static
@@ -474,6 +487,9 @@ class HarborDualClockScanout extends Module {
     final more = fetchLine.lt(vActive).named('line_left');
     final outstanding = Logic(name: 'outstanding');
     final underrunReg = Logic(name: 'underrun_reg');
+    // One pulse for each late or skipped line, and their count.
+    final underrunPulse = Logic(name: 'underrun_pulse');
+    final underrunCount = Logic(name: 'underrun_count_r', width: 16);
     // Line 0 waits for the line in flight at the frame start.
     final wait0 = Logic(name: 'wait0');
     final dSync0 = Logic(name: 'd_sync0');
@@ -496,6 +512,7 @@ class HarborDualClockScanout extends Module {
     final Logic wrSel;
     final Logic wrIdx;
     final Logic wrData;
+    final fetchErr = Logic(name: 'fetch_err');
     if (port) {
       final f = HarborScanoutFetcher(
         clk: sysClk,
@@ -519,6 +536,7 @@ class HarborDualClockScanout extends Module {
         f.wrIdx,
         f.wrData,
       );
+      fetchErr <= Const(0);
     } else {
       final mWaist = memory!.clone()
         ..pairConnectIO(
@@ -545,7 +563,9 @@ class HarborDualClockScanout extends Module {
         f.wrIdx,
         f.wrData,
       );
+      fetchErr <= f.err;
     }
+    addOutput('fetch_error') <= fetchErr;
     final buffer = HarborDoubleLineBuffer(
       wrClk: sysClk,
       wrEn: wrEn,
@@ -562,6 +582,7 @@ class HarborDualClockScanout extends Module {
 
     pixel <= buffer.rdData;
     underrun <= underrunReg;
+    output('underrun_count') <= underrunCount;
 
     // Issue a request: toggle req, latch payload, advance the line pointer.
     final fetchNext = (fetchAddr + stride).named('fetch_next');
@@ -585,6 +606,11 @@ class HarborDualClockScanout extends Module {
 
     // Pixel-domain sequential.
     Sequential(pixelClk, reset: pixelReset, [
+      underrunPulse < Const(0),
+      If(
+        underrunPulse & underrunCount.neq(Const(0xffff, width: 16)),
+        then: [underrunCount < underrunCount + 1],
+      ),
       dSync0 < doneToggle,
       dSync1 < dSync0,
       dPrev < dSync1,
@@ -618,10 +644,12 @@ class HarborDualClockScanout extends Module {
                 Iff(lineStart, [
                   readSel < ~readSel,
                   underrunReg < Const(1),
+                  underrunPulse < Const(1),
                   ...skip(),
                 ]),
                 ElseIf(firstLine & (wait0 | busy), [
                   underrunReg < Const(1),
+                  underrunPulse < Const(1),
                   If(wait0, then: [wait0 < Const(0), ...skip()]),
                 ]),
                 ElseIf(~outstanding & more, [
@@ -638,7 +666,10 @@ class HarborDualClockScanout extends Module {
               If.block([
                 Iff(lineStart, [
                   readSel < ~readSel,
-                  If(busy, then: [underrunReg < Const(1)]),
+                  If(
+                    busy,
+                    then: [underrunReg < Const(1), underrunPulse < Const(1)],
+                  ),
                   phase < Const(1, width: 2),
                 ]),
                 ElseIf(doneEdge, [phase < Const(3, width: 2)]),
@@ -651,7 +682,11 @@ class HarborDualClockScanout extends Module {
                   readSel < ~readSel,
                   If(
                     busy,
-                    then: [underrunReg < Const(1), phase < Const(1, width: 2)],
+                    then: [
+                      underrunReg < Const(1),
+                      underrunPulse < Const(1),
+                      phase < Const(1, width: 2),
+                    ],
                     orElse: [If(more, then: issue(fetchAddr, readSel))],
                   ),
                 ],
@@ -819,7 +854,7 @@ class HarborDualClockScanout extends Module {
     }
 
     Logic word32(Logic v) =>
-        port ? [v.getRange(2), Const(0, width: 2)].swizzle() : v;
+        port ? [v.getRange(2), Const(0, width: 2)].concat() : v;
     final base = [
       word32(addInput('fb_base', fbBase, width: 32)),
       for (var k = 1; k < planes; k++)
@@ -983,7 +1018,7 @@ class HarborDualClockScanout extends Module {
       return [
         If(
           go.reduce((a, b) => a | b),
-          then: [reqToggle < ~reqToggle, reqMask < go.rswizzle()],
+          then: [reqToggle < ~reqToggle, reqMask < go.rconcat()],
         ),
         for (var k = 0; k < all; k++)
           if (lines[k] case (final f, final addr, final fill, final step))
@@ -1167,7 +1202,7 @@ class HarborDualClockScanout extends Module {
         phase <
             (early == null
                 ? Const(3, width: 2)
-                : mux(early, Const(2, width: 2), Const(3, width: 2))),
+                : mux<Logic>(early, Const(2, width: 2), Const(3, width: 2))),
       ];
     }
 
@@ -1220,7 +1255,7 @@ class HarborDualClockScanout extends Module {
         phase <
             (stay == null
                 ? Const(3, width: 2)
-                : mux(stay, Const(2, width: 2), Const(3, width: 2))),
+                : mux<Logic>(stay, Const(2, width: 2), Const(3, width: 2))),
       ];
     }
 
@@ -1376,7 +1411,7 @@ class HarborDualClockScanout extends Module {
             ~lineStart & ~firstLine & ~busy & release.reduce((a, b) => a | b),
             then: [
               reqToggle < ~reqToggle,
-              reqMask < release.rswizzle(),
+              reqMask < release.rconcat(),
               for (var k = 0; k < all; k++)
                 If(
                   release[k],
@@ -1423,6 +1458,7 @@ class HarborDualClockScanout extends Module {
     final Logic wrSel;
     final Logic wrIdx;
     final Logic wrData;
+    final fetchErr = Logic(name: 'fetch_err');
     if (port) {
       final f = HarborScanoutFetcher(
         clk: sysClk,
@@ -1446,6 +1482,7 @@ class HarborDualClockScanout extends Module {
         f.wrIdx,
         f.wrData,
       );
+      fetchErr <= Const(0);
     } else {
       final mWaist = memory!.clone()
         ..pairConnectIO(
@@ -1472,8 +1509,10 @@ class HarborDualClockScanout extends Module {
         f.wrIdx,
         f.wrData,
       );
+      fetchErr <= f.err;
     }
 
+    addOutput('fetch_error') <= fetchErr;
     final rd = <Logic>[];
     for (var k = 0; k < all; k++) {
       final o = k >= planes;
@@ -1501,7 +1540,7 @@ class HarborDualClockScanout extends Module {
     for (var k = 1; k < planes; k++) {
       output('plane_data_$k') <= rd[k];
     }
-    planeUnderrun <= underrunReg.sublist(0, planes).rswizzle();
+    planeUnderrun <= underrunReg.sublist(0, planes).rconcat();
     underrun <= underrunReg.reduce((a, b) => a | b);
     if (fmt != null) addOutput('format', width: selW) <= fmt;
     for (var k = 0; k < planes; k++) {
@@ -1513,7 +1552,7 @@ class HarborDualClockScanout extends Module {
         addOutput('overlay_underrun_count_$j', width: 16) <= uCount[planes + j];
       }
       addOutput('overlay_underrun', width: ovPlanes) <=
-          underrunReg.sublist(planes).rswizzle();
+          underrunReg.sublist(planes).rconcat();
       addOutput('overlay_on') <= ov.on;
       if (ov.format != null) {
         addOutput('overlay_frame_format', width: ov.format!.width) <=
@@ -1672,7 +1711,7 @@ class HarborDualClockScanout extends Module {
 
     Logic flag(Logic? sel, bool Function(HarborPixelFormat) f) =>
         pick(sel, (g) => Const(f(g) ? 1 : 0));
-    Logic clear0(Logic v, Logic c) => [v.getRange(1), v[0] & ~c].swizzle();
+    Logic clear0(Logic v, Logic c) => [v.getRange(1), v[0] & ~c].concat();
 
     final fmt = selIn == null ? null : Logic(name: 'ov_format', width: selW);
     final on = Logic(name: 'ov_on');
@@ -1726,7 +1765,7 @@ class HarborDualClockScanout extends Module {
         pixelClk,
         srcXe +
             wVis.zeroExtend(ew) -
-            mux(ahead, Const(0, width: ew), Const(1, width: ew)),
+            mux<Logic>(ahead, Const(0, width: ew), Const(1, width: ew)),
         reset: pixelReset,
       ).named('ov${j}_last_pixel');
       final count = pick(fmt, (f) {
@@ -1744,7 +1783,7 @@ class HarborDualClockScanout extends Module {
         pick(fmt, (f) {
           if (j >= f.planes.length) return Const(0, width: 32);
           final sh = HarborScanoutOverlay.wordShift(f, j);
-          return [(srcXe >>> sh).zeroExtend(30), Const(0, width: 2)].swizzle();
+          return [(srcXe >>> sh).zeroExtend(30), Const(0, width: 2)].concat();
         }).named('ov${j}_start_byte'),
       );
     }

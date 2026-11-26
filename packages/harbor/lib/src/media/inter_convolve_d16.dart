@@ -178,7 +178,7 @@ class HarborInterConvolveD16 extends BridgeModule {
       if (n == 0) {
         return x;
       }
-      return [x[w - 1].replicate(n), x.getRange(n, w)].swizzle();
+      return [x[w - 1].replicate(n), x.getRange(n, w)].concat();
     }
 
     // Add a constant (possibly negative) bias, low w bits.
@@ -289,6 +289,6 @@ class HarborInterConvolveD16 extends BridgeModule {
       }
     }
     // Pack index y*width + x LSB-first, 16 bits each.
-    output('conv') <= outParts.reversed.toList().swizzle();
+    output('conv') <= outParts.reversed.toList().concat();
   }
 }

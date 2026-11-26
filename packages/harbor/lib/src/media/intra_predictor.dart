@@ -85,7 +85,7 @@ class HarborIntraPredictor extends BridgeModule {
     }
 
     // SMOOTH weights, selected by block size, as 16-bit values.
-    Logic smWeight(int i) => mux(
+    Logic smWeight(int i) => mux<Logic>(
       size8,
       Const(_smWeights8[i], width: 16),
       Const(i < 4 ? _smWeights4[i] : 0, width: 16),
@@ -98,9 +98,8 @@ class HarborIntraPredictor extends BridgeModule {
 
     // reconstruct = clamp(pred + residual, 0, maxVal).
     Logic recon(Logic pred, Logic resi) {
-      final sum =
-          (pred.zeroExtend(18) + [resi[15].replicate(2), resi].swizzle())
-              .getRange(0, 18);
+      final sum = (pred.zeroExtend(18) + [resi[15].replicate(2), resi].concat())
+          .getRange(0, 18);
       final neg = sum[17];
       final tooBig = ~neg & sum.gt(Const(maxVal, width: 18));
       return mux(
@@ -174,6 +173,6 @@ class HarborIntraPredictor extends BridgeModule {
         outs[r * 8 + c] = recon(pred, res[r * 8 + c]);
       }
     }
-    output('recon') <= [for (var i = 63; i >= 0; i--) outs[i]].swizzle();
+    output('recon') <= [for (var i = 63; i >= 0; i--) outs[i]].concat();
   }
 }

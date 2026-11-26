@@ -397,7 +397,7 @@ class EthMacBench {
       outstanding: 8,
     );
     final top = EthMacTop(mac, memConfig);
-    final clk = SimpleClockGenerator(sysPeriod).clk;
+    final clk = SimpleClockGenerator(sysPeriod + (sysPeriod & 1)).clk;
     final reset = Logic(name: 'reset');
     top.input('clk').srcConnection! <= clk;
     top.input('reset').srcConnection! <= reset;

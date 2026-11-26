@@ -21,6 +21,16 @@ import 'pcie_stream.dart';
 ///   block waits for each write response before it continues. A write that
 ///   gets a fabric error, a poisoned write and a write longer than
 ///   [maxPayloadBytes] are dropped and counted in `write_errors`.
+/// - Each wait for the memory has a limit of [timeoutCycles] cycles with no
+///   progress. On a timeout a write is dropped and counted in `write_errors`
+///   and `timeout_errors`. Bursts of the write that were already sent stay
+///   in the memory, so the write can be partial. A read gets one completion
+///   with status CA for the rest of the request and is counted in
+///   `timeout_errors`. The block sends the write data that the memory still
+///   expects with no byte strobes, and it reads and discards late responses.
+///   While it does this, `wedged` is high and new BAR requests are
+///   answered at once: writes are dropped and counted in `write_errors`, and
+///   reads get a completion with status CA.
 /// - A memory read is answered by completions. The first ends at the read
 ///   completion boundary, the next ones have the maximum payload size, and
 ///   the last ends at the end of the request. The block reads one
@@ -60,8 +70,18 @@ class HarborPcieMemoryCompleter extends BridgeModule {
   /// The memory master port.
   late final HarborMemoryMasterPort memory;
 
+  /// Cycles without progress that a wait for the memory can last. A value of
+  /// 8192 is 131 us at 62.5 MHz and 65 us at 125 MHz.
+  final int timeoutCycles;
+
   /// Count of dropped writes. It stops at 0xffff.
   Logic get writeErrors => output('write_errors');
+
+  /// Count of timeouts. It stops at 0xffff.
+  Logic get timeoutErrors => output('timeout_errors');
+
+  /// High while the block clears a request that the memory did not answer.
+  Logic get memoryWedged => output('wedged');
 
   HarborPcieMemoryCompleter({
     required Logic clk,
@@ -79,6 +99,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     this.memoryOffset = 0,
     int? barHitBit,
     this.maxPayloadBytes = 256,
+    this.timeoutCycles = 8192,
     String? name,
   }) : width = rx.width,
        barBytes = _barSize(endpointConfig, barBytes),
@@ -88,7 +109,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
          '_${fabricKind.name}'
          '_S${_barSize(endpointConfig, barBytes).toRadixString(16)}'
          '_O${memoryOffset.toRadixString(16)}'
-         '_B${_hitBit(endpointConfig, barHitBit)}_P$maxPayloadBytes',
+         '_B${_hitBit(endpointConfig, barHitBit)}_P${maxPayloadBytes}_T$timeoutCycles',
          name: name ?? 'pcie_memory_completer',
        ) {
     _validate(tx);
@@ -199,6 +220,9 @@ class HarborPcieMemoryCompleter extends BridgeModule {
         BigInt.one << addressWidth) {
       throw ArgumentError('the BAR does not fit in $addressWidth bits');
     }
+    if (timeoutCycles < 16) {
+      throw ArgumentError.value(timeoutCycles, 'timeoutCycles', 'at least 16');
+    }
     if (barHitBit < 2 || barHitBit > 8) {
       throw RangeError.range(barHitBit, 2, 8, 'barHitBit');
     }
@@ -289,6 +313,15 @@ class HarborPcieMemoryCompleter extends BridgeModule {
 
     final errCount = Logic(name: 'err_count', width: 16);
     addOutput('write_errors', width: 16) <= errCount;
+    final tmoCount = Logic(name: 'tmo_count', width: 16);
+    addOutput('timeout_errors', width: 16) <= tmoCount;
+    // Abandoned bursts whose responses have not come. Responses of one
+    // ID are in order, so the oldest responses belong to these.
+    // A timeout drains the bus before new work starts, so each count is 0 or 1.
+    final orphanB = Logic(name: 'orphan_b');
+    final orphanR = Logic(name: 'orphan_r');
+    final owed = Logic(name: 'owed', width: 9);
+    final tmoWait = Logic(name: 'tmo_wait', width: _log2(timeoutCycles) + 1);
 
     Logic laneOf(Logic addr) => dpb == 1
         ? Const(0, width: 2)
@@ -331,7 +364,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
         mux(
           be[2],
           Const(2, width: 2),
-          mux(be[3], Const(3, width: 2), Const(0, width: 2)),
+          mux<Logic>(be[3], Const(3, width: 2), Const(0, width: 2)),
         ),
       ),
     );
@@ -346,7 +379,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
         mux(
           tailBe[1],
           Const(2, width: 2),
-          mux(tailBe[0], Const(3, width: 2), Const(0, width: 2)),
+          mux<Logic>(tailBe[0], Const(3, width: 2), Const(0, width: 2)),
         ),
       ),
     );
@@ -361,7 +394,11 @@ class HarborPcieMemoryCompleter extends BridgeModule {
     final aDw = hBarOff.slice(11, 2).zeroExtend(12);
 
     // Completion split.
-    final rcbDw = mux(rcb128, Const(32, width: 12), Const(16, width: 12));
+    final rcbDw = mux<Logic>(
+      rcb128,
+      Const(32, width: 12),
+      Const(16, width: 12),
+    );
     final mpsCode = mux(
       maxPayload.gt(Const(maxCode, width: 3)),
       Const(maxCode, width: 3),
@@ -422,46 +459,66 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       );
       strobes.add(mux(inRange, be, Const(0, width: 4)));
     }
-    mem.wdataValid <= inState(sWdata);
+    final drainW = owed.neq(0);
+    mem.wdataValid <= inState(sWdata) | drainW;
     // Bytes with no strobe are driven 0.
-    final strb = strobes.rswizzle();
-    final raw = [for (var l = dpb - 1; l >= 0; l--) window[l]].swizzle();
+    final strb = strobes.rconcat();
+    final raw = [for (var l = dpb - 1; l >= 0; l--) window[l]].concat();
+    final liveData = [
+      for (var b = beatBytes - 1; b >= 0; b--)
+        mux(strb[b], raw.slice(8 * b + 7, 8 * b), Const(0, width: 8)),
+    ].concat();
+    // The beat offered at a timeout stays unchanged until the bus takes it.
+    final heldData = Logic(name: 'held_data', width: 8 * beatBytes);
+    final heldStrb = Logic(name: 'held_strb', width: beatBytes);
+    final heldBeat = Logic(name: 'held_beat');
     mem.wdataData <=
-        [
-          for (var b = beatBytes - 1; b >= 0; b--)
-            mux(strb[b], raw.slice(8 * b + 7, 8 * b), Const(0, width: 8)),
-        ].swizzle();
-    mem.wdataStrb <= strb;
-    mem.wdataLast <= burstLeft.eq(1);
-    final wFire = mem.wdataValid & mem.wdataReady;
-    mem.wrespReady <= inState(sWresp);
-    final bFire = mem.wrespValid & mem.wrespReady;
-    mem.rdataReady <= inState(sRdata);
-    final rFire = mem.rdataValid & mem.rdataReady;
+        mux(
+          drainW,
+          mux(heldBeat, heldData, Const(0, width: 8 * beatBytes)),
+          liveData,
+        );
+    mem.wdataStrb <=
+        mux(drainW, mux(heldBeat, heldStrb, Const(0, width: beatBytes)), strb);
+    mem.wdataLast <= mux(drainW, owed.eq(1), burstLeft.eq(1));
+    final wFire = mem.wdataValid & mem.wdataReady & ~drainW;
+    final owedFire = mem.wdataValid & mem.wdataReady & drainW;
+    final drainB = orphanB.neq(0);
+    final drainR = orphanR.neq(0);
+    mem.wrespReady <= inState(sWresp) | drainB;
+    mem.rdataReady <= inState(sRdata) | drainR;
+    final bFire = mem.wrespValid & inState(sWresp) & ~drainB;
+    final rFire = mem.rdataValid & inState(sRdata) & ~drainR;
+    final waiting =
+        inState(sReq) | inState(sWdata) | inState(sWresp) | inState(sRdata);
+    final progress = reqFire | wFire | bFire | rFire;
+    final dead = drainB | drainR | drainW;
+    addOutput('wedged') <= dead;
+    final timeout = waiting & ~progress & tmoWait.eq(timeoutCycles - 1);
 
     // TX side.
     final cplData = cplStatus.eq(0);
     final dw0 = [
-      mux(cplData, Const(0x4a, width: 8), Const(0x0a, width: 8)),
+      mux<Logic>(cplData, Const(0x4a, width: 8), Const(0x0a, width: 8)),
       Const(0, width: 1),
       hTc,
       Const(0, width: 6),
       hAttr,
       Const(0, width: 2),
       mux(cplData, cDw.slice(9, 0), Const(0, width: 10)),
-    ].swizzle();
+    ].concat();
     final dw1 = [
       completerId,
       cplStatus,
       Const(0, width: 1),
       rdRemaining.slice(11, 0),
-    ].swizzle();
+    ].concat();
     final dw2 = [
       hReqId,
       hTag,
       Const(0, width: 1),
       rdStart.slice(6, 0),
-    ].swizzle();
+    ].concat();
     // The packet length in DWs is a register, loaded when the engine goes
     // to the TX state.
     final totalDw = Logic(name: 'tx_total', width: 12);
@@ -479,8 +536,8 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       txKeep.add(live.replicate(4));
     }
     final txLast = (txT + n).gte(totalDw);
-    txs.data <= txLanes.rswizzle();
-    txs.keep <= txKeep.rswizzle();
+    txs.data <= txLanes.rconcat();
+    txs.keep <= txKeep.rconcat();
     txs.last <= txLast;
     // With more than 3 lanes the first beat has payload. The buffer can
     // write that payload in the last cycle before the TX state, so the
@@ -520,7 +577,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       wrCount: mux(
         inRdata,
         Const(dpb, width: 3),
-        mux(hdrWrite, Const(1, width: 3), Const(n, width: 3)),
+        mux<Logic>(hdrWrite, Const(1, width: 3), Const(n, width: 3)),
       ),
       wrLanes: [
         for (var k = 0; k < banks; k++)
@@ -562,10 +619,34 @@ class HarborPcieMemoryCompleter extends BridgeModule {
       ];
     }
 
+    List<Conditional> orphanUpdate(Logic count, Logic add, Logic drained) => [
+      If(
+        add & ~drained,
+        then: [count < 1],
+        orElse: [
+          If(drained & ~add, then: [count < 0]),
+        ],
+      ),
+    ];
+
+    List<Conditional> readAbort() => [
+      cplStatus < statusCa,
+      txT < 0,
+      totalDw < 3,
+      txBase < lane0.zeroExtend(idxW) - 3,
+      state < sTx,
+    ];
+
     Sequential(clk, [
       If(
         reset,
         then: [
+          orphanB < 0,
+          orphanR < 0,
+          owed < 0,
+          heldBeat < 0,
+          tmoWait < 0,
+          tmoCount < 0,
           state < sRx,
           pastHeader < 0,
           rxBase < 0,
@@ -576,6 +657,42 @@ class HarborPcieMemoryCompleter extends BridgeModule {
           totalDw < 3,
         ],
         orElse: [
+          If(
+            ~waiting | progress,
+            then: [tmoWait < 0],
+            orElse: [tmoWait < tmoWait + 1],
+          ),
+          ...orphanUpdate(
+            orphanB,
+            timeout & (inState(sWresp) | inState(sWdata)),
+            mem.wrespValid & mem.wrespReady & drainB,
+          ),
+          If(
+            timeout & inState(sWdata),
+            then: [
+              owed < burstLeft,
+              heldBeat < 1,
+              heldData < liveData,
+              heldStrb < strb,
+            ],
+            orElse: [
+              If(owedFire, then: [owed < owed - 1, heldBeat < 0]),
+            ],
+          ),
+          ...orphanUpdate(
+            orphanR,
+            timeout & inState(sRdata),
+            mem.rdataValid & mem.rdataReady & drainR & mem.rdataLast,
+          ),
+          If(
+            timeout,
+            then: [
+              tmoWait < 0,
+              If(~tmoCount.and(), then: [tmoCount < tmoCount + 1]),
+              If(opWrite, then: [...countError(), state < sRx]),
+              If(~opWrite, then: [...readAbort()]),
+            ],
+          ),
           Case(state, [
             CaseItem(Const(sRx, width: 3), [
               If(
@@ -599,7 +716,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                   hBarOff < addrComb.slice(barBits - 1, 0),
                   rxBase <
                       lane0Comb.zeroExtend(idxW) +
-                          mux(
+                          mux<Logic>(
                             tlpIs4Dw(header),
                             Const(0, width: idxW),
                             Const(1, width: idxW),
@@ -617,7 +734,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
               If.block([
                 Iff(hHit & isMWr, [
                   If(
-                    hPoison | tooLong,
+                    hPoison | tooLong | dead,
                     then: [...countError(), state < sRx],
                     orElse: [
                       ...startOp(fabStart, hLenDw),
@@ -634,7 +751,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                   rdStart < begin,
                   rdFab < fabStart,
                   opWrite < 0,
-                  state < sChunk,
+                  If(dead, then: [...readAbort()], orElse: [state < sChunk]),
                 ]),
                 ElseIf(nonPosted, [
                   cplStatus < statusUr,
@@ -662,7 +779,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                   beatsLeft < beatsLeft - burst.slice(11, 0),
                   curAddr < curAddr + (burst.zeroExtend(aw) << sizeLog),
                   state <
-                      mux(
+                      mux<Logic>(
                         opWrite,
                         Const(sWdata, width: 3),
                         Const(sRdata, width: 3),
@@ -705,7 +822,7 @@ class HarborPcieMemoryCompleter extends BridgeModule {
                         beatsLeft.eq(0) | fabErr | mem.rdataErr,
                         then: [
                           cplStatus <
-                              mux(
+                              mux<Logic>(
                                 fabErr | mem.rdataErr,
                                 Const(statusCa, width: 3),
                                 Const(0, width: 3),

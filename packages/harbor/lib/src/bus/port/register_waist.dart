@@ -63,5 +63,5 @@ Logic harborWordAddress(Logic addr, int dataWidth) {
   final lowBits = (dataWidth ~/ 8).bitLength - 1;
   if (lowBits == 0) return addr;
   if (lowBits >= addr.width) return Const(0, width: addr.width);
-  return [addr.getRange(lowBits), Const(0, width: lowBits)].swizzle();
+  return [addr.getRange(lowBits), Const(0, width: lowBits)].concat();
 }

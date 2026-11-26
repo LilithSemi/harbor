@@ -122,6 +122,7 @@ class HarborMemorySlavePort {
     }
     final waist = HarborMemoryWaist(config);
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
+      harborMarkCrossed(module, name, fabricClock.clk);
       final inner = create(
         module: module,
         name: name,
@@ -277,6 +278,20 @@ class HarborMemoryMasterPort {
   /// the waist in front of it. [fabricClock] and [cdcDepth] work as for
   /// [HarborMemorySlavePort.create]. AXI4 gives a full AXI4 manager, TileLink a
   /// TL-UH master and Wishbone a master with registered feedback bursts.
+  ///
+  /// [recoverTimeout] is the wait limit of the crossing after a device reset
+  /// (see [HarborMemoryWaistCdc.recoverTimeout]). With a crossing, the native
+  /// port has one more ID bit than [config] says.
+  ///
+  /// [busAddressWidth] makes the AXI4 address wider than the waist address
+  /// in [config]. The bus address is the waist address with zeros above it.
+  /// Only AXI4 takes a [busAddressWidth] other than the waist width.
+  ///
+  /// With [readOnly], the device sends reads only. The write request, write
+  /// data and write response paths are not built. The write side of the
+  /// native port stays idle and the device must not send a write request.
+  /// A simulation stops when it does. Without a clock crossing, WDATA_READY
+  /// and WRESP_VALID also stay 0.
   static HarborMemoryMasterPort create({
     required BridgeModule module,
     required String name,
@@ -286,16 +301,55 @@ class HarborMemoryMasterPort {
     required Logic reset,
     HarborFabricClock? fabricClock,
     int? cdcDepth,
+    int recoverTimeout = HarborMemoryWaistCdc.defaultRecoverTimeout,
+    int? busAddressWidth,
+    bool readOnly = false,
   }) {
+    if (busAddressWidth != null &&
+        busAddressWidth != config.addressWidth &&
+        (kind != HarborFabricKind.axi4 ||
+            busAddressWidth < config.addressWidth)) {
+      throw ArgumentError.value(
+        busAddressWidth,
+        'busAddressWidth',
+        'must be the waist width, or wider on AXI4',
+      );
+    }
     final waist = HarborMemoryWaist(config);
+    if (readOnly) {
+      clk.glitch.listen((args) {
+        if (LogicValue.isPosedge(
+              args.previousValue,
+              args.newValue,
+              ignoreInvalid: true,
+            ) &&
+            reset.value == LogicValue.zero &&
+            waist.reqValid.value == LogicValue.one &&
+            waist.reqWrite.value == LogicValue.one) {
+          Simulator.throwException(
+            Exception('memory master port: write request on a read only port'),
+            StackTrace.current,
+          );
+        }
+      });
+    }
     if (fabricClock != null && fabricClock.crossesFrom(clk)) {
+      harborMarkCrossed(module, name, fabricClock.clk);
+      // The native port has one more ID bit, for the epoch of the crossing.
       final inner = create(
         module: module,
         name: name,
         kind: kind,
-        config: config,
+        config: HarborMemoryWaistConfig(
+          addressWidth: config.addressWidth,
+          dataWidth: config.dataWidth,
+          idWidth: config.idWidth + 1,
+          outstanding: config.outstanding,
+        ),
         clk: fabricClock.clk,
         reset: fabricClock.reset,
+        busAddressWidth: busAddressWidth,
+        readOnly: readOnly,
       );
       final cdc = HarborMemoryWaistCdc(
         fabricClk: fabricClock.clk,
@@ -306,6 +360,7 @@ class HarborMemoryMasterPort {
         device: waist,
         slave: false,
         depth: cdcDepth,
+        recoverTimeout: recoverTimeout,
         name: '${name}_cdc',
       );
       return HarborMemoryMasterPort._(
@@ -320,7 +375,7 @@ class HarborMemoryMasterPort {
     switch (kind) {
       case HarborFabricKind.axi4:
         final ref = module.addInterface(
-          _axi4(config),
+          _axi4(config, addressWidth: busAddressWidth),
           name: name,
           role: PairRole.provider,
         );
@@ -330,6 +385,7 @@ class HarborMemoryMasterPort {
           waist: waist,
           axi: ref.internalInterface!,
           name: '${name}_axi4',
+          readOnly: readOnly,
         );
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);
       case HarborFabricKind.wishbone:
@@ -344,6 +400,7 @@ class HarborMemoryMasterPort {
           waist: waist,
           wb: ref.internalInterface!,
           name: '${name}_wishbone',
+          readOnly: readOnly,
         );
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);
       case HarborFabricKind.tilelink:
@@ -358,6 +415,7 @@ class HarborMemoryMasterPort {
           waist: waist,
           tl: ref.internalInterface!,
           name: '${name}_tilelink',
+          readOnly: readOnly,
         );
         return HarborMemoryMasterPort._(waist, kind, ref, reset, 0);
     }
@@ -366,7 +424,7 @@ class HarborMemoryMasterPort {
 
 /// Adds the debug outputs of [cdc] to [module] as plain outputs:
 /// `<prefix>_reads`, `<prefix>_writes`, `<prefix>_recover`, `<prefix>_empty`,
-/// `<prefix>_full` and `<prefix>_dropped`. See [HarborMemoryWaistCdc] for the
+/// `<prefix>_full`, `<prefix>_dropped`, `<prefix>_recover_timeouts` and `<prefix>_giveup_held`. See [HarborMemoryWaistCdc] for the
 /// fields. Without a crossing, the outputs are 0.
 void harborAddCdcDebug(
   BridgeModule module,
@@ -385,10 +443,14 @@ void harborAddCdcDebug(
   module.addOutput('${prefix}_full', width: 4) <= or0(cdc?.debugFull, 4);
   module.addOutput('${prefix}_dropped', width: 16) <=
       or0(cdc?.debugDropped, 16);
+  module.addOutput('${prefix}_recover_timeouts', width: 8) <=
+      or0(cdc?.debugRecoverTimeouts, 8);
+  module.addOutput('${prefix}_giveup_held') <= or0(cdc?.debugGiveupHeld, 1);
 }
 
-Axi4Interface _axi4(HarborMemoryWaistConfig config) => Axi4Interface(
-  addressWidth: config.addressWidth,
-  dataWidth: config.dataWidth,
-  idWidth: config.idWidth,
-);
+Axi4Interface _axi4(HarborMemoryWaistConfig config, {int? addressWidth}) =>
+    Axi4Interface(
+      addressWidth: addressWidth ?? config.addressWidth,
+      dataWidth: config.dataWidth,
+      idWidth: config.idWidth,
+    );

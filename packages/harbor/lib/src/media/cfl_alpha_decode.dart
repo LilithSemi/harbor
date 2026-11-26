@@ -216,14 +216,14 @@ class HarborCflAlphaDecode extends BridgeModule {
           byteAt(cursor),
           byteAt((cursor + Const(1, width: cursor.width))),
           byteAt((cursor + Const(2, width: cursor.width))),
-        ].swizzle();
+        ].concat();
     final sym = ec.output('symbol');
     final bytePop = ec.output('byte_pop');
 
     Logic packCdf(List<int> icdf) => [
       for (var s = _maxSyms - 1; s >= 0; s--)
         Const(s < icdf.length ? icdf[s] : 0, width: 16),
-    ].swizzle();
+    ].concat();
 
     // Mux the 6 default alpha CDF rows by a runtime row index (0..5).
     Logic selAlphaCdf(Logic row) {
@@ -431,6 +431,10 @@ Logic _divBy3(Logic v) {
   return mux(
     v.gte(Const(6, width: w)),
     Const(2, width: w),
-    mux(v.gte(Const(3, width: w)), Const(1, width: w), Const(0, width: w)),
+    mux<Logic>(
+      v.gte(Const(3, width: w)),
+      Const(1, width: w),
+      Const(0, width: w),
+    ),
   ).getRange(0, w);
 }

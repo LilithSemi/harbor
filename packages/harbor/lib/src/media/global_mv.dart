@@ -54,7 +54,7 @@ class HarborGlobalMv extends BridgeModule {
     Logic neg(Logic a) => sub(sc(0), a);
     Logic sgn(Logic a) => a[_w - 1];
     Logic asrC(Logic x, int n) =>
-        n <= 0 ? x : [x[_w - 1].replicate(n), x.getRange(n, _w)].swizzle();
+        n <= 0 ? x : [x[_w - 1].replicate(n), x.getRange(n, _w)].concat();
     Logic absS(Logic a) => mux(sgn(a), neg(a), a);
 
     // ROUND_POWER_OF_TWO_SIGNED with a CONSTANT shift n (matches SW roundSigned:
@@ -82,7 +82,7 @@ class HarborGlobalMv extends BridgeModule {
       final av = absS(v);
       final low = av.getRange(0, 3); // av & 7
       // magnitude with low 3 bits cleared: (av>>3)<<3.
-      final cleared = [av.getRange(3, _w), Const(0, width: 3)].swizzle();
+      final cleared = [av.getRange(3, _w), Const(0, width: 3)].concat();
       final add8 = low.gt(Const(4, width: 3)); // low > 4 -> round up
       final m = mux(add8, add(cleared, sc(8)), cleared);
       return mux(neg0, neg(m), m);

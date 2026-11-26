@@ -138,7 +138,7 @@ class HarborKeyframeDecode2Sb16VertSeq extends BridgeModule {
     final sb0Bottom = [
       for (var c = f - 1; c >= 0; c--)
         frame0.getRange(((f - 1) * f + c) * 8, ((f - 1) * f + c) * 8 + 8),
-    ].swizzle();
+    ].concat();
 
     // SB1 sits 4 MI (one 16x16) below the tile top.
     final recon1 = mkRecon(cap1, recon1Start, 4, sb0Bottom, 'recon1');

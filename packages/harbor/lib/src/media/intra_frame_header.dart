@@ -79,7 +79,7 @@ class HarborIntraFrameHeader extends BridgeModule {
     final bytesIn = input('bytes');
     final gStream = [
       for (var i = 0; i < bufBytes; i++) bytesIn.getRange(i * 8, i * 8 + 8),
-    ].swizzle();
+    ].concat();
 
     Logic viewAt(Logic b) {
       final shifted = (gStream << b.zeroExtend(totalBits)).getRange(
@@ -88,7 +88,7 @@ class HarborIntraFrameHeader extends BridgeModule {
       );
       return [
         for (var i = 0; i < 16; i++) shifted.getRange(i * 8, i * 8 + 8),
-      ].swizzle();
+      ].concat();
     }
 
     final numPlanes = input('num_planes');

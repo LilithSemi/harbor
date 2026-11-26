@@ -41,7 +41,7 @@ class _Bench {
       sign: pick(unpack.sign, sign),
       exponent: pick(unpack.exponent, exponent.getRange(0, ew)),
       significand: pick(
-        [unpack.significand, Const(0, width: 2)].swizzle(),
+        [unpack.significand, Const(0, width: 2)].concat(),
         significand.getRange(0, sigW),
       ),
       sticky: pick(Const(0), sticky),

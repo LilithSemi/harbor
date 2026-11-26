@@ -522,6 +522,7 @@ void main() {
       driveM('stb', 0);
       await clk.nextNegedge;
       expect(_out(soc, 'bus_error'), 0);
+      expect(_out(soc, 'bus_timeouts'), 0);
 
       // A slave that never answers is cut off after 16 cycles.
       driveM('cyc', 1);
@@ -538,6 +539,7 @@ void main() {
       driveM('stb', 0);
       await clk.nextNegedge;
       expect(_out(soc, 'bus_error'), 1);
+      expect(_out(soc, 'bus_timeouts'), 1);
       await Simulator.endSimulation();
     });
 
@@ -557,6 +559,7 @@ void main() {
       soc.addSubModule(slave);
       soc.addPeripheralSlave(slave, 'bus', const BusAddressRange(0, 4096));
       soc.buildFabric();
+      expect(soc.tryOutput('bus_timeouts'), isNull);
       soc.exposeBusError();
       final (clk, _) = await _start(soc);
       void driveM(String n, int v) => m.input(n).srcConnection!.inject(v);

@@ -273,6 +273,17 @@ class XilinxDdr3TreeSpec {
     this.dqsPhaseDeg = 180.0,
     this.ddrGearRatio = 1,
   });
+
+  /// The KC705 tree from its 200 MHz oscillator. [ckHz] is 333.33 MHz or 300
+  /// MHz. At 300 MHz the VCO is 1200 MHz and the divides are exact: CK/4, the
+  /// controller clock, is 75 MHz and the IDELAYCTRL reference is 200 MHz.
+  const XilinxDdr3TreeSpec.kc705({
+    required this.coreClkHz,
+    this.ddrCkHz = 333333333,
+  }) : sourceHz = 200000000,
+       idelayRefHz = 200000000,
+       dqsPhaseDeg = 180.0,
+       ddrGearRatio = 1;
 }
 
 /// Solves one 7-series MMCME2 VCO for the four DDR3 clocks: DDR CK (fractional
@@ -462,9 +473,14 @@ XilinxDdr3Clocks buildXilinxDdr3ClockTree(
   // fails to route on nextpnr-xilinx ("Failed to route arc of net CLKOUTx").
   // Every PLL output therefore stays on its own global BUFG.
   // CK/4 SERDES/CLKDIV clock (also the sequencer clock at gearRatio 1).
-  final ctrlNet = bufOut('CLKOUT1', 'ctrl');
+  final ctrlNet = bufOut(
+    'CLKOUT1',
+    'ctrl',
+  ).named(geared ? 'ddr_ck4_clk' : 'ddr_clk');
   // CK/8 controller-logic clock on the spare CLKOUT5, only when geared.
-  final ctrlGearNet = geared ? bufOut('CLKOUT5', 'ctrlgear') : null;
+  final ctrlGearNet = geared
+      ? bufOut('CLKOUT5', 'ctrlgear').named('ddr_clk')
+      : null;
   return XilinxDdr3Clocks(
     ddrCk: bufOut('CLKOUT0', 'ck'),
     controller: ctrlNet,
@@ -569,6 +585,35 @@ class XilinxBufg extends BridgeModule {
     addOutput('O');
     // Sim only: the buffer is a wire. Synthesis gets the ports only.
     output('O') <= input('I');
+  }
+}
+
+/// Xilinx 7-series BUFGCTRL: a global clock buffer with a two input clock
+/// mux. S0 selects I0 and S1 selects I1. The enables and the ignore inputs
+/// are fixed.
+///
+/// The simulation model is a plain mux on S1. It has no glitch free switch,
+/// so a select change in simulation can show a short pulse that the real
+/// part does not make.
+class XilinxBufgctrl extends BridgeModule {
+  XilinxBufgctrl({
+    required Logic i0,
+    required Logic i1,
+    required Logic s0,
+    required Logic s1,
+    super.name = 'bufgctrl',
+  }) : super('BUFGCTRL', isSystemVerilogLeaf: true) {
+    final a = addInput('I0', i0);
+    final b = addInput('I1', i1);
+    addInput('S0', s0);
+    final sel = addInput('S1', s1);
+    addInput('CE0', Const(1));
+    addInput('CE1', Const(1));
+    addInput('IGNORE0', Const(0));
+    addInput('IGNORE1', Const(0));
+    addOutput('O');
+    // Sim only: S1 picks the clock. Synthesis gets the ports only.
+    output('O') <= mux(sel, b, a);
   }
 }
 
@@ -793,10 +838,13 @@ class XilinxIobufds extends BridgeModule {
 /// Xilinx 7-series RAMB36E1: 36Kbit block RAM.
 class XilinxRamb36e1 extends BridgeModule {
   XilinxRamb36e1({
+    String ramMode = 'TDP',
     int readWidthA = 36,
     int writeWidthA = 36,
     int readWidthB = 36,
     int writeWidthB = 36,
+    String? writeModeA,
+    String? writeModeB,
     super.name = 'bram',
   }) : super('RAMB36E1', isSystemVerilogLeaf: true) {
     // Port A
@@ -822,10 +870,13 @@ class XilinxRamb36e1 extends BridgeModule {
     createPort('DOBDO', PortDirection.output, width: 32);
     createPort('DOPBDOP', PortDirection.output, width: 4);
 
+    createParameter('RAM_MODE', '"$ramMode"');
     createParameter('READ_WIDTH_A', '$readWidthA');
     createParameter('WRITE_WIDTH_A', '$writeWidthA');
     createParameter('READ_WIDTH_B', '$readWidthB');
     createParameter('WRITE_WIDTH_B', '$writeWidthB');
+    if (writeModeA != null) createParameter('WRITE_MODE_A', '"$writeModeA"');
+    if (writeModeB != null) createParameter('WRITE_MODE_B', '"$writeModeB"');
   }
 }
 
@@ -905,6 +956,65 @@ class XilinxXadc extends BridgeModule {
     addOutput('EOC');
     addOutput('EOS');
     addOutput('BUSY');
+  }
+}
+
+/// Xilinx 7-series DNA_PORT: access to the 57-bit device DNA (UG470, Device
+/// Identifier and Device DNA).
+///
+/// A rising [clk] edge with [read] high loads the shift register with the DNA
+/// and [dout] shows bit 56. [read] overrides [shift]. A rising [clk] edge with
+/// [shift] high moves the register toward [dout] and shifts [din] into bit 0.
+/// The clock limit is 100 MHz (DS181, FDNACK, 70 MHz for the -2LE grade).
+///
+/// [simDnaValue] sets the DNA of the simulation model and the SIM_DNA_VALUE
+/// parameter of the primitive.
+class XilinxDnaPort extends BridgeModule {
+  /// Width of the device DNA in bits.
+  static const int dnaWidth = 57;
+
+  Logic get dout => output('DOUT');
+
+  XilinxDnaPort({
+    required Logic clk,
+    required Logic din,
+    required Logic read,
+    required Logic shift,
+    BigInt? simDnaValue,
+    super.name = 'dna_port',
+  }) : super('DNA_PORT', isSystemVerilogLeaf: true) {
+    final value = simDnaValue ?? BigInt.zero;
+    if (value.isNegative || value.bitLength > dnaWidth) {
+      throw ArgumentError.value(
+        simDnaValue,
+        'simDnaValue',
+        'must fit in $dnaWidth bits',
+      );
+    }
+    createParameter('SIM_DNA_VALUE', "$dnaWidth'h${value.toRadixString(16)}");
+    addInput('CLK', clk);
+    addInput('DIN', din);
+    addInput('READ', read);
+    addInput('SHIFT', shift);
+    final dout = addOutput('DOUT');
+    // Sim only. The register has no reset, so it is unknown until the first
+    // READ.
+    final sreg = Logic(name: '${name}_sim_sreg', width: dnaWidth);
+    Sequential(input('CLK'), [
+      If(
+        input('READ'),
+        then: [sreg < Const(value, width: dnaWidth)],
+        orElse: [
+          If(
+            input('SHIFT'),
+            then: [
+              sreg < [sreg.getRange(0, dnaWidth - 1), input('DIN')].concat(),
+            ],
+          ),
+        ],
+      ),
+    ]);
+    dout <= sreg[dnaWidth - 1];
   }
 }
 

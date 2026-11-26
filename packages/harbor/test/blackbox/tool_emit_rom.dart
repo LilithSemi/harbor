@@ -23,6 +23,6 @@ Future<void> main() async {
     wrData: wrData,
   );
   await rom.build();
-  File('/tmp/ecp5_rom.sv').writeAsStringSync(rom.generateSynth());
+  File('/tmp/ecp5_rom.sv').writeAsStringSync(rom.dumpSystemVerilog());
   print('wrote /tmp/ecp5_rom.sv');
 }

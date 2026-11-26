@@ -4,15 +4,40 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
+import '../bus/port/reg_fifo.dart' show HarborFifoRam;
 import '../soc/acpi.dart';
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../soc/target.dart';
 import 'device_register.dart';
 
-/// 16550-compatible UART peripheral.
+/// 16550A-compatible UART peripheral.
 ///
 /// Works with Linux `ns16550a` driver and U-Boot `ns16550` driver.
+///
+/// The UART follows the TI PC16550D data sheet. One bit lasts 16 times the
+/// divisor in clocks, and the clock-frequency property gives the raw clock.
+///
+/// It has a 16-byte TX FIFO and
+/// a 16-byte RX FIFO in distributed RAM. FCR bit 0 enables the FIFOs. With
+/// the FIFOs off, each direction holds one byte, as in a 16450. A byte that
+/// arrives when the RX FIFO is full is dropped and sets LSR OE. A THR write
+/// when the TX FIFO is full is dropped. A frame with a low stop bit is
+/// dropped, so LSR bits 7 and 4:2 always read 0. The UART has no modem pins.
+/// Outside loopback, MSR reads CTS, DSR and DCD high. In loopback (MCR bit 4),
+/// MSR follows MCR, the `tx` pin stays high and the transmitter output feeds
+/// the receiver. The `rx` pin is ignored.
+///
+/// The 8-bit `debug` output comes from flops in the UART clock domain. The
+/// sticky bits clear only on reset. The bits are:
+/// - 0: the divisor is not zero
+/// - 1: LCR bit 7 (DLAB)
+/// - 2: sticky, a bus write in the window was accepted
+/// - 3: sticky, a DLL or DLM write with DLAB set
+/// - 4: sticky, a THR write
+/// - 5: sticky, the transmitter started a frame
+/// - 6: sticky, a bus read in the window was accepted
+/// - 7: the `tx` pin
 ///
 /// Register map (standard 16550), register index n:
 /// - 0: RBR (read) / THR (write) / DLL (DLAB=1)
@@ -77,6 +102,17 @@ class HarborUart extends BridgeModule
         'must be 0 (byte registers) or 2 (32-bit word registers)',
       );
     }
+    // An AXI4-Lite read has no byte strobes, so it selects whole 32-bit
+    // words. A read of one packed register would also read its neighbours,
+    // and a read of IIR, LSR or RBR changes state.
+    if (kind == HarborFabricKind.axi4 && regShift == 0 && dataWidth > 8) {
+      throw ArgumentError.value(
+        dataWidth,
+        'busDataWidth',
+        'must be 8 when regShift is 0 on AXI4, because an AXI4-Lite read '
+            'selects every register in the word',
+      );
+    }
     if (regShift == 2 && dataWidth < 32) {
       throw ArgumentError.value(
         dataWidth,
@@ -120,6 +156,7 @@ class HarborUart extends BridgeModule
     createPort('rx', PortDirection.input);
     addOutput('tx');
     addOutput('interrupt');
+    addOutput('debug', width: 8);
 
     bus = BusSlavePort.create(
       module: this,
@@ -158,7 +195,7 @@ class HarborUart extends BridgeModule
       ]);
       // The lane in the word, plus the word-select address bit on a 32-bit
       // bus. A 64-bit bus holds all 8 registers in one word.
-      addr = laneBits >= 3 ? wrLane : [bus.addr[2], wrLane].swizzle();
+      addr = laneBits >= 3 ? wrLane : [bus.addr[2], wrLane].concat();
       final laneData = Logic(name: 'uart_dat_in', width: 8);
       Combinational([
         laneData < Const(0, width: 8),
@@ -196,73 +233,175 @@ class HarborUart extends BridgeModule
     final mcr = Logic(name: 'mcr', width: 8);
     final scr = Logic(name: 'scr', width: 8);
 
-    // TX state (single-byte holding register, no FIFO for simplicity)
+    final dlab = lcr[7];
+
+    // Status flops for the `debug` output.
+    final dbgWrite = Logic(name: 'dbg_write');
+    final dbgDivWrite = Logic(name: 'dbg_div_write');
+    final dbgThrWrite = Logic(name: 'dbg_thr_write');
+    final dbgTxStart = Logic(name: 'dbg_tx_start');
+    final dbgRead = Logic(name: 'dbg_read');
+    final fifoOn = fcr[0];
+
+    // TX state. The TX FIFO holds 16 bytes in distributed RAM. A THR write
+    // lands in thrData and enters the FIFO one cycle later.
     final txBusy = Logic(name: 'tx_busy');
     final txShift = Logic(name: 'tx_shift', width: 10);
     final txCount = Logic(name: 'tx_count', width: 4);
-    final txHolding = Logic(name: 'tx_holding', width: 8);
-    final txHoldingFull = Logic(name: 'tx_holding_full');
+    final thrData = Logic(name: 'thr_data', width: 8);
+    final thrValid = Logic(name: 'thr_valid');
+    final txWr = Logic(name: 'tx_wr_ptr', width: 5);
+    final txRd = Logic(name: 'tx_rd_ptr', width: 5);
+    // The THRE interrupt is a latch: it sets when the TX FIFO empties and
+    // clears on a THR write or on an IIR read that reports it.
+    final threPend = Logic(name: 'thre_pend');
+    final txEmptyQ = Logic(name: 'tx_empty_q');
 
-    // RX state (single-byte holding register). The pin is asynchronous, so it
-    // passes through a two-flop synchronizer before the sampler looks at it.
+    // RX state. The RX FIFO holds 16 bytes in distributed RAM. The pin is
+    // asynchronous, so it passes through a two-flop synchronizer before the
+    // sampler looks at it.
     final rxIn = input('rx');
     final rxSyncA = Logic(name: 'rx_sync_a');
     final rxSyncB = Logic(name: 'rx_sync_b');
+    final txLine = Logic(name: 'tx_line');
     final rxBusy = Logic(name: 'rx_busy');
     final rxBits = Logic(name: 'rx_bits', width: 4);
-    final rxBaud = Logic(name: 'rx_baud', width: 16);
+    final rxPhase = Logic(name: 'rx_phase', width: 4);
+    final rxSample = Logic(name: 'rx_sample');
     final rxShift = Logic(name: 'rx_shift', width: 8);
-    final rxData = Logic(name: 'rx_data', width: 8);
-    final rxReady = Logic(name: 'rx_ready');
+    final rxWr = Logic(name: 'rx_wr_ptr', width: 5);
+    final rxRd = Logic(name: 'rx_rd_ptr', width: 5);
+    final overrun = Logic(name: 'rx_overrun');
+    final timeoutCount = Logic(name: 'rx_timeout_count', width: 6);
+    final timeoutFlag = Logic(name: 'rx_timeout');
 
-    // Baud rate
+    // FIFO fill levels. Pointers carry one extra bit, so the difference is
+    // the level. With FIFOs off the capacity is one byte.
+    final txLevel = (txWr - txRd).named('tx_level');
+    final rxLevel = (rxWr - rxRd).named('rx_level');
+    Logic fullOf(Logic level) => level[4] | (~fifoOn & level.or());
+    final txFull = fullOf(txLevel).named('tx_full');
+    final rxFull = fullOf(rxLevel).named('rx_full');
+    final rxHasData = rxLevel.or().named('rx_has_data');
+    final txEmpty = (~txLevel.or() & ~thrValid).named('tx_empty');
+
+    // A frame with a high stop bit ends in the RX FIFO. A frame that finds
+    // the FIFO full is dropped and sets the overrun flag.
+    final rxFrame =
+        (rxBusy & rxSample & rxBits.gt(Const(8, width: 4)) & rxSyncB).named(
+          'rx_frame',
+        );
+    // An RBR read in the same cycle frees the slot the frame needs.
+    final rbrPop = Logic(name: 'rbr_pop');
+    final rxPush = (rxFrame & (~rxFull | rbrPop)).named('rx_push');
+    final txPush = (thrValid & ~txFull).named('tx_push');
+
+    final txRam = HarborFifoRam(
+      name: 'tx_fifo_ram',
+      clk: clk,
+      wrEn: txPush,
+      wrAddr: txWr.getRange(0, 4),
+      wrData: thrData,
+      rdAddr: txRd.getRange(0, 4),
+      depth: 16,
+      zeroInit: true,
+    );
+    final rxRam = HarborFifoRam(
+      name: 'rx_fifo_ram',
+      clk: clk,
+      wrEn: rxPush,
+      wrAddr: rxWr.getRange(0, 4),
+      wrData: rxShift,
+      rdAddr: rxRd.getRange(0, 4),
+      depth: 16,
+      zeroInit: true,
+    );
+
+    // Baud rate. As in a 16550, one bit lasts 16 divisor periods. The
+    // baud tick runs at 16 times the bit rate, and txPhase counts it up to
+    // the bit tick.
     final baudCount = Logic(name: 'baud_count', width: 16);
     final baudTick = Logic(name: 'baud_tick');
-    final divisor = [dlm, dll].swizzle();
+    final txPhase = Logic(name: 'tx_phase', width: 4);
+    final divisor = [dlm, dll].concat();
+    // A write of a divisor latch loads the counter, as in a PC16550D.
+    Logic divisorLoad(Logic next) => mux<Logic>(
+      next.eq(Const(0, width: 16)),
+      Const(0, width: 16),
+      next - Const(1, width: 16),
+    );
     baudTick <=
         baudCount.eq(Const(0, width: 16)) & divisor.neq(Const(0, width: 16));
+    final bitTick = (baudTick & txPhase.eq(Const(15, width: 4))).named(
+      'bit_tick',
+    );
 
-    // LSR
+    // LSR. Bit 7 stays 0 because a frame with a low stop bit is dropped, so
+    // no byte in the FIFO carries an error. Bits 4:2 are 0 for the same
+    // reason.
     final lsr = Logic(name: 'lsr', width: 8);
     lsr <=
-        rxReady.zeroExtend(8) | // bit 0: data ready
-            ((~txHoldingFull).zeroExtend(8) <<
-                Const(5, width: 8)) | // bit 5: THRE
-            (((~txHoldingFull) & (~txBusy)).zeroExtend(8) <<
-                Const(6, width: 8)); // bit 6: TEMT
+        [
+          Const(0),
+          txEmpty & ~txBusy, // TEMT
+          txEmpty, // THRE
+          Const(0, width: 3),
+          overrun, // OE
+          rxHasData, // DR
+        ].concat();
 
-    // IIR
-    final irqRx = rxReady & ier[0];
-    final irqTx = (~txHoldingFull) & ier[1];
+    // MSR. The UART has no modem pins, so CTS, DSR and DCD read high. In
+    // loopback the upper nibble follows MCR. The delta bits stay 0.
+    final msr = mux(
+      mcr[4],
+      [mcr[3], mcr[2], mcr[0], mcr[1], Const(0, width: 4)].concat(),
+      Const(0xB0, width: 8),
+    );
+
+    // Interrupt sources, highest priority first.
+    final rxTrigger = fcr.getRange(6, 8).selectFrom(<Logic>[
+      Const(1, width: 5),
+      Const(4, width: 5),
+      Const(8, width: 5),
+      Const(14, width: 5),
+    ]);
+    final rxLevelHit = mux(fifoOn, rxLevel.gte(rxTrigger), rxHasData);
+    final lineInt = ier[2] & overrun;
+    final rxInt = ier[0] & rxLevelHit;
+    final timeoutInt = fifoOn & ier[0] & timeoutFlag;
+    final threInt = ier[1] & threPend;
     final computedIir = Logic(name: 'computed_iir', width: 8);
     Combinational([
-      computedIir < (fcr.getRange(6, 8).zeroExtend(8) << Const(6, width: 8)),
-      If(
-        irqRx,
-        then: [computedIir < (computedIir | Const(0x04, width: 8))],
-        orElse: [
-          If(
-            irqTx,
-            then: [computedIir < (computedIir | Const(0x02, width: 8))],
-            orElse: [computedIir < (computedIir | Const(0x01, width: 8))],
-          ),
-        ],
-      ),
+      If.block([
+        Iff(lineInt, [computedIir < Const(0x06, width: 8)]),
+        ElseIf(rxInt, [computedIir < Const(0x04, width: 8)]),
+        ElseIf(timeoutInt, [computedIir < Const(0x0c, width: 8)]),
+        ElseIf(threInt, [computedIir < Const(0x02, width: 8)]),
+        Else([computedIir < Const(0x01, width: 8)]),
+      ]),
     ]);
+    final iirOut = [
+      fifoOn,
+      fifoOn,
+      Const(0, width: 2),
+      computedIir.getRange(0, 4),
+    ].concat();
 
-    interrupt <= irqRx | irqTx;
-
-    final dlab = lcr[7];
+    // The output comes from one flop, so it carries no glitch from the
+    // interrupt logic.
+    final irqQ = Logic(name: 'irq_q');
+    interrupt <= irqQ;
+    final irqNext = lineInt | rxInt | timeoutInt | threInt;
 
     // Read value of each register index.
     final regValue = <Logic>[
-      mux(dlab, dll, rxData),
+      mux(dlab, dll, rxRam.rdData),
       mux(dlab, dlm, ier),
-      computedIir,
+      iirOut,
       lcr,
       mcr,
       lsr,
-      Const(0, width: 8),
+      msr,
       scr,
     ];
 
@@ -271,24 +410,70 @@ class HarborUart extends BridgeModule
       CaseItem(Const(0, width: 3), [
         If(
           dlab,
-          then: [dll < d],
-          orElse: [txHolding < d, txHoldingFull < Const(1)],
+          then: [
+            dbgDivWrite < Const(1),
+            dll < d,
+            baudCount < divisorLoad([dlm, d].concat()),
+          ],
+          orElse: [
+            dbgThrWrite < Const(1),
+            thrData < d,
+            thrValid < Const(1),
+            threPend < Const(0),
+          ],
         ),
       ]),
       CaseItem(Const(1, width: 3), [
-        If(dlab, then: [dlm < d], orElse: [ier < d]),
+        If(
+          dlab,
+          then: [
+            dbgDivWrite < Const(1),
+            dlm < d,
+            baudCount < divisorLoad([d, dll].concat()),
+          ],
+          orElse: [
+            // Only bits 3:0 exist. Enabling THRE while the TX FIFO is empty
+            // raises the interrupt.
+            ier < (d & Const(0x0f, width: 8)),
+            If(d[1] & ~ier[1] & txEmpty, then: [threPend < Const(1)]),
+          ],
+        ),
       ]),
-      CaseItem(Const(2, width: 3), [fcr < d]),
+      // The reset bits do not stay set. A change of the enable bit clears
+      // both FIFOs. The byte in the TX shift register still goes out.
+      CaseItem(Const(2, width: 3), [
+        fcr < (d & Const(0xc1, width: 8)),
+        If(
+          (d[0] & d[1]) | (d[0] ^ fcr[0]),
+          then: [
+            rxWr < Const(0, width: 5),
+            rxRd < Const(0, width: 5),
+            timeoutCount < Const(0, width: 6),
+            timeoutFlag < Const(0),
+          ],
+        ),
+        If(
+          (d[0] & d[2]) | (d[0] ^ fcr[0]),
+          then: [
+            txWr < Const(0, width: 5),
+            txRd < Const(0, width: 5),
+            thrValid < Const(0),
+          ],
+        ),
+      ]),
       CaseItem(Const(3, width: 3), [lcr < d]),
       CaseItem(Const(4, width: 3), [mcr < d]),
       // LSR (5) and MSR (6) are read-only.
       CaseItem(Const(7, width: 3), [scr < d]),
     ]);
 
-    // Only a read that selects the RBR byte pops the receive buffer, so a
-    // read of another register in the same word does not.
+    // A read changes state only when it selects the byte lane of the
+    // register: RBR pops the receive buffer and IIR clears THRE. A read of
+    // another register in the same word does neither.
     final List<Conditional> readItems;
     final List<Conditional> writeItems;
+    // High when the bus word of a read holds register [r] in a selected lane.
+    final Logic Function(int r) regSel;
     if (wide) {
       // Each bus word holds `slots` registers, one per 32-bit slot. Slot s
       // of word w is register w * slots + s.
@@ -301,7 +486,7 @@ class HarborUart extends BridgeModule
       Logic regIndex(int s) => switch ((word, slotBits)) {
         (null, _) => Const(s, width: 3),
         (final w?, 0) => w,
-        (final w?, _) => [w, Const(s, width: slotBits)].swizzle(),
+        (final w?, _) => [w, Const(s, width: slotBits)].concat(),
       };
       final used = slots < 8 ? slots : 8;
       final slotValue = [
@@ -317,11 +502,13 @@ class HarborUart extends BridgeModule
                 ])
                 .zeroExtend(32),
       ];
-      final rbrWord = word == null ? Const(1) : word.eq(0);
+      regSel = (r) => [
+        for (var s = 0; s < used; s++)
+          regIndex(s).eq(Const(r, width: 3)) & bus.sel[4 * s],
+      ].reduce((a, b) => a | b);
       readItems = [
         datOutW <
-            slotValue.reversed.toList().swizzle().zeroExtend(bus.dataOut.width),
-        If(~dlab & rbrWord & bus.sel[0], then: [rxReady < Const(0)]),
+            slotValue.reversed.toList().concat().zeroExtend(bus.dataOut.width),
       ];
       writeItems = [
         for (var s = 0; s < used; s++)
@@ -333,13 +520,11 @@ class HarborUart extends BridgeModule
           ),
       ];
     } else if (lanes == 1) {
+      regSel = (r) => addr!.eq(Const(r, width: 3));
       readItems = [
         Case(addr!, [
           for (var i = 0; i < 8; i++)
-            CaseItem(Const(i, width: 3), [
-              datOutW < regValue[i],
-              if (i == 0) If(~dlab, then: [rxReady < Const(0)]),
-            ]),
+            CaseItem(Const(i, width: 3), [datOutW < regValue[i]]),
         ]),
       ];
       writeItems = [
@@ -347,22 +532,23 @@ class HarborUart extends BridgeModule
       ];
     } else {
       // Every register of the addressed word is returned in its lane.
-      final word0 = regValue.sublist(0, 4).reversed.toList().swizzle();
-      final word1 = regValue.sublist(4).reversed.toList().swizzle();
+      regSel = (r) {
+        if (lanes >= 8) return bus.sel[r];
+        final lane = r & 3 < lanes ? bus.sel[r & 3] : Const(0);
+        return (r < 4 ? ~bus.addr[2] : bus.addr[2]) & lane;
+      };
+      final word0 = regValue.sublist(0, 4).reversed.toList().concat();
+      final word1 = regValue.sublist(4).reversed.toList().concat();
       if (lanes >= 8) {
         readItems = [
-          datOutW < [word1, word0].swizzle().zeroExtend(bus.dataOut.width),
-          If(~dlab & bus.sel[0], then: [rxReady < Const(0)]),
+          datOutW < [word1, word0].concat().zeroExtend(bus.dataOut.width),
         ];
       } else {
         readItems = [
           If(
             bus.addr[2],
             then: [datOutW < word1.zeroExtend(bus.dataOut.width)],
-            orElse: [
-              datOutW < word0.zeroExtend(bus.dataOut.width),
-              If(~dlab & bus.sel[0], then: [rxReady < Const(0)]),
-            ],
+            orElse: [datOutW < word0.zeroExtend(bus.dataOut.width)],
           ),
         ];
       }
@@ -379,6 +565,34 @@ class HarborUart extends BridgeModule
       ];
     }
 
+    // The middle of the start bit is 8 ticks after the edge, the middle of
+    // every other bit 16 ticks after the one before.
+    rxSample <=
+        (rxBusy &
+            baudTick &
+            rxPhase.eq(
+              mux<Logic>(
+                rxBits.eq(Const(0, width: 4)),
+                Const(7, width: 4),
+                Const(15, width: 4),
+              ),
+            ));
+
+    // Reads that change state. A read of RBR, IIR or LSR acts only when its
+    // own lane is selected.
+    final readEvt = stb & ~ack & inWindow & ~we;
+    final rbrRead = (readEvt & ~dlab & regSel(0)).named('rbr_read');
+    rbrPop <= rbrRead & rxHasData;
+
+    // Four character times in bit times: start, data, parity, stop.
+    final timeoutLimit =
+        ((Const(7, width: 6) +
+                    lcr.getRange(0, 2).zeroExtend(6) +
+                    lcr[3].zeroExtend(6) +
+                    lcr[2].zeroExtend(6)) <<
+                Const(2, width: 6))
+            .named('rx_timeout_limit');
+
     Sequential(clk, [
       If(
         reset,
@@ -390,18 +604,32 @@ class HarborUart extends BridgeModule
           lcr < Const(0x03, width: 8), // 8N1
           mcr < Const(0, width: 8),
           scr < Const(0, width: 8),
+          dbgWrite < Const(0),
+          dbgDivWrite < Const(0),
+          dbgThrWrite < Const(0),
+          dbgTxStart < Const(0),
+          dbgRead < Const(0),
           txBusy < Const(0),
           txShift < Const(0x3FF, width: 10),
           txCount < Const(0, width: 4),
-          txHolding < Const(0, width: 8),
-          txHoldingFull < Const(0),
-          rxData < Const(0, width: 8),
-          rxReady < Const(0),
+          thrData < Const(0, width: 8),
+          thrValid < Const(0),
+          txWr < Const(0, width: 5),
+          txRd < Const(0, width: 5),
+          threPend < Const(0),
+          txEmptyQ < Const(1),
+          irqQ < Const(0),
+          rxWr < Const(0, width: 5),
+          rxRd < Const(0, width: 5),
+          overrun < Const(0),
+          timeoutCount < Const(0, width: 6),
+          timeoutFlag < Const(0),
           rxSyncA < Const(1), // idle-high line
           rxSyncB < Const(1),
           rxBusy < Const(0),
           rxBits < Const(0, width: 4),
-          rxBaud < Const(0, width: 16),
+          rxPhase < Const(0, width: 4),
+          txPhase < Const(0, width: 4),
           rxShift < Const(0, width: 8),
           baudCount < Const(0, width: 16),
           ack < Const(0),
@@ -409,16 +637,26 @@ class HarborUart extends BridgeModule
           datOutW < Const(0, width: bus.dataOut.width),
         ],
         orElse: [
+          irqQ < irqNext,
+
           // Baud counter
+          // The counter holds at 0 while the divisor is 0.
           If(
             baudCount.eq(Const(0, width: 16)),
-            then: [baudCount < (divisor - Const(1, width: 16))],
+            then: [
+              If(
+                divisor.neq(Const(0, width: 16)),
+                then: [baudCount < (divisor - Const(1, width: 16))],
+              ),
+            ],
             orElse: [baudCount < (baudCount - Const(1, width: 16))],
           ),
 
+          If(baudTick, then: [txPhase < (txPhase + Const(1, width: 4))]),
+
           // TX engine
           If(
-            txBusy & baudTick,
+            txBusy & bitTick,
             then: [
               txShift < (txShift >> Const(1, width: 10)),
               txCount < (txCount + Const(1, width: 4)),
@@ -429,28 +667,39 @@ class HarborUart extends BridgeModule
             ],
           ),
 
-          // Load from holding register when TX idle. Reloading the baud
-          // counter here phase-aligns the generator to the new frame:
-          // without it the free-running counter truncates the start bit to
-          // whatever remained of the current period, and receivers misframe
-          // the first byte after an idle gap.
+          // THRE interrupt when the TX FIFO becomes empty.
+          txEmptyQ < txEmpty,
+          If(txEmpty & ~txEmptyQ, then: [threPend < Const(1)]),
+
+          thrValid < Const(0),
+          If(txPush, then: [txWr < (txWr + Const(1, width: 5))]),
+
+          // Load from the TX FIFO when TX idle, on a baud tick. The baud
+          // counter runs free, as in a 16550, so the start bit lasts exactly
+          // 16 divisor periods and the receiver keeps its sample points.
+          // Nothing loads while the divisor is 0.
           If(
-            ~txBusy & txHoldingFull,
+            ~txBusy & txLevel.or() & baudTick,
             then: [
               txShift <
-                  [Const(1, width: 1), txHolding, Const(0, width: 1)].swizzle(),
+                  [
+                    Const(1, width: 1),
+                    txRam.rdData,
+                    Const(0, width: 1),
+                  ].concat(),
               txBusy < Const(1),
               txCount < Const(0, width: 4),
-              txHoldingFull < Const(0),
-              baudCount < (divisor - Const(1, width: 16)),
+              txRd < (txRd + Const(1, width: 5)),
+              txPhase < Const(0, width: 4),
             ],
           ),
 
           // RX engine: hunt for a start bit on the synchronized line, then
-          // sample mid-bit at the divisor rate (8N1, LSB first). The divisor
+          // sample at the middle of each bit, 8 baud ticks after the start
+          // edge and every 16 ticks after that (8N1, LSB first). The divisor
           // gate keeps the receiver idle until the UART is configured, the
           // same rule the transmitter follows.
-          rxSyncA < rxIn,
+          rxSyncA < mux(mcr[4], txLine, rxIn),
           rxSyncB < rxSyncA,
           If(
             ~rxBusy,
@@ -460,17 +709,15 @@ class HarborUart extends BridgeModule
                 then: [
                   rxBusy < Const(1),
                   rxBits < Const(0, width: 4),
-                  // Half a bit period, to land mid-start for validation.
-                  rxBaud <
-                      [Const(0, width: 1), divisor.getRange(1, 16)].swizzle(),
+                  rxPhase < Const(0, width: 4),
                 ],
               ),
             ],
             orElse: [
               If(
-                rxBaud.eq(Const(0, width: 16)),
+                rxSample,
                 then: [
-                  rxBaud < (divisor - Const(1, width: 16)),
+                  rxPhase < Const(0, width: 4),
                   If(
                     rxBits.eq(Const(0, width: 4)),
                     then: [
@@ -488,22 +735,46 @@ class HarborUart extends BridgeModule
                         then: [
                           // Data bits 1..8: insert at the top and shift down,
                           // so the first (LSB-first) bit ends at bit 0.
-                          rxShift < [rxSyncB, rxShift.getRange(1, 8)].swizzle(),
+                          rxShift < [rxSyncB, rxShift.getRange(1, 8)].concat(),
                           rxBits < (rxBits + Const(1, width: 4)),
                         ],
                         orElse: [
-                          // Stop position: a high line frames a valid byte.
-                          If(
-                            rxSyncB,
-                            then: [rxData < rxShift, rxReady < Const(1)],
-                          ),
+                          // Stop position: a high line frames a valid byte,
+                          // and rxFrame pushes it into the RX FIFO.
                           rxBusy < Const(0),
                         ],
                       ),
                     ],
                   ),
                 ],
-                orElse: [rxBaud < (rxBaud - Const(1, width: 16))],
+                orElse: [
+                  If(
+                    baudTick,
+                    then: [rxPhase < (rxPhase + Const(1, width: 4))],
+                  ),
+                ],
+              ),
+            ],
+          ),
+
+          If(rxPush, then: [rxWr < (rxWr + Const(1, width: 5))]),
+          If(rbrRead & rxHasData, then: [rxRd < (rxRd + Const(1, width: 5))]),
+
+          // The timeout counts bit times from the last byte in or out of the
+          // RX FIFO. It stops at four character times.
+          If(
+            rxPush | rbrRead | ~rxHasData,
+            then: [timeoutCount < Const(0, width: 6), timeoutFlag < Const(0)],
+            orElse: [
+              If(
+                bitTick & ~timeoutFlag,
+                then: [
+                  timeoutCount < (timeoutCount + Const(1, width: 6)),
+                  If(
+                    timeoutCount.eq(timeoutLimit - Const(1, width: 6)),
+                    then: [timeoutFlag < Const(1)],
+                  ),
+                ],
               ),
             ],
           ),
@@ -518,28 +789,55 @@ class HarborUart extends BridgeModule
             then: [
               ack < Const(1),
 
+              If(inWindow & we, then: [dbgWrite < Const(1)]),
+              If(inWindow & ~we, then: [dbgRead < Const(1)]),
               If(
                 inWindow & we,
                 then: writeItems,
                 orElse: [If(inWindow & ~we, then: readItems)],
               ),
+              // An IIR read that reports THRE clears it.
+              If(
+                inWindow &
+                    ~we &
+                    regSel(2) &
+                    computedIir.getRange(0, 4).eq(Const(2, width: 4)),
+                then: [threPend < Const(0)],
+              ),
+              // An LSR read clears the overrun flag.
+              If(readEvt & regSel(5), then: [overrun < Const(0)]),
             ],
           ),
+          If(rxFrame & ~rxPush, then: [overrun < Const(1)]),
+          If(txBusy, then: [dbgTxStart < Const(1)]),
         ],
       ),
     ]);
 
-    // TX output: LSB of shift register when busy, else idle high
+    // TX line: LSB of shift register when busy, else idle high. Loopback
+    // holds the pin high and feeds the line to the receiver synchronizer.
     Combinational([
-      If(txBusy, then: [tx < txShift[0]], orElse: [tx < Const(1)]),
+      If(txBusy, then: [txLine < txShift[0]], orElse: [txLine < Const(1)]),
     ]);
+    tx <= txLine | mcr[4];
+    output('debug') <=
+        [
+          tx,
+          dbgRead,
+          dbgTxStart,
+          dbgThrWrite,
+          dbgDivWrite,
+          dbgWrite,
+          dlab,
+          [dlm, dll].concat().or(),
+        ].concat().named('debug_value');
   }
 
   /// A terminal on the TX line: decodes 8N1 serial and writes bytes to stdout.
   ///
   /// The divisor is a runtime register, so the bit period cannot be known when
-  /// this is generated. The default assumes the firmware programs
-  /// `<this peripheral's clock>` / 115200; override with
+  /// this is generated. The default assumes the firmware programs a divisor of
+  /// `<this peripheral's clock>` / (16 * 115200) for 115200 baud; override with
   /// `--uart-cycles-per-bit=N`. A wrong value is reported as a framing error
   /// rather than printed as mojibake, so the failure names its own cause.
   ///
@@ -653,8 +951,7 @@ struct UartSink {
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(
-    hid: 'PNP0501',
-    cid: ['PNP0501'],
+    hid: 'RSCV0003',
     uid: 0,
     memory: [BusAddressRange(baseAddress, 0x1000)],
     properties: {

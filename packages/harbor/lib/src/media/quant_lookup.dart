@@ -29,7 +29,7 @@ class HarborQuantLookup extends BridgeModule {
     // clamp(qindex + delta, 0, 255) with a signed delta.
     Logic clampQ(Logic delta) {
       final sum =
-          (qindex.zeroExtend(11) + [delta[7].replicate(3), delta].swizzle())
+          (qindex.zeroExtend(11) + [delta[7].replicate(3), delta].concat())
               .getRange(0, 11);
       final neg = sum[10];
       final tooBig = ~neg & ~sum.getRange(8, 11).eq(Const(0, width: 3));
@@ -53,7 +53,7 @@ class HarborQuantLookup extends BridgeModule {
     final romDc = Const(BigInt.parse(dcRoms[bitDepth]!), width: 256 * 16);
     final romAc = Const(BigInt.parse(acRoms[bitDepth]!), width: 256 * 16);
     Logic romGet(Logic rom, Logic idx) {
-      final shift = [idx, Const(0, width: 4)].swizzle(); // idx * 16
+      final shift = [idx, Const(0, width: 4)].concat(); // idx * 16
       return (rom >>> shift.zeroExtend(256 * 16)).getRange(0, 16);
     }
 

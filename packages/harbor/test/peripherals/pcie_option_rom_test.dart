@@ -628,6 +628,7 @@ class _SpiChain extends BridgeModule {
     );
     flash = addSubModule(
       HarborSpiFlashController(
+        clockHz: 100000000,
         config: const HarborSpiFlashConfig.w25q128(readAheadWords: 32),
         baseAddress: 0,
         busAddressWidth: 24,

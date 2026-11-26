@@ -104,7 +104,7 @@ Iterable<Module> _all(Module m) sync* {
 /// Checks the cell patterns of [m] against its generated registers.
 Future<void> _check(HarborEthernetMac m) async {
   await m.build();
-  final regs = _vivadoRegs(m.generateSynth(), m.definitionName, 'eth0');
+  final regs = _vivadoRegs(m.dumpSystemVerilog(), m.definitionName, 'eth0');
   final list = [
     ...m.constraints(topPort: (p) => 'eth0_$p', instance: 'eth0'),
     ...m.cdcConstraints(sysPeriodNs: 8, instance: 'eth0'),

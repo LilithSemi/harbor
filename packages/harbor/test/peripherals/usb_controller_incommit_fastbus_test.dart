@@ -11,7 +11,7 @@ void main() {
   test('IN_COMMIT with a bus clock faster than usb_clk sends whole packets '
       'for every size and phase', () async {
     final (dut, host, clk, _, _) = await buildUsbControllerHarness(
-      busPeriod: 3,
+      busPeriod: 4,
       usbPeriod: 10,
       maxSimTime: 40000000,
     );

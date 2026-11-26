@@ -64,7 +64,7 @@ class Oserdese2SimModel extends Module {
     addOutput('TQ');
 
     // Pack the beats into one word, D1 in the LSB so a right-shift pops D1 first.
-    final word = beats.rswizzle().named('load_word');
+    final word = beats.rconcat().named('load_word');
 
     // CLKDIV edge detector on the fast CLK: reload the shifter on the CLKDIV
     // rising edge (its value differs from the registered copy and is high).
@@ -81,7 +81,7 @@ class Oserdese2SimModel extends Module {
         ],
         orElse: [
           // Shift one beat out (LSB popped), fill high with 0.
-          sr < [Const(0), sr.getRange(1, dataWidth)].swizzle(),
+          sr < [Const(0), sr.getRange(1, dataWidth)].concat(),
         ],
       ),
     ]);

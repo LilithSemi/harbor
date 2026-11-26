@@ -28,12 +28,14 @@ class DmaConfig {
   final List<int> infoWords;
   final int timeoutCycles;
   final int maxReadRequestBytes;
+  final int memoryOutstanding;
   final bool fifoSource;
   final bool ringSource;
   final int addressWidth;
 
   /// Puts an [AxiStallGate] on the fabric port. See [DmaBench.hold].
   final bool axiGate;
+  final bool bReorder;
 
   /// Builds the reset status input. See [DmaBench.resetStatus].
   final bool resetStatus;
@@ -56,17 +58,21 @@ class DmaConfig {
     this.infoWords = const [],
     this.timeoutCycles = 6250000,
     this.maxReadRequestBytes = 512,
+    this.memoryOutstanding = 1,
     this.fifoSource = true,
     this.ringSource = false,
     this.addressWidth = dmaAddressWidth,
     this.axiGate = false,
+    this.bReorder = false,
     this.resetStatus = false,
     this.crossing = false,
     this.resetMemory = false,
   });
 
   @override
-  String toString() => 'W$width D$dataWidth ${kind.name}';
+  String toString() =>
+      'W$width D$dataWidth ${kind.name}'
+      '${memoryOutstanding == 1 ? '' : ' N$memoryOutstanding'}';
 }
 
 class DmaRecord {
@@ -192,6 +198,7 @@ class DmaBench {
       infoWords: config.infoWords,
       timeoutCycles: config.timeoutCycles,
       maxReadRequestBytes: config.maxReadRequestBytes,
+      memoryOutstanding: config.memoryOutstanding,
       fifoSource: config.fifoSource,
       ringSource: config.ringSource,
       resetStatus: config.resetStatus ? Logic(width: 64) : null,
@@ -201,12 +208,10 @@ class DmaBench {
       dut,
       iface: 'memory',
       kind: config.kind,
-      config: HarborMemoryWaistConfig(
-        addressWidth: config.addressWidth,
-        dataWidth: config.dataWidth,
-      ),
+      config: dut.memoryConfig,
       withErr: true,
       axiGate: config.axiGate,
+      bReorder: config.bReorder,
       fabricCrossing: config.crossing,
       memoryReset: config.crossing && config.resetMemory
           ? 'memory_reset'
@@ -221,6 +226,7 @@ class DmaBench {
     final gates = {
       if (config.axiGate)
         for (final c in AxiStallGate.channels.keys) c: Logic(name: 'pass_$c'),
+      if (config.bReorder) 'b': Logic(name: 'pass_b'),
     };
     final resetStatus = config.resetStatus
         ? Logic(name: 'reset_status', width: 64)
@@ -299,7 +305,8 @@ class DmaBench {
   };
 
   /// Holds AXI channel [channel] (`ar`, `r`, `aw`, `w` or `b`) while
-  /// [held] is set. Needs [DmaConfig.axiGate].
+  /// [held] is set. Needs [DmaConfig.axiGate], or [DmaConfig.bReorder] for
+  /// `b`.
   void hold(String channel, {bool held = true}) =>
       _gates[channel]!.inject(held ? 0 : 1);
 

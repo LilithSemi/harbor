@@ -150,7 +150,7 @@ class HarborKeyframeDecodeTile2x2 extends BridgeModule {
             0,
             2,
           ),
-      ].swizzle();
+      ].concat();
       final reconYModes = ymCap;
       final reconTxTypes = ttCap;
       final reconCoeffs = [
@@ -158,12 +158,12 @@ class HarborKeyframeDecodeTile2x2 extends BridgeModule {
           Const(0, width: 192 * 16),
           coeffCap.getRange(l * 64 * 16, l * 64 * 16 + 64 * 16),
         ],
-      ].swizzle();
+      ].concat();
       int posVal(int row, int col) => row | (col << miBits);
       final reconPositions = [
         for (var l = maxLeaves - 1; l >= 0; l--)
           Const(posVal(l >> 1, l & 1), width: 2 * miBits),
-      ].swizzle();
+      ].concat();
       return (
         leafCount: reconLeafCount,
         positions: reconPositions,
@@ -232,12 +232,12 @@ class HarborKeyframeDecodeTile2x2 extends BridgeModule {
     Logic bottomRow(Logic fr) => [
       for (var c = f - 1; c >= 0; c--)
         fr.getRange((7 * f + c) * 8, (7 * f + c) * 8 + 8),
-    ].swizzle();
+    ].concat();
     // right column: frame[(r*f + 7)] for r = 0..7.
     Logic rightCol(Logic fr) => [
       for (var rr = f - 1; rr >= 0; rr--)
         fr.getRange((rr * f + (f - 1)) * 8, (rr * f + (f - 1)) * 8 + 8),
-    ].swizzle();
+    ].concat();
     // bottom-right pixel: frame[(7*f + 7)].
     Logic brPixel(Logic fr) =>
         fr.getRange((7 * f + (f - 1)) * 8, (7 * f + (f - 1)) * 8 + 8);
@@ -304,7 +304,7 @@ class HarborKeyframeDecodeTile2x2 extends BridgeModule {
     }
     // swizzle: tilePix[0] is tile pixel (0,0) -> low byte of frame.
     output('frame') <=
-        [for (var i = tilePix.length - 1; i >= 0; i--) tilePix[i]].swizzle();
+        [for (var i = tilePix.length - 1; i >= 0; i--) tilePix[i]].concat();
 
     // sequencing FSM. walk SB0..SB3 (latching each), then recon SB0..SB3 in
     // raster (each recon's neighbour inputs are stable before it runs).

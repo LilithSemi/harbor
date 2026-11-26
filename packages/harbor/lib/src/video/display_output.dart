@@ -8,6 +8,9 @@ import '../peripherals/display.dart';
 /// a transmitter chip that wants parallel timing instead of TMDS (for example
 /// the SiI9134 on Glacier's AX7203 board).
 ///
+/// Adv7511 drives 16 bit YCbCr 4:2:2 with syncs and a pixel clock for the
+/// ADV7511 transmitter, see [HarborAdv7511PinStage].
+///
 /// VGA is the same parallel RGB signal set, wired to a resistor DAC instead of
 /// a transmitter chip, so it needs no new backend here, only DAC-facing board
 /// wiring; it is not enabled by this set until that wiring exists.
@@ -17,6 +20,7 @@ const Set<HarborDisplayInterface> _supportedDisplayOutputs = {
   HarborDisplayInterface.dvi,
   HarborDisplayInterface.hdmi,
   HarborDisplayInterface.parallelRgb,
+  HarborDisplayInterface.adv7511,
 };
 
 /// Whether Harbor can currently drive [type].

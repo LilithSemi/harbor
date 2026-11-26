@@ -413,7 +413,7 @@ class HarborAudioController extends BridgeModule
       readAddr:
           (txDmaAddr +
                   txDmaRd +
-                  mux(inRight, Const(4, width: 32), Const(0, width: 32)))
+                  mux<Logic>(inRight, Const(4, width: 32), Const(0, width: 32)))
               .slice(dmaAddressWidth - 1, 0)
               .zeroExtend(dmaAddressWidth)
               .named('dma_read_addr'),
@@ -437,7 +437,7 @@ class HarborAudioController extends BridgeModule
       reset: reset | ~play,
       depth: txFifoDepth,
       pushValid: pushValid,
-      pushData: [readData.slice(23, 0), leftSample].swizzle(),
+      pushData: [readData.slice(23, 0), leftSample].concat(),
       popReady: popReady,
       resetEntries: true,
     );
@@ -463,7 +463,7 @@ class HarborAudioController extends BridgeModule
             then: [
               leftSample < readData.slice(23, 0),
               fState <
-                  mux(
+                  mux<Logic>(
                     readErr | ~play,
                     Const(fIdle, width: 2),
                     Const(fRight, width: 2),
@@ -498,7 +498,7 @@ class HarborAudioController extends BridgeModule
     final readFail = (readValid & readErr & ~fetchIdle).named('dma_fail');
     final regWrite = (bus.stb & ~bus.ack & bus.we).named('reg_write');
     Logic writes(int offset) => regWrite & regAddr.eq(Const(offset, width: 12));
-    Logic aligned(Logic v) => [v.getRange(3), Const(0, width: 3)].swizzle();
+    Logic aligned(Logic v) => [v.getRange(3), Const(0, width: 3)].concat();
     final wrNew = aligned(bus.selMerge(txDmaWr, 0x40)).named('tx_dma_wr_new');
     final rdNew = aligned(bus.selMerge(txDmaRd, 0x48)).named('tx_dma_rd_new');
     Logic pastSize(Logic v) => v.gte(txDmaSize) & v.neq(0);
@@ -526,7 +526,7 @@ class HarborAudioController extends BridgeModule
       Const(0, width: 2),
       play & ringLow,
       play & ringEmpty,
-    ].swizzle().named('int_set');
+    ].concat().named('int_set');
 
     final intClear = mux(
       writes(0x70),
@@ -547,7 +547,7 @@ class HarborAudioController extends BridgeModule
       dry,
       ringLow,
       ringEmpty,
-    ].swizzle();
+    ].concat();
 
     // I2S clock generation (simplified: divider chain from system clock)
     final mclkDiv = Logic(name: 'mclk_div', width: 8);
@@ -761,7 +761,7 @@ class HarborAudioController extends BridgeModule
                 // TX_DMA_ERR (W1C below)
                 CaseItem(Const(0xA0, width: 12), [
                   bus.dataOut <
-                      [errPtr, errTimeout, errBus].swizzle().zeroExtend(32),
+                      [errPtr, errTimeout, errBus].concat().zeroExtend(32),
                 ]),
                 // CODEC_CAPS
                 CaseItem(Const(0x110, width: 12), [

@@ -47,7 +47,7 @@ class HarborInverseDct4 extends BridgeModule {
     // Arithmetic round-shift by 12 (add 2048 first).
     Logic roundShift(Logic x) {
       final r = (x + Const(2048, width: w)).getRange(0, w);
-      return [r[w - 1].replicate(12), r.getRange(12, w)].swizzle();
+      return [r[w - 1].replicate(12), r.getRange(12, w)].concat();
     }
 
     // 1D inverse over a length-4 input vector: out[i] = round(sum_k M[k][i]*in[k]).
@@ -80,6 +80,6 @@ class HarborInverseDct4 extends BridgeModule {
       }
     }
 
-    output('residual') <= out.reversed.toList().swizzle();
+    output('residual') <= out.reversed.toList().concat();
   }
 }

@@ -173,12 +173,12 @@ class HarborInvTxfm extends BridgeModule {
 
     Logic kc(int v) => Const(BigInt.from(v).toUnsigned(w), width: w);
     Logic ashr(Logic x, int s) =>
-        s == 0 ? x : [x[w - 1].replicate(s), x.getRange(s, w)].swizzle();
+        s == 0 ? x : [x[w - 1].replicate(s), x.getRange(s, w)].concat();
     // Reinterpret the low 32 bits as signed (libaom `(int32_t)`). At w == 32
     // this is the identity (the value already is the low 32 bits).
     Logic s32(Logic v) => w == 32
         ? v.getRange(0, 32)
-        : [v[31].replicate(w - 32), v.getRange(0, 32)].swizzle();
+        : [v[31].replicate(w - 32), v.getRange(0, 32)].concat();
     Logic addW(Logic a, Logic b) => (a + b).getRange(0, w);
     Logic subW(Logic a, Logic b) => (a - b).getRange(0, w);
     Logic mulW(Logic a, int k) => (a * kc(k)).getRange(0, w);
@@ -1620,7 +1620,7 @@ class HarborInvTxfm extends BridgeModule {
 
     output('done') <= state.eq(Const(sDone, width: 2));
     output('residual') <=
-        [for (var i = txw * txh - 1; i >= 0; i--) resReg[i]].swizzle();
+        [for (var i = txw * txh - 1; i >= 0; i--) resReg[i]].concat();
 
     Sequential(clk, [
       If(

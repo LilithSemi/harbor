@@ -3,6 +3,68 @@ import 'package:test/test.dart';
 
 void main() {
   group('HarborDeviceTreeGenerator', () {
+    test('an ESP32 child on the SPI node refers to the GPIO node', () {
+      final gpio = HarborGpio(baseAddress: 0x10001000, pinCount: 16);
+      final spi = HarborSpiController(
+        baseAddress: 0x10002000,
+        children: [
+          HarborDeviceTreeChild(
+            name: 'wifi@0',
+            properties: {
+              'compatible': 'espressif,esp32-spi',
+              'reg': 0,
+              'spi-max-frequency': 10000000,
+              'spi-cpol': true,
+              'reset-gpios': HarborDeviceTreeCells([
+                HarborDeviceTreeRef(gpio.dtLabel),
+                0,
+                1,
+              ]),
+              'handshake-gpios': HarborDeviceTreeCells([
+                HarborDeviceTreeRef(gpio.dtLabel),
+                1,
+                0,
+              ]),
+              'data-ready-gpios': HarborDeviceTreeCells([
+                HarborDeviceTreeRef(gpio.dtLabel),
+                2,
+                0,
+              ]),
+            },
+          ),
+        ],
+      );
+      final dts = HarborDeviceTreeGenerator(
+        model: 'Test SoC',
+        compatible: 'test,soc-v1',
+        peripherals: [gpio, spi],
+      ).generate();
+
+      expect(dts, contains('gpio: gpio@10001000 {'));
+      expect(dts, isNot(contains('sifive,gpio0')));
+      expect(
+        dts,
+        contains('''
+        spi@10002000 {
+            compatible = "harbor,spi", "opencores,spi-oc";
+            reg = <0x10002000 0x1000>;
+            num-cs = <1>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            wifi@0 {
+                compatible = "espressif,esp32-spi";
+                reg = <0>;
+                spi-max-frequency = <10000000>;
+                spi-cpol;
+                reset-gpios = <&gpio 0 1>;
+                handshake-gpios = <&gpio 1 0>;
+                data-ready-gpios = <&gpio 2 0>;
+            };
+        };
+'''),
+      );
+    });
+
     test('generates valid DTS with CPUs and peripherals', () {
       final clint = HarborClint(baseAddress: 0x02000000);
       final plic = HarborPlic(baseAddress: 0x0C000000, sources: 32);
@@ -42,6 +104,55 @@ void main() {
       expect(dts, contains('clock-frequency'));
     });
 
+    test('emits the isa-base and isa-extensions pair', () {
+      final dts = HarborDeviceTreeGenerator(
+        model: 'Test SoC',
+        compatible: 'test,soc-v1',
+        cpus: [
+          HarborCpu(
+            hartId: 0,
+            isa: 'rv64imafdc_zicsr_zifencei_sstc',
+            isaBase: 'rv64i',
+            isaExtensions: const [
+              'i',
+              'm',
+              'a',
+              'f',
+              'd',
+              'c',
+              'zicsr',
+              'zifencei',
+              'sstc',
+            ],
+            mmu: 'riscv,sv39',
+          ),
+        ],
+        peripherals: [HarborClint(baseAddress: 0x02000000)],
+      ).generate();
+
+      expect(dts, contains('riscv,isa-base = "rv64i"'));
+      expect(
+        dts,
+        contains(
+          'riscv,isa-extensions = "i", "m", "a", "f", "d", "c", '
+          '"zicsr", "zifencei", "sstc";',
+        ),
+      );
+    });
+
+    test('leaves the pair out when the caller gives no extension list', () {
+      final dts = HarborDeviceTreeGenerator(
+        model: 'Test SoC',
+        compatible: 'test,soc-v1',
+        cpus: [HarborCpu(hartId: 0, isa: 'rv64imac')],
+        peripherals: [HarborClint(baseAddress: 0x02000000)],
+      ).generate();
+
+      expect(dts, contains('riscv,isa = "rv64imac"'));
+      expect(dts, isNot(contains('riscv,isa-base')));
+      expect(dts, isNot(contains('riscv,isa-extensions')));
+    });
+
     test('emits a device_type=memory root node for RAM spans', () {
       final dts = HarborDeviceTreeGenerator(
         model: 'Mem SoC',
@@ -66,6 +177,28 @@ void main() {
       ).generate();
 
       expect(dts, contains('timebase-frequency = <25000000>;'));
+      // Linux reads it from /cpus, so it must sit right under that node.
+      expect(
+        dts,
+        contains(
+          '    cpus {\n'
+          '        #address-cells = <1>;\n'
+          '        #size-cells = <0>;\n'
+          '        timebase-frequency = <25000000>;\n',
+        ),
+      );
+    });
+
+    test('rejects harts with different timebase-frequency values', () {
+      final gen = HarborDeviceTreeGenerator(
+        model: 'Mixed SoC',
+        compatible: 'test,mixed-v1',
+        cpus: [
+          HarborCpu(hartId: 0, isa: 'rv64imac', timebaseFrequency: 25000000),
+          HarborCpu(hartId: 1, isa: 'rv64imac', timebaseFrequency: 10000000),
+        ],
+      );
+      expect(gen.generate, throwsArgumentError);
     });
 
     test('generates minimal DTS without CPUs', () {
@@ -92,6 +225,85 @@ void main() {
 
       expect(dts, contains('cpu@0'));
       expect(dts, contains('cpu@1'));
+    });
+  });
+
+  group('HarborDeviceTreeGenerator labels and interrupt domains', () {
+    String gen(
+      List<HarborDeviceTreeNodeProvider> p, {
+      Map<HarborDeviceTreeNodeProvider, List<int>> irqs = const {},
+    }) => HarborDeviceTreeGenerator(
+      model: 'm',
+      compatible: 'c',
+      peripherals: p,
+      interrupts: irqs,
+    ).generate();
+
+    test('a GPIO without an interrupt is not an interrupt controller', () {
+      final gpio = HarborGpio(baseAddress: 0x10001000);
+      final dts = gen([gpio]);
+      expect(dts, isNot(contains('interrupt-controller')));
+      expect(dts, isNot(contains('#interrupt-cells')));
+    });
+
+    test('a GPIO with an interrupt writes its interrupt domain', () {
+      final gpio = HarborGpio(baseAddress: 0x10001000);
+      final dts = gen(
+        [gpio],
+        irqs: {
+          gpio: [5],
+        },
+      );
+      expect(dts, contains('interrupts = <0x5>;'));
+      expect(dts, contains('interrupt-controller;'));
+      expect(dts, contains('#interrupt-cells = <2>;'));
+    });
+
+    test('two nodes with the same label are refused', () {
+      final a = HarborGpio(baseAddress: 0x10001000);
+      final b = HarborGpio(baseAddress: 0x10002000);
+      expect(
+        () => gen([a, b]),
+        throwsA(isA<ArgumentError>().having((e) => e.name, 'name', 'label')),
+      );
+      final named = HarborGpio(baseAddress: 0x10002000, dtLabel: 'gpio1');
+      expect(gen([a, named]), contains('gpio1: gpio@10002000'));
+    });
+
+    test('a reference to a missing label is refused', () {
+      final spi = HarborSpiController(
+        baseAddress: 0x10002000,
+        children: [
+          HarborDeviceTreeChild(
+            name: 'dev@0',
+            properties: {
+              'reg': 0,
+              'reset-gpios': HarborDeviceTreeCells([
+                HarborDeviceTreeRef('nogpio'),
+                0,
+                0,
+              ]),
+            },
+          ),
+        ],
+      );
+      expect(
+        () => gen([spi]),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.name,
+            'name',
+            'HarborDeviceTreeRef',
+          ),
+        ),
+      );
+    });
+
+    test('a label on an interrupt controller is used', () {
+      final plic = _LabelledController();
+      final dts = gen([plic]);
+      expect(dts, contains('myintc: labelled@c000000'));
+      expect(dts, contains('interrupt-parent = <&myintc>;'));
     });
   });
 
@@ -149,5 +361,65 @@ void main() {
       expect(node.toString(), contains('ns16550a'));
       expect(node.toString(), contains('0x10000000'));
     });
+
+    group('model and cpu naming', () {
+      String gen({String model = 'Test SoC', List<HarborCpu>? cpus}) =>
+          HarborDeviceTreeGenerator(
+            model: model,
+            compatible: 'test,soc-v1',
+            cpus: cpus ?? [HarborCpu(hartId: 0, isa: 'rv64imac')],
+          ).generate();
+
+      test('default cpu node is unchanged', () {
+        final dts = gen();
+        expect(dts, contains('    model = "Test SoC";\n'));
+        expect(dts, contains('            compatible = "riscv";\n'));
+        expect(
+          RegExp(r'^\s+model = ', multiLine: true).allMatches(dts).length,
+          equals(1),
+        );
+      });
+
+      test('cpu model and vendor compatible are emitted', () {
+        final dts = gen(
+          model: 'Delta V1',
+          cpus: [
+            HarborCpu(
+              hartId: 0,
+              isa: 'rv64imac',
+              model: 'River RC1.f',
+              compatible: ['lilith,river-rc1f'],
+            ),
+            HarborCpu(
+              hartId: 1,
+              isa: 'rv64imac',
+              model: 'River RC1.f',
+              compatible: ['lilith,river-rc1f'],
+            ),
+          ],
+        );
+        expect(dts, contains('    model = "Delta V1";\n'));
+        expect('model = "River RC1.f";'.allMatches(dts).length, equals(2));
+        expect(
+          'compatible = "lilith,river-rc1f", "riscv";'.allMatches(dts).length,
+          equals(2),
+        );
+      });
+
+      test('strings are escaped', () {
+        final dts = gen(model: 'A "quoted" \\ name');
+        expect(dts, contains(r'model = "A \"quoted\" \\ name";'));
+      });
+    });
   });
+}
+
+class _LabelledController with HarborDeviceTreeNodeProvider {
+  @override
+  HarborDeviceTreeNode get dtNode => HarborDeviceTreeNode(
+    compatible: ['test,labelled'],
+    reg: BusAddressRange(0x0C000000, 0x1000),
+    interruptController: true,
+    label: 'myintc',
+  );
 }

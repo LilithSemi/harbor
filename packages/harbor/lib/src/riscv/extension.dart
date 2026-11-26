@@ -29,6 +29,17 @@ class RiscVExtension {
   /// misa mask value. Computed from [misaBit] if set.
   int get mask => misaBit != null ? (1 << misaBit!) : 0;
 
+  /// Whether the entry names a real extension in the device tree property
+  /// `riscv,isa-extensions`. False for an entry that groups instructions
+  /// without being an extension name of its own, like the privileged
+  /// architecture.
+  final bool hasDtName;
+
+  /// The device tree name, lowercase, or null when the entry has none. The
+  /// single-letter extensions use their misa letter and the named ones use
+  /// their full name, which is what the binding lists.
+  String? get dtName => hasDtName ? (key ?? name).toLowerCase() : null;
+
   /// All operations defined by this extension.
   final List<RiscVOperation> operations;
 
@@ -37,6 +48,7 @@ class RiscVExtension {
     this.key,
     this.misaBit,
     this.operations = const [],
+    this.hasDtName = true,
   });
 
   /// Finds the first operation that decodes [instruction], skipping ops that

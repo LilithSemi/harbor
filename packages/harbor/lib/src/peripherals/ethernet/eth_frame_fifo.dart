@@ -19,7 +19,7 @@ Logic _grayToBin(Logic g) {
   for (var i = n - 2; i >= 0; i--) {
     bits[i] = bits[i + 1]! ^ g[i];
   }
-  return bits.reversed.map((b) => b!).toList().swizzle();
+  return bits.reversed.map((b) => b!).toList().concat();
 }
 
 Logic _byteOf(Logic word, Logic idx) => mux(
@@ -379,7 +379,7 @@ class HarborEthTxFrameFifo extends Module {
         fBin < _grayToBin(fGrayS1),
         full < usedNow.gte(words - 1),
         freeR <
-            mux(
+            mux<Logic>(
               usedNow.gte(words - 1),
               Const(0, width: pw),
               Const(words - 1, width: pw) - usedNow,
@@ -434,7 +434,7 @@ class HarborEthTxFrameFifo extends Module {
       wrClk: sysClk,
       wrEn: store,
       wrAddr: wPtr.getRange(0, aw),
-      wrData: [wLast, mux(wLast, wBytes, Const(0, width: 2)), wData].swizzle(),
+      wrData: [wLast, mux(wLast, wBytes, Const(0, width: 2)), wData].concat(),
       rdClk: txClk,
       rdReset: txRst,
       rdEn: fetch,
@@ -475,7 +475,6 @@ class HarborEthTxFrameFifo extends Module {
       If(
         load,
         then: [
-          cur < ram,
           curValid < Const(1),
           bi < Const(0, width: 2),
           If(ramLast, then: [doneFrames < doneFrames + 1]),
@@ -491,6 +490,9 @@ class HarborEthTxFrameFifo extends Module {
         ],
       ),
     ], reset: txRst);
+    Sequential(txClk, [
+      If(load, then: [cur < ram]),
+    ]);
 
     inValid <= curValid;
     outBusy <= availR | ramValid | curValid;
@@ -612,12 +614,8 @@ class HarborEthRxFrameFifo extends Module {
     final inDataR = Logic(name: 'in_data_r', width: 8);
     final inLastR = Logic(name: 'in_last_r');
     final inStatusR = Logic(name: 'in_status_r', width: 8);
-    Sequential(rxClk, [
-      inValidR < inValid,
-      inDataR < inData,
-      inLastR < inLast,
-      inStatusR < inStatus,
-    ], reset: rxReset);
+    Sequential(rxClk, [inValidR < inValid, inLastR < inLast], reset: rxReset);
+    Sequential(rxClk, [inDataR < inData, inStatusR < inStatus]);
     inValid = inValidR;
     inData = inDataR;
     inLast = inLastR;
@@ -668,8 +666,8 @@ class HarborEthRxFrameFifo extends Module {
       mux(inLast, inStatus, Const(0, width: 8)),
       inLast,
       mux(inLast, bi + 1, Const(0, width: 2)),
-      lanes.reversed.toList().swizzle(),
-    ].swizzle().named('w_word');
+      lanes.reversed.toList().concat(),
+    ].concat().named('w_word');
     final wPtrNext = mux(
       overflow,
       wStart,
@@ -689,7 +687,7 @@ class HarborEthRxFrameFifo extends Module {
           If(
             take,
             then: [
-              acc < lanes.sublist(0, 3).reversed.toList().swizzle(),
+              acc < lanes.sublist(0, 3).reversed.toList().concat(),
               bi < bi + 1,
             ],
           ),
@@ -785,15 +783,17 @@ class HarborEthRxFrameFifo extends Module {
           then: [doneFrames < doneNext, doneNext < doneNext + 1],
         ),
         qN < qN + move.zeroExtend(2) - pop.zeroExtend(2),
-        If.block([
-          Iff(pop, [q0 < mux(qN[1], q1, ram)]),
-          ElseIf(qN.eq(0), [q0 < ram]),
-        ]),
-        If(move & ~pop & qN.eq(1), then: [q1 < ram]),
       ],
       reset: sysRst,
       resetValues: {doneNext: Const(1, width: pw)},
     );
+    Sequential(sysClk, [
+      If.block([
+        Iff(pop, [q0 < mux(qN[1], q1, ram)]),
+        ElseIf(qN.eq(0), [q0 < ram]),
+      ]),
+      If(move & ~pop & qN.eq(1), then: [q1 < ram]),
+    ]);
 
     final xValid = (rAbort | headValid).named('x_valid');
     final xLast = (rAbort | q0[34]).named('x_last');
@@ -802,7 +802,7 @@ class HarborEthRxFrameFifo extends Module {
       xLast,
       mux(rAbort, Const(0, width: 2), q0.getRange(32, 34)),
       mux(rAbort, Const(0, width: 32), q0.getRange(0, 32)),
-    ].swizzle().named('x_word');
+    ].concat().named('x_word');
     final xTake = (xValid & sReady).named('x_take');
 
     Sequential(sysClk, [
@@ -825,15 +825,24 @@ class HarborEthRxFrameFifo extends Module {
         then: [
           If(
             skValid,
-            then: [oWord < skWord, oValid < Const(1), skValid < Const(0)],
-            orElse: [oWord < xWord, oValid < xValid],
+            then: [oValid < Const(1), skValid < Const(0)],
+            orElse: [oValid < xValid],
           ),
         ],
         orElse: [
-          If(xTake, then: [skWord < xWord, skValid < Const(1)]),
+          If(xTake, then: [skValid < Const(1)]),
         ],
       ),
     ], reset: sysReset);
+    Sequential(sysClk, [
+      If(
+        ~oValid | rReady,
+        then: [oWord < mux(skValid, skWord, xWord)],
+        orElse: [
+          If(xTake, then: [skWord < xWord]),
+        ],
+      ),
+    ]);
     rValid <= oValid;
     rData <= oWord.getRange(0, 32);
     rBytes <= oWord.getRange(32, 34);

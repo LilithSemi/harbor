@@ -12,7 +12,7 @@ void main() {
       'clash between its tx84/tx48 and pred84/pred48 siblings)', () async {
     final dut = HarborKeyframeDecodeHorzVert();
     await dut.build();
-    final sv = dut.generateSynth();
+    final sv = dut.dumpSystemVerilog();
 
     for (final prefix in ['HarborInvTxfm', 'HarborIntraPredRect']) {
       final names = RegExp(
@@ -30,7 +30,7 @@ void main() {
       'shapes, luma + chroma)', () async {
     final dut = HarborKeyframeDecodeHorzVertYuv();
     await dut.build();
-    final sv = dut.generateSynth();
+    final sv = dut.dumpSystemVerilog();
 
     for (final prefix in ['HarborInvTxfm', 'HarborIntraPredRect']) {
       final names = RegExp(

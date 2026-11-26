@@ -150,7 +150,7 @@ class PcieGpuTop extends BridgeModule {
       );
       addSubModule(rom!);
       romStatus <=
-          [rom!.output('completions'), rom!.output('rom_reads')].swizzle();
+          [rom!.output('completions'), rom!.output('rom_reads')].concat();
     }
     HarborPcieRouter(
       clk: clk,

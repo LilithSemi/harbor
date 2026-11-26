@@ -127,7 +127,8 @@ class HarborDmaController extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// Outstanding requests the master memory port carries. Fixed at 1: the
   /// engine never has more than one read or write beat in flight.
   static const int masterOutstanding = 1;
@@ -529,9 +530,8 @@ class HarborDmaController extends BridgeModule
           activeCh < Const(0, width: channels.bitLength),
           dmaState < Const(sIdle, width: 3),
           xferCount < Const(0, width: 24),
-          readData < Const(0, width: dataWidth),
-          curSrc < Const(0, width: addressWidth),
-          curDst < Const(0, width: addressWidth),
+          // The beat data and the working pointers load before use and take
+          // no reset.
           reqSent < Const(0),
           wSent < Const(0),
           if (source == HarborDmaSource.peripheralStream)

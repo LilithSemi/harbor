@@ -93,13 +93,13 @@ class HarborKeyframeDecodeRoot64 extends BridgeModule {
     final reconLog2 = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         (l2Cap.getRange(l * 3, l * 3 + 3) - Const(2, width: 3)).getRange(0, 2),
-    ].swizzle();
+    ].concat();
     final reconCoeffs = coeffCap;
     int posVal(int row, int col) => row | (col << miBits);
     final reconPositions = [
       for (var l = maxLeaves - 1; l >= 0; l--)
         Const(posVal((l >> 1) * 8, (l & 1) * 8), width: 2 * miBits),
-    ].swizzle();
+    ].concat();
 
     recon.input('clk').srcConnection! <= clk;
     recon.input('reset').srcConnection! <= reset;

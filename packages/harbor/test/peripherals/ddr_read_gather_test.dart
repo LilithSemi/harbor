@@ -15,13 +15,13 @@ import 'package:test/test.dart';
 /// and IS sim-visible). It locks in the gather order: for every bitslip 0..7 and
 /// every requested word 0..3, the two beats that land in the fabric word are the
 /// correct pair from the rotated 8-beat burst, and the packing half-order
-/// (packWord = [evenBeat, oddBeat].swizzle, the HW-verified within-word order)
+/// (packWord = [evenBeat, oddBeat].concat, the HW-verified within-word order)
 /// is preserved.
 void main() {
   // Mirror of the PHY's alignedBeat()/packWord(): the same 8-position rotation
   // and half-pack the RTL uses, computed in Dart so the test is the golden model.
   int alignedBeat(List<int> hist8, int slp, int p) => hist8[(slp + p) % 8];
-  // packWord(evenBeat, oddBeat) = [oddBeat, evenBeat].swizzle() -> the ODD beat in
+  // packWord(evenBeat, oddBeat) = [oddBeat, evenBeat].concat() -> the ODD beat in
   // the MSBs (HALF-SWAP FIX 2026-07-11). The WRITE path packs the EVEN beat = rise =
   // low16 and the ODD beat = fall = high16, so to round-trip a written word EXACTLY
   // the read must put the odd beat (high16) in the MSBs: readWord = (odd<<16)|even.

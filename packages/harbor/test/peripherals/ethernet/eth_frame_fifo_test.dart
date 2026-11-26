@@ -1130,8 +1130,8 @@ void main() {
         await tx.build();
         await rx.build();
         expect(tx.usesBlockRam, target != null);
-        final txSv = tx.generateSynth();
-        final rxSv = rx.generateSynth();
+        final txSv = tx.dumpSystemVerilog();
+        final rxSv = rx.dumpSystemVerilog();
         if (target == null) {
           expect(tx.definitionName, 'HarborEthTxFrameFifo_4096');
           expect(txSv, contains('HarborEthFrameStore_35x1024'));

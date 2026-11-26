@@ -219,7 +219,7 @@ void main() {
     );
     await csc.build();
     expect(csc.definitionName, 'HarborCsc_ecp5');
-    final sv = csc.generateSynth();
+    final sv = csc.dumpSystemVerilog();
     expect(RegExp(r'MULT18X18D\s*#').allMatches(sv), hasLength(9));
     expect(sv, contains('.REG_OUTPUT_CLK("CLK0")'));
   });

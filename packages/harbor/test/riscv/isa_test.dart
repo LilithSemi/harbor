@@ -266,4 +266,96 @@ void main() {
       expect(isa.effectivePagingModes, isNot(contains(RiscVPagingMode.sv32)));
     });
   });
+
+  group('device tree ISA', () {
+    // The pattern from the riscv,isa property in the kernel's
+    // Documentation/devicetree/bindings/riscv/extensions.yaml. A string that
+    // fails it is one an OS is free to reject.
+    final isaPattern = RegExp(
+      r'^rv(?:64|32)imaf?d?q?c?b?k?j?p?v?h?'
+      r'(?:[hsxz](?:[0-9a-z])+)?(?:_[hsxz](?:[0-9a-z])+)*$',
+    );
+
+    test('names every extension, not only the single letters', () {
+      final isa = RiscVIsaConfig(
+        mxlen: RiscVMxlen.rv64,
+        extensions: [
+          rvC,
+          rvZicsr,
+          rvZifencei,
+          rvM,
+          rvA,
+          rvF,
+          rvD,
+          rvZcd,
+          rvPriv,
+          rvSstc,
+          rv64i,
+          rv32i,
+        ],
+        hasSupervisor: true,
+        hasUser: true,
+      );
+      expect(isa.dtIsaBase, equals('rv64i'));
+      expect(
+        isa.dtIsaExtensions,
+        equals([
+          'i',
+          'm',
+          'a',
+          'f',
+          'd',
+          'c',
+          'zicsr',
+          'zifencei',
+          'zca',
+          'zcd',
+          'sstc',
+        ]),
+      );
+      expect(isa.dtIsaString, equals('rv64imafdc_zicsr_zifencei_zca_zcd_sstc'));
+      expect(isa.dtIsaString, matches(isaPattern));
+    });
+
+    test('drops the privilege modes and the privileged architecture', () {
+      final isa = RiscVIsaConfig(
+        mxlen: RiscVMxlen.rv64,
+        extensions: [rv64i, rv32i, rvM, rvA, rvC, rvPriv],
+        hasSupervisor: true,
+        hasUser: true,
+      );
+      // Supervisor and user are not extension names. The old string appended
+      // them as letters, which no OS accepts.
+      expect(isa.dtIsaString, equals('rv64imac'));
+      expect(isa.dtIsaExtensions, isNot(contains('priv')));
+      expect(isa.dtIsaExtensions, isNot(contains('s')));
+      expect(isa.dtIsaExtensions, isNot(contains('u')));
+      expect(isa.dtIsaString, matches(isaPattern));
+    });
+
+    test('reports Zca with Zcd, which the binding requires', () {
+      final isa = RiscVIsaConfig(
+        mxlen: RiscVMxlen.rv64,
+        extensions: [rv64i, rv32i, rvM, rvA, rvF, rvD, rvC, rvZcd],
+      );
+      expect(isa.dtIsaExtensions, contains('zca'));
+      expect(isa.dtIsaExtensions, contains('d'));
+    });
+
+    test('rv32 reports its own base', () {
+      final isa = RiscVIsaConfig(
+        mxlen: RiscVMxlen.rv32,
+        extensions: [rv32i, rvM, rvA, rvC, rvZicsr, rvZifencei],
+      );
+      expect(isa.dtIsaBase, equals('rv32i'));
+      expect(isa.dtIsaString, equals('rv32imac_zicsr_zifencei'));
+      expect(isa.dtIsaString, matches(isaPattern));
+    });
+
+    test('a hart with no I base reports no base', () {
+      final isa = RiscVIsaConfig(mxlen: RiscVMxlen.rv64, extensions: [rvC]);
+      expect(isa.dtIsaBase, isNull);
+      expect(isa.dtIsaString, equals('rv64'));
+    });
+  });
 }

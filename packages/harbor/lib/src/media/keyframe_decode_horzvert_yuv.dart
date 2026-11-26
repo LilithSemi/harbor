@@ -153,13 +153,13 @@ class HarborKeyframeDecodeHorzVertYuv extends BridgeModule {
     final isLeaf1 = leaf;
     final py = mux(
       isHorz,
-      mux(isLeaf1, Const(4, width: 4), Const(0, width: 4)),
+      mux<Logic>(isLeaf1, Const(4, width: 4), Const(0, width: 4)),
       Const(0, width: 4),
     );
     final px = mux(
       isHorz,
       Const(0, width: 4),
-      mux(isLeaf1, Const(4, width: 4), Const(0, width: 4)),
+      mux<Logic>(isLeaf1, Const(4, width: 4), Const(0, width: 4)),
     );
 
     final haveA = mux(
@@ -206,9 +206,9 @@ class HarborKeyframeDecodeHorzVertYuv extends BridgeModule {
     pred84.input('have_above').srcConnection! <= haveA;
     pred84.input('have_left').srcConnection! <= haveL;
     pred84.input('above').srcConnection! <=
-        [for (var i = 8 - 1; i >= 0; i--) aboveSel[i]].swizzle();
+        [for (var i = 8 - 1; i >= 0; i--) aboveSel[i]].concat();
     pred84.input('left').srcConnection! <=
-        [for (var i = 4 - 1; i >= 0; i--) leftSel[i]].swizzle();
+        [for (var i = 4 - 1; i >= 0; i--) leftSel[i]].concat();
     pred84.input('above_left').srcConnection! <= cornerSel;
 
     final pred48 = HarborIntraPredRect(bw: 4, bh: 8, name: 'pred48');
@@ -217,9 +217,9 @@ class HarborKeyframeDecodeHorzVertYuv extends BridgeModule {
     pred48.input('have_above').srcConnection! <= haveA;
     pred48.input('have_left').srcConnection! <= haveL;
     pred48.input('above').srcConnection! <=
-        [for (var i = 4 - 1; i >= 0; i--) aboveSel[i]].swizzle();
+        [for (var i = 4 - 1; i >= 0; i--) aboveSel[i]].concat();
     pred48.input('left').srcConnection! <=
-        [for (var i = 8 - 1; i >= 0; i--) leftSel[i]].swizzle();
+        [for (var i = 8 - 1; i >= 0; i--) leftSel[i]].concat();
     pred48.input('above_left').srcConnection! <= cornerSel;
 
     // rect inverse transforms: one per (kind, tx_type).
@@ -282,7 +282,7 @@ class HarborKeyframeDecodeHorzVertYuv extends BridgeModule {
     Logic recon84Px(int idx) => recon84.getRange(idx * 8, idx * 8 + 8);
     Logic recon48Px(int idx) => recon48.getRange(idx * 8, idx * 8 + 8);
 
-    final lumaFrame = [for (var i = nPix - 1; i >= 0; i--) frame[i]].swizzle();
+    final lumaFrame = [for (var i = nPix - 1; i >= 0; i--) frame[i]].concat();
     output('luma') <= lumaFrame;
 
     // chroma recon blocks (U then V)
@@ -315,7 +315,7 @@ class HarborKeyframeDecodeHorzVertYuv extends BridgeModule {
             return ((a + b + cc2 + d) << 1).getRange(0, cflAcBits);
           })(),
     ];
-    final cflAcPacked = [for (var k = cN - 1; k >= 0; k--) cflAc[k]].swizzle();
+    final cflAcPacked = [for (var k = cN - 1; k >= 0; k--) cflAc[k]].concat();
 
     // chroma derivations (const muxes on uvModeCap).
     Logic romSel(List<int> table, Logic idx, int w) {

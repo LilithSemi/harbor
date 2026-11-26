@@ -76,9 +76,9 @@ class HarborIntraPredFull extends BridgeModule {
     dr.input('mode').srcConnection! <= mode;
     dr.input('angle_delta').srcConnection! <= input('angle_delta');
     dr.input('above').srcConnection! <=
-        [for (var i = 2 * bs - 1; i >= 0; i--) aboveC[i]].swizzle();
+        [for (var i = 2 * bs - 1; i >= 0; i--) aboveC[i]].concat();
     dr.input('left').srcConnection! <=
-        [for (var i = 2 * bs - 1; i >= 0; i--) leftC[i]].swizzle();
+        [for (var i = 2 * bs - 1; i >= 0; i--) leftC[i]].concat();
     dr.input('corner').srcConnection! <= cornerC;
 
     final directional =

@@ -31,7 +31,8 @@ class HarborPwmTimer extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// Number of timer/PWM channels.
   final int channels;
 
@@ -137,7 +138,7 @@ class HarborPwmTimer extends BridgeModule
 
     interrupt <=
         (intStatus &
-                [for (var i = channels - 1; i >= 0; i--) chIrqEn[i]].swizzle())
+                [for (var i = channels - 1; i >= 0; i--) chIrqEn[i]].concat())
             .or();
 
     // PWM outputs: high when count < duty

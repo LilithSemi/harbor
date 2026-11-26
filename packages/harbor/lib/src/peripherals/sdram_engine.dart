@@ -6,6 +6,7 @@ import 'package:meta/meta.dart';
 import 'package:rohd/rohd.dart';
 
 import '../blackbox/ecp5/ecp5.dart';
+import '../clock/cdc.dart';
 import 'sdram_bank_timers.dart';
 import 'sdram_command.dart';
 import 'sdram_config.dart';
@@ -63,6 +64,11 @@ class _Entry {
 /// requests enter the look-ahead entry, which moves into the current
 /// entry once that one is empty or finishing.
 ///
+/// With `warmAfterFirstInit`, every reset after the first finished init
+/// runs the warm path: precharge all first, with cke high, then the full
+/// power-up wait and init, and `coldReset` is ignored. Without it, only a
+/// `reset` while `coldReset` is low takes that path.
+///
 /// `abort` is the bus side reset: it drops queued reads and in-flight read
 /// data, but queued writes still run and init, refresh and bank state
 /// keep going, so the sdram keeps its contents. It keeps the reads of the
@@ -112,6 +118,7 @@ class SdramEngine extends Module {
     Logic? abort,
     Logic? abortNext,
     Logic? coldReset,
+    bool warmAfterFirstInit = false,
     Logic? timersReset,
     Logic? dataReset,
     Set<int> keepReadsOnAbort = const {},
@@ -129,6 +136,7 @@ class SdramEngine extends Module {
          abort: abort,
          abortNext: abortNext,
          coldReset: coldReset,
+         warmAfterFirstInit: warmAfterFirstInit,
          timersReset: timersReset,
          dataReset: dataReset,
          keepReadsOnAbort: keepReadsOnAbort,
@@ -149,6 +157,7 @@ class SdramEngine extends Module {
     required Logic? abort,
     required Logic? abortNext,
     required Logic? coldReset,
+    required bool warmAfterFirstInit,
     required Logic? timersReset,
     required Logic? dataReset,
     required Set<int> keepReadsOnAbort,
@@ -211,8 +220,7 @@ class SdramEngine extends Module {
     abort = addInput('abort', abort ?? Const(0));
     // Only a real power-on clears [warmReset] below. With no [coldReset]
     // given, every reset counts as cold, so warmReset never latches and
-    // init always takes the cold path: unchanged from before this input
-    // existed.
+    // init always takes the cold path. [warmAfterFirstInit] ignores it.
     final coldResetSig = addInput('cold_reset', coldReset ?? externalReset);
     // A copy of [reset] for the bank timers, so neither reset net carries
     // every flop in the engine. It must assert and release with [reset].
@@ -286,15 +294,34 @@ class SdramEngine extends Module {
     final initDoneReq = initDoneCopy('req');
     final initDonePins = initDoneCopy('pins');
     final initDonePick = initDoneCopy('pick');
-    Sequential(
-      clk,
-      [
-        If(initDone, then: [warmReset < Const(1)]),
-      ],
-      reset: coldResetSig,
-      asyncReset: true,
-      resetValues: {warmReset: Const(0)},
-    );
+    if (warmAfterFirstInit) {
+      // Set by the first finished init and never cleared, so every later
+      // reset takes the warm path: precharge all first, then the full
+      // power-up wait. The flops power up at 0 on the fpga, and
+      // [harborSimPowerUp] does the same in a sim. The set condition waits
+      // 3 cycles, until the done flop and the resets hold known values, so
+      // it never loads an unknown value into the flag.
+      final seen = Logic(name: 'init_seen');
+      final arm = [for (var i = 0; i < 3; i++) Logic(name: 'init_seen_arm_$i')];
+      Sequential(clk, [
+        arm[0] < 1,
+        arm[1] < arm[0],
+        arm[2] < arm[1],
+        seen < mux(arm[2] & initDone & ~reset, Const(1), seen),
+      ]);
+      harborSimPowerUp(clk, [seen, ...arm]);
+      warmReset <= seen;
+    } else {
+      Sequential(
+        clk,
+        [
+          If(initDone, then: [warmReset < Const(1)]),
+        ],
+        reset: coldResetSig,
+        asyncReset: true,
+        resetValues: {warmReset: Const(0)},
+      );
+    }
 
     // The last command as one registered strobe per command and bank, so
     // the timers need no decode.
@@ -376,6 +403,10 @@ class SdramEngine extends Module {
     final forceRef = Logic(name: 'force_ref');
     final idleRefWant = Logic(name: 'idle_ref_want');
     final refCommit = Logic(name: 'ref_commit');
+    // High from a refresh pick until the refresh credit counted it. A new
+    // idle refresh waits, because a refresh at a low clock rate is shorter
+    // than that feedback and would be issued again from a stale credit.
+    final refGuard = Logic(name: 'ref_guard');
     final idleWidth = pullInIdleCycles.bitLength;
     final idleCnt = Logic(name: 'idle_cnt', width: idleWidth);
     final idleLong = Logic(name: 'idle_long');
@@ -421,12 +452,10 @@ class SdramEngine extends Module {
     // cycle.
     final wantPreAll = Logic(name: 'want_pre_all');
     final wantRef = Logic(name: 'want_ref');
-    final idleNow = ~cur.valid & ~la.valid & idleRefWant;
+    final idleNow = ~cur.valid & ~la.valid & idleRefWant & ~refGuard;
     // A force does not wait for the current request to end. Its precharge
     // all can cut that request, which opens its row again afterwards.
     final wantPreAllNext = initDonePick & (forceAny | idleNow);
-    final wantRefNext = initDonePick & (forceRef | idleNow | refCommit);
-    final holdNext = ~initDonePick | wantPreAllNext | wantRefNext;
 
     // The sel_* registers and free flags cover the cycle the timers miss.
     // This needs want_* to hold curGo and laBase low in that cycle, and no
@@ -436,9 +465,18 @@ class SdramEngine extends Module {
         (selIdle & wantPreAll & timers.anyOpen & timers.canPreAll).named(
           'pick_pre_all',
         );
-    final pickRef = (selIdle & wantRef & ~timers.anyOpen & timers.canRef).named(
-      'pick_ref',
-    );
+    // can_ref is only high with every bank closed, so it covers any_open.
+    final pickRef = (selIdle & wantRef & timers.canRef).named('pick_ref');
+
+    // A commit ends at the pick, so the want does not stay for a second
+    // refresh when the refresh time is 2 cycles or less.
+    final wantRefNext =
+        initDonePick & (forceRef | idleNow | (refCommit & ~pickRef));
+    // The hold is split so the refresh pick joins it after the entry logic,
+    // not in front of it.
+    final refDropHold = initDonePick & refCommit & ~pickRef;
+    final holdNext =
+        ~initDonePick | wantPreAllNext | (initDonePick & (forceRef | idleNow));
 
     final readIssue = (selCurCol & ~cur.write).named('read_issue');
     final writeIssue = (selCurCol & cur.write).named('write_issue');
@@ -504,7 +542,11 @@ class SdramEngine extends Module {
     final a10 = Const(1 << 10, width: rowW);
     final initAddr =
         init.cmdAddr |
-        mux(init.cmd.eq(SdramCommand.preAll.index), a10, Const(0, width: rowW));
+        mux<Logic>(
+          init.cmd.eq(SdramCommand.preAll.index),
+          a10,
+          Const(0, width: rowW),
+        );
     final zeroAddr = Const(0, width: rowW);
     final curAddr = mux(
       cur.hit,
@@ -739,7 +781,7 @@ class SdramEngine extends Module {
     Logic strobes(Logic Function(int b) engine, SdramCommand c) => [
       for (var b = 0; b < banks; b++)
         mux(initDonePick, engine(b), initIs(c) & init.cmdBa.eq(b)),
-    ].rswizzle();
+    ].rconcat();
     final actNext = strobes(
       (b) => (pickCurAct & cur.bank.eq(b)) | (pickLaAct & la.bank.eq(b)),
       SdramCommand.act,
@@ -762,6 +804,7 @@ class SdramEngine extends Module {
       initIs(SdramCommand.preAll),
     );
     final refNext = mux(initDonePick, pickRef, initIs(SdramCommand.ref));
+    refGuard <= (refNext | selRef | lastRef).named('ref_guard_any');
     final mrsNext = ~initDonePick & initIs(SdramCommand.mrs);
 
     // A flag for the entry that is current after this edge. Both picks run
@@ -786,7 +829,8 @@ class SdramEngine extends Module {
     // --- refresh policy ---
     // A precharge all for a refresh commits to that refresh, so rows are
     // never closed for nothing.
-    final refCommitNext = (refCommit | (pickPreAll & wantRef)) & ~selRef;
+    final refCommitNext =
+        (refCommit | (pickPreAll & wantRef)) & ~selRef & ~pickRef;
     final busy = cur.valid | la.valid;
     final idleCntNext = mux(
       busy,
@@ -797,10 +841,12 @@ class SdramEngine extends Module {
     // Pull a refresh in only after a long idle time or with every bank
     // closed. An owed refresh does not wait.
     final idleRefWantNext =
-        credit.need | (credit.mayPullIn & (idleLong | ~timers.anyOpen));
-    final forceRefNext = initDonePick & credit.force;
+        ~refGuard &
+        (credit.need | (credit.mayPullIn & (idleLong | ~timers.anyOpen)));
+    final forceRefNext = initDonePick & credit.force & ~refGuard;
     final rowAgeForce = rowAgeGuard ? timers.rowAgeForce : Const(0);
-    final forceAnyNext = initDonePick & (credit.force | rowAgeForce);
+    final forceAnyNext =
+        initDonePick & ((credit.force & ~refGuard) | rowAgeForce);
 
     // --- read return ---
     final pipeDepth = phyReadLatency + 1;
@@ -846,7 +892,7 @@ class SdramEngine extends Module {
     final dqmNext = mux(
       writeIssue,
       ~wrMaskNow,
-      mux(
+      mux<Logic>(
         dqmLowNext,
         Const(0, width: dqmW),
         Const((1 << dqmW) - 1, width: dqmW),
@@ -921,8 +967,8 @@ class SdramEngine extends Module {
       (curCanAct, forNextCur((_, b) => canActFor(b)), 0),
       (curCanPre, forNextCur((_, b) => canPreFor(b)), 0),
       (curCanColR, forNextCur(canColFor), 0),
-      (curGo, byFinish(goFor), 0),
-      (laBase, byFinish(laBaseFor), 0),
+      (curGo, byFinish(goFor) & ~refDropHold, 0),
+      (laBase, byFinish(laBaseFor) & ~refDropHold, 0),
       (laCanAct, mux(accept, canActFor(inBank), canActFor(la.bank)), 0),
       (laCanPre, mux(accept, canPreFor(inBank), canPreFor(la.bank)), 0),
       (forceAny, forceAnyNext, 0),
@@ -1009,7 +1055,7 @@ class SdramEngine extends Module {
           // cke itself is not in [regs]: on a warm reset, the row may
           // still be open, so cke must stay high through [reset] and into
           // the init sequencer's own precharge, not drop at once.
-          phyCkeR < mux(warmReset, Const(1), Const(0)),
+          phyCkeR < mux<Logic>(warmReset, Const(1), Const(0)),
         ],
         orElse: [phyCkeR < init.cke],
       ),
@@ -1085,6 +1131,7 @@ SdramEngine debugSdramEngineWithoutRowAgeGuard(
   abort: abort,
   abortNext: null,
   coldReset: coldReset,
+  warmAfterFirstInit: false,
   timersReset: null,
   dataReset: null,
   keepReadsOnAbort: const {},

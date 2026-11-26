@@ -161,7 +161,7 @@ class HarborPcieRouter extends Module {
     final anyHit = _or(hits);
     final ur = ~anyHit & nonPosted & ~isCpl;
     final drop = ~anyHit & ~ur;
-    final decoded = [...hits, ur, drop].rswizzle();
+    final decoded = [...hits, ur, drop].rconcat();
     final sel = mux(first, decoded, selReg);
     final selUr = sel[n];
     final selDrop = sel[n + 1];
@@ -233,22 +233,22 @@ class HarborPcieRouter extends Module {
       Const(0, width: 6),
       urAttr,
       Const(0, width: 12),
-    ].swizzle();
-    final dw1 = [completerId, Const(1 << 13 | 4, width: 16)].swizzle();
-    final dw2 = [urRequester, urTag, Const(0, width: 8)].swizzle();
+    ].concat();
+    final dw1 = [completerId, Const(1 << 13 | 4, width: 16)].concat();
+    final dw2 = [urRequester, urTag, Const(0, width: 8)].concat();
     final Logic urData;
     final Logic urKeep;
     final Logic urLast;
     if (width == 64) {
       urData = mux(
         urBeat,
-        [Const(0, width: 32), dw2].swizzle(),
-        [dw1, dw0].swizzle(),
+        [Const(0, width: 32), dw2].concat(),
+        [dw1, dw0].concat(),
       );
-      urKeep = mux(urBeat, Const(0x0f, width: 8), Const(0xff, width: 8));
+      urKeep = mux<Logic>(urBeat, Const(0x0f, width: 8), Const(0xff, width: 8));
       urLast = urBeat;
     } else {
-      urData = [Const(0, width: 32), dw2, dw1, dw0].swizzle();
+      urData = [Const(0, width: 32), dw2, dw1, dw0].concat();
       urKeep = Const(0x0fff, width: 16);
       urLast = Const(1);
     }
@@ -303,8 +303,8 @@ class HarborPcieRouter extends Module {
     _urDone <= urFire & urLast;
 
     final fire = tx.valid & tx.ready;
-    final pickNext = pickAfter(grant).rswizzle();
-    final pickIdle = pickAfter(lastGrant).rswizzle();
+    final pickNext = pickAfter(grant).rconcat();
+    final pickIdle = pickAfter(lastGrant).rconcat();
     Sequential(clk, [
       If(
         reset,

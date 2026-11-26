@@ -20,7 +20,7 @@ void main() {
     expect(rf.readLatency, equals(1));
 
     await rf.build();
-    final sv = rf.generateSynth();
+    final sv = rf.dumpSystemVerilog();
     expect(sv, contains('RAMB36E1'));
     expect(sv, isNot(contains('DP16KD')));
   });
@@ -30,7 +30,7 @@ void main() {
     expect(rf.readLatency, equals(1));
 
     await rf.build();
-    final sv = rf.generateSynth();
+    final sv = rf.dumpSystemVerilog();
     expect(sv, contains('DP16KD'));
     expect(sv, isNot(contains('RAMB36E1')));
   });
@@ -45,7 +45,7 @@ void main() {
     expect(rf.readLatency, equals(0));
 
     await rf.build();
-    final sv = rf.generateSynth();
+    final sv = rf.dumpSystemVerilog();
     expect(sv, isNot(contains('RAMB36E1')));
   });
 
@@ -113,5 +113,19 @@ void main() {
     );
     // A write to entry 0 is dropped and the read returns zero.
     expect(await writeThenRead(rf, 0, 0xAB), equals(0));
+  });
+
+  test('resetEntries:false gives the flop entries no reset', () async {
+    final rf = HarborRegisterFile(
+      numEntries: 4,
+      dataWidth: 8,
+      numReadPorts: 1,
+      reservedZero: false,
+      resetEntries: false,
+    );
+    expect(await writeThenRead(rf, 2, 0x5A), equals(0x5A));
+    final sv = rf.dumpSystemVerilog();
+    expect(rf.definitionName, endsWith('_NR'));
+    expect(sv, isNot(contains("reg_0 <= 8'h0")));
   });
 }

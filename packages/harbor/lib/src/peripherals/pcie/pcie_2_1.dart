@@ -57,7 +57,9 @@ class HarborXilinxPcie21 extends BridgeModule {
     }
     // Simulation only. The block has no model, so these link outputs show a
     // link with no partner. Thus no X goes into the PHY link watchdog.
-    output('TRNLNKUP') <= Const(0);
+    // TRNLNKUP must stay driveable so a test can model a link coming up.
+    final trnlnkup = Logic(name: 'trnlnkup')..put(0);
+    output('TRNLNKUP') <= trnlnkup;
     output('PLPHYLNKUPN') <= Const(1);
     output('PLLTSSMSTATE') <= Const(0, width: 6);
   }

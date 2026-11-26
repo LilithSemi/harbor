@@ -146,7 +146,7 @@ class HdmiAudioRateGen extends Module {
     Logic pick(int Function((int, int)) f, int width) => mux(
       applied.eq(0),
       Const(f(pairs[0]), width: width),
-      mux(
+      mux<Logic>(
         applied.eq(1),
         Const(f(pairs[1]), width: width),
         Const(f(pairs[2]), width: width),
@@ -342,33 +342,33 @@ class HdmiPacketScheduler extends Module {
       left.xor() ^ cs,
       cs,
       Const(0, width: 2),
-    ].swizzle();
-    final sub = [status, right, left].swizzle().named('sample_subpacket');
+    ].concat();
+    final sub = [status, right, left].concat().named('sample_subpacket');
 
     // ACR: SB1..SB3 CTS, SB4..SB6 N, high byte first (section 5.3.3).
     Logic bytes20(Logic v) => [
       v.getRange(0, 8),
       v.getRange(8, 16),
       v.getRange(16, 20).zeroExtend(8),
-    ].swizzle();
+    ].concat();
     final acrSub = [
       bytes20(gen.n),
       bytes20(gen.cts),
       Const(0, width: 8),
-    ].swizzle();
+    ].concat();
 
     // AVI: PB2 is M1:M0 and R3:R0, PB3 has Q1:Q0, PB4 is the VIC. The
     // other bytes are 0.
     final pb2 = [
       Const(0, width: 2),
       aviM,
-      mux(aviM.neq(0), Const(8, width: 4), Const(0, width: 4)),
-    ].swizzle().named('avi_pb2');
+      mux<Logic>(aviM.neq(0), Const(8, width: 4), Const(0, width: 4)),
+    ].concat().named('avi_pb2');
     final pb3 = [
       Const(0, width: 4),
       aviQ,
       Const(0, width: 2),
-    ].swizzle().named('avi_pb3');
+    ].concat().named('avi_pb3');
     final pb4 = vic.zeroExtend(8);
     final aviSum = Const(
       (aviHeader & 0xff) + (aviHeader >> 8 & 0xff) + (aviHeader >> 16),
@@ -384,7 +384,7 @@ class HdmiPacketScheduler extends Module {
       pb2,
       Const(0, width: 8),
       aviCheck,
-    ].swizzle();
+    ].concat();
     const aifSum =
         (audioInfoHeader & 0xff) +
         (audioInfoHeader >> 8 & 0xff) +
@@ -398,7 +398,7 @@ class HdmiPacketScheduler extends Module {
       mux(
         count.eq(2),
         Const(3, width: 4),
-        mux(count.eq(3), Const(7, width: 4), Const(15, width: 4)),
+        mux<Logic>(count.eq(3), Const(7, width: 4), Const(15, width: 4)),
       ),
     );
     final audioHeader = [
@@ -407,7 +407,7 @@ class HdmiPacketScheduler extends Module {
       Const(0, width: 4),
       present,
       Const(0x02, width: 8),
-    ].swizzle();
+    ].concat();
     final zero56 = Const(0, width: 56);
 
     final missedNow =

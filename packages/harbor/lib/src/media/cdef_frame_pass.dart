@@ -88,7 +88,7 @@ class HarborCdefFramePass extends BridgeModule {
             [
               for (var r = 11; r >= 0; r--)
                 for (var c = 11; c >= 0; c--) pad(by * 8 + r, bx * 8 + c),
-            ].swizzle();
+            ].concat();
         blk.input('pri').srcConnection! <= pri;
         blk.input('sec').srcConnection! <= sec;
         blk.input('pri_damp').srcConnection! <= priDamp;
@@ -109,6 +109,6 @@ class HarborCdefFramePass extends BridgeModule {
     }
 
     output('out') <=
-        [for (var i = region * region - 1; i >= 0; i--) grid[i]].swizzle();
+        [for (var i = region * region - 1; i >= 0; i--) grid[i]].concat();
   }
 }

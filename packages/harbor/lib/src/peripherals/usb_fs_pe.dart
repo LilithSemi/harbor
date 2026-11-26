@@ -264,7 +264,7 @@ class HarborUsbFsInPe extends BridgeModule {
                   currentEndp.eq(Const(ep, width: 4)))
               .named('busy_$ep'),
     );
-    output('busy') <= busyBits.rswizzle();
+    output('busy') <= busyBits.rconcat();
 
     // A flush drops the packet and its bytes. It does nothing while the
     // endpoint is busy.
@@ -351,8 +351,8 @@ class HarborUsbFsInPe extends BridgeModule {
       ]);
     }
 
-    output('in_ep_acked') <= ackedBits.rswizzle();
-    output('in_ep_data_free') <= dataFreeBits.rswizzle();
+    output('in_ep_acked') <= ackedBits.rconcat();
+    output('in_ep_data_free') <= dataFreeBits.rconcat();
 
     // ------------------------------------------------------------------
     // Per-endpoint sequential: state and put address.
@@ -485,7 +485,7 @@ class HarborUsbFsInPe extends BridgeModule {
                   currentEpState.eq(Const(stGetting, width: 2)),
                   then: [
                     inXfrStateNext < Const(xfrSendData, width: 2),
-                    txPid < [currentDataToggle, Const(3, width: 3)].swizzle(),
+                    txPid < [currentDataToggle, Const(3, width: 3)].concat(),
                     inXfrStart < Const(1),
                   ],
                   orElse: [
@@ -1034,13 +1034,13 @@ class HarborUsbFsOutPe extends BridgeModule {
       numOutEps,
       (ep) => setupTokenReceived & rxEndp.eq(Const(ep, width: 4)),
     );
-    output('out_ep_setup_token') <= setupTokenBits.rswizzle();
+    output('out_ep_setup_token') <= setupTokenBits.rconcat();
     if (exposeSetupDone) {
       output('out_ep_setup_done') <=
           List.generate(
             numOutEps,
             (ep) => newPktEnd & setupXfr & currentEndp.eq(Const(ep, width: 4)),
-          ).rswizzle();
+          ).rconcat();
     }
 
     // A toggle reset waits for the end of an OUT transaction on its
@@ -1172,9 +1172,9 @@ class HarborUsbFsOutPe extends BridgeModule {
       ]);
     }
 
-    output('out_ep_data_avail') <= availBits.rswizzle();
-    output('out_ep_acked') <= ackedBits.rswizzle();
-    output('out_ep_pkt_full') <= pktFullBits.rswizzle();
+    output('out_ep_data_avail') <= availBits.rconcat();
+    output('out_ep_acked') <= ackedBits.rconcat();
+    output('out_ep_pkt_full') <= pktFullBits.rconcat();
 
     if (exposeLength) {
       final lengthBits = List.generate(
@@ -1182,14 +1182,14 @@ class HarborUsbFsOutPe extends BridgeModule {
         (ep) =>
             (epPutAddr[ep] - Const(2, width: addrWidth)).named('ep_length_$ep'),
       );
-      output('out_ep_length') <= lengthBits.rswizzle();
+      output('out_ep_length') <= lengthBits.rconcat();
     }
     if (exposeRelease) {
       output('out_ep_held') <=
           List.generate(
             numOutEps,
             (ep) => epState[ep].eq(Const(stGetting, width: 2)),
-          ).rswizzle();
+          ).rconcat();
     }
 
     // ------------------------------------------------------------------
@@ -1588,7 +1588,7 @@ class HarborUsbFsPe extends BridgeModule {
         granted = granted | outEpReq.slice(ep, ep);
       }
     }
-    output('out_ep_grant') <= outGrantBits.rswizzle();
+    output('out_ep_grant') <= outGrantBits.rconcat();
 
     final inGrantBits = List.generate(
       numInEps,
@@ -1607,7 +1607,7 @@ class HarborUsbFsPe extends BridgeModule {
         granted = granted | inEpReq.slice(ep, ep);
       }
     }
-    output('in_ep_grant') <= inGrantBits.rswizzle();
+    output('in_ep_grant') <= inGrantBits.rconcat();
 
     // ------------------------------------------------------------------
     // Nets driven by the transmitter below: packet end and the data
@@ -1678,7 +1678,7 @@ class HarborUsbFsPe extends BridgeModule {
 
     outPe.input('out_ep_data_get').srcConnection! <= outEpDataGet;
     outPe.input('out_ep_stall').srcConnection! <= outEpStall;
-    outPe.input('out_ep_grant').srcConnection! <= outGrantBits.rswizzle();
+    outPe.input('out_ep_grant').srcConnection! <= outGrantBits.rconcat();
 
     outPe.input('rx_pkt_start').srcConnection! <= rx.output('pkt_start');
     outPe.input('rx_pkt_end').srcConnection! <= rx.output('pkt_end');
@@ -1713,7 +1713,7 @@ class HarborUsbFsPe extends BridgeModule {
         List.generate(
           numInEps,
           (ep) => ep < numOutEps ? outSetupToken[ep] : Const(0),
-        ).rswizzle();
+        ).rconcat();
     if (exposeEpControl) {
       outPe.input('out_ep_control').srcConnection! <= input('out_ep_control');
     }

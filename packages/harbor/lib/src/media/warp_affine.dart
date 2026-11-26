@@ -294,7 +294,7 @@ class HarborWarpAffine extends BridgeModule {
     Logic addP(Logic a, Logic b) => (a + b).getRange(0, _wP);
     Logic mulP(Logic a, Logic b) => (a * b).getRange(0, _wP);
     Logic asrP(Logic x, int n) =>
-        [x[_wP - 1].replicate(n), x.getRange(n, _wP)].swizzle();
+        [x[_wP - 1].replicate(n), x.getRange(n, _wP)].concat();
 
     // offs = ((sx + 512) >> 10) + 64, arithmetic. Result is 0..192 for valid
     // streams. Slice to an 8b index (covers 0..255, table guards 0..192).
@@ -317,7 +317,7 @@ class HarborWarpAffine extends BridgeModule {
           _wH,
         );
     Logic asrH(Logic x, int n) =>
-        [x[_wH - 1].replicate(n), x.getRange(n, _wH)].swizzle();
+        [x[_wH - 1].replicate(n), x.getRange(n, _wH)].concat();
 
     // Select the 8 taps for a phase index from the 193-row table (width _wH).
     List<Logic> tapsH(Logic phase) {
@@ -371,7 +371,7 @@ class HarborWarpAffine extends BridgeModule {
           _wV,
         );
     Logic asrV(Logic x, int n) =>
-        [x[_wV - 1].replicate(n), x.getRange(n, _wV)].swizzle();
+        [x[_wV - 1].replicate(n), x.getRange(n, _wV)].concat();
 
     List<Logic> tapsV(Logic phase) {
       final out = <Logic>[];
@@ -427,6 +427,6 @@ class HarborWarpAffine extends BridgeModule {
     }
 
     // Pack output (oy*8 + ox) LSB-first row-major.
-    output('pred') <= outParts.reversed.toList().swizzle();
+    output('pred') <= outParts.reversed.toList().concat();
   }
 }

@@ -29,7 +29,7 @@ void main() {
   /// Run [n] sustained transactions. The fast-side slave acks with a ONE-CYCLE
   /// pulse per master cycle (like the DDR sequencer's [busDone], timed off the
   /// PHY read-latency count). Returns the number completed.
-  Future<int> run({required int n, int sPeriod = 10, int mPeriod = 7}) async {
+  Future<int> run({required int n, int sPeriod = 10, int mPeriod = 8}) async {
     const aw = 32;
     const dw = 32;
     // syncStages 4 mirrors the real DDR instantiation.
@@ -39,8 +39,8 @@ void main() {
       syncStages: 4,
     );
 
-    final sClk = SimpleClockGenerator(sPeriod).clk;
-    final mClk = SimpleClockGenerator(mPeriod).clk;
+    final sClk = SimpleClockGenerator(sPeriod + (sPeriod & 1)).clk;
+    final mClk = SimpleClockGenerator(mPeriod + (mPeriod & 1)).clk;
     final sReset = Logic(name: 's_reset');
     final mReset = Logic(name: 'm_reset');
     final sCyc = Logic(name: 's_cyc');

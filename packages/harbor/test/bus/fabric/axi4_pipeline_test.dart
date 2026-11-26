@@ -1,0 +1,392 @@
+// Throughput and latency of each pipeline level of the AXI4 fabric.
+
+import 'package:harbor/harbor.dart';
+import 'package:test/test.dart';
+
+import '../port/memory_harness.dart';
+import 'axi4_fabric_harness.dart';
+
+// The cycle of the first AR at the slave, counted from the first rise after
+// the master issues. With one slave the master has no input FIFO.
+const _firstArOneSlave = {
+  HarborFabricPipeline.compact: 4,
+  HarborFabricPipeline.balanced: 6,
+  HarborFabricPipeline.fast: 6,
+};
+const _firstArTwoSlaves = {
+  HarborFabricPipeline.compact: 5,
+  HarborFabricPipeline.balanced: 7,
+  HarborFabricPipeline.fast: 7,
+};
+
+Burst _rd(int id, int addr) =>
+    Burst(id: id, write: false, addr: addr, len: 0, size: 2, burst: 1);
+
+// Issues [reads] from m0 and returns the cycles in which a slave took an
+// AR, in order.
+Future<List<int>> _arCycles(
+  HarborFabricTopology t,
+  HarborFabricPipeline p,
+  List<SlaveCfg> slaves,
+  List<Burst> reads,
+) async {
+  final b = await Bench.start(
+    t,
+    pipeline: p,
+    stall: 0,
+    masters: const [MasterCfg('m0', 2, 16)],
+    slaves: slaves,
+  );
+  final m = b.managers['m0']!;
+  var cycle = 0;
+  final seen = <int>[];
+  b.sim.onRise(() {
+    cycle++;
+    for (final s in slaves) {
+      if (b.sim.pre('${s.name}_ARVALID') == 1 &&
+          b.sim.pre('${s.name}_ARREADY') == 1) {
+        seen.add(cycle);
+      }
+    }
+  });
+  for (final x in reads) {
+    m.read(x);
+  }
+  await b.drain(limit: 20000);
+  await b.sim.stop();
+  must(b.errors, isEmpty);
+  return seen;
+}
+
+Burst _wr(int id, int addr) => Burst(
+  id: id,
+  write: true,
+  addr: addr,
+  len: 0,
+  size: 2,
+  burst: 1,
+  data: [addr * 3 + 1],
+  strb: [0xf],
+);
+
+// Cycles from the R beat that frees a slot of outstanding 2 at the master
+// to the next AR at the slave, with reads always waiting. The balanced
+// level adds the grant register and the bubble of the eligibility flop.
+// The slot frees at the slave, and at the fast level the R beat reaches
+// the master 2 cycles after that.
+const _slotReuse = {
+  HarborFabricPipeline.compact: 2,
+  HarborFabricPipeline.balanced: 4,
+  HarborFabricPipeline.fast: 2,
+};
+
+// Cycles from an R beat at the slave to the same beat at the master. The
+// fast level adds the response stage and the response grant register.
+const _rLatency = {
+  HarborFabricPipeline.compact: 1,
+  HarborFabricPipeline.balanced: 1,
+  HarborFabricPipeline.fast: 3,
+};
+
+Burst _rdLen(int id, int addr, int len) =>
+    Burst(id: id, write: false, addr: addr, len: len, size: 2, burst: 1);
+
+Burst _wrLen(int id, int addr, int len) => Burst(
+  id: id,
+  write: true,
+  addr: addr,
+  len: len,
+  size: 2,
+  burst: 1,
+  data: [for (var i = 0; i <= len; i++) addr * 7 + i],
+  strb: List.filled(len + 1, 0xf),
+);
+
+// Reads and writes of two masters to two slaves, with the same IDs on both
+// slaves and bursts of 1 to 8 beats. Every response must come back in
+// order per ID.
+Future<void> _mixed(
+  HarborFabricTopology t,
+  HarborFabricPipeline p, {
+  double stall = 0.3,
+  void Function(Bench b)? setUp,
+}) async {
+  final b = await Bench.start(
+    t,
+    pipeline: p,
+    stall: stall,
+    seed: 5,
+    masters: const [MasterCfg('m0', 2, 8), MasterCfg('m1', 2, 8)],
+    slaves: const [
+      SlaveCfg('s0', 4, 8, 0x00000, 0x10000),
+      SlaveCfg('s1', 2, 4, 0x10000, 0x10000),
+    ],
+  );
+  setUp?.call(b);
+  for (final (k, name) in ['m0', 'm1'].indexed) {
+    final m = b.managers[name]!;
+    for (var i = 0; i < 24; i++) {
+      final slave = (i >> 1) & 1;
+      final addr = slave * 0x10000 + k * 0x4000 + i * 0x40;
+      m.write(_wrLen(i & 3, addr, i % 8));
+      m.read(_rdLen(i & 3, addr, (i * 3) % 8));
+    }
+  }
+  await b.drain(limit: 40000);
+  await b.sim.stop();
+  must(b.errors, isEmpty);
+  for (final name in ['m0', 'm1']) {
+    final m = b.managers[name]!;
+    must(checkWrites(name, m.awOrder, m.bResp, (_) => 0), isEmpty);
+    must(checkReads(name, m.arOrder, m.rBeats, (x) => (0, null)), isEmpty);
+  }
+}
+
+void _consecutive(List<int> seen, int n) {
+  must(seen.length, n);
+  for (var i = 1; i < seen.length; i++) {
+    must(seen[i], seen[i - 1] + 1, reason: 'AR $i');
+  }
+}
+
+void main() {
+  tearDown(endAndReset);
+
+  for (final p in HarborFabricPipeline.values) {
+    for (final t in HarborFabricTopology.values) {
+      group('${p.name} ${t.name}', () {
+        test('16 back to back ARs reach one slave on 16 cycles', () async {
+          final seen = await _arCycles(
+            t,
+            p,
+            const [SlaveCfg('s0', 4, 8, 0x00000, 0x10000)],
+            [for (var i = 0; i < 16; i++) _rd(0, i * 4)],
+          );
+          _consecutive(seen, 16);
+          must(seen.first, _firstArOneSlave[p]);
+        });
+
+        test('two IDs to two slaves issue every cycle', () async {
+          final seen = await _arCycles(
+            t,
+            p,
+            const [
+              SlaveCfg('s0', 4, 8, 0x00000, 0x10000),
+              SlaveCfg('s1', 4, 8, 0x10000, 0x10000),
+            ],
+            [
+              for (var i = 0; i < 16; i++)
+                _rd(i & 1, (i & 1) * 0x10000 + (i >> 1) * 4),
+            ],
+          );
+          _consecutive(seen, 16);
+          must(seen.first, _firstArTwoSlaves[p]);
+        });
+
+        // Slave ID 1 bit, outstanding 8: two slave IDs for eight requests.
+        Future<List<int>> fewIds(List<Burst> reads) async {
+          final b = await Bench.start(
+            t,
+            pipeline: p,
+            stall: 0,
+            masters: const [MasterCfg('m0', 2, 16)],
+            slaves: const [SlaveCfg('s0', 1, 8, 0x00000, 0x10000)],
+          );
+          var cycle = 0;
+          final seen = <int>[];
+          // The master IDs in flight on each slave ID. One slave ID carries
+          // one master ID at a time, and at most k = 2 slave IDs are live.
+          final live = <int, List<int>>{};
+          final wrong = <String>[];
+          b.sim.onRise(() {
+            cycle++;
+            if (b.sim.pre('s0_RVALID') == 1 &&
+                b.sim.pre('s0_RREADY') == 1 &&
+                b.sim.pre('s0_RLAST') == 1) {
+              live[b.sim.pre('s0_RID')]!.removeAt(0);
+            }
+            if (b.sim.pre('s0_ARVALID') == 1 && b.sim.pre('s0_ARREADY') == 1) {
+              final sid = b.sim.pre('s0_ARID');
+              (live[sid] ??= []).add(reads[seen.length].id);
+              seen.add(cycle);
+            }
+            final ids = [
+              for (final q in live.values)
+                if (q.isNotEmpty) q,
+            ];
+            if (ids.length > 2 || ids.any((q) => q.toSet().length > 1)) {
+              wrong.add('cycle $cycle: $live');
+            }
+          });
+          final m = b.managers['m0']!;
+          for (final x in reads) {
+            m.read(x);
+          }
+          await b.drain(limit: 20000);
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          must(wrong.take(5).toList(), isEmpty);
+          must(
+            checkReads('m0', m.arOrder, m.rBeats, (_) => (0, null)),
+            isEmpty,
+          );
+          return seen;
+        }
+
+        test('one ID streams to a slave with few IDs', () async {
+          final seen = await fewIds([
+            for (var i = 0; i < 16; i++) _rd(1, i * 4),
+          ]);
+          must(seen.length, 16);
+          _consecutive(seen.sublist(4), 12);
+        });
+
+        test(
+          'two live IDs stream and a third waits for a free slave ID',
+          () async {
+            final seen = await fewIds([
+              for (var i = 0; i < 16; i++) _rd(i & 1, i * 4),
+              _rd(2, 0x400),
+              for (var i = 0; i < 8; i++) _rd(i & 1, 0x800 + i * 4),
+            ]);
+            must(seen.length, 25);
+            _consecutive(seen.sublist(4, 16), 12);
+          },
+        );
+
+        test('outstanding 1 with reads and writes from two masters', () async {
+          final b = await Bench.start(
+            t,
+            pipeline: p,
+            stall: 0,
+            masters: const [MasterCfg('m0', 2, 4), MasterCfg('m1', 2, 4)],
+            slaves: const [SlaveCfg('s0', 4, 1, 0x00000, 0x10000)],
+          );
+          for (var i = 0; i < 12; i++) {
+            b.managers['m0']!.read(_rd(i & 3, i * 4));
+            b.managers['m1']!.write(_wr(i & 3, 0x100 + i * 4));
+            b.managers['m0']!.write(_wr(i & 3, 0x200 + i * 4));
+            b.managers['m1']!.read(_rd(i & 3, 0x300 + i * 4));
+          }
+          await b.drain(limit: 20000);
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          final mem = b.memories['s0']!;
+          must(mem.maxInflight, 1);
+          must(mem.arOrder.length, 24);
+          must(mem.awOrder.length, 24);
+        });
+
+        test(
+          'a slave that takes nothing for 20 cycles loses nothing',
+          () async {
+            final b = await Bench.start(
+              t,
+              pipeline: p,
+              stall: 0,
+              masters: const [MasterCfg('m0', 2, 16)],
+              slaves: const [SlaveCfg('s0', 4, 8, 0x00000, 0x10000)],
+            );
+            var cycle = 0;
+            b.sim.onRise(() => cycle++);
+            final mem = b.memories['s0']!;
+            mem.ar.gate = () => cycle >= 20;
+            final reads = [for (var i = 0; i < 12; i++) _rd(i & 3, i * 4)];
+            for (final x in reads) {
+              b.managers['m0']!.read(x);
+            }
+            await b.drain(limit: 20000);
+            await b.sim.stop();
+            must(b.errors, isEmpty);
+            must(
+              [for (final x in mem.arOrder) x.addr],
+              [for (final x in reads) x.addr],
+            );
+          },
+        );
+
+        test('16 R beats of one burst reach the master on 16 cycles', () async {
+          final b = await Bench.start(
+            t,
+            pipeline: p,
+            stall: 0,
+            masters: const [MasterCfg('m0', 2, 16)],
+            slaves: const [SlaveCfg('s0', 4, 8, 0x00000, 0x10000)],
+          );
+          var cycle = 0;
+          final atSlave = <int>[];
+          final atMaster = <int>[];
+          b.sim.onRise(() {
+            cycle++;
+            if (b.sim.pre('s0_RVALID') == 1 && b.sim.pre('s0_RREADY') == 1) {
+              atSlave.add(cycle);
+            }
+            if (b.sim.pre('m0_RVALID') == 1 && b.sim.pre('m0_RREADY') == 1) {
+              atMaster.add(cycle);
+            }
+          });
+          b.managers['m0']!.read(_rdLen(1, 0x100, 15));
+          await b.drain(limit: 20000);
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          _consecutive(atSlave, 16);
+          _consecutive(atMaster, 16);
+          must(atMaster.first - atSlave.first, _rLatency[p]);
+        });
+
+        test('responses keep their order per ID across two slaves', () async {
+          await _mixed(t, p);
+        });
+
+        test('a master that takes no response for 20 cycles loses '
+            'nothing', () async {
+          await _mixed(
+            t,
+            p,
+            stall: 0,
+            setUp: (b) {
+              var cycle = 0;
+              b.sim.onRise(() => cycle++);
+              for (final m in b.managers.values) {
+                m.r.gate = () => cycle >= 20 && (cycle < 60 || cycle >= 80);
+                m.b.gate = () => cycle >= 20 && (cycle < 60 || cycle >= 80);
+              }
+            },
+          );
+        });
+
+        test('a freed slot of outstanding 2 is used again', () async {
+          final b = await Bench.start(
+            t,
+            pipeline: p,
+            stall: 0,
+            masters: const [MasterCfg('m0', 2, 16)],
+            slaves: const [SlaveCfg('s0', 4, 2, 0x00000, 0x10000)],
+          );
+          var cycle = 0;
+          int? freed;
+          final waits = <int>[];
+          b.sim.onRise(() {
+            cycle++;
+            if (b.sim.pre('s0_ARVALID') == 1 && b.sim.pre('s0_ARREADY') == 1) {
+              if (freed != null) waits.add(cycle - freed!);
+              freed = null;
+            }
+            if (b.sim.pre('m0_RVALID') == 1 && b.sim.pre('m0_RREADY') == 1) {
+              freed ??= cycle;
+            }
+          });
+          for (var i = 0; i < 16; i++) {
+            b.managers['m0']!.read(_rd(0, i * 4));
+          }
+          await b.drain(limit: 20000);
+          await b.sim.stop();
+          must(b.errors, isEmpty);
+          must(b.memories['s0']!.maxInflight, 2);
+          must(waits.length, greaterThanOrEqualTo(7));
+          must(waits.toSet(), {_slotReuse[p]});
+        });
+      });
+    }
+  }
+}

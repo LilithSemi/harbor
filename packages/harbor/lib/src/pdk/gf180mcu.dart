@@ -1,4 +1,5 @@
 import 'analog_block.dart';
+import 'pad_library.dart';
 import 'pdk_provider.dart';
 import 'standard_cell_library.dart';
 
@@ -34,6 +35,71 @@ class Gf180mcuProvider extends PdkProvider {
     Gf180mcuVoltage.v5_0 => 5.0,
   };
 
+  @override
+  HarborPadLibrary get padLibrary => const HarborPadLibrary(
+    libName: 'gf180mcu_fd_io',
+    master: {
+      HarborPadKind.input: 'in_c',
+      HarborPadKind.clockInput: 'in_s',
+      HarborPadKind.output: 'bi_24t',
+      HarborPadKind.bidir: 'bi_24t',
+      HarborPadKind.analog: 'asig_5p0',
+      HarborPadKind.ioPower: 'dvdd',
+      HarborPadKind.ioGround: 'dvss',
+      HarborPadKind.corePower: 'dvdd',
+      HarborPadKind.coreGround: 'dvss',
+      HarborPadKind.spare: 'bi_24t',
+    },
+    tieOffs: {
+      HarborPadKind.input: {'PU': "1'b0", 'PD': "1'b0"},
+      HarborPadKind.clockInput: {'PU': "1'b0", 'PD': "1'b0"},
+      HarborPadKind.output: {
+        'OE': "1'b1",
+        'IE': "1'b0",
+        'CS': "1'b0",
+        'SL': "1'b0",
+        'PU': "1'b0",
+        'PD': "1'b0",
+      },
+      HarborPadKind.bidir: {
+        'IE': "1'b1",
+        'CS': "1'b0",
+        'SL': "1'b0",
+        'PU': "1'b0",
+        'PD': "1'b0",
+      },
+      HarborPadKind.spare: {
+        'A': "1'b0",
+        'OE': "1'b0",
+        'IE': "1'b0",
+        'CS': "1'b0",
+        'SL': "1'b0",
+        'PU': "1'b0",
+        'PD': "1'b0",
+      },
+    },
+    padPin: 'PAD',
+    inPin: 'Y',
+    outPin: 'A',
+    oePin: 'OE',
+    analogPin: 'ASIG5V',
+    openingOffsetUm: 37.5,
+    openingEdgeUm: 2,
+  );
+
+  @override
+  HarborCoreRing get coreRing => const HarborCoreRing(
+    offsetUm: 6,
+    widthUm: 25,
+    spaceUm: 1.7,
+    padClearanceUm: 30,
+    layers: ['Metal4', 'Metal3'],
+    padLayer: 'Metal2',
+    padPowerPins: ['DVDD'],
+    padGroundPins: ['DVSS'],
+    sramPdnLayers: ['Metal3', 'Metal4'],
+  );
+
   String get _libName => switch (voltage) {
     Gf180mcuVoltage.v3_3 => 'gf180mcu_fd_sc_mcu7t5v0',
     Gf180mcuVoltage.v5_0 => 'gf180mcu_fd_sc_mcu9t5v0',
@@ -62,6 +128,36 @@ class Gf180mcuProvider extends PdkProvider {
       '${_libName}__fill_2',
       '${_libName}__fill_4',
     ],
+    decapCells: ['${_libName}__fillcap_*'],
+    antennaCell: '${_libName}__antenna',
+    pinHorizontalLayer: 'Metal3',
+    pinVerticalLayer: 'Metal2',
+    wireRcLayer: 'Metal2',
+    powerPins: const ['VDD', 'VNW'],
+    groundPins: const ['VSS', 'VPW'],
+    tapCell: '${_libName}__filltie',
+    endcapCell: '${_libName}__endcap',
+    tapDistanceUm: 20,
+    pdn: const HarborPdnGrid(
+      railLayer: 'Metal1',
+      railWidthUm: 0.6,
+      stripes: [
+        HarborPdnStripe(
+          layer: 'Metal4',
+          widthUm: 1.6,
+          pitchUm: 40,
+          offsetUm: 10,
+          spacingUm: 1.7,
+        ),
+        HarborPdnStripe(
+          layer: 'Metal5',
+          widthUm: 1.6,
+          pitchUm: 153.18,
+          offsetUm: 16.65,
+          spacingUm: 1.7,
+        ),
+      ],
+    ),
   );
 
   @override
@@ -115,14 +211,17 @@ class Gf180mcuProvider extends PdkProvider {
   bool get hasSramMacro => true;
 
   @override
+  String get sramLibName => 'gf180mcu_fd_ip_sram';
+
+  @override
   AnalogBlock? sramMacro({
     required int words,
     required int width,
     int numPorts = 1,
   }) {
-    final macroName = 'gf180mcu_fd_ip_sram__sram${words}x${width}m8wm1';
+    final macroName = '${sramLibName}__sram${words}x${width}m8wm1';
     return AnalogBlock(
-      symbolPath: '$pdkRoot/libs.ref/gf180mcu_fd_ip_sram/lef/$macroName.lef',
+      symbolPath: '$pdkRoot/libs.ref/$sramLibName/lef/$macroName.lef',
       pinMapping: {
         'clk': 'CLK',
         'addr': 'A',

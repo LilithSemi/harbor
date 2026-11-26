@@ -172,6 +172,56 @@ void main() {
     });
   });
 
+  test('two channels, no channelSlaves: every master reaches all', () async {
+    const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
+    final soc = HarborSoC(name: 'NoMapSoC', compatible: 'test,nomap');
+    final mCpu = _RwMaster(cfg, 0x20, 0xAAAA1111, name: 'cpu');
+    final mDma = _RwMaster(cfg, 0x1020, 0xBBBB2222, name: 'dma');
+    soc.addMaster(mCpu, busInterfaceName: 'bus', channel: 'primary');
+    soc.addMaster(mDma, busInterfaceName: 'bus', channel: 'dma');
+    soc.addPeripheral(
+      HarborSram(baseAddress: 0, size: 4096, busAddressWidth: 32, name: 'perA'),
+    );
+    soc.addPeripheral(
+      HarborSram(
+        baseAddress: 0x1000,
+        size: 4096,
+        busAddressWidth: 32,
+        name: 'perB',
+      ),
+    );
+    soc.buildFabric();
+
+    final clk = SimpleClockGenerator(10).clk;
+    final resetL = Logic(name: 'reset')..inject(1);
+    final start = Logic(name: 'start')..inject(0);
+    soc.input('clk').srcConnection! <= clk;
+    soc.input('reset').srcConnection! <= resetL;
+    for (final m in [mCpu, mDma]) {
+      m.input('start').srcConnection! <= start;
+    }
+
+    await soc.build();
+    Simulator.setMaxSimTime(2000000);
+    unawaited(Simulator.run());
+    await clk.nextPosedge;
+    await clk.nextPosedge;
+    resetL.inject(0);
+    await clk.nextPosedge;
+    start.inject(1);
+    await clk.nextPosedge;
+    start.inject(0);
+
+    var guard = 0;
+    while (guard++ < 500) {
+      await clk.nextPosedge;
+      if ([mCpu, mDma].every((m) => m.output('done').value.toBool())) break;
+    }
+    expect(mCpu.output('rdata').value.toInt(), equals(0xAAAA1111));
+    expect(mDma.output('rdata').value.toInt(), equals(0xBBBB2222));
+    await Simulator.endSimulation();
+  });
+
   test('two channels, disjoint slaves: a fabric per channel', () async {
     const cfg = WishboneConfig(addressWidth: 32, dataWidth: 32);
     final soc = HarborSoC(name: 'DisjointSoC', compatible: 'test,disjoint');

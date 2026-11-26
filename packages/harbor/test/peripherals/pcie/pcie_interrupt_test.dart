@@ -100,6 +100,8 @@ class _Bench {
     int mm = 3,
     bool bme = true,
     int seed = 1,
+    int minMsiCycles = 0,
+    int maxSimTime = 1000000,
   }) async {
     dut = HarborPcieInterrupt(
       clk: clk,
@@ -111,6 +113,7 @@ class _Bench {
       busMasterEnable: busMaster,
       interruptDisable: intDisable,
       interruptRdyN: rdyN,
+      minMsiCycles: minMsiCycles,
     );
     await dut.build();
     reset.inject(1);
@@ -122,7 +125,7 @@ class _Bench {
     intDisable.inject(0);
     rdyN.inject(1);
     stub = _HardBlockStub(clk, dut, rdyN, msiEnable, mmEnable, busMaster, seed);
-    Simulator.setMaxSimTime(1000000);
+    Simulator.setMaxSimTime(maxSimTime);
     unawaited(Simulator.run());
     await idle(3);
     await clk.nextNegedge;
@@ -151,6 +154,146 @@ class _Bench {
 
 void main() {
   tearDown(Simulator.reset);
+
+  test('bounds repeated MSI edges and retains pending vectors', () async {
+    const interval = 64;
+    final bench = _Bench();
+    await bench.start(minMsiCycles: interval);
+    for (var i = 0; i < 128; i++) {
+      await bench.set(bench.irq, i.isEven ? 0xff : 0);
+      await bench.idle(2);
+    }
+    await bench.set(bench.irq, 0);
+    await bench.idle(interval * 10);
+    final times = bench.stub.msiTimes;
+    expect(times, isNotEmpty);
+    for (var i = 1; i < times.length; i++) {
+      expect(times[i] - times[i - 1], greaterThanOrEqualTo(interval * 10));
+    }
+    expect(bench.stub.msis.toSet(), {0, 1, 2, 3, 4, 5, 6, 7});
+    final count = times.length;
+    await bench.idle(interval * 2);
+    expect(times.length, count);
+    await bench.finish();
+  });
+
+  test(
+    'retains a completion during MSI cooldown and transmit backpressure',
+    () async {
+      final bench = _Bench();
+      await bench.start(mm: 0, minMsiCycles: 64);
+      await bench.set(bench.irq, 1);
+      await bench.idle(20);
+      expect(bench.stub.msis, [0]);
+      await bench.set(bench.txBusy, 1);
+      await bench.set(bench.irq, 0);
+      await bench.set(bench.irq, 1);
+      await bench.set(bench.irq, 0);
+      await bench.idle(100);
+      expect(bench.stub.msis, [0]);
+      await bench.set(bench.txBusy, 0);
+      await bench.idle(20);
+      expect(bench.stub.msis, [0, 0]);
+      await bench.idle(100);
+      expect(bench.stub.msis, [0, 0]);
+      await bench.finish();
+    },
+  );
+
+  test('the MSI gap comes from minMsiIntervalNs and the user clock', () {
+    const userClkHz = 62500000;
+    expect(const HarborPcieEndpointConfig().minMsiCycles(userClkHz), 0);
+    expect(
+      const HarborPcieEndpointConfig(
+        minMsiIntervalNs: 1000000,
+      ).minMsiCycles(userClkHz),
+      62500,
+    );
+    expect(
+      const HarborPcieEndpointConfig(
+        minMsiIntervalNs: 10000,
+      ).minMsiCycles(userClkHz),
+      625,
+    );
+    expect(
+      const HarborPcieEndpointConfig(
+        minMsiIntervalNs: 0,
+      ).minMsiCycles(userClkHz),
+      0,
+    );
+    for (final ns in [-1, 1000000000]) {
+      expect(
+        () => HarborPcieEndpointConfig(
+          minMsiIntervalNs: ns,
+        ).minMsiCycles(userClkHz),
+        throwsA(
+          isA<ArgumentError>().having(
+            (e) => e.name,
+            'name',
+            'minMsiIntervalNs',
+          ),
+        ),
+      );
+    }
+    expect(
+      () => HarborPcieInterrupt(
+        clk: Logic(),
+        reset: Logic(),
+        irqPending: Logic(width: 8),
+        txBusy: Logic(),
+        msiEnable: Logic(),
+        mmEnable: Logic(width: 3),
+        busMasterEnable: Logic(),
+        interruptDisable: Logic(),
+        interruptRdyN: Logic(),
+        minMsiCycles: HarborPcieInterrupt.maxMinMsiCycles + 1,
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  for (final (label, ns) in [
+    ('10 us', 10000),
+    (
+      'the default of no gap',
+      const HarborPcieEndpointConfig().minMsiIntervalNs,
+    ),
+    ('1 ms', 1000000),
+  ]) {
+    test('causes during the gap merge into later MSIs at $label', () async {
+      final gap = HarborPcieEndpointConfig(
+        minMsiIntervalNs: ns,
+      ).minMsiCycles(62500000);
+      final bench = _Bench();
+      await bench.start(minMsiCycles: gap, maxSimTime: (gap * 4 + 1000) * 10);
+      await bench.set(bench.irq, 0x01);
+      await bench.idle(20);
+      expect(bench.stub.msis, [0]);
+      // Two edges of vector 1 and one of vector 2, all in the gap.
+      for (final value in [0x02, 0x00, 0x06, 0x00]) {
+        await bench.set(bench.irq, value);
+      }
+      if (gap > 0) {
+        await bench.idle(gap ~/ 2);
+        expect(bench.stub.msis, [0], reason: 'an MSI went out in the gap');
+      }
+      await bench.idle(gap * 2 + 100);
+      final msis = bench.stub.msis;
+      final times = bench.stub.msiTimes;
+      if (gap > 0) {
+        expect(msis, [0, 1, 2]);
+        for (var i = 1; i < times.length; i++) {
+          expect(times[i] - times[i - 1], greaterThanOrEqualTo(gap * 10));
+        }
+      } else {
+        // With no gap an edge can come after its MSI started, so vector 1
+        // can go out twice. No cause is lost.
+        expect(msis.first, 0);
+        expect(msis.toSet(), {0, 1, 2});
+      }
+      await bench.finish();
+    });
+  }
 
   test('sends the lowest pending vector first with 8 granted', () async {
     final bench = _Bench();

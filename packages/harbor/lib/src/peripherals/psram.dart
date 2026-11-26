@@ -5,6 +5,7 @@ import '../arith/fpu_config.dart' show harborStableDefinitionName;
 import '../bus/bus.dart';
 import '../bus/bus_slave_port.dart';
 import '../soc/acpi.dart';
+import '../soc/board_zon.dart' show HarborMemoryInfo, HarborMemoryKind;
 import '../soc/device_tree.dart';
 import '../soc/svd.dart';
 import '../util/pretty_string.dart';
@@ -175,9 +176,9 @@ class HarborPsramController extends BridgeModule
     final wrCycles = Logic(name: 'wr_cycles', width: 6);
     final wrBuffer = Logic(name: 'wr_buffer', width: 32);
     Logic pack8(Logic byte) =>
-        [byte, Const(0, width: 24)].swizzle().getRange(0, 32);
+        [byte, Const(0, width: 24)].concat().getRange(0, 32);
     Logic pack16(Logic half) =>
-        [half, Const(0, width: 16)].swizzle().getRange(0, 32);
+        [half, Const(0, width: 16)].concat().getRange(0, 32);
     Combinational([
       byteOffset < Const(0, width: 2),
       wrCycles < Const(32, width: 6),
@@ -257,20 +258,24 @@ class HarborPsramController extends BridgeModule
             Const(0, width: 2),
             input('spi_miso'),
             Const(0),
-          ].swizzle().named('sio_in');
+          ].concat().named('sio_in');
 
     // Command byte selected by mode + direction, placed in the top byte.
     final cmdByte = mux(
       Const(quad),
-      mux(weR, Const(cmdQuadWrite, width: 8), Const(cmdFastReadQuad, width: 8)),
-      mux(weR, Const(cmdWrite, width: 8), Const(cmdRead, width: 8)),
+      mux<Logic>(
+        weR,
+        Const(cmdQuadWrite, width: 8),
+        Const(cmdFastReadQuad, width: 8),
+      ),
+      mux<Logic>(weR, Const(cmdWrite, width: 8), Const(cmdRead, width: 8)),
     );
     // Address word placed in bits [31:8]: {1'b0, wordAddr[20:0], offset[1:0]}.
     final addrField = [
       Const(0),
       wordAddrR,
       mux(weR, byteOffsetR, Const(0, width: 2)),
-    ].swizzle().getRange(0, 24);
+    ].concat().getRange(0, 24);
 
     final quadC = Const(quad);
     final oeQuadAddr = quad ? Const(0xF, width: 4) : Const(0x1, width: 4);
@@ -303,7 +308,7 @@ class HarborPsramController extends BridgeModule
                   mux(
                     isQuad,
                     spiBuf.getRange(28, 32),
-                    [Const(0, width: 3), spiBuf[31]].swizzle().getRange(0, 4),
+                    [Const(0, width: 3), spiBuf[31]].concat().getRange(0, 4),
                   ),
               If(
                 sclk,
@@ -316,11 +321,11 @@ class HarborPsramController extends BridgeModule
                         [
                           spiBuf.getRange(0, 28),
                           sioIn,
-                        ].swizzle().getRange(0, 32),
+                        ].concat().getRange(0, 32),
                         [
                           spiBuf.getRange(0, 31),
                           sioIn[1],
-                        ].swizzle().getRange(0, 32),
+                        ].concat().getRange(0, 32),
                       ),
                   xferCycles <
                       mux(
@@ -369,10 +374,7 @@ class HarborPsramController extends BridgeModule
                   ]),
                   CaseItem(Const(sCmd, width: 3), [
                     spiBuf <
-                        [
-                          cmdByte,
-                          Const(0, width: 24),
-                        ].swizzle().getRange(0, 32),
+                        [cmdByte, Const(0, width: 24)].concat().getRange(0, 32),
                     xferCycles < Const(8, width: 6),
                     state < Const(sAddr, width: 3),
                   ]),
@@ -381,12 +383,12 @@ class HarborPsramController extends BridgeModule
                         [
                           addrField,
                           Const(0, width: 8),
-                        ].swizzle().getRange(0, 32),
+                        ].concat().getRange(0, 32),
                     sioOe < oeQuadAddr,
                     xferCycles < Const(24, width: 6),
                     isQuad < quadC,
                     state <
-                        mux(
+                        mux<Logic>(
                           quadC & read,
                           Const(sWait, width: 3),
                           Const(sXfer, width: 3),
@@ -455,6 +457,13 @@ class HarborPsramController extends BridgeModule
   List<BusAddressRange> get systemMemory => [
     BusAddressRange(baseAddress, config.size),
   ];
+
+  @override
+  HarborMemoryInfo get memoryInfo => HarborMemoryInfo(
+    kind: HarborMemoryKind.psram,
+    sizeBytes: config.size,
+    widthBits: config.mode == HarborPsramMode.quad ? 4 : 1,
+  );
 
   @override
   HarborAcpiDevice get acpiDevice => HarborAcpiDevice(

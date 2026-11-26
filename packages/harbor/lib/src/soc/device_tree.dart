@@ -1,5 +1,6 @@
 import '../bus/bus.dart';
 import '../util/pretty_string.dart';
+import 'board_zon.dart' show HarborMemoryInfo;
 import 'cpu.dart';
 
 /// A device tree node: an immutable value object describing a device's
@@ -47,6 +48,25 @@ class HarborDeviceTreeRef {
   const HarborDeviceTreeRef(this.label);
 }
 
+/// A property value made of cells that mix numbers and references, such as the
+/// `<&gpio 5 1>` of a `reset-gpios` property. A [HarborDeviceTreeRef] writes as
+/// `&label` and an [int] writes as a decimal cell.
+class HarborDeviceTreeCells {
+  /// The cells, in order.
+  final List<Object> cells;
+
+  const HarborDeviceTreeCells(this.cells);
+}
+
+/// An address and size pair, written in the address and size cells of the
+/// root node, like the `reg` of a `memory` node.
+class HarborDeviceTreeRegion {
+  /// The span.
+  final BusAddressRange range;
+
+  const HarborDeviceTreeRegion(this.range);
+}
+
 /// One context (hart-facing register block) of an interrupt controller.
 ///
 /// A RISC-V PLIC gives each privilege level that claims interrupts its own
@@ -91,6 +111,9 @@ class HarborDeviceTreeNode with HarborPrettyString {
   /// Address range (`reg` property): base address and size.
   final BusAddressRange reg;
 
+  /// More `reg` entries after [reg], in order.
+  final List<BusAddressRange> extraReg;
+
   /// Interrupt numbers this device sources.
   final List<int> interrupts;
 
@@ -108,14 +131,33 @@ class HarborDeviceTreeNode with HarborPrettyString {
   /// Nested child nodes (e.g. a `partitions` container under a flash node).
   final List<HarborDeviceTreeChild> children;
 
+  /// Label of the node, for a [HarborDeviceTreeRef] to it. It must be unique
+  /// in the device tree. An interrupt controller without a label gets a
+  /// generated one.
+  final String? label;
+
+  /// The number of cells of an interrupt specifier when the node maps its own
+  /// interrupts, such as the pin and type of a GPIO controller. The generator
+  /// writes `interrupt-controller` and `#interrupt-cells` for it only when the
+  /// node has an interrupt, because the driver builds the domain only then.
+  final int? interruptDomainCells;
+
+  /// Node name without the unit address, or null to derive it from the first
+  /// compatible string.
+  final String? name;
+
   const HarborDeviceTreeNode({
     required this.compatible,
     required this.reg,
+    this.extraReg = const [],
     this.interrupts = const [],
     this.interruptController = false,
     this.interruptCells = 1,
     this.properties = const {},
     this.children = const [],
+    this.label,
+    this.interruptDomainCells,
+    this.name,
   });
 
   /// The primary compatible string (first in the list).
@@ -125,10 +167,9 @@ class HarborDeviceTreeNode with HarborPrettyString {
   ///
   /// Generated from the first compatible string + hex base address.
   String get nodeName {
-    final base = primaryCompatible
-        .split(',')
-        .last
-        .replaceAll(RegExp(r'[^a-z0-9]'), '-');
+    final base =
+        name ??
+        primaryCompatible.split(',').last.replaceAll(RegExp(r'[^a-z0-9]'), '-');
     return '$base@${reg.start.toRadixString(16)}';
   }
 
@@ -185,6 +226,22 @@ class HarborDeviceTreeNode with HarborPrettyString {
 mixin HarborDeviceTreeNodeProvider {
   /// The device tree node for this device.
   HarborDeviceTreeNode get dtNode;
+
+  /// More nodes for the same device, emitted after [dtNode]. They get no
+  /// interrupts from the SoC.
+  List<HarborDeviceTreeNode> get extraDtNodes => const [];
+
+  /// Nodes for the `/chosen` node, such as a `simple-framebuffer` that the
+  /// firmware sets up. They get no interrupts from the SoC.
+  List<HarborDeviceTreeNode> get chosenDtNodes => const [];
+}
+
+/// A peripheral with more than one slave port. [HarborSoC.addPeripheral]
+/// maps each port in [secondarySlaves] into the fabric, as
+/// [HarborSoC.addPeripheralSlave] does.
+mixin HarborSecondarySlaveProvider {
+  /// The slave ports after the port named `bus`.
+  List<({String busInterfaceName, BusAddressRange range})> get secondarySlaves;
 }
 
 /// Interface for devices that back usable system RAM (DRAM, etc.).
@@ -198,6 +255,44 @@ mixin HarborSystemMemoryProvider {
   /// The usable RAM span(s) this device backs. Excludes any control-register
   /// window, matching the ACPI memory view.
   List<BusAddressRange> get systemMemory;
+
+  /// The kind, size and data width of this memory, for the firmware board
+  /// file.
+  HarborMemoryInfo get memoryInfo;
+}
+
+/// A span of memory that the OS must not use as normal RAM, emitted as a
+/// child of the root `reserved-memory` node.
+class HarborReservedMemory {
+  /// Label of the node, for a [HarborDeviceTreeRef] from a device node.
+  final String label;
+
+  /// Node name without the unit address, for example `framebuffer`.
+  final String name;
+
+  /// The reserved span.
+  final BusAddressRange range;
+
+  /// Value of the `compatible` property, or null for none. A
+  /// `shared-dma-pool` gives a device a private DMA pool.
+  final String? compatible;
+
+  /// True for the `no-map` property: the OS does not map the span.
+  final bool noMap;
+
+  const HarborReservedMemory({
+    required this.label,
+    required this.name,
+    required this.range,
+    this.compatible,
+    this.noMap = true,
+  });
+}
+
+/// Interface for devices that reserve a span of system memory.
+mixin HarborReservedMemoryProvider {
+  /// The spans this device reserves.
+  List<HarborReservedMemory> get reservedMemory;
 }
 
 /// Generates a Linux/U-Boot compatible `.dts` file from a list of
@@ -234,6 +329,10 @@ class HarborDeviceTreeGenerator {
   /// `device_type = "memory"`. Without these an OS/SBI payload finds no RAM.
   final List<BusAddressRange> memories;
 
+  /// Spans of memory that the OS must not use as RAM, emitted under a root
+  /// `reserved-memory` node.
+  final List<HarborReservedMemory> reservedMemories;
+
   /// Interrupt numbers assigned to peripherals by the SoC's allocator, keyed
   /// by provider.
   ///
@@ -257,13 +356,15 @@ class HarborDeviceTreeGenerator {
     this.cpus = const [],
     this.peripherals = const [],
     this.memories = const [],
+    this.reservedMemories = const [],
     this.interrupts = const {},
     this.interruptContexts = const [],
   });
 
   /// All device tree nodes from the peripherals.
-  List<HarborDeviceTreeNode> get nodes =>
-      peripherals.map((p) => p.dtNode).toList();
+  List<HarborDeviceTreeNode> get nodes => [
+    for (final p in peripherals) ...[p.dtNode, ...p.extraDtNodes],
+  ];
 
   /// Encodes [value] as [cells] 32-bit device-tree cells, most-significant
   /// first (big-endian cell order), e.g. cells=2 -> `0x<hi> 0x<lo>`.
@@ -275,8 +376,15 @@ class HarborDeviceTreeGenerator {
     return parts.join(' ');
   }
 
+  /// Escapes [value] for use inside a DTS string literal.
+  static String _str(String value) => value
+      .replaceAll(r'\', r'\\')
+      .replaceAll('"', r'\"')
+      .replaceAll('\n', r'\n');
+
   /// Generates the DTS source as a string.
   String generate() {
+    _checkLabels();
     final buf = StringBuffer();
 
     // Phandle plan. An `interrupts` number means nothing to an OS until the
@@ -305,13 +413,13 @@ class HarborDeviceTreeGenerator {
     // below are the conventional source form that dtc can check.
     String cpuIntcLabel(int hartId) => 'cpu${hartId}_intc';
     String controllerLabel(HarborDeviceTreeNodeProvider c) =>
-        'intc${controllers.indexOf(c)}';
+        c.dtNode.label ?? 'intc${controllers.indexOf(c)}';
 
     buf.writeln('/dts-v1/;');
     buf.writeln();
     buf.writeln('/ {');
-    buf.writeln('    model = "$model";');
-    buf.writeln('    compatible = "$compatible";');
+    buf.writeln('    model = "${_str(model)}";');
+    buf.writeln('    compatible = "${_str(compatible)}";');
     buf.writeln('    #address-cells = <$addressCells>;');
     buf.writeln('    #size-cells = <$sizeCells>;');
 
@@ -320,13 +428,43 @@ class HarborDeviceTreeGenerator {
       buf.writeln('    cpus {');
       buf.writeln('        #address-cells = <1>;');
       buf.writeln('        #size-cells = <0>;');
+      // Linux reads the timebase from /cpus only. The binding allows one
+      // value there when every hart shares it.
+      final timebases = {
+        for (final cpu in cpus)
+          if (cpu.timebaseFrequency != null) cpu.timebaseFrequency,
+      };
+      if (timebases.length > 1) {
+        throw ArgumentError.value(
+          timebases.toList(),
+          'cpus',
+          'harts have different timebase-frequency values',
+        );
+      }
+      if (timebases.isNotEmpty) {
+        buf.writeln('        timebase-frequency = <${timebases.single}>;');
+      }
       for (final cpu in cpus) {
         buf.writeln();
         buf.writeln('        cpu@${cpu.hartId} {');
         buf.writeln('            device_type = "cpu";');
-        buf.writeln('            compatible = "riscv";');
+        if (cpu.model != null) {
+          buf.writeln('            model = "${_str(cpu.model!)}";');
+        }
+        final cpuCompat = [...cpu.compatible, 'riscv'];
+        buf.writeln(
+          '            compatible = ${cpuCompat.map((c) => '"${_str(c)}"').join(', ')};',
+        );
         buf.writeln('            reg = <0x${cpu.hartId.toRadixString(16)}>;');
+        // riscv,isa is deprecated and cannot name an extension past the
+        // single letters in every case, so the isa-base and isa-extensions
+        // pair goes out with it. An OS reads the pair first.
         buf.writeln('            riscv,isa = "${cpu.isa}";');
+        if (cpu.isaBase != null && cpu.isaExtensions.isNotEmpty) {
+          buf.writeln('            riscv,isa-base = "${cpu.isaBase}";');
+          final list = cpu.isaExtensions.map((e) => '"$e"').join(', ');
+          buf.writeln('            riscv,isa-extensions = $list;');
+        }
         if (cpu.mmu != null) {
           buf.writeln('            mmu-type = "${cpu.mmu}";');
         }
@@ -376,6 +514,54 @@ class HarborDeviceTreeGenerator {
       buf.writeln('    };');
     }
 
+    if (reservedMemories.isNotEmpty) {
+      buf.writeln();
+      buf.writeln('    reserved-memory {');
+      buf.writeln('        #address-cells = <$addressCells>;');
+      buf.writeln('        #size-cells = <$sizeCells>;');
+      buf.writeln('        ranges;');
+      for (final r in reservedMemories) {
+        buf.writeln();
+        buf.writeln(
+          '        ${r.label}: ${r.name}@${r.range.start.toRadixString(16)} {',
+        );
+        if (r.compatible != null) {
+          buf.writeln('            compatible = "${_str(r.compatible!)}";');
+        }
+        buf.writeln(
+          '            reg = <${_regCells(r.range.start, addressCells)} '
+          '${_regCells(r.range.size, sizeCells)}>;',
+        );
+        if (r.noMap) buf.writeln('            no-map;');
+        buf.writeln('        };');
+      }
+      buf.writeln('    };');
+    }
+
+    final chosenNodes = [for (final p in peripherals) ...p.chosenDtNodes];
+    if (chosenNodes.isNotEmpty) {
+      buf.writeln();
+      buf.writeln('    chosen {');
+      buf.writeln('        #address-cells = <$addressCells>;');
+      buf.writeln('        #size-cells = <$sizeCells>;');
+      for (final node in chosenNodes) {
+        buf.writeln();
+        final label = node.label == null ? '' : '${node.label}: ';
+        buf.writeln('        $label${node.nodeName} {');
+        final compatStr = node.compatible.map((c) => '"$c"').join(', ');
+        buf.writeln('            compatible = $compatStr;');
+        buf.writeln(
+          '            reg = <${_regCells(node.reg.start, addressCells)} '
+          '${_regCells(node.reg.size, sizeCells)}>;',
+        );
+        for (final entry in node.properties.entries) {
+          _emitProperty(buf, '            ', entry.key, entry.value);
+        }
+        buf.writeln('        };');
+      }
+      buf.writeln('    };');
+    }
+
     if (peripherals.isNotEmpty) {
       buf.writeln();
       buf.writeln('    soc {');
@@ -392,20 +578,32 @@ class HarborDeviceTreeGenerator {
         );
       }
 
-      for (final p in peripherals) {
-        final node = p.dtNode;
-        final irqList = interrupts[p] ?? node.interrupts;
+      final entries = [
+        for (final p in peripherals) ...[
+          (p, p.dtNode, true),
+          for (final extra in p.extraDtNodes) (p, extra, false),
+        ],
+      ];
+      for (final (p, node, primary) in entries) {
+        final irqList = primary
+            ? (interrupts[p] ?? node.interrupts)
+            : node.interrupts;
         buf.writeln();
-        final label = node.interruptController ? '${controllerLabel(p)}: ' : '';
+        final label = primary && node.interruptController
+            ? '${controllerLabel(p)}: '
+            : node.label == null
+            ? ''
+            : '${node.label}: ';
         buf.writeln('        $label${node.nodeName} {');
         final compatStr = node.compatible.map((c) => '"$c"').join(', ');
         buf.writeln('            compatible = $compatStr;');
         buf.writeln(
-          '            reg = <${_regCells(node.reg.start, addressCells)} '
-          '${_regCells(node.reg.size, sizeCells)}>;',
+          '            reg = <${[
+            for (final r in [node.reg, ...node.extraReg]) '${_regCells(r.start, addressCells)} ${_regCells(r.size, sizeCells)}',
+          ].join(' ')}>;',
         );
 
-        if (node.interruptController) {
+        if (primary && node.interruptController) {
           buf.writeln('            interrupt-controller;');
           buf.writeln(
             '            #interrupt-cells = <${node.interruptCells}>;',
@@ -432,6 +630,12 @@ class HarborDeviceTreeGenerator {
         if (irqList.isNotEmpty) {
           final irqs = irqList.map((i) => '0x${i.toRadixString(16)}').join(' ');
           buf.writeln('            interrupts = <$irqs>;');
+          if (!node.interruptController && node.interruptDomainCells != null) {
+            buf.writeln('            interrupt-controller;');
+            buf.writeln(
+              '            #interrupt-cells = <${node.interruptDomainCells}>;',
+            );
+          }
         }
 
         for (final entry in node.properties.entries) {
@@ -450,6 +654,78 @@ class HarborDeviceTreeGenerator {
 
     buf.writeln('};');
     return buf.toString();
+  }
+
+  /// Throws when two nodes share a label or a reference names no label.
+  void _checkLabels() {
+    final seen = <String>{};
+    void add(String? label) {
+      if (label == null) return;
+      if (!seen.add(label)) {
+        throw ArgumentError.value(
+          label,
+          'label',
+          'more than one device tree node has this label',
+        );
+      }
+    }
+
+    void addChild(HarborDeviceTreeChild c) {
+      add(c.label);
+      c.children.forEach(addChild);
+    }
+
+    final nodes = [
+      for (final p in peripherals) ...[
+        p.dtNode,
+        ...p.extraDtNodes,
+        ...p.chosenDtNodes,
+      ],
+    ];
+    for (final n in nodes) {
+      add(n.label);
+      n.children.forEach(addChild);
+    }
+    for (final r in reservedMemories) {
+      add(r.label);
+    }
+    for (final cpu in cpus) {
+      if (peripherals.any((p) => p.dtNode.interruptController)) {
+        add('cpu${cpu.hartId}_intc');
+      }
+    }
+    for (final (i, p)
+        in peripherals.where((p) => p.dtNode.interruptController).indexed) {
+      if (p.dtNode.label == null) add('intc$i');
+    }
+
+    // A reference must name a node that exists.
+    void check(Object value) {
+      final refs = value is HarborDeviceTreeRef
+          ? [value]
+          : value is HarborDeviceTreeCells
+          ? value.cells.whereType<HarborDeviceTreeRef>()
+          : const <HarborDeviceTreeRef>[];
+      for (final r in refs) {
+        if (!seen.contains(r.label)) {
+          throw ArgumentError.value(
+            r.label,
+            'HarborDeviceTreeRef',
+            'no device tree node has this label',
+          );
+        }
+      }
+    }
+
+    void checkChild(HarborDeviceTreeChild c) {
+      c.properties.values.forEach(check);
+      c.children.forEach(checkChild);
+    }
+
+    for (final n in nodes) {
+      n.properties.values.forEach(check);
+      n.children.forEach(checkChild);
+    }
   }
 
   /// Recursively emits a nested [HarborDeviceTreeChild] at [indent].
@@ -485,9 +761,21 @@ class HarborDeviceTreeGenerator {
     if (value is String) return '"$value"';
     if (value is int) return '<$value>';
     if (value is HarborDeviceTreeRef) return '<&${value.label}>';
+    if (value is HarborDeviceTreeRegion) {
+      return '<${_regCells(value.range.start, addressCells)} '
+          '${_regCells(value.range.size, sizeCells)}>';
+    }
+    if (value is HarborDeviceTreeCells) {
+      final cells = [
+        for (final c in value.cells)
+          if (c is HarborDeviceTreeRef) '&${c.label}' else '$c',
+      ];
+      return '<${cells.join(' ')}>';
+    }
     if (value is List<int>) {
       return '<${value.map((v) => '0x${v.toRadixString(16)}').join(' ')}>';
     }
+    if (value is List<String>) return value.map((v) => '"$v"').join(', ');
     return '"$value"';
   }
 }

@@ -105,7 +105,7 @@ class TestDfuSink extends BridgeModule {
             'err_now',
           );
       sink.error <=
-          mux(errorNow, Const(errorCode, width: 4), Const(0, width: 4));
+          mux<Logic>(errorNow, Const(errorCode, width: 4), Const(0, width: 4));
     } else {
       sink.error <= Const(0, width: 4);
     }

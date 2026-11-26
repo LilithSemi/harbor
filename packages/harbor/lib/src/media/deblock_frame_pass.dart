@@ -38,7 +38,7 @@ class HarborDeblockFramePass extends BridgeModule {
     List<Logic> filt(List<Logic> line8) {
       final f = HarborDeblockFilter(narrowOnly: true, name: 'flt_${inst++}');
       addSubModule(f);
-      f.input('line').srcConnection! <= line8.reversed.toList().swizzle();
+      f.input('line').srcConnection! <= line8.reversed.toList().concat();
       f.input('blimit').srcConnection! <= blimit;
       f.input('limit').srcConnection! <= limit;
       f.input('thresh').srcConnection! <= thresh;
@@ -86,6 +86,6 @@ class HarborDeblockFramePass extends BridgeModule {
     }
 
     output('out') <=
-        [for (var i = width * height - 1; i >= 0; i--) grid2[i]].swizzle();
+        [for (var i = width * height - 1; i >= 0; i--) grid2[i]].concat();
   }
 }

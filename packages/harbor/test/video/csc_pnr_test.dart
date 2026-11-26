@@ -84,7 +84,7 @@ Future<Directory> _synth(
   final dir = Directory.systemTemp.createTempSync('harbor_csc_pnr_');
   addTearDown(() => dir.deleteSync(recursive: true));
   final d = dir.path;
-  File('$d/dut.sv').writeAsStringSync(dut.generateSynth());
+  File('$d/dut.sv').writeAsStringSync(dut.dumpSystemVerilog());
   File('$d/top.sv').writeAsStringSync(_bench(dut));
   final yosys = await Process.run('yosys', [
     '-q',

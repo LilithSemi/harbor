@@ -71,7 +71,7 @@ class HarborLrParamsParser extends BridgeModule {
         mux(
           lt.eq(Const(1, width: 2)),
           Const(3, width: 2),
-          mux(
+          mux<Logic>(
             lt.eq(Const(2, width: 2)),
             Const(1, width: 2),
             Const(2, width: 2),

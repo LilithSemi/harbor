@@ -198,7 +198,8 @@ class HarborEfuseDevice extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// Base address in the SoC memory map.
   final int baseAddress;
 
@@ -398,7 +399,7 @@ class HarborEfuseDevice extends BridgeModule
                         errorFlag,
                         doneFlag,
                         busy,
-                      ].swizzle(),
+                      ].concat(),
                   // Clear done/error on read
                   If(
                     ~bus.we,

@@ -141,7 +141,6 @@ class HarborMemoryBeats {
           size < 0,
           burst < 0,
           rValid < 0,
-          rData < 0,
           rLast < 0,
           bValid < 0,
           rErr < 0,

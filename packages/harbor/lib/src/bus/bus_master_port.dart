@@ -122,6 +122,7 @@ class BusMasterPort {
     HarborFabricClock? fabricClock,
   }) {
     final crossed = fabricClock != null && fabricClock.crossesFrom(clk);
+    if (crossed) harborMarkCrossed(module, name, fabricClock.clk);
     if (exclusive && kind != HarborFabricKind.axi4) {
       throw ArgumentError('$name: a ${kind.name} port has no exclusive access');
     }
@@ -418,7 +419,7 @@ class BusMasterPort {
     tl.aOpcode <=
         mux(
           we,
-          mux(
+          mux<Logic>(
             sel.and(),
             Const(TileLinkAOpcode.putFullData.value, width: 3),
             Const(TileLinkAOpcode.putPartialData.value, width: 3),

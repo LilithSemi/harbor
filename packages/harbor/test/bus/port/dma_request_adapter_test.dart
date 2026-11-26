@@ -547,6 +547,7 @@ class _MediaTop extends BridgeModule {
     eng.input('dma_read_data').srcConnection! <= a.readData;
     eng.input('dma_read_valid').srcConnection! <= a.readValid;
     eng.input('dma_write_ack').srcConnection! <= a.writeAck;
+    eng.input('dma_err').srcConnection! <= a.err;
     addOutput('interrupt') <= eng.output('interrupt');
   }
 }

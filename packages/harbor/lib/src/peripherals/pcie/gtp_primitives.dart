@@ -3,7 +3,9 @@ import 'package:rohd_bridge/rohd_bridge.dart';
 
 import 'gtp_pcie_params.dart';
 import 'gtp_pcie_phy.dart';
+import 'pcie_phy.dart';
 import 'pcie_pipe.dart';
+import 'pipe_clock.dart';
 
 class HarborXilinxIbufdsGte2 extends BridgeModule {
   Logic get clock => output('O');
@@ -82,31 +84,7 @@ class HarborXilinxGtpe2Channel extends BridgeModule {
 }
 
 /// Artix-7 x1 GTP physical layer for the 7-series PCIe hard block.
-class HarborArtix7PciePhy extends Module {
-  Logic get txP => output('tx_p');
-  Logic get txN => output('tx_n');
-  Logic get pclk => output('pclk');
-  Logic get userClk1 => output('userclk1');
-  Logic get userClk2 => output('userclk2');
-  Logic get ready => output('ready');
-
-  /// MMCM lock, not synchronised.
-  Logic get mmcmLock => output('mmcm_lock');
-
-  /// Current [HarborGtpResetState] code.
-  Logic get resetState => output('reset_state');
-
-  /// [HarborGtpResetState] code of the last failure.
-  Logic get resetFailState => output('reset_fail_state');
-
-  /// Number of failures since reset, it stops at 255.
-  Logic get resetRetries => output('reset_retries');
-
-  /// Number of link training watchdog restarts, it stops at 255. Null when
-  /// the watchdog is off.
-  Logic? get linkRetrains =>
-      timeouts.linkWait == 0 ? null : output('link_retrains');
-
+class HarborArtix7PciePhy extends HarborPciePhy {
   /// The link inputs are optional as in [HarborGtpPciePhy]. They are
   /// necessary only when [HarborGtpPcieTimeouts.linkWait] is not 0, and the
   /// PHY gives an [ArgumentError] when they are missing.
@@ -186,6 +164,10 @@ class HarborArtix7PciePhy extends Module {
     addOutput('reset_retries', width: 8) <= phy.resetRetries;
     if (watch) addOutput('link_retrains', width: 8) <= phy.linkRetrains!;
   }
+
+  @override
+  int get userClkHz =>
+      HarborPipeClock.userClkHz(HarborGtpPciePhy.userClkDivide(1));
 
   /// Bounds of the waits and of the link training watchdog.
   final HarborGtpPcieTimeouts timeouts;

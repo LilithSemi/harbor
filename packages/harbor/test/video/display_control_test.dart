@@ -138,7 +138,9 @@ void main() {
         'counts', () async {
       final pixelClk = SimpleClockGenerator(20).clk;
       final scanClk = SimpleClockGenerator(4).clk;
-      final ctrlClk = SimpleClockGenerator(controlPeriod).clk;
+      final ctrlClk = SimpleClockGenerator(
+        controlPeriod + (controlPeriod & 1),
+      ).clk;
       final pixelReset = Logic(name: 'pixel_reset');
       final scanReset = Logic(name: 'scan_reset');
       final ctrlReset = Logic(name: 'ctrl_reset');
@@ -381,7 +383,9 @@ void main() {
         'update does not change the set that the pixel side takes', () async {
       final pixelClk = SimpleClockGenerator(20).clk;
       final scanClk = SimpleClockGenerator(4).clk;
-      final ctrlClk = SimpleClockGenerator(controlPeriod).clk;
+      final ctrlClk = SimpleClockGenerator(
+        controlPeriod + (controlPeriod & 1),
+      ).clk;
       final pixelReset = Logic(name: 'pixel_reset');
       final scanReset = Logic(name: 'scan_reset');
       final ctrlReset = Logic(name: 'ctrl_reset');

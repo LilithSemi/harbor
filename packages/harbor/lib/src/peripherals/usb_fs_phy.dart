@@ -55,7 +55,7 @@ class HarborUsbFsRx extends BridgeModule {
         reset,
         then: [dpairQ < Const(0, width: 4)],
         orElse: [
-          dpairQ < [dpairQ.slice(1, 0), dp, dn].swizzle(),
+          dpairQ < [dpairQ.slice(1, 0), dp, dn].concat(),
         ],
       ),
     ]);
@@ -242,7 +242,7 @@ class HarborUsbFsRx extends BridgeModule {
             lineStateValid,
             then: [
               lineHistory <
-                  [lineHistory.slice(3, 0), lineState.slice(1, 0)].swizzle(),
+                  [lineHistory.slice(3, 0), lineState.slice(1, 0)].concat(),
             ],
           ),
           // This port clears packet_valid on reset, because ROHD has no
@@ -324,7 +324,7 @@ class HarborUsbFsRx extends BridgeModule {
           If(
             dvalidRaw,
             then: [
-              bitstuffHistory < [bitstuffHistory.slice(4, 0), din].swizzle(),
+              bitstuffHistory < [bitstuffHistory.slice(4, 0), din].concat(),
             ],
           ),
         ],
@@ -350,7 +350,7 @@ class HarborUsbFsRx extends BridgeModule {
           If(
             dvalid & ~pidComplete,
             then: [
-              fullPid < [din, fullPid.slice(8, 1)].swizzle(),
+              fullPid < [din, fullPid.slice(8, 1)].concat(),
             ],
           ),
         ],
@@ -379,7 +379,7 @@ class HarborUsbFsRx extends BridgeModule {
                     crc5.slice(1, 1) ^ crc5Invert,
                     crc5.slice(0, 0),
                     crc5Invert,
-                  ].swizzle(),
+                  ].concat(),
             ],
           ),
         ],
@@ -409,7 +409,7 @@ class HarborUsbFsRx extends BridgeModule {
                     crc16.slice(1, 1) ^ crc16Invert,
                     crc16.slice(0, 0),
                     crc16Invert,
-                  ].swizzle(),
+                  ].concat(),
             ],
           ),
         ],
@@ -459,7 +459,7 @@ class HarborUsbFsRx extends BridgeModule {
           If(
             dvalid & pidComplete & pktIsToken & ~tokenPayloadDone,
             then: [
-              tokenPayload < [din, tokenPayload.slice(11, 1)].swizzle(),
+              tokenPayload < [din, tokenPayload.slice(11, 1)].concat(),
             ],
           ),
         ],
@@ -516,7 +516,7 @@ class HarborUsbFsRx extends BridgeModule {
           If(
             dvalid & pidComplete & pktIsData,
             then: [
-              rxDataBuffer < [din, rxDataBuffer.slice(8, 1)].swizzle(),
+              rxDataBuffer < [din, rxDataBuffer.slice(8, 1)].concat(),
             ],
           ),
         ],
@@ -578,7 +578,7 @@ class HarborUsbFsTx extends BridgeModule {
     final bitHistory = [
       serialTxData,
       bitHistoryQ,
-    ].swizzle().named('bit_history');
+    ].concat().named('bit_history');
     final bitstuff = bitHistory.eq(Const(63, width: 6)).named('bitstuff');
 
     // Stuff-pipeline: the CRC must skip a stuff bit when it reaches the
@@ -652,7 +652,7 @@ class HarborUsbFsTx extends BridgeModule {
                     crc16.slice(1, 1) ^ crc16Invert,
                     crc16.slice(0, 0),
                     crc16Invert,
-                  ].swizzle(),
+                  ].concat(),
             ],
           ),
         ],
@@ -720,7 +720,7 @@ class HarborUsbFsTx extends BridgeModule {
                     then: [pktState < Const(stDataOrCrc16_0, width: 32)],
                     orElse: [pktState < Const(stEop, width: 32)],
                   ),
-                  dataShiftReg < [~pidq, pidq].swizzle(),
+                  dataShiftReg < [~pidq, pidq].concat(),
                   oeShiftReg < Const(255, width: 8),
                   se0ShiftReg < Const(0, width: 8),
                 ],
@@ -754,7 +754,7 @@ class HarborUsbFsTx extends BridgeModule {
                             crc16.slice(13, 13),
                             crc16.slice(14, 14),
                             crc16.slice(15, 15),
-                          ].swizzle(),
+                          ].concat(),
                       oeShiftReg < Const(255, width: 8),
                       se0ShiftReg < Const(0, width: 8),
                     ],
@@ -778,7 +778,7 @@ class HarborUsbFsTx extends BridgeModule {
                         crc16.slice(5, 5),
                         crc16.slice(6, 6),
                         crc16.slice(7, 7),
-                      ].swizzle(),
+                      ].concat(),
                   oeShiftReg < Const(255, width: 8),
                   se0ShiftReg < Const(0, width: 8),
                 ],
@@ -838,7 +838,7 @@ class HarborUsbFsTx extends BridgeModule {
                     then: [
                       bitHistoryQ < bitHistory.slice(5, 1),
                       dataShiftReg <
-                          [dataShiftReg.slice(7, 1), Const(0)].swizzle(),
+                          [dataShiftReg.slice(7, 1), Const(0)].concat(),
                     ],
                     orElse: [
                       bitCount < bitCount + Const(1, width: 3),

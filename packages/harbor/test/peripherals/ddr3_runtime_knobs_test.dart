@@ -261,7 +261,7 @@ void main() {
         runtimeTrainable: false,
       );
       await dut.build();
-      final sv = dut.generateSynth();
+      final sv = dut.dumpSystemVerilog();
       expect(sv, isNot(contains('rt_odelay')));
       expect(sv, isNot(contains('rt_active')));
       expect(sv, isNot(contains('rt_wb2_ack')));
@@ -341,7 +341,7 @@ void main() {
     );
     await ddr.build();
     // The train slave is at the full bus width; the boundary narrows to wb2.
-    final sv = ddr.generateSynth();
+    final sv = ddr.dumpSystemVerilog();
     expect(sv, contains('train_DAT_MOSI'));
     expect(ddr.trainBus, isNotNull);
     expect(ddr.trainBus!.dataIn.width, 64);

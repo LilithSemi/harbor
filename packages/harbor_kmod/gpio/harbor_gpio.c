@@ -13,6 +13,11 @@
  *   0x18: IRQ_EN     (RW) - Interrupt enable per pin
  *   0x20: IRQ_STATUS (W1C) - Interrupt status
  *   0x28: IRQ_EDGE   (RW) - 0=level, 1=edge triggered
+ *   0x30: IRQ_FALL   (RW) - 1=falling edge triggered
+ *
+ * A pin triggers on a high level when both IRQ_EDGE and IRQ_FALL are 0, on a
+ * rising edge for IRQ_EDGE only, on a falling edge for IRQ_FALL only and on
+ * both edges when both are 1.
  */
 
 #include <linux/module.h>
@@ -29,6 +34,7 @@
 #define HARBOR_GPIO_IRQ_EN     0x18
 #define HARBOR_GPIO_IRQ_STATUS 0x20
 #define HARBOR_GPIO_IRQ_EDGE   0x28
+#define HARBOR_GPIO_IRQ_FALL   0x30
 
 struct harbor_gpio {
 	void __iomem *base;
@@ -106,22 +112,34 @@ static void harbor_gpio_irq_mask(struct irq_data *d)
 {
 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
 	struct harbor_gpio *hg = gpiochip_get_data(gc);
+	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+	unsigned long flags;
 	u32 reg;
 
+	raw_spin_lock_irqsave(&hg->lock, flags);
 	reg = readl(hg->base + HARBOR_GPIO_IRQ_EN);
-	reg &= ~BIT(irqd_to_hwirq(d));
+	reg &= ~BIT(hwirq);
 	writel(reg, hg->base + HARBOR_GPIO_IRQ_EN);
+	raw_spin_unlock_irqrestore(&hg->lock, flags);
+
+	gpiochip_disable_irq(gc, hwirq);
 }
 
 static void harbor_gpio_irq_unmask(struct irq_data *d)
 {
 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
 	struct harbor_gpio *hg = gpiochip_get_data(gc);
+	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+	unsigned long flags;
 	u32 reg;
 
+	gpiochip_enable_irq(gc, hwirq);
+
+	raw_spin_lock_irqsave(&hg->lock, flags);
 	reg = readl(hg->base + HARBOR_GPIO_IRQ_EN);
-	reg |= BIT(irqd_to_hwirq(d));
+	reg |= BIT(hwirq);
 	writel(reg, hg->base + HARBOR_GPIO_IRQ_EN);
+	raw_spin_unlock_irqrestore(&hg->lock, flags);
 }
 
 static void harbor_gpio_irq_ack(struct irq_data *d)
@@ -136,14 +154,47 @@ static int harbor_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 {
 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
 	struct harbor_gpio *hg = gpiochip_get_data(gc);
+	u32 bit = BIT(irqd_to_hwirq(d));
+	bool edge, fall;
+	unsigned long flags;
 	u32 reg;
 
+	switch (type & IRQ_TYPE_SENSE_MASK) {
+	case IRQ_TYPE_LEVEL_HIGH:
+		edge = false;
+		fall = false;
+		break;
+	case IRQ_TYPE_EDGE_RISING:
+		edge = true;
+		fall = false;
+		break;
+	case IRQ_TYPE_EDGE_FALLING:
+		edge = false;
+		fall = true;
+		break;
+	case IRQ_TYPE_EDGE_BOTH:
+		edge = true;
+		fall = true;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	raw_spin_lock_irqsave(&hg->lock, flags);
 	reg = readl(hg->base + HARBOR_GPIO_IRQ_EDGE);
-	if (type & IRQ_TYPE_EDGE_RISING)
-		reg |= BIT(irqd_to_hwirq(d));
-	else
-		reg &= ~BIT(irqd_to_hwirq(d));
+	reg = edge ? reg | bit : reg & ~bit;
 	writel(reg, hg->base + HARBOR_GPIO_IRQ_EDGE);
+	reg = readl(hg->base + HARBOR_GPIO_IRQ_FALL);
+	reg = fall ? reg | bit : reg & ~bit;
+	writel(reg, hg->base + HARBOR_GPIO_IRQ_FALL);
+	/* The two writes pass through another trigger, so drop what it caught. */
+	writel(bit, hg->base + HARBOR_GPIO_IRQ_STATUS);
+	raw_spin_unlock_irqrestore(&hg->lock, flags);
+
+	if (type & IRQ_TYPE_LEVEL_MASK)
+		irq_set_handler_locked(d, handle_level_irq);
+	else
+		irq_set_handler_locked(d, handle_edge_irq);
 
 	return 0;
 }
@@ -154,6 +205,8 @@ static const struct irq_chip harbor_gpio_irqchip = {
     .irq_unmask = harbor_gpio_irq_unmask,
     .irq_ack = harbor_gpio_irq_ack,
     .irq_set_type = harbor_gpio_irq_set_type,
+    .flags = IRQCHIP_IMMUTABLE,
+    GPIOCHIP_IRQ_RESOURCE_HELPERS,
 };
 
 static irqreturn_t harbor_gpio_irq_handler(int irq, void *dev_id)

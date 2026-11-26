@@ -92,7 +92,8 @@ class HarborPowerManagementUnit extends BridgeModule
     with
         HarborDeviceTreeNodeProvider,
         HarborAcpiDeviceProvider,
-        HarborSvdPeripheralProvider {
+        HarborSvdPeripheralProvider,
+        HarborNarrowSlaveOk {
   /// PMU configuration.
   final HarborPmuConfig config;
 

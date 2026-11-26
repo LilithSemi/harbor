@@ -21,7 +21,7 @@ void main() {
       shiftReset: shiftReset,
     );
     await dvi.build();
-    final sv = dvi.generateSynth();
+    final sv = dvi.dumpSystemVerilog();
 
     expect(dvi.gpdi.width, equals(4));
     expect(sv, contains('VideoTimingGenerator'));

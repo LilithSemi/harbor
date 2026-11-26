@@ -145,6 +145,8 @@ class HarborAxi4MemorySlave extends Module {
         ],
       ]),
       popReady: reqFire & pickWrite,
+      // The exclusive monitor reads the entries in place.
+      inPlace: ex,
     );
     final arF = HarborRegFifo(
       name: 'ar',
@@ -165,6 +167,8 @@ class HarborAxi4MemorySlave extends Module {
         ],
       ]),
       popReady: reqFire & ~pickWrite,
+      // The exclusive monitor reads the entries in place.
+      inPlace: ex,
     );
     a.awReady <= awF.pushReady;
     a.arReady <= arF.pushReady;
@@ -392,7 +396,7 @@ class HarborAxi4MemorySlave extends Module {
     Const(Axi4RespField.slvErr.value, width: Axi4Interface.respWidth),
     exOkay == null
         ? Const(Axi4RespField.okay.value, width: Axi4Interface.respWidth)
-        : mux(
+        : mux<Logic>(
             exOkay,
             Const(Axi4RespField.exOkay.value, width: Axi4Interface.respWidth),
             Const(Axi4RespField.okay.value, width: Axi4Interface.respWidth),
@@ -599,21 +603,35 @@ class HarborAxi4MemorySlaveReadOnly extends Module {
 /// check the exclusive pair rules of [HarborMemoryWaist]. The device keeps
 /// them, and uses only the IDs that get a slot from the fabric master's
 /// `exclusiveIds`.
+///
+/// The AXI4 address can be wider than the waist address. AWADDR and ARADDR
+/// are then the waist address with zeros above it, and the AW and AR FIFOs
+/// keep only the waist bits.
 class HarborAxi4MemoryMaster extends Module {
   HarborAxi4MemoryMaster({
     required Logic clk,
     required Logic reset,
     required HarborMemoryWaist waist,
     required Axi4Interface axi,
+    bool readOnly = false,
     super.name = 'axi4_memory_master',
   }) : super(
          definitionName:
              'HarborAxi4MemoryMaster_a${waist.config.addressWidth}'
              '_d${waist.config.dataWidth}_i${waist.config.idWidth}'
-             '_n${waist.config.outstanding}',
+             '_n${waist.config.outstanding}'
+             '${readOnly ? '_ro' : ''}'
+             '${axi.addressWidth > waist.config.addressWidth ? '_b${axi.addressWidth}' : ''}',
        ) {
     final config = waist.config;
-    _checkMatch(axi, config);
+    if (axi.addressWidth < config.addressWidth ||
+        axi.dataWidth != config.dataWidth ||
+        axi.idWidth != config.idWidth) {
+      throw ArgumentError(
+        'AXI4 widths (addr ${axi.addressWidth}, data ${axi.dataWidth}, '
+        'id ${axi.idWidth}) do not fit $config',
+      );
+    }
     final c = addInput('clk', clk);
     final r = addInput('reset', reset);
     final m = waist.clone()
@@ -646,43 +664,55 @@ class HarborAxi4MemoryMaster extends Module {
     // resetEntries: true, since popData drives AWSIZE/ARSIZE and the rest
     // of AW/AR directly, and the rohd_hcl write checker reads those at the
     // posedge without waiting on AWVALID, so an unreset X would throw.
-    final awF = HarborRegFifo(
-      name: 'aw',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: reqFire & m.reqWrite,
-      pushData: reqData,
-      popReady: awFire,
-      resetEntries: true,
-    );
+    final awF = readOnly
+        ? null
+        : HarborRegFifo(
+            name: 'aw',
+            clk: c,
+            reset: r,
+            depth: 2,
+            pushValid: reqFire & m.reqWrite,
+            pushData: reqData,
+            popReady: awFire,
+            resetEntries: true,
+          );
     final arF = HarborRegFifo(
       name: 'ar',
       clk: c,
       reset: r,
       depth: 2,
-      pushValid: reqFire & ~m.reqWrite,
+      pushValid: readOnly ? reqFire : reqFire & ~m.reqWrite,
       pushData: reqData,
       popReady: arFire,
       resetEntries: true,
     );
     m.reqReady <=
         inflight.lt(Const(n, width: inflight.width)) &
-            awF.pushReady &
+            (awF?.pushReady ?? Const(1)) &
             arF.pushReady;
     reqFire <= m.reqValid & m.reqReady;
 
-    final [awId, awAddr, awLen, awSize, awBurst, awLock] = harborUnpack(
-      awF.popData,
-      reqWidths,
-    );
-    a.awValid <= awF.popValid;
-    a.awId <= awId;
-    a.awAddr <= awAddr;
-    a.awLen <= awLen;
-    a.awSize <= awSize;
-    a.awBurst <= awBurst;
-    a.awLock <= awLock;
+    if (awF != null) {
+      final [awId, awAddr, awLen, awSize, awBurst, awLock] = harborUnpack(
+        awF.popData,
+        reqWidths,
+      );
+      a.awValid <= awF.popValid;
+      a.awId <= awId;
+      a.awAddr <= awAddr.zeroExtend(axi.addressWidth);
+      a.awLen <= awLen;
+      a.awSize <= awSize;
+      a.awBurst <= awBurst;
+      a.awLock <= awLock;
+    } else {
+      a.awValid <= Const(0);
+      a.awId <= Const(0, width: idW);
+      a.awAddr <= Const(0, width: axi.addressWidth);
+      a.awLen <= Const(0, width: lenW);
+      a.awSize <= Const(0, width: sizeW);
+      a.awBurst <= Const(0, width: burstW);
+      a.awLock <= Const(0);
+    }
     awFire <= a.awValid & a.awReady;
 
     final [arId, arAddr, arLen, arSize, arBurst, arLock] = harborUnpack(
@@ -691,7 +721,7 @@ class HarborAxi4MemoryMaster extends Module {
     );
     a.arValid <= arF.popValid;
     a.arId <= arId;
-    a.arAddr <= arAddr;
+    a.arAddr <= arAddr.zeroExtend(axi.addressWidth);
     a.arLen <= arLen;
     a.arSize <= arSize;
     a.arBurst <= arBurst;
@@ -704,43 +734,56 @@ class HarborAxi4MemoryMaster extends Module {
       a.port('${p}QOS') <= Const(0, width: Axi4Interface.qosWidth);
     }
 
-    // resetEntries: true, since popData drives WDATA/WSTRB/WLAST directly
-    // and the rohd_hcl checkers read those at the posedge.
-    final wF = HarborRegFifo(
-      name: 'w',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: m.wdataValid,
-      pushData: harborPack([m.wdataData, m.wdataStrb, m.wdataLast]),
-      popReady: a.wReady,
-      resetEntries: true,
-    );
-    m.wdataReady <= wF.pushReady;
-    final [wData, wStrb, wLast] = harborUnpack(wF.popData, [dataW, strbW, 1]);
-    a.wValid <= wF.popValid;
-    a.wData <= wData;
-    a.wStrb <= wStrb;
-    a.wLast <= wLast;
-
     // SLVERR and DECERR both have bit 1 set.
     Logic exOkay(Logic resp) =>
         resp.eq(Const(Axi4RespField.exOkay.value, width: resp.width));
-    final bF = HarborRegFifo(
-      name: 'b',
-      clk: c,
-      reset: r,
-      depth: 2,
-      pushValid: a.bValid,
-      pushData: harborPack([a.bId, a.bResp[1], exOkay(a.bResp)]),
-      popReady: m.wrespReady,
-    );
-    a.bReady <= bF.pushReady;
-    final [bId, bErr, bEx] = harborUnpack(bF.popData, [idW, 1, 1]);
-    m.wrespValid <= bF.popValid;
-    m.wrespId <= bId;
-    m.wrespErr <= bErr;
-    m.wrespExOkay <= bEx;
+    if (readOnly) {
+      m.wdataReady <= Const(0);
+      a.wValid <= Const(0);
+      a.wData <= Const(0, width: dataW);
+      a.wStrb <= Const(0, width: strbW);
+      a.wLast <= Const(0);
+      a.bReady <= Const(1);
+      m.wrespValid <= Const(0);
+      m.wrespId <= Const(0, width: idW);
+      m.wrespErr <= Const(0);
+      m.wrespExOkay <= Const(0);
+    } else {
+      // resetEntries: true, since popData drives WDATA/WSTRB/WLAST directly
+      // and the rohd_hcl checkers read those at the posedge.
+      final wF = HarborRegFifo(
+        name: 'w',
+        clk: c,
+        reset: r,
+        depth: 2,
+        pushValid: m.wdataValid,
+        pushData: harborPack([m.wdataData, m.wdataStrb, m.wdataLast]),
+        popReady: a.wReady,
+        resetEntries: true,
+      );
+      m.wdataReady <= wF.pushReady;
+      final [wData, wStrb, wLast] = harborUnpack(wF.popData, [dataW, strbW, 1]);
+      a.wValid <= wF.popValid;
+      a.wData <= wData;
+      a.wStrb <= wStrb;
+      a.wLast <= wLast;
+
+      final bF = HarborRegFifo(
+        name: 'b',
+        clk: c,
+        reset: r,
+        depth: 2,
+        pushValid: a.bValid,
+        pushData: harborPack([a.bId, a.bResp[1], exOkay(a.bResp)]),
+        popReady: m.wrespReady,
+      );
+      a.bReady <= bF.pushReady;
+      final [bId, bErr, bEx] = harborUnpack(bF.popData, [idW, 1, 1]);
+      m.wrespValid <= bF.popValid;
+      m.wrespId <= bId;
+      m.wrespErr <= bErr;
+      m.wrespExOkay <= bEx;
+    }
 
     final rF = HarborRegFifo(
       name: 'r',

@@ -199,9 +199,9 @@ class ScanoutContentionBench {
     );
     soc.buildFabric();
 
-    sysClk = SimpleClockGenerator(sysPeriodPs).clk;
-    memClk = SimpleClockGenerator(memPeriodPs).clk;
-    pixelClk = SimpleClockGenerator(pixelPeriodPs).clk;
+    sysClk = SimpleClockGenerator(sysPeriodPs + (sysPeriodPs & 1)).clk;
+    memClk = SimpleClockGenerator(memPeriodPs + (memPeriodPs & 1)).clk;
+    pixelClk = SimpleClockGenerator(pixelPeriodPs + (pixelPeriodPs & 1)).clk;
 
     soc.input('clk').srcConnection! <= sysClk;
     soc.input('reset').srcConnection! <= sysReset;
@@ -230,10 +230,9 @@ class ScanoutContentionBench {
     final bbs = {for (final m in phy.subModules.whereType<Ecp5Bb>()) m.name: m};
     final dqBbs = [for (var i = 0; i < 16; i++) bbs['dq_bb_$i']!];
     const fpgaToSdramNs = 4.6;
-    final tAcNs = cycles.casLatency == 3 ? 5.0 : 6.0;
     if (!sdramPhyCaptureOk(
       periodPs: memPeriodPs,
-      tAcNs: tAcNs,
+      casLatency: cycles.casLatency,
       fpgaToSdramNs: fpgaToSdramNs,
       phy: const HarborSdramPhyConfig(),
     )) {
@@ -252,8 +251,8 @@ class ScanoutContentionBench {
       dq: sdram.inOutSource('sdram_dq') as LogicNet,
       rules: const SdramModelRules.as4c16m16sb6().copyWith(powerUpNs: 2000),
       fpgaToSdramNs: fpgaToSdramNs,
-      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rswizzle(),
-      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rswizzle(),
+      fpgaDqOe: [for (final bb in dqBbs) ~bb.input('T')].rconcat(),
+      fpgaDqOut: [for (final bb in dqBbs) bb.input('I')].rconcat(),
       refreshPolicy: SdramRefreshPolicy(
         maxPostponed: cycles.maxPostponed,
         maxPulledIn: cycles.maxPulledIn,

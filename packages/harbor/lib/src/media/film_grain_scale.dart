@@ -99,16 +99,16 @@ class HarborFilmGrainScale extends BridgeModule {
     Logic asr(Logic x, int k) {
       if (k == 0) return x;
       if (k >= wWork) return x[wWork - 1].replicate(wWork);
-      return [x[wWork - 1].replicate(k), x.getRange(k, wWork)].swizzle();
+      return [x[wWork - 1].replicate(k), x.getRange(k, wWork)].concat();
     }
 
     // Clamp bounds selected by clip_legal / is_chroma (bd8).
-    final lo = mux(
+    final lo = mux<Logic>(
       clipLegal,
       Const(16, width: wWork), // legal min: 16 for both luma and chroma.
       Const(0, width: wWork),
     );
-    final hiLegal = mux(
+    final hiLegal = mux<Logic>(
       isChroma,
       Const(240, width: wWork),
       Const(235, width: wWork),
@@ -151,6 +151,6 @@ class HarborFilmGrainScale extends BridgeModule {
       lanes.add(clamped.getRange(0, 8));
     }
 
-    output('out') <= lanes.reversed.toList().swizzle();
+    output('out') <= lanes.reversed.toList().concat();
   }
 }
