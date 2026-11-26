@@ -287,7 +287,9 @@ Future<List<String>> sdramRandomBursts(
   );
   late MemoryPortCheck check;
   final flagErrors = <String>[];
-  late List<int> flagChecked;
+  // A wishbone build has no SdramMemoryPort, so it has no flag to watch.
+  final watchFlag = kind != HarborFabricKind.wishbone;
+  List<int>? flagChecked;
   final bench = await SdramPortBench.start(
     kind,
     config,
@@ -295,11 +297,13 @@ Future<List<String>> sdramRandomBursts(
     sync: sync,
     addressMap: addressMap,
     attach: (s) {
-      flagChecked = watchCommitFlag(
-        s,
-        (s.dut as SdramPortTop).sdram,
-        flagErrors,
-      );
+      if (watchFlag) {
+        flagChecked = watchCommitFlag(
+          s,
+          (s.dut as SdramPortTop).sdram,
+          flagErrors,
+        );
+      }
       check = MemoryPortCheck(
         s,
         Random(seed),
@@ -316,7 +320,7 @@ Future<List<String>> sdramRandomBursts(
     if (pastTheEnd) ...await _pastTheEnd(check),
     ...bench.model.errors.take(8),
     ...flagErrors,
-    if (flagChecked[0] == 0) 'wb_cmt_any was never checked',
+    if (watchFlag && flagChecked![0] == 0) 'wb_cmt_any was never checked',
   ];
   if (bench.sdram.busError.value.toInt() != 0) bad.add('bus_error is set');
   await bench.stop();
