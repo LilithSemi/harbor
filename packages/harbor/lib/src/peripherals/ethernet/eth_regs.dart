@@ -234,8 +234,8 @@ class HarborEthRegs extends Module {
     final weR = Logic(name: 'req_we');
     final wdataR = Logic(name: 'req_wdata', width: 32);
     final selR = Logic(name: 'req_sel', width: 4);
-    Sequential(clk, reset: reset, [
-      act < stb & ~ackR & ~act,
+    Sequential(clk, reset: reset, [act < stb & ~ackR & ~act]);
+    Sequential(clk, [
       If(~act, then: [addrR < addr, weR < we, wdataR < wdata, selR < sel]),
     ]);
     final latch = (stb & ~ackR & ~act).named('req_latch');

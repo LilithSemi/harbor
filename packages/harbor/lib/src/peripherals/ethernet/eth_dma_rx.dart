@@ -419,7 +419,7 @@ class HarborEthDmaRx extends Module {
     errCodeOut <= errCodeReg;
     busyOut <= ~inState(_idle);
 
-    Sequential(clk, reset: reset, [
+    Sequential(clk, [
       rxDoneReg < Const(0),
       rxErrReg < Const(0),
       rxMissedReg < Const(0),
@@ -618,6 +618,45 @@ class HarborEthDmaRx extends Module {
         ]),
       ]),
       If(ringReset, then: [ringPend < Const(1)]),
+      // Only the control flops reset.
+      If(
+        reset,
+        then: [
+          for (final f in [
+            rxDoneReg,
+            rxErrReg,
+            rxMissedReg,
+            inflight,
+            beatsReady,
+            wErr,
+            ringPend,
+            ringErrReg,
+            headReg,
+            ended,
+            bufOver,
+            descFail,
+            count,
+            beatsLeft,
+            wordsLeft,
+            status,
+            hValid,
+            hLast,
+            missed,
+            state,
+            dBeat,
+            dErr,
+            alignedR,
+            sizeZero,
+            rem,
+            errCodeReg,
+            code,
+            wbReqDone,
+            wbData,
+            wbBeat,
+          ])
+            f < 0,
+        ],
+      ),
     ]);
   }
 }

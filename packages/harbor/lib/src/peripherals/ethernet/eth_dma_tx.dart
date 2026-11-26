@@ -479,7 +479,7 @@ class HarborEthDmaTx extends Module {
     wLastOut <= oLast;
     wErrOut <= oErr;
 
-    Sequential(clk, reset: reset, [
+    Sequential(clk, [
       txDoneReg < Const(0),
       txErrReg < Const(0),
       inflight < inflightNext,
@@ -774,6 +774,59 @@ class HarborEthDmaTx extends Module {
         ]),
       ]),
       If(ringReset, then: [ringPend < Const(1)]),
+      // Only the control flops reset.
+      If(
+        reset,
+        then: [
+          for (final f in [
+            txDoneReg,
+            txErrReg,
+            inflight,
+            resv,
+            owedR,
+            atHead,
+            space,
+            armed,
+            beats,
+            armWait,
+            oValid,
+            ringPend,
+            ringErrReg,
+            headReg,
+            waitKick,
+            idx,
+            pass2,
+            irqAcc,
+            fail,
+            state,
+            dBeat,
+            dErr,
+            dBad,
+            tooBig,
+            sum2Over,
+            code,
+            wbLast,
+            wbReqDone,
+            wbData,
+            wbBeat,
+            wbErr,
+            tailSeen,
+            eopIdx,
+            abort,
+            oErr,
+            accN,
+            bufEndLo,
+            beatLo,
+            beatN,
+            toBoundary,
+            reqWords,
+            rxWords,
+            oLast,
+            errCodeReg,
+          ])
+            f < 0,
+        ],
+      ),
     ]);
   }
 }
