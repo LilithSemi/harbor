@@ -26,12 +26,12 @@ import 'memory_waist.dart';
     then: [
       If(
         sValid,
-        then: [oData < sData, oValid < Const(1), sValid < Const(0)],
-        orElse: [oData < inData, oValid < inValid],
+        then: [oValid < Const(1), sValid < Const(0)],
+        orElse: [oValid < inValid],
       ),
     ],
     orElse: [
-      If(inValid & ready, then: [sData < inData, sValid < Const(1)]),
+      If(inValid & ready, then: [sValid < Const(1)]),
     ],
   );
   Sequential(clk, reset: reset, [
@@ -39,6 +39,16 @@ import 'memory_waist.dart';
       step
     else
       If(clear, then: [oValid < Const(0), sValid < Const(0)], orElse: [step]),
+  ]);
+  // The data takes no reset. It is read only while its valid is high.
+  Sequential(clk, [
+    If(
+      ~oValid | outReady,
+      then: [oData < mux(sValid, sData, inData)],
+      orElse: [
+        If(inValid & ready, then: [sData < inData]),
+      ],
+    ),
   ]);
   return (valid: oValid, data: oData, ready: ready);
 }

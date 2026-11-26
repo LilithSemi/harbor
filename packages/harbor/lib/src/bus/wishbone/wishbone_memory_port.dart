@@ -549,12 +549,7 @@ void _buildWishboneMemoryMasterFast(
         beatActive < (startBus | beatActive) & ~busEnd,
         cycHeld < (startBus | cycHeld) & ~(resolve & last),
         If.block([
-          Iff(freshResult & ~readyNow, [
-            pendValid < Const(1),
-            pendData < resultData,
-            pendErr < resultErr,
-            pendLast < last,
-          ]),
+          Iff(freshResult & ~readyNow, [pendValid < Const(1)]),
           ElseIf(pendTaken, [pendValid < Const(0)]),
         ]),
         If(
@@ -569,6 +564,13 @@ void _buildWishboneMemoryMasterFast(
         If(finalDelivered, then: [busy < Const(0)]),
       ]),
     ]),
+  ]);
+  // The held result is read only with pendValid, so it takes no reset.
+  Sequential(c, [
+    If(
+      busy & freshResult & ~readyNow,
+      then: [pendData < resultData, pendErr < resultErr, pendLast < last],
+    ),
   ]);
 }
 

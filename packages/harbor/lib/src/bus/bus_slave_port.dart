@@ -606,8 +606,6 @@ class BusSlavePort {
           aSize < tl.aSize,
           aSource < tl.aSource,
           aAddress < tl.aAddress,
-          aMask < tl.aMask,
-          aData < tl.aData,
           aDrainLeft < drainBeats,
         ]),
         ElseIf(tl.aValid & draining, [
@@ -633,11 +631,20 @@ class BusSlavePort {
           dOpcode < respOpcode,
           dSize < aSize,
           dSource < aSource,
-          dData < mux(stb, dataOut, Const(0, width: dataWidth)),
           dDenied < denied,
           // A denied response with data must also be corrupt.
           dCorrupt < (denied & withData),
         ],
+      ),
+    ]);
+
+    // The write data, the mask and the response data are read only with
+    // their valid, so they take no reset.
+    Sequential(clk, [
+      If(tl.aValid & ~aHeld, then: [aMask < tl.aMask, aData < tl.aData]),
+      If(
+        respond,
+        then: [dData < mux(stb, dataOut, Const(0, width: dataWidth))],
       ),
     ]);
 
