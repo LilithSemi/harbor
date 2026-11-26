@@ -85,6 +85,7 @@ class Gf180mcuProvider extends PdkProvider {
     padLayer: 'Metal2',
     padPowerPins: ['DVDD'],
     padGroundPins: ['DVSS'],
+    sramPdnLayers: ['Metal3', 'Metal4'],
   );
 
   String get _libName => switch (voltage) {
@@ -198,14 +199,17 @@ class Gf180mcuProvider extends PdkProvider {
   bool get hasSramMacro => true;
 
   @override
+  String get sramLibName => 'gf180mcu_fd_ip_sram';
+
+  @override
   AnalogBlock? sramMacro({
     required int words,
     required int width,
     int numPorts = 1,
   }) {
-    final macroName = 'gf180mcu_fd_ip_sram__sram${words}x${width}m8wm1';
+    final macroName = '${sramLibName}__sram${words}x${width}m8wm1';
     return AnalogBlock(
-      symbolPath: '$pdkRoot/libs.ref/gf180mcu_fd_ip_sram/lef/$macroName.lef',
+      symbolPath: '$pdkRoot/libs.ref/$sramLibName/lef/$macroName.lef',
       pinMapping: {
         'clk': 'CLK',
         'addr': 'A',

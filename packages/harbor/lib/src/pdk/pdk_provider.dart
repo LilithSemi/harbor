@@ -81,6 +81,11 @@ abstract class PdkProvider {
   /// Whether this PDK provides SRAM macros.
   bool get hasSramMacro => false;
 
+  /// Library of the [sramMacro] cells. A cell name is the library name,
+  /// `__` and the macro name. Null when the cell names have no library
+  /// prefix.
+  String? get sramLibName => null;
+
   /// Number of metal layers available for routing.
   int get metalLayers;
 

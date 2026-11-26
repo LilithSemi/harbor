@@ -1697,6 +1697,10 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// the PnR die is `DIE_AREA`. Null gives a core-only flow.
   final HarborPadPlan? padPlan;
 
+  /// SRAM macros at a set core edge of the pad ring. The flow places them
+  /// before the other SRAM macros.
+  final List<HarborMacroPin> macroPins;
+
   const HarborAsicTarget({
     required this.provider,
     required this.topCell,
@@ -1709,6 +1713,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     this.klayoutDrc,
     this.analogGdsPaths = const [],
     this.padPlan,
+    this.macroPins = const [],
   });
 
   /// Whether this uses hierarchical macro hardening.
@@ -1727,6 +1732,12 @@ class HarborAsicTarget extends HarborDeviceTarget {
       }
       throw ArgumentError(
         '${provider.name} has no verified pad cells for a pad ring',
+      );
+    }
+    if (ring.layers.length != 2) {
+      throw ArgumentError(
+        'The core ring of ${provider.name} needs two layers, '
+        'not ${ring.layers.length}',
       );
     }
     return (library: library, ring: ring);
@@ -2010,6 +2021,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     bool tile = false,
     List<String> macroCells = const [],
     HarborCoreRing? ring,
+    bool srams = false,
   }) {
     if (ring == null) _writeGlobalConnections(buf, lib);
 
@@ -2089,7 +2101,21 @@ class HarborAsicTarget extends HarborDeviceTarget {
         '-layers {${stripes[n - 2].layer} ${stripes[n - 1].layer}}',
       );
     }
+    if (srams && ring != null) {
+      buf.writeln(
+        r'define_pdn_grid -name sram -macro -instances $srams '
+        '-voltage_domains CORE -grid_over_boundary',
+      );
+      buf.writeln(
+        'add_pdn_connect -grid sram -layers {${ring.sramPdnLayers.join(' ')}}',
+      );
+    }
     buf.writeln('pdngen');
+    if (srams) {
+      for (final line in _sramPowerCheckTcl) {
+        buf.writeln(line);
+      }
+    }
     buf.writeln();
   }
 
@@ -2171,10 +2197,30 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// In hierarchical mode, reads pre-hardened macro LEF/LIB files
   /// and places them with halos. Routes only on upper metal layers
   /// to avoid DRC violations with macro-internal routing.
-  String generateOpenroadTcl() {
+  ///
+  /// [leafCells] are the hard cells of the netlist. A pad ring flow places
+  /// the SRAM macros among them and gives them a power grid.
+  String generateOpenroadTcl({List<String> leafCells = const []}) {
     final lib = provider.standardCellLibrary;
     final plan = padPlan;
     final pads = plan == null ? null : padCells;
+    final srams = pads == null ? const <String>[] : _sramCells(leafCells);
+    if (macroPins.isNotEmpty) {
+      if (pads == null) {
+        throw ArgumentError('Macro pins need a pad ring');
+      }
+      if (srams.isEmpty) {
+        throw ArgumentError('Macro pins need SRAM macros in the netlist');
+      }
+      for (final pin in macroPins) {
+        if (pin.edge != HarborIoPadEdge.south &&
+            pin.edge != HarborIoPadEdge.north) {
+          throw ArgumentError(
+            'The SRAM ${pin.inst} must be on the south or north core edge',
+          );
+        }
+      }
+    }
     final top = flowTop;
     final buf = StringBuffer();
     buf.writeln('# Auto-generated OpenROAD P&R for $top');
@@ -2189,6 +2235,9 @@ class HarborAsicTarget extends HarborDeviceTarget {
     if (pads != null) {
       buf.writeln('# Pad ring: DIE_AREA, IO_DIR, IO_LIB_NAME, LIB_CORNER.');
     }
+    if (srams.isNotEmpty) {
+      buf.writeln('# SRAM macros: SRAM_DIR, SRAM_LIB_NAME.');
+    }
     if (isHierarchical) {
       buf.writeln(
         '# Mode: hierarchical assembly '
@@ -2198,7 +2247,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     buf.writeln();
 
     if (pads != null) {
-      _writePadRingReads(buf);
+      _writePadRingReads(buf, srams);
     } else {
       // Read inputs (paths supplied by asix via env vars). The tech LEF is
       // read explicitly, then every other cell LEF is globbed from
@@ -2239,6 +2288,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
 
     if (plan != null && pads != null) {
       _writePadRing(buf, lib, plan, pads.library, pads.ring);
+      if (srams.isNotEmpty) _writeSramPlacement(buf, pads.ring);
     } else {
       _writeCoreFloorplan(buf);
     }
@@ -2262,6 +2312,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
       lib,
       macroCells: [for (final m in macros) m.moduleName],
       ring: pads?.ring,
+      srams: srams.isNotEmpty,
     );
 
     // Placement (density supplied by asix as PLACEMENT_DENSITY). With pin
@@ -2349,8 +2400,15 @@ class HarborAsicTarget extends HarborDeviceTarget {
 
   /// Writes the env checks, the PDK pad configuration and the LEF and
   /// liberty reads of a pad ring flow.
-  static void _writePadRingReads(StringBuffer buf) {
-    for (final env in ['DIE_AREA', 'IO_DIR', 'IO_LIB_NAME']) {
+  static void _writePadRingReads(StringBuffer buf, List<String> srams) {
+    for (final env in [
+      'DIE_AREA',
+      'IO_DIR',
+      'IO_LIB_NAME',
+      'TECH_LEF',
+      'LIB_CORNER',
+      if (srams.isNotEmpty) ...['SRAM_DIR', 'SRAM_LIB_NAME'],
+    ]) {
       buf.writeln('if {![info exists ::env($env)]} {');
       buf.writeln('  puts stderr "The pad ring needs the $env env var"');
       buf.writeln('  exit 1');
@@ -2380,12 +2438,163 @@ class HarborAsicTarget extends HarborDeviceTarget {
       r'foreach _lef [lsort [glob $::env(IO_DIR)/lef/$::env(IO_LIB_NAME)__*.lef]] {',
       r'    read_lef $_lef',
       '}',
-      r'read_liberty $::env(LIB_FILE)',
-      r'read_liberty $::env(IO_DIR)/lib/$::env(IO_LIB_NAME)__$::env(LIB_CORNER).lib',
     ]) {
       buf.writeln(line);
     }
+    for (final cell in srams) {
+      buf.writeln(
+        'read_lef \$::env(SRAM_DIR)/lef/\$::env(SRAM_LIB_NAME)__$cell.lef',
+      );
+    }
+    buf.writeln(r'read_liberty $::env(LIB_FILE)');
+    for (final cell in srams) {
+      buf.writeln(
+        'read_liberty \$::env(SRAM_DIR)/lib/'
+        '\$::env(SRAM_LIB_NAME)__${cell}__\$::env(LIB_CORNER).lib',
+      );
+    }
+    buf.writeln(
+      r'read_liberty $::env(IO_DIR)/lib/$::env(IO_LIB_NAME)__$::env(LIB_CORNER).lib',
+    );
   }
+
+  /// The SRAM macro names in [leafCells], without the library prefix.
+  List<String> _sramCells(List<String> leafCells) {
+    final libName = provider.sramLibName;
+    if (libName == null) return const [];
+    final prefix = '${libName}__';
+    return {
+      for (final c in leafCells)
+        if (c.startsWith(prefix)) c.substring(prefix.length),
+    }.toList()..sort();
+  }
+
+  /// Writes the SRAM placement inside the pad ring and the row cuts at the
+  /// macro halos.
+  void _writeSramPlacement(StringBuffer buf, HarborCoreRing ring) {
+    buf.writeln(
+      '# SRAM macros. The signal pins of a south macro face the core edge. '
+      'A north macro is mirrored',
+    );
+    buf.writeln(
+      '# (MX). The south macros sit above the core edge by sram_lift, so the '
+      'antenna repair has free',
+    );
+    buf.writeln('# sites below the pins.');
+    buf.writeln(
+      'set halo [expr {[info exists ::env(MACRO_HALO)] ? '
+      '\$::env(MACRO_HALO) : ${_um(ring.macroHaloUm)}}]',
+    );
+    buf.writeln('set sram_lift ${_um(ring.sramLiftUm)}');
+    buf.writeln('set macro_channel ${_um(ring.macroChannelUm)}');
+    final pins = [
+      for (final p in macroPins)
+        '{${p.inst} ${p.edge.name} {${p.offsetUm == null ? '' : _um(p.offsetUm!)}}}',
+    ];
+    buf.writeln('set sram_pins {${pins.join(' ')}}');
+    for (final line in _sramPlaceTcl) {
+      buf.writeln(line);
+    }
+    buf.writeln();
+  }
+
+  /// Tcl that finds and places the SRAM macros.
+  static const _sramPlaceTcl = [
+    'set srams {}',
+    r'foreach inst [$block getInsts] {',
+    r'  if { [string match $::env(SRAM_LIB_NAME)__* [[$inst getMaster] getName]] } {',
+    r'    lappend srams [$inst getName]',
+    '  }',
+    '}',
+    r'set srams [lsort $srams]',
+    r'if { [llength $srams] == 0 } {',
+    r'  puts stderr "The netlist has no SRAM of $::env(SRAM_LIB_NAME)"',
+    '  exit 1',
+    '}',
+    'set sram_rects {}',
+    '',
+    '# Tries the SRAM at x on the edge. The result is "placed", "full" when '
+        'the SRAM goes out of the',
+    '# core, or the east side of the macro that is in the way.',
+    'proc sram_try { name edge x } {',
+    '  global block dbu halo sram_lift macro_channel cx0 cy0 cx1 cy1 '
+        'sram_rects',
+    r'  set master [[$block findInst $name] getMaster]',
+    r'  set w [expr [$master getWidth] / double($dbu)]',
+    r'  set h [expr [$master getHeight] / double($dbu)]',
+    r'  if { $edge eq "south" } {',
+    r'    set y [expr $cy0 + $halo + $sram_lift]',
+    '  } else {',
+    r'    set y [expr $cy1 - $halo - $h]',
+    '  }',
+    r'  if { $x < $cx0 + $halo || $x + $w + $halo > $cx1 || '
+        r'$y < $cy0 + $halo || $y + $h + $halo > $cy1 } {',
+    '    return full',
+    '  }',
+    r'  foreach rect $sram_rects {',
+    r'    lassign $rect rx0 ry0 rx1 ry1',
+    r'    if { $x < $rx1 + $macro_channel && $x + $w + $macro_channel > $rx0 '
+        r'&& $y < $ry1 + $macro_channel && $y + $h + $macro_channel > $ry0 } {',
+    r'      return $rx1',
+    '    }',
+    '  }',
+    r'  place_macro -macro_name $name -location [list $x $y] '
+        r'-orientation [expr {$edge eq "south" ? "R0" : "MX"}]',
+    r'  lappend sram_rects [list $x $y [expr $x + $w] [expr $y + $h]]',
+    '  return placed',
+    '}',
+    '',
+    '# Puts the SRAM on the first free location of the edge, from west to '
+        'east.',
+    'proc sram_pack { name edge } {',
+    '  global cx0 halo macro_channel',
+    r'  set x [expr $cx0 + $halo]',
+    '  while 1 {',
+    r'    set result [sram_try $name $edge $x]',
+    r'    if { $result eq "placed" || $result eq "full" } { return $result }',
+    r'    set x [expr $result + $macro_channel]',
+    '  }',
+    '}',
+    '',
+    r'foreach pin $sram_pins {',
+    r'  lassign $pin name edge offset',
+    r'  if { $name ni $srams } {',
+    r'    puts stderr "The pinned SRAM $name is not in the netlist"',
+    '    exit 1',
+    '  }',
+    r'  if { $offset eq "" } {',
+    r'    set result [sram_pack $name $edge]',
+    '  } else {',
+    r'    set result [sram_try $name $edge [expr $cx0 + $offset]]',
+    '  }',
+    r'  if { $result ne "placed" } {',
+    r'    puts stderr "The SRAM $name does not fit in the core"',
+    '    exit 1',
+    '  }',
+    '}',
+    r'foreach name $srams {',
+    r'  if { [lsearch -index 0 $sram_pins $name] >= 0 } { continue }',
+    r'  if { [sram_pack $name south] ne "placed" && '
+        r'[sram_pack $name north] ne "placed" } {',
+    r'    puts stderr "The SRAM $name does not fit in the core"',
+    '    exit 1',
+    '  }',
+    '}',
+    r'cut_rows -halo_width_x $halo -halo_width_y $halo',
+  ];
+
+  /// Tcl that stops the flow when an SRAM supply pin has no net.
+  static const _sramPowerCheckTcl = [
+    r'foreach name $srams {',
+    '  foreach pin {VDD VSS} {',
+    r'    set iterm [[$block findInst $name] findITerm $pin]',
+    r'    if { $iterm eq "NULL" || [$iterm getNet] eq "NULL" } {',
+    r'      puts stderr "The SRAM pin $name/$pin has no net"',
+    '      exit 1',
+    '    }',
+    '  }',
+    '}',
+  ];
 
   /// Tcl of the pad slots and the core area inside the pad ring.
   static const _padRingTcl = [

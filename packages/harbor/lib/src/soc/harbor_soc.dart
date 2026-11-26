@@ -2883,7 +2883,13 @@ class HarborSoC extends BridgeModule {
           File('$path/synth.tcl').writeAsStringSync(
             t.generateYosysTcl(hasBlackboxes: blackboxStubs.isNotEmpty),
           );
-          File('$path/pnr.tcl').writeAsStringSync(t.generateOpenroadTcl());
+          final leaves = <BridgeModule>[];
+          _collectLeafModules(this, leaves);
+          File('$path/pnr.tcl').writeAsStringSync(
+            t.generateOpenroadTcl(
+              leafCells: [for (final m in leaves) m.definitionName],
+            ),
+          );
 
           // Hierarchical macro scripts
           if (t.isHierarchical) {

@@ -91,6 +91,19 @@ class HarborCoreRing {
   /// Pad cell supply pins on the core ground net.
   final List<String> padGroundPins;
 
+  /// Halo around an SRAM macro (um). The `MACRO_HALO` env var overrides it.
+  final double macroHaloUm;
+
+  /// Space from the south core edge to the south SRAM macros (um). The
+  /// antenna repair needs free sites below the macro pins.
+  final double sramLiftUm;
+
+  /// Space between two SRAM macros (um).
+  final double macroChannelUm;
+
+  /// Layers that the SRAM macro grid connects.
+  final List<String> sramPdnLayers;
+
   const HarborCoreRing({
     required this.offsetUm,
     required this.widthUm,
@@ -100,5 +113,9 @@ class HarborCoreRing {
     required this.padLayer,
     required this.padPowerPins,
     required this.padGroundPins,
+    required this.sramPdnLayers,
+    this.macroHaloUm = 10,
+    this.sramLiftUm = 40,
+    this.macroChannelUm = 20,
   });
 }

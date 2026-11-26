@@ -375,7 +375,13 @@ void main() {
     final plan = _plan();
     final tcl = _padTarget().generateOpenroadTcl();
 
-    for (final env in ['DIE_AREA', 'IO_DIR', 'IO_LIB_NAME']) {
+    for (final env in [
+      'DIE_AREA',
+      'IO_DIR',
+      'IO_LIB_NAME',
+      'TECH_LEF',
+      'LIB_CORNER',
+    ]) {
       expect(tcl, contains('if {![info exists ::env($env)]} {'));
       expect(tcl, contains('puts stderr "The pad ring needs the $env'));
     }
@@ -444,7 +450,7 @@ void main() {
     ]) {
       expect(tcl, contains('puts stderr "$msg"'));
     }
-    expect(RegExp(r'exit 1').allMatches(tcl).length, 6);
+    expect(RegExp(r'exit 1').allMatches(tcl).length, 8);
     expect(tcl, isNot(contains('place_pins')));
 
     final order = [
