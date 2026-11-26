@@ -312,27 +312,23 @@ class HarborPcieStreamRegister extends Module {
     final take = down.ready | ~mainValid;
     final upFields = fields(up);
     Sequential(clk, [
+      // Data loads do not wait for upstream valid, so the upstream decode
+      // does not drive the flop enables. The data takes no reset.
+      If(
+        ~skidValid,
+        then: [for (var i = 0; i < skid.length; i++) skid[i] < upFields[i]],
+      ),
+      If(
+        take,
+        then: [
+          for (var i = 0; i < main.length; i++)
+            main[i] < harborBitMux(skidValid, skid[i], upFields[i]),
+        ],
+      ),
       If(
         reset,
-        then: [
-          mainValid < 0,
-          skidValid < 0,
-          for (final r in [...main, ...skid]) r < 0,
-        ],
+        then: [mainValid < 0, skidValid < 0],
         orElse: [
-          // Data loads do not wait for upstream valid, so the upstream
-          // decode does not drive the flop enables.
-          If(
-            ~skidValid,
-            then: [for (var i = 0; i < skid.length; i++) skid[i] < upFields[i]],
-          ),
-          If(
-            take,
-            then: [
-              for (var i = 0; i < main.length; i++)
-                main[i] < harborBitMux(skidValid, skid[i], upFields[i]),
-            ],
-          ),
           If.block([
             Iff(take & skidValid, [mainValid < 1, skidValid < 0]),
             ElseIf(take, [mainValid < upFire]),

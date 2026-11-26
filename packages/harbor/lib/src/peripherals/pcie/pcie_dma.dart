@@ -1180,6 +1180,8 @@ class HarborPcieDma extends BridgeModule {
     final portReset = resetMemoryOnEngineReset ? reset | _memReset : reset;
     Sequential(clk, [
       wHold < mem.wdataValid & ~mem.wdataReady,
+    ], reset: portReset);
+    Sequential(clk, [
       If(
         ~wHold,
         then: [
@@ -1188,7 +1190,7 @@ class HarborPcieDma extends BridgeModule {
           wHoldLast < liveLast,
         ],
       ),
-    ], reset: portReset);
+    ]);
     mem.wrespReady <=
         (overlap ? bOwe.neq(0) : inH2d & inD(dResp) | ~ownB & bOwe);
     final wFire = mem.wdataValid & mem.wdataReady;
