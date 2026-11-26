@@ -1,5 +1,21 @@
 import 'package:harbor/harbor.dart';
+import 'package:rohd/rohd.dart';
 import 'package:test/test.dart';
+
+class _FakeLedDriver implements HarborLedDriver {
+  final List<List<Logic>> _outs;
+
+  _FakeLedDriver(List<int> widths)
+    : _outs = [
+        for (final w in widths) [for (var i = 0; i < w; i++) Logic()],
+      ];
+
+  @override
+  int get channelCount => _outs.length;
+
+  @override
+  List<Logic> channelOut(int k) => _outs[k];
+}
 
 void main() {
   for (final name in ['kc705', 'ulx3s-85f']) {
@@ -78,17 +94,49 @@ void main() {
     expect(byBall.values.where((v) => v.length > 1), isEmpty);
   });
 
-  test('each preset builds an engine', () async {
+  test('each preset binds its channels to the pins and ports', () {
     for (final board in HarborBoard.byName.values) {
+      if (board.ledChannels.isEmpty) continue;
+      final driver = _FakeLedDriver([
+        for (final ch in board.ledChannels) ch.pins.length,
+      ]);
+      final soc = HarborSoC(name: 'LedSoC', compatible: 'test,soc-v1');
+      soc.bindBoardLeds(driver, board);
+      final names = <String, int>{};
       for (final ch in board.ledChannels) {
-        final led = HarborLedEngine(
-          baseAddress: 0x10005000,
-          channels: [ch.config],
-          maxPixels: ch.pixels,
-        );
-        expect(led.channelOut(0), hasLength(ch.pins.length));
+        for (final pin in ch.pins) {
+          final m = RegExp(r'^(\w+)\[(\d+)\]$').firstMatch(pin);
+          if (m == null) {
+            names[pin] = 1;
+          } else {
+            final n = m.group(1)!;
+            final w = int.parse(m.group(2)!) + 1;
+            if (w > (names[n] ?? 0)) names[n] = w;
+          }
+        }
+      }
+      for (final e in names.entries) {
+        expect(soc.output(e.key).width, equals(e.value), reason: e.key);
       }
     }
+  });
+
+  test('a driver with too few channels is rejected', () {
+    final board = HarborBoard.get('kc705');
+    final soc = HarborSoC(name: 'LedSoC', compatible: 'test,soc-v1');
+    expect(
+      () => soc.bindBoardLeds(_FakeLedDriver(const []), board),
+      throwsArgumentError,
+    );
+  });
+
+  test('a channel with the wrong output count is rejected', () {
+    final board = HarborBoard.get('kc705');
+    final soc = HarborSoC(name: 'LedSoC', compatible: 'test,soc-v1');
+    expect(
+      () => soc.bindBoardLeds(_FakeLedDriver(const [3]), board),
+      throwsArgumentError,
+    );
   });
 
   test('a speed grade copy keeps the led channels', () {

@@ -1,7 +1,7 @@
-import '../peripherals/led_engine.dart';
+import 'board_led.dart';
 import 'target.dart';
 
-/// The LEDs that one channel of a `HarborLedEngine` drives on a board.
+/// The LEDs that one channel of a `HarborLedDriver` drives on a board.
 class HarborBoardLedChannel {
   /// The channel kind and pin map.
   final HarborLedChannelConfig config;
@@ -95,7 +95,7 @@ class HarborBoard {
   /// gives a buffer that was not necessary.
   final Set<String> clockCapableSites;
 
-  /// The user LEDs as channels of a `HarborLedEngine`, with the pin catalog
+  /// The user LEDs as channels of a `HarborLedDriver`, with the pin catalog
   /// name of each pin. Empty for a board that has no preset.
   final List<HarborBoardLedChannel> ledChannels;
 

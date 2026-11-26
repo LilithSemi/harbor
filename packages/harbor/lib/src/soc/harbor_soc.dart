@@ -29,7 +29,7 @@ import '../pdk/pad_plan.dart';
 import '../peripherals/flash.dart';
 import '../peripherals/harbor_ddr3.dart';
 import '../peripherals/harbor_sdram.dart';
-import '../peripherals/led_engine.dart';
+import 'board_led.dart';
 import '../peripherals/maskrom.dart';
 import '../peripherals/reset_controller.dart';
 import '../peripherals/spi_flash.dart';
@@ -1340,24 +1340,24 @@ class HarborSoC extends BridgeModule {
     return pullUpPort(peripheral.port(portName), newPortName: topName);
   }
 
-  /// Binds the pins of [engine] to the LED pins of [board].
+  /// Binds the pins of [driver] to the LED pins of [board].
   ///
-  /// Channel `k` of [engine] drives `board.ledChannels[k]`. A catalog pin
+  /// Channel `k` of [driver] drives `board.ledChannels[k]`. A catalog pin
   /// such as `led[3]` joins one top-level vector port `led`, bit 3, so that
   /// the pin constraints match. A pin without an index, such as `led0_r`,
   /// is a 1-bit port of the same name. The pin indices of one vector must be
   /// 0 to N-1 with no gap.
-  void bindBoardLeds(HarborLedEngine engine, HarborBoard board) {
-    if (board.ledChannels.length > engine.channels.length) {
+  void bindBoardLeds(HarborLedDriver driver, HarborBoard board) {
+    if (board.ledChannels.length > driver.channelCount) {
       throw ArgumentError(
         '${board.name} has ${board.ledChannels.length} LED channels but the '
-        'engine has ${engine.channels.length}',
+        'driver has ${driver.channelCount}',
       );
     }
     final vectors = <String, Map<int, Logic>>{};
     for (var k = 0; k < board.ledChannels.length; k++) {
       final pins = board.ledChannels[k].pins;
-      final outs = engine.channelOut(k);
+      final outs = driver.channelOut(k);
       if (pins.length != outs.length) {
         throw ArgumentError(
           'LED channel $k has ${outs.length} outputs for ${pins.length} pins',

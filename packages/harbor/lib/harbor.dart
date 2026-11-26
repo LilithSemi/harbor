@@ -64,6 +64,7 @@ export 'src/clock/wishbone_cdc.dart';
 
 // SoC
 export 'src/soc/acpi.dart';
+export 'src/soc/board_led.dart';
 export 'src/soc/board.dart';
 export 'src/soc/board_zon.dart';
 export 'src/soc/boot_sequencer.dart';
@@ -399,7 +400,6 @@ export 'src/peripherals/hpm.dart';
 export 'src/peripherals/i2c.dart';
 export 'src/peripherals/imsic.dart';
 export 'src/peripherals/iommu.dart';
-export 'src/peripherals/led_engine.dart';
 export 'src/peripherals/maskrom.dart';
 export 'src/peripherals/pcie.dart';
 export 'src/peripherals/pcie/gtp_pcie_params.dart';
