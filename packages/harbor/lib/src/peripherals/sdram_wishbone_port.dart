@@ -13,7 +13,8 @@ import 'sdram_port.dart';
 /// `cyc` drops before the ack, the request still runs to completion on
 /// the engine side, but the port does not ack it.
 ///
-/// `reset` clears everything. `abort` is the bus side reset: it drops a
+/// `reset` clears the control registers. The address and data registers
+/// take no reset. `abort` is the bus side reset: it drops a
 /// read or a request not yet taken, but a write the arbiter took still
 /// hands over both words, so no taken write is lost or torn.
 ///
@@ -161,8 +162,8 @@ class SdramWishbonePort extends Module {
         writeTaken ?? (phase.eq(st(pReq)) & reqWriteReg & port.reqReady);
     final wrDone = (port.wrReady | wordsOut) & (taken | takenNow);
 
-    // Only the control registers clear on drop. The data registers clear
-    // on reset alone, so drop has a small fanout.
+    // Only the control registers clear, on drop. The data registers take no
+    // reset.
     Sequential(clk, [
       If(
         drop,
@@ -243,59 +244,48 @@ class SdramWishbonePort extends Module {
       ),
     ]);
 
+    // The address and data registers are read only in the phases that load
+    // them first, so they take no reset.
     Sequential(clk, [
-      If(
-        reset,
-        then: [
-          reqAddrReg < Const(0, width: wordAddrWidth),
-          wrDataReg < Const(0, width: 16),
-          wrMaskReg < Const(0, width: 2),
-          for (final r in loWordRegs) r < Const(0, width: 16),
-          datRReg < Const(0, width: dw),
-          for (final r in hiWordRegs) r < Const(0, width: 18),
-        ],
-        orElse: [
-          Case(phase, [
-            CaseItem(st(pIdle), [
-              If(
-                cyc,
-                then: [
-                  reqAddrReg < alignedWordAddr,
-                  wrDataReg < loData,
-                  wrMaskReg < loMask,
-                  for (var i = 1; i < wpa; i++)
-                    hiWordRegs[i - 1] < [maskWord(i), dataWord(i)].concat(),
-                ],
-              ),
-            ]),
-            for (var i = 0; i < wpa - 1; i++)
-              CaseItem(st(wr(i)), [
-                If(
-                  port.wrReady,
-                  then: [
-                    wrDataReg < hiWordRegs[i].getRange(0, 16),
-                    wrMaskReg < hiWordRegs[i].getRange(16, 18),
-                  ],
-                ),
-              ]),
-            CaseItem(st(pWrLast), [
-              If(port.wrReady, then: [datRReg < Const(0, width: dw)]),
-            ]),
-            for (var i = 0; i < wpa - 1; i++)
-              CaseItem(st(rd(i)), [
-                If(port.rdValid, then: [loWordRegs[i] < port.rdData]),
-              ]),
-            CaseItem(st(pRdLast), [
-              If(
-                port.rdValid & port.rdLast,
-                then: [
-                  datRReg < [...loWordRegs, port.rdData].rconcat(),
-                ],
-              ),
-            ]),
+      Case(phase, [
+        CaseItem(st(pIdle), [
+          If(
+            cyc,
+            then: [
+              reqAddrReg < alignedWordAddr,
+              wrDataReg < loData,
+              wrMaskReg < loMask,
+              for (var i = 1; i < wpa; i++)
+                hiWordRegs[i - 1] < [maskWord(i), dataWord(i)].concat(),
+            ],
+          ),
+        ]),
+        for (var i = 0; i < wpa - 1; i++)
+          CaseItem(st(wr(i)), [
+            If(
+              port.wrReady,
+              then: [
+                wrDataReg < hiWordRegs[i].getRange(0, 16),
+                wrMaskReg < hiWordRegs[i].getRange(16, 18),
+              ],
+            ),
           ]),
-        ],
-      ),
+        CaseItem(st(pWrLast), [
+          If(port.wrReady, then: [datRReg < Const(0, width: dw)]),
+        ]),
+        for (var i = 0; i < wpa - 1; i++)
+          CaseItem(st(rd(i)), [
+            If(port.rdValid, then: [loWordRegs[i] < port.rdData]),
+          ]),
+        CaseItem(st(pRdLast), [
+          If(
+            port.rdValid & port.rdLast,
+            then: [
+              datRReg < [...loWordRegs, port.rdData].rconcat(),
+            ],
+          ),
+        ]),
+      ]),
     ]);
   }
 }
