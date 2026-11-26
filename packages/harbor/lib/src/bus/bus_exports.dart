@@ -4,7 +4,7 @@
 export 'bus.dart';
 export 'bus_error_source.dart';
 export 'bus_master_port.dart';
-export 'bus_slave_port.dart';
+export 'bus_slave_port.dart' hide harborInnerSlavePort;
 export 'firewall.dart';
 
 // Port layer

@@ -98,6 +98,22 @@ class BusSlavePort {
     this.cdcDepth = 0,
   });
 
+  BusSlavePort._inner(
+    BusSlavePort port, {
+    required String name,
+    required this.addr,
+    required this.dataIn,
+    required this.stb,
+    required this.we,
+    required this.sel,
+  }) : dataOut = Logic(name: '${name}_dat_out', width: port.dataIn.width),
+       ack = Logic(name: '${name}_ack_out'),
+       err = port.err == null ? null : Logic(name: '${name}_err_out'),
+       kind = port.kind,
+       interfaceRef = port.interfaceRef,
+       reset = port.reset,
+       cdcDepth = port.cdcDepth;
+
   /// Entries in each FIFO of a register port crossing.
   static const crossingDepth = 2;
 
@@ -674,6 +690,30 @@ class BusSlavePort {
     );
   }
 }
+
+/// A waist for device logic behind an arbiter between [port] and a second
+/// master. The arbiter drives [addr], [dataIn], [stb], [we] and [sel]. The
+/// device logic drives `ack`, `dataOut` and, when [port] has one, `err`.
+/// The new signals have names that start with [name]. The waist has the
+/// kind, interface, reset and crossing of [port]. Only the arbiters in this
+/// package use it.
+BusSlavePort harborInnerSlavePort(
+  BusSlavePort port, {
+  required String name,
+  required Logic addr,
+  required Logic dataIn,
+  required Logic stb,
+  required Logic we,
+  required Logic sel,
+}) => BusSlavePort._inner(
+  port,
+  name: name,
+  addr: addr,
+  dataIn: dataIn,
+  stb: stb,
+  we: we,
+  sel: sel,
+);
 
 /// Byte-lane write helpers for a [BusSlavePort].
 ///

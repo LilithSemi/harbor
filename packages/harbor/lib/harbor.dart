@@ -393,6 +393,7 @@ export 'src/peripherals/ethernet/eth_phy_rgmii.dart';
 export 'src/peripherals/ethernet/eth_regs.dart';
 export 'src/peripherals/ethernet/eth_rx_filter.dart';
 export 'src/peripherals/flash.dart';
+export 'src/peripherals/tdp_bram.dart';
 export 'src/peripherals/gpio.dart';
 export 'src/peripherals/hpm.dart';
 export 'src/peripherals/i2c.dart';
