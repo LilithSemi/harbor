@@ -2646,21 +2646,14 @@ class HarborAsicTarget extends HarborDeviceTarget {
   ];
 
   /// Tcl of the pad slots on a fab slot. Each pad opening center goes on its
-  /// slot position. In R0, MX, R90 and MXR90 the cell edge at x = 0 is the
-  /// low edge along the side, in the other orientations it is the high edge.
+  /// slot position. The I/O rows of `make_io_sites` keep cell x = 0 at the
+  /// low edge along each side, so the opening is the same distance from the
+  /// low edge on every side.
   static const _padSlotsFabTcl = [
-    '',
-    'proc pad_location { center w orient } {',
-    '  global pad_opening',
-    r'  if { $orient in {R0 MX R90 MXR90} } {',
-    r'    return [expr $center - $pad_opening]',
-    '  }',
-    r'  return [expr $center - $w + $pad_opening]',
-    '}',
     '',
     '# The result is a list of pad name, start and width along the side.',
     'proc pad_slots { side } {',
-    '  global pads centers pad_orient block dbu dx0 dy0 dx1 dy1 corner_w '
+    '  global pads centers pad_opening block dbu dx0 dy0 dx1 dy1 corner_w '
         'corner_h',
     r'  set horizontal [expr {$side eq "south" || $side eq "north"}]',
     r'  set end [expr {$horizontal ? $dx0 + $corner_w : $dy0 + $corner_h}]',
@@ -2669,7 +2662,7 @@ class HarborAsicTarget extends HarborDeviceTarget {
     r'  foreach name $pads($side) center $centers($side) {',
     r'    set w [expr [[[$block findInst $name] getMaster] getWidth] / '
         r'double($dbu)]',
-    r'    set pos [pad_location $center $w $pad_orient($side)]',
+    r'    set pos [expr $center - $pad_opening]',
     r'    if { $pos < $end - 0.001 || $pos + $w > $hi + 0.001 } {',
     r'      puts stderr "The pad $name at $center on the $side side overlaps '
         r'a pad or a corner"',
@@ -2710,9 +2703,12 @@ class HarborAsicTarget extends HarborDeviceTarget {
     r'    set box [$inst getBBox]',
     r'    set lo [expr {($horizontal ? [$box xMin] : [$box yMin]) / '
         r'double($dbu)}]',
-    r'    set w [expr [[$inst getMaster] getWidth] / double($dbu)]',
-    r'    set got [expr $center + $lo - [pad_location $center $w '
-        r'[$inst getOrient]]]',
+    r'    if { [$inst getOrient] ne $pad_orient($side) } {',
+    r'      puts stderr "The pad $name has orientation [$inst getOrient], the '
+        r'pad opening needs $pad_orient($side)"',
+    '      exit 1',
+    '    }',
+    r'    set got [expr $lo + $pad_opening]',
     r'    if { abs($got - $center) > 0.001 } {',
     r'      puts stderr "The pad opening of $name is at $got, slot position '
         r'$center"',
@@ -2918,8 +2914,8 @@ class HarborAsicTarget extends HarborDeviceTarget {
   static const padRowOrient = {
     HarborIoPadEdge.south: 'R0',
     HarborIoPadEdge.east: 'R90',
-    HarborIoPadEdge.north: 'R180',
-    HarborIoPadEdge.west: 'R270',
+    HarborIoPadEdge.north: 'MX',
+    HarborIoPadEdge.west: 'MXR90',
   };
 
   /// Writes the slot positions of each pad and the check of `DIE_AREA`

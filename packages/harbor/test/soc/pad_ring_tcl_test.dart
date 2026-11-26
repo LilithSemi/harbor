@@ -548,36 +548,23 @@ void main() {
       );
     });
 
-    for (final (side, orient, low) in [
-      ('south', 'R0', true),
-      ('east', 'R90', true),
-      ('north', 'R180', false),
-      ('west', 'R270', false),
+    // Reference DEF of asix: pad location and opening center on each side.
+    for (final (side, orient, location, opening) in [
+      ('south', 'R0', 1034.5, 1072.0),
+      ('east', 'R90', 1024.0, 1061.5),
+      ('north', 'MX', 1034.5, 1072.0),
+      ('west', 'MXR90', 1024.0, 1061.5),
     ]) {
       test('$side pads sit in $orient with the opening on the slot', () {
         final t = tcl();
+        final edge = HarborIoPadEdge.values.byName(side);
+        expect(HarborAsicTarget.padRowOrient[edge], orient);
         expect(t, contains('set pad_orient($side) $orient'));
-        expect(
-          const {'R0', 'MX', 'R90', 'MXR90'}.contains(orient),
-          low,
-          reason: 'cell x = 0 is the low edge along the side',
-        );
-        expect(
-          t,
-          contains(
-            'proc pad_location { center w orient } {\n'
-            '  global pad_opening\n'
-            r'  if { $orient in {R0 MX R90 MXR90} } {'
-            '\n'
-            r'    return [expr $center - $pad_opening]'
-            '\n  }\n'
-            r'  return [expr $center - $w + $pad_opening]',
-          ),
-        );
-        expect(
-          HarborAsicTarget.padRowOrient[HarborIoPadEdge.values.byName(side)],
-          orient,
-        );
+        expect(slot.centers[edge], contains(opening));
+        expect(opening - _gf180.padLibrary.openingOffsetUm!, location);
+        expect(t, contains('set pad_opening 37.5'));
+        expect(t, contains(r'    set pos [expr $center - $pad_opening]'));
+        expect(t, contains(r'    set got [expr $lo + $pad_opening]'));
       });
     }
 
@@ -586,12 +573,12 @@ void main() {
       expect(t, isNot(contains(r'set gap [expr floor(')));
       for (final line in [
         r'  foreach name $pads($side) center $centers($side) {',
-        r'    set pos [pad_location $center $w $pad_orient($side)]',
         r'      puts stderr "The pad $name at $center on the $side side '
             r'overlaps a pad or a corner"',
         r'  if { [$row getOrient] ne $pad_orient($side) } {',
-        r'    set got [expr $center + $lo - [pad_location $center $w '
-            r'[$inst getOrient]]]',
+        r'    if { [$inst getOrient] ne $pad_orient($side) } {',
+        r'      puts stderr "The pad $name has orientation [$inst getOrient], '
+            r'the pad opening needs $pad_orient($side)"',
         r'      puts stderr "The pad opening of $name is at $got, slot '
             r'position $center"',
         r'place_corners $::env(PAD_CORNER)',
