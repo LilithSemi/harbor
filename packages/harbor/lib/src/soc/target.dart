@@ -2101,13 +2101,14 @@ class HarborAsicTarget extends HarborDeviceTarget {
         '-layers {${stripes[n - 2].layer} ${stripes[n - 1].layer}}',
       );
     }
-    if (srams && ring != null) {
+    if (srams) {
       buf.writeln(
         r'define_pdn_grid -name sram -macro -instances $srams '
         '-voltage_domains CORE -grid_over_boundary',
       );
       buf.writeln(
-        'add_pdn_connect -grid sram -layers {${ring.sramPdnLayers.join(' ')}}',
+        'add_pdn_connect -grid sram -layers '
+        '{${ring!.sramPdnLayers.join(' ')}}',
       );
     }
     buf.writeln('pdngen');
@@ -2205,6 +2206,12 @@ class HarborAsicTarget extends HarborDeviceTarget {
     final plan = padPlan;
     final pads = plan == null ? null : padCells;
     final srams = pads == null ? const <String>[] : _sramCells(leafCells);
+    if (pads != null && isHierarchical) {
+      throw ArgumentError(
+        'A pad ring cannot have hardened macros: macro_placement would '
+        'move the SRAM macros',
+      );
+    }
     if (macroPins.isNotEmpty) {
       if (pads == null) {
         throw ArgumentError('Macro pins need a pad ring');
@@ -2473,14 +2480,17 @@ class HarborAsicTarget extends HarborDeviceTarget {
   /// macro halos.
   void _writeSramPlacement(StringBuffer buf, HarborCoreRing ring) {
     buf.writeln(
-      '# SRAM macros. The signal pins of a south macro face the core edge. '
-      'A north macro is mirrored',
+      '# SRAM macros. The signal pins are on the bottom side of the macro, '
+      'so the pins of a north',
     );
     buf.writeln(
-      '# (MX). The south macros sit above the core edge by sram_lift, so the '
-      'antenna repair has free',
+      '# macro face into the core. The antenna repair needs free sites below '
+      'the pins: a south macro',
     );
-    buf.writeln('# sites below the pins.');
+    buf.writeln(
+      '# sits above the core edge by sram_lift, and the area sram_lift below '
+      'a north macro stays free.',
+    );
     buf.writeln(
       'set halo [expr {[info exists ::env(MACRO_HALO)] ? '
       '\$::env(MACRO_HALO) : ${_um(ring.macroHaloUm)}}]',
@@ -2522,25 +2532,27 @@ class HarborAsicTarget extends HarborDeviceTarget {
     r'  set master [[$block findInst $name] getMaster]',
     r'  set w [expr [$master getWidth] / double($dbu)]',
     r'  set h [expr [$master getHeight] / double($dbu)]',
+    '  # y0 is the bottom of the macro and of the free area below its pins.',
     r'  if { $edge eq "south" } {',
     r'    set y [expr $cy0 + $halo + $sram_lift]',
+    r'    set y0 $y',
     '  } else {',
     r'    set y [expr $cy1 - $halo - $h]',
+    r'    set y0 [expr $y - $sram_lift]',
     '  }',
     r'  if { $x < $cx0 + $halo || $x + $w + $halo > $cx1 || '
-        r'$y < $cy0 + $halo || $y + $h + $halo > $cy1 } {',
+        r'$y0 < $cy0 + $halo || $y + $h + $halo > $cy1 } {',
     '    return full',
     '  }',
     r'  foreach rect $sram_rects {',
     r'    lassign $rect rx0 ry0 rx1 ry1',
     r'    if { $x < $rx1 + $macro_channel && $x + $w + $macro_channel > $rx0 '
-        r'&& $y < $ry1 + $macro_channel && $y + $h + $macro_channel > $ry0 } {',
+        r'&& $y0 < $ry1 + $macro_channel && $y + $h + $macro_channel > $ry0 } {',
     r'      return $rx1',
     '    }',
     '  }',
-    r'  place_macro -macro_name $name -location [list $x $y] '
-        r'-orientation [expr {$edge eq "south" ? "R0" : "MX"}]',
-    r'  lappend sram_rects [list $x $y [expr $x + $w] [expr $y + $h]]',
+    r'  place_macro -macro_name $name -location [list $x $y] -orientation R0',
+    r'  lappend sram_rects [list $x $y0 [expr $x + $w] [expr $y + $h]]',
     '  return placed',
     '}',
     '',
@@ -2567,8 +2579,12 @@ class HarborAsicTarget extends HarborDeviceTarget {
     '  } else {',
     r'    set result [sram_try $name $edge [expr $cx0 + $offset]]',
     '  }',
-    r'  if { $result ne "placed" } {',
+    r'  if { $result eq "full" } {',
     r'    puts stderr "The SRAM $name does not fit in the core"',
+    '    exit 1',
+    '  }',
+    r'  if { $result ne "placed" } {',
+    r'    puts stderr "The SRAM $name overlaps another SRAM"',
     '    exit 1',
     '  }',
     '}',
@@ -2583,7 +2599,8 @@ class HarborAsicTarget extends HarborDeviceTarget {
     r'cut_rows -halo_width_x $halo -halo_width_y $halo',
   ];
 
-  /// Tcl that stops the flow when an SRAM supply pin has no net.
+  /// Tcl that stops the flow when an SRAM supply pin has no net or the
+  /// power grid does not reach it.
   static const _sramPowerCheckTcl = [
     r'foreach name $srams {',
     '  foreach pin {VDD VSS} {',
@@ -2592,6 +2609,29 @@ class HarborAsicTarget extends HarborDeviceTarget {
     r'      puts stderr "The SRAM pin $name/$pin has no net"',
     '      exit 1',
     '    }',
+    '  }',
+    '}',
+    '# The pad ring nets have no terminals. Cells that are not fixed yet are '
+        'not checked.',
+    'foreach net {VDD VSS} {',
+    r'  set pg_report pdn_$net.rpt',
+    r'  file delete -force $pg_report',
+    r'  if { [catch {check_power_grid -net $net -floorplanning '
+        r'-dont_require_terminals -error_file $pg_report} err] } {',
+    '    set floating {}',
+    r'    if { [file exists $pg_report] } {',
+    r'      set fh [open $pg_report]',
+    r'      set floating [regexp -all -inline {inst:\S+} [read $fh]]',
+    r'      close $fh',
+    '    }',
+    r'    foreach name $srams {',
+    r'      if { "inst:$name" in $floating } {',
+    r'        puts stderr "The SRAM $name is not connected to the $net power grid"',
+    '        exit 1',
+    '      }',
+    '    }',
+    r'    puts stderr "The $net power grid is not connected: $err"',
+    '    exit 1',
     '  }',
     '}',
   ];

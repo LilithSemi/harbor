@@ -66,16 +66,19 @@ void main() {
       'set sram_pins {}',
       r'  if { [string match $::env(SRAM_LIB_NAME)__* '
           r'[[$inst getMaster] getName]] } {',
-      // South macros are lifted, north macros are at halo from the edge.
+      // South macros are lifted. North macros are at halo from the edge
+      // and keep the lift free below their pins.
       r'    set y [expr $cy0 + $halo + $sram_lift]',
       r'    set y [expr $cy1 - $halo - $h]',
+      r'    set y0 [expr $y - $sram_lift]',
       r'  if { $x < $cx0 + $halo || $x + $w + $halo > $cx1 || '
-          r'$y < $cy0 + $halo || $y + $h + $halo > $cy1 } {',
+          r'$y0 < $cy0 + $halo || $y + $h + $halo > $cy1 } {',
       r'    if { $x < $rx1 + $macro_channel && $x + $w + $macro_channel > '
-          r'$rx0 && $y < $ry1 + $macro_channel && $y + $h + $macro_channel > '
+          r'$rx0 && $y0 < $ry1 + $macro_channel && $y + $h + $macro_channel > '
           r'$ry0 } {',
-      r'  place_macro -macro_name $name -location [list $x $y] '
-          r'-orientation [expr {$edge eq "south" ? "R0" : "MX"}]',
+      // Both edges use R0, so the bottom-edge signal pins face the core.
+      r'  place_macro -macro_name $name -location [list $x $y] -orientation R0',
+      r'  lappend sram_rects [list $x $y0 [expr $x + $w] [expr $y + $h]]',
       r'    set x [expr $result + $macro_channel]',
       // South first, then north, never automatic placement.
       r'  if { [sram_pack $name south] ne "placed" && '
@@ -86,6 +89,10 @@ void main() {
       'add_pdn_connect -grid sram -layers {Metal3 Metal4}',
       '  foreach pin {VDD VSS} {',
       r'    if { $iterm eq "NULL" || [$iterm getNet] eq "NULL" } {',
+      r'  if { [catch {check_power_grid -net $net -floorplanning '
+          r'-dont_require_terminals -error_file $pg_report} err] } {',
+      r'      set floating [regexp -all -inline {inst:\S+} [read $fh]]',
+      r'      if { "inst:$name" in $floating } {',
     ]) {
       expect(tcl, contains(line));
     }
@@ -94,9 +101,12 @@ void main() {
       r'The pinned SRAM $name is not in the netlist',
       r'The SRAM $name does not fit in the core',
       r'The SRAM pin $name/$pin has no net',
+      r'The SRAM $name is not connected to the $net power grid',
+      r'The $net power grid is not connected: $err',
     ]) {
       expect(tcl, contains('puts stderr "$msg"\n'));
     }
+    expect(tcl, isNot(contains('MX')));
     expect(tcl, isNot(contains('macro_placement')));
     expect(tcl, isNot(contains('rtl_macro_placer')));
     expect(tcl, isNot(contains('MACRO_HALO) -halo_width_y')));
@@ -111,11 +121,87 @@ void main() {
       'define_pdn_grid -name sram',
       'pdngen',
       '  foreach pin {VDD VSS} {',
+      'check_power_grid',
       'global_placement',
     ];
     final at = [for (final s in order) tcl.indexOf(s)];
     expect(at, isNot(contains(-1)));
     expect(at, orderedEquals([...at]..sort()));
+  });
+
+  test('three srams fill the south edge, then the north edge', () {
+    const three = [
+      'gf180mcu_fd_ip_sram__sram512x8m8wm1',
+      'gf180mcu_fd_ip_sram__sram256x8m8wm1',
+      'gf180mcu_fd_ip_sram__sram64x8m8wm1',
+    ];
+    final tcl = _target().generateOpenroadTcl(leafCells: three);
+    for (final cell in ['sram512x8m8wm1', 'sram256x8m8wm1', 'sram64x8m8wm1']) {
+      expect(
+        tcl,
+        contains(
+          'read_lef \$::env(SRAM_DIR)/lef/\$::env(SRAM_LIB_NAME)__$cell.lef',
+        ),
+      );
+    }
+    // Each macro tries the south edge from west to east, past the macros in
+    // the way, then the north edge. With no free location the flow stops.
+    final pack = tcl.substring(tcl.indexOf('proc sram_pack'));
+    expect(pack, contains(r'  set x [expr $cx0 + $halo]'));
+    expect(
+      pack,
+      contains(
+        r'    if { $result eq "placed" || $result eq "full" } '
+        r'{ return $result }',
+      ),
+    );
+    expect(pack, contains(r'    set x [expr $result + $macro_channel]'));
+    final rule = tcl.substring(tcl.indexOf(r'foreach name $srams {'));
+    expect(
+      rule,
+      startsWith(
+        r'foreach name $srams {'
+        '\n'
+        r'  if { [lsearch -index 0 $sram_pins $name] >= 0 } { continue }'
+        '\n'
+        r'  if { [sram_pack $name south] ne "placed" && '
+        r'[sram_pack $name north] ne "placed" } {'
+        '\n'
+        r'    puts stderr "The SRAM $name does not fit in the core"'
+        '\n'
+        '    exit 1\n',
+      ),
+    );
+  });
+
+  test('a macro out of the core or on another sram stops the flow', () {
+    final tcl = _target(
+      pins: const [
+        HarborMacroPin(
+          inst: 'ram',
+          edge: HarborIoPadEdge.south,
+          offsetUm: 5000,
+        ),
+      ],
+    ).generateOpenroadTcl(leafCells: _leaves);
+    expect(
+      tcl,
+      contains(
+        r'  if { $result eq "full" } {'
+        '\n'
+        r'    puts stderr "The SRAM $name does not fit in the core"'
+        '\n'
+        '    exit 1\n'
+        '  }\n'
+        r'  if { $result ne "placed" } {'
+        '\n'
+        r'    puts stderr "The SRAM $name overlaps another SRAM"'
+        '\n'
+        '    exit 1\n',
+      ),
+    );
+    expect(tcl, contains('    return full\n'));
+    expect(tcl, contains(r'      return $rx1'));
   });
 
   test('pinned srams go first at their edge', () {
@@ -174,6 +260,18 @@ void main() {
         pins: const [HarborMacroPin(inst: 'ram', edge: HarborIoPadEdge.east)],
       ).generateOpenroadTcl(leafCells: _leaves),
       fails('The SRAM ram must be on the south or north core edge'),
+    );
+    expect(
+      () => HarborAsicTarget(
+        provider: _gf180,
+        topCell: 'top',
+        padPlan: _plan(),
+        macros: const [HarborAsicMacro(moduleName: 'Tile')],
+      ).generateOpenroadTcl(leafCells: _leaves),
+      fails(
+        'A pad ring cannot have hardened macros: macro_placement would '
+        'move the SRAM macros',
+      ),
     );
   });
 
